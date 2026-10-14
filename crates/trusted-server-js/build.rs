@@ -28,7 +28,7 @@ use sha2::{Digest as _, Sha256};
 use self::bundle_set::{bundle_file_name, check_bundle_set, expected_module_ids, scan_bundle_dir};
 
 const PREBUILT_DIR_VAR: &str = "TSJS_PREBUILT_DIR";
-const INVENTORY_VAR: &str = "TSJS_PREBUILT_INVENTORY";
+const INVENTORY_VAR: &str = "TRUSTED_SERVER__TSJS_PREBUILT_INVENTORY";
 const RELEASE_VAR: &str = "TRUSTED_SERVER__RELEASE_BUILD";
 const SOURCE_VAR: &str = "TRUSTED_SERVER__GIT_VERSION";
 const SKIP_BUILD_VAR: &str = "TSJS_SKIP_BUILD";
@@ -119,38 +119,41 @@ pub(crate) fn run_with_hook(hook: impl FnMut(&Path, &Path)) {
             "tsjs: Using prebuilt bundles from {}",
             prebuilt_dir.display()
         );
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        {
-            let inventory = inventory_path.as_ref().map(|path| {
-                let expected_source = source.as_ref().map(|source| {
-                    source
-                        .to_str()
-                        .expect("should provide a UTF-8 source when checking inventory")
+        if let Some(path) = inventory_path {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                prebuilt::inventory_outside(&prebuilt_dir, &path).unwrap_or_else(|error| {
+                    panic!("tsjs: invalid inventory path {}: {error}", path.display())
                 });
-                prebuilt::inventory_outside(&prebuilt_dir, path)
-                    .unwrap_or_else(|error| panic!("tsjs: invalid inventory path: {error}"));
-                inventory::read_inventory(path, &expected, expected_source)
-                    .unwrap_or_else(|error| panic!("tsjs: invalid inventory: {error}"))
-            });
-            prebuilt::copy_checked(
-                &expected,
-                &prebuilt_dir,
-                &bundle_dir,
-                inventory.as_ref().map(|checked| &checked.inventory),
-                hook,
-            )
-            .unwrap_or_else(|error| panic!("tsjs: invalid prebuilt inventory inputs: {error}"));
-            if let Some(inventory) = inventory {
+                let inventory = inventory::read_inventory(&path, &expected, release.as_deref())
+                    .unwrap_or_else(|error| {
+                        panic!("tsjs: invalid inventory {}: {error}", path.display())
+                    });
+                prebuilt::copy_checked(
+                    &expected,
+                    &prebuilt_dir,
+                    &bundle_dir,
+                    &inventory.inventory,
+                    hook,
+                )
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "tsjs: invalid prebuilt inventory inputs in {}: {error}",
+                        prebuilt_dir.display()
+                    )
+                });
                 // Cargo JSON build-script messages expose the prepared input
                 // identity to the later release evidence collector.
                 println!(
-                    "cargo:rustc-env=TSJS_INPUT_INVENTORY_SHA256={}",
+                    "cargo:rustc-env=TRUSTED_SERVER__TSJS_INVENTORY_SHA256={}",
                     inventory.raw_sha256
                 );
             }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            panic!("tsjs: checked prebuilt copying requires a supported Linux or macOS build host");
+        } else {
+            copy_prebuilt(&expected, &prebuilt_dir, &bundle_dir);
         }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        panic!("tsjs: checked prebuilt copying requires a supported Linux or macOS build host");
     } else {
         build_bundles(&ts_dir, &bundle_dir);
     }
@@ -163,6 +166,22 @@ pub(crate) fn run_with_hook(hook: impl FnMut(&Path, &Path)) {
     );
 
     write_module_table(&expected, &bundle_dir, &out_dir);
+}
+
+fn copy_prebuilt(expected: &[String], source: &Path, destination: &Path) {
+    let found =
+        bundle_set::scan_legacy_bundle_dir(source).unwrap_or_else(|error| panic!("tsjs: {error}"));
+    check_bundle_set(expected, &found)
+        .unwrap_or_else(|error| panic!("tsjs: invalid prebuilt bundle set: {error}"));
+    if destination.exists() {
+        fs::remove_dir_all(destination).expect("should clear private prebuilt destination");
+    }
+    fs::create_dir_all(destination).expect("should create private prebuilt destination");
+    for id in expected {
+        let filename = bundle_file_name(id);
+        fs::copy(source.join(&filename), destination.join(&filename))
+            .unwrap_or_else(|error| panic!("tsjs: failed to copy {filename}: {error}"));
+    }
 }
 
 fn build_bundles(ts_dir: &Path, bundle_dir: &Path) {

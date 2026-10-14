@@ -1,71 +1,76 @@
 # Disposable release qualification framework
 
-Status: **local framework only; Task 8 qualification remains pending**. No tool,
+Status: **Rust migration pending; Tasks 8–9 qualification remains incomplete**. No tool,
 SDK, OCI image or recipe has become qualified. `release-tools.json` retains null
 measurement slots. A source checksum and a successful unit test cannot supply
 hosted execution or acquisition authenticity.
 
-The locally authorized work consists of a strict observation schema, semantic
-checks, source-owned candidate socket boundaries and an inert hosted workflow
-proposal. It creates no repository, dispatches no job, registers no workflow,
+The retained observation schema, source-owned candidate boundary design and inert
+hosted proposal guide replacement Rust semantic checks and native execution. It creates no repository, dispatches no job, registers no workflow,
 publishes no tag, signs no release and deploys no publisher service.
 
-## Task 9 local recipe status
+## Rust migration and Task 9 status
 
-Task 9 is **partial local implementation**. The closed Rust recipe, immutable
-material checks, Cargo JSON final selection, native parsing and final-byte Fastly
-runtime gates are reviewable. Actual local socket/Cargo download-attempt and tiny
-Mach-O fixtures provide diagnostic evidence only. They do not establish selected
-macOS 15/GNU startup, native dependency closure, or a canonical application build.
+Introduced Python qualification/recipe tooling and validator requirements are removed. Historical local socket/Cargo/tiny Mach-O probes are not replacement Rust boundary results or selected macOS 15/GNU qualification. The [Rust migration addendum](../../../docs/superpowers/specs/2026-10-14-release-tooling-rust-migration.md) and [primary plan](../../../docs/superpowers/plans/2026-10-13-attested-release-implementation.md#rust-migration-and-current-execution-boundary) define the host-only `crates/trusted-server-release` tool. Its document/schema utilities are implemented; source/preflight, complete helper closure and actual qualification remain pending.
 
-The public selectors still refuse pending qualification. Before measuring the
-executable closure, the focused Task 8 integration must supply independently
-authenticated bootstrap/acquisition selection, a data-driven reviewed receipt
-adapter, and the shared-JS producer/current-run transfer binding. An inventory's
-source labels and byte hashes alone do not authenticate its producer. The private
-candidate tool policy has no self-referencing source commit; independent caller
-approval must match the actual executing checkout and loaded helper bytes.
+Current wrappers fail closed until the independently approved native Rust
+bootstrap and source-owned authenticated selections are implemented. Neither
+inventory labels/hashes nor a self-authored checksum authenticates its producer.
+Private typed source/acquisition approval and actual JS completion are constructed
+only by the corresponding successful verification/execution path; no serialized
+authorization boolean is accepted. The tool has no core/CLI/JS crate dependency.
 
-The central recipe has not yet executed vendor preparation, the complete product
-compile, final-byte acceptance and output copying together. Those integration
-paths require the authenticated adapters above; helper-level local tests must not
-be reported as canonical build proof. Task 10 must also capture metadata/tree
-messages through the same source-owned environment and boundary before hosted
-qualification. Native selected runtimes and Fastly A/B acceptance remain pending.
+Task 9 remains incomplete. Rust MUST compose original-material preparation, actual
+whole-product Cargo compilation, final-byte acceptance and output copying. Task 10
+MUST collect explicit-target metadata/tree, effective unit features, native archive
+and sysroot evidence through the same boundary before hosted measurement. Native
+selected runtimes and complete Fastly A/B acceptance remain mandatory. Independently
+reviewed all-cohort remote evidence is distinct from current installed-tool rehash
+and SDK/environment checks; neither is a substitute for the other.
 
-## Local checks
+## Local Rust checks
 
-Use a private Python 3.11+ environment and install the complete locked validator
-set before running tests:
+Current registered utility checks use the source-built developer target. The
+qualification module/filter below is a future instruction: it MUST fail its
+nonzero guard until the real qualification tests are registered.
 
 ```sh
-python3 -m venv /private/tmp/ts-qualification-venv
-/private/tmp/ts-qualification-venv/bin/python -m pip install --require-hashes --only-binary=:all: -r scripts/release/requirements.txt
-/private/tmp/ts-qualification-venv/bin/python -m pip check
-/private/tmp/ts-qualification-venv/bin/python -B -m unittest discover -s scripts/release/tests -p 'test_qualification.py' -v
+set -eu
+HOST_TARGET=$(rustc -vV | sed -n 's/^host: //p')
+test -n "$HOST_TARGET"
+RELEASE_TEST_LIST=$(mktemp)
+trap 'rm -f "$RELEASE_TEST_LIST"' EXIT
+cargo test -p trusted-server-release --target "$HOST_TARGET" qualification::tests -- --list > "$RELEASE_TEST_LIST"
+awk '/: test$/ { count++ } END { if (count == 0) { print "Qualification filter selected zero tests"; exit 1 } print "Selected " count " qualification tests" }' "$RELEASE_TEST_LIST"
+cargo test -p trusted-server-release --target "$HOST_TARGET" qualification::tests
+cargo clippy -p trusted-server-release --target "$HOST_TARGET" --all-targets --all-features -- -D warnings
 ```
 
-The real unconfined probe requires local socket permission. On macOS, set
-`TS_RELEASE_BOUNDARY_TESTS=1` to additionally execute the actual candidate
-sandbox-exec profile. Run those tests outside an enclosing application sandbox.
-The child and grandchild execute the same probe through inherited confinement,
-with private HOME/TMP and closed inherited descriptors. A successful local test
-does not qualify macOS 15, GNU, Intel execution, a whole SDK or a tool acquisition.
+These commands provide local behavior evidence, not authenticated native bootstrap
+or official release proof. Private tests live alongside `src/qualification.rs` or
+in its registered child `tests.rs`; public process tests use `tests/commands.rs`.
+Fixtures MUST stay fictional. Do not make internal APIs public for tests.
 
-`qualify.py validate-observation <file>` applies the bounded closed schema and
-semantic joins, but prints an explicit pending qualification diagnostic even
-when the observations are coherent. `require_qualified` always refuses. The
-production `preflight.validate_tools(require_qualified=True)` and
-`prepare.qualified_js_selection` also remain closed. Fields asserting `passed`,
-caller commands and unknown keys are rejected. Actual logs, signed acquisition
-evidence, trust roots and run identities still require independent verification;
-no JSON field authenticates itself.
+The real unconfined probe requires local socket permission. Selected actual native
+boundary probes MUST run outside an enclosing application sandbox. Child and
+grandchild execute the same compiled Rust probe under inherited confinement with
+private HOME/TMP and closed inherited descriptors. No ambient interpreter/tool
+selection is trusted. A successful local test does not qualify macOS 15, GNU,
+Intel execution, the whole SDK or original distribution acquisition.
+
+The proposed command `trusted-server-release qualify validate-observation <file>`
+MUST check bounded closed schema and semantic joins once implemented; coherent JSON still has pending
+qualification until independent evidence is verified. The production qualified
+selector remains closed. Fields asserting `passed`, caller commands and unknown
+keys are rejected. Actual logs, acquisition signatures, independent trust roots
+and run identities MUST be verified; no JSON field authenticates itself. Native
+bootstrap/schema pins MUST be reviewed before this command can serve production.
 
 ## Closed identities and fingerprints
 
 The GNU builder selection is a distinct `gnu-builder-x86_64` slot, with no image
 chosen or digest invented. UBI 9 is an initial candidate to investigate; its
-availability, glibc, compiler and SDK must be measured before selecting it. UBI 9,
+availability, glibc, compiler and SDK MUST be measured before selecting it. UBI 9,
 Ubuntu 22.04 and Debian 12 are three separate compatibility runtime slots. They
 do not pretend to supply a build SDK.
 
@@ -73,7 +78,7 @@ macOS records GitHub's actual runner image version and the Apple SDK identity.
 No VM byte hash is available through this contract, so a hash of a version string
 is never labeled an image digest. The source-owned labels are `macos-15` for ARM64
 and `macos-15-intel` for native Intel. Native `uname`, `sw_vers`, translation
-`sysctl`, Xcode build version and SDK version/tree identity must be recorded.
+`sysctl`, Xcode build version and SDK version/tree identity MUST be recorded.
 The actual startup OS is 15; the Mach-O loader floor is explicitly 13.0. Neither
 Rosetta nor startup on a newer developer Mac establishes this matrix.
 
@@ -91,68 +96,85 @@ This avoids a self-hash cycle: a result cannot hash a future tools file containi
 that result's digest. The observation records its own source commit; the later
 reviewed measured-pin commit has different raw tools bytes. Recipe/profile/helper
 changes or changed executable/acquisition selections invalidate qualification.
-`candidate_fingerprints` refuses missing shared Task 9 helpers. The existing
+The Rust candidate fingerprint validator MUST refuse missing shared Task 9 helpers or changed executable source. The closure includes the release-tool manifest/lockfile and full compiled path-dependency closure, all loaded Rust modules, POSIX adapters, retained Node collector, reviewed profiles and schema bytes; a candidate cannot choose that path list. The existing
 Git reader assumes a trusted immutable object store; the actual staging boundary
-must make Git objects and tracked source files read-only while permitting the
+MUST make Git objects and tracked source files read-only while permitting the
 private installation's required node_modules/output writes. This framework does
 not claim race-proof reads against mutable Git storage.
 
 The reviewed closure explicitly includes the Rust build scripts and their
 shared git-version/JS prebuilt/inventory/bundle-set helpers, Cargo configuration
-and manifests, and the executable JS build-all/module-options/composition/Vitest
+and ALL path-dependency manifests, explicitly `crates/trusted-server-openrtb/Cargo.toml`, tool-version files, authenticated executable digests, SDK identities and raw receipts, and the executable JS build-all/module-options/composition/Vitest
 pipeline. Ordinary application source and dependencies have separate commit and
-dependency identities. Future imported build helpers must enter this reviewed
+dependency identities. Future imported build helpers MUST enter this reviewed
 closure before execution; the candidate selector cannot supply its own path list.
+
+The host release helper itself MUST load/run inside the GNU <=2.34 builder; build
+it through an independently approved baseline image/toolchain/material channel,
+not ambient Ubuntu 24 followed by an assumed UBI 9 invocation. Bind helper target,
+loader/runtime and its own source/dependency closure. Native macOS helper CPU/SDK
+and floor compatibility need the same independent approval. Initial shell/hash/
+Rust/Cargo trust is external to the tool; authenticate rustup only if actually used; compiled native socket/lifecycle probes
+cannot bootstrap their own authority.
 
 ## Candidate boundaries
 
-The Linux seccomp baseline is the exact Moby `seccomp/v0.2.1` source revision
-`e295db0a4d7b67853387fef0b2ef0a29e796b1c1`, file
+The Linux seccomp baseline is retained from `moby/profiles`: annotated tag
+`seccomp/v0.2.1` has tag-object identity
+`e295db0a4d7b67853387fef0b2ef0a29e796b1c1` and peels to commit
+`5ad5f40ecde90d78e4a7c861c003fe92747d5518`, file
 `seccomp/default.json`, SHA-256
 `536529b665dd0972c37bfb569f5d4ac8a53592e7b00752bc39ff063ca9864c74`.
-Its Apache license is retained in `SECCOMP-LICENSE`. The baseline's default deny,
-architecture mapping and other syscall conditions are preserved. Every socket,
-socketpair and socketcall allowance is removed; only socket/socketpair with
-argument zero equal to AF_UNIX is added. This avoids inventing a syscall allowlist.
-The file hash is checked before generating the effective profile.
+Its Apache license is retained in `SECCOMP-LICENSE`. The future Rust profile MUST preserve the baseline's default deny,
+architecture mapping and other reviewed syscall conditions. It MUST remove every socket/socketpair/socketcall
+allowance and add only socket/socketpair with argument zero equal to AF_UNIX. This avoids inventing a syscall allowlist.
+The original file hash MUST be checked before generating the effective profile.
+Both original and effective profile hashes MUST be checked before EVERY host command.
+The AF_UNIX layer is required because this contract denies INET sockets including
+loopback; `--network none` alone permits loopback. Preserve reviewed syscalls
+rather than introducing an unchecked custom allowlist.
 
-The candidate container command combines `--network none` with that seccomp
-profile; network namespace isolation alone permits loopback sockets. It also
-drops all capabilities, sets no-new-privileges, uses private IPC/PID namespaces,
-a read-only root, an unprivileged fixed UID, bounded memory/CPU/processes, and
-separate controlled read-only tool/source mounts plus a private writable root.
-No host daemon socket is mounted. Preparation must establish writable ownership
-for UID 65532. Container/profile command construction is tested locally; Linux
-execution remains unmeasured because no local Docker proof exists.
+The pending Rust container adapter MUST combine `--network none` with that
+seccomp profile, drop all capabilities, set no-new-privileges, use private IPC
+and Docker's default private PID namespace (no invalid `--pid=private`), a
+read-only root and UID 65532 with prepared writable ownership. Memory, CPU and
+process limits MUST fit the actual host; Cargo A jobs 4/B jobs 2 does not
+authorize four container CPUs on a two-vCPU host. No host daemon socket is mounted.
 
-Linux positive controls execute in the same selected OCI image/interpreter with
-the checked default seccomp baseline and its ordinary private network namespace;
-confined controls use the AF_UNIX-only profile and network-none namespace.
-Both map the private host workspace to `/work`. Mount scanning rejects sockets
-and symlink members escaping the approved roots; preparation must keep those
-prepared trees immutable while the command executes. No local scan claims to
-prevent an adversarial concurrent mount mutation.
+Both profiles and an empty Docker client configuration MUST live in a host-owned
+root disjoint from every container-writable workspace. Scan BEFORE creating
+these inputs and rehash BOTH profiles before EVERY host command. Select the
+authenticated fixed Docker client, explicit empty config and Unix daemon; reject
+TTY, plugins, alternate contexts and inherited Docker overrides. Read-only
+anchors MUST remain outside the writable root. Test escaping/dangling aliases
+in the CONTAINER namespace, not only their host interpretation.
 
-The macOS candidate reuses Task 7's locally exercised file isolation and adds
-AF_UNIX/private-path rules. INET, arbitrary Mach lookup and AppleEvent delegation
-remain denied by default. The same generated profile must wrap probes and the
-complete Cargo/compiler/proc-macro/build-script/native-tool invocation. This file
-does not replace Task 7's independent JS boundary or qualify hosted recipes.
+A local Docker CLIENT exists, but the daemon is unusable; no actual Linux
+execution proof follows. Rust MUST execute positive, denied and full-recipe
+controls with the same selected native probe and OCI image, not merely compare
+command arguments. Controls map approved workspace inputs to `/work`, with
+shared tools/source read-only. Scan sockets and aliases before use; this does
+not claim protection against an adversarial mutable host mount.
 
-The candidate macOS profile can mark actual tracked source files and Git-object
-directories inside the private root immutable, while leaving node_modules and
-output writes available. It also denies unlink/rename of their ancestors so a
-writable ancestor cannot move a protected file outside its literal deny rule.
-This separation is locally exercised with actual ancestor rename/removal,
-hard-link, source-write and private-output controls; the full recipe must pass
-its reviewed tracked-object set.
+The pending macOS Rust adapter MUST enforce private-path/AF_UNIX rules, denying
+INET, arbitrary Mach lookup and AppleEvent delegation. The same generated
+profile wraps positive/denied probes and the full Cargo/compiler/proc-macro/
+build-script/native-tool invocation; Task 7's lifecycle/JS boundary needs the
+same actual qualification.
+
+Tracked source and Git-object stores MUST be immutable while private installation/
+output writes remain available. Deny ancestor unlink/rename. Every immutable
+regular file MUST have `nlink == 1` before execution; reject pre-existing
+hard-link aliases and execute write-through/restoration negatives. Limit signals
+to `same-sandbox`: own-child success and outside same-user sibling/orchestrator
+denial are required. Deleted local prototypes do not establish these Rust proofs.
 
 Both boundaries require actual positive then confined TCP and UDP bind/connect/
 send probes for IPv4/IPv6, loopback/documentation-address destinations, across
 parent/child/grandchild, plus private Unix exchange. External routing failures and
 unsupported unconfined IPv6 are recorded as unavailable, never successful
-controls. Positive IPv4 loopback operations must succeed, every confined INET
-operation must return EPERM/EACCES, and private Unix exchange must succeed. A
+controls. Positive IPv4 loopback operations MUST succeed, every confined INET
+operation MUST return EPERM/EACCES, and private Unix exchange MUST succeed. A
 socket helper is only boundary evidence; full recipe success is a separate gate.
 
 ## Reviewable hosted resource proposal
@@ -163,51 +185,72 @@ GitHub-hosted jobs: `ubuntu-24.04`, `macos-15`, `macos-15-intel`; 120 minutes ea
 no matrix fail-fast, no concurrent cancellation, contents-read only, no OIDC,
 attestation/provider/release permissions, credentials, cache restore or publish
 steps. Logs are retained for seven days. Action versions and full revisions were
-read from primary GitHub tag refs for checkout 4.2.2, setup-python 5.6.0 and
-upload-artifact 4.6.2; they are source-reviewed code selections, not independently
+verified from primary action metadata for checkout 5.0.0 and upload-artifact
+6.0.0 (Node 24); full fetch history avoids the pending shallow-source rejection.
+Pins require manual review/maintenance: Dependabot does not scan this inert
+path outside `.github/workflows`. Logs use `tee` with `pipefail` so failure
+output is visible and retained. Native Rust bootstrap steps remain pending; they are source-reviewed code selections, not independently
 authenticated tool archives. Runner labels were checked against primary GitHub
-runner documentation on 2026-10-14; availability must be rechecked at dispatch.
+runner documentation on 2026-10-14; availability MUST be rechecked at dispatch.
 
 This proposal intentionally stops at `check-ready`. It cannot falsely report a
 complete qualification with version-only probes. The reviewed executable staging
-steps may replace that stop only when all prerequisites below are complete:
+steps may replace that stop only when all prerequisites below are complete. Production selection MUST
+require all qualified inputs by default; named audit diagnostics cannot
+construct approval state or turn pending/null pins into success:
 
 1. Task 9 implements the shared full production recipes, native inspection and
    exact-final-Wasm core-ABI/publisher-response validation. The staging selector
-   must invoke those same source-owned functions with independently authenticated
+   MUST invoke those same source-owned functions with independently authenticated
    candidate selections. It cannot require its own future production-qualified
    result, accept downloaded commands or introduce a public local-fixture bypass.
-2. Review the bootstrap chain and actually acquire Python 3.12.6, Git/shell,
-   rustup/Rust 1.95.0 components/sysroot, compiler/linker/archiver, Node 24.12.0,
+2. Review independently approved-source native Rust bootstrap and actually acquire
+   Git/shell, signed Rust 1.95.0 components/sysroot, compiler/linker/archiver,
+   Node 24.12.0,
    npm 11.6.2 and the selected runtime tools through source-owned authenticators.
    Node uses signed checksums and independently reviewed keys; Rust uses signed
    manifests/components; gh uses its verified archive and independent bootstrap.
    A colocated checksum alone does not authenticate Fastly or an SDK. Retain raw
    signature/checksum evidence, reviewed trust roots, archive and extracted-tree
    digests and actual selected file identities. SDK/platform trust needs an
-   explicit vendor/platform evidence chain. Ambient PATH or PYTHONPATH cannot
-   select the interpreter before isolation. setup-python alone supplies no
-   qualifying bootstrap proof.
+   explicit vendor/platform evidence chain. Ambient PATH cannot select unreviewed native tools before isolation. A
+   source-built tool and colocated checksum supply no qualifying bootstrap proof.
+   Authenticate original Fastly vendor archive bytes through independently reviewed
+   vendor-source evidence; no missing-root fallback is permitted.
 3. Acquire the candidate GNU image by authenticated content identity, record both
    OCI index and selected AMD64 manifest digests, and measure glibc <=2.34 inside
    that builder. Select the three runtime-only images by their actual digests.
    Record native archive/link/sysroot identities: aws-lc-sys 0.42 target-suffix
    overrides and generic/target system-use=0, AWS-LC 5.1 source, ring 0.17.14
    pregenerated source membership, and SQLite 0.30.1 bundled 3.46/pkg-config=0.
-4. Network-enabled authenticated acquisition/lifecycle preparation happens before
-   compilation. Close source/object-store writes and run positive/negative probes,
+4. Network-enabled authenticated archive/tool acquisition precedes fresh offline
+   installation and compilation. Execute actual lifecycle hooks under the selected
+   native denial boundary; recording an install flag alone is insufficient.
+   Close source/object-store writes and run positive/negative probes,
    full working compilation, actual Cargo/npm download-attempt negatives and
    actual missing-tool negatives through the same selected boundary. Retain
    outcomes and attempted fetch evidence even when a script catches denial.
+   Audit inherited hosted/setup exports before clearing them; only explicitly
+   reviewed qualified values/path identities may survive. Bound subprocess
+   pipes/deadlines, clear token/provider/injection environment, terminate/reap
+   descendant groups on timeout/cancellation/failure and
+   clean up private profiles/resources and Docker containers with bounded removal.
 5. Outside the compile-denial boundary, run the exact CLI bytes outside checkout
    on clean UBI 9/Ubuntu 22.04/Debian 12 and actual native macOS 15 ARM/Intel.
    Verify GNU symbol ceiling/libraries and Mach-O LC_BUILD_VERSION 13.0. Validate
    the exact final Fastly Wasm with pinned Wasmtime and complete publisher-origin
    response/injection through pinned Viceroy, retaining pre/post byte hashes.
    No health-only success, cross-Intel inference or changed cohort is accepted.
-6. Collect the closed observations with actual repository/owner/run/attempt/job
+6. Join every observation to the reviewed approved-source catalog, selection
+   digest, exact tool versions/authentication methods and full helper closure
+   before accepting it. Record actual errno; do not invent `ETIMEDOUT`. Hash the
+   selected shell rather than assuming `/bin/sh --version` works. Use
+   host-independent tool/environment fixtures. Collect the closed observations
+   with actual repository/owner/run/attempt/job
    identities and raw retained evidence. Independently authenticate and review
-   those identities, acquisitions, source closure and selections. Only then
+   those identities, acquisitions, source closure and selections. A valid receipt
+   proves only its signed contents; independent catalog/source/root approval is
+   still required and cannot be supplied by that receipt or its checksum. Only then
    update the source-owned measured pins and implement their production selector.
 
 New workflow files on a feature branch may be unavailable to manual dispatch
@@ -222,5 +265,5 @@ resource spending and dispatch remain separate permission gates.
 
 Missing native Intel or the GNU baseline stops this cohort. Only after actual
 hosted qualification may the final Task 8 commit use the title `Qualify controlled
-release build environments`. The local framework commit must use an accurate
+release build environments`. The local framework commit MUST use an accurate
 title such as `Add release environment qualification checks`.

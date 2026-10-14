@@ -201,3 +201,54 @@ fn non_unicode_release_inputs_fail_closed() {
         "should reject non-Unicode source"
     );
 }
+
+#[test]
+fn actual_build_source_resolution_never_calls_git_in_release_mode() {
+    let source =
+        git_version::resolve_build_source(Some(OsStr::new("1")), Some(OsStr::new(COMMIT)), || {
+            panic!("should not call Git in release mode")
+        })
+        .expect("should resolve valid release source");
+    assert_eq!(
+        source.as_deref(),
+        Some(COMMIT),
+        "should retain the complete release commit"
+    );
+    let result =
+        git_version::resolve_build_source(Some(OsStr::new("1")), Some(OsStr::new("main")), || {
+            panic!("should not fall back after invalid release source")
+        });
+    assert!(
+        result.is_err(),
+        "should reject malformed release source without Git fallback"
+    );
+}
+
+#[test]
+fn actual_build_source_resolution_preserves_development_override_and_fallback() {
+    for identity in ["main", " v1.2.3 ", COMMIT] {
+        let source = git_version::resolve_build_source(None, Some(OsStr::new(identity)), || {
+            panic!("should not call Git with a usable development override")
+        })
+        .expect("should resolve development override");
+        assert_eq!(
+            source.as_deref(),
+            Some(identity.trim()),
+            "should preserve development override"
+        );
+    }
+    for identity in [None, Some(OsStr::new("")), Some(OsStr::new("bad identity"))] {
+        let mut called = false;
+        let source = git_version::resolve_build_source(None, identity, || {
+            called = true;
+            Some("local-branch".to_owned())
+        })
+        .expect("should resolve development fallback");
+        assert!(called, "should call actual fallback for unusable override");
+        assert_eq!(
+            source.as_deref(),
+            Some("local-branch"),
+            "should use fallback result"
+        );
+    }
+}

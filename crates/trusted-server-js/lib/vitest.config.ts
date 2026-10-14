@@ -4,6 +4,13 @@ import { defineConfig } from 'vitest/config';
 
 import { releaseBuild } from './release-composition.mjs';
 
+if (
+  Object.hasOwn(process.env, 'TRUSTED_SERVER__RELEASE_JS_TESTS') &&
+  process.env.TRUSTED_SERVER__RELEASE_JS_TESTS !== '1'
+) {
+  throw new Error('TRUSTED_SERVER__RELEASE_JS_TESTS must be exactly 1 when present');
+}
+
 export default defineConfig({
   ...(releaseBuild()
     ? {

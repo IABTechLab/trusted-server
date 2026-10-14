@@ -7,11 +7,13 @@
 use crate::constants::TS_GIT_VERSION;
 
 /// The owning product's compile-time feature variant.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, derive_more::Display)]
 pub enum BuildVariant {
     /// The product's default feature set.
+    #[display("default")]
     Default,
     /// Fastly's opt-in reusable sandbox feature.
+    #[display("reusable-sandbox")]
     ReusableSandbox,
 }
 
@@ -76,5 +78,24 @@ impl BuildInfo {
     #[must_use]
     pub const fn variant(&self) -> BuildVariant {
         self.variant
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn variants_display_canonical_product_labels() {
+        assert_eq!(
+            BuildVariant::Default.to_string(),
+            "default",
+            "should label the default product variant"
+        );
+        assert_eq!(
+            BuildVariant::ReusableSandbox.to_string(),
+            "reusable-sandbox",
+            "should label the reusable sandbox product variant"
+        );
     }
 }

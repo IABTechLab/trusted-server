@@ -1,4 +1,4 @@
-name: "Run Tests"
+name: 'Run Tests'
 
 permissions:
   contents: read
@@ -18,19 +18,19 @@ jobs:
 
       - name: Retrieve Rust version
         id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Retrieve Viceroy version
         id: viceroy-version
         # `.tool-versions` is the single source of truth so this workflow and
         # `.github/actions/setup-integration-test-env/action.yml` can't drift.
-        run: echo "viceroy-version=$(grep '^viceroy ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "viceroy-version=$(grep '^viceroy ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Retrieve Node.js version
         id: node-version
-        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Set up Rust toolchain
@@ -79,7 +79,7 @@ jobs:
 
       - name: Retrieve Rust version
         id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Set up Rust toolchain
@@ -133,7 +133,7 @@ jobs:
 
       - name: Retrieve Rust version
         id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Set up Rust toolchain (native + wasm32-unknown-unknown)
@@ -160,7 +160,7 @@ jobs:
 
       - name: Retrieve Rust version
         id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Set up Rust toolchain (native + wasm32-wasip1)
@@ -185,7 +185,7 @@ jobs:
           TRUSTED_SERVER__PUBLISHER__ORIGIN_URL: http://127.0.0.1:8080
           TRUSTED_SERVER__PUBLISHER__PROXY_SECRET: integration-test-proxy-secret
           TRUSTED_SERVER__EC__PASSPHRASE: integration-test-ec-secret-padded-32
-          TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK: "false"
+          TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK: 'false'
         run: cargo build --package trusted-server-adapter-spin --target wasm32-wasip1 --features spin --release
 
       - name: Run Spin adapter tests (native host)
@@ -199,7 +199,7 @@ jobs:
 
       - name: Retrieve Rust version
         id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Set up Rust toolchain
@@ -230,14 +230,14 @@ jobs:
 
       - name: Retrieve Rust version
         id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Set up Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
-          components: "clippy, rustfmt"
+          components: 'clippy, rustfmt'
           cache-shared-key: cargo-cli-${{ runner.os }}
 
       - name: Read pinned Node.js version for CLI fixtures
@@ -292,6 +292,75 @@ jobs:
           cargo test --manifest-path crates/trusted-server-cli/Cargo.toml --target "$TARGET" \
             --test proxy_trust_linux -- --ignored
 
+  # Ordinary source-built behavior checks; this matrix is not release qualification.
+  test-release-native:
+    name: cargo test (release tooling and JS prebuilt, native)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0 (Node 24)
+        with:
+          persist-credentials: false
+
+      - name: Read pinned tool versions
+        id: tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "rust=$(awk '$1 == "rust" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+          echo "node=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+
+      - name: Use pinned Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0 (Node 24)
+        with:
+          node-version: ${{ steps.tools.outputs.node }}
+          cache: npm
+          cache-dependency-path: crates/trusted-server-js/lib/package-lock.json
+
+      - name: Install JS dependencies
+        working-directory: crates/trusted-server-js/lib
+        run: npm ci
+
+      # The runner's installed rustup bootstraps ordinary CI, not the release producer.
+      - name: Install pinned native Rust toolchain
+        env:
+          RUST_VERSION: ${{ steps.tools.outputs.rust }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy
+          rustup override set "$RUST_VERSION"
+          HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+          test -n "$HOST_TARGET"
+          echo "HOST_TARGET=$HOST_TARGET" >> "$GITHUB_ENV"
+
+      - name: Guard and run all native release-tool tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          TEST_LIST="$(mktemp)"
+          trap 'rm -f "$TEST_LIST"' EXIT
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --all-features -- --list > "$TEST_LIST"
+          awk '/: test$/ { count++ } END { if (count == 0) { print "No native release-tool tests selected"; exit 1 } print "Selected " count " native release-tool tests" }' "$TEST_LIST"
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --all-features
+          cargo clippy -p trusted-server-release --target "$HOST_TARGET" --all-targets --all-features -- -D warnings
+          cargo doc -p trusted-server-release --target "$HOST_TARGET" --no-deps --all-features
+
+      - name: Guard and run native JS prebuilt tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          TEST_LIST="$(mktemp)"
+          trap 'rm -f "$TEST_LIST"' EXIT
+          cargo test -p trusted-server-js --target "$HOST_TARGET" --test release_prebuilt -- --list > "$TEST_LIST"
+          awk '/: test$/ { count++ } END { if (count == 0) { print "No native JS prebuilt tests selected"; exit 1 } print "Selected " count " native JS prebuilt tests" }' "$TEST_LIST"
+          cargo test -p trusted-server-js --target "$HOST_TARGET" --test release_prebuilt
+          cargo clippy -p trusted-server-js --target "$HOST_TARGET" --all-targets --all-features -- -D warnings
+
   test-typescript:
     name: vitest
     runs-on: ubuntu-latest
@@ -299,19 +368,21 @@ jobs:
       run:
         working-directory: crates/trusted-server-js/lib
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0 (Node 24)
+        with:
+          persist-credentials: false
 
       - name: Retrieve Node.js version
         id: node-version
         working-directory: .
-        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Use Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0 (Node 24)
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
-          cache: "npm"
+          cache: 'npm'
           cache-dependency-path: crates/trusted-server-js/lib/package.json
 
       - name: Install dependencies
@@ -321,4 +392,6 @@ jobs:
         run: npm run build
 
       - name: Run unit tests
+        env:
+          TRUSTED_SERVER__RELEASE_JS_TESTS: '1'
         run: npm test -- --run

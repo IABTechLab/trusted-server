@@ -6,15 +6,17 @@
 
 **Architecture:** Consume final canonical Build A executables and their qualified evidence; packaging never recompiles or alters those bytes. A separately signed package inventory binds outer package digests to exact executable members. One publication job uploads canonical and selected package evidence before publishing a new immutable tag.
 
-**Tech Stack:** Existing #1292 shell helpers/nfpm packaging design, Python strict metadata and bounded archive readers, SPDX canonical executable evidence, pinned GitHub attest/gh contracts from the primary plan.
+**Tech Stack:** Existing #1292 shell helpers/nfpm packaging design, the host-only Rust release tool's strict metadata and bounded package/archive modules, SPDX canonical executable evidence, pinned GitHub attest/gh contracts from the primary plan.
 
 ---
+
+The [Rust migration addendum](../specs/2026-10-14-release-tooling-rust-migration.md) applies to every new packaging producer helper. Extend private `crates/trusted-server-release/src/package.rs` and `distribution.rs` modules; retain thin POSIX/nfpm adapters, no introduced Python or generic packaging framework. Native independently approved-source bootstrap and all exact executable/acquisition checks remain required. Unit tests stay private alongside modules; fixture data uses the crate's `tests/fixtures/` and public process tests use `tests/commands.rs`.
 
 ## Inputs and prerequisites
 
 Read the [primary release plan](2026-10-13-attested-release-implementation.md), [#1235 contract](../specs/2026-10-09-1235-release-attestation-design.md), PR #1292's packaging spec/plan and its final reviewed revision. At planning time #1292 is documentation only; do not assume its workflow/helper paths exist. Fetch or stack the owning changes before editing them. This plan supplements that plan rather than copying its independent publish job.
 
-The approved #1235 index v1 covers three raw CLI binaries plus Fastly, no package-inventory reference and no Linux ARM64. The package integration therefore requires a reviewed additive contract and new schema version. Task P1 must approve it before P2–P7 implementation. Neither package provenance alone nor SHA256SUMS satisfies the executable's SPDX/provenance graph.
+The governing draft #1235 index v1 covers three raw CLI binaries plus Fastly, no package-inventory reference and no Linux ARM64. The package integration therefore requires a reviewed additive contract and new schema version. Task P1 MUST approve it before P2–P7 implementation. Neither package provenance alone nor SHA256SUMS satisfies the executable's SPDX/provenance graph.
 
 **Selected initial integration:** preserve the existing three qualified CLI targets. Produce three Linux x86_64 installer formats and two macOS archives (five packages). This deliberately does not complete #863's Linux ARM64 requirement. Task P8 independently extends canonical qualification/SBOM/policy to ARM64 before publishing its three packages. If maintainers require all eight installer assets in the first packaging release, P8 becomes a prerequisite before that release; no half-qualified ARM asset is slipped into the three-target cohort.
 
@@ -29,7 +31,7 @@ Initial #1235 release can happen first; packaging appears on a later new tag onc
 - [ ] Agree on #1262's GNU/macOS baselines and real Intel startup. Do not treat Ubuntu 22.04/glibc 2.35 or Rosetta alone as satisfying GNU 2.34/Intel qualification. Keep package ecosystem smoke tests as additional evidence.
 - [ ] Resolve version policy explicitly: packaging milestone chooses #1292's tag equals owning CLI Cargo version, with documented maintainer bump/changelog procedure. This is a reviewed narrower packaging prerequisite, not an attempt to embed external tag into binaries. Initial un-packaged #1235 tags need not retroactively adopt it.
 - [ ] Approve index v2's optional `package_inventory` reference and its attestation references with exact name/length/digests. Enable it only in the reviewed `phase1-fastly-cli-packaged` cohort and updated consumer policy. Approve `ts release verify <tag> --package <package-asset> --expected-source-commit <commit>` as the distinct package-selection interface; `--package` and `--asset` are mutually exclusive. Older v1 consumers reject unsupported v2, with an independently trusted verifier upgrade path documented.
-- [ ] Define package inventory records: schema/source/cohort/recipe/policy identity, each package name/format/architecture/size/SHA-256, exact executable member path/mode/size/SHA-256 and canonical raw asset name. Refer to raw asset digests, not release-index digest: index → inventory → package/member must not form a self-hash cycle. Bundle references are in the index, not inside the inventory that the bundles authenticate.
+- [ ] Define package inventory records: schema/source/cohort/recipe/policy identity, each package name/format/architecture/size/SHA-256, exact executable member path/mode/size/SHA-256 and canonical raw asset name. Refer to raw asset digests, not release-index digest: index → inventory → package/member MUST NOT form a self-hash cycle. Bundle references are in the index, not inside the inventory that the bundles authenticate.
 - [ ] Replace #1292's signed/annotated `git tag -s` release instruction with `git tag v<version> <approved-commit>` followed by the explicit tag push. Validate lightweight object type; a tag signature does not replace the approved source/signing policy.
 - [ ] Get the delta approved/merged and update plan baseline. Commit `Align CLI packaging with canonical attestation`.
 
@@ -37,40 +39,40 @@ Initial #1235 release can happen first; packaging appears on a later new tag onc
 
 ### Task P2: Consume canonical executables without transformations
 
-**Modify/create according to #1292 ownership:** `scripts/release/package-linux.sh`, `package-macos.sh`, `packaging/nfpm.yaml`, `scripts/release/tests/test_package_inputs.py`.
+**Modify/create according to #1292 ownership:** `scripts/release/package-linux.sh`, `package-macos.sh`, `packaging/nfpm.yaml`, release tool private `package::tests` and `tests/commands.rs`.
 
 - [ ] Write tests rejecting wrong source/target/role, source recompilation, strip/sign hooks, unverified raw input, altered member and CLI B output substituted for A.
-- [ ] Run `python3 -m unittest discover -s scripts/release/tests -p 'test_package_inputs.py' -v`; expect missing integration behavior.
+- [ ] Derive `HOST_TARGET=$(rustc -vV | sed -n 's/^host: //p')`; run `cargo test -p trusted-server-release --target "$HOST_TARGET" package::tests` with the primary plan's nonzero-selection guard; expect missing integration behavior. These local source-built commands do not qualify native bootstrap.
 - [ ] Accept only Task 12/13 primary-plan validated A output and identity table. All final stripping/signature transformations occur in the canonical recipe before its digest/SBOM, never in packaging. Remove #1292's independent strip step and compiled-cache restoration from the canonical build path.
 - [ ] Add packaging configuration for the qualified x86_64 Linux executable and both Apple executables. Preserve member bytes; set documented installation modes. nfpm/tool acquisition has reviewed version/digest verification, not a floating installer.
 - [ ] Test canonical file unchanged before/after all package formats. Commit `Package the canonical CLI bytes without modification`.
 
 ### Task P3: Inspect whole package structure and bind members
 
-**Create:** `scripts/release/inspect-cli-package.py`, `make-package-inventory.py`, `tests/test_package_inventory.py`, adversarial package fixtures.
+**Extend:** release tool `src/package.rs`, `src/distribution.rs` and private registered tests; add adversarial data under `crates/trusted-server-release/tests/fixtures/packages/` and process cases to `tests/commands.rs`. Proposed fixed commands are `trusted-server-release inspect-cli-package` and `make-package-inventory`, only after P1 approval.
 
 - [ ] Write tests for nested traversal, links/hardlinks, duplicate members, oversized compressed/decompressed content, extra executable members, wrong architecture/mode, substituted maintainer script, unsupported compression and altered ts bytes.
-- [ ] Run package inventory tests; expect absent inspector.
+- [ ] Run `cargo test -p trusted-server-release --target "$HOST_TARGET" package::tests` and `distribution::tests` separately with the nonzero-selection guard; expect absent inspector.
 - [ ] Implement bounded format-specific inspection: Debian ar/control/data archives, RPM payload/header, Arch tar and macOS tar. Use maintained parsers/pinned utilities where possible. Each adapter validates allowed installation paths, executable ts, license/readme and explicitly approved metadata/scripts; reject unknown code-bearing entries. A raw tar scan is insufficient for .deb/.rpm.
 - [ ] Compare extracted executable bytes against canonical retained SHA-256/size, check 0755 installation mode, then hash the final outer package. Generate deterministic inventory only after every selected wrapper passes. Do not compare an archive digest directly to executable digest.
 - [ ] Validate closed package schema and source/target/profile joins with the canonical index data. Reject inventory attempts to approve an unknown raw target. Commit `Bind installer packages to canonical CLI members`.
 
 ### Task P4: Smoke-test installation and provenance-aware extraction
 
-**Modify:** #1292 smoke helpers/workflow jobs; `scripts/release/tests/test_package_smoke.py`.
+**Modify:** #1292 smoke helpers/workflow jobs; release tool private package-smoke tests and public process fixtures.
 
 - [ ] Test that failed install/startup/version or member mismatch blocks the selected package cohort; metadata-only architecture checks do not count as execution qualification.
-- [ ] Run smoke fixture tests; expect incomplete checks.
+- [ ] Run `cargo test -p trusted-server-release --target "$HOST_TARGET" package_smoke` with the nonzero-selection guard after registering these cases; expect incomplete checks.
 - [ ] Install Linux wrappers in reviewed clean Ubuntu/Fedora/Arch environments, run version/help/config-init outside a checkout, and compare installed /usr/bin/ts to canonical digest. Preserve the GNU compatibility qualification independently of package-manager tests.
 - [ ] Extract/run macOS archives on actual qualified ARM/Intel hosts. Rosetta may be extra coverage, never the sole Intel gate. Restore executable permissions without altering bytes; verify loader requirements.
-- [ ] Record exact container/tool/OS identities and outcomes. Smoke images must be pinned and qualified, not `latest`. Commit `Qualify installed CLI package behavior and identity`.
+- [ ] Record exact container/tool/OS identities and outcomes. Smoke images MUST be pinned and qualified, not `latest`. Commit `Qualify installed CLI package behavior and identity`.
 
 ### Task P5: Sign package evidence inside the existing trusted boundary
 
-**Modify:** `.github/workflows/release-build.yml`, `scripts/release/validate-distribution.py`, workflow contract tests.
+**Modify:** `.github/workflows/release-build.yml`, release tool `src/distribution.rs`, workflow contract tests.
 
 - [ ] Test package metadata cannot replace executable SPDX/provenance, wrong signer/action/run, modified outer bytes, inventory-member mismatch and unapproved package subject.
-- [ ] Run workflow/graph fixtures; expect package evidence unsupported.
+- [ ] Run `cargo test -p trusted-server-release --target "$HOST_TARGET" distribution::tests` and `workflow_contract` separately with the nonzero-selection guard; expect package evidence unsupported.
 - [ ] Reuse exact same-revision signer and pinned attest 4.2.2; do not keep #1292's direct v2 provenance action in publish. Package provenance names each final package plus authenticated package inventory as exact subjects. Raw executable proofs still name only their approved executable/companions.
 - [ ] Add a signed package-inventory proof and index v2 references for inventory/bundles. Root index is assembled after package proofs exist and covers them; no signature/checksum cycle. For the CLI's component composition, consumers use the executable's SPDX proof. Do not advertise an enclosing installer SBOM unless a separate container-level scope is actually generated.
 - [ ] Verify actual pinned certificates/provenance and all wrapper/member edges before publication. Commit `Attest CLI installer and member evidence`.
@@ -90,7 +92,7 @@ Initial #1235 release can happen first; packaging appears on a later new tag onc
 **Modify:** `.github/workflows/release.yml`, package release helpers, `CONTRIBUTING.md`, `CHANGELOG.md` and tests.
 
 - [ ] Test incomplete wrappers, mixed source versions, package-only draft, missing raw/SBOM assets, an existing immutable v1 tag and uncertain publish response.
-- [ ] Run publication fixtures; expect package cohort unsupported.
+- [ ] Run `cargo test -p trusted-server-release --target "$HOST_TARGET" publication::tests` with the nonzero-selection guard; expect package cohort unsupported.
 - [ ] Publish exact canonical plus selected wrapper assets/evidence/checksums through the single owner. No independent #1292 publish job races or finalizes the tag first. Require all selected wrapper gates, complete downloads/joins and post-publication immutable checks.
 - [ ] Rehearse the whole v2 release and trusted package install in an authorized disposable repo, then run all AGENTS gates and producer/consumer tests. Only a separately authorized new production tag follows.
 - [ ] Commit `Publish canonical and packaged CLI evidence together`.

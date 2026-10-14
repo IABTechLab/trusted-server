@@ -4,3 +4,4 @@ src/integrations/prebid/.external-generated-*
 
 # Serializes `npm ci` across concurrent cargo build scripts
 .tsjs-npm-ci.lock
+.release-test-*/

@@ -20,13 +20,12 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(trusted_server_release_build)");
     let control = std::env::var_os("TRUSTED_SERVER__RELEASE_BUILD");
     let source = std::env::var_os("TRUSTED_SERVER__GIT_VERSION");
-    if let Some(source) = git_version::release_source(control.as_deref(), source.as_deref())
+    if git_version::release_source(control.as_deref(), source.as_deref())
         .expect("should provide valid release build inputs")
+        .is_some()
     {
         println!("cargo:rustc-cfg=trusted_server_release_build");
-        println!("cargo:rustc-env=TRUSTED_SERVER__GIT_VERSION={source}");
     }
     let target = std::env::var("TARGET").expect("should set the owning Cargo target");
-    println!("cargo:rustc-env=TRUSTED_SERVER_BUILD_TARGET={target}");
-    println!("cargo:rustc-env=TRUSTED_SERVER_BUILD_VARIANT=default");
+    println!("cargo:rustc-env=TRUSTED_SERVER__BUILD_TARGET={target}");
 }

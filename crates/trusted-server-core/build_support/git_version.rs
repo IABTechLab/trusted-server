@@ -33,6 +33,32 @@ pub fn release_source(
     Ok(Some(source.to_owned()))
 }
 
+/// Resolve the actual build source, calling local Git only in development.
+///
+/// # Errors
+///
+/// Returns release input errors before invoking the fallback.
+pub fn resolve_build_source(
+    control: Option<&OsStr>,
+    source: Option<&OsStr>,
+    local_git: impl FnOnce() -> Option<String>,
+) -> Result<Option<String>, &'static str> {
+    if let Some(commit) = release_source(control, source)? {
+        return Ok(Some(commit));
+    }
+    let override_value = source.and_then(OsStr::to_str);
+    if override_value.is_some_and(is_usable) {
+        Ok(resolve_git_version(&Candidates {
+            override_value,
+            exact_tag: None,
+            branch: None,
+            commit: None,
+        }))
+    } else {
+        Ok(local_git())
+    }
+}
+
 /// Raw candidates for the deployed git version, in priority order.
 pub struct Candidates<'a> {
     /// `TRUSTED_SERVER__GIT_VERSION`, supplied by the deploy pipeline.

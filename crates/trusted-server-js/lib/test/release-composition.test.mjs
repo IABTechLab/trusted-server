@@ -2,6 +2,7 @@
 import crypto from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { build } from 'vite';
@@ -22,6 +23,7 @@ function fixture() {
   return root;
 }
 afterEach(() => {
+  vi.unstubAllEnvs();
   for (const root of temporary.splice(0)) {
     if (fs.lstatSync(root, { throwIfNoEntry: false })?.isSymbolicLink()) fs.unlinkSync(root);
     else fs.rmSync(root, { recursive: true, force: true });
@@ -39,6 +41,55 @@ function recorder(onContributions, overrides = {}) {
 }
 
 describe('release Rollup composition', () => {
+  it('reuses checked installed ownership for recorded module builds', async () => {
+    const { installedOrigins } = await import('../release-composition.mjs');
+    const owners = installedOrigins({ repoRoot, lockFile });
+    const root = fixture();
+    const entry = path.join(root, 'index.ts');
+    fs.writeFileSync(entry, 'globalThis.exampleResult = 7;');
+    let rows;
+    const recorded = await bundle(
+      root,
+      entry,
+      recorder(
+        (value) => {
+          rows = value;
+        },
+        {
+          owners,
+          lockFile: path.join(root, 'unused-lock.json'),
+        }
+      )
+    );
+    expect(recorded).toEqual(await bundle(root, entry));
+    expect(rows).toHaveLength(1);
+  });
+  it('omits a rendered zero-length namespace module without changing bundle bytes', async () => {
+    const root = fixture();
+    const empty = path.join(root, 'empty.ts');
+    const entry = path.join(root, 'index.ts');
+    fs.writeFileSync(empty, 'export {};');
+    fs.writeFileSync(entry, "import * as empty from './empty'; globalThis.exampleResult = empty;");
+    let rows;
+    let renderedLength;
+    const observe = {
+      name: 'example-rendered-module-observer',
+      generateBundle(_options, output) {
+        renderedLength = Object.values(output)[0].modules[empty].renderedLength;
+      },
+    };
+    const recorded = await bundle(
+      root,
+      entry,
+      recorder((value) => {
+        rows = value;
+      }),
+      [observe]
+    );
+    expect(renderedLength).toBe(0);
+    expect(rows.some((row) => row.path?.endsWith('/empty.ts'))).toBe(false);
+    expect(recorded).toEqual(await bundle(root, entry));
+  });
   it('records retained source and transitive npm helpers without changing final bytes', async () => {
     const root = fixture();
     const entry = path.join(root, 'index.ts');
@@ -188,6 +239,73 @@ describe('release Rollup composition', () => {
 });
 
 describe('release collector boundaries', () => {
+  it('accepts only absent or exact 1 for the optional full collector test control', async () => {
+    for (const value of ['', '0', 'true']) {
+      vi.stubEnv('TRUSTED_SERVER__RELEASE_JS_TESTS', value);
+      vi.resetModules();
+      await expect(import('../vitest.config.ts')).rejects.toThrow(/RELEASE_JS_TESTS.*exactly 1/);
+    }
+    for (const value of [undefined, '1']) {
+      vi.stubEnv('TRUSTED_SERVER__RELEASE_JS_TESTS', value);
+      vi.resetModules();
+      await expect(import('../vitest.config.ts')).resolves.toHaveProperty('default.test');
+    }
+  });
+  it('runs symlinked build and collector CLIs while imported entry points stay inert', async () => {
+    const root = fixture();
+    const direct = path.join(root, 'direct');
+    const linked = path.join(root, 'linked');
+    const buildScript = path.join(libDir, 'build-all.mjs');
+    const buildLink = path.join(root, 'build-link.mjs');
+    fs.symlinkSync(buildScript, buildLink);
+    const env = { ...process.env, TSJS_SKIP_BUILD: '1' };
+    delete env.TRUSTED_SERVER__RELEASE_BUILD;
+    const run = (script, output) =>
+      spawnSync(process.execPath, [script, '--out-dir', output], { env, encoding: 'utf8' });
+    expect(run(buildScript, direct).status).toBe(0);
+    expect(run(buildLink, linked).status).toBe(0);
+    const files = fs.readdirSync(direct).sort();
+    expect(files).toContain('tsjs-core.js');
+    expect(files.length).toBeGreaterThan(1);
+    expect(fs.readdirSync(linked).sort()).toEqual(files);
+    for (const file of files)
+      expect(fs.readFileSync(path.join(linked, file))).toEqual(
+        fs.readFileSync(path.join(direct, file))
+      );
+    const collector = path.join(repoRoot, 'scripts/release/collect-js.mjs');
+    const collectorLink = path.join(root, 'collector-link.mjs');
+    fs.symlinkSync(collector, collectorLink);
+    const invalid = spawnSync(process.execPath, [collectorLink], { env, encoding: 'utf8' });
+    expect(invalid.status).not.toBe(0);
+    expect(invalid.stderr).toMatch(/Usage: collect-js/);
+    const imported = spawnSync(
+      process.execPath,
+      [
+        '--input-type=module',
+        '-e',
+        `import ${JSON.stringify(pathToFileURL(buildScript).href)}; import ${JSON.stringify(pathToFileURL(collector).href)};`,
+      ],
+      { env, encoding: 'utf8' }
+    );
+    expect(imported.status).toBe(0);
+    expect(imported.stdout).toBe('');
+  }, 30_000);
+  it('reaches bootstrap refusal from absolute, relative and own-directory shell invocation', () => {
+    const directory = path.join(repoRoot, 'scripts/release');
+    for (const file of ['build.sh', 'build-js.sh']) {
+      for (const [cwd, script] of [
+        [repoRoot, path.join(directory, file)],
+        [repoRoot, `scripts/release/${file}`],
+        [directory, file],
+      ]) {
+        const result = spawnSync('/bin/sh', [script], { cwd, encoding: 'utf8' });
+        expect(result.status).toBe(1);
+        expect(result.stderr.trim()).toBe(
+          'Release bootstrap is pending the reviewed Rust tooling replacement'
+        );
+      }
+    }
+  });
   it.each([
     '{"a":1,"a":2}',
     '{"a":{"b":1,"b":2}}',
@@ -206,8 +324,16 @@ describe('release collector boundaries', () => {
     const { releaseBuild } = await import('../release-composition.mjs');
     for (const control of ['', '0', 'true'])
       expect(() => releaseBuild({ TRUSTED_SERVER__RELEASE_BUILD: control })).toThrow();
-    for (const skip of ['', '0', '1'])
-      expect(() => releaseBuild({ TSJS_SKIP_BUILD: skip })).toThrow();
+    for (const skip of ['', '0', '1']) {
+      expect(releaseBuild({ TSJS_SKIP_BUILD: skip })).toBe(false);
+      expect(() =>
+        releaseBuild({
+          TSJS_SKIP_BUILD: skip,
+          TRUSTED_SERVER__RELEASE_BUILD: '1',
+          TRUSTED_SERVER__GIT_VERSION: 'a'.repeat(40),
+        })
+      ).toThrow(/skip/i);
+    }
     expect(() => releaseBuild({ TRUSTED_SERVER__RELEASE_BUILD: '1' })).toThrow();
     expect(
       releaseBuild({
@@ -220,10 +346,9 @@ describe('release collector boundaries', () => {
     const root = fixture();
     const entry = path.join(root, 'index.ts');
     fs.writeFileSync(entry, 'globalThis.exampleResult = import.meta.env.VITE_EXAMPLE;');
-    const oldRelease = process.env.TRUSTED_SERVER__RELEASE_BUILD;
-    const oldSource = process.env.TRUSTED_SERVER__GIT_VERSION;
-    process.env.TRUSTED_SERVER__RELEASE_BUILD = '1';
-    process.env.TRUSTED_SERVER__GIT_VERSION = 'a'.repeat(40);
+    vi.stubEnv('TRUSTED_SERVER__RELEASE_BUILD', '1');
+    vi.stubEnv('TRUSTED_SERVER__GIT_VERSION', 'a'.repeat(40));
+    vi.stubEnv('TSJS_SKIP_BUILD', undefined);
     try {
       const options = moduleBuildOptions({
         name: 'fixture',
@@ -239,6 +364,7 @@ describe('release collector boundaries', () => {
         fs.writeFileSync(path.join(root, file), 'VITE_EXAMPLE=fictional-environment-value');
       await build(options);
       expect(fs.readFileSync(path.join(root, 'out/tsjs-fixture.js'))).toEqual(expected);
+      vi.resetModules();
       const config = (await import('../vitest.config.ts')).default;
       expect(config.envDir).toBe(false);
       expect(config.mode).toBe('production');
@@ -248,7 +374,7 @@ describe('release collector boundaries', () => {
       );
       expect(nativeImports.resolveId('node:fs')).toEqual({ id: 'node:fs', external: true });
       expect(nativeImports.resolveId('dlv')).toBeUndefined();
-      delete process.env.TRUSTED_SERVER__RELEASE_BUILD;
+      vi.stubEnv('TRUSTED_SERVER__RELEASE_BUILD', undefined);
       vi.resetModules();
       const ordinary = (await import('../vitest.config.ts')).default;
       expect(ordinary.server).toBeUndefined();
@@ -256,18 +382,14 @@ describe('release collector boundaries', () => {
       expect(ordinary.envDir).toBeUndefined();
       expect(ordinary.mode).toBeUndefined();
     } finally {
-      if (oldRelease === undefined) delete process.env.TRUSTED_SERVER__RELEASE_BUILD;
-      else process.env.TRUSTED_SERVER__RELEASE_BUILD = oldRelease;
-      if (oldSource === undefined) delete process.env.TRUSTED_SERVER__GIT_VERSION;
-      else process.env.TRUSTED_SERVER__GIT_VERSION = oldSource;
+      vi.unstubAllEnvs();
     }
   });
   it('rejects source symlink escape and unknown transform queries', async () => {
     const { installedOrigins } = await import('../release-composition.mjs');
     const root = fixture();
-    const external = fs.mkdtempSync(
-      path.join(process.env.TMPDIR ?? '/private/tmp', 'tsjs-outside-')
-    );
+    vi.stubEnv('TMPDIR', undefined);
+    const external = fs.mkdtempSync(path.join(os.tmpdir(), 'tsjs-outside-'));
     temporary.push(external);
     fs.writeFileSync(path.join(external, 'outside.ts'), 'export const example = 7;');
     const link = path.join(root, 'alias.ts');
@@ -278,7 +400,6 @@ describe('release collector boundaries', () => {
   });
   it('requires checked preparation records rather than inventing lifecycle observations', async () => {
     const collector = await import(path.join(repoRoot, 'scripts/release/collect-js.mjs'));
-    expect(typeof collector.collectJs).toBe('function');
     await expect(
       collector.collectJs({
         repoRoot,
@@ -292,7 +413,6 @@ describe('release collector boundaries', () => {
 describe('prepared evidence and installed trees', () => {
   it('hashes normalized executable modes and excludes separately owned nested packages', async () => {
     const { installedTreeHash } = await import('../release-composition.mjs');
-    expect(typeof installedTreeHash).toBe('function');
     const root = fixture();
     fs.writeFileSync(path.join(root, 'example.js'), 'example bytes');
     const nested = path.join(root, 'node_modules/example-dependency');
@@ -307,7 +427,6 @@ describe('prepared evidence and installed trees', () => {
   });
   it('checks preparation distribution file and lifecycle output hashes', async () => {
     const { validatePreparation } = await import('../release-composition.mjs');
-    expect(typeof validatePreparation).toBe('function');
     const root = fixture();
     const file = path.join(root, 'tool');
     fs.writeFileSync(file, 'fictional distribution bytes');
@@ -381,7 +500,6 @@ describe('prepared evidence and installed trees', () => {
 describe('complete inventory producer', () => {
   it('binds measured bundler native files separately from npm archive integrity', async () => {
     const { actualToolFiles } = await import('../release-composition.mjs');
-    expect(typeof actualToolFiles).toBe('function');
     const tools = actualToolFiles({ installRoot: libDir });
     expect(tools.map((tool) => tool.name)).toEqual(
       expect.arrayContaining([
@@ -495,131 +613,145 @@ describe('complete inventory producer', () => {
     ).toMatchObject({ lock_path: key, package_name: 'example-child', path: 'index.js' });
   });
 
-  it('writes deterministic closed inventory records after final Vite/esbuild output', async () => {
-    const { actualToolFiles, expectedLifecycleEvents, installedOrigins, installedMaterials } =
-      await import('../release-composition.mjs');
-    const { collectJs } = await import(path.join(repoRoot, 'scripts/release/collect-js.mjs'));
-    expect(typeof actualToolFiles).toBe('function');
-    const root = fixture();
-    const packages = installedMaterials(installedOrigins({ repoRoot, lockFile }));
-    const measured = actualToolFiles({ installRoot: libDir });
-    const distributions = measured.map(({ name, version, sha256: hash, path: file }) => ({
-      material: { kind: 'tool-distribution', id: `tool:${name}`, name, version, sha256: hash },
-      path: file,
-    }));
-    const tools = measured.map(({ name, version, role }) => ({
-      name,
-      version,
-      role,
-      material_id: `tool:${name}`,
-    }));
-    const preparationPath = path.join(root, 'preparation.json');
-    fs.writeFileSync(
-      preparationPath,
-      JSON.stringify({
-        schema_version: 1,
-        packages,
-        distributions,
-        tools,
-        // Synthetic observations exercise joins; no preparation actually runs in this fixture.
-        lifecycle_events: expectedLifecycleEvents({ installRoot: libDir, packages }),
-        lifecycle_outputs: [],
-      })
-    );
-    const oldRelease = process.env.TRUSTED_SERVER__RELEASE_BUILD;
-    const oldSource = process.env.TRUSTED_SERVER__GIT_VERSION;
-    process.env.TRUSTED_SERVER__RELEASE_BUILD = '1';
-    // This is the fixture's source identity, not release approval.
-    process.env.TRUSTED_SERVER__GIT_VERSION = execFileSync('git', ['rev-parse', 'HEAD'], {
-      cwd: repoRoot,
-      encoding: 'utf8',
-    }).trim();
-    try {
-      const inventoryPath = path.join(root, 'inventory.json');
-      const outDir = path.join(root, 'bundles');
-      const inventory = await collectJs({ repoRoot, outDir, inventoryPath, preparationPath });
-      expect(Object.keys(inventory).sort()).toEqual([
-        'materials',
-        'modules',
-        'schema_version',
-        'source_commit',
-        'tools',
-      ]);
-      expect(inventory.modules.map((row) => row.id)).toEqual(
-        [...inventory.modules.map((row) => row.id)].sort()
+  it.runIf(process.env.TRUSTED_SERVER__RELEASE_JS_TESTS === '1')(
+    'writes deterministic closed inventory records after final Vite/esbuild output',
+    async () => {
+      const { actualToolFiles, expectedLifecycleEvents, installedOrigins, installedMaterials } =
+        await import('../release-composition.mjs');
+      const { collectJs } = await import(path.join(repoRoot, 'scripts/release/collect-js.mjs'));
+      const root = fixture();
+      const packages = installedMaterials(installedOrigins({ repoRoot, lockFile }));
+      const measured = actualToolFiles({ installRoot: libDir });
+      const distributions = measured.map(({ name, version, sha256: hash, path: file }) => ({
+        material: { kind: 'tool-distribution', id: `tool:${name}`, name, version, sha256: hash },
+        path: file,
+      }));
+      const tools = measured.map(({ name, version, role }) => ({
+        name,
+        version,
+        role,
+        material_id: `tool:${name}`,
+      }));
+      const preparationPath = path.join(root, 'preparation.json');
+      fs.writeFileSync(
+        preparationPath,
+        JSON.stringify({
+          schema_version: 1,
+          packages,
+          distributions,
+          tools,
+          // Synthetic observations exercise joins; no preparation actually runs in this fixture.
+          lifecycle_events: expectedLifecycleEvents({ installRoot: libDir, packages }),
+          lifecycle_outputs: [],
+        })
       );
-      const plainDirectory = path.join(root, 'plain-bundles');
-      await buildAll({ outDir: plainDirectory });
-      for (const module of inventory.modules) {
-        const bytes = fs.readFileSync(path.join(outDir, module.filename));
-        expect(bytes).toEqual(fs.readFileSync(path.join(plainDirectory, module.filename)));
-        expect(module.size).toBe(bytes.length);
-        expect(module.sha256).toBe(sha256(bytes));
-        expect(Object.keys(module).sort()).toEqual([
-          'contributions',
-          'filename',
-          'id',
-          'sha256',
-          'size',
+      // This is the fixture's source identity, not release approval.
+      const sourceCommit = execFileSync('git', ['rev-parse', 'HEAD'], {
+        cwd: repoRoot,
+        encoding: 'utf8',
+      }).trim();
+      vi.stubEnv('TRUSTED_SERVER__RELEASE_BUILD', '1');
+      vi.stubEnv('TRUSTED_SERVER__GIT_VERSION', sourceCommit);
+      vi.stubEnv('TSJS_SKIP_BUILD', undefined);
+      try {
+        const inventoryPath = path.join(root, 'inventory.json');
+        const outDir = path.join(root, 'bundles');
+        const inventory = await collectJs({ repoRoot, outDir, inventoryPath, preparationPath });
+        expect(Object.keys(inventory).sort()).toEqual([
+          'materials',
+          'modules',
+          'schema_version',
+          'source_commit',
+          'tools',
         ]);
+        expect(inventory.modules.map((row) => row.id)).toEqual(
+          [...inventory.modules.map((row) => row.id)].sort()
+        );
+        const plainDirectory = path.join(root, 'plain-bundles');
+        await buildAll({ outDir: plainDirectory });
+        for (const module of inventory.modules) {
+          const bytes = fs.readFileSync(path.join(outDir, module.filename));
+          expect(bytes).toEqual(fs.readFileSync(path.join(plainDirectory, module.filename)));
+          expect(module.size).toBe(bytes.length);
+          expect(module.sha256).toBe(sha256(bytes));
+          expect(Object.keys(module).sort()).toEqual([
+            'contributions',
+            'filename',
+            'id',
+            'sha256',
+            'size',
+          ]);
+        }
+        expect(inventory.materials.some((row) => row.kind === 'lifecycle-output')).toBe(false);
+        expect(inventory.materials.some((row) => row.kind === 'lifecycle-event')).toBe(true);
+        for (const source of [
+          'crates/trusted-server-js/lib/tsconfig.json',
+          'scripts/release/bootstrap.sh',
+        ]) {
+          expect(inventory.materials.find((row) => row.id === `source:${source}`)).toMatchObject({
+            kind: 'source',
+            path: source,
+            sha256: sha256(fs.readFileSync(path.join(repoRoot, source))),
+          });
+        }
+        expect(fs.readFileSync(inventoryPath, 'utf8')).toBe(`${JSON.stringify(inventory)}\n`);
+        const alias = path.join(root, 'bundle-alias');
+        fs.symlinkSync(outDir, alias);
+        await expect(
+          collectJs({
+            repoRoot,
+            outDir: alias,
+            inventoryPath: path.join(outDir, 'inside.json'),
+            preparationPath,
+          })
+        ).rejects.toThrow(/outside.*bundle/i);
+        await expect(
+          collectJs({
+            repoRoot: fixture(),
+            outDir,
+            inventoryPath: path.join(root, 'wrong-checkout.json'),
+            preparationPath,
+          })
+        ).rejects.toThrow(/collector.*checkout/i);
+        const originalPreparation = fs.readFileSync(preparationPath);
+        const colliding = JSON.parse(originalPreparation);
+        const collision = 'source:crates/trusted-server-js/lib/package.json';
+        colliding.distributions.find((row) => row.material.name === 'node').material.id = collision;
+        colliding.tools.find((row) => row.name === 'node').material_id = collision;
+        fs.writeFileSync(preparationPath, JSON.stringify(colliding));
+        await expect(
+          collectJs({
+            repoRoot,
+            outDir,
+            inventoryPath: path.join(root, 'collision.json'),
+            preparationPath,
+          })
+        ).rejects.toThrow(/duplicate.*material|material.*identity/i);
+        expect(fs.existsSync(path.join(root, 'collision.json'))).toBe(false);
+        fs.writeFileSync(preparationPath, originalPreparation);
+        const bad = JSON.parse(fs.readFileSync(preparationPath, 'utf8'));
+        bad.distributions.find((row) => row.material.name === 'vite').path = path.join(
+          root,
+          'fictional-tool'
+        );
+        const actualVite = measured.find((row) => row.name === 'vite');
+        fs.copyFileSync(actualVite.path, path.join(root, 'fictional-tool'));
+        expect(sha256(fs.readFileSync(path.join(root, 'fictional-tool')))).toBe(actualVite.sha256);
+        fs.writeFileSync(preparationPath, JSON.stringify(bad));
+        await expect(
+          collectJs({
+            repoRoot,
+            outDir,
+            inventoryPath: path.join(root, 'bad.json'),
+            preparationPath,
+          })
+        ).rejects.toThrow(/actual.*tool.*identity/i);
+      } finally {
+        vi.unstubAllEnvs();
       }
-      expect(inventory.materials.some((row) => row.kind === 'lifecycle-output')).toBe(false);
-      expect(inventory.materials.some((row) => row.kind === 'lifecycle-event')).toBe(true);
-      expect(fs.readFileSync(inventoryPath, 'utf8')).toBe(`${JSON.stringify(inventory)}\n`);
-      const alias = path.join(root, 'bundle-alias');
-      fs.symlinkSync(outDir, alias);
-      await expect(
-        collectJs({
-          repoRoot,
-          outDir: alias,
-          inventoryPath: path.join(outDir, 'inside.json'),
-          preparationPath,
-        })
-      ).rejects.toThrow(/outside.*bundle/i);
-      await expect(
-        collectJs({
-          repoRoot: fixture(),
-          outDir,
-          inventoryPath: path.join(root, 'wrong-checkout.json'),
-          preparationPath,
-        })
-      ).rejects.toThrow(/collector.*checkout/i);
-      const originalPreparation = fs.readFileSync(preparationPath);
-      const colliding = JSON.parse(originalPreparation);
-      const collision = 'source:crates/trusted-server-js/lib/package.json';
-      colliding.distributions.find((row) => row.material.name === 'node').material.id = collision;
-      colliding.tools.find((row) => row.name === 'node').material_id = collision;
-      fs.writeFileSync(preparationPath, JSON.stringify(colliding));
-      await expect(
-        collectJs({
-          repoRoot,
-          outDir,
-          inventoryPath: path.join(root, 'collision.json'),
-          preparationPath,
-        })
-      ).rejects.toThrow(/duplicate.*material|material.*identity/i);
-      expect(fs.existsSync(path.join(root, 'collision.json'))).toBe(false);
-      fs.writeFileSync(preparationPath, originalPreparation);
-      const bad = JSON.parse(fs.readFileSync(preparationPath, 'utf8'));
-      bad.distributions.find((row) => row.material.name === 'vite').path = path.join(
-        root,
-        'fictional-tool'
-      );
-      fs.writeFileSync(path.join(root, 'fictional-tool'), 'unrelated Vite distribution');
-      bad.distributions.find((row) => row.material.name === 'vite').material.sha256 = sha256(
-        'unrelated Vite distribution'
-      );
-      fs.writeFileSync(preparationPath, JSON.stringify(bad));
-      await expect(
-        collectJs({ repoRoot, outDir, inventoryPath: path.join(root, 'bad.json'), preparationPath })
-      ).rejects.toThrow(/actual.*tool|tool.*digest/i);
-    } finally {
-      if (oldRelease === undefined) delete process.env.TRUSTED_SERVER__RELEASE_BUILD;
-      else process.env.TRUSTED_SERVER__RELEASE_BUILD = oldRelease;
-      if (oldSource === undefined) delete process.env.TRUSTED_SERVER__GIT_VERSION;
-      else process.env.TRUSTED_SERVER__GIT_VERSION = oldSource;
-    }
-  }, 120_000);
+    },
+    120_000
+  );
 });
 
 describe('strict parser parity', () => {
@@ -701,6 +833,36 @@ describe('observer output boundary', () => {
 });
 
 describe('complete preparation lifecycle coverage', () => {
+  it('rejects an omitted installed package even when it has no lifecycle hooks', async () => {
+    const { validatePreparation } = await import('../release-composition.mjs');
+    const root = fixture();
+    const packageRoot = path.join(root, 'node_modules/example');
+    fs.mkdirSync(packageRoot, { recursive: true });
+    fs.writeFileSync(
+      path.join(packageRoot, 'package.json'),
+      JSON.stringify({ name: 'example', version: '1.0.0' })
+    );
+    const npm = {
+      kind: 'npm-package',
+      id: 'npm:node_modules/example',
+      lock_path: 'node_modules/example',
+      name: 'example',
+      version: '1.0.0',
+      integrity: `sha512-${Buffer.alloc(64).toString('base64')}`,
+      installed_tree_sha256: 'a'.repeat(64),
+    };
+    const prepared = {
+      schema_version: 1,
+      tools: [],
+      distributions: [],
+      packages: [],
+      lifecycle_events: [],
+      lifecycle_outputs: [],
+    };
+    expect(() => validatePreparation(prepared, { installRoot: root, packages: [npm] })).toThrow(
+      'Incomplete prepared package set'
+    );
+  });
   it('rejects a missing observation for an installed registry postinstall hook', async () => {
     const { validatePreparation } = await import('../release-composition.mjs');
     const root = fixture();
@@ -734,6 +896,66 @@ describe('complete preparation lifecycle coverage', () => {
 });
 
 describe('nested package contribution fixture', () => {
+  it('rejects another node_modules tree inside the repository but outside the install root', async () => {
+    const { installedOrigins } = await import('../release-composition.mjs');
+    const root = fixture();
+    const outside = path.join(root, 'node_modules/example');
+    fs.mkdirSync(outside, { recursive: true });
+    fs.writeFileSync(
+      path.join(outside, 'package.json'),
+      JSON.stringify({ name: 'example', version: '1.0.0' })
+    );
+    fs.writeFileSync(path.join(outside, 'index.js'), 'export default 7;');
+    const installRoot = path.join(root, 'install');
+    fs.mkdirSync(installRoot);
+    const fixtureLock = path.join(installRoot, 'package-lock.json');
+    fs.writeFileSync(fixtureLock, JSON.stringify({ lockfileVersion: 3, packages: {} }));
+    const origins = installedOrigins({ repoRoot, lockFile: fixtureLock });
+    expect(() => origins.origin(path.join(outside, 'index.js'))).toThrow(
+      /unmapped installed ownership/i
+    );
+  });
+  it('assigns a nested type-only format manifest to its archive package', async () => {
+    const { installedOrigins } = await import('../release-composition.mjs');
+    const root = fixture();
+    const key = 'node_modules/@example/parent';
+    const directory = path.join(root, key);
+    const format = path.join(directory, 'dist/esm');
+    fs.mkdirSync(format, { recursive: true });
+    fs.writeFileSync(
+      path.join(directory, 'package.json'),
+      JSON.stringify({ name: '@example/parent', version: '1.0.0' })
+    );
+    fs.writeFileSync(path.join(format, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(format, 'index.js'), 'export default 7;');
+    const fixtureLock = path.join(root, 'package-lock.json');
+    fs.writeFileSync(
+      fixtureLock,
+      JSON.stringify({
+        lockfileVersion: 3,
+        packages: {
+          [key]: {
+            version: '1.0.0',
+            resolved: archiveSource,
+            integrity: `sha512-${Buffer.alloc(64).toString('base64')}`,
+          },
+        },
+      })
+    );
+    const origins = installedOrigins({ repoRoot, lockFile: fixtureLock });
+    expect(origins.origin(path.join(format, 'index.js'))).toMatchObject({
+      lock_path: key,
+      path: 'dist/esm/index.js',
+    });
+    const hostile = path.join(directory, 'node_modules/example-unmapped');
+    fs.mkdirSync(hostile, { recursive: true });
+    fs.writeFileSync(
+      path.join(hostile, 'package.json'),
+      JSON.stringify({ name: 'example-unmapped', version: '1.0.0' })
+    );
+    fs.writeFileSync(path.join(hostile, 'index.js'), 'export default 42;');
+    expect(() => origins.origin(path.join(hostile, 'index.js'))).toThrow(/unmapped/i);
+  });
   it('preserves final bytes while recording the indirect nested installation identity', async () => {
     const root = fixture();
     const parentKey = 'node_modules/example-parent';
@@ -810,58 +1032,66 @@ describe('nested package contribution fixture', () => {
 });
 
 describe('approved source module discovery', () => {
-  it('uses the selected commit despite index removal or an invented staged integration', async () => {
-    const { expectedModuleIds } = await import(
-      path.join(repoRoot, 'scripts/release/collect-js.mjs')
-    );
-    expect(typeof expectedModuleIds).toBe('function');
-    const root = fixture();
-    const git = (args) =>
-      execFileSync(
-        'git',
-        [
-          '-c',
-          'commit.gpgsign=false',
-          '-c',
-          'user.name=Example',
-          '-c',
-          'user.email=example@example.com',
-          ...args,
-        ],
-        {
-          cwd: root,
-          encoding: 'utf8',
-          env: {
-            PATH: process.env.PATH,
-            TMPDIR: process.env.TMPDIR ?? '/private/tmp',
-            GIT_CONFIG_NOSYSTEM: '1',
-            GIT_CONFIG_GLOBAL: '/dev/null',
-            GIT_NO_REPLACE_OBJECTS: '1',
-          },
-        }
+  it.runIf(process.env.TRUSTED_SERVER__RELEASE_JS_TESTS === '1')(
+    'uses the selected commit despite index removal or an invented staged integration',
+    async () => {
+      const { expectedModuleIds } = await import(
+        path.join(repoRoot, 'scripts/release/collect-js.mjs')
       );
-    git(['init', '-q']);
-    for (const file of [
-      'crates/trusted-server-js/lib/src/core/index.ts',
-      'crates/trusted-server-js/lib/src/integrations/example/index.ts',
-    ]) {
-      fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
-      fs.writeFileSync(path.join(root, file), 'export const example = 7;');
+      const root = fixture();
+      vi.stubEnv('TMPDIR', undefined);
+      const git = (args) =>
+        execFileSync(
+          'git',
+          [
+            '-c',
+            'commit.gpgsign=false',
+            '-c',
+            'user.name=Example',
+            '-c',
+            'user.email=example@example.com',
+            ...args,
+          ],
+          {
+            cwd: root,
+            encoding: 'utf8',
+            env: {
+              PATH: process.env.PATH,
+              TMPDIR: os.tmpdir(),
+              GIT_CONFIG_NOSYSTEM: '1',
+              GIT_CONFIG_GLOBAL: '/dev/null',
+              GIT_NO_REPLACE_OBJECTS: '1',
+            },
+          }
+        );
+      git(['init', '-q']);
+      for (const file of [
+        'crates/trusted-server-js/lib/src/core/index.ts',
+        'crates/trusted-server-js/lib/src/integrations/example/index.ts',
+      ]) {
+        fs.mkdirSync(path.dirname(path.join(root, file)), { recursive: true });
+        fs.writeFileSync(path.join(root, file), 'export const example = 7;');
+      }
+      git(['add', '.']);
+      git(['commit', '-qm', 'Record example source']);
+      const source = git(['rev-parse', 'HEAD']).trim();
+      git([
+        'rm',
+        '--cached',
+        '-q',
+        'crates/trusted-server-js/lib/src/integrations/example/index.ts',
+      ]);
+      const invented = path.join(
+        root,
+        'crates/trusted-server-js/lib/src/integrations/invented/index.ts'
+      );
+      fs.mkdirSync(path.dirname(invented), { recursive: true });
+      fs.writeFileSync(invented, 'export const example = 42;');
+      git(['add', invented]);
+      expect(expectedModuleIds(root, source)).toEqual(['core', 'example']);
+      expect(() => expectedModuleIds(root, 'a'.repeat(40))).toThrow();
     }
-    git(['add', '.']);
-    git(['commit', '-qm', 'Record example source']);
-    const source = git(['rev-parse', 'HEAD']).trim();
-    git(['rm', '--cached', '-q', 'crates/trusted-server-js/lib/src/integrations/example/index.ts']);
-    const invented = path.join(
-      root,
-      'crates/trusted-server-js/lib/src/integrations/invented/index.ts'
-    );
-    fs.mkdirSync(path.dirname(invented), { recursive: true });
-    fs.writeFileSync(invented, 'export const example = 42;');
-    git(['add', invented]);
-    expect(expectedModuleIds(root, source)).toEqual(['core', 'example']);
-    expect(() => expectedModuleIds(root, 'a'.repeat(40))).toThrow();
-  });
+  );
 });
 
 describe('locked archive source policy', () => {

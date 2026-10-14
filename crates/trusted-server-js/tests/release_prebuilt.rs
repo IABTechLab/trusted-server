@@ -66,10 +66,14 @@ impl Fixture {
             .env("CARGO_MANIFEST_DIR", self.root.path())
             .env("OUT_DIR", self.path("out"))
             .env("PATH", self.path("bin"))
+            .env("TRUSTED_SERVER__TSJS_TEST_SUBPROCESS", "1")
             .env("TRUSTED_SERVER__RELEASE_BUILD", "1")
             .env("TRUSTED_SERVER__GIT_VERSION", SOURCE)
             .env("TSJS_PREBUILT_DIR", self.path("bundles"))
-            .env("TSJS_PREBUILT_INVENTORY", self.path("inventory.json"));
+            .env(
+                "TRUSTED_SERVER__TSJS_PREBUILT_INVENTORY",
+                self.path("inventory.json"),
+            );
         command
     }
 
@@ -82,11 +86,7 @@ impl Fixture {
     }
 
     fn rejected(&self, output: &Output, diagnostic: &str) {
-        let output_text = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let output_text = String::from_utf8_lossy(&output.stderr);
         assert!(
             !output.status.success(),
             "should reject fixture: {output_text}"
@@ -104,13 +104,92 @@ impl Fixture {
             "should not generate a rejected module table"
         );
     }
+
+    fn add_integration(&mut self, id: &str) {
+        fs::create_dir(self.path(&format!("lib/src/integrations/{id}")))
+            .expect("should create integration");
+        fs::write(
+            self.path(&format!("lib/src/integrations/{id}/index.ts")),
+            b"export {};",
+        )
+        .expect("should write integration entry");
+        fs::write(self.path(&format!("bundles/tsjs-{id}.js")), BYTES)
+            .expect("should write integration bundle");
+        let mut module = self.inventory["modules"][0].clone();
+        module["id"] = json!(id);
+        module["filename"] = json!(format!("tsjs-{id}.js"));
+        self.inventory["modules"]
+            .as_array_mut()
+            .expect("should access modules")
+            .push(module);
+        self.inventory["modules"]
+            .as_array_mut()
+            .expect("should access modules")
+            .sort_by(|left, right| left["id"].as_str().cmp(&right["id"].as_str()));
+    }
+}
+
+#[test]
+fn rejects_reversed_complete_two_module_inventory() {
+    let mut fixture = Fixture::new();
+    fixture.add_integration("aaa");
+    fixture.inventory["modules"]
+        .as_array_mut()
+        .expect("should access modules")
+        .reverse();
+    fixture.write_inventory();
+    fixture.rejected(
+        &fixture.command().output().expect("should execute fixture"),
+        "inventory module identity, order, size or digest is invalid",
+    );
+}
+
+#[test]
+fn rejects_unsafe_and_duplicate_core_source_integrations() {
+    for id in ["unsafe\"name", "core"] {
+        let mut fixture = Fixture::new();
+        fixture.add_integration(id);
+        fixture.write_inventory();
+        fixture.rejected(
+            &fixture.command().output().expect("should execute fixture"),
+            if id == "core" {
+                "duplicate core module ID"
+            } else {
+                "module ID unsafe\"name must be a safe ASCII identifier"
+            },
+        );
+    }
+}
+
+#[test]
+fn accepts_safe_opaque_floats_and_negative_integers() {
+    let mut fixture = Fixture::new();
+    fixture.inventory["tools"] = json!([
+        0.5,
+        1.5e-10,
+        -1,
+        -9_007_199_254_740_991_i64,
+        9_007_199_254_740_991_u64
+    ]);
+    fixture.inventory["materials"] = json!([{"nested": [1.0, -0.0]}]);
+    fixture.write_inventory();
+    let output = fixture.command().output().expect("should execute fixture");
+    assert!(
+        output.status.success(),
+        "should accept safe opaque numeric metadata: {output:?}"
+    );
 }
 
 #[test]
 #[ignore = "entry point invoked only by fixture subprocesses"]
 fn fixture_entry() {
-    build_script::run_with_hook(
-        |source, copied| match env::var("FIXTURE_MUTATION").as_deref() {
+    if env::var_os("TRUSTED_SERVER__TSJS_TEST_SUBPROCESS").as_deref()
+        != Some(std::ffi::OsStr::new("1"))
+    {
+        return;
+    }
+    build_script::run_with_hook(|source, copied| {
+        match env::var("TRUSTED_SERVER__TSJS_TEST_MUTATION").as_deref() {
             Ok("source") => fs::write(source.join("tsjs-core.js"), b"changed bytes")
                 .expect("should mutate source"),
             Ok("swap") => {
@@ -143,8 +222,8 @@ fn fixture_entry() {
                 symlink(root.join("other"), parent).expect("should redirect parent link");
             }
             _ => {}
-        },
-    );
+        }
+    });
 }
 
 #[test]
@@ -164,6 +243,25 @@ fn release_accepts_checked_bundles_without_npm() {
     assert!(
         !fixture.path("npm-called").exists(),
         "should never invoke npm in release mode"
+    );
+}
+
+#[test]
+fn ignored_entry_without_explicit_subprocess_marker_does_not_write() {
+    let fixture = Fixture::new();
+    fixture.write_inventory();
+    let output = fixture
+        .command()
+        .env_remove("TRUSTED_SERVER__TSJS_TEST_SUBPROCESS")
+        .output()
+        .expect("should invoke ignored entry directly");
+    assert!(
+        output.status.success(),
+        "should leave the direct ignored entry inert: {output:?}"
+    );
+    assert!(
+        !fixture.path("out/tsjs_modules.rs").exists(),
+        "should never write without explicit marker"
     );
 }
 
@@ -188,7 +286,10 @@ fn rejects_any_skip_presence_before_prebuilt_selection() {
 
 #[test]
 fn release_requires_both_prebuilt_inputs() {
-    for missing in ["TSJS_PREBUILT_DIR", "TSJS_PREBUILT_INVENTORY"] {
+    for missing in [
+        "TSJS_PREBUILT_DIR",
+        "TRUSTED_SERVER__TSJS_PREBUILT_INVENTORY",
+    ] {
         let fixture = Fixture::new();
         fixture.write_inventory();
         let output = fixture
@@ -212,7 +313,6 @@ fn rejects_inventory_identity_and_module_tampering() {
         "missing",
         "empty",
         "extra",
-        "order",
         "unknown",
         "version",
         "tools",
@@ -240,7 +340,7 @@ fn rejects_inventory_identity_and_module_tampering() {
             "id" => fixture.inventory["modules"][0]["id"] = json!("../core"),
             "missing" => fixture.inventory["modules"] = json!([]),
             "empty" => fixture.inventory["modules"][0]["size"] = json!(0),
-            "extra" | "order" => {
+            "extra" => {
                 let mut module = fixture.inventory["modules"][0].clone();
                 module["id"] = json!("aaa");
                 module["filename"] = json!("tsjs-aaa.js");
@@ -270,7 +370,19 @@ fn rejects_inventory_identity_and_module_tampering() {
         fixture.write_inventory();
         fixture.rejected(
             &fixture.command().output().expect("should execute fixture"),
-            "inventory",
+            match case {
+                "source" => "inventory schema version or source does not match",
+                "digest" => "inventory bundle digest mismatch",
+                "size" => "inventory bundle size mismatch",
+                "missing" => "missing bundles",
+                "unknown" | "module_unknown" => "unknown field",
+                "missing_array" => "missing field",
+                "version" | "tools" | "bool_size" | "float_size" | "contributions" => {
+                    "invalid type"
+                }
+                "negative_size" => "invalid value",
+                _ => "inventory module identity, order, size or digest is invalid",
+            },
         );
     }
 }
@@ -325,7 +437,14 @@ fn rejects_inexact_source_directories() {
         }
         fixture.rejected(
             &fixture.command().output().expect("should execute fixture"),
-            "tsjs",
+            match case {
+                "missing" => "missing bundles",
+                "empty" => "empty bundles",
+                "extra" | "unrelated" | "directory" => "unexpected extra bundle directory entry",
+                "link" => "cannot open bundle",
+                "hardlink" => "exactly one hard link",
+                _ => unreachable!("should use listed case"),
+            },
         );
     }
 }
@@ -375,7 +494,16 @@ fn rejects_ambiguous_or_unbounded_json() {
         fs::write(fixture.path("inventory.json"), raw).expect("should write malformed inventory");
         fixture.rejected(
             &fixture.command().output().expect("should execute fixture"),
-            "inventory",
+            match case {
+                "duplicate" | "nested" => "duplicate JSON key",
+                "nonfinite" | "bom" => "expected value",
+                "overflow" => "inventory number overflows",
+                "integer_overflow" => "unsafe integer",
+                "depth" => "JSON depth exceeds 64",
+                "oversize" => "inventory exceeds 1 MiB",
+                "utf8" => "inventory must be UTF-8",
+                _ => unreachable!("should use listed case"),
+            },
         );
     }
 }
@@ -383,10 +511,28 @@ fn rejects_ambiguous_or_unbounded_json() {
 #[test]
 fn development_prebuilt_without_inventory_remains_supported() {
     let fixture = Fixture::new();
+    fs::write(fixture.path("bundles/manifest.json"), b"{}").expect("should write legacy manifest");
+    fs::write(fixture.path("bundles/.DS_Store"), b"metadata")
+        .expect("should write legacy metadata");
+    fs::create_dir(fixture.path("bundles/prebid")).expect("should create legacy tree");
+    fs::write(fixture.path("bundles/prebid/package.json"), b"{}")
+        .expect("should write legacy package output");
+    fs::write(fixture.path("bundles/prebid/prebid.js"), BYTES)
+        .expect("should write legacy external bundle output");
+    symlink(
+        fixture.path("bundles/prebid"),
+        fixture.path("bundles/legacy-link"),
+    )
+    .expect("should create legacy directory alias");
+    fs::hard_link(
+        fixture.path("bundles/tsjs-core.js"),
+        fixture.path("alias.js"),
+    )
+    .expect("should retain legacy bundle hard links");
     let output = fixture
         .command()
         .env_remove("TRUSTED_SERVER__RELEASE_BUILD")
-        .env_remove("TSJS_PREBUILT_INVENTORY")
+        .env_remove("TRUSTED_SERVER__TSJS_PREBUILT_INVENTORY")
         .output()
         .expect("should execute fixture");
     assert!(
@@ -409,10 +555,20 @@ fn rejects_source_or_copied_bytes_changed_during_copy() {
         fixture.write_inventory();
         let output = fixture
             .command()
-            .env("FIXTURE_MUTATION", mutation)
+            .env("TRUSTED_SERVER__TSJS_TEST_MUTATION", mutation)
             .output()
             .expect("should execute fixture");
-        fixture.rejected(&output, "tsjs");
+        fixture.rejected(
+            &output,
+            match mutation {
+                "source" => "changed during copy",
+                "swap" => "cannot open bundle",
+                "private" => "private copied bundle does not match",
+                "extra" => "unexpected extra bundle directory entry",
+                "identity" | "directory" => "identity changed during copy",
+                _ => unreachable!("should use listed mutation"),
+            },
+        );
     }
 }
 
@@ -425,7 +581,7 @@ fn rejects_release_controls_and_relative_paths_before_npm() {
         ("TRUSTED_SERVER__GIT_VERSION", ""),
         ("TRUSTED_SERVER__GIT_VERSION", "abcdef"),
         ("TSJS_PREBUILT_DIR", "bundles"),
-        ("TSJS_PREBUILT_INVENTORY", "inventory.json"),
+        ("TRUSTED_SERVER__TSJS_PREBUILT_INVENTORY", "inventory.json"),
     ] {
         let fixture = Fixture::new();
         fixture.write_inventory();
@@ -435,7 +591,16 @@ fn rejects_release_controls_and_relative_paths_before_npm() {
                 .env(variable, value)
                 .output()
                 .expect("should execute fixture"),
-            "tsjs",
+            match variable {
+                "TRUSTED_SERVER__RELEASE_BUILD" => {
+                    "TRUSTED_SERVER__RELEASE_BUILD must be exactly 1"
+                }
+                "TRUSTED_SERVER__GIT_VERSION" if value.is_empty() => {
+                    "release source must be exactly 40"
+                }
+                "TRUSTED_SERVER__GIT_VERSION" => "release source must be exactly 40",
+                _ => "must be an absolute path",
+            },
         );
     }
     let fixture = Fixture::new();
@@ -451,21 +616,31 @@ fn rejects_release_controls_and_relative_paths_before_npm() {
 }
 
 #[test]
-fn development_inventory_checks_explicit_source_and_bundle_bytes() {
-    for case in ["source", "bytes"] {
+fn development_inventory_checks_bundle_bytes_without_comparing_display_source() {
+    for identity in ["main", "v1.2.3", "a".repeat(40).as_str()] {
+        let fixture = Fixture::new();
+        fixture.write_inventory();
+        let output = fixture
+            .command()
+            .env_remove("TRUSTED_SERVER__RELEASE_BUILD")
+            .env("TRUSTED_SERVER__GIT_VERSION", identity)
+            .output()
+            .expect("should execute development fixture");
+        assert!(
+            output.status.success(),
+            "should permit development display identity: {output:?}"
+        );
+    }
+    {
         let fixture = Fixture::new();
         fixture.write_inventory();
         let mut command = fixture.command();
         command.env_remove("TRUSTED_SERVER__RELEASE_BUILD");
-        if case == "source" {
-            command.env("TRUSTED_SERVER__GIT_VERSION", "a".repeat(40));
-        } else {
-            fs::write(fixture.path("bundles/tsjs-core.js"), b"tampered bytes")
-                .expect("should change bundle");
-        }
+        fs::write(fixture.path("bundles/tsjs-core.js"), b"tampered bytes")
+            .expect("should change bundle");
         fixture.rejected(
             &command.output().expect("should execute fixture"),
-            "inventory",
+            "inventory bundle size mismatch",
         );
     }
     let fixture = Fixture::new();
@@ -490,7 +665,7 @@ fn rejects_skip_presence_in_development_source_and_prebuilt_modes() {
             let mut command = fixture.command();
             command
                 .env_remove("TRUSTED_SERVER__RELEASE_BUILD")
-                .env_remove("TSJS_PREBUILT_INVENTORY")
+                .env_remove("TRUSTED_SERVER__TSJS_PREBUILT_INVENTORY")
                 .env("TSJS_SKIP_BUILD", value);
             if !prebuilt {
                 command.env_remove("TSJS_PREBUILT_DIR");
@@ -518,7 +693,7 @@ fn development_source_build_uses_fresh_npm_output() {
         .command()
         .env_remove("TRUSTED_SERVER__RELEASE_BUILD")
         .env_remove("TSJS_PREBUILT_DIR")
-        .env_remove("TSJS_PREBUILT_INVENTORY")
+        .env_remove("TRUSTED_SERVER__TSJS_PREBUILT_INVENTORY")
         .output()
         .expect("should execute fixture");
     assert!(
@@ -581,7 +756,7 @@ fn rejects_inventory_inside_source_and_private_destination_links() {
                 )
                 .expect("should place inventory inside source");
                 command.env(
-                    "TSJS_PREBUILT_INVENTORY",
+                    "TRUSTED_SERVER__TSJS_PREBUILT_INVENTORY",
                     fixture.path("bundles/inventory.json"),
                 );
             }
@@ -591,7 +766,14 @@ fn rejects_inventory_inside_source_and_private_destination_links() {
                 .expect("should write conflicting destination"),
             _ => unreachable!("should use listed case"),
         }
-        fixture.rejected(&command.output().expect("should execute fixture"), "tsjs");
+        fixture.rejected(
+            &command.output().expect("should execute fixture"),
+            match case {
+                "inside" => "inventory must be outside",
+                "link" | "file" => "private bundle destination must be a directory",
+                _ => unreachable!("should use listed case"),
+            },
+        );
         assert_eq!(
             fs::read(fixture.path("bundles/tsjs-core.js")).expect("should preserve input bundle"),
             BYTES,
@@ -610,7 +792,7 @@ fn emits_rerun_directives_for_inventory_and_release_inputs() {
     for variable in [
         "TSJS_SKIP_BUILD",
         "TSJS_PREBUILT_DIR",
-        "TSJS_PREBUILT_INVENTORY",
+        "TRUSTED_SERVER__TSJS_PREBUILT_INVENTORY",
         "TRUSTED_SERVER__RELEASE_BUILD",
         "TRUSTED_SERVER__GIT_VERSION",
     ] {
@@ -653,7 +835,7 @@ fn exposes_raw_inventory_digest_for_later_cargo_build_evidence() {
     let stdout = String::from_utf8(output.stdout).expect("should capture UTF-8 directives");
     assert!(
         stdout.contains(&format!(
-            "cargo:rustc-env=TSJS_INPUT_INVENTORY_SHA256={}",
+            "cargo:rustc-env=TRUSTED_SERVER__TSJS_INVENTORY_SHA256={}",
             hex::encode(Sha256::digest(&raw))
         )),
         "should report digest of the exact held inventory bytes: {stdout}"
@@ -661,7 +843,7 @@ fn exposes_raw_inventory_digest_for_later_cargo_build_evidence() {
 }
 
 #[test]
-fn development_inventory_rejects_present_non_unicode_source() {
+fn development_inventory_does_not_compare_non_unicode_display_source() {
     let fixture = Fixture::new();
     fixture.write_inventory();
 
@@ -675,7 +857,49 @@ fn development_inventory_rejects_present_non_unicode_source() {
         .output()
         .expect("should execute fixture");
 
-    fixture.rejected(&output, "source");
+    assert!(
+        output.status.success(),
+        "should leave development identity resolution to core: {output:?}"
+    );
+}
+
+#[test]
+fn rejects_source_leaf_links_with_lexical_directory_suffixes() {
+    for suffix in ["", "/", "//", "/.", "/./"] {
+        let fixture = Fixture::new();
+        fixture.write_inventory();
+        symlink(fixture.path("bundles"), fixture.path("bundles-link"))
+            .expect("should link source directory");
+        let output = fixture
+            .command()
+            .env(
+                "TSJS_PREBUILT_DIR",
+                format!("{}{suffix}", fixture.path("bundles-link").display()),
+            )
+            .output()
+            .expect("should execute linked source fixture");
+        fixture.rejected(&output, "bundles-link");
+    }
+}
+
+#[test]
+fn rejects_unsafe_integral_opaque_numbers() {
+    for literal in ["9007199254740993", "-9007199254740993", "1e20", "1.5e300"] {
+        for field in ["tools", "materials", "contributions"] {
+            let fixture = Fixture::new();
+            let raw = serde_json::to_string(&fixture.inventory)
+                .expect("should serialize inventory")
+                .replace(
+                    &format!("\"{field}\":[]"),
+                    &format!("\"{field}\":[{{\"nested\":{literal}}}]"),
+                );
+            fs::write(fixture.path("inventory.json"), raw).expect("should write opaque number");
+            fixture.rejected(
+                &fixture.command().output().expect("should execute fixture"),
+                "unsafe integer",
+            );
+        }
+    }
 }
 
 #[test]
@@ -730,7 +954,7 @@ fn rejects_parent_link_redirection_to_byte_identical_directory() {
     let output = fixture
         .command()
         .env("TSJS_PREBUILT_DIR", fixture.path("parent-alias/bundles"))
-        .env("FIXTURE_MUTATION", "parent")
+        .env("TRUSTED_SERVER__TSJS_TEST_MUTATION", "parent")
         .output()
         .expect("should execute fixture");
 

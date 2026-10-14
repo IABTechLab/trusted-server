@@ -59,7 +59,7 @@ Each distribution material contains `kind: "tool-distribution"`, `id`, `name`,
 `version`, `sha256`. `path` selects the actual measured tool entry file or native
 executable, never a command to run. Required tools are Node, npm, Vite, Rollup,
 esbuild, Vitest and the selected esbuild/Rollup native executables. Paths, versions,
-roles and file digests must match the producer's actual tool selection. Whole
+roles and file digests MUST match the producer's actual tool selection. Whole
 locked npm package trees are recorded separately. Tool entry/native file hashes
 are measured identities; they are not authenticated distribution acquisition or
 qualified host evidence. Task 8 supplies that boundary.
@@ -69,11 +69,11 @@ Lifecycle events contain `kind: "lifecycle-event"`, unique `id`,
 of the UTF-8 command string in the owning installed package's
 `package.json.scripts[event]`. Outputs contain `kind: "lifecycle-output"`, unique
 `id`, the same event/script/package join, installation-relative `path`, `size`
-and `sha256`. Each output must remain inside its owning package and match an
+and `sha256`. Each output MUST remain inside its owning package and match an
 explicit observed event. Registry-install coverage requires exactly the installed packages’ declared
 preinstall, install and postinstall hooks, including hooks producing no files.
 Registry dependency prepare scripts do not run in the selected npm ci recipe.
-Implicit binding.gyp installs without explicit reviewed hooks are rejected. Neither array is inferred from lockfile flags. Task 7 must produce
+Implicit binding.gyp installs without explicit reviewed hooks are rejected. Neither array is inferred from lockfile flags. Task 7 MUST produce
 these records from actual preparation execution; semantic checks here cannot
 prove that an execution occurred or that the observations are exhaustive.
 Synthetic fixture observations exercise joins but do not claim genuine execution
@@ -87,7 +87,7 @@ order. A directory contributes compact JSON `[relative_path,"directory"]` plus
 newline. A regular file contributes compact JSON
 `[relative_path,"file",byte_length,is_executable]`, newline, actual bytes and
 newline; `is_executable` means any executable bit is set. A symlink contributes
-compact JSON `[relative_path,"symlink",relative_target]` plus newline and must
+compact JSON `[relative_path,"symlink",relative_target]` plus newline and MUST
 resolve inside its package. Separately locked nested package roots and their
 contents are excluded from the parent's hash. Timestamps, owners and
 non-executable permission bits are excluded. Files are read through held
@@ -97,73 +97,81 @@ JSON and final inventory are limited to 1 MiB; source and final bundle reads are
 limited to 32 MiB. Duplicate keys, invalid UTF-8, BOM, unpaired surrogates,
 unsafe integers, non-finite numbers and more than 64 nested containers fail.
 The inventory writer sorts module/material/tool records and appends one newline.
-The inventory must live outside the bundle directory. This task does not perform
+The inventory MUST live outside the bundle directory. This task does not perform
 fresh installation, network confinement, A/B comparison, signing or publication.
 
-## Independent preparation recipe
+## Independent Rust preparation recipe
 
-`build-js.sh` runs the isolated Python entry in `prepare.py`. The official entry
-requires qualified acquisitions and hosted denial evidence; it currently refuses
-before creating work directories. There is no command-line fixture bypass.
-Task 8 owns the source-owned authenticated tool and boundary selection.
+Introduced Python release orchestration is removed; replacement Rust execution remains pending.
+`build-js.sh` remains a thin POSIX adapter to the independently approved-source
+OS-native `trusted-server-release build-js` command. Until its authenticated Rust
+bootstrap, source-owned selections and real recipe are implemented, the wrapper
+refuses before creating work directories. No public fixture bypass, unchecked
+interpreter or colocated self-authored SHA file establishes bootstrap authority.
+The host-only tool has no core/CLI/JS crate dependency; it retains this Node
+collector and composition pipeline. See the [migration addendum](../../docs/superpowers/specs/2026-10-14-release-tooling-rust-migration.md).
 
-The separate `local_js_pair` Python API exercises the actual full recipe using
-macOS sandbox-exec and returns `local-unqualified`. It cannot qualify a release.
-Each installation has its own tracked-object snapshot, sanitized private Git
-object store, cache, node_modules, HOME, TMP, observations and bundles. Shared
-archive/tool paths permit reads only; sibling workspace data and metadata, shared
-writes, network sockets and arbitrary Mach services are denied. Local system
-runtime and developer-tool directories are explicitly readable. These local path
-measurements do not authenticate an image, SDK or distribution acquisition.
+Port the actual recipe into private `materials`, `process`, `boundary`,
+`preparation` and `javascript` modules. Each installation owns a fresh tracked
+source/object snapshot, sanitized private Git store, cache, node_modules, HOME,
+TMP, lifecycle observations and bundles. Original sources/object stores and shared
+authenticated archives/tools are read-only; sibling data/metadata, shared writes,
+network sockets and arbitrary Mach delegation are denied. Current installed-tool
+rehashing is separate from independently reviewed all-cohort hosted evidence.
+Local macOS 26.6.2 diagnostics cannot qualify macOS 15 ARM/Intel or GNU.
 
-Archive filenames are locked SHA-512 hexadecimal digests followed by `.tgz`.
-Preparation authenticates raw bytes before bounded decompression/tar inspection.
-Three pinned npm archives contain the identical raw pair
-`package/./dist/index.js` and `package/dist/index.js`: agent-base 7.1.4,
-http-proxy-agent 7.0.2 and https-proxy-agent 7.0.6. Their exact locked SHA-512
-identities are source-owned exceptions in `NPM_ALIAS_ARCHIVES`. Both regular
-entries must have identical size, bytes, type and mode, and their canonical file
-is materialized once. Other duplicates, dot aliases, traversal, links, devices
-and privileged modes fail. SHA-256/exact-root registry validation and exact Git
-revision/whole-tree validation are also reusable by later Cargo preparation.
-Source acquisition and repeated source checks first query all selected object
-metadata in bounded batches, rejecting objects above 32 MiB or aggregate bodies
-above 512 MiB before requesting any bodies. Body headers then rejoin the checked
-OID, type and exact integer size. This precheck assumes the sanitized trusted Git
-tool reads an immutable object store; it does not claim race-proof streaming
-against a mutable or corrupted store.
+Archive filenames remain locked SHA-512 hex digests followed by `.tgz`. Authenticate
+original bytes before bounded decompression/TAR inspection. Preserve the source-owned
+exception for three exact locked npm archives containing identical
+`package/./dist/index.js` and `package/dist/index.js` entries: agent-base 7.1.4,
+http-proxy-agent 7.0.2 and https-proxy-agent 7.0.6. Resolve their original locked
+SHA-512 identities and require matching regular type, size, mode and bytes;
+materialize the canonical file once. Other duplicates, dot aliases, traversal,
+links, devices and privileged modes fail. Registry archive SHA-256/exact-root and
+Git revision/whole-tree validation remain available to Cargo preparation. Query
+selected Git object identity/type/size before body acquisition: reject objects
+over 32 MiB or cumulative bodies over 512 MiB, then rejoin exact body headers.
+This reader assumes the sanitized trusted Git implementation and an immutable
+object store, rather than claiming adversarial race-proof streaming.
 
-Each private cache is seeded via pinned npm's public `cache add` API using only
-verified archives, offline and with scripts disabled. Fresh pinned npm ci runs
-offline with dev dependencies included, audit/fund disabled and hooks in the
-foreground. Root install/prepare hooks and implicit binding.gyp installs fail.
-Only the two exact reviewed dependency hooks are enabled. A recipe-owned script
-shell records actual starts, completions, failures, command hashes and changed
-owned files, including hooks with no outputs; optional failures cannot disappear
-behind npm's success status. Its effective PATH binds bare `node` to the selected
-runtime. Task 6 measures the full installed locked trees and actual executables.
+Seed each private cache through selected npm's public `cache add` API with only
+verified archives, offline and scripts disabled. Run fresh pinned npm 11.6.2
+`ci --offline --include=dev --no-audit --no-fund` with hooks in the foreground
+under the qualified lifecycle denial boundary. Reject root install/prepare hooks
+and implicit binding.gyp installs. Preserve the two exact reviewed dependency
+hooks and actual starts/completions/failures/script hashes/changed-owned-files,
+including no-output hooks and swallowed optional failures. Bind bare `node` to
+selected Node 24.12.0 despite package-bin shadowing. Missing prepared native
+Vite/esbuild tools MUST fail without fetching substitutes. Observed lifecycle
+records cannot be inferred from lockfile flags or successful npm exit alone.
 
-Collector and Vitest execute under the same denial policy, with source checks
-covering all tracked inputs and unexpected files before and after each stage.
-Vitest is unconditional and uses a literal host in release mode to avoid
-localhost DNS resolution; it retains its middleware mode without a network
-server. Its release-only test plugin preserves native `node:` imports that Vite
-otherwise replaces with browser stubs in production mode; npm imports are not
-externalized by this plugin. Collector builds use `configFile: false`, so the
-test plugin never affects published IIFEs. Ordinary development retains its
-existing config. Only final bundle bytes must match: all tracked integrations and core
-are compared. A's bundles and inventory are published together only after
-equality, in one atomic parent with `bundles/` and sibling `tsjs-inventory.json`.
-B's inventory can legitimately contain different virtual-code hashes.
-Publication rechecks the closed root/module shape and exact integer sizes and
-digests against A's final bytes, retaining A's original inventory encoding.
-Contribution, package and tool semantics remain the collector's responsibility.
+Run collector and unconditional full Vitest/type checks under that same native
+boundary, checking tracked source and unexpected files before/after each stage.
+Preserve release Vitest's literal host and narrowly scoped native `node:` import
+resolver; npm imports remain unmodified. `configFile: false` collector builds
+remain separate from that test plugin. Existing ordinary development behavior
+remains supported. Both actual A/B Vitest processes MUST unconditionally receive
+`TRUSTED_SERVER__RELEASE_JS_TESTS=1` and run the full registered suite/type checks,
+with no developer opt-out. Require all tracked core/integration final files
+compared byte-for-byte. Ordinary development skips only the two slow Git
+collector fixtures by default; CI enables the full suite. B inventory virtual-code hashes may differ because paths differ.
 
-Run ordinary fixtures with `python3 -B -m unittest discover -s
-scripts/release/tests -p 'test_*.py' -v`. On macOS, explicitly enable actual local
-boundary probes with `TS_RELEASE_BOUNDARY_TESTS=1`, and the full two-installation
-probe with `TS_RELEASE_FULL_JS_TESTS=1`. Select Node 24.12.0 on the fixture PATH;
-the exact npm 11.6.2 is checked. The full local test authenticates original archive
-bytes read from the local npm cache and never copies cache indexes or installed
-trees. These probes require sandbox-exec outside an enclosing application
-sandbox. Hosted qualification remains pending regardless of their result.
+After all actual preparation/lifecycle/test/build/control/comparison stages pass,
+construct a private typed completion bound to approved source, authenticated tools,
+settings, raw inventory digest and retained A module bytes. A parsed JSON boolean,
+source label, arbitrary checked inventory or asserted path/hash cannot construct
+that state. Atomically retain A's `bundles/` plus sibling `tsjs-inventory.json`,
+with only JS files in `bundles/`; preserve A's original inventory encoding and
+closed root/module shape, exact integer sizes and final digests. Rehash at handoff.
+Use bounded child pipes/deadlines and kill/reap descendants on cancellation,
+timeout or oversize output. Clean private profiles/resources and Docker containers
+on success and failure with bounded stop/remove operations.
+
+Once Rust modules/tests exist, derive `HOST_TARGET=$(rustc -vV | sed -n 's/^host: //p')`
+and run `cargo test -p trusted-server-release --target "$HOST_TARGET" javascript::tests`
+using the [primary plan's nonzero-selection guard](../../docs/superpowers/plans/2026-10-13-attested-release-implementation.md#focused-rust-test-selection-guard).
+Private fixtures belong alongside their registered modules; public process tests
+use `tests/commands.rs`. Full local two-installation/native-probe execution MUST be
+selected explicitly through reviewed test paths and cannot waive hosted gates.
+
+The committed Node collector/composition fixtures are current local interface checks. Task 7's real two-installation orchestration and Task 8's selected native qualification remain pending; utility fixtures do not construct producer completion.

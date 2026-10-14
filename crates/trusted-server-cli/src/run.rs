@@ -18,15 +18,17 @@ use crate::prebid_bundle::{NpmPrebidBundleGenerator, PrebidBundleArgs, run_bundl
 /// Immutable facts compiled into the owning CLI product.
 pub const BUILD_INFO: BuildInfo = BuildInfo::new(
     env!("CARGO_PKG_VERSION"),
-    env!("TRUSTED_SERVER_BUILD_TARGET"),
+    env!("TRUSTED_SERVER__BUILD_TARGET"),
     BuildVariant::Default,
 );
 
 static VERSION_TEXT: LazyLock<String> = LazyLock::new(|| {
     format!(
-        "{} ({})",
+        "package={} source={} target={} variant={}",
         BUILD_INFO.package_version(),
-        BUILD_INFO.source().unwrap_or("unknown")
+        BUILD_INFO.source().unwrap_or("unknown"),
+        BUILD_INFO.target(),
+        BUILD_INFO.variant()
     )
 });
 
@@ -225,11 +227,12 @@ mod tests {
         assert_eq!(
             err.to_string(),
             format!(
-                "ts {} ({})\n",
+                "ts package={} source={} target={} variant=default\n",
                 env!("CARGO_PKG_VERSION"),
-                trusted_server_core::constants::TS_GIT_VERSION.unwrap_or("unknown")
+                trusted_server_core::constants::TS_GIT_VERSION.unwrap_or("unknown"),
+                env!("TRUSTED_SERVER__BUILD_TARGET")
             ),
-            "should print the owning package version and compiled source identity"
+            "should print all four labeled owning build facts"
         );
     }
 

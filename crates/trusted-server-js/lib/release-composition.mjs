@@ -87,8 +87,8 @@ export function strictJson(bytes) {
 
 /** Derive release settings from the existing build control only. */
 export function releaseBuild(env = process.env) {
-  if (Object.hasOwn(env, 'TSJS_SKIP_BUILD')) throw new Error('TSJS_SKIP_BUILD is forbidden');
   if (!Object.hasOwn(env, 'TRUSTED_SERVER__RELEASE_BUILD')) return false;
+  if (Object.hasOwn(env, 'TSJS_SKIP_BUILD')) throw new Error('TSJS_SKIP_BUILD is forbidden');
   if (env.TRUSTED_SERVER__RELEASE_BUILD !== '1')
     throw new Error('Release build control must be exactly 1');
   if (!/^[a-f0-9]{40}$/.test(env.TRUSTED_SERVER__GIT_VERSION ?? ''))
@@ -195,7 +195,7 @@ export function installedOrigins({ repoRoot, lockFile, installRoot = path.dirnam
       }
       if (
         fs.existsSync(path.join(directory, 'package.json')) &&
-        relative(installRoot, directory).includes('node_modules/')
+        /(?:^|\/)node_modules\/(?:@[^/]+\/)?[^/]+$/.test(lockPath)
       )
         throw new Error(`Unmapped installed ownership: ${id}`);
       if (directory === installRoot) break;
@@ -209,8 +209,8 @@ export function installedOrigins({ repoRoot, lockFile, installRoot = path.dirnam
 }
 
 /** Observe exactly one IIFE's rendered modules without altering emitted output. */
-export function compositionPlugin({ name, ...settings }) {
-  const owners = installedOrigins(settings);
+export function compositionPlugin({ name, owners: checkedOwners, ...settings }) {
+  const owners = checkedOwners ?? installedOrigins(settings);
   return {
     name: 'trusted-server-release-composition',
     generateBundle(options, bundle) {

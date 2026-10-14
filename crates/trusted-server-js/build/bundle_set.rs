@@ -59,8 +59,8 @@ pub(crate) fn expected_module_ids(lib_src: &Path) -> Result<Vec<String>, String>
     let mut ids = Vec::with_capacity(integrations.len() + 1);
     ids.push(CORE_MODULE_ID.to_owned());
     ids.extend(integrations);
-    if ids.iter().any(|id| !safe_module_id(id)) {
-        return Err("module IDs must be safe ASCII identifiers".to_owned());
+    if let Some(id) = ids.iter().find(|id| !safe_module_id(id)) {
+        return Err(format!("module ID {id} must be a safe ASCII identifier"));
     }
     if ids
         .iter()
@@ -79,6 +79,19 @@ pub(crate) fn expected_module_ids(lib_src: &Path) -> Result<Vec<String>, String>
 ///
 /// Returns a message when the directory or a bundle's metadata cannot be read.
 pub(crate) fn scan_bundle_dir(dir: &Path) -> Result<Vec<(String, u64)>, String> {
+    scan(dir, true)
+}
+
+/// Scan development prebuilt bundles, ignoring legacy nonbundle output.
+///
+/// # Errors
+///
+/// Returns a message when the directory or a bundle's metadata cannot be read.
+pub(crate) fn scan_legacy_bundle_dir(dir: &Path) -> Result<Vec<(String, u64)>, String> {
+    scan(dir, false)
+}
+
+fn scan(dir: &Path, checked: bool) -> Result<Vec<(String, u64)>, String> {
     let entries = fs::read_dir(dir)
         .map_err(|err| format!("failed to read bundle directory {}: {err}", dir.display()))?;
     let mut found = Vec::new();
@@ -90,10 +103,17 @@ pub(crate) fn scan_bundle_dir(dir: &Path) -> Result<Vec<(String, u64)>, String> 
             .strip_prefix("tsjs-")
             .and_then(|stem| stem.strip_suffix(".js"))
         else {
-            return Err(format!("unexpected file in bundle directory: {file_name}"));
+            if checked {
+                return Err(format!("unexpected file in bundle directory: {file_name}"));
+            }
+            continue;
         };
-        let metadata = fs::symlink_metadata(entry.path())
-            .map_err(|err| format!("failed to read metadata for {file_name}: {err}"))?;
+        let metadata = if checked {
+            fs::symlink_metadata(entry.path())
+        } else {
+            fs::metadata(entry.path())
+        }
+        .map_err(|err| format!("failed to read metadata for {file_name}: {err}"))?;
         if !safe_module_id(id) || !metadata.is_file() {
             return Err(format!("unsafe or nonregular bundle: {file_name}"));
         }
@@ -161,6 +181,30 @@ mod tests {
             .into_iter()
             .map(str::to_owned)
             .collect()
+    }
+
+    #[test]
+    fn module_identifiers_accept_only_safe_ascii() {
+        for id in ["core", "example_1", "example-2", "UPPER"] {
+            assert!(safe_module_id(id), "should accept safe ID {id}");
+        }
+        for id in ["", "../core", "has space", "quote\"", "é", "a/b", "a\\b"] {
+            assert!(!safe_module_id(id), "should reject unsafe ID {id:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_found_ids_including_core() {
+        for id in ["core", "gpt"] {
+            let mut entries = found(&[("core", 10), ("gpt", 20), ("prebid", 30)]);
+            entries.push((id.to_owned(), 10));
+            let error = check_bundle_set(&expected(), &entries)
+                .expect_err("should reject duplicate found ID");
+            assert!(
+                error.contains("duplicate bundle IDs"),
+                "should explain duplicate: {error}"
+            );
+        }
     }
 
     fn found(entries: &[(&str, u64)]) -> Vec<(String, u64)> {

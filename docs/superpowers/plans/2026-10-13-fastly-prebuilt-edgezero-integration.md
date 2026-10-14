@@ -12,7 +12,7 @@
 
 ## Authority and prerequisites
 
-Read the [primary plan](2026-10-13-attested-release-implementation.md) and [contract R-DEPLOY through R-RECOVERY](../specs/2026-10-09-1235-release-attestation-design.md). This is AC-8, a separate integration milestone, not an initial #1235 closure condition. It depends on the primary verifier/retained artifact, package inspector and public qualification; it may be prepared upstream in parallel but cannot ship an official release path without that verifier.
+Read the [primary plan](2026-10-13-attested-release-implementation.md) and [contract R-DEPLOY through R-RECOVERY](../specs/2026-10-09-1235-release-attestation-design.md#r-deploy). This is AC-8, a separate integration milestone, not an initial #1235 closure condition. It depends on the primary verifier/retained artifact, package inspector and public qualification; it may be prepared upstream in parallel but cannot ship an official release path without that verifier.
 
 Baseline EdgeZero revision is `683202c66948146ec360f490126f1d60f920288b`. Its generic adapter operation returns unit, source deploy can execute manifest shell commands, and Fastly staging builds/autoclones before staging. These are reference mechanisms, not an existing typed prebuilt seam.
 
@@ -22,7 +22,7 @@ Use a separate upstream EdgeZero checkout/worktree; do not edit Cargo's shared c
 
 Keep small concrete APIs, with default unsupported behavior for other adapters. Do not add speculative Cloudflare/Spin/Axum payload variants.
 
-The owning upstream design must implement these concrete records (not empty adapter variants):
+The owning upstream design MUST implement these concrete records (not empty adapter variants):
 
 | Record / interface                                 | Required fields / behavior                                                                                                                                                                                  |
 | -------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -30,7 +30,7 @@ The owning upstream design must implement these concrete records (not empty adap
 | `PrebuiltFastlyRequest`                            | Strong service ID, exact base version, production/staging mode, prepared payload and resolved context/sharing policy                                                                                        |
 | `WriteIntent`                                      | Stable operation ID, monotonically increasing sequence, phase (`clone`, `upload`, `relink`, `selector-write`, `stage`, `activate`), exact resource/version where known, request identity digest             |
 | `WriteObservation`                                 | Matching operation/sequence/phase, actual response resource/version, known/unknown result and sanitized evidence references                                                                                 |
-| `OperationSink::before_write(&WriteIntent)`        | Synchronous concrete fallible result; caller must flush durable intent and failure forbids the following mutation                                                                                           |
+| `OperationSink::before_write(&WriteIntent)`        | Synchronous concrete fallible result; caller MUST flush durable intent and failure forbids the following mutation                                                                                           |
 | `OperationSink::after_response(&WriteObservation)` | Synchronous concrete fallible result; failure stops subsequent writes while preserving already attempted effects                                                                                            |
 | `PrebuiltOutcome`                                  | Exact module/package/service identities, optional exact version, last confirmed phase, mutation-attempted flag and per-phase known/unknown results on success and error; no inferred active-version success |
 
@@ -44,7 +44,7 @@ E1 follows the owning repository's AGENTS.md for concrete error conventions and 
 - [ ] Write fake adapter tests for unsupported adapter/action, payload/context mismatch, mutation attempts before authorization, unit-success ambiguity and failed durability sink, truncated payload, pre-send failure versus sent/no-response uncertainty and missing exact version.
 - [ ] Run upstream targeted prebuilt tests; expect missing API.
 - [ ] Define private retained payload identity, exact service/base version, action/mode, logical/physical mappings, staging selector identity and sharing policy. Return structured observed IDs/phase states and error outcomes with known/unknown state, not an active-version lookup.
-- [ ] Define explicit phase enum and WriteIntent/WriteObservation with stable operation/sequence IDs; before_write must synchronously succeed before every provider/config mutation. Journal persistence errors halt further writes, even after earlier successful writes.
+- [ ] Define explicit phase enum and WriteIntent/WriteObservation with stable operation/sequence IDs; before_write MUST synchronously succeed before every provider/config mutation. Journal persistence errors halt further writes, even after earlier successful writes.
 - [ ] Approve exact-source Fastly unsupported defaults and review public API/docs/error types. Commit `Add a typed prebuilt Fastly operation interface`.
 
 ### Task E2: Prepare byte-preserving packages from retained inputs
@@ -114,7 +114,7 @@ E1 follows the owning repository's AGENTS.md for concrete error conventions and 
 
 - [ ] Execute fake-provider coverage for all writes, crash boundaries, context mismatches, locks and unknown results; verify no provider writes occur on failed official evidence.
 - [ ] Before enabling integrated production transport, execute end-to-end `ts deploy --release` production qualification on a separately authorized disposable Fastly service using an independently verified production-capable release. Assert canonical module bytes, explicit clone/upload to the exact returned draft, context validation before activation, the exact activated version, durable per-write observations and receipt/restart behavior. The primary manual compute-deploy rehearsal is a different transport and cannot satisfy this gate.
-- [ ] First qualify direct upstream prepared-byte staging on a separately authorized disposable Fastly service, using source-built fixtures and no claim of an official staging-capable release. Compare actual module/context and shared/isolated bindings, plus separate health/rollback commands. The initial production-only CLI/release must continue to reject staging before writes.
+- [ ] First qualify direct upstream prepared-byte staging on a separately authorized disposable Fastly service, using source-built fixtures and no claim of an official staging-capable release. Compare actual module/context and shared/isolated bindings, plus separate health/rollback commands. The initial production-only CLI/release MUST continue to reject staging before writes.
 - [ ] After that transport proof, approve the cohort and embedded policy capability change, then publish a separately authorized new staging-enabled release through the primary pipeline. Use the independently trusted verifier to qualify end-to-end `ts deploy --release --staging` against that new release. Test that historical production-only releases still reject staging; no downloaded metadata or test policy override enables it in the production CLI.
 - [ ] Qualify durable recovery across process restart and uncertain responses without exposing secrets. An irreducibly unknown clone remains a documented manual resolution case, not a passed exactly-once guarantee.
 - [ ] Record the already reviewed/qualified staging capability and historical producer/consumer compatibility explicitly. Document receipt limits and the actual loaded snapshot boundary for #161; unsigned operator observations are not publisher authority or remote execution proof.

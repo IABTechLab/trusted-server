@@ -60,13 +60,15 @@ pub(crate) fn read_inventory(
     expected: &[String],
     source: Option<&str>,
 ) -> io::Result<CheckedInventory> {
+    let leaf_path = path.components().collect::<std::path::PathBuf>();
     #[cfg(unix)]
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(path)?;
+        .open(&leaf_path)
+        .map_err(|error| invalid(format!("cannot open inventory {}: {error}", path.display())))?;
     #[cfg(not(unix))]
-    let file = File::open(path)?;
+    let file = File::open(&leaf_path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(invalid("inventory must be a regular file"));
@@ -178,12 +180,18 @@ fn validate_numbers(text: &str) -> io::Result<()> {
                     index += 1;
                 }
                 let number = &text[start..index];
-                if number.contains(['.', 'e', 'E']) {
-                    if !number.parse::<f64>().is_ok_and(f64::is_finite) {
-                        return Err(invalid("inventory number overflows"));
-                    }
-                } else if (number.starts_with('-') && number.parse::<i64>().is_err())
-                    || (!number.starts_with('-') && number.parse::<u64>().is_err())
+                let value = number
+                    .parse::<f64>()
+                    .map_err(|_| invalid("invalid inventory number"))?;
+                if !value.is_finite() {
+                    return Err(invalid("inventory number overflows"));
+                }
+                if value.fract() == 0.0 && value.abs() > 9_007_199_254_740_991.0 {
+                    return Err(invalid("inventory contains an unsafe integer"));
+                }
+                if !number.contains(['.', 'e', 'E'])
+                    && ((number.starts_with('-') && number.parse::<i64>().is_err())
+                        || (!number.starts_with('-') && number.parse::<u64>().is_err()))
                 {
                     return Err(invalid("inventory integer overflows"));
                 }
@@ -293,5 +301,37 @@ mod tests {
             result.is_err(),
             "should reject links at the actual inventory read"
         );
+    }
+
+    #[test]
+    fn declared_bundle_cap_is_enforced_by_inventory_parser() {
+        let root = tempdir().expect("should create inventory fixture");
+        let path = root.path().join("inventory.json");
+        const CONTRACT_LIMIT: u64 = 32 * 1024 * 1024;
+        for (size, accepted) in [(CONTRACT_LIMIT, true), (CONTRACT_LIMIT + 1, false)] {
+            fs::write(
+                &path,
+                serde_json::to_vec(&json!({
+                    "schema_version": 1, "source_commit": "a".repeat(40),
+                    "modules": [{"id": "core", "filename": "tsjs-core.js", "size": size,
+                        "sha256": "a".repeat(64), "contributions": []}],
+                    "tools": [], "materials": []
+                }))
+                .expect("should serialize inventory"),
+            )
+            .expect("should write inventory");
+            let result = read_inventory(&path, &["core".to_owned()], None);
+            if accepted {
+                assert!(result.is_ok(), "should accept exact declared bundle cap");
+            } else {
+                let error = result
+                    .err()
+                    .expect("should reject oversized declared bundle");
+                assert!(
+                    error.to_string().contains("size"),
+                    "should explain inventory size rejection: {error}"
+                );
+            }
+        }
     }
 }

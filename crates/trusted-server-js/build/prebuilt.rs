@@ -42,10 +42,13 @@ fn identity(file: &File) -> io::Result<Identity> {
 }
 
 fn open_directory(path: &Path) -> io::Result<File> {
+    // Components remove trailing separators and '.' without following links.
+    let leaf_path = path.components().collect::<std::path::PathBuf>();
     OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
+        .open(&leaf_path)
+        .map_err(|error| invalid(format!("cannot open directory {}: {error}", path.display())))
 }
 
 fn open_file(directory: &File, name: &str) -> io::Result<File> {
@@ -60,15 +63,18 @@ fn open_file(directory: &File, name: &str) -> io::Result<File> {
         )
     };
     if descriptor < 0 {
-        return Err(io::Error::last_os_error());
+        return Err(invalid(format!(
+            "cannot open bundle {name:?}: {}",
+            io::Error::last_os_error()
+        )));
     }
     // SAFETY: openat returned a fresh descriptor owned solely by this File.
     let file = unsafe { File::from_raw_fd(descriptor) };
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.nlink() != 1 {
-        return Err(invalid(
-            "bundle must be a regular file with exactly one hard link",
-        ));
+        return Err(invalid(format!(
+            "bundle {name:?} must be a regular file with exactly one hard link"
+        )));
     }
     Ok(file)
 }
@@ -128,7 +134,9 @@ fn names(directory: &File, maximum: usize) -> io::Result<Vec<String>> {
             .map_err(|_| invalid("bundle filename must be UTF-8"))?;
         if name != "." && name != ".." {
             if result.len() >= maximum {
-                return Err(invalid("unexpected extra bundle directory entry"));
+                return Err(invalid(format!(
+                    "unexpected extra bundle directory entry: {name}"
+                )));
             }
             result.push(name.to_owned());
         }
@@ -157,7 +165,7 @@ fn snapshot(directory: &File, expected: &[String]) -> io::Result<BTreeMap<String
             .strip_prefix("tsjs-")
             .and_then(|stem| stem.strip_suffix(".js"))
             .filter(|id| safe_module_id(id))
-            .ok_or_else(|| invalid("unexpected or unsafe bundle filename"))?;
+            .ok_or_else(|| invalid(format!("unexpected or unsafe bundle filename: {name}")))?;
         let file = open_file(directory, &name)?;
         let identity = identity(&file)?;
         found.push((id.to_owned(), identity.size));
@@ -214,7 +222,7 @@ pub(crate) fn copy_checked(
     expected: &[String],
     source_path: &Path,
     destination: &Path,
-    inventory: Option<&Inventory>,
+    inventory: &Inventory,
     mut hook: impl FnMut(&Path, &Path),
 ) -> io::Result<()> {
     let source = open_directory(source_path)?;
@@ -229,14 +237,17 @@ pub(crate) fn copy_checked(
             return Err(invalid("source bundle identity changed before copy"));
         }
         let module = inventory
-            .and_then(|inventory| inventory.modules.iter().find(|module| module.id == *id));
-        let size = module.map_or(file.metadata()?.len(), |module| module.size);
+            .modules
+            .iter()
+            .find(|module| module.id == *id)
+            .ok_or_else(|| invalid(format!("inventory missing bundle {name}")))?;
+        let size = module.size;
         if size > MAX_BUNDLE {
             return Err(invalid("bundle exceeds 32 MiB"));
         }
         let digest = copy_one(&mut file, &destination.join(&name), size)?;
-        if module.is_some_and(|module| module.sha256 != digest) {
-            return Err(invalid("inventory bundle digest mismatch"));
+        if module.sha256 != digest {
+            return Err(invalid(format!("inventory bundle digest mismatch: {name}")));
         }
         if before.get(&name) != Some(&identity(&file)?) {
             return Err(invalid("source bundle changed during copy"));
