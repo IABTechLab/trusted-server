@@ -1504,7 +1504,7 @@ fn resolve_analytics_module(
     let selected = settings
         .sections
         .section(ANALYTICS_TYPE)
-        .map(|section| section.selected())
+        .map(crate::provider_table::SectionModules::selected)
         .unwrap_or_default();
     let resolved = match selected {
         [] => None,
