@@ -148,6 +148,8 @@ jobs:
           # wasm32-wasip1 is required by the "Verify Fastly WASM release
           # build" step below; the axum build and tests are native.
           target: wasm32-wasip1
+          # clippy is required by the "Lint native finalization harness" step.
+          components: clippy
           cache-shared-key: cargo-${{ runner.os }}
 
       - name: Read pinned Node.js version for CLI fixtures
