@@ -1707,3 +1707,83 @@ mod tests {
         );
     }
 }
+
+/// A loading cache that keeps every value with its lifetime under its key
+/// and runs each load in its caller, so a test reads what was kept and for
+/// how long.
+#[derive(Default)]
+pub struct LifetimeRecordingCache {
+    values: Mutex<HashMap<String, bytes::Bytes>>,
+    lifetimes: Mutex<HashMap<String, Duration>>,
+}
+
+impl LifetimeRecordingCache {
+    /// The lifetimes of the kept copies, leaving out the records and
+    /// the marks of what may not be shared.
+    /// The lifetimes of the asset copies kept, in no order.
+    pub fn copy_lifetimes(&self) -> Vec<Duration> {
+        let values = self.values.lock().expect("should lock the values");
+        self.lifetimes
+            .lock()
+            .expect("should lock the lifetimes")
+            .iter()
+            .filter(|(key, _)| key.contains(&format!("/{}/", crate::settings::ASSETS_CACHE)))
+            .filter(|(key, _)| {
+                values.get(*key).is_some_and(|value| {
+                    matches!(
+                        crate::asset_cache::AssetEntry::decode(value),
+                        Ok(crate::asset_cache::AssetEntry::Copy(_))
+                    )
+                })
+            })
+            .map(|(_, lifetime)| *lifetime)
+            .collect()
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl super::PlatformLoadingCache for LifetimeRecordingCache {
+    async fn get_or_load(
+        &self,
+        _services: &RuntimeServices,
+        _spec: &crate::platform::CacheSpec,
+        key: &crate::platform::StoreKey,
+        load: crate::platform::Loader,
+    ) -> Result<bytes::Bytes, crate::platform::LoadError> {
+        let key = key.to_string();
+        let held = self
+            .values
+            .lock()
+            .expect("should lock the values")
+            .get(&key)
+            .cloned();
+        if let Some(value) = held {
+            return Ok(value);
+        }
+        let loaded = load().await?;
+        let lifetime = loaded.lifetime.unwrap_or(Duration::MAX);
+        if !lifetime.is_zero() {
+            self.values
+                .lock()
+                .expect("should lock the values")
+                .insert(key.clone(), loaded.bytes.clone());
+            self.lifetimes
+                .lock()
+                .expect("should lock the lifetimes")
+                .insert(key, lifetime);
+        }
+        Ok(loaded.bytes)
+    }
+
+    async fn remove(
+        &self,
+        _services: &RuntimeServices,
+        _spec: &crate::platform::CacheSpec,
+        key: &crate::platform::StoreKey,
+    ) {
+        self.values
+            .lock()
+            .expect("should lock the values")
+            .remove(&key.to_string());
+    }
+}
