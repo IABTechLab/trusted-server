@@ -333,15 +333,6 @@ mod tests {
         }
     }
 
-    /// A hook that leaves every request to be addressed by its host.
-    struct AnswersByHost;
-
-    impl RequestAddressing for AnswersByHost {
-        fn address(&self, _host: Option<&str>, _path: &str) -> Addressing {
-            Addressing::ByHost
-        }
-    }
-
     fn request(uri: &str, host: Option<&str>) -> Request<EdgeBody> {
         let mut builder = request_builder().method("GET").uri(uri);
         if let Some(host) = host {
@@ -442,7 +433,7 @@ mod tests {
         );
         let before = addressed.uri().clone();
 
-        address_request(&AnswersByHost, &mut addressed)
+        address_request(&ByHostAddressing, &mut addressed)
             .expect("should address the request by its host");
 
         assert_eq!(
@@ -557,19 +548,16 @@ mod tests {
     }
 
     #[test]
-    fn with_no_hook_or_a_by_host_hook_routing_is_unchanged() {
+    fn a_by_host_hook_leaves_routing_unchanged() {
         let by_host = addressed_router(echo_router(), Arc::new(ByHostAddressing));
-        let answering = addressed_router(echo_router(), Arc::new(AnswersByHost));
 
         for uri in ["/", "/news?page=2", "/publisher.example/news"] {
             let plain = body_of(route(&echo_router(), request(uri, Some("front.example"))));
-            for router in [&by_host, &answering] {
-                assert_eq!(
-                    body_of(route(router, request(uri, Some("front.example")))),
-                    plain,
-                    "`{uri}` should route as it does with no hook"
-                );
-            }
+            assert_eq!(
+                body_of(route(&by_host, request(uri, Some("front.example")))),
+                plain,
+                "`{uri}` should route as it does with no hook"
+            );
         }
     }
 

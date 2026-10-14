@@ -1,9 +1,8 @@
 //! What the asset cache keeps for a response that is not a page, being the
 //! response as the fetch phase left it, and the address it is kept under.
 //!
-//! A copy holds the headers a reader is served and the body. A body the fetch
-//! phase rewrote is kept decoded, and each reader's copy is encoded as it is
-//! served. Every copy is kept under what the origin's own `Vary` names, see
+//! A copy holds the headers a reader is served and the body, as the origin
+//! sent them. Every copy is kept under what the origin's own `Vary` names, see
 //! `crate::source_cache`.
 
 use edgezero_core::body::Body as EdgeBody;
@@ -44,8 +43,7 @@ const NOT_KEPT: &[&str] = &[
 /// the address's record once the origin has said it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssetCacheKey {
-    /// The URL asked of the origin, without its query where the publisher's
-    /// declaration names the parameters that matter.
+    /// The URL asked of the origin, with its query.
     pub url: String,
     /// The host the reader asked, which the fetch phase writes into the body
     /// in place of the origin's.
@@ -56,7 +54,7 @@ pub struct AssetCacheKey {
     pub origin_identity: String,
     /// Digest of every setting and module that can shape the fetch phase,
     /// and of the build, so a build that rewrites bodies differently never
-    /// serves a copy an earlier one made.
+    /// serves a copy an earlier one made. Empty for an asset route's answer.
     pub fingerprint: String,
 }
 
@@ -67,10 +65,7 @@ impl AssetCacheKey {
     /// inputs run together into the same key.
     #[must_use]
     pub fn to_cache_key(&self) -> String {
-        fn push(hasher: &mut Sha256, part: &[u8]) {
-            hasher.update((part.len() as u64).to_be_bytes());
-            hasher.update(part);
-        }
+        use crate::platform::hash_length_prefixed as push;
 
         let mut hasher = Sha256::new();
         push(&mut hasher, b"ts-asset-cache");
@@ -92,8 +87,8 @@ impl AssetCacheKey {
 pub struct AssetCopy {
     /// The headers a reader is served, as the fetch phase left them.
     pub headers: Vec<(String, String)>,
-    /// Whether the fetch phase decoded and rewrote the body, in which case it
-    /// is kept decoded and encoded for each reader as it is served.
+    /// Whether the body is kept without its `Content-Encoding`. Every copy is
+    /// kept as the origin sent it today, so this is false.
     pub decoded: bool,
     /// When the copy was made, in seconds since the Unix epoch.
     pub made_at: u64,

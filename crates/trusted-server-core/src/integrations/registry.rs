@@ -3263,14 +3263,17 @@ pub(crate) mod test_support {
                 MiddlewareAction::pass()
             }
         }
-        /// The name of the serve middleware that writes a header on a text
-        /// response.
+        /// The name of the serve middleware that sets headers through the
+        /// headers step alone.
         pub(crate) const LOCATING: &str = "testing.middleware-fixture.locating";
         pub(crate) const LOCATION_PREFIX: &str = "/fixture";
+        /// The header the locating middleware sets on every response it is
+        /// shown, carrying that response's status.
+        pub(crate) const SHOWN_STATUS_NAME: &str = "x-fixture-shown-status";
 
-        /// Puts a prefix on a redirect's root-relative `Location`, through the
-        /// headers step alone, which is what a deployment that names the
-        /// publisher in the first part of the address needs.
+        /// Puts a prefix on a redirect's root-relative `Location`, which is
+        /// what a deployment that names the publisher in the first part of the
+        /// address needs, and names the status of every response it is shown.
         struct Locating;
 
         impl Middleware for Locating {
@@ -3291,23 +3294,28 @@ pub(crate) mod test_support {
                 _context: &MiddlewareContext<'_>,
                 response: &ResponseView<'_>,
             ) -> Vec<ResponseHeader> {
+                let mut headers = vec![(
+                    http::HeaderName::from_static(SHOWN_STATUS_NAME),
+                    http::HeaderValue::from(response.status.as_u16()),
+                )];
                 if !response.status.is_redirection() {
-                    return Vec::new();
+                    return headers;
                 }
                 let Some(location) = response
                     .headers
                     .get(http::header::LOCATION)
                     .and_then(|value| value.to_str().ok())
                 else {
-                    return Vec::new();
+                    return headers;
                 };
-                if !location.starts_with('/') || location.starts_with("//") {
-                    return Vec::new();
+                if location.starts_with('/')
+                    && !location.starts_with("//")
+                    && let Ok(value) =
+                        http::HeaderValue::from_str(&format!("{LOCATION_PREFIX}{location}"))
+                {
+                    headers.push((http::header::LOCATION, value));
                 }
-                match http::HeaderValue::from_str(&format!("{LOCATION_PREFIX}{location}")) {
-                    Ok(value) => vec![(http::header::LOCATION, value)],
-                    Err(_) => Vec::new(),
-                }
+                headers
             }
         }
 
@@ -3351,6 +3359,8 @@ pub(crate) mod test_support {
             }
         }
 
+        /// The name of the serve middleware that writes a header on a text
+        /// response.
         pub(crate) const TEXT_HEADER: &str = "testing.middleware-fixture.text-header";
         /// The header the text header middleware writes, name and value.
         pub(crate) const TEXT_HEADER_NAME: &str = "x-fixture-text";
@@ -6893,6 +6903,37 @@ mod tests {
         assert!(
             chain_for("text/css", "/news/site.css").is_empty(),
             "should run nothing on a media type no entry covers"
+        );
+    }
+
+    #[test]
+    fn middleware_for_path_gives_every_covering_entry_s_middleware_once_in_entry_order() {
+        let registry = IntegrationRegistry::new(&fixture_settings_with_entries(Vec::new()))
+            .expect("should build a registry");
+        let entries = PhaseEntries::new(vec![
+            html_entry(Some("/news/"), &[fixture::LOCATING, fixture::READER]),
+            text_entry(&[fixture::TEXT_HEADER, fixture::LOCATING]),
+            html_entry(Some("/sport/"), &[fixture::BROKEN_READER]),
+            html_entry(None, &["testing.nothing", fixture::READER]),
+        ]);
+
+        let ids = |path: &str| -> Vec<&'static str> {
+            registry
+                .middleware_for_path(&entries, path)
+                .iter()
+                .map(|middleware| middleware.middleware_id())
+                .collect()
+        };
+        assert_eq!(
+            ids("/news/today"),
+            [fixture::LOCATING, fixture::READER, fixture::TEXT_HEADER],
+            "should give each middleware once, in entry order, whatever the entry's media type"
+        );
+        assert_eq!(
+            ids("/weather/"),
+            [fixture::TEXT_HEADER, fixture::LOCATING, fixture::READER],
+            "should leave out an entry whose path does not cover the request, and a name \
+             nothing supplies"
         );
     }
 

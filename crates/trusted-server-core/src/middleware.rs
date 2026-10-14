@@ -530,13 +530,13 @@ pub trait Middleware: Send + Sync {
     /// Decides what to do with one document.
     fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction;
 
-    /// The headers a serve middleware sets on `response`. Asked for every
-    /// response the publisher path sends for a request path the
-    /// middleware's entry covers, whatever the response's media type and
-    /// whether or not it has a body, so a redirect reaches a middleware
-    /// that rewrites its `Location`. A header returned replaces one of the
-    /// same name. Nothing by default, and a middleware that answers only
-    /// here returns a passing action from [`create`](Self::create).
+    /// The headers a serve middleware sets on the response the publisher path
+    /// sends, a redirect with no body included, for a request path its entry
+    /// covers. Each replaces a
+    /// header of the same name, and one the action from
+    /// [`create`](Self::create) sets in
+    /// [`MiddlewareAction::response_headers`] replaces it in turn. None by
+    /// default.
     fn response_headers(
         &self,
         context: &MiddlewareContext<'_>,
@@ -569,11 +569,16 @@ impl PhaseEntry {
     /// `path`.
     #[must_use]
     pub fn covers(&self, media_type: &str, path: &str) -> bool {
-        self.media_type == media_type
-            && self
-                .path
-                .as_deref()
-                .is_none_or(|prefix| path.starts_with(prefix))
+        self.media_type == media_type && self.covers_path(path)
+    }
+
+    /// Whether the entry covers a request for `path`, whatever the media
+    /// type.
+    #[must_use]
+    pub fn covers_path(&self, path: &str) -> bool {
+        self.path
+            .as_deref()
+            .is_none_or(|prefix| path.starts_with(prefix))
     }
 }
 
@@ -621,14 +626,7 @@ impl PhaseEntries {
     #[must_use]
     pub fn for_path(&self, path: &str) -> Vec<&str> {
         let mut names: Vec<&str> = Vec::new();
-        for entry in &self.0 {
-            if !entry
-                .path
-                .as_deref()
-                .is_none_or(|prefix| path.starts_with(prefix))
-            {
-                continue;
-            }
+        for entry in self.0.iter().filter(|entry| entry.covers_path(path)) {
             for name in &entry.middleware {
                 if !names.contains(&name.as_str()) {
                     names.push(name);

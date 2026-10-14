@@ -65,15 +65,7 @@ impl RequestAddressing for FirstSegment {
 | `https://front.example/not_a_host/news`              | None, nothing is looked up | `421 Misdirected Request`                   | None                   |
 | `https://front.example/health` on Fastly             | None                       | `200`, before the hook is asked             | None                   |
 
-**The rules.**
-
-- A hook that answers "by host" leaves the request exactly as it was, and its blob is chosen by its host as before.
-- A miss on every selector value is refused `421`, exactly as a host with no blob is. The request is never served from a key the hook did not name, which includes the logical store ID and the blob of the host the request arrived on.
-- A selector value is keyed as a host is, lowercased with a port and one trailing dot removed, and a value that is not a host name is passed over without a lookup. A value therefore cannot name the logical store ID or a part of a stored blob, each of which carries an underscore.
-- A lookup that fails refuses the request `500` and no later value is tried, because a later value must not serve while it is unknown whether an earlier one has a blob.
-- A selector without `{host}` reads its one blob and the values are ignored. The path and the prefix still apply.
-- The continuing path starts with `/`, is percent-encoded ASCII and carries no query or fragment, or `RequestAddress::new` refuses it, so every adapter routes the same path.
-- The values and the path come from the request, so no log line prints either. A request refused for want of a blob logs how many values the hook named and the selector.
+**The rules** are those the guide gives under "One blob for each path" in `docs/guide/configuration.md`. How a value is keyed and why a failed lookup stops the search are in the rustdoc of `resolve_addressed_key`, and what a continuing path may be is in that of `RequestAddress::new`. The values and the path come from the request, so no log line prints either.
 
 **Why it is in core and not a middleware.** No settings exist when the blob is chosen, and the router has already matched a path by the time a middleware runs. Only a step the adapter takes before both can choose the blob and change the path the router sees, so the extension point is in core, and the policy that uses it is the deployment's.
 

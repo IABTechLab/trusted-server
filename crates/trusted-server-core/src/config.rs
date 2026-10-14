@@ -279,61 +279,32 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
                 ],
                 true,
             ),
-            field(
-                vec![
-                    optional_object("proxy"),
-                    optional_object("asset_routes"),
-                    SecretPathSegment::ArrayEach,
-                    optional_object("auth"),
-                    object("access_key_id"),
-                ],
-                true,
-            ),
-            field(
-                vec![
-                    optional_object("proxy"),
-                    optional_object("asset_routes"),
-                    SecretPathSegment::ArrayEach,
-                    optional_object("auth"),
-                    object("secret_access_key"),
-                ],
-                true,
-            ),
-            field(
-                vec![
-                    optional_object("proxy"),
-                    optional_object("asset_routes"),
-                    SecretPathSegment::ArrayEach,
-                    optional_object("auth"),
-                    object("session_token"),
-                ],
-                true,
-            ),
-            field(
-                vec![
-                    object("publisher"),
-                    optional_object("origin_auth"),
-                    object("access_key_id"),
-                ],
-                true,
-            ),
-            field(
-                vec![
-                    object("publisher"),
-                    optional_object("origin_auth"),
-                    object("secret_access_key"),
-                ],
-                true,
-            ),
-            field(
-                vec![
-                    object("publisher"),
-                    optional_object("origin_auth"),
-                    object("session_token"),
-                ],
-                true,
-            ),
         ];
+        // An asset route's `auth` and `[publisher]`'s `origin_auth` take the
+        // same table, so each holds the same three key references.
+        let origin_auth_keys = ["access_key_id", "secret_access_key", "session_token"];
+        fields.extend(origin_auth_keys.map(|key| {
+            field(
+                vec![
+                    optional_object("proxy"),
+                    optional_object("asset_routes"),
+                    SecretPathSegment::ArrayEach,
+                    optional_object("auth"),
+                    object(key),
+                ],
+                true,
+            )
+        }));
+        fields.extend(origin_auth_keys.map(|key| {
+            field(
+                vec![
+                    object("publisher"),
+                    optional_object("origin_auth"),
+                    object(key),
+                ],
+                true,
+            )
+        }));
         // The settings a module declares in its own table, for core's
         // modules and the ones a tool registered for deploy validation.
         let builders = crate::integrations::all_builders(deploy_integrations()).collect::<Vec<_>>();
