@@ -46,7 +46,6 @@ pub fn format_eids(eids: &[trusted_server_core::ec::eids::Eid]) -> Vec<Eid> {
                         serde_json::Value::Object(object) => Some(object.clone()),
                         _ => None,
                     }),
-                    ..Default::default()
                 })
                 .collect(),
             ..Default::default()

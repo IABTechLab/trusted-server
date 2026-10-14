@@ -962,11 +962,14 @@ fn the_driver_builds_what_core_sends_and_classifies_every_answer() {
             outbound
                 .headers
                 .get(header::CONTENT_TYPE)
-                .map(|v| v.as_bytes()),
+                .map(http::HeaderValue::as_bytes),
             Some(b"application/json".as_slice())
         );
         assert_eq!(
-            outbound.headers.get(header::ACCEPT).map(|v| v.as_bytes()),
+            outbound
+                .headers
+                .get(header::ACCEPT)
+                .map(http::HeaderValue::as_bytes),
             Some(b"application/json".as_slice()),
             "the plain implementation asks for JSON"
         );
