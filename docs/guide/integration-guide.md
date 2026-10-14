@@ -336,7 +336,7 @@ and core never names the vendor. The crates in this repository sit under
 `crates/<type>/<vendor>/`, and a vendor's crate can equally live in a
 repository of its own.
 
-`crates/testing/seam-probe` is the worked example. It is a test fixture rather
+`crates/testing/iabtl` is the worked example. It is a test fixture rather
 than something to deploy, and it exercises every part of the seam from a
 vendor crate's position. The round-trip tests in
 `crates/trusted-server-adapter-axum/tests/seam_probe.rs` drive each part
@@ -456,8 +456,8 @@ the request's cookies.
 
 The registry builds only the modules a section selects, so the module that
 supplies one of these has to be selected in its section as well. The probe
-is run with `[testing] modules = ["seam-probe"]` and its geo module is
-selected with `[geo] module = "testing.seam-probe"`. A `[geo] module` or
+is run with `[testing] modules = ["iabtl"]` and its geo module is
+selected with `[geo] module = "testing.iabtl"`. A `[geo] module` or
 `[device] module` naming something no running module supplies refuses
 startup. The message lists the modules of that type the deployment runs, and
 says when the name is a module no section selects or one that supplies no
