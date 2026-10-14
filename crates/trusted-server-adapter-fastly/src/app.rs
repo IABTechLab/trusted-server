@@ -128,7 +128,7 @@ use trusted_server_core::integrations::{
 use trusted_server_core::module_context::ModuleRequest;
 use trusted_server_core::permissions::PermissionState;
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, LoadingCaches, PlatformKvStore, RuntimeServices, StoreName,
+    ClientInfo, GeoInfo, GeoModule, LoadingCaches, PlatformKvStore, RuntimeServices, StoreName,
     build_geo_module,
 };
 use trusted_server_core::proxy::{
@@ -518,6 +518,16 @@ pub(crate) fn build_finalize_services(
         .geo(build_geo_module(settings, Arc::new(FastlyPlatformGeo)))
         .client_info(ClientInfo::default())
         .build()
+}
+
+/// The geo module a response's headers are resolved with: the one `[geo]
+/// module` selects from the registry, and otherwise the host's own lookup or
+/// the disabled module, as `build_geo_module` chooses between them.
+pub(crate) fn finalize_geo_module(state: &AppState) -> Arc<dyn GeoModule> {
+    state
+        .registry
+        .geo_module()
+        .unwrap_or_else(|| build_geo_module(&state.settings, Arc::new(FastlyPlatformGeo)))
 }
 
 fn publisher_fallback_methods() -> [Method; 7] {
@@ -1532,7 +1542,7 @@ impl TrustedServerApp {
         let mut router = RouterService::builder().middleware(
             FinalizeResponseMiddleware::new(
                 Arc::clone(&state.settings),
-                build_geo_module(&state.settings, Arc::new(FastlyPlatformGeo)),
+                finalize_geo_module(state),
                 build_finalize_services(
                     &state.settings,
                     Arc::clone(&state.default_kv_store),

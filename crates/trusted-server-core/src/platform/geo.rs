@@ -87,10 +87,8 @@ impl dyn GeoModule + '_ {
     /// services and the client. One place builds the call, so a module sees
     /// the same evidence on every path that asks for a location.
     ///
-    /// `headers` is `None` on a path the request's headers do not survive to,
-    /// which the Fastly adapter's finalize paths are. Those call the host's
-    /// own lookup through [`PlatformGeoModule`], which reads the address
-    /// alone, and never a module from the registry.
+    /// `headers` is `None` where the caller has no request headers, and a
+    /// module then sees the address alone.
     ///
     /// # Errors
     ///

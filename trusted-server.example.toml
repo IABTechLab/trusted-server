@@ -911,6 +911,7 @@ auction_timeout_ms = 500
 # script_url = "https://ads.example.com/gpt.js"
 # cache_ttl_seconds = 3600
 # rewrite_script = true
+# write_loader = false
 
 # GPT runtime diagnostics browser overlay. Selected manually rather than by
 # `ts audit`, it serves a diagnostics module gated behind an activation query

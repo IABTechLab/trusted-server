@@ -111,10 +111,12 @@ impl Middleware for FinalizeResponseMiddleware {
         };
 
         // The request's view, kept here because the request goes into the
-        // handler and does not come back. The headers are not kept: the
-        // module on this path is the host's own lookup or the disabled one,
-        // chosen by `build_geo_module`, and reads the address alone.
+        // handler and does not come back. The headers are kept too, because
+        // the module on this path is the one `[geo] module` selects, which
+        // may read the request's evidence, and the answer it holds for the
+        // same evidence from earlier in the request is then the one it gives.
         let method = ctx.request().method().clone();
+        let headers = ctx.request().headers().clone();
         let uri = ctx.request().uri().clone();
         let scheme = uri.scheme_str().unwrap_or("https").to_owned();
         let host = ctx
@@ -142,7 +144,7 @@ impl Middleware for FinalizeResponseMiddleware {
             let request = ModuleRequest::new(&method, &host, &scheme, uri.path())
                 .with_query(uri.query().unwrap_or_default());
             self.geo
-                .locate_request(request, None, Some(&self.settings), &services)
+                .locate_request(request, Some(&headers), Some(&self.settings), &services)
                 .await
                 .unwrap_or_else(|e| {
                     log::warn!("geo lookup failed: {e}");
@@ -274,7 +276,8 @@ mod tests {
     use edgezero_core::params::PathParams;
     use error_stack::Report;
     use futures::executor::block_on;
-    use trusted_server_core::platform::{ClientInfo, PlatformError, PlatformGeo};
+    use trusted_server_core::module_context::{FromModuleContext, ModuleCall};
+    use trusted_server_core::platform::{ClientInfo, GeoModule, PlatformError, PlatformGeo};
     use trusted_server_core::response_privacy::apply_inactive_ad_stack_browser_cache_policy;
 
     fn empty_response() -> Response {
@@ -320,6 +323,33 @@ mod tests {
                 .lock()
                 .expect("should lock recorded geo lookups")
                 .push(client_ip);
+            Ok(None)
+        }
+    }
+
+    /// A geo module that records the user agent of the evidence each call
+    /// carries, which only a call made with the request's headers can give.
+    struct RecordingModule {
+        user_agents: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl GeoModule for RecordingModule {
+        fn id(&self) -> &'static str {
+            "recording-module"
+        }
+
+        async fn locate(
+            &self,
+            call: ModuleCall<'_>,
+        ) -> Result<Option<GeoInfo>, Report<PlatformError>> {
+            let evidence =
+                <&dyn trusted_server_core::evidence::RequestInfo>::from_module_context(&call)
+                    .expect("should be called with the request's evidence");
+            self.user_agents
+                .lock()
+                .expect("should lock recorded user agents")
+                .push(evidence.user_agent().to_owned());
             Ok(None)
         }
     }
@@ -661,6 +691,42 @@ mod tests {
             *lookups.lock().expect("should lock recorded geo lookups"),
             vec![Some(reader_ip)],
             "should look up geo using the resolved ClientInfo IP"
+        );
+    }
+
+    #[test]
+    fn finalize_handle_hands_the_geo_module_the_request_headers() {
+        let settings = settings_with_response_headers(vec![]);
+        let user_agents = Arc::new(Mutex::new(Vec::new()));
+        let middleware = FinalizeResponseMiddleware::new(
+            Arc::new(settings),
+            Arc::new(RecordingModule {
+                user_agents: Arc::clone(&user_agents),
+            }),
+            test_finalize_services(),
+        );
+        let mut ctx = empty_ctx();
+        ctx.request_mut().headers_mut().insert(
+            HeaderName::from_static("user-agent"),
+            HeaderValue::from_static("Finalize/1.0"),
+        );
+        ctx.request_mut().extensions_mut().insert(ClientInfo {
+            client_ip: Some(IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 7))),
+            ..ClientInfo::default()
+        });
+        let handler =
+            Arc::new(
+                |_ctx: RequestContext| async move { Ok::<Response, EdgeError>(empty_response()) },
+            );
+
+        block_on(middleware.handle(ctx, Next::new(&[], &*handler))).expect("should succeed");
+
+        assert_eq!(
+            *user_agents
+                .lock()
+                .expect("should lock recorded user agents"),
+            vec!["Finalize/1.0".to_owned()],
+            "should hand the geo module the request's headers as its evidence"
         );
     }
 
