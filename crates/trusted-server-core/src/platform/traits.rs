@@ -2,10 +2,7 @@ use std::net::IpAddr;
 
 use error_stack::Report;
 
-use super::{
-    BackendNamingPolicy, GeoInfo, PlatformBackendSpec, PlatformError, RuntimeServices, StoreId,
-    StoreName,
-};
+use super::{GeoInfo, PlatformBackendSpec, PlatformError, RuntimeServices, StoreId, StoreName};
 
 /// Synchronous, object-safe access to a key-value config store.
 ///
@@ -96,10 +93,12 @@ pub trait PlatformSecretStore: Send + Sync {
 }
 
 /// Synchronous, object-safe dynamic backend management.
+///
+/// The one interface through which the host answers how it names a backend
+/// and how it bounds a transport timer. Startup validation asks the same
+/// implementation the runtime services carry, so the names validation
+/// predicts are the names the host registers.
 pub trait PlatformBackend: Send + Sync {
-    /// Return this adapter's pure backend naming and transport timer policy.
-    fn naming_policy(&self) -> BackendNamingPolicy;
-
     /// Compute the deterministic backend name for the given spec without
     /// registering anything.
     ///
@@ -125,17 +124,30 @@ pub trait PlatformBackend: Send + Sync {
     /// provider's request deadline, so it must be identical for prediction and
     /// registration of the same launch.
     ///
-    /// Adapters that embed the transport timeout in the dynamic backend name
-    /// (Fastly) override this to round budget-derived values to a coarse
-    /// ladder, so per-request wall-clock jitter neither defeats cross-request
-    /// connection pooling nor accumulates registrations toward the per-service
-    /// dynamic backend limit.
-    ///
-    /// Delegates to the same pure policy used by startup validation so runtime
-    /// transport timers and predicted names cannot drift.
+    /// A host that embeds the transport timeout in the backend name overrides
+    /// this to round budget-derived values to a coarse ladder, so per-request
+    /// wall-clock jitter neither defeats cross-request connection pooling nor
+    /// accumulates registrations toward the host's backend limit. The default
+    /// keeps the exact bounded value.
     fn canonicalize_transport_timeout_ms(&self, remaining_ms: u32, configured_ms: u32) -> u32 {
-        self.naming_policy()
-            .canonicalize_transport_timeout_ms(remaining_ms, configured_ms)
+        remaining_ms.min(configured_ms)
+    }
+
+    /// How many backend names the auction may register on this host, or
+    /// `None` where a backend name is not a limited resource.
+    fn auction_backend_budget(&self) -> Option<usize> {
+        None
+    }
+
+    /// How many distinct backend names one provider with this configured
+    /// timeout can reach through [`Self::canonicalize_transport_timeout_ms`].
+    ///
+    /// Plan validation adds every provider's count and refuses a plan that
+    /// could exceed [`Self::auction_backend_budget`]. A host whose names do
+    /// not carry the timer reaches one name per provider.
+    fn transport_timeout_bucket_count(&self, configured_ms: u32) -> usize {
+        let _ = configured_ms;
+        1
     }
 }
 

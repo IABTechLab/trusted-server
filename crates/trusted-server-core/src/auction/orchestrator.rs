@@ -2602,10 +2602,9 @@ mod tests {
         build_services_with_http_client, noop_services,
     };
     use crate::platform::{
-        BackendNamingPolicy, PlatformBackend, PlatformBackendSpec, PlatformConfigStore,
-        PlatformError, PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest,
-        PlatformResponse, PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId,
-        StoreName,
+        PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError,
+        PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
+        PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId, StoreName,
     };
     use crate::test_support::tests::crate_test_settings_str;
     use error_stack::{Report, ResultExt};
@@ -2804,7 +2803,7 @@ mod tests {
             .expect("should compile launch-failure plan"),
         );
         let orchestrator = AuctionOrchestrator::from_plan(plan, None);
-        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
+        let backend = Arc::new(NamingBackend::new());
         backend.fail_ensure_for("launch_fail");
         let http = Arc::new(StubHttpClient::new());
         let services = build_services_with_backend_and_http_client(
@@ -2990,10 +2989,6 @@ mod tests {
     }
 
     impl PlatformBackend for ZeroCanonicalBackend {
-        fn naming_policy(&self) -> BackendNamingPolicy {
-            BackendNamingPolicy::Fastly
-        }
-
         fn predict_name(
             &self,
             _spec: &PlatformBackendSpec,
@@ -3031,18 +3026,11 @@ mod tests {
     }
 
     impl PlatformBackend for FailThenZeroCanonicalBackend {
-        fn naming_policy(&self) -> BackendNamingPolicy {
-            BackendNamingPolicy::Axum
-        }
-
         fn predict_name(
             &self,
             spec: &PlatformBackendSpec,
         ) -> Result<String, Report<PlatformError>> {
-            BackendNamingPolicy::Axum
-                .predict(spec)
-                .map(|prediction| prediction.name)
-                .change_context(PlatformError::Backend)
+            NamingBackend::new().predict_name(spec)
         }
 
         fn ensure(&self, _spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
@@ -3062,10 +3050,6 @@ mod tests {
     struct CollidingBackend;
 
     impl PlatformBackend for CollidingBackend {
-        fn naming_policy(&self) -> BackendNamingPolicy {
-            BackendNamingPolicy::Axum
-        }
-
         fn predict_name(
             &self,
             _spec: &PlatformBackendSpec,
@@ -3597,10 +3581,6 @@ mod tests {
     }
 
     impl PlatformBackend for CanonicalTimeoutBackend {
-        fn naming_policy(&self) -> crate::platform::BackendNamingPolicy {
-            crate::platform::BackendNamingPolicy::Axum
-        }
-
         fn predict_name(
             &self,
             _spec: &PlatformBackendSpec,
@@ -5224,7 +5204,7 @@ mod tests {
     async fn harness_outer_select_error_materializes_all_launches_as_transport_failures() {
         let http = Arc::new(OuterSelectErrorHttpClient::new());
         http.push_response(204, Vec::new());
-        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
+        let backend = Arc::new(NamingBackend::new());
         let services = build_services_with_backend_and_http_client(
             Arc::clone(&backend) as Arc<_>,
             Arc::clone(&http) as Arc<_>,
@@ -5274,7 +5254,7 @@ mod tests {
     async fn planned_dispatch_does_not_snapshot_inbound_headers() {
         let http = Arc::new(StubHttpClient::new());
         http.push_response(204, Vec::new());
-        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
+        let backend = Arc::new(NamingBackend::new());
         let services = build_services_with_backend_and_http_client(
             Arc::clone(&backend) as Arc<_>,
             Arc::clone(&http) as Arc<_>,
@@ -5320,7 +5300,7 @@ mod tests {
         let http = Arc::new(OuterSelectErrorHttpClient::new());
         http.push_response(204, Vec::new());
         http.push_response(204, Vec::new());
-        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
+        let backend = Arc::new(NamingBackend::new());
         let services = build_services_with_backend_and_http_client(
             Arc::clone(&backend) as Arc<_>,
             Arc::clone(&http) as Arc<_>,
@@ -5592,7 +5572,7 @@ mod tests {
                 }))
                 .expect("should serialize provider response"),
             );
-            let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
+            let backend = Arc::new(NamingBackend::new());
             let services = build_services_with_backend_and_http_client(
                 Arc::clone(&backend) as Arc<_>,
                 Arc::clone(&http) as Arc<_>,
@@ -5679,7 +5659,7 @@ mod tests {
             }))
             .expect("should serialize provider response"),
         );
-        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
+        let backend = Arc::new(NamingBackend::new());
         let services = build_services_with_backend_and_http_client(
             Arc::clone(&backend) as Arc<_>,
             Arc::clone(&http) as Arc<_>,
@@ -5742,7 +5722,7 @@ mod tests {
         http.push_response(200, b"{}".to_vec());
         http.push_select_delay(Duration::ZERO);
         http.push_wait_delay(Duration::from_millis(50));
-        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
+        let backend = Arc::new(NamingBackend::new());
         let services = build_services_with_backend_and_http_client(
             Arc::clone(&backend) as Arc<_>,
             Arc::clone(&http) as Arc<_>,
@@ -5807,7 +5787,7 @@ mod tests {
         http.push_response(200, b"{}".to_vec());
         http.push_select_success();
         http.push_wait_error();
-        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
+        let backend = Arc::new(NamingBackend::new());
         let services = build_services_with_backend_and_http_client(
             Arc::clone(&backend) as Arc<_>,
             Arc::clone(&http) as Arc<_>,
@@ -5868,7 +5848,7 @@ mod tests {
                     .expect("should serialize the upstream response"),
                 );
             }
-            let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Fastly));
+            let backend = Arc::new(NamingBackend::new());
             let services = build_services_with_backend_and_http_client(
                 Arc::clone(&backend) as Arc<_>,
                 Arc::clone(&http) as Arc<_>,
@@ -6129,7 +6109,7 @@ mod tests {
             }))
             .expect("should serialize response b"),
         );
-        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Fastly));
+        let backend = Arc::new(NamingBackend::new());
         let services = build_services_with_backend_and_http_client(
             Arc::clone(&backend) as Arc<_>,
             Arc::clone(&http) as Arc<_>,
@@ -6295,7 +6275,7 @@ mod tests {
         http.push_response(204, Vec::new());
         http.push_response(204, Vec::new());
         http.push_pending_backend_name_override(Some("divergent-backend"));
-        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
+        let backend = Arc::new(NamingBackend::new());
         let services = build_services_with_backend_and_http_client(
             Arc::clone(&backend) as Arc<_>,
             Arc::clone(&http) as Arc<_>,
@@ -6342,7 +6322,7 @@ mod tests {
         http.push_response(204, Vec::new());
         http.push_response(204, Vec::new());
         http.push_pending_backend_name_override(None);
-        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
+        let backend = Arc::new(NamingBackend::new());
         let services = build_services_with_backend_and_http_client(
             Arc::clone(&backend) as Arc<_>,
             Arc::clone(&http) as Arc<_>,
@@ -6466,7 +6446,7 @@ mod tests {
     async fn planned_skipped_provider_has_no_io_and_no_zero_impression_launch() {
         let http = Arc::new(StubHttpClient::new());
         http.push_response(204, Vec::new());
-        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
+        let backend = Arc::new(NamingBackend::new());
         let services = build_services_with_backend_and_http_client(
             Arc::clone(&backend) as Arc<_>,
             Arc::clone(&http) as Arc<_>,
@@ -6632,7 +6612,7 @@ mod tests {
         http.push_select_success();
         http.push_select_success();
         http.push_select_error();
-        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
+        let backend = Arc::new(NamingBackend::new());
         backend.fail_ensure_for("launch_fail");
         let services = build_services_with_backend_and_http_client(
             Arc::clone(&backend) as Arc<_>,
@@ -6733,7 +6713,7 @@ mod tests {
         let (profile, provider_id) = ("standard", "standard");
         let http = Arc::new(StubHttpClient::new());
         http.push_response(200, vec![b'x'; 1024 * 1024 + 1]);
-        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
+        let backend = Arc::new(NamingBackend::new());
         let services = build_services_with_backend_and_http_client(
             Arc::clone(&backend) as Arc<_>,
             Arc::clone(&http) as Arc<_>,
@@ -6794,7 +6774,7 @@ mod tests {
             key: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [7_u8; 32])
                 .into_bytes(),
         });
-        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
+        let backend = Arc::new(NamingBackend::new());
         let http = Arc::new(StubHttpClient::new());
         http.push_response(204, Vec::new());
         let services = RuntimeServices::builder()
@@ -6862,7 +6842,7 @@ mod tests {
             key: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [11_u8; 32])
                 .into_bytes(),
         });
-        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
+        let backend = Arc::new(NamingBackend::new());
         let http = Arc::new(StubHttpClient::new());
         http.push_response(204, Vec::new());
         http.push_response(204, Vec::new());
@@ -6927,7 +6907,7 @@ mod tests {
             let config_store = Arc::new(FailingCountingConfigStore {
                 reads: AtomicUsize::new(0),
             });
-            let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
+            let backend = Arc::new(NamingBackend::new());
             let http = Arc::new(StubHttpClient::new());
             let services = RuntimeServices::builder()
                 .config_store(Arc::clone(&config_store) as Arc<_>)
@@ -7018,7 +6998,7 @@ mod tests {
         let config_store = Arc::new(FailingCountingConfigStore {
             reads: AtomicUsize::new(0),
         });
-        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
+        let backend = Arc::new(NamingBackend::new());
         let http = Arc::new(StubHttpClient::new());
         let services = RuntimeServices::builder()
             .config_store(Arc::clone(&config_store) as Arc<_>)
@@ -7076,7 +7056,7 @@ mod tests {
             key: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [13_u8; 32])
                 .into_bytes(),
         });
-        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
+        let backend = Arc::new(NamingBackend::new());
         let http = Arc::new(StubHttpClient::new());
         let services = RuntimeServices::builder()
             .config_store(Arc::clone(&config_store) as Arc<_>)
@@ -7150,7 +7130,7 @@ mod tests {
     async fn planned_fanout_rejection_happens_before_backend_or_send() {
         let http = Arc::new(StubHttpClient::new());
         http.set_concurrent_fanout(false);
-        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Cloudflare));
+        let backend = Arc::new(NamingBackend::new());
         let services = build_services_with_backend_and_http_client(
             Arc::clone(&backend) as Arc<_>,
             Arc::clone(&http) as Arc<_>,
