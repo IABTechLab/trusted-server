@@ -66,6 +66,11 @@ pub(super) struct NextJsDocumentState {
     /// Later captures cannot make its remaining source safe for ordinary GTM.
     pub(super) raw_flight_unclaimed: bool,
     pub(super) raw_qualifier_tail: String,
+    /// A raw channel-1 head may open a T row continued in a later script.
+    pub(super) raw_data_seen: bool,
+    /// Data observed in released source cannot be accounted for by a later buffer.
+    pub(super) raw_data_unclaimed: bool,
+    pub(super) raw_data_tail: String,
     /// Lexical context advances with original parser fragments, never replacements.
     pub(super) flight_lexical: ScriptLexer,
     /// Snapshot at the beginning of a claimed buffer for source-offset matching.
@@ -92,6 +97,9 @@ impl Default for NextJsDocumentState {
             raw_flight_seen: false,
             raw_flight_unclaimed: false,
             raw_qualifier_tail: String::new(),
+            raw_data_seen: false,
+            raw_data_unclaimed: false,
+            raw_data_tail: String::new(),
             flight_lexical: ScriptLexer::default(),
             rsc_lexical_start: ScriptLexer::default(),
         }
@@ -175,13 +183,13 @@ pub(super) fn capture_fragment<'a>(
 
 pub(super) struct NextJsRscStreamProcessorFactory {
     config: Arc<NextJsIntegrationConfig>,
-    transform: Option<fn(&str) -> String>,
+    transform: Option<fn(&str, bool) -> String>,
 }
 
 impl NextJsRscStreamProcessorFactory {
     pub(super) fn new(
         config: Arc<NextJsIntegrationConfig>,
-        transform: Option<fn(&str) -> String>,
+        transform: Option<fn(&str, bool) -> String>,
     ) -> Self {
         Self { config, transform }
     }
@@ -220,7 +228,7 @@ pub(super) struct NextJsRscStreamProcessor {
     group: Vec<CapturedPayload>,
     classifier: RscGroupClassifier,
     rewriter: RscUrlRewriter,
-    transform: Option<fn(&str) -> String>,
+    transform: Option<fn(&str, bool) -> String>,
 }
 
 impl NextJsRscStreamProcessor {
@@ -230,7 +238,7 @@ impl NextJsRscStreamProcessor {
         request_host: String,
         request_scheme: String,
         limit: usize,
-        transform: Option<fn(&str) -> String>,
+        transform: Option<fn(&str, bool) -> String>,
     ) -> Self {
         Self {
             state,
@@ -1206,7 +1214,8 @@ mod tests {
             processor
                 .process_chunk(input.as_bytes(), true)
                 .expect("should restore held-output overflow"),
-            format!("{incomplete}{interstitial}{body}").as_bytes()
+            format!("{incomplete}{interstitial}{body}").as_bytes(),
+            "should restore original payloads and interstitial bytes on overflow"
         );
         let (mut processor, _) = processor_with_payloads(&[body], 1000);
         processor.transform = Some(crate::integrations::google_tag_manager::rewrite_gtm_rsc_span);
@@ -1215,7 +1224,8 @@ mod tests {
                 .process_chunk(&[], true)
                 .expect_err("should reject missing captured placeholder")
                 .to_string()
-                .contains("not present")
+                .contains("not present"),
+            "should report a captured placeholder missing from parser output"
         );
     }
 
