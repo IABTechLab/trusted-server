@@ -8,7 +8,6 @@ use futures::StreamExt as _;
 use http::{HeaderValue, Method, Request, Response, StatusCode, header};
 use serde::{Deserialize, Serialize};
 use std::io::{Cursor, Write};
-use std::sync::Arc;
 use std::time::Duration;
 use web_time::{SystemTime, UNIX_EPOCH};
 
@@ -1199,12 +1198,8 @@ pub async fn handle_asset_proxy_request(
     } else {
         None
     };
-    let mut kept_copy = None;
-    let mut handed_back = None;
+    let mut from_asset_cache = None;
     if let Some(key) = copy_key.as_ref() {
-        let cache = crate::publisher::asset_cache(settings);
-        let address = crate::publisher::asset_address(services, key);
-        let hand_back = crate::publisher::HandBack::new();
         let uri: http::Uri =
             target_url
                 .as_str()
@@ -1212,57 +1207,19 @@ pub async fn handle_asset_proxy_request(
                 .change_context(TrustedServerError::Proxy {
                     message: "invalid asset target URL".to_string(),
                 })?;
-        let fetch = crate::publisher::asset_fetch(
-            Arc::new(crate::publisher::AssetLoad {
-                services: services.clone(),
-                uri,
-                headers: outbound_headers.clone(),
-                backend_name: backend_name.clone(),
-                stream_response,
-                max_lifetime: cache.copies.lifetimes.store,
-            }),
-            hand_back.id,
-        );
-        let not_shareable =
-            bytes::Bytes::from(crate::asset_cache::AssetEntry::NotShareable.encode());
-        let found = crate::source_cache::get_or_fetch(
-            &crate::source_cache::Lookup {
-                services,
-                cache: &cache,
-                address: &address,
-                headers: &outbound_headers,
-                declared: None,
-                not_shareable: &not_shareable,
-            },
-            fetch,
-        )
+        from_asset_cache = crate::publisher::asset_from_cache(&crate::publisher::AssetRequest {
+            settings,
+            services,
+            key,
+            uri: &uri,
+            headers: &outbound_headers,
+            backend_name: &backend_name,
+            stream_response,
+        })
         .await;
-        match found {
-            Ok(crate::source_cache::Found::Copy { value, key }) => {
-                match crate::asset_cache::AssetEntry::decode(&value) {
-                    Ok(crate::asset_cache::AssetEntry::Copy(copy)) => kept_copy = Some(copy),
-                    Ok(crate::asset_cache::AssetEntry::NotShareable) => {
-                        // This request's own load fetched the answer, so it is
-                        // served from that fetch rather than a second one.
-                        handed_back = hand_back.take();
-                    }
-                    Err(miss) => {
-                        log::warn!("asset_cache invalid entry: {miss}; removing it");
-                        services
-                            .loading_cache_for(cache.copies.name)
-                            .remove(services, &cache.copies, &key)
-                            .await;
-                    }
-                }
-            }
-            Ok(crate::source_cache::Found::NoCopies) => handed_back = hand_back.take(),
-            Err(error) => log::warn!("asset_cache load failed: {error}; fetching the origin"),
-        }
     }
 
-    let platform_resp = if let Some(copy) = kept_copy {
-        PlatformResponse::new(copy.into_response(crate::publisher::unix_seconds()))
-    } else if let Some(response) = handed_back {
+    let platform_resp = if let Some(response) = from_asset_cache {
         PlatformResponse::new(response)
     } else {
         let mut platform_req = build_asset_platform_request(
@@ -1306,7 +1263,8 @@ pub async fn handle_asset_proxy_request(
 /// The key an asset route's answer is held under, or nothing for a request
 /// whose answer is not kept: one that is not a `GET`, one carrying
 /// `Authorization`, a conditional header or a range, which a copy cannot
-/// answer, one that names no host, and any request while the cache
+/// answer, one whose `Cache-Control` asks for the origin, as the publisher
+/// path reads it, one that names no host, and any request while the cache
 /// `[cache.assets]` selects keeps nothing. The route's origin and prefix are
 /// part of the key, so two routes to one address keep their own copies.
 fn asset_route_copy_key(
@@ -1315,19 +1273,9 @@ fn asset_route_copy_key(
     route: &ProxyAssetRoute,
     target_url: &url::Url,
 ) -> Option<crate::asset_cache::AssetCacheKey> {
-    const NOT_FROM_A_COPY: [header::HeaderName; 7] = [
-        header::AUTHORIZATION,
-        header::IF_NONE_MATCH,
-        header::IF_MODIFIED_SINCE,
-        header::IF_MATCH,
-        header::IF_UNMODIFIED_SINCE,
-        header::RANGE,
-        header::IF_RANGE,
-    ];
     if req.method() != Method::GET
-        || NOT_FROM_A_COPY
-            .iter()
-            .any(|name| req.headers().contains_key(name))
+        || req.headers().contains_key(header::AUTHORIZATION)
+        || crate::publisher::request_bypasses_template_cache(req.headers())
     {
         return None;
     }
@@ -5176,23 +5124,10 @@ mod tests {
     /// for the next.
     fn asset_route_services(
         stub: &Arc<crate::platform::test_support::StubHttpClient>,
-        cache: &Arc<crate::platform::test_support::LifetimeRecordingCache>,
+        cache: &Arc<crate::platform::test_support::MemoryLoadingCache>,
     ) -> RuntimeServices {
-        RuntimeServices::builder()
-            .config_store(Arc::new(crate::platform::test_support::NoopConfigStore))
-            .secret_store(Arc::new(crate::platform::test_support::NoopSecretStore))
-            .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
-            .backend(Arc::new(crate::platform::test_support::StubBackend))
-            .http_client(Arc::clone(stub) as _)
-            .geo(Arc::new(crate::platform::PlatformGeoModule::new(
-                "noop",
-                Arc::new(crate::platform::test_support::NoopGeo),
-            )))
-            .client_info(crate::platform::ClientInfo::default())
-            .loading_caches(Arc::new(crate::platform::LoadingCaches::every(
-                Arc::clone(cache) as _,
-            )))
-            .build()
+        build_services_with_http_client(Arc::clone(stub) as _)
+            .with_loading_cache(Arc::clone(cache) as _)
     }
 
     fn held_asset_stub() -> Arc<crate::platform::test_support::StubHttpClient> {
@@ -5230,7 +5165,7 @@ mod tests {
         futures::executor::block_on(async {
             let stub = held_asset_stub();
             shareable_stylesheet(&stub);
-            let cache = Arc::new(crate::platform::test_support::LifetimeRecordingCache::default());
+            let cache = Arc::new(crate::platform::test_support::MemoryLoadingCache::default());
             let services = asset_route_services(&stub, &cache);
             let uri = "https://www.example.com/.images/site.css";
 
@@ -5260,7 +5195,7 @@ mod tests {
                 matches!(second.into_body(), EdgeBody::Once(bytes) if bytes.as_ref() == b"body { color: red }"),
                 "should serve the copy's bytes"
             );
-            let lifetimes = cache.copy_lifetimes();
+            let lifetimes = crate::platform::test_support::asset_copy_lifetimes(&cache);
             assert!(
                 lifetimes.len() == 1
                     && lifetimes[0] > std::time::Duration::from_secs(295)
@@ -5285,7 +5220,7 @@ mod tests {
                     ],
                 );
             }
-            let cache = Arc::new(crate::platform::test_support::LifetimeRecordingCache::default());
+            let cache = Arc::new(crate::platform::test_support::MemoryLoadingCache::default());
             let services = asset_route_services(&stub, &cache);
             let uri = "https://www.example.com/.images/site.css";
 
@@ -5299,7 +5234,10 @@ mod tests {
                 2,
                 "should ask the origin for each request of an answer that set a cookie"
             );
-            assert!(cache.copy_lifetimes().is_empty(), "should keep no copy");
+            assert!(
+                crate::platform::test_support::asset_copy_lifetimes(&cache).is_empty(),
+                "should keep no copy"
+            );
         });
     }
 
@@ -5309,7 +5247,7 @@ mod tests {
             let stub = held_asset_stub();
             shareable_stylesheet(&stub);
             shareable_stylesheet(&stub);
-            let cache = Arc::new(crate::platform::test_support::LifetimeRecordingCache::default());
+            let cache = Arc::new(crate::platform::test_support::MemoryLoadingCache::default());
             let services = asset_route_services(&stub, &cache);
             let uri = "https://www.example.com/.images/site.css";
 
@@ -5325,6 +5263,34 @@ mod tests {
                 2,
                 "should ask the origin for a range, which a copy cannot answer"
             );
+        });
+    }
+
+    #[test]
+    fn a_request_asking_for_the_origin_through_an_asset_route_is_not_served_a_copy() {
+        futures::executor::block_on(async {
+            for cache_control in ["no-cache", "no-store", "min-fresh=10"] {
+                let stub = held_asset_stub();
+                shareable_stylesheet(&stub);
+                shareable_stylesheet(&stub);
+                let cache = Arc::new(crate::platform::test_support::MemoryLoadingCache::default());
+                let services = asset_route_services(&stub, &cache);
+                let uri = "https://www.example.com/.images/site.css";
+
+                asset_route_answer(&services, build_http_request(Method::GET, uri)).await;
+                let mut reload = build_http_request(Method::GET, uri);
+                reload.headers_mut().insert(
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static(cache_control),
+                );
+                asset_route_answer(&services, reload).await;
+
+                assert_eq!(
+                    stub.recorded_request_uris().len(),
+                    2,
+                    "should ask the origin for a request carrying Cache-Control {cache_control}"
+                );
+            }
         });
     }
 

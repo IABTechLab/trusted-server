@@ -85,14 +85,7 @@ pub struct Publisher {
     #[serde(default = "default_max_buffered_body_bytes")]
     #[validate(range(min = 1, message = "must be at least 1 byte"))]
     pub max_buffered_body_bytes: usize,
-    /// Optional signing of every publisher origin request, for an origin such
-    /// as private object storage that answers only signed reads.
-    ///
-    /// Takes the same table as an asset route's `auth` and signs with the same
-    /// signer. A signed request carries none of the reader's credentials,
-    /// referrer, conditional validators or range, and only `GET` and `HEAD`
-    /// are signed. Left out of the serialized settings when unset, so a
-    /// document without it serializes as one written before it existed.
+    /// Optional signing of publisher origin reads, taking an asset route's `auth` table.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_auth: Option<AssetOriginAuth>,
     /// Optional file name added to a request path that ends in `/` on the way

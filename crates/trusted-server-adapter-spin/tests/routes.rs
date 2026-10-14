@@ -12,8 +12,9 @@ use edgezero_core::app::Hooks as _;
 use edgezero_core::http::{Request, Response, request_builder};
 use edgezero_core::router::RouterService;
 use trusted_server_adapter_spin::app::TrustedServerApp;
-use trusted_server_core::addressing::{Addressing, RequestAddress, RequestAddressing};
+use trusted_server_core::addressing::ByHostAddressing;
 use trusted_server_core::settings::Settings;
+use trusted_server_core::test_support::addressing::{FirstSegment, status_and_type};
 
 /// Build the full application router from explicit test settings.
 ///
@@ -1008,51 +1009,6 @@ async fn a_response_carries_no_blanket_rule_without_the_section() {
     assert_eq!(robots_tag(&response), None);
 }
 
-/// A request addressing that continues `/<segment>/<rest>` at `/<rest>`, as
-/// a deployment serving publishers under a path of their own would.
-struct FirstSegment;
-
-impl RequestAddressing for FirstSegment {
-    fn address(&self, _host: Option<&str>, path: &str) -> Addressing {
-        let rest = path.strip_prefix('/').unwrap_or(path);
-        let (segment, tail) = rest.split_once('/').unwrap_or((rest, ""));
-        let address = RequestAddress::new(
-            vec![segment.to_owned()],
-            format!("/{tail}"),
-            format!("/{segment}"),
-        )
-        .expect("should name a valid continuing path");
-        Addressing::Addressed(address)
-    }
-}
-
-/// A request addressing that leaves every request as it is.
-struct AnswersByHost;
-
-impl RequestAddressing for AnswersByHost {
-    fn address(&self, _host: Option<&str>, _path: &str) -> Addressing {
-        Addressing::ByHost
-    }
-}
-
-/// The status and content type `router` answers a GET for `uri` with.
-async fn status_and_type(router: RouterService, uri: &str) -> (u16, String) {
-    let req = request_builder()
-        .method("GET")
-        .uri(uri)
-        .header("host", "front.example")
-        .body(edgezero_core::body::Body::empty())
-        .expect("should build request");
-    let resp = route(router, req).await;
-    let content_type = resp
-        .headers()
-        .get("content-type")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .to_owned();
-    (resp.status().as_u16(), content_type)
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_request_addressing_continues_the_request_at_its_path_before_routing() {
     let router =
@@ -1069,7 +1025,7 @@ async fn a_request_addressing_continues_the_request_at_its_path_before_routing()
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_request_addressed_by_host_is_routed_as_it_is() {
     let router =
-        TrustedServerApp::routes_with_addressing(test_settings(), &[], Arc::new(AnswersByHost))
+        TrustedServerApp::routes_with_addressing(test_settings(), &[], Arc::new(ByHostAddressing))
             .expect("should build router with a request addressing");
 
     assert_eq!(
