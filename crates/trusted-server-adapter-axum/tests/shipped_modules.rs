@@ -168,6 +168,7 @@ fn every_linked_module_rejects_a_setting_it_does_not_know() {
     use serde_json::json;
     use trusted_server_core::config::validate_settings_for_deploy_with;
     use trusted_server_core::module_name::short_form;
+    use trusted_server_core::settings::SHARED_TYPE;
     use trusted_server_core::test_support::tests::create_test_settings;
 
     let linked = shipped_module_builders();
@@ -175,24 +176,31 @@ fn every_linked_module_rejects_a_setting_it_does_not_know() {
         .iter()
         .filter(|builder| builder.supplies_integration())
     {
-        let name = builder
-            .module_name()
-            .expect("every linked page module names itself");
-        let section = builder
-            .section()
-            .expect("every linked page module has a section");
         let mut settings = create_test_settings();
-        settings
-            .insert_module_config(section, name, &json!({ "no_such_setting": true }))
-            .expect("should insert the planted table");
+        let (name, table) = if let Some(vendor) = builder.shared_settings() {
+            settings.shared =
+                serde_json::from_value(json!({ vendor: { "no_such_setting": true } }))
+                    .expect("should plant the shared table");
+            (builder.id(), format!("[{SHARED_TYPE}.{vendor}]"))
+        } else {
+            let name = builder
+                .module_name()
+                .expect("every linked page module names itself");
+            let section = builder
+                .section()
+                .expect("every linked page module has a section");
+            settings
+                .insert_module_config(section, name, &json!({ "no_such_setting": true }))
+                .expect("should insert the planted table");
+            (name, format!("[{section}.{}]", short_form(section, name)))
+        };
 
         let error = match validate_settings_for_deploy_with(&settings, &linked) {
             Ok(()) => panic!("`{name}` should refuse a setting it does not know"),
             Err(error) => format!("{error:?}"),
         };
-        let written = short_form(section, name);
         assert!(
-            error.contains(&format!("[{section}.{written}]")) && error.contains("no_such_setting"),
+            error.contains(&table) && error.contains("no_such_setting"),
             "`{name}` should name its table and the unknown setting: {error}"
         );
     }
