@@ -191,7 +191,9 @@ fn flight_url_token_end(
 ///
 /// Call only after original T-record boundaries are known, before lengths are
 /// recomputed. Originals used for fallback must never pass through this function.
-pub(crate) fn rewrite_gtm_rsc_span(content: &str) -> String {
+/// `record_text` marks exactly one complete T-record body. Other spans can start
+/// mid-URL at a payload-script boundary and must not be routed as whole URLs.
+pub(crate) fn rewrite_gtm_rsc_span(content: &str, record_text: bool) -> String {
     fn route(token: &str) -> Option<String> {
         let captures = GTM_RSC_WHOLE_URL_PATTERN.captures(token)?;
         let slash = &captures["slash"];
@@ -201,7 +203,7 @@ pub(crate) fn rewrite_gtm_rsc_span(content: &str) -> String {
             "{slash}integrations{slash}google_tag_manager{path}{suffix}"
         ))
     }
-    if let Some(rewritten) = route(content) {
+    if record_text && let Some(rewritten) = route(content) {
         return rewritten;
     }
     let mut rewritten = String::with_capacity(content.len());
@@ -448,10 +450,24 @@ pub struct GoogleTagManagerIntegration {
     proxy_allowed_domains: Vec<String>,
 }
 
+/// Response-local script buffering; raw fallback never transforms held source.
 #[derive(Default)]
 struct GtmScriptState {
+    /// Withheld fragments, retained in source order until completion or fallback.
     held: String,
+    /// An oversized script passes through until its final text fragment.
     bypass_until_last: bool,
+}
+
+impl GtmScriptState {
+    fn release(&mut self, content: &str) -> ScriptRewriteAction {
+        if self.held.is_empty() {
+            return ScriptRewriteAction::Keep;
+        }
+        let mut restored = std::mem::take(&mut self.held);
+        restored.push_str(content);
+        ScriptRewriteAction::Replace(restored)
+    }
 }
 
 impl GoogleTagManagerIntegration {
@@ -1126,12 +1142,7 @@ impl IntegrationScriptRewriter for GoogleTagManagerIntegration {
             if ctx.is_last_in_text_node {
                 state.bypass_until_last = false;
             }
-            if state.held.is_empty() {
-                return ScriptRewriteAction::Keep;
-            }
-            let mut restored = std::mem::take(&mut state.held);
-            restored.push_str(content);
-            return ScriptRewriteAction::Replace(restored);
+            return state.release(content);
         }
         if state.bypass_until_last {
             if ctx.is_last_in_text_node {
@@ -1144,6 +1155,7 @@ impl IntegrationScriptRewriter for GoogleTagManagerIntegration {
         if state.held.is_empty() && !might_contain_gtm_prefix(content) {
             return ScriptRewriteAction::Keep;
         }
+        // The cap also applies to a single final fragment with no held bytes.
         if state
             .held
             .len()
@@ -1151,12 +1163,7 @@ impl IntegrationScriptRewriter for GoogleTagManagerIntegration {
             .is_none_or(|length| length > ctx.max_buffered_script_bytes)
         {
             state.bypass_until_last = !ctx.is_last_in_text_node;
-            if state.held.is_empty() {
-                return ScriptRewriteAction::Keep;
-            }
-            let mut restored = std::mem::take(&mut state.held);
-            restored.push_str(content);
-            return ScriptRewriteAction::Replace(restored);
+            return state.release(content);
         }
         if !ctx.is_last_in_text_node {
             state.held.push_str(content);
@@ -3559,7 +3566,7 @@ container_id = "GTM-DEFAULT"
                             for slash in ["/", r"\/", r"\\/"] {
                                 let flight_source = source.replace('/', slash);
                                 assert_eq!(
-                                    rewrite_gtm_rsc_span(&flight_source),
+                                    rewrite_gtm_rsc_span(&flight_source, true),
                                     expected.replace('/', slash),
                                     "should preserve Flight routing policy and escapes: {flight_source}"
                                 );
@@ -3569,6 +3576,27 @@ container_id = "GTM-DEFAULT"
                 }
             }
         }
+    }
+
+    #[test]
+    fn whole_flight_url_routing_requires_a_complete_record_body() {
+        let url = "//www.googletagmanager.com/gtm.js?id=GTM-MIX1";
+        assert_eq!(
+            rewrite_gtm_rsc_span(url, false),
+            url,
+            "should preserve a possible mid-URL payload fragment"
+        );
+        assert_eq!(
+            rewrite_gtm_rsc_span(url, true),
+            "/integrations/google_tag_manager/gtm.js?id=GTM-MIX1",
+            "should still route a whole T-record URL"
+        );
+        let fragment = r#"//www.googletagmanager.com/gtm.js?id=GTM-MIX1\",\"href\":\"https://example.com/p\"}\n"#;
+        assert_eq!(
+            rewrite_gtm_rsc_span(fragment, false),
+            fragment,
+            "should not absorb trailing model source into a whole URL"
+        );
     }
 
     #[test]
@@ -3604,7 +3632,7 @@ container_id = "GTM-DEFAULT"
             ),
         ] {
             assert_eq!(
-                rewrite_gtm_rsc_span(source),
+                rewrite_gtm_rsc_span(source, false),
                 expected,
                 "should preserve query delimiters and template interpolation: {source}"
             );
@@ -3622,7 +3650,7 @@ container_id = "GTM-DEFAULT"
                     "{quote}{slash}integrations{slash}google_tag_manager{slash}gtm.js{quote}"
                 );
                 assert_eq!(
-                    rewrite_gtm_rsc_span(&source),
+                    rewrite_gtm_rsc_span(&source, true),
                     expected,
                     "should preserve source escape layer: {source}"
                 );
@@ -3633,11 +3661,11 @@ container_id = "GTM-DEFAULT"
             "text http://www.googletagmanager.com/gtm.js text",
             "'http://www.googletagmanager.com/gtm.js/path'",
             "'http://www.googletagmanager.com/collect;matrix'",
-            "'http://www.googletagmanager.com.evil/gtm.js'",
+            "'http://www.googletagmanager.com.evil/gtm.js'", // allow-domain: www.googletagmanager.com.evil
             "'http://www.googletagmanager.com/gtm.js\"",
         ] {
             assert_eq!(
-                rewrite_gtm_rsc_span(source),
+                rewrite_gtm_rsc_span(source, true),
                 source,
                 "should not route unsupported or unbounded token"
             );
@@ -3676,7 +3704,10 @@ container_id = "GTM-DEFAULT"
                 .expect("should consume final"),
         );
         let html = String::from_utf8(bytes).expect("should emit UTF-8");
-        assert!(html.contains("var url='/integrations/google_tag_manager/gtm.js';var tail_=1;"));
+        assert!(
+            html.contains("var url='/integrations/google_tag_manager/gtm.js';var tail_=1;"),
+            "should rewrite the GTM URL and preserve trailing script source"
+        );
         assert_eq!(
             html.matches("var url=").count(),
             1,
@@ -3713,7 +3744,8 @@ container_id = "GTM-DEFAULT"
         }
         assert_eq!(
             emitted,
-            "var falsePrefix='googleX';first=1;second=2;var tag='/integrations/google_tag_manager/gtm.js';last=3;"
+            "var falsePrefix='googleX';first=1;second=2;var tag='/integrations/google_tag_manager/gtm.js';last=3;",
+            "should release a false prefix and later rewrite the complete GTM URL"
         );
     }
 
@@ -3763,7 +3795,8 @@ container_id = "GTM-DEFAULT"
         );
         assert_eq!(
             IntegrationScriptRewriter::rewrite(&*integration, "google", &context(false, 6, &a)),
-            ScriptRewriteAction::RemoveNode
+            ScriptRewriteAction::RemoveNode,
+            "should hold the first bounded fragment for this document"
         );
         assert_eq!(
             IntegrationScriptRewriter::rewrite(&*integration, "X", &context(false, 6, &a)),
@@ -3772,11 +3805,13 @@ container_id = "GTM-DEFAULT"
         );
         assert_eq!(
             IntegrationScriptRewriter::rewrite(&*integration, "tail", &context(true, 6, &a)),
-            ScriptRewriteAction::Keep
+            ScriptRewriteAction::Keep,
+            "should pass through the final fragment after size fallback"
         );
         assert_eq!(
             IntegrationScriptRewriter::rewrite(&*integration, "google", &context(false, 6, &a)),
-            ScriptRewriteAction::RemoveNode
+            ScriptRewriteAction::RemoveNode,
+            "should start fresh buffering after the previous script finishes"
         );
         assert_eq!(
             IntegrationScriptRewriter::rewrite(&*integration, "", &context(true, 6, &a)),

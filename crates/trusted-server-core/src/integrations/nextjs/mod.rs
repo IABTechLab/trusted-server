@@ -112,7 +112,8 @@ pub fn register(
             "google_tag_manager",
         )?
         .map(|_| {
-            crate::integrations::google_tag_manager::rewrite_gtm_rsc_span as fn(&str) -> String
+            crate::integrations::google_tag_manager::rewrite_gtm_rsc_span
+                as fn(&str, bool) -> String
         });
     let stream_processor = Arc::new(NextJsRscStreamProcessorFactory::new(
         config.clone(),
@@ -222,6 +223,15 @@ mod tests {
         compression: Compression,
         chunk_size: usize,
     ) -> String {
+        html_output_with_compression(html, mixed_config(100000, 100000), compression, chunk_size)
+    }
+
+    fn html_output_with_compression(
+        html: &str,
+        config: HtmlProcessorConfig,
+        compression: Compression,
+        chunk_size: usize,
+    ) -> String {
         let input = if compression == Compression::Gzip {
             let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
             encoder
@@ -237,7 +247,7 @@ mod tests {
                 output_compression: compression,
                 chunk_size,
             },
-            create_html_processor(mixed_config(100000, 100000)),
+            create_html_processor(config),
         );
         let mut output = Vec::new();
         pipeline
@@ -255,9 +265,12 @@ mod tests {
     }
 
     #[test]
-    fn non_code_flight_spellings_preserve_source_and_later_flight_rewrites() {
+    fn non_code_flight_hints_preserve_source_and_data_heads_bypass_later_flight() {
         let payload = "0:{\"url\":\"https://origin.example.com/page\"}\n";
         let flight = flight_html(&[payload]);
+        let opaque = format!("const value={}0{};", "{a:".repeat(33), "}".repeat(33));
+        let opaque_hint = format!("{opaque}var hint=\"self.__next_f.push(\";");
+        let opaque_data = format!("{opaque}var hint=\"self.__next_f.push([1,\";");
         for prefix in [
             r#"const demo="self.__next_f.push(";"#,
             r#"const demo='self.__next_f.push([1,"1:T7,example"])';"#,
@@ -273,6 +286,8 @@ mod tests {
             "const demo=`self.__next_f.push(`;",
             "const demo=`outer ${`inner self.__next_f.push(`}`;",
             r"const demo=`escaped\` self.__next_f.push( \${self.__next_f.push(}`;",
+            opaque_hint.as_str(),
+            opaque_data.as_str(),
         ] {
             for split in 0..=prefix.len() {
                 let mut processor = create_html_processor(mixed_config(10000, 10000));
@@ -294,9 +309,14 @@ mod tests {
                     output.contains(&format!("<script>{prefix}const tag='https://www.googletagmanager.com/gtm.js';</script>")),
                     "should conservatively retain GTM beside inert Flight at split {split}: {output}"
                 );
+                let host = if prefix.contains("[1,") {
+                    "origin.example.com"
+                } else {
+                    "test.example.com"
+                };
                 assert!(
-                    output.contains(r#"\"url\":\"https://test.example.com/page\""#),
-                    "should still rewrite later real Flight at split {split}: {output}"
+                    output.contains(&format!(r#"\"url\":\"https://{host}/page\""#)),
+                    "should bypass later Flight only for data heads at split {split}: {output}"
                 );
                 assert!(
                     !output.contains("__ts_rsc_"),
@@ -314,7 +334,7 @@ mod tests {
         for (source, expected) in [
             (
                 format!("{fake}{push};/* self.__next_f.push( */"),
-                format!("{fake}{rewritten_push};/* self.__next_f.push( */"),
+                format!("{fake}{push};/* self.__next_f.push( */"),
             ),
             (
                 format!("if (ready) {{ work() }} /self.__next_f.push()/;{push};"),
@@ -394,13 +414,19 @@ mod tests {
                         .expect("should complete Flight after division"),
                 );
                 let output = String::from_utf8(bytes).expect("should emit UTF-8");
-                assert!(output.starts_with(&format!("<script>{prefix}")));
+                assert!(
+                    output.starts_with(&format!("<script>{prefix}")),
+                    "should preserve the publisher prefix verbatim"
+                );
                 let payloads = flight_payloads(&output);
                 assert_eq!(payloads.len(), 2, "should emit each real Flight push once");
                 for payload in payloads {
                     assert_mixed_t_model(&payload, &expected);
                 }
-                assert!(!output.contains("__ts_rsc_"));
+                assert!(
+                    !output.contains("__ts_rsc_"),
+                    "should resolve every generated placeholder"
+                );
             }
             let html = format!("<script>{source}</script><script>{push}</script>");
             for compression in [Compression::None, Compression::Gzip] {
@@ -415,14 +441,17 @@ mod tests {
                     for payload in payloads {
                         assert_mixed_t_model(&payload, &expected);
                     }
-                    assert!(!output.contains("__ts_rsc_"));
+                    assert!(
+                        !output.contains("__ts_rsc_"),
+                        "should resolve every generated placeholder"
+                    );
                 }
             }
         }
     }
 
     #[test]
-    fn lexer_false_negatives_preserve_raw_flight_and_later_rewrites() {
+    fn lexer_false_negatives_bypass_later_flight_and_restore_queued_originals() {
         let data = json!({"url": "https://origin.example.com/page", "tag": "http://www.googletagmanager.com/gtm.js?id=GTM-MIX1", "text": "é😀"});
         let body = data.to_string();
         let payload = format!("1:T{:x},{body}", body.len());
@@ -453,10 +482,16 @@ mod tests {
                         payloads[missed], payload,
                         "should retain missed Flight bytes and lengths: {prefix}"
                     );
-                    if missed != 0 {
+                    // A complete earlier row may already have streamed. If it
+                    // was still queued when bypass began, it must remain raw.
+                    if missed != 0 && payloads[0] != payload {
                         assert_mixed_t_model(&payloads[0], &rewritten);
                     }
-                    assert_mixed_t_model(&payloads[missed + 1], &rewritten);
+                    assert_eq!(
+                        payloads[missed + 1],
+                        payload,
+                        "should bypass every later Flight push"
+                    );
                     assert!(!output.contains("__ts_rsc_"), "should resolve all captures");
                 };
                 for split in (0..=source.len()).filter(|split| source.is_char_boundary(*split)) {
@@ -488,6 +523,85 @@ mod tests {
     }
 
     #[test]
+    fn missed_data_head_bypasses_continued_rows_in_nextjs_only_and_mixed_responses() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config("nextjs", &json!({"enabled": true}))
+            .expect("should enable Next.js alone");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(crate::auction::compile_auction_plan(&settings).expect("should compile plan")),
+        )
+        .expect("should create registry");
+        let nextjs = config_from_settings(&settings, &registry);
+        let data = json!({"url": "https://origin.example.com/page", "tag": "http://www.googletagmanager.com/gtm.js?id=GTM-MIX1", "text": "é😀"});
+        let body = data.to_string();
+        let row = format!("1:T{:x},{body}\n", body.len());
+        let split = row.find("https:").expect("should locate origin scheme") + 2;
+        let push = |payload: &str| {
+            format!(
+                "self.__next_f.push([1,{}]);",
+                serde_json::to_string(payload).expect("should serialize Flight")
+            )
+        };
+        for (mixed, config) in [(false, nextjs), (true, mixed_config(100000, 100000))] {
+            let mut rewritten = data.clone();
+            rewritten["url"] = json!("https://test.example.com/page");
+            if mixed {
+                rewritten["tag"] = json!("/integrations/google_tag_manager/gtm.js?id=GTM-MIX1");
+            }
+            let rewritten_body = rewritten.to_string();
+            let rewritten_row = format!("1:T{:x},{rewritten_body}\n", rewritten_body.len());
+            for (prefix, rewritable) in [
+                ("", true),
+                ("var ok=1;", true),
+                ("foo: { bar() } /'/.test(s);", false),
+                ("switch (k) { case 1: {} /'/.test(s) }", false),
+                ("const f = () => {}\n/'/.test(s);", false),
+                ("const o = {while: (a) / 2, b: '/'};", false),
+                ("for (const m of /'/g.exec(s) || []) {}", false),
+            ] {
+                for queued in [false, true] {
+                    // An earlier captured partial row must be restored, even if
+                    // its placeholder reached the downstream processor already.
+                    let (leading, start) = if queued {
+                        (format!("<script>{}</script>", push(&row[..8])), 8)
+                    } else {
+                        (String::new(), 0)
+                    };
+                    let html = format!(
+                        "<html><body>{leading}<script>{prefix}{}</script><script>{}</script><script>{}</script></body></html>",
+                        push(&row[start..split]),
+                        push(&row[split..]),
+                        push(&row),
+                    );
+                    let expected = if rewritable { &rewritten_row } else { &row };
+                    for compression in [Compression::None, Compression::Gzip] {
+                        for chunk_size in [16, 32, 8192] {
+                            let output = html_output_with_compression(
+                                &html,
+                                config.clone(),
+                                compression,
+                                chunk_size,
+                            );
+                            assert_eq!(
+                                flight_payloads(&output).concat(),
+                                expected.repeat(2),
+                                "should preserve lengths and queued originals: {prefix}, queued={queued}, mixed={mixed}"
+                            );
+                            assert!(
+                                !output.contains("__ts_rsc_"),
+                                "should resolve every placeholder on fallback"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn raw_flight_protection_survives_lexer_resynchronization_and_capture() {
         let missed_body = "`http://www.googletagmanager.com/gtm.js`";
         let missed_payload = format!("1:T{:x},{missed_body}", missed_body.len());
@@ -502,9 +616,7 @@ mod tests {
             serde_json::to_string(&format!("1:T{:x},{body}", body.len()))
                 .expect("should encode capturable Flight")
         );
-        let mut expected = data;
-        expected["url"] = json!("https://test.example.com/page");
-        expected["tag"] = json!("/integrations/google_tag_manager/gtm.js?id=GTM-MIX1");
+        let original_payload = format!("1:T{:x},{body}", body.len());
         let source = format!("foo: {{ bar() }} /'/.test(s);{missed_push} /'/.test(s);{push}");
         let assert_output = |output: &str, boundary: usize| {
             let payloads = flight_payloads(output);
@@ -517,8 +629,14 @@ mod tests {
                 payloads[0], missed_payload,
                 "should preserve raw continuation at boundary {boundary}"
             );
-            assert_mixed_t_model(&payloads[1], &expected);
-            assert_mixed_t_model(&payloads[2], &expected);
+            assert_eq!(
+                payloads[1], original_payload,
+                "should retain later raw Flight"
+            );
+            assert_eq!(
+                payloads[2], original_payload,
+                "should bypass the next script"
+            );
             assert!(
                 !output.contains("__ts_rsc_"),
                 "should resolve safe captures"
@@ -572,6 +690,73 @@ mod tests {
                     .expect("should finish later safe captures"),
             );
             assert_output(&String::from_utf8(bytes).expect("should emit UTF-8"), split);
+        }
+    }
+
+    #[test]
+    fn complete_form_state_preserves_metadata_and_allows_later_flight_rewrites() {
+        let data = json!({"url": "https://origin.example.com/page", "tag": "http://www.googletagmanager.com/gtm.js?id=GTM-MIX1"});
+        let body = data.to_string();
+        let row = format!("1:T{:x},{body}", body.len());
+        let split = row.find("https:").expect("should locate scheme") + 2;
+        let flight = flight_html(&[&row[..split], &row[split..]]);
+        let mut expected = data;
+        expected["url"] = json!("https://test.example.com/page");
+        expected["tag"] = json!("/integrations/google_tag_manager/gtm.js?id=GTM-MIX1");
+        for form_state in [
+            json!([{"message": "Saved"}, "k1", "7f3a", 0]),
+            json!({"nested": [{"quoted": "\" ) ]; self.__next_f.push([1,", "url": "https://origin.example.com/form", "tag": "http://www.googletagmanager.com/gtm.js"}], "text": "é😀"}),
+            json!("1:T40,'http://www.googletagmanager.com/gtm.js'"),
+        ] {
+            let bootstrap = format!(
+                "(self.__next_f=self.__next_f||[]).push([0]);self.__next_f.push([2,{form_state}]);"
+            );
+            let html = format!("<script>{bootstrap}</script>{flight}");
+            for compression in [Compression::None, Compression::Gzip] {
+                for chunk_size in [16, 32, 8192] {
+                    let output = mixed_output_with_compression(&html, compression, chunk_size);
+                    assert!(
+                        output.contains(&bootstrap),
+                        "should preserve form-state bytes verbatim"
+                    );
+                    let (_, later_output) = output
+                        .split_once("</script>")
+                        .expect("should retain the bootstrap script");
+                    assert_mixed_t_model(&flight_payloads(later_output).concat(), &expected);
+                    assert!(
+                        !output.contains("__ts_rsc_"),
+                        "should resolve later captures"
+                    );
+                }
+            }
+        }
+        for arguments in [
+            r#"[2,{"message":"Saved"}"#,
+            r#"[2,{"message":"Saved"},"extra"]"#,
+            "[2,computeFormState()]",
+            r#"[2,{'message':'Saved'}]"#,
+            r#"[3,"AAECAw=="]"#,
+        ] {
+            let unsupported = format!("self.__next_f.push({arguments});");
+            let html = format!("<script>{unsupported}</script>{flight}");
+            for compression in [Compression::None, Compression::Gzip] {
+                for chunk_size in [16, 8192] {
+                    let output = mixed_output_with_compression(&html, compression, chunk_size);
+                    assert!(
+                        output.contains(&unsupported),
+                        "should preserve unsupported arguments"
+                    );
+                    assert_eq!(
+                        flight_payloads(&output).concat(),
+                        row,
+                        "should retain raw later Flight"
+                    );
+                    assert!(
+                        !output.contains("__ts_rsc_"),
+                        "should release original queued source"
+                    );
+                }
+            }
         }
     }
 
@@ -642,7 +827,8 @@ mod tests {
             expected["tag"] = json!("/integrations/google_tag_manager/gtm.js");
             assert_eq!(
                 serde_json::from_str::<serde_json::Value>(source).expect("should retain JSON"),
-                expected
+                expected,
+                "should preserve valid JSON and rewrite the expected model"
             );
             assert!(
                 output.ends_with(
@@ -833,7 +1019,8 @@ mod tests {
         );
         assert_eq!(
             &serde_json::from_str::<serde_json::Value>(body).expect("should retain model JSON"),
-            expected
+            expected,
+            "should retain the complete expected Flight model"
         );
     }
 
@@ -868,8 +1055,14 @@ mod tests {
                     let payloads = flight_payloads(&output);
                     assert_eq!(payloads.len(), 1, "should emit payload exactly once");
                     assert_mixed_t_model(&payloads[0], &expected);
-                    assert!(!output.contains("__ts_rsc_"));
-                    assert!(output.ends_with("<p>suffix</p></body></html>"));
+                    assert!(
+                        !output.contains("__ts_rsc_"),
+                        "should resolve every generated placeholder"
+                    );
+                    assert!(
+                        output.ends_with("<p>suffix</p></body></html>"),
+                        "should retain the complete trailing HTML suffix"
+                    );
                 }
             }
         }
@@ -895,11 +1088,12 @@ mod tests {
             let (header, transformed) = payloads[0].split_once(',').expect("should retain T");
             assert_eq!(
                 usize::from_str_radix(&header[3..], 16).expect("should parse hex"),
-                transformed.len()
+                transformed.len(),
+                "should recompute the T length from transformed bytes"
             );
             assert_eq!(
-                transformed,
-                r"'/integrations/google_tag_manager/gtm.js?q=\'x\''"
+                transformed, r"'/integrations/google_tag_manager/gtm.js?q=\'x\''",
+                "should route the tag while preserving escaped query quotes"
             );
         }
     }
@@ -953,7 +1147,11 @@ mod tests {
             if payload.starts_with("1:T") {
                 assert_mixed_t_model(&payloads[0], &expected);
             } else {
-                assert_eq!(payloads[0], format!("0:{expected}\n"));
+                assert_eq!(
+                    payloads[0],
+                    format!("0:{expected}\n"),
+                    "should rewrite the model and preserve its row terminator"
+                );
             }
             for split in (0..=push.len()).filter(|split| push.is_char_boundary(*split)) {
                 let mut processor = create_html_processor(mixed_config(10000, 10000));
@@ -1055,7 +1253,7 @@ mod tests {
                     for chunk in [32, 64, 1000, 8192] {
                         let output = mixed_output(&html, chunk);
                         let payloads = flight_payloads(&output);
-                        assert_eq!(payloads.len(), 1);
+                        assert_eq!(payloads.len(), 1, "should emit exactly one Flight payload");
                         let (header, body) =
                             payloads[0].split_once(',').expect("should retain T record");
                         assert!(
@@ -1079,11 +1277,48 @@ mod tests {
             32,
         );
         let payloads = flight_payloads(&output);
-        assert!(payloads[0].contains("test.example.com/page"));
+        assert!(
+            payloads[0].contains("test.example.com/page"),
+            "should rewrite the origin URL in the captured payload"
+        );
         assert!(
             payloads[0].contains("/integrations/google_tag_manager/gtm.js"),
             "should rewrite queryless escaped quote URL"
         );
+    }
+
+    #[test]
+    fn flight_url_split_after_scheme_preserves_the_whole_destination() {
+        for scheme in ["http:", "https:"] {
+            for slash in ["/", r"\/"] {
+                let body = json!({
+                    "tag": format!("{scheme}//www.googletagmanager.com/gtm.js?id=GTM-MIX1"),
+                    "href": "https://origin.example.com/p",
+                });
+                let payload = format!("0:{body}\n").replace('/', slash);
+                let tag_prefix = format!("{scheme}{slash}{slash}www.googletagmanager.com");
+                let split =
+                    payload.find(&tag_prefix).expect("should locate tag scheme") + scheme.len();
+                let html = flight_html(&[&payload[..split], &payload[split..]]);
+                let expected = payload.replace("origin.example.com", "test.example.com");
+                for compression in [Compression::None, Compression::Gzip] {
+                    for chunk_size in [16, 32, 8192] {
+                        let output = mixed_output_with_compression(&html, compression, chunk_size);
+                        let payloads = flight_payloads(&output);
+                        assert_eq!(payloads.len(), 2, "should retain both payload boundaries");
+                        assert_eq!(
+                            payloads.concat(),
+                            expected,
+                            "should preserve the split GTM URL and rewrite the complete origin URL"
+                        );
+                        assert!(
+                            !output.contains("__ts_rsc_"),
+                            "should resolve every captured payload"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -1200,9 +1435,13 @@ mod tests {
                 assert_eq!(
                     serde_json::from_str::<serde_json::Value>(script)
                         .expect("should retain valid JSON"),
-                    expected
+                    expected,
+                    "should preserve valid Pages JSON and its expected values"
                 );
-                assert!(output.ends_with("</body></html>"));
+                assert!(
+                    output.ends_with("</body></html>"),
+                    "should retain the complete trailing HTML suffix"
+                );
             }
         }
     }
@@ -1213,10 +1452,10 @@ mod tests {
         let mut a = create_html_processor(config.clone());
         let mut b = create_html_processor(config);
         let mut output_a = a
-            .process_chunk(b"<script>var a='http://www.google", false)
+            .process_chunk(b"<script>var a='http://www.google", false) // allow-domain: www.google
             .expect("should accept document A prefix");
         let mut output_b = b
-            .process_chunk(b"<script>var b='https://www.google", false)
+            .process_chunk(b"<script>var b='https://www.google", false) // allow-domain: www.google
             .expect("should accept document B prefix");
         output_a.extend(
             a.process_chunk(b"tagmanager.com/gtm.js';</script>", true)
@@ -1228,11 +1467,13 @@ mod tests {
         );
         assert_eq!(
             String::from_utf8(output_a).expect("should emit UTF-8"),
-            "<script>var a='/integrations/google_tag_manager/gtm.js';</script>"
+            "<script>var a='/integrations/google_tag_manager/gtm.js';</script>",
+            "should isolate document A and route its GTM URL"
         );
         assert_eq!(
             String::from_utf8(output_b).expect("should emit UTF-8"),
-            "<script>var b='/integrations/google_tag_manager/collect?v=2';</script>"
+            "<script>var b='/integrations/google_tag_manager/collect?v=2';</script>",
+            "should isolate document B and route its collect URL"
         );
     }
 
@@ -1260,7 +1501,8 @@ mod tests {
                 .expect("should close script");
             assert_eq!(
                 serde_json::from_str::<serde_json::Value>(script).expect("should keep valid JSON"),
-                json!({"padding": prefix, "href": "https://test.example.com/page"})
+                json!({"padding": prefix, "href": "https://test.example.com/page"}),
+                "should preserve padding and rewrite the Pages href"
             );
         }
     }
@@ -1297,12 +1539,18 @@ mod tests {
                 .find(|payload| payload.starts_with("f:T"))
                 .expect("should retain designated Flight proof");
             assert_mixed_t_model(proof, &expected);
-            assert!(!output.contains("__ts_rsc_"));
+            assert!(
+                !output.contains("__ts_rsc_"),
+                "should resolve every generated placeholder"
+            );
             assert!(
                 output.contains("googletagmanager.com/ns.html"),
                 "should retain unsupported iframe routing"
             );
-            assert!(output.trim_end().ends_with("</html>"));
+            assert!(
+                output.trim_end().ends_with("</html>"),
+                "should retain the final HTML closing tag"
+            );
         }
     }
 
@@ -1336,20 +1584,27 @@ mod tests {
                 let (header, rewritten) = combined.split_once(',').expect("should retain T header");
                 assert_eq!(
                     usize::from_str_radix(&header[3..], 16).expect("should parse length"),
-                    rewritten.len()
+                    rewritten.len(),
+                    "should recompute the T length from rewritten bytes"
                 );
                 let data: serde_json::Value =
                     serde_json::from_str(rewritten).expect("should preserve model JSON");
                 if split == (payload.find("http:").expect("should locate URL") - 1) {
-                    assert_eq!(data["tag"], "/integrations/google_tag_manager/gtm.js");
+                    assert_eq!(
+                        data["tag"], "/integrations/google_tag_manager/gtm.js",
+                        "should route the captured GTM tag"
+                    );
                 } else {
                     assert_eq!(
                         data["tag"], "http://www.googletagmanager.com/gtm.js",
                         "should safely preserve URL split across actual payload scripts"
                     );
                 }
-                assert_eq!(data["url"], "https://test.example.com/page");
-                assert_eq!(data["text"], "é😀");
+                assert_eq!(
+                    data["url"], "https://test.example.com/page",
+                    "should rewrite the captured origin URL"
+                );
+                assert_eq!(data["text"], "é😀", "should preserve Unicode model text");
             }
         }
         let escaped = body.replace('/', r"\/");
@@ -1359,11 +1614,15 @@ mod tests {
         let (header, body) = payloads[0].split_once(',').expect("should retain T");
         assert_eq!(
             usize::from_str_radix(&header[3..], 16).expect("should parse length"),
-            body.len()
+            body.len(),
+            "should match the declared T length to the model bytes"
         );
         let data: serde_json::Value =
             serde_json::from_str(body).expect("should preserve escaped model JSON");
-        assert_eq!(data["tag"], "/integrations/google_tag_manager/gtm.js");
+        assert_eq!(
+            data["tag"], "/integrations/google_tag_manager/gtm.js",
+            "should route the captured GTM tag"
+        );
     }
 
     #[test]
@@ -1391,7 +1650,10 @@ mod tests {
                         "should rewrite ordinary script after Flight fallback"
                     );
                 }
-                assert!(output.ends_with("</body></html>"));
+                assert!(
+                    output.ends_with("</body></html>"),
+                    "should retain the complete trailing HTML suffix"
+                );
             }
         }
     }

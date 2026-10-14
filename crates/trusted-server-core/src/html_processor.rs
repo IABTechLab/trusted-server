@@ -664,60 +664,63 @@ pub fn create_html_processor(config: HtmlProcessorConfig) -> impl StreamProcesso
 
     // Selector callbacks retain lol_html's CSS matching; only the composed text
     // callback mutates a fragment. Start each script with fresh match state.
-    let script_matches = Rc::new(RefCell::new(vec![false; script_rewriters.len()]));
-    let reset_matches = script_matches.clone();
-    element_content_handlers.push(element!("script", move |_el| {
-        reset_matches.borrow_mut().fill(false);
-        Ok(())
-    }));
-    for (index, rewriter) in script_rewriters.iter().enumerate() {
-        let matches = script_matches.clone();
-        element_content_handlers.push(element!(rewriter.selector(), move |_el| {
-            matches.borrow_mut()[index] = true;
+    // Without script rewriters, skip script text capture entirely.
+    if !script_rewriters.is_empty() {
+        let script_matches = Rc::new(RefCell::new(vec![false; script_rewriters.len()]));
+        let reset_matches = script_matches.clone();
+        element_content_handlers.push(element!("script", move |_el| {
+            reset_matches.borrow_mut().fill(false);
+            Ok(())
+        }));
+        for (index, rewriter) in script_rewriters.iter().enumerate() {
+            let matches = script_matches.clone();
+            element_content_handlers.push(element!(rewriter.selector(), move |_el| {
+                matches.borrow_mut()[index] = true;
+                Ok(())
+            }));
+        }
+        let script_patterns = patterns.clone();
+        let script_document_state = document_state.clone();
+        element_content_handlers.push(text!("script", move |text| {
+            let mut working = Cow::Borrowed(text.as_str());
+            let mut changed = false;
+            for (rewriter, matched) in script_rewriters.iter().zip(script_matches.borrow().iter()) {
+                if !matched {
+                    continue;
+                }
+                let ctx = IntegrationScriptContext {
+                    selector: rewriter.selector(),
+                    request_host: &script_patterns.request_host,
+                    request_scheme: &script_patterns.request_scheme,
+                    origin_host: &script_patterns.origin_host,
+                    is_last_in_text_node: text.last_in_text_node(),
+                    max_buffered_script_bytes: config.max_buffered_body_bytes,
+                    document_state: &script_document_state,
+                };
+                match rewriter.rewrite(&working, &ctx) {
+                    ScriptRewriteAction::Keep => {}
+                    ScriptRewriteAction::Replace(rewritten) => {
+                        working = Cow::Owned(rewritten);
+                        changed = true;
+                    }
+                    ScriptRewriteAction::RemoveNode => {
+                        working = Cow::Borrowed("");
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                if working.is_empty() {
+                    text.remove();
+                } else if let Cow::Owned(rewritten) = working {
+                    // Script is raw text: HTML entities would change JS/JSON data.
+                    // Emit composed source verbatim rather than escaping it again.
+                    text.replace(&rewritten, ContentType::Html);
+                }
+            }
             Ok(())
         }));
     }
-    let script_patterns = patterns.clone();
-    let script_document_state = document_state.clone();
-    element_content_handlers.push(text!("script", move |text| {
-        let mut working = Cow::Borrowed(text.as_str());
-        let mut changed = false;
-        for (rewriter, matched) in script_rewriters.iter().zip(script_matches.borrow().iter()) {
-            if !matched {
-                continue;
-            }
-            let ctx = IntegrationScriptContext {
-                selector: rewriter.selector(),
-                request_host: &script_patterns.request_host,
-                request_scheme: &script_patterns.request_scheme,
-                origin_host: &script_patterns.origin_host,
-                is_last_in_text_node: text.last_in_text_node(),
-                max_buffered_script_bytes: config.max_buffered_body_bytes,
-                document_state: &script_document_state,
-            };
-            match rewriter.rewrite(&working, &ctx) {
-                ScriptRewriteAction::Keep => {}
-                ScriptRewriteAction::Replace(rewritten) => {
-                    working = Cow::Owned(rewritten);
-                    changed = true;
-                }
-                ScriptRewriteAction::RemoveNode => {
-                    working = Cow::Borrowed("");
-                    changed = true;
-                }
-            }
-        }
-        if changed {
-            if working.is_empty() {
-                text.remove();
-            } else if let Cow::Owned(rewritten) = working {
-                // Script is raw text: HTML entities would change JS/JSON data.
-                // Emit composed source verbatim rather than escaping it again.
-                text.replace(&rewritten, ContentType::Html);
-            }
-        }
-        Ok(())
-    }));
 
     let rewriter_settings = RewriterSettings {
         document_content_handlers,
@@ -786,7 +789,11 @@ mod tests {
             "script[data-suppress='yes']"
         }
         fn rewrite(&self, _text: &str, ctx: &IntegrationScriptContext<'_>) -> ScriptRewriteAction {
-            assert_eq!(ctx.selector, self.selector());
+            assert_eq!(
+                ctx.selector,
+                self.selector(),
+                "should pass the registered selector to the suppressing stage"
+            );
             ScriptRewriteAction::RemoveNode
         }
     }
@@ -800,7 +807,11 @@ mod tests {
             "script#flush"
         }
         fn rewrite(&self, text: &str, ctx: &IntegrationScriptContext<'_>) -> ScriptRewriteAction {
-            assert_eq!(ctx.selector, self.selector());
+            assert_eq!(
+                ctx.selector,
+                self.selector(),
+                "should pass the registered selector to the flushing stage"
+            );
             assert!(text.is_empty(), "should see upstream suppression");
             if ctx.is_last_in_text_node {
                 ScriptRewriteAction::Replace("flushed-once".into())

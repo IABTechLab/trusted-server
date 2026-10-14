@@ -3,7 +3,9 @@
 //! This is not a JavaScript parser. It masks strings, comments and template text
 //! without changing byte offsets, and exposes code inside template expressions.
 
-const MAX_TEMPLATE_DEPTH: usize = 32;
+const MAX_LEXICAL_DEPTH: usize = 32;
+// Retain only short keyword candidates; longer words cannot guide token context.
+const WORD_BYTE_THRESHOLD: usize = 10;
 
 #[derive(Clone, Debug, Default)]
 enum Mode {
@@ -52,11 +54,15 @@ struct PendingClass {
     brace_depth: usize,
 }
 
+/// Resumable bounded heuristics, not a JavaScript parser. Excessive nesting
+/// becomes opaque and masks the remaining source instead of guessing call heads.
 #[derive(Clone, Debug)]
 pub(super) struct ScriptLexer {
     mode: Mode,
     template_braces: Vec<usize>,
+    /// The next slash may begin a regexp literal rather than division.
     expression_start: bool,
+    /// The next brace may open a statement block rather than an object.
     statement_start: bool,
     braces: Vec<BraceKind>,
     word: String,
@@ -127,7 +133,7 @@ impl ScriptLexer {
                         self.body_pending = None;
                     }
                     self.operator = None;
-                    if self.word.len() < 10 && !self.word_overflow {
+                    if self.word.len() < WORD_BYTE_THRESHOLD && !self.word_overflow {
                         self.word.push(character);
                     } else {
                         self.word_overflow = true;
@@ -168,7 +174,7 @@ impl ScriptLexer {
                             };
                             if self.word == "function" {
                                 self.function_pending = Some(body);
-                            } else if self.classes.len() == MAX_TEMPLATE_DEPTH {
+                            } else if self.classes.len() == MAX_LEXICAL_DEPTH {
                                 self.mode = Mode::Opaque;
                                 return false;
                             } else {
@@ -197,7 +203,7 @@ impl ScriptLexer {
                 }
                 match character {
                     '(' => {
-                        if self.parentheses.len() == MAX_TEMPLATE_DEPTH {
+                        if self.parentheses.len() == MAX_LEXICAL_DEPTH {
                             self.mode = Mode::Opaque;
                         } else {
                             let kind = if self.control_pending {
@@ -258,7 +264,7 @@ impl ScriptLexer {
                     }
                     '`' => {
                         self.statement_start = false;
-                        if self.template_braces.len() == MAX_TEMPLATE_DEPTH {
+                        if self.template_braces.len() == MAX_LEXICAL_DEPTH {
                             self.mode = Mode::Opaque;
                         } else {
                             self.template_braces.push(0);
@@ -286,7 +292,7 @@ impl ScriptLexer {
                         } else {
                             BraceKind::Object
                         };
-                        if self.braces.len() == MAX_TEMPLATE_DEPTH {
+                        if self.braces.len() == MAX_LEXICAL_DEPTH {
                             self.mode = Mode::Opaque;
                         } else {
                             self.braces.push(kind);
@@ -427,7 +433,11 @@ mod tests {
         let source = r#"'é self.__next_f.push('/* self.__next_f.push( */`😀 ${ {nested: `self.__next_f.push(`} } ${self.__next_f.push([1,"data"])} `"#;
         let expected = ScriptLexer::default().mask(source);
         assert_eq!(expected.len(), source.len(), "should preserve byte offsets");
-        assert_eq!(expected.matches("self.__next_f.push(").count(), 1);
+        assert_eq!(
+            expected.matches("self.__next_f.push(").count(),
+            1,
+            "should expose exactly one executable Flight head"
+        );
         for split in (0..=source.len()).filter(|split| source.is_char_boundary(*split)) {
             let mut lexer = ScriptLexer::default();
             let actual = format!(
@@ -487,27 +497,48 @@ mod tests {
     #[test]
     fn bounds_nested_braces() {
         let mut lexer = ScriptLexer::default();
-        lexer.mask(&"{".repeat(MAX_TEMPLATE_DEPTH + 1));
+        lexer.mask(&"{".repeat(MAX_LEXICAL_DEPTH + 1));
         assert!(lexer.is_opaque(), "should refuse excessive brace nesting");
-        assert_eq!(lexer.braces.len(), MAX_TEMPLATE_DEPTH);
-        assert!(!lexer.mask("self.__next_f.push(").contains("__next_f"));
+        assert_eq!(
+            lexer.braces.len(),
+            MAX_LEXICAL_DEPTH,
+            "should bound the brace stack at the lexical depth limit"
+        );
+        assert!(
+            !lexer.mask("self.__next_f.push(").contains("__next_f"),
+            "should mask call heads after the lexical nesting cap is exceeded"
+        );
     }
 
     #[test]
     fn bounds_pending_class_heads() {
         let mut lexer = ScriptLexer::default();
-        lexer.mask(&"class extends (".repeat(MAX_TEMPLATE_DEPTH + 1));
+        lexer.mask(&"class extends (".repeat(MAX_LEXICAL_DEPTH + 1));
         assert!(lexer.is_opaque(), "should refuse excessive class nesting");
-        assert_eq!(lexer.classes.len(), MAX_TEMPLATE_DEPTH);
-        assert!(!lexer.mask("self.__next_f.push(").contains("__next_f"));
+        assert_eq!(
+            lexer.classes.len(),
+            MAX_LEXICAL_DEPTH,
+            "should bound pending classes at the lexical depth limit"
+        );
+        assert!(
+            !lexer.mask("self.__next_f.push(").contains("__next_f"),
+            "should mask call heads after the lexical nesting cap is exceeded"
+        );
     }
 
     #[test]
     fn bounds_nested_templates() {
         let mut lexer = ScriptLexer::default();
-        lexer.mask(&"`${".repeat(MAX_TEMPLATE_DEPTH + 1));
+        lexer.mask(&"`${".repeat(MAX_LEXICAL_DEPTH + 1));
         assert!(lexer.is_opaque(), "should refuse excessive nesting");
-        assert_eq!(lexer.template_braces.len(), MAX_TEMPLATE_DEPTH);
-        assert!(!lexer.mask("self.__next_f.push(").contains("__next_f"));
+        assert_eq!(
+            lexer.template_braces.len(),
+            MAX_LEXICAL_DEPTH,
+            "should bound the template stack at the lexical depth limit"
+        );
+        assert!(
+            !lexer.mask("self.__next_f.push(").contains("__next_f"),
+            "should mask call heads after the lexical nesting cap is exceeded"
+        );
     }
 }
