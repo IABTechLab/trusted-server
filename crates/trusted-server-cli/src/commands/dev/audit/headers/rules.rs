@@ -57,6 +57,7 @@ impl ContentTypeGroup {
             }
             "application/json" => Self::RtbJson,
             "text/css" => Self::StaticAsset,
+            "application/woff" | "application/woff2" => Self::StaticAsset,
             other if other.starts_with("image/") => Self::Image,
             other if other.starts_with("font/") || other.starts_with("application/font-") => {
                 Self::StaticAsset
@@ -197,12 +198,28 @@ struct CacheDirectives {
     s_maxage: Option<u64>,
 }
 
+/// Folds a parsed TTL into an accumulator, tracking conflicts. The first valid
+/// value is kept; a later unparseable (`None`) or duplicate-identical value is
+/// ignored (RFC 9111 §4.2.1); a later *different* valid value marks a conflict,
+/// after which the caller treats the directive as absent.
+fn accumulate(current: &mut Option<u64>, conflict: &mut bool, incoming: Option<u64>) {
+    if let Some(value) = incoming {
+        match *current {
+            Some(existing) if existing != value => *conflict = true,
+            None => *current = Some(value),
+            _ => {}
+        }
+    }
+}
+
 impl CacheDirectives {
     fn parse(value: &str) -> Self {
         let mut tokens = BTreeSet::new();
         let mut unqualified = BTreeSet::new();
         let mut max_age = None;
+        let mut max_age_conflict = false;
         let mut s_maxage = None;
+        let mut s_maxage_conflict = false;
 
         for raw in value.split(',') {
             let token = raw.trim().to_ascii_lowercase();
@@ -215,11 +232,14 @@ impl CacheDirectives {
                 // parameter syntax) still parse.
                 let seconds = seconds.trim().trim_matches('"').trim().parse::<u64>().ok();
                 match name.trim() {
-                    // First valid occurrence wins: a later malformed or
-                    // duplicate directive must not discard an already-parsed
-                    // value (RFC 9111 §4.2.1 — treat unparseable as absent).
-                    "max-age" => max_age = max_age.or(seconds),
-                    "s-maxage" => s_maxage = s_maxage.or(seconds),
+                    // RFC 9111 §4.2.1: a later unparseable or duplicate-identical
+                    // directive must not discard an already-parsed value, so the
+                    // first valid occurrence wins for those cases. But two
+                    // *different* valid values are a genuine contradiction the
+                    // operator cannot reason about, so the directive is treated
+                    // as absent (invalidated) rather than silently picking one.
+                    "max-age" => accumulate(&mut max_age, &mut max_age_conflict, seconds),
+                    "s-maxage" => accumulate(&mut s_maxage, &mut s_maxage_conflict, seconds),
                     _ => {}
                 }
                 // A `name=value` directive is present but only in qualified
@@ -235,8 +255,8 @@ impl CacheDirectives {
         Self {
             tokens,
             unqualified,
-            max_age,
-            s_maxage,
+            max_age: if max_age_conflict { None } else { max_age },
+            s_maxage: if s_maxage_conflict { None } else { s_maxage },
         }
     }
 
@@ -499,45 +519,44 @@ fn evaluate_cdn_ttl(headers: &ResponseHeaders) -> Option<HeaderVerdict> {
     })
 }
 
-/// RTB/JSON must never be cached: `no-store` is required (RFC 9111 §5.2.2.5).
+/// JSON carries no assumed posture. RTB bid responses come from the TS edge
+/// (`POST /auction`, `GET /_ts/page-bids`), not the publisher origin, so the
+/// audit never treats origin JSON as bid data and never requires `no-store`
+/// (spec §3.2, §6.5). It emits a single informational Pass recording the
+/// observed policy, plus an `add_private` note when `no-store` is present
+/// without `private` (bare `no-store` forbids storage per RFC 9111 §5.2.2.5,
+/// but some CDNs ignore it and TS itself emits `no-store, private`).
 fn evaluate_rtb(headers: &ResponseHeaders) -> Vec<HeaderVerdict> {
-    let mut verdicts = Vec::new();
-
-    let expected = "no-store";
-    match headers.cache_control.as_deref() {
-        Some(value) if CacheDirectives::parse(value).has_unqualified("no-store") => {
-            verdicts.push(HeaderVerdict::pass(
-                "Cache-Control",
-                Some(value.to_owned()),
-                expected,
-            ));
+    let expected = "no assumed posture (origin JSON is not bid data)";
+    let actual = headers.cache_control.clone();
+    let recommendation = match headers.cache_control.as_deref() {
+        Some(value) => {
+            let directives = CacheDirectives::parse(value);
+            if directives.has_unqualified("no-store") && !directives.has_unqualified("private") {
+                "Origin JSON is not graded as bid data; consider adding `private` alongside `no-store` (some CDNs ignore bare `no-store`)"
+            } else {
+                ""
+            }
         }
-        Some(value) => verdicts.push(HeaderVerdict::flagged(
-            "Cache-Control",
-            Verdict::Fail,
-            Some(value.to_owned()),
-            expected,
-            "RTB responses cached means stale bids served to users; set `no-store`",
-        )),
-        None => verdicts.push(HeaderVerdict::flagged(
-            "Cache-Control",
-            Verdict::Fail,
-            None,
-            expected,
-            "RTB responses have no Cache-Control; set `no-store`",
-        )),
-    }
+        None => "",
+    };
 
-    verdicts.extend(evaluate_surrogate_no_store(
-        headers,
-        "CDN may cache RTB responses; set Surrogate-Control to `no-store`",
-    ));
-
-    verdicts
+    let verdict = if recommendation.is_empty() {
+        HeaderVerdict::pass("Cache-Control", actual, expected)
+    } else {
+        HeaderVerdict::flagged(
+            "Cache-Control",
+            Verdict::Pass,
+            actual,
+            expected,
+            recommendation,
+        )
+    };
+    vec![verdict]
 }
 
-/// `Surrogate-Control`, when present, must not permit CDN caching for
-/// non-cacheable groups (HTML, RTB).
+/// `Surrogate-Control`, when present on HTML, must not permit CDN caching of
+/// personalized content.
 fn evaluate_surrogate_no_store(
     headers: &ResponseHeaders,
     recommendation: &str,
@@ -739,11 +758,13 @@ mod tests {
 
     #[test]
     fn rtb_passes_on_no_store_without_private() {
+        // Origin JSON carries no assumed posture (spec §3.2, §6.5): the audit
+        // never requires `no-store`, so it passes regardless.
         let verdicts = evaluate(ContentTypeGroup::RtbJson, &headers_with(Some("no-store")));
         assert_eq!(
             verdict_for(&verdicts, "Cache-Control"),
             Verdict::Pass,
-            "bare no-store should pass for RTB"
+            "origin JSON carries no assumed posture, so it passes"
         );
     }
 
@@ -990,6 +1011,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn application_woff_classifies_as_static_asset() {
+        for mime in ["application/woff", "application/woff2"] {
+            assert_eq!(
+                ContentTypeGroup::classify(mime),
+                ContentTypeGroup::StaticAsset,
+                "{mime} should classify as a static asset (font), not Other"
+            );
+        }
+    }
+
+    #[test]
+    fn conflicting_duplicate_max_age_invalidates_the_directive() {
+        // Two *different* valid max-age values are a contradiction the operator
+        // cannot reason about, so the directive is treated as absent — unlike a
+        // duplicate-identical or unparseable value, which keeps the first valid.
+        // On an immutable JS bundle, invalidating max-age drops it below the
+        // immutable floor and must warn.
+        let verdicts = evaluate(
+            ContentTypeGroup::JavaScript,
+            &ResponseHeaders {
+                cache_control: Some("public, immutable, max-age=31536000, max-age=60".to_owned()),
+                surrogate_key: Some("js".to_owned()),
+                etag: Some("\"abc\"".to_owned()),
+                ..ResponseHeaders::default()
+            },
+        );
+        assert_eq!(
+            verdict_for(&verdicts, "Cache-Control"),
+            Verdict::Warn,
+            "conflicting max-age values should invalidate the directive"
+        );
+    }
+
+    #[test]
+    fn duplicate_identical_max_age_is_not_a_conflict() {
+        // Same valid value twice is not a contradiction — keep it.
+        let verdicts = evaluate(
+            ContentTypeGroup::JavaScript,
+            &ResponseHeaders {
+                cache_control: Some(
+                    "public, immutable, max-age=31536000, max-age=31536000".to_owned(),
+                ),
+                surrogate_key: Some("js".to_owned()),
+                etag: Some("\"abc\"".to_owned()),
+                ..ResponseHeaders::default()
+            },
+        );
+        assert_eq!(
+            verdict_for(&verdicts, "Cache-Control"),
+            Verdict::Pass,
+            "a repeated identical max-age must not be treated as a conflict"
+        );
+    }
+
     /// Look up a verdict by both header name and expected string — two distinct
     /// checks can share a header name (e.g. Surrogate-Control).
     fn verdict_by<'a>(
@@ -1074,17 +1150,38 @@ mod tests {
     }
 
     #[test]
-    fn rtb_qualified_no_store_is_not_accepted() {
-        // Blocker 4 (RTB): `no-store="x"` leaves the body storable, so RTB must
-        // still fail.
+    fn rtb_json_add_private_note_is_informational_only() {
+        // `no-store` without `private` on origin JSON yields an informational
+        // add_private recommendation but stays a Pass (no posture is assumed).
+        let verdicts = evaluate(ContentTypeGroup::RtbJson, &headers_with(Some("no-store")));
+        let cc = verdicts
+            .iter()
+            .find(|verdict| verdict.header == "Cache-Control")
+            .expect("should have a Cache-Control verdict");
+        assert_eq!(
+            cc.verdict,
+            Verdict::Pass,
+            "add_private is informational only"
+        );
+        assert!(
+            !cc.recommendation.is_empty(),
+            "should carry an add_private recommendation"
+        );
+    }
+
+    #[test]
+    fn rtb_json_carries_no_assumed_posture() {
+        // Per revised spec §3.2/§6.5: origin JSON is not treated as bid data, so
+        // even a publicly cacheable policy must not FAIL — the audit assumes no
+        // group-specific posture for JSON.
         let verdicts = evaluate(
             ContentTypeGroup::RtbJson,
-            &headers_with(Some("public, max-age=600, no-store=\"x\"")),
+            &headers_with(Some("public, max-age=600")),
         );
         assert_eq!(
             verdict_for(&verdicts, "Cache-Control"),
-            Verdict::Fail,
-            "qualified no-store must not satisfy the RTB body-safety check"
+            Verdict::Pass,
+            "origin JSON must not be failed for cache posture"
         );
     }
 

@@ -49,11 +49,13 @@ fn render_human(report: &AuditReport, out: &mut dyn Write) -> CliResult<()> {
             } else {
                 &verdict.recommendation
             };
+            let actual = verdict.actual.as_deref().unwrap_or("(absent)");
             writeln!(
                 out,
-                "    {} {:<18} {}",
+                "    {} {:<18} {:<40} {}",
                 verdict_glyph(verdict.verdict),
                 verdict.header,
+                actual,
                 recommendation
             )
             .map_err(|error| write_error(&error))?;

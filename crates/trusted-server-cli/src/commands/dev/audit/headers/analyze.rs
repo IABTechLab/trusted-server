@@ -248,9 +248,15 @@ mod tests {
         ];
         let report = run_analysis("https://origin.example", &responses);
         assert_eq!(report.summary.total_groups, 2, "should count HTML and RTB");
-        assert_eq!(report.summary.pass, 1, "HTML no-store should pass");
-        assert_eq!(report.summary.fail, 1, "cacheable RTB should fail");
-        assert_eq!(report.exit_code(), 1, "any fail should exit 1");
+        assert_eq!(
+            report.summary.pass, 2,
+            "HTML no-store and origin JSON (no assumed posture) both pass"
+        );
+        assert_eq!(
+            report.summary.fail, 0,
+            "cacheable origin JSON is not failed — it carries no assumed posture"
+        );
+        assert_eq!(report.exit_code(), 0, "no failures should exit 0");
     }
 
     #[test]
