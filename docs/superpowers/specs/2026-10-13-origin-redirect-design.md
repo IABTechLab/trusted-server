@@ -1,10 +1,11 @@
 # Design Spec: An origin's redirect to itself keeps the reader on the address they asked for
 
-**Status:** Proposed, 2026-10-13. Implemented on a local working branch, with no pull request raised yet.
+**Status:** Proposed, 2026-10-13. Raised as draft pull request jwrosewell/trusted-server#32, for Tech Lab review.
 **Author:** 51Degrees (contributed), for Tech Lab review
 **Related specs:** `2026-10-13-publisher-object-storage-origin-design.md`
-**Related PRs:** none yet
-**Last updated:** 2026-10-13
+**Related PRs:** jwrosewell/trusted-server#32
+**Issues:** IABTechLab/trusted-server#1330
+**Last updated:** 2026-10-14
 
 > **Why this spec exists.** The publisher proxy relays an origin's redirect exactly as the origin wrote it, so a redirect the origin sends to itself hands the reader the origin's own address and their browser leaves the deployment.
 
