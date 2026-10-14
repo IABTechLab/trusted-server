@@ -25,6 +25,7 @@ use crate::platform::{DisabledGeo, GeoModule, PlatformGeoModule, RuntimeServices
 use crate::prefix::{PrefixModule, Prefixes, SelectedPrefixModule};
 use crate::robots_txt::{ALLOW_ALL, REFUSE_ALL, RobotsTxtContributor};
 use crate::settings::Settings;
+use crate::source::{Source, SourceFactory};
 
 /// What a middleware's element handler decides about one attribute of an
 /// element.
@@ -681,6 +682,12 @@ pub struct IntegrationRegistration {
     /// Declaring them does not put them in the file, because the file is only
     /// built from the contributors `[robots-txt] modules` names.
     pub robots_txt_contributor: Option<(&'static str, Arc<dyn RobotsTxtContributor>)>,
+    /// Source module this registration supplies, with the name a source table
+    /// selects it by, see [`crate::source`].
+    ///
+    /// Declaring one does not make it serve anything, because a source is only
+    /// built where `[source]` or an asset route's `source` table names it.
+    pub source_module: Option<(&'static str, Arc<dyn SourceFactory>)>,
 }
 
 impl IntegrationRegistration {
@@ -712,6 +719,7 @@ impl IntegrationRegistrationBuilder {
                 device_module: None,
                 prefix_module: None,
                 robots_txt_contributor: None,
+                source_module: None,
             },
         }
     }
@@ -802,6 +810,19 @@ impl IntegrationRegistrationBuilder {
     #[must_use]
     pub fn with_prefix_module(mut self, name: &'static str, module: Arc<dyn PrefixModule>) -> Self {
         self.registration.prefix_module = Some((name, module));
+        self
+    }
+
+    /// Declare a source module under `name`, which `[source]` or an asset
+    /// route's `source` table selects. The factory builds a source from the
+    /// selecting table's settings, see [`crate::source`].
+    #[must_use]
+    pub fn with_source_module(
+        mut self,
+        name: &'static str,
+        factory: Arc<dyn SourceFactory>,
+    ) -> Self {
+        self.registration.source_module = Some((name, factory));
         self
     }
 
@@ -941,6 +962,18 @@ struct IntegrationRegistryInner {
     // The prefix module `[prefix] module` resolved to, core's own when
     // nothing is selected.
     prefix_module: SelectedPrefixModule,
+    // The source modules the running registrations supply, each with its name.
+    source_modules: Vec<(&'static str, Arc<dyn SourceFactory>)>,
+    // The publisher's source and each asset route's, in route order, built
+    // from the settings. `None` for a registry built without settings.
+    sources: Option<BuiltSources>,
+}
+
+/// The sources a deployment's settings name, built once.
+#[derive(Clone)]
+struct BuiltSources {
+    publisher: Arc<dyn Source>,
+    routes: Vec<Arc<dyn Source>>,
 }
 
 impl Default for IntegrationRegistryInner {
@@ -977,6 +1010,8 @@ impl Default for IntegrationRegistryInner {
             device_module: None,
             prefix_modules: Vec::new(),
             prefix_module: SelectedPrefixModule::default(),
+            source_modules: Vec::new(),
+            sources: None,
         }
     }
 }
@@ -1590,6 +1625,12 @@ fn check_section_selections(
         .filter_map(|builder| builder.module_name())
         .collect();
     for (section, modules) in settings.module_sections() {
+        // A source is offered by a registration under a name of its own, as
+        // a prefix module is, so building the sources checks the selection
+        // against the sources on offer.
+        if section == crate::source::SOURCE_SECTION {
+            continue;
+        }
         for written in modules.selected() {
             if crate::module_name::resolve(section, written, &offered).is_some() {
                 continue;
@@ -1628,7 +1669,111 @@ fn check_section_selections(
     Ok(())
 }
 
+/// The source `selection` names, built from its table, where `setting` names
+/// the table in a refusal. Core's `origin` is always on offer, beside the
+/// sources the registrations supply.
+fn build_source(
+    selection: &crate::provider_table::SectionModules,
+    setting: &str,
+    offered: &[(&'static str, Arc<dyn SourceFactory>)],
+) -> Result<Arc<dyn Source>, Report<TrustedServerError>> {
+    let (written, table) = crate::source::selected(selection, setting)?;
+    let table_setting = format!("{setting}.{written}");
+    let names: Vec<&str> = offered
+        .iter()
+        .map(|(name, _)| *name)
+        .chain(std::iter::once(crate::source::ORIGIN_MODULE))
+        .collect();
+    let Some(found) = crate::module_name::resolve(crate::source::SOURCE_SECTION, written, &names)
+    else {
+        let short: Vec<&str> = names
+            .iter()
+            .map(|name| crate::module_name::short_form(crate::source::SOURCE_SECTION, name))
+            .collect();
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "[{setting}] selects `{written}`, which no module this deployment supplies. \
+                 The source modules it supplies are [{}]",
+                short.join(", ")
+            ),
+        }));
+    };
+    if found == crate::source::ORIGIN_MODULE {
+        return crate::source::OriginFactory.build(&table, &table_setting);
+    }
+    let factory = offered
+        .iter()
+        .find(|(name, _)| *name == found)
+        .map(|(_, factory)| Arc::clone(factory))
+        .ok_or_else(|| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!("[{setting}] selects `{written}`, which nothing builds"),
+            })
+        })?;
+    factory.build(&table, &table_setting)
+}
+
+/// The publisher's source and each asset route's, built from `settings`.
+fn build_sources(
+    settings: &Settings,
+    offered: &[(&'static str, Arc<dyn SourceFactory>)],
+) -> Result<BuiltSources, Report<TrustedServerError>> {
+    let publisher = build_source(&settings.source, crate::source::SOURCE_SECTION, offered)?;
+    let routes = settings
+        .proxy
+        .asset_routes
+        .iter()
+        .map(|route| build_source(&route.source, &route.source_setting(), offered))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(BuiltSources { publisher, routes })
+}
+
 impl IntegrationRegistry {
+    /// The publisher's source, built when the registry was built from the
+    /// settings, or built now from `settings` with core's sources alone for a
+    /// registry built without them.
+    ///
+    /// # Errors
+    ///
+    /// When the registry holds none and `settings` name a source core does
+    /// not supply, or one it cannot build.
+    pub fn publisher_source(
+        &self,
+        settings: &Settings,
+    ) -> Result<Arc<dyn Source>, Report<TrustedServerError>> {
+        match &self.inner.sources {
+            Some(sources) => Ok(Arc::clone(&sources.publisher)),
+            None => build_source(&settings.source, crate::source::SOURCE_SECTION, &[]),
+        }
+    }
+
+    /// The source of the asset route at `index` in `settings`, built as for
+    /// [`Self::publisher_source`].
+    ///
+    /// # Errors
+    ///
+    /// When there is no route at `index`, or as [`Self::publisher_source`].
+    pub fn route_source(
+        &self,
+        settings: &Settings,
+        index: usize,
+    ) -> Result<Arc<dyn Source>, Report<TrustedServerError>> {
+        if let Some(source) = self
+            .inner
+            .sources
+            .as_ref()
+            .and_then(|sources| sources.routes.get(index))
+        {
+            return Ok(Arc::clone(source));
+        }
+        let route = settings.proxy.asset_routes.get(index).ok_or_else(|| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!("there is no asset route at {index}"),
+            })
+        })?;
+        build_source(&route.source, &route.source_setting(), &[])
+    }
+
     /// Tells the registry what the adapter reports about the platform, which
     /// a middleware is told about every document.
     #[must_use]
@@ -1963,6 +2108,10 @@ impl IntegrationRegistry {
                 claim_module_name(&mut claimed, "prefix", name, registration.integration_id)?;
                 inner.prefix_modules.push((name, module));
             }
+            if let Some((name, factory)) = registration.source_module {
+                claim_module_name(&mut claimed, "source", name, registration.integration_id)?;
+                inner.source_modules.push((name, factory));
+            }
             if let Some((name, contributor)) = registration.robots_txt_contributor {
                 claim_module_name(
                     &mut claimed,
@@ -2021,6 +2170,7 @@ impl IntegrationRegistry {
         inner.ec_module = resolve_ec_module(settings, &inner);
         inner.device_module = resolve_device_module(settings, &inner)?;
         inner.prefix_module = resolve_prefix_module(settings, &inner)?;
+        inner.sources = Some(build_sources(settings, &inner.source_modules)?);
         inner.geo_module = geo_module;
         check_robots_txt_selection(settings, &inner)?;
         if let Some(config) = settings.robots_txt.as_ref() {
@@ -2632,6 +2782,8 @@ impl IntegrationRegistry {
                 device_module: None,
                 prefix_modules: Vec::new(),
                 prefix_module: SelectedPrefixModule::default(),
+                source_modules: Vec::new(),
+                sources: None,
             }),
             plan: None,
             platform: Arc::default(),
@@ -2714,6 +2866,8 @@ impl IntegrationRegistry {
                 device_module: None,
                 prefix_modules: Vec::new(),
                 prefix_module: SelectedPrefixModule::default(),
+                source_modules: Vec::new(),
+                sources: None,
             }),
             plan: None,
             platform: Arc::default(),

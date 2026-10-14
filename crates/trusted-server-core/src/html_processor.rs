@@ -1054,10 +1054,15 @@ pub mod test_support {
     /// The least a deployment's settings must say, which a module's own
     /// settings are written after.
     const BASE_SETTINGS: &str = r#"
+[source]
+module = "origin"
+
+[source.origin]
+url = "https://origin.example.com"
+
 [publisher]
 domain = "publisher.example.com"
 cookie_domain = ".publisher.example.com"
-origin_url = "https://origin.example.com"
 proxy_secret = "page-recording-proxy-secret"
 
 [geo]

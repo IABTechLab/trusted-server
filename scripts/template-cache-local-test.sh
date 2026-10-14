@@ -251,8 +251,8 @@ def replace_once(content, old, new, description):
 
 s = replace_once(
     s,
-    'origin_url = "https://origin.example.com"',
-    f'origin_url = "http://127.0.0.1:{origin_port}"',
+    'url = "https://origin.example.com"',
+    f'url = "http://127.0.0.1:{origin_port}"',
     "publisher origin",
 )
 s = replace_once(

@@ -29,6 +29,7 @@ use crate::platform::{
 };
 use crate::s3_sigv4::{self, S3Credentials};
 use crate::settings::{AssetOriginAuth, OriginQueryPolicy, ProxyAssetRoute, Settings};
+use crate::source::{Source, SourceLocation, SourceRequest};
 use crate::streaming_processor::{Compression, PipelineConfig, StreamProcessor, StreamingPipeline};
 
 /// Chunk size used for streaming content through the rewrite pipeline.
@@ -856,29 +857,29 @@ fn default_port_for_scheme(scheme: &str) -> Option<u16> {
 
 fn build_asset_proxy_target_url(
     route: &ProxyAssetRoute,
+    location: &SourceLocation,
     path: &str,
     query: &str,
 ) -> Result<url::Url, Report<TrustedServerError>> {
-    let mut target_url =
-        url::Url::parse(&route.origin_url).change_context(TrustedServerError::Proxy {
-            message: format!("Invalid asset origin_url: {}", route.origin_url),
-        })?;
+    let mut target_url = location.parsed().clone();
+    // A folder in the source's address comes before the route's target path,
+    // and a target path that could climb out of it is refused.
+    let folder = target_url.path().trim_end_matches('/').to_owned();
 
-    let scheme = target_url.scheme();
-    if scheme != "http" && scheme != "https" {
-        return Err(Report::new(TrustedServerError::Proxy {
-            message: format!("Unsupported asset origin_url scheme: {scheme}"),
+    let mut target_path = route.target_path_for(path)?;
+    if !folder.is_empty() && crate::publisher::path_has_dot_segment(&target_path) {
+        return Err(Report::new(TrustedServerError::BadRequest {
+            message: "an asset path under a source folder must not have a `.` or `..` segment"
+                .to_string(),
         }));
     }
-
-    if target_url.host_str().is_none() {
-        return Err(Report::new(TrustedServerError::Proxy {
-            message: "Missing host in asset origin_url".to_string(),
-        }));
+    if let Some(index) = location
+        .directory_index()
+        .filter(|_| target_path.ends_with('/'))
+    {
+        target_path.push_str(index);
     }
-
-    let target_path = route.target_path_for(path)?;
-    target_url.set_path(&target_path);
+    target_url.set_path(&format!("{folder}{target_path}"));
     if query.is_empty() {
         target_url.set_query(None);
     } else {
@@ -1031,24 +1032,24 @@ fn apply_no_store_cache_control(response: &mut Response<EdgeBody>) {
 }
 
 fn should_preflight_s3(
-    route: &ProxyAssetRoute,
+    location: &SourceLocation,
     image_optimizer_enabled: bool,
     request_method: &Method,
 ) -> bool {
     image_optimizer_enabled
-        && matches!(route.auth.as_ref(), Some(AssetOriginAuth::S3SigV4(_)))
+        && matches!(location.auth(), Some(AssetOriginAuth::S3SigV4(_)))
         && (request_method == Method::GET || request_method == Method::HEAD)
 }
 
 async fn preflight_s3_origin_for_image_optimizer(
     services: &RuntimeServices,
-    route: &ProxyAssetRoute,
+    location: &SourceLocation,
     target_url: &url::Url,
     request_method: &Method,
     unsigned_headers: &http::HeaderMap,
     backend_name: &str,
 ) -> Result<Option<AssetProxyResponse>, Report<TrustedServerError>> {
-    let Some(auth @ AssetOriginAuth::S3SigV4(_)) = route.auth.as_ref() else {
+    let Some(auth @ AssetOriginAuth::S3SigV4(_)) = location.auth() else {
         return Ok(None);
     };
 
@@ -1116,10 +1117,23 @@ pub async fn handle_asset_proxy_request(
     services: &RuntimeServices,
     req: Request<EdgeBody>,
     route: &ProxyAssetRoute,
+    source: &dyn Source,
 ) -> Result<AssetProxyResponse, Report<TrustedServerError>> {
     let incoming_path = req.uri().path();
     let incoming_query = req.uri().query().unwrap_or("");
-    let mut target_url = build_asset_proxy_target_url(route, incoming_path, incoming_query)?;
+    let removed_prefix = req
+        .extensions()
+        .get::<crate::addressing::RemovedPathPrefix>()
+        .map(|prefix| prefix.as_str().to_owned());
+    let location = source.locate(&SourceRequest {
+        method: req.method(),
+        path: incoming_path,
+        query: incoming_query,
+        headers: req.headers(),
+        removed_prefix: removed_prefix.as_deref(),
+    })?;
+    let mut target_url =
+        build_asset_proxy_target_url(route, &location, incoming_path, incoming_query)?;
     let skip_image_optimizer = asset_path_skips_image_optimizer(incoming_path)
         || asset_path_skips_image_optimizer(target_url.path());
     let image_optimizer = if skip_image_optimizer {
@@ -1133,7 +1147,7 @@ pub async fn handle_asset_proxy_request(
         crate::asset_image_optimizer::options_for_asset_request(settings, route, incoming_query)?
     };
 
-    if route.origin_query_policy() == OriginQueryPolicy::Strip {
+    if route.origin_query_policy_at(&location) == OriginQueryPolicy::Strip {
         target_url.set_query(None);
     }
 
@@ -1150,7 +1164,7 @@ pub async fn handle_asset_proxy_request(
             scheme: scheme.to_string(),
             host: host.to_string(),
             port: target_url.port(),
-            host_header_override: None,
+            host_header_override: location.host_header_override().map(str::to_owned),
             certificate_check: settings.proxy.certificate_check,
             first_byte_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
             between_bytes_timeout: DEFAULT_FIRST_BYTE_TIMEOUT,
@@ -1166,12 +1180,18 @@ pub async fn handle_asset_proxy_request(
             outbound_headers.insert(header_name, value.clone());
         }
     }
-    outbound_headers.insert(header::HOST, asset_origin_host_header(&target_url)?);
+    let host_header = match location.host_header_override() {
+        Some(host) => HeaderValue::from_str(host).change_context(TrustedServerError::Proxy {
+            message: "invalid source host header".to_string(),
+        })?,
+        None => asset_origin_host_header(&target_url)?,
+    };
+    outbound_headers.insert(header::HOST, host_header);
 
-    if should_preflight_s3(route, image_optimizer.is_some(), req.method())
+    if should_preflight_s3(&location, image_optimizer.is_some(), req.method())
         && let Some(response) = preflight_s3_origin_for_image_optimizer(
             services,
-            route,
+            &location,
             &target_url,
             req.method(),
             &outbound_headers,
@@ -1182,7 +1202,7 @@ pub async fn handle_asset_proxy_request(
         return Ok(response);
     }
 
-    if let Some(auth) = &route.auth {
+    if let Some(auth) = location.auth() {
         apply_asset_origin_auth(req.method(), &target_url, &mut outbound_headers, auth)?;
     }
 
@@ -1194,7 +1214,7 @@ pub async fn handle_asset_proxy_request(
     // answer the platform's image optimizer makes is not kept, because the
     // platform holds it.
     let copy_key = if image_optimizer.is_none() {
-        asset_route_copy_key(services, &req, route, &target_url)
+        asset_route_copy_key(services, &req, route, &location, &target_url)
     } else {
         None
     };
@@ -1260,6 +1280,16 @@ pub async fn handle_asset_proxy_request(
     Ok(response)
 }
 
+/// What tells one route's copies apart from another's: the address its
+/// source answered and the route's prefix, so two routes to one address keep
+/// their own copies, and the `Host` where the source sets one.
+fn route_origin_identity(route: &ProxyAssetRoute, location: &SourceLocation) -> String {
+    match location.host_header_override() {
+        Some(host) => format!("{}\0{}\0{host}", location.url(), route.prefix),
+        None => format!("{}\0{}", location.url(), route.prefix),
+    }
+}
+
 /// The key an asset route's answer is held under, or nothing for a request
 /// whose answer is not kept: one that is not a `GET`, one carrying
 /// `Authorization`, a conditional header or a range, which a copy cannot
@@ -1271,6 +1301,7 @@ fn asset_route_copy_key(
     services: &RuntimeServices,
     req: &Request<EdgeBody>,
     route: &ProxyAssetRoute,
+    location: &SourceLocation,
     target_url: &url::Url,
 ) -> Option<crate::asset_cache::AssetCacheKey> {
     if req.method() != Method::GET
@@ -1300,7 +1331,7 @@ fn asset_route_copy_key(
         url: target_url.to_string(),
         request_host,
         request_scheme: req.uri().scheme_str().unwrap_or("https").to_owned(),
-        origin_identity: format!("{}\0{}", route.origin_url, route.prefix),
+        origin_identity: route_origin_identity(route, location),
         fingerprint: String::new(),
     })
 }
@@ -2362,7 +2393,8 @@ mod tests {
         asset_path_skips_image_optimizer, build_asset_proxy_target_url, handle_asset_proxy_request,
         handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
         handle_first_party_proxy_sign, is_host_allowed, is_host_permitted, proxy_request,
-        rebuild_response_with_body, reconstruct_and_validate_signed_target, stream_asset_body,
+        rebuild_response_with_body, reconstruct_and_validate_signed_target, route_origin_identity,
+        stream_asset_body,
     };
     use crate::cache_policy::{CachePolicy, EdgeCacheHeader};
     use crate::constants::{HEADER_ACCEPT, HEADER_X_FORWARDED_FOR};
@@ -2383,7 +2415,9 @@ mod tests {
         ImageOptimizerCropOffsetsConfig, ImageOptimizerProfileSet, ImageOptimizerSettings,
         OriginQueryPolicy, ProxyAssetRoute, S3SigV4AuthConfig, Settings, UnknownProfilePolicy,
     };
-    use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
+    use crate::test_support::tests::{
+        crate_test_settings_str, create_test_settings, set_route_auth,
+    };
     use bytes::Bytes;
     use edgezero_core::body::Body as EdgeBody;
     use edgezero_core::http::response_builder as edge_response_builder;
@@ -4989,12 +5023,128 @@ mod tests {
         );
     }
 
+    /// Where `route`'s `origin` source fetches from.
+    fn location_of(route: &ProxyAssetRoute) -> crate::source::SourceLocation {
+        route
+            .origin_source()
+            .expect("the route should select the origin source")
+            .location()
+            .expect("the origin source should give a location")
+    }
+
+    /// `route`'s `origin` source, as the registry builds it.
+    fn origin_source_of(route: &ProxyAssetRoute) -> crate::source::OriginSource {
+        crate::source::OriginSource::new(
+            &route
+                .origin_source()
+                .expect("the route should select the origin source"),
+        )
+        .expect("should build the route's source")
+    }
+
+    #[test]
+    fn a_route_copy_is_named_by_its_address_prefix_and_any_host_its_source_sets() {
+        let route = ProxyAssetRoute::new("/assets/", "https://assets.example.com");
+        let location = location_of(&route);
+        assert_eq!(
+            route_origin_identity(&route, &location),
+            "https://assets.example.com\0/assets/",
+            "a source setting no Host should keep the key existing copies have"
+        );
+
+        let named = location.with_host_header(Some("www.example.com".to_owned()));
+        assert_eq!(
+            route_origin_identity(&route, &named),
+            "https://assets.example.com\0/assets/\0www.example.com",
+            "a source setting a Host should keep copies apart from one that does not"
+        );
+    }
+
+    #[test]
+    fn build_asset_proxy_target_url_puts_the_path_under_the_source_folder() {
+        let mut route = ProxyAssetRoute::new("/assets/", "https://storage.example.com/bucket/site");
+        let target_url =
+            build_asset_proxy_target_url(&route, &location_of(&route), "/assets/app.js", "v=1")
+                .expect("should build asset target URL");
+        assert_eq!(
+            target_url.as_str(),
+            "https://storage.example.com/bucket/site/assets/app.js?v=1",
+            "should send the path under the folder the source names"
+        );
+
+        route.path_pattern = Some(r"^/assets/(.*)$".to_string());
+        route.target_path = Some("/static/$1".to_string());
+        let target_url =
+            build_asset_proxy_target_url(&route, &location_of(&route), "/assets/app.js", "")
+                .expect("should build rewritten asset target URL");
+        assert_eq!(
+            target_url.as_str(),
+            "https://storage.example.com/bucket/site/static/app.js",
+            "should put a rewritten path under the folder too"
+        );
+    }
+
+    #[test]
+    fn build_asset_proxy_target_url_keeps_requests_inside_the_source_folder() {
+        let route = ProxyAssetRoute::new("/assets/", "https://storage.example.com/bucket/site");
+        for path in [
+            "/assets/../../other/secret.json",
+            "/assets/%2e%2e/%2e%2e/other/secret.json",
+            "/assets/./app.js",
+            "/assets/%252e%252e/secret.json",
+        ] {
+            let err = build_asset_proxy_target_url(&route, &location_of(&route), path, "")
+                .expect_err("should refuse a path that could leave the folder");
+            assert_eq!(
+                err.current_context().status_code(),
+                StatusCode::BAD_REQUEST,
+                "should answer `{path}` with 400"
+            );
+        }
+
+        let root = ProxyAssetRoute::new("/assets/", "https://assets.example.com");
+        build_asset_proxy_target_url(&root, &location_of(&root), "/assets/./app.js", "")
+            .expect("a source with no folder has nothing to climb out of");
+    }
+
+    #[test]
+    fn build_asset_proxy_target_url_adds_the_source_index_to_a_folder_path() {
+        let mut route = ProxyAssetRoute::new("/docs/", "https://storage.example.com/bucket/site");
+        route.set_origin_source(&crate::source::OriginSettings {
+            directory_index: Some("index.html".to_owned()),
+            ..crate::source::OriginSettings::new("https://storage.example.com/bucket/site")
+        });
+        let location = location_of(&route);
+        for (path, expected) in [
+            (
+                "/docs/",
+                "https://storage.example.com/bucket/site/docs/index.html",
+            ),
+            (
+                "/docs/guide/",
+                "https://storage.example.com/bucket/site/docs/guide/index.html",
+            ),
+            (
+                "/docs/guide",
+                "https://storage.example.com/bucket/site/docs/guide",
+            ),
+        ] {
+            let target_url = build_asset_proxy_target_url(&route, &location, path, "")
+                .expect("should build asset target URL");
+            assert_eq!(target_url.as_str(), expected, "the target of `{path}`");
+        }
+    }
+
     #[test]
     fn build_asset_proxy_target_url_preserves_path_and_query() {
         let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
-        let target_url =
-            build_asset_proxy_target_url(&route, "/.images/foo.jpg", "auto=webp&width=800")
-                .expect("should build asset target URL");
+        let target_url = build_asset_proxy_target_url(
+            &route,
+            &location_of(&route),
+            "/.images/foo.jpg",
+            "auto=webp&width=800",
+        )
+        .expect("should build asset target URL");
 
         assert_eq!(
             target_url.as_str(),
@@ -5010,6 +5160,7 @@ mod tests {
         route.target_path = Some("/image/upload/$1.$2".to_string());
         let target_url = build_asset_proxy_target_url(
             &route,
+            &location_of(&route),
             "/.image/c_fit,w_1440/MjA/example.jpg",
             "auto=webp",
         )
@@ -5027,8 +5178,13 @@ mod tests {
         let mut route = ProxyAssetRoute::new("/_next/static/", "https://static-assets.example.com");
         route.path_pattern = Some(r"^(.*)$".to_string());
         route.target_path = Some("/_network$1".to_string());
-        let target_url = build_asset_proxy_target_url(&route, "/_next/static/chunks/app.js", "")
-            .expect("should build rewritten static asset target URL");
+        let target_url = build_asset_proxy_target_url(
+            &route,
+            &location_of(&route),
+            "/_next/static/chunks/app.js",
+            "",
+        )
+        .expect("should build rewritten static asset target URL");
 
         assert_eq!(
             target_url.as_str(),
@@ -5042,7 +5198,7 @@ mod tests {
         let mut route = ProxyAssetRoute::new("/.image/", "https://assets.example.com");
         route.path_pattern = Some(r"^/\.image/(.*)\.jpg$".to_string());
         route.target_path = Some("/image/upload/$1.jpg".to_string());
-        let err = build_asset_proxy_target_url(&route, "/.image/foo.png", "")
+        let err = build_asset_proxy_target_url(&route, &location_of(&route), "/.image/foo.png", "")
             .expect_err("should reject paths that do not match the configured rewrite");
 
         assert!(
@@ -5056,7 +5212,7 @@ mod tests {
         let mut route = ProxyAssetRoute::new("/assets/", "https://assets.example.com");
         route.path_pattern = Some(r"^/assets/(.*)$".to_string());
         route.target_path = Some("$1".to_string());
-        let err = build_asset_proxy_target_url(&route, "/assets/app.js", "")
+        let err = build_asset_proxy_target_url(&route, &location_of(&route), "/assets/app.js", "")
             .expect_err("should reject rewritten paths without a leading slash");
 
         assert!(
@@ -5153,11 +5309,17 @@ mod tests {
     ) -> Response<EdgeBody> {
         let settings = create_test_settings();
         let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
-        handle_asset_proxy_request(&settings, services, request, &route)
-            .await
-            .expect("should answer the asset request")
-            .into_response()
-            .expect("should return a buffered asset response")
+        handle_asset_proxy_request(
+            &settings,
+            services,
+            request,
+            &route,
+            &origin_source_of(&route),
+        )
+        .await
+        .expect("should answer the asset request")
+        .into_response()
+        .expect("should return a buffered asset response")
     }
 
     #[test]
@@ -5382,11 +5544,17 @@ mod tests {
             );
 
             let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com:8443");
-            let response = handle_asset_proxy_request(&settings, &services, req, &route)
-                .await
-                .expect("should proxy asset request")
-                .into_response()
-                .expect("should return buffered asset response");
+            let response = handle_asset_proxy_request(
+                &settings,
+                &services,
+                req,
+                &route,
+                &origin_source_of(&route),
+            )
+            .await
+            .expect("should proxy asset request")
+            .into_response()
+            .expect("should return buffered asset response");
             assert_eq!(response.status(), StatusCode::OK);
             assert_eq!(
                 stub.recorded_stream_response_flags(),
@@ -5472,9 +5640,15 @@ mod tests {
             let req = build_http_request(Method::GET, "https://www.example.com/.images/foo.jpg");
             let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
 
-            handle_asset_proxy_request(&settings, &services, req, &route)
-                .await
-                .expect("should proxy streaming asset response");
+            handle_asset_proxy_request(
+                &settings,
+                &services,
+                req,
+                &route,
+                &origin_source_of(&route),
+            )
+            .await
+            .expect("should proxy streaming asset response");
 
             assert_eq!(stub.recorded_stream_response_flags(), vec![true]);
         });
@@ -5505,11 +5679,17 @@ mod tests {
             let req = build_http_request(Method::GET, "https://www.example.com/.images/foo.jpg");
 
             let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
-            let response = handle_asset_proxy_request(&settings, &services, req, &route)
-                .await
-                .expect("should proxy asset request")
-                .into_response()
-                .expect("should return buffered asset response");
+            let response = handle_asset_proxy_request(
+                &settings,
+                &services,
+                req,
+                &route,
+                &origin_source_of(&route),
+            )
+            .await
+            .expect("should proxy asset request")
+            .into_response()
+            .expect("should return buffered asset response");
 
             assert!(
                 response.headers().get(header::SET_COOKIE).is_none(),
@@ -5568,9 +5748,15 @@ mod tests {
             );
             let route = ProxyAssetRoute::new("/assets/", "https://assets.example.com");
 
-            let asset_response = handle_asset_proxy_request(&settings, &services, req, &route)
-                .await
-                .expect("should proxy asset request");
+            let asset_response = handle_asset_proxy_request(
+                &settings,
+                &services,
+                req,
+                &route,
+                &origin_source_of(&route),
+            )
+            .await
+            .expect("should proxy asset request");
             assert_eq!(
                 asset_response.cache_policy(),
                 AssetProxyCachePolicy::Normalized(CachePolicy::public_immutable(
@@ -5675,9 +5861,15 @@ mod tests {
             let req = build_http_request(Method::GET, "https://www.example.com/assets/app.js");
             let route = ProxyAssetRoute::new("/assets/", "https://assets.example.com");
 
-            let asset_response = handle_asset_proxy_request(&settings, &services, req, &route)
-                .await
-                .expect("should proxy asset request");
+            let asset_response = handle_asset_proxy_request(
+                &settings,
+                &services,
+                req,
+                &route,
+                &origin_source_of(&route),
+            )
+            .await
+            .expect("should proxy asset request");
 
             assert_eq!(
                 asset_response.cache_policy(),
@@ -5740,16 +5932,19 @@ mod tests {
             "/.images/",
             "https://examplebucket.s3.us-east-1.amazonaws.com",
         );
-        route.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
-            region: "us-east-1".to_string(),
-            secret_store: None,
-            access_key_id: Redacted::new("AKIAIOSFODNN7EXAMPLE".to_string()),
-            secret_access_key: Redacted::new(
-                "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
-            ),
-            session_token: None,
-            origin_query: None,
-        }));
+        set_route_auth(
+            &mut route,
+            Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
+                region: "us-east-1".to_string(),
+                secret_store: None,
+                access_key_id: Redacted::new("AKIAIOSFODNN7EXAMPLE".to_string()),
+                secret_access_key: Redacted::new(
+                    "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
+                ),
+                session_token: None,
+                origin_query: None,
+            })),
+        );
         route.image_optimizer = Some(AssetImageOptimizerConfig {
             enabled: true,
             region: "us_east".to_string(),
@@ -5786,20 +5981,29 @@ mod tests {
                 "/.images/",
                 "https://examplebucket.s3.us-east-1.amazonaws.com",
             );
-            route.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
-                region: "us-east-1".to_string(),
-                secret_store: None,
-                access_key_id: Redacted::new("AKIAIOSFODNN7EXAMPLE".to_string()),
-                secret_access_key: Redacted::new(
-                    "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
-                ),
-                session_token: None,
-                origin_query: Some(OriginQueryPolicy::Strip),
-            }));
+            set_route_auth(
+                &mut route,
+                Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
+                    region: "us-east-1".to_string(),
+                    secret_store: None,
+                    access_key_id: Redacted::new("AKIAIOSFODNN7EXAMPLE".to_string()),
+                    secret_access_key: Redacted::new(
+                        "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
+                    ),
+                    session_token: None,
+                    origin_query: Some(OriginQueryPolicy::Strip),
+                })),
+            );
 
-            handle_asset_proxy_request(&settings, &services, req, &route)
-                .await
-                .expect("should proxy signed S3 asset request");
+            handle_asset_proxy_request(
+                &settings,
+                &services,
+                req,
+                &route,
+                &origin_source_of(&route),
+            )
+            .await
+            .expect("should proxy signed S3 asset request");
 
             let uris = stub.recorded_request_uris();
             assert_eq!(
@@ -5852,20 +6056,29 @@ mod tests {
                 "https://www.example.com/.images/foo.jpg?profile=medium",
             );
             let mut route = test_s3_image_optimizer_route();
-            route.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
-                region: "us-east-1".to_string(),
-                secret_store: None,
-                access_key_id: Redacted::new("AKIAIOSFODNN7EXAMPLE".to_string()),
-                secret_access_key: Redacted::new(
-                    "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
-                ),
-                session_token: Some(Redacted::new("session-token".to_string())),
-                origin_query: None,
-            }));
+            set_route_auth(
+                &mut route,
+                Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
+                    region: "us-east-1".to_string(),
+                    secret_store: None,
+                    access_key_id: Redacted::new("AKIAIOSFODNN7EXAMPLE".to_string()),
+                    secret_access_key: Redacted::new(
+                        "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY".to_string(),
+                    ),
+                    session_token: Some(Redacted::new("session-token".to_string())),
+                    origin_query: None,
+                })),
+            );
 
-            handle_asset_proxy_request(&settings, &services, req, &route)
-                .await
-                .expect("should proxy optimized S3 asset request");
+            handle_asset_proxy_request(
+                &settings,
+                &services,
+                req,
+                &route,
+                &origin_source_of(&route),
+            )
+            .await
+            .expect("should proxy optimized S3 asset request");
 
             assert_eq!(
                 stub.recorded_request_methods(),
@@ -5915,9 +6128,15 @@ mod tests {
                 origin_query: None,
             });
 
-            handle_asset_proxy_request(&settings, &services, req, &route)
-                .await
-                .expect("should proxy optimized asset request");
+            handle_asset_proxy_request(
+                &settings,
+                &services,
+                req,
+                &route,
+                &origin_source_of(&route),
+            )
+            .await
+            .expect("should proxy optimized asset request");
 
             let uris = stub.recorded_request_uris();
             assert_eq!(
@@ -5972,9 +6191,15 @@ mod tests {
                 origin_query: None,
             });
 
-            handle_asset_proxy_request(&settings, &services, req, &route)
-                .await
-                .expect("should proxy SVG asset without Image Optimizer profile parsing");
+            handle_asset_proxy_request(
+                &settings,
+                &services,
+                req,
+                &route,
+                &origin_source_of(&route),
+            )
+            .await
+            .expect("should proxy SVG asset without Image Optimizer profile parsing");
 
             assert_eq!(
                 stub.recorded_request_uris(),
@@ -6017,9 +6242,15 @@ mod tests {
                 origin_query: None,
             });
 
-            handle_asset_proxy_request(&settings, &services, req, &route)
-                .await
-                .expect("should proxy incoming SVG asset without Image Optimizer profile parsing");
+            handle_asset_proxy_request(
+                &settings,
+                &services,
+                req,
+                &route,
+                &origin_source_of(&route),
+            )
+            .await
+            .expect("should proxy incoming SVG asset without Image Optimizer profile parsing");
 
             assert_eq!(
                 stub.recorded_request_uris(),
@@ -6060,9 +6291,15 @@ mod tests {
                 origin_query: None,
             });
 
-            handle_asset_proxy_request(&settings, &services, req, &route)
-                .await
-                .expect("should proxy rewritten SVG asset without Image Optimizer metadata");
+            handle_asset_proxy_request(
+                &settings,
+                &services,
+                req,
+                &route,
+                &origin_source_of(&route),
+            )
+            .await
+            .expect("should proxy rewritten SVG asset without Image Optimizer metadata");
 
             assert_eq!(
                 stub.recorded_request_uris(),
@@ -6093,11 +6330,17 @@ mod tests {
             );
             let route = test_s3_image_optimizer_route();
 
-            let response = handle_asset_proxy_request(&settings, &services, req, &route)
-                .await
-                .expect("should proxy raw SVG asset through S3 route")
-                .into_response()
-                .expect("should return buffered asset response");
+            let response = handle_asset_proxy_request(
+                &settings,
+                &services,
+                req,
+                &route,
+                &origin_source_of(&route),
+            )
+            .await
+            .expect("should proxy raw SVG asset through S3 route")
+            .into_response()
+            .expect("should return buffered asset response");
 
             assert_eq!(response_body_string(response), "raw-svg");
             assert_eq!(
@@ -6139,11 +6382,16 @@ mod tests {
             );
             let route = test_s3_image_optimizer_route();
 
-            let (response, stream_body) =
-                handle_asset_proxy_request(&settings, &services, req, &route)
-                    .await
-                    .expect("should proxy optimized S3 asset request")
-                    .into_response_and_body();
+            let (response, stream_body) = handle_asset_proxy_request(
+                &settings,
+                &services,
+                req,
+                &route,
+                &origin_source_of(&route),
+            )
+            .await
+            .expect("should proxy optimized S3 asset request")
+            .into_response_and_body();
 
             assert_eq!(response.status(), StatusCode::OK, "should proxy the asset");
             let mut output = Vec::new();
@@ -6218,9 +6466,15 @@ mod tests {
             );
             let route = test_s3_image_optimizer_route();
 
-            let asset_response = handle_asset_proxy_request(&settings, &services, req, &route)
-                .await
-                .expect("should return raw S3 error response");
+            let asset_response = handle_asset_proxy_request(
+                &settings,
+                &services,
+                req,
+                &route,
+                &origin_source_of(&route),
+            )
+            .await
+            .expect("should return raw S3 error response");
             assert_eq!(
                 asset_response.cache_policy(),
                 AssetProxyCachePolicy::NoStorePrivate,
@@ -6290,11 +6544,16 @@ mod tests {
             );
             let route = test_s3_image_optimizer_route();
 
-            let (response, stream_body) =
-                handle_asset_proxy_request(&settings, &services, req, &route)
-                    .await
-                    .expect("should proxy debug S3 asset request")
-                    .into_response_and_body();
+            let (response, stream_body) = handle_asset_proxy_request(
+                &settings,
+                &services,
+                req,
+                &route,
+                &origin_source_of(&route),
+            )
+            .await
+            .expect("should proxy debug S3 asset request")
+            .into_response_and_body();
 
             assert_eq!(response.status(), StatusCode::OK, "should proxy the asset");
             let mut output = Vec::new();
@@ -6347,9 +6606,15 @@ mod tests {
                 origin_query: None,
             });
 
-            handle_asset_proxy_request(&settings, &services, req, &route)
-                .await
-                .expect("should proxy debug asset request");
+            handle_asset_proxy_request(
+                &settings,
+                &services,
+                req,
+                &route,
+                &origin_source_of(&route),
+            )
+            .await
+            .expect("should proxy debug asset request");
 
             let options = stub.recorded_image_optimizer_options();
             assert!(
@@ -6369,11 +6634,16 @@ mod tests {
             let req = build_http_request(Method::GET, "https://www.example.com/.images/foo.jpg");
             let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
 
-            let (response, stream_body) =
-                handle_asset_proxy_request(&settings, &services, req, &route)
-                    .await
-                    .expect("should proxy a streaming asset response")
-                    .into_response_and_body();
+            let (response, stream_body) = handle_asset_proxy_request(
+                &settings,
+                &services,
+                req,
+                &route,
+                &origin_source_of(&route),
+            )
+            .await
+            .expect("should proxy a streaming asset response")
+            .into_response_and_body();
             assert_eq!(response.status(), StatusCode::OK);
             assert!(
                 response.headers().get(header::SET_COOKIE).is_none(),
@@ -6503,9 +6773,15 @@ mod tests {
             let settings = create_test_settings();
             let req = build_http_request(Method::GET, "https://www.example.com/.images/foo.jpg");
             let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
-            let asset_response = handle_asset_proxy_request(&settings, &services, req, &route)
-                .await
-                .expect("should proxy a streaming asset response");
+            let asset_response = handle_asset_proxy_request(
+                &settings,
+                &services,
+                req,
+                &route,
+                &origin_source_of(&route),
+            )
+            .await
+            .expect("should proxy a streaming asset response");
 
             let err = asset_response
                 .into_response()

@@ -433,6 +433,18 @@ impl SectionModules {
         Some(table)
     }
 
+    /// A section selecting `written` alone, with `module`, and holding its
+    /// settings table.
+    #[must_use]
+    pub fn one(written: &str, settings: Map<String, Value>) -> Self {
+        let mut section = Self {
+            key: Some(SelectionKey::Module),
+            ..Self::default()
+        };
+        section.insert(written, settings);
+        section
+    }
+
     /// Selects `written` and stores its settings table, which is what writing
     /// both in a document does.
     pub fn insert(&mut self, written: &str, settings: Map<String, Value>) {

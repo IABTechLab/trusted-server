@@ -1115,10 +1115,15 @@ mod tests {
     fn settings_with_probe(body: &str) -> Settings {
         Settings::from_toml(&format!(
             r#"
+                [source]
+                module = "origin"
+
+                [source.origin]
+                url = "https://origin.test-publisher.example.com"
+
                 [publisher]
                 domain = "test-publisher.example.com"
                 cookie_domain = ".test-publisher.example.com"
-                origin_url = "https://origin.test-publisher.example.com"
                 proxy_secret = "seam-probe-test-proxy-secret"
 
                 [ec]
@@ -1358,10 +1363,15 @@ mod tests {
     fn validate_reports_not_selected_without_a_module_entry() {
         let settings = Settings::from_toml(
             r#"
+                [source]
+                module = "origin"
+
+                [source.origin]
+                url = "https://origin.test-publisher.example.com"
+
                 [publisher]
                 domain = "test-publisher.example.com"
                 cookie_domain = ".test-publisher.example.com"
-                origin_url = "https://origin.test-publisher.example.com"
                 proxy_secret = "seam-probe-test-proxy-secret"
 
                 [ec]

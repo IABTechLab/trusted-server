@@ -25,10 +25,15 @@ const LEGACY_ADMIN_DENY_METHODS: &[&str] =
 fn test_settings() -> trusted_server_core::settings::Settings {
     trusted_server_core::settings::Settings::from_toml(
         r#"
+            [source]
+            module = "origin"
+
+            [source.origin]
+            url = "https://origin.test-publisher.example.com"
+
             [publisher]
             domain = "test-publisher.example.com"
             cookie_domain = ".test-publisher.example.com"
-            origin_url = "https://origin.test-publisher.example.com"
             proxy_secret = "integration-test-proxy-secret"
 
             [ec]
@@ -650,10 +655,15 @@ async fn first_party_proxy_rebuild_is_routed() {
 /// inject, with the `[ec.acme]` block that module's settings live in.
 /// `acme` is a fictional vendor key.
 const UNINJECTED_MODULE_TOML: &str = r#"
+    [source]
+    module = "origin"
+
+    [source.origin]
+    url = "https://origin.test-publisher.example.com"
+
     [publisher]
     domain = "test-publisher.example.com"
     cookie_domain = ".test-publisher.example.com"
-    origin_url = "https://origin.test-publisher.example.com"
     proxy_secret = "integration-test-proxy-secret"
 
     [ec]

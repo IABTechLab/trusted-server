@@ -31,10 +31,15 @@ fn test_router() -> RouterService {
 fn test_settings() -> Settings {
     Settings::from_toml(
         r#"
+            [source]
+            module = "origin"
+
+            [source.origin]
+            url = "https://origin.test-publisher.example.com"
+
             [publisher]
             domain = "test-publisher.example.com"
             cookie_domain = ".test-publisher.example.com"
-            origin_url = "https://origin.test-publisher.example.com"
             proxy_secret = "route-test-proxy-secret"
 
             [ec]
@@ -78,10 +83,15 @@ fn assert_route_registered(method: &str, path: &str) {
 fn make_router() -> RouterService {
     let settings = trusted_server_core::settings::Settings::from_toml(
         r#"
+            [source]
+            module = "origin"
+
+            [source.origin]
+            url = "https://origin.test-publisher.example.com"
+
             [publisher]
             domain = "test-publisher.example.com"
             cookie_domain = ".test-publisher.example.com"
-            origin_url = "https://origin.test-publisher.example.com"
             proxy_secret = "integration-test-proxy-secret"
 
             [geo]
@@ -445,10 +455,15 @@ async fn tsjs_route_prefix_is_handled_not_5xx() {
 /// inject, with the `[ec.acme]` block that module's settings live in.
 /// `acme` is a fictional vendor key.
 const UNINJECTED_MODULE_TOML: &str = r#"
+    [source]
+    module = "origin"
+
+    [source.origin]
+    url = "https://origin.test-publisher.example.com"
+
     [publisher]
     domain = "test-publisher.example.com"
     cookie_domain = ".test-publisher.example.com"
-    origin_url = "https://origin.test-publisher.example.com"
     proxy_secret = "route-test-proxy-secret"
 
     [ec]
@@ -586,10 +601,15 @@ fn every_fixed_route_beneath_an_underscore_prefix_is_reserved() {
 fn router_refusing_every_crawler() -> RouterService {
     let settings = Settings::from_toml(
         r#"
+            [source]
+            module = "origin"
+
+            [source.origin]
+            url = "https://origin.test-publisher.example.com"
+
             [publisher]
             domain = "test-publisher.example.com"
             cookie_domain = ".test-publisher.example.com"
-            origin_url = "https://origin.test-publisher.example.com"
             proxy_secret = "route-test-proxy-secret"
 
             [ec]
