@@ -6305,6 +6305,18 @@ source_domain = "partner.example.com"
     }
 
     #[test]
+    fn legacy_env_loader_ignores_build_time_git_version() {
+        let toml_str = crate_test_settings_str();
+
+        for value in ["v0.0.0-example", ""] {
+            temp_env::with_var("TRUSTED_SERVER__GIT_VERSION", Some(value), || {
+                Settings::from_toml_and_env(&toml_str)
+                    .expect("should ignore the build-time git version input");
+            });
+        }
+    }
+
+    #[test]
     fn test_origin_host_header_override_env() {
         let env_key = format!(
             "{}{}PUBLISHER{}ORIGIN_HOST_HEADER_OVERRIDE",
