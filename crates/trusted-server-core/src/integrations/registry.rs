@@ -17,6 +17,7 @@ use crate::ec::device::DeviceModule;
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::module::{EcModuleSelection, EdgeCookieModule};
 use crate::error::TrustedServerError;
+use crate::evidence::OwnedRequestInfo;
 use crate::geo::GeoInfo;
 use crate::http_util::is_navigation_request;
 use crate::middleware::{Middleware, MiddlewareChain, MiddlewarePhase, PhaseEntries};
@@ -2484,10 +2485,25 @@ impl IntegrationRegistry {
             req.headers_mut().remove(HEADER_X_TS_EC.clone());
 
             // The route takes the request, so the context holds a copy of
-            // what it resolved to, beside what was resolved for it.
+            // what it resolved to and of its evidence, beside what was
+            // resolved for it. The evidence is read as the permission path
+            // reads it, after the caller's EC header is gone.
             let resolved = ResolvedRequest::of(&req, services.client_info());
+            let evidence = OwnedRequestInfo::new(
+                services
+                    .client_info()
+                    .client_ip
+                    .map(crate::ec::generation::normalize_ip)
+                    .unwrap_or_default(),
+                req.headers().clone(),
+            )
+            .with_request_target(
+                req.uri().path().to_owned(),
+                req.uri().query().unwrap_or_default().to_owned(),
+            );
             let context = ModuleContext::new(resolved.view())
                 .with_settings(settings)
+                .with_evidence(&evidence)
                 .with_request_state(ec_context, services);
             Some(
                 proxy
@@ -4856,6 +4872,105 @@ mod tests {
             answer(PermissionSet::none()),
             "test-publisher.com storage=true id=none",
             "and one declaring nothing still sees the permissions but not the identifier"
+        );
+    }
+
+    /// A route that answers with the request evidence its module call
+    /// handed it.
+    struct EvidenceReadingRoute;
+
+    impl EvidenceReadingRoute {
+        fn report(
+            &self,
+            _req: Request<EdgeBody>,
+            evidence: &dyn crate::evidence::RequestInfo,
+        ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+            let body = format!(
+                "ip={} path={} query={} session={} ec={}",
+                evidence.client_ip(),
+                evidence.path(),
+                evidence.query(),
+                evidence.cookie("session").unwrap_or("none"),
+                evidence.header("x-ts-ec").unwrap_or("none"),
+            );
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .body(EdgeBody::from(body))
+                .expect("should build the response"))
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl IntegrationProxy for EvidenceReadingRoute {
+        fn integration_name(&self) -> &'static str {
+            "evidence"
+        }
+
+        fn routes(&self) -> Vec<IntegrationEndpoint> {
+            vec![IntegrationEndpoint::post("/integrations/test/evidence")]
+        }
+
+        async fn handle(
+            &self,
+            call: ModuleCall<'_>,
+            req: Request<EdgeBody>,
+        ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+            call.inject_with(self, req, Self::report)?
+        }
+    }
+
+    /// A route is handed its request's evidence, being the client address,
+    /// the headers and the address it was asked at, without the caller's EC
+    /// header, so a route that reads the request as evidence can answer.
+    #[test]
+    fn a_route_is_handed_its_requests_evidence() {
+        let settings = create_test_settings();
+        let registry = IntegrationRegistry::from_routes(vec![(
+            Method::POST,
+            "/integrations/test/evidence",
+            (
+                Arc::new(EvidenceReadingRoute) as Arc<dyn IntegrationProxy>,
+                "evidence",
+            ),
+        )]);
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("https://test-publisher.com/integrations/test/evidence?from=page")
+            .header(header::HOST, "test-publisher.com")
+            .header(header::COOKIE, "session=abc")
+            .header(HEADER_X_TS_EC.clone(), "caller-supplied")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        let mut ec_context =
+            EcContext::new_for_test(None, crate::consent::ConsentContext::default());
+        let services =
+            crate::platform::test_support::noop_services_with_client_ip(std::net::IpAddr::from([
+                203, 0, 113, 7,
+            ]));
+
+        let response = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
+            method: &Method::POST,
+            path: "/integrations/test/evidence",
+            settings: &settings,
+            kv: None,
+            ec_context: &mut ec_context,
+            services: &services,
+            req,
+        }))
+        .expect("should find the route")
+        .expect("a route reading the evidence should answer");
+        let body = String::from_utf8(
+            response
+                .into_body()
+                .into_bytes()
+                .unwrap_or_default()
+                .to_vec(),
+        )
+        .expect("the answer is text");
+
+        assert_eq!(
+            body,
+            "ip=203.0.113.7 path=/integrations/test/evidence query=from=page session=abc ec=none"
         );
     }
 
