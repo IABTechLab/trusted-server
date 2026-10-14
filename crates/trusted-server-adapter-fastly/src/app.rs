@@ -296,10 +296,18 @@ fn registered_integrations() -> &'static [IntegrationBuilder] {
 /// adapter, or when the auction orchestrator or the integration registry fail
 /// to initialize, which includes two builders claiming the same integration
 /// id.
+/// The second header Compute reads a shared cache policy from, beside
+/// `Surrogate-Control`, which core strips from every response it makes
+/// private.
+pub const FASTLY_SURROGATE_CONTROL_HEADER: &str = "fastly-surrogate-control";
+
 pub(crate) fn build_state_with_registrations(
     settings: Settings,
     integrations: &[IntegrationBuilder],
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    trusted_server_core::platform::declare_platform_cache_headers(&[
+        FASTLY_SURROGATE_CONTROL_HEADER,
+    ]);
     warn_if_certificate_check_disabled(&settings);
 
     // The modules this adapter links come first and the deployment's own
@@ -342,7 +350,11 @@ pub(crate) fn build_state_with_registrations(
             &shipped_signal_modules(),
         )?;
 
-    let auction_telemetry_sink = crate::tinybird::auction_sink_from_settings(&settings);
+    // The sink `[analytics] module` selected, or core's no-op sink.
+    let auction_telemetry_sink = registry.analytics_module().unwrap_or_else(|| {
+        Arc::new(trusted_server_core::auction::NoopAuctionTelemetrySink)
+            as Arc<dyn AuctionTelemetrySink>
+    });
     let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
     let loading_caches =
         trusted_server_core::integrations::loading_caches_from(&settings, integrations)?;
@@ -408,6 +420,8 @@ pub fn shipped_module_builders() -> Vec<IntegrationBuilder> {
         trusted_server_ads_txt_iabtl::builder(),
         // Run by `[shared.51degrees]` rather than selected by a section.
         trusted_server_middleware_51degrees::builder(),
+        // The analytics module `[analytics]` selects, which changes no page.
+        trusted_server_analytics_tinybird::builder(),
         // Implementations `[demand]` and `[ad-server]` can name, which no
         // section selects.
         trusted_server_auction_protocol_openrtb::builder(),
@@ -3517,6 +3531,7 @@ mod tests {
                 "ad-tag.google.diagnostics",
                 "ads-txt.iabtl",
                 "51degrees",
+                "analytics.tinybird",
                 "auction-protocol.openrtb",
                 "auction.prebid-server",
                 "auction.aps",

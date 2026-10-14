@@ -56,7 +56,6 @@ mod platform;
 mod rate_limiter;
 mod sandbox;
 mod template_cache;
-mod tinybird;
 mod value_cache;
 
 use crate::app::{

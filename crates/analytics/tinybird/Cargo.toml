@@ -1,0 +1,36 @@
+[package]
+name = "trusted-server-analytics-tinybird"
+description = "Tinybird as an analytics module: each auction's telemetry rows sent to the Events API as one request, selected by `[analytics]`."
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+version = { workspace = true }
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+edgezero-core = { workspace = true }
+error-stack = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+trusted-server-core = { workspace = true }
+urlencoding = { workspace = true }
+validator = { workspace = true }
+
+[dev-dependencies]
+futures = { workspace = true }
+trusted-server-core = { workspace = true, features = ["test-utils"] }
+
+# The visible owner of this vendor crate, the way Prebid.js requires a named
+# maintainer of every adapter. Tinybird has not yet adopted this crate, so the
+# Trusted Server maintainers own it until a vendor owner steps up.
+[package.metadata.maintainers]
+owner = "Trusted Server maintainers"
+status = "seeking vendor owner"

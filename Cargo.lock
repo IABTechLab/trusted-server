@@ -6606,6 +6606,7 @@ dependencies = [
  "trusted-server-ad-server-iabtl",
  "trusted-server-ad-tag-google",
  "trusted-server-ads-txt-iabtl",
+ "trusted-server-analytics-tinybird",
  "trusted-server-auction-aps",
  "trusted-server-auction-prebid",
  "trusted-server-auction-prebid-server",
@@ -6652,6 +6653,7 @@ dependencies = [
  "trusted-server-ad-server-iabtl",
  "trusted-server-ad-tag-google",
  "trusted-server-ads-txt-iabtl",
+ "trusted-server-analytics-tinybird",
  "trusted-server-auction-aps",
  "trusted-server-auction-prebid",
  "trusted-server-auction-prebid-server",
@@ -6703,6 +6705,7 @@ dependencies = [
  "trusted-server-ad-server-iabtl",
  "trusted-server-ad-tag-google",
  "trusted-server-ads-txt-iabtl",
+ "trusted-server-analytics-tinybird",
  "trusted-server-auction-aps",
  "trusted-server-auction-prebid",
  "trusted-server-auction-prebid-server",
@@ -6729,7 +6732,6 @@ dependencies = [
  "trusted-server-tag-google-tag-manager",
  "trusted-server-testing-iabtl",
  "trusted-server-testing-testlight",
- "urlencoding",
 ]
 
 [[package]]
@@ -6754,6 +6756,7 @@ dependencies = [
  "trusted-server-ad-server-iabtl",
  "trusted-server-ad-tag-google",
  "trusted-server-ads-txt-iabtl",
+ "trusted-server-analytics-tinybird",
  "trusted-server-auction-aps",
  "trusted-server-auction-prebid",
  "trusted-server-auction-prebid-server",
@@ -6791,6 +6794,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "trusted-server-analytics-tinybird"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "edgezero-core",
+ "error-stack",
+ "futures",
+ "log",
+ "serde",
+ "serde_json",
+ "trusted-server-core",
+ "urlencoding",
+ "validator",
+]
+
+[[package]]
 name = "trusted-server-auction-aps"
 version = "0.1.0"
 dependencies = [
@@ -6804,6 +6823,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "trusted-server-auction-protocol-openrtb",
  "trusted-server-core",
  "trusted-server-permission-signal-gpc",
  "trusted-server-permission-signal-gpp",
@@ -6849,6 +6869,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "trusted-server-auction-protocol-openrtb",
  "trusted-server-core",
  "trusted-server-permission-signal-gpc",
  "trusted-server-permission-signal-gpp",
@@ -6864,10 +6885,16 @@ name = "trusted-server-auction-protocol-openrtb"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "edgezero-core",
  "error-stack",
+ "futures",
+ "http",
+ "log",
  "serde",
  "serde_json",
  "trusted-server-core",
+ "trusted-server-openrtb",
+ "url",
 ]
 
 [[package]]
@@ -6957,6 +6984,7 @@ dependencies = [
  "trusted-server-ad-server-iabtl",
  "trusted-server-ad-tag-google",
  "trusted-server-ads-txt-iabtl",
+ "trusted-server-analytics-tinybird",
  "trusted-server-auction-aps",
  "trusted-server-auction-prebid",
  "trusted-server-auction-prebid-server",
@@ -7355,6 +7383,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tokio",
+ "trusted-server-auction-protocol-openrtb",
  "trusted-server-core",
  "validator",
 ]

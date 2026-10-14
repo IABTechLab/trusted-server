@@ -22,9 +22,11 @@ pub const MIN_API_TOKEN_LENGTH: usize = 32;
 pub struct PartnerConfig {
     /// Human-readable partner name.
     pub name: String,
-    /// Canonical `OpenRTB` EID source domain and EC KV `ids` key.
+    /// The source domain the partner's identifiers carry, and the EC KV
+    /// `ids` key.
     pub source_domain: String,
-    /// `OpenRTB` `atype` value.
+    /// The agent type the partner's identifiers carry, as `openrtb_atype` in
+    /// the partner's table sets it.
     pub openrtb_atype: i32,
     /// Whether this partner's UIDs appear in auction `user.eids`.
     pub bidstream_enabled: bool,
