@@ -712,6 +712,7 @@ describe('complete inventory producer', () => {
             outDir: alias,
             inventoryPath: path.join(outDir, 'inside.json'),
             preparationPath,
+            sourceContextPath,
           })
         ).rejects.toThrow(/outside.*bundle/i);
         await expect(
@@ -720,6 +721,7 @@ describe('complete inventory producer', () => {
             outDir,
             inventoryPath: path.join(root, 'wrong-checkout.json'),
             preparationPath,
+            sourceContextPath,
           })
         ).rejects.toThrow(/collector.*checkout/i);
         const originalPreparation = fs.readFileSync(preparationPath);
@@ -734,6 +736,7 @@ describe('complete inventory producer', () => {
             outDir,
             inventoryPath: path.join(root, 'collision.json'),
             preparationPath,
+            sourceContextPath,
           })
         ).rejects.toThrow(/duplicate.*material|material.*identity/i);
         expect(fs.existsSync(path.join(root, 'collision.json'))).toBe(false);
@@ -753,6 +756,7 @@ describe('complete inventory producer', () => {
             outDir,
             inventoryPath: path.join(root, 'bad.json'),
             preparationPath,
+            sourceContextPath,
           })
         ).rejects.toThrow(/actual.*tool.*identity/i);
       } finally {

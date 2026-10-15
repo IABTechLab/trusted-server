@@ -207,3 +207,52 @@ fn failed_cleanup_cannot_return_or_retain_a_completed_build() {
         "should retain both failure contexts"
     );
 }
+
+#[test]
+fn vitest_failure_diagnostics_include_only_bounded_registered_names() {
+    let report = json!({"testResults":[
+        {"name":"/work/lib/test/fictional.test.ts","status":"failed","message":"PRIVATE ASSERTION","assertionResults":[
+            {"fullName":"fictional suite should reject invalid input","status":"failed","failureMessages":["PRIVATE STACK"]},
+            {"fullName":"successful case","status":"passed"}
+        ]},
+        {"name":"/outside/private-file","status":"failed","assertionResults":[]}
+    ]});
+    let expected = BTreeSet::from(["test/fictional.test.ts".to_owned()]);
+    let bytes = serde_json::to_vec(&report).expect("should encode fictional report");
+    let diagnostic = vitest_failure_diagnostic(&bytes, &expected, Path::new("/work/lib"))
+        .expect("should parse report");
+    assert!(
+        diagnostic.contains("test/fictional.test.ts")
+            && diagnostic.contains("fictional suite should reject invalid input"),
+        "should preserve failed suite and test identities"
+    );
+    for omitted in [
+        "PRIVATE ASSERTION",
+        "PRIVATE STACK",
+        "successful case",
+        "private-file",
+    ] {
+        assert!(
+            !diagnostic.contains(omitted),
+            "should omit arbitrary failure context and unregistered paths"
+        );
+    }
+    assert!(
+        vitest_failure_diagnostic(b"{", &expected, Path::new("/work/lib")).is_err(),
+        "should reject malformed reports"
+    );
+    let tests: Vec<_> = (0..100)
+        .map(|_| json!({"fullName":format!("{}\n\u{1b}","x".repeat(1000)),"status":"failed"}))
+        .collect();
+    let large = json!({"testResults":[{"name":"/work/lib/test/fictional.test.ts","status":"failed","assertionResults":tests}]});
+    let diagnostic = vitest_failure_diagnostic(
+        &serde_json::to_vec(&large).expect("should encode bounded fixture"),
+        &expected,
+        Path::new("/work/lib"),
+    )
+    .expect("should summarize names");
+    assert!(
+        diagnostic.len() < 5000 && !diagnostic.contains(['\n', '\u{1b}']),
+        "should bound count and length and remove controls"
+    );
+}

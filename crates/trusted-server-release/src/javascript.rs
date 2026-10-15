@@ -342,6 +342,67 @@ fn test_report(
     Ok(total)
 }
 
+// Failure diagnostics deliberately exclude assertions, stacks and child output.
+fn vitest_failure_diagnostic(
+    bytes: &[u8],
+    expected: &BTreeSet<String>,
+    execution_library: &Path,
+) -> Result<String, Report<ReleaseError>> {
+    let report = parse_json(bytes, Role::Companion)?;
+    let results = report["testResults"]
+        .as_array()
+        .ok_or_else(|| preparation_error("Vitest report lacks suite results"))?;
+    let sanitize = |name: &str| -> String {
+        name.chars()
+            .take(256)
+            .map(|character| {
+                if character.is_ascii() && !character.is_ascii_control() {
+                    character
+                } else {
+                    '?'
+                }
+            })
+            .collect()
+    };
+    let mut names = Vec::new();
+    for result in results {
+        if names.len() >= 16 {
+            break;
+        }
+        let Some(relative) = result["name"].as_str().and_then(|name| {
+            Path::new(name)
+                .strip_prefix(execution_library)
+                .ok()?
+                .to_str()
+        }) else {
+            continue;
+        };
+        if !expected.contains(relative) {
+            continue;
+        }
+        if result["status"] == "failed" {
+            names.push(format!("suite failed: {}", sanitize(relative)));
+        }
+        if let Some(assertions) = result["assertionResults"].as_array() {
+            for assertion in assertions {
+                if names.len() >= 16 {
+                    break;
+                }
+                if assertion["status"] == "failed"
+                    && let Some(name) = assertion["fullName"].as_str()
+                {
+                    names.push(format!("test failed: {}", sanitize(name)));
+                }
+            }
+        }
+    }
+    Ok(if names.is_empty() {
+        "Vitest failed without registered failed names".to_owned()
+    } else {
+        format!("Vitest failed names (at most 16): {}", names.join("; "))
+    })
+}
+
 struct MissingFiles {
     paths: Vec<(PathBuf, PathBuf)>,
     _directory: tempfile::TempDir,
@@ -567,7 +628,38 @@ impl PreparedJsBuild<'_> {
                     .execution_path(&side.output().join("vitest.json"))?
                     .into_os_string(),
             ];
-            self.run_command(index, boundaries[index], proofs[index], arguments)?;
+            if let Err(mut error) =
+                self.run_command(index, boundaries[index], proofs[index], arguments)
+            {
+                let diagnostic = read_bounded_with_check(
+                    &side.output().join("vitest.json"),
+                    Role::Companion,
+                    &|| self.attempt.check(),
+                )
+                .and_then(|report| {
+                    vitest_failure_diagnostic(
+                        &report.bytes,
+                        &side.expected_tests,
+                        &boundaries[index].execution_path(&side.library())?,
+                    )
+                });
+                error = error.attach(
+                    diagnostic
+                        .unwrap_or_else(|_| "Bounded Vitest failure names unavailable".to_owned()),
+                );
+                if let Err(changed) =
+                    verify_captured_output(&side.output(), &captured, &|| self.attempt.check())
+                {
+                    error = error.attach(format!(
+                        "post-failure collector recheck failed: {changed:?}"
+                    ));
+                }
+                if let Err(changed) = side.verify_source() {
+                    error =
+                        error.attach(format!("post-failure source recheck failed: {changed:?}"));
+                }
+                return Err(error);
+            }
             verify_captured_output(&side.output(), &captured, &|| self.attempt.check())?;
             let report = read_bounded_with_check(
                 &side.output().join("vitest.json"),
