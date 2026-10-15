@@ -54,7 +54,8 @@ const TRUSTED_SERVER_HEAD: &str = "ts";
 /// so the script writes the deployment's names and holds no copy of its own.
 pub const PUBLIC_PREFIX_ATTRIBUTE: &str = "data-ts-public-prefix";
 
-/// The start of every name the browser holds for a publisher, such as `_ex`.
+/// The start of every name the browser holds for a publisher, such as `_ex`,
+/// and the `Path` of the cookies it names.
 ///
 /// Made of parts, such as `_ex` and `www.example.com`, joined by `.`. Every
 /// part holds only ASCII letters, digits, `_`, `-` and `.`, so the prefix is a
@@ -62,6 +63,9 @@ pub const PUBLIC_PREFIX_ATTRIBUTE: &str = "data-ts-public-prefix";
 /// or a single `_`, so no cookie name starts with `__`, where browsers give
 /// names such as `__Host-` rules of their own and drop a cookie that breaks
 /// them.
+///
+/// The path is `/` unless [`Self::for_request`] or [`Self::under_path`]
+/// built the prefix for a request addressed by path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicPrefix {
     dotted: String,
@@ -133,10 +137,12 @@ impl PublicPrefix {
     }
 
     /// The prefix for `request`, its cookies written under the prefix
-    /// request addressing removed, or under `/` when none was removed.
+    /// request addressing removed, or under `/` when none was removed or
+    /// [`Self::under_path`] keeps `/` for it.
     ///
-    /// A browser sends a cookie only under its `Path`, so publishers served
-    /// from one host by path never receive each other's cookies.
+    /// A browser sends a cookie only on requests under its `Path`, so a
+    /// cookie written under one publisher's path is not sent on another
+    /// publisher's requests. A cookie written under `/` is sent on them all.
     #[must_use]
     pub fn for_request<B>(&self, request: &http::Request<B>) -> Self {
         self.clone().under_path(

@@ -951,7 +951,9 @@ impl EcContext {
     }
 
     /// The start of every cookie name this request's Edge Cookie state reads
-    /// and writes, such as `ts` for `ts-ec`.
+    /// and writes, such as `ts` for `ts-ec`, and the `Path` it writes them
+    /// under, which is the request's removed prefix or `/`, see
+    /// [`PublicPrefix::for_request`].
     #[must_use]
     pub fn public_prefix(&self) -> &PublicPrefix {
         &self.public_prefix
