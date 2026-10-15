@@ -4,8 +4,8 @@ Trusted Server can emit bounded auction observations to an analytics module.
 `[analytics] module` selects the module, and core hands each settled auction's
 rows to the sink that module supplies. Without the section nothing is sent,
 through core's no-op sink. The one module a stock build ships is Tinybird,
-`crates/analytics/tinybird`, offered by `crates/trusted-server-modules` to
-every adapter that builds its state from that list.
+`crates/analytics/tinybird`, which each adapter lists among the modules it
+links.
 
 ## Data path
 
