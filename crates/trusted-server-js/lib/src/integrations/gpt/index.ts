@@ -17,6 +17,7 @@ import type {
   TsjsApi,
 } from '../../core/types';
 import {
+  APS_NATIVE_RENDERER_TIMEOUT_MS,
   APS_RENDER_FAILED_MESSAGE,
   APS_UNIVERSAL_CREATIVE_RENDERER,
   APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
@@ -1943,7 +1944,12 @@ function recordConsumedPrebidApsId(
   expiresAt: number,
   adUnitCode: string
 ): void {
-  consumedIds.set(adId, { expiresAt, adUnitCode });
+  // A capability consumed with little TTL left would otherwise lose its
+  // tombstone before the renderer frame's timeout fires, dropping the relayed
+  // reason. Holding it for at least that long also keeps the ad ID blocked
+  // longer, which is the safer direction for a security tombstone.
+  const minimum = Date.now() + APS_NATIVE_RENDERER_TIMEOUT_MS;
+  consumedIds.set(adId, { expiresAt: Math.max(expiresAt, minimum), adUnitCode });
 }
 
 /**
@@ -2003,8 +2009,28 @@ export function installTsRenderBridge(): void {
       if (typeof failedAdId === 'string' && reason !== undefined) {
         pruneConsumedPrebidApsIds(consumedPrebidApsIds, Date.now());
         const tombstone = consumedPrebidApsIds.get(failedAdId);
-        if (tombstone && sourceFrameForAdUnit(e.source, tombstone.adUnitCode)) {
-          safelyRecordCreativeFailure(safelyRecordCreativeRequest(tombstone.adUnitCode), reason);
+        let failedSlotId: string | undefined;
+        if (tombstone) {
+          // The Prebid path tombstones the publisher's ad unit code, which is a
+          // div id. The store keys associations by the configured Trusted Server
+          // slot id, so resolve it; a div Trusted Server never associated has no
+          // slot id and is left alone rather than recorded under the wrong key.
+          if (sourceFrameForAdUnit(e.source, tombstone.adUnitCode)) {
+            failedSlotId = window.tsjs?.divToSlotId?.[tombstone.adUnitCode];
+          }
+        } else {
+          // Server-side APS winners are served the same renderer and emit the
+          // same relay, but are tracked per slot. `hb_adid` is not unique per
+          // slot, so require the sender to sit in the slot that consumed it.
+          for (const [slotId, consumedAdId] of consumedServerApsBySlot) {
+            if (consumedAdId === failedAdId && sourceFrameForSlotId(e.source, slotId)) {
+              failedSlotId = slotId;
+              break;
+            }
+          }
+        }
+        if (failedSlotId !== undefined) {
+          safelyRecordCreativeFailure(safelyRecordCreativeRequest(failedSlotId), reason);
         }
       }
       return;

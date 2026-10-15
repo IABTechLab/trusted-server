@@ -123,7 +123,7 @@ function receive(event){
  if(event.source!==parent)return;
  var message=event.data;
  if(!keys(message,['nonce','renderer']))return;
- if(message.nonce!==expected){report('nonce_mismatch',message.nonce);return;}
+ if(message.nonce!==expected){report('nonce_mismatch',expected);return;}
  var problem=rendererProblem(message.renderer);
  if(problem){report(problem,message.nonce);return;}
  removeEventListener('message',receive);

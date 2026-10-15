@@ -3688,7 +3688,10 @@ describe('installTsRenderBridge', () => {
         getSlotElementId: () => 'div-header',
         getAdUnitPath: () => '/example/div-header',
       };
-      store.recordTrustedServerOpportunity(slot, 'div-header', 'renderable_candidate');
+      // Production associates under the configured slot id and maps the div to
+      // it, so the ids differ here the way they do on a real page.
+      (window as TestWindow).tsjs.divToSlotId = { 'div-header': 'homepage_header' };
+      store.recordTrustedServerOpportunity(slot, 'homepage_header', 'renderable_candidate');
       store.recordSlotRequested(slot);
 
       // Serve the capability so the ad ID is tombstoned with its ad unit.
@@ -3716,6 +3719,59 @@ describe('installTsRenderBridge', () => {
 
       expect(store.snapshot().slots[0].requests[0].trustedServerCreativeFailures).toEqual([
         'aps_frame_timeout',
+      ]);
+    } finally {
+      delete (window as TestWindow).tsjs.gptDiagnosticsRecorder;
+    }
+  });
+
+  it('records a relayed APS render failure for a server-side APS winner', async () => {
+    const renderer = apsRenderer();
+    const store = new GptDiagnosticsStore({ defer: () => undefined });
+    (window as TestWindow).tsjs.gptDiagnosticsRecorder = store as never;
+    (window as TestWindow).tsjs.bids.homepage_header = {
+      hb_adid: renderer.bidId,
+      hb_bidder: 'aps',
+      hb_pb: '1.23',
+      renderer,
+    };
+
+    try {
+      const bridgeListener = await captureBridgeListener();
+      const source = createTrustedSlotIframe();
+      const slot = {
+        getSlotElementId: () => 'div-header',
+        getAdUnitPath: () => '/example/div-header',
+      };
+      (window as TestWindow).tsjs.divToSlotId = { 'div-header': 'homepage_header' };
+      store.recordTrustedServerOpportunity(slot, 'homepage_header', 'renderable_candidate');
+      store.recordSlotRequested(slot);
+
+      // Serve the server-side capability, which is tracked per slot rather than
+      // through the Prebid renderer tombstone.
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: renderer.bidId }),
+          ports: [{ postMessage: () => {} }],
+          source,
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent
+      );
+
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: {
+            message: APS_RENDER_FAILED_MESSAGE,
+            adId: renderer.bidId,
+            reason: 'amazon_script_error',
+          },
+          source,
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent
+      );
+
+      expect(store.snapshot().slots[0].requests[0].trustedServerCreativeFailures).toEqual([
+        'aps_runner_script_error',
       ]);
     } finally {
       delete (window as TestWindow).tsjs.gptDiagnosticsRecorder;

@@ -740,10 +740,14 @@ export function renderApsCreative({ slotId, renderer: input }: RenderApsCreative
     if (activeFrames.get(container) === iframe) activeFrames.delete(container);
     iframe.remove();
   };
-  const fail = (): void => {
+  // `reason` is the allowlisted category when the frame named one, so the log
+  // distinguishes a rejected descriptor from a timeout instead of reporting
+  // every cause as a load failure. Recording it against a diagnostics attempt
+  // depends on the attempt-lifecycle work tracked separately.
+  const fail = (reason?: GptDiagnosticsCreativeFailure): void => {
     if (settled) return;
     cancel();
-    log.warn('APS renderer: frame load failed');
+    log.warn(`APS renderer: frame failed (${reason ?? 'unspecified'})`);
   };
   const commit = (): void => {
     if (settled || activeFrames.get(container) !== iframe || !iframe.isConnected) return;
@@ -762,9 +766,16 @@ export function renderApsCreative({ slotId, renderer: input }: RenderApsCreative
       if (hasExactKeys(event.data, ['message', 'nonce']) && sent === nonce) commit();
       return;
     }
-    // A failure message also carries a `reason`, and the frame reports
-    // `bad_hash` before it has learned a nonce to echo back.
-    if (message === RENDERER_FAILED_MESSAGE && (sent === nonce || sent === undefined)) fail();
+    // A failure message also carries a `reason`. `bad_hash` is the only report
+    // a frame sends before it has learned a nonce, so accepting a nonce-less
+    // failure is narrowed to that reason: anything else running in the frame
+    // could otherwise tear it down without knowing the nonce.
+    if (
+      message === RENDERER_FAILED_MESSAGE &&
+      (sent === nonce || (sent === undefined && event.data.reason === 'bad_hash'))
+    ) {
+      fail(apsRenderFailureReason(event.data.reason));
+    }
   }
 
   window.addEventListener('message', receive);
@@ -785,9 +796,9 @@ export function renderApsCreative({ slotId, renderer: input }: RenderApsCreative
     },
     { once: true }
   );
-  iframe.addEventListener('error', fail, { once: true });
+  iframe.addEventListener('error', () => fail('aps_frame_load_error'), { once: true });
 
-  const timeoutId = window.setTimeout(fail, RENDERER_READY_TIMEOUT_MS);
+  const timeoutId = window.setTimeout(() => fail('aps_frame_timeout'), RENDERER_READY_TIMEOUT_MS);
   pendingFrameCancels.set(container, cancel);
   container.appendChild(iframe);
   return true;
@@ -796,8 +807,22 @@ export function renderApsCreative({ slotId, renderer: input }: RenderApsCreative
 /**
  * Static source executed by Prebid Universal Creative's dynamic-renderer frame.
  * It reads only the validated descriptor and trusted absolute endpoint URL from data.
+ *
+ * Failure reports go out through Universal Creative's own `sendMessage` helper
+ * rather than `postMessage` on the creative window. Universal Creative runs this
+ * source inside a hidden frame it creates in the creative document, so a
+ * `postMessage` call made from here carries that hidden frame as
+ * `event.source`, whatever window it targets: the source is the realm of the
+ * running function, not the window the method is called on. The top-window
+ * listener authenticates a sender by matching it against iframes in the
+ * publisher document, which the hidden frame is not, so such a report is always
+ * dropped. The helper is a creative-realm function, so a report sent through it
+ * arrives as the creative iframe the listener already recognizes.
+ *
+ * The helper stringifies the body and stamps Universal Creative's own `adId`,
+ * both of which the consuming bridge already handles.
  */
-export const APS_UNIVERSAL_CREATIVE_RENDERER = String.raw`(function(){window.render=function(d,_h,w){return new Promise(function(resolve,reject){
+export const APS_UNIVERSAL_CREATIVE_RENDERER = String.raw`(function(){window.render=function(d,h,w){return new Promise(function(resolve,reject){
 try{var r=d&&d.apsRenderer,u=d&&d.rendererUrl;if(!r||typeof u!=="string")throw new Error("invalid APS renderer data");
 var p=new URL(u);if((p.protocol!=="https:"&&p.protocol!=="http:")||p.username||p.password||p.pathname!=="${APS_RENDERER_PATH}"||p.search||p.hash)throw new Error("invalid APS renderer URL");
 var c=w.crypto;if(!c||typeof c.getRandomValues!=="function")throw new Error("APS renderer randomness unavailable");
@@ -805,11 +830,11 @@ var b=new Uint8Array(16);c.getRandomValues(b);var s="";for(var i=0;i<b.length;i+
 var n=w.btoa(s).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/g,"");
 var f=w.document.createElement("iframe"),done=false,t;
 function clean(){w.removeEventListener("message",receive);if(t)w.clearTimeout(t);}
-function report(x){try{(w.top||w).postMessage({message:"${APS_RENDER_FAILED_MESSAGE}",adId:(d&&typeof d.adId==="string")?d.adId:"",reason:x},"*");}catch(_e){}}
+function report(x){try{if(h&&typeof h.sendMessage==="function")h.sendMessage("${APS_RENDER_FAILED_MESSAGE}",{reason:x});}catch(_e){}}
 function fail(x){if(done)return;done=true;clean();f.remove();report(x||"unknown");reject(new Error("APS renderer frame failed"));}
 function receive(e){var m=e.data;if(e.source!==f.contentWindow||!m)return;
 if(m.message==="${RENDERER_READY_MESSAGE}"&&m.nonce===n){done=true;clean();resolve();}
-else if(m.message==="${RENDERER_FAILED_MESSAGE}"&&(m.nonce===n||m.nonce===undefined))fail(typeof m.reason==="string"?m.reason:"frame_reported_failure");}
+else if(m.message==="${RENDERER_FAILED_MESSAGE}"&&(m.nonce===n||(m.nonce===undefined&&m.reason==="bad_hash")))fail(typeof m.reason==="string"?m.reason:"frame_reported_failure");}
 f.width=String(r.width);f.height=String(r.height);f.style.border="0";
 f.setAttribute("sandbox","${APS_RENDERER_SANDBOX}");
 f.src=p.href+"#tsaps="+n;f.onload=function(){if(!done&&f.contentWindow)f.contentWindow.postMessage({nonce:n,renderer:r},"*");};
