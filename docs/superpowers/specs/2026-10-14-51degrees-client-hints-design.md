@@ -34,46 +34,52 @@ and a port, and the server a publisher's pages come from is its source, as
 
 **A serve middleware, `51degrees.client_hints`, in `crates/middleware/51degrees`.**
 The crate registers the middleware and a request filter together. As the
-filter sees a page navigation it asks the service, through the cache the
-51Degrees modules share, which hints it wants from the request's browser, and
-leaves the names in the request's state. Core copies them into the document
-state the serve middleware share. From that list the middleware writes
+filter sees a page navigation whose path a `[[serve]]` entry naming the
+middleware covers, it asks the service, through the cache the 51Degrees
+modules share, which hints it wants from the request's browser, and leaves the
+names in the request's state. Core copies them into the document state the
+serve middleware share. From that list the middleware writes
 `Accept-CH`, `Critical-CH` and `Permissions-Policy` through
 `Middleware::response_headers`, each adding to what the response already
 carries under that name as "What the headers keep" says, and the
 `Delegate-CH` tag in the head through its action. It reads `critical` from its
 own table, `[middleware.51degrees.client_hints]`, on by default.
+`Accept-CH` and `Critical-CH` are left off where the request already carries
+every hint the service names and the response names no `Accept-CH` set of its
+own, because a browser keeps an origin's set until a response names another.
 
 The three parts run in different places.
 
-| Part                                                | Runs                                                                                                                                   | Decided by                                                                          |
-| --------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
-| The filter, which asks the service and leaves names | Before routing, on the Fastly adapter alone, which is the only adapter that runs request filters, and it acts on page navigations only | `[shared.51degrees]` alone. The filter reads no entry and no `path`                 |
-| The `Delegate-CH` tag                               | In the serve phase, on each page                                                                                                       | The first `[[serve]]` entry that covers the page's media type and path              |
-| `Accept-CH`, `Critical-CH` and `Permissions-Policy` | In the headers step of the serve phase, on each response the publisher path sends, a redirect included                                 | Any `[[serve]]` entry whose `path` covers the request path, whatever its media type |
+| Part                                                | Runs                                                                                                                                   | Decided by                                                                                                 |
+| --------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| The filter, which asks the service and leaves names | Before routing, on the Fastly adapter alone, which is the only adapter that runs request filters, and it acts on page navigations only | Any `[[serve]]` entry naming the middleware whose `path` covers the request path, the rule the headers use |
+| The `Delegate-CH` tag                               | In the serve phase, on each page                                                                                                       | The first `[[serve]]` entry that covers the page's media type and path                                     |
+| `Accept-CH`, `Critical-CH` and `Permissions-Policy` | In the headers step of the serve phase, on each response the publisher path sends, a redirect included                                 | Any `[[serve]]` entry whose `path` covers the request path, whatever its media type                        |
 
 A page navigation, for the filter, is a `GET` or `HEAD` request whose
 `Sec-Fetch-Dest` is `document` or whose `Accept` names `text/html`, so a
 request for a frame, or one a script makes for an HTML fragment, qualifies
-when it sends such an `Accept`. Any other request asks the service nothing. A
-service that names no hints for a browser, or does not answer, leaves
-nothing, and the page gets no headers and no tag. The origin delegated to is
+when it sends such an `Accept`. Any other request asks the service nothing,
+and so does a page navigation whose path no `[[serve]]` entry naming the
+middleware covers, which is where no headers would be written. A service that
+names no hints for a browser, or does not answer, leaves nothing, and the page
+gets no headers and no tag. The origin delegated to is
 the origin of the configured endpoint, and an endpoint on the page's own
 origin delegates nothing.
 
 **What the headers keep.** For each of `Accept-CH`, `Critical-CH` and
-`Permissions-Policy` the middleware reads the first line the response carries
-under that name and adds the hints after it. `Accept-CH` and `Critical-CH`
-keep that line's hints and name each hint once. `Permissions-Policy` keeps
-that line's members and adds one delegation after them for each hint, as
+`Permissions-Policy` the middleware reads every line the response carries
+under that name, joins them in order into one list, and adds the hints after
+it. `Accept-CH` and `Critical-CH` keep the response's hints and name each hint
+once. `Permissions-Policy` keeps the response's members and adds one
+delegation after them for each hint, as
 `ch-ua-model=(self "https://cloud.51degrees.com")`. A later member of a name
 replaces an earlier one in a policy, so for each hint the service names, the
 delegation overrides a member of the publisher's own that denies the hint,
 such as `ch-ua-model=()`. Core then writes each header with
 `write_response_headers` (`crates/trusted-server-core/src/middleware.rs`),
-which uses `HeaderMap::insert` and so replaces every line of that name. A
-header the response carries on several lines therefore keeps only its first
-line.
+which uses `HeaderMap::insert` and so replaces every line of that name with
+the one line written, which already holds what each of them said.
 
 **What the 51Degrees modules share, in `crates/shared/51degrees`.** The
 vendor's table, `[shared.51degrees]`, being `endpoint`, `license_key` and
@@ -83,9 +89,9 @@ The one call to the service for a request's evidence, a form POST to the
 service's `json` endpoint over the platform's HTTP client, naming the
 properties each module registered so one call carries them all, and its
 answer held in the loading cache so a question many requests ask at once is
-asked once. The evidence a request gives, being the address, the `User-Agent`
-and what the browser gathered into its `51D_` cookies. The names the service
-asked for, as the type a module reads them from the request's state by.
+asked once. The evidence a request gives, being the `User-Agent` and the
+`Sec-CH-UA` hints and nothing else. The names the service asked for, as the
+type a module reads them from the request's state by.
 
 **The cache is a declared one.** The builder declares `51degrees-answers`,
 and a deployment selects the loading cache that holds it and sizes its copies
@@ -93,15 +99,13 @@ in `[cache.51degrees-answers]`, as every declared cache is selected. A stock
 build holds the answers with its one loading cache module without a line in
 the document. A build that links no loading cache module, or several with no
 `[cache.51degrees-answers]` table naming one, holds nothing, so every page
-navigation calls the service. On Fastly the copies are held in the host's
-value cache, shared by every instance at a location, with a brief copy in
-process memory in front. An answer is held for an hour at most, because the
-address in its evidence can be reassigned. The key is a hash of the endpoint,
-the license key, the properties and the evidence, so a held answer serves
-only a request with the same address, `User-Agent` and `51D_` cookies, and
-the first navigation of each such combination waits for the service. The
-cache therefore holds an answer for each combination and not one for each
-browser.
+navigation an entry covers calls the service. On Fastly the copies are held in
+the host's value cache, shared by every instance at a location, with a brief
+copy in process memory in front. An answer is held for an hour at most. The
+key is a hash of the endpoint, the license key, the properties and the
+evidence sent, being the `User-Agent` and the `Sec-CH-UA` hints, so one held
+answer serves every reader whose browser sends the same values, and only the
+first navigation from each such browser waits for the service.
 
 **The builder is run by the table, not selected by a section.** It carries
 the vendor's shared table, declares the license key as a secret setting in
@@ -148,17 +152,16 @@ it is not.
 | Cloudflare                  | No              | The call is never made. The adapter's fetch would set no timeout, and the adapter's own note says only the Workers runtime's limit bounds a call (`crates/trusted-server-adapter-cloudflare/src/platform.rs`)                |
 | Spin                        | No              | The call is never made. `spin_sdk::http::send` takes no timeout, so `timeout_ms` would be ignored, and the adapter's own note says the Spin runtime's default applies (`crates/trusted-server-adapter-spin/src/platform.rs`) |
 
-**What each navigation sends.** For a page navigation the filter asks the
-cache for the answer to one question, and where none is held it makes one
-`POST` to the service. The form carries the license key, the three
-properties that name the hints, and the evidence, being the visitor's address
-as `client-ip`, the `User-Agent`, and the values of the
-`51D_ScreenPixelsWidth`, `51D_ScreenPixelsHeight` and
-`51D_GetHighEntropyValues` cookies when the browser sent them. Nothing in
-this repository writes those cookies. A request with no `User-Agent` asks
-nothing. Every 51Degrees module sends the same evidence, so that one held
-answer serves them all (`crates/shared/51degrees/src/hints_engine.rs`), and
-the filter reads only the three hint properties from the answer.
+**What each navigation sends.** For a page navigation an entry covers, the
+filter asks the cache for the answer to one question, and where none is held
+it makes one `POST` to the service. The form carries the license key, the
+three properties that name the hints, and the evidence, being the
+`User-Agent` and each `Sec-CH-UA` header the request carries, that is
+`Sec-CH-UA` and every header whose name begins `Sec-CH-UA-`, under their own
+names (`crates/shared/51degrees/src/evidence.rs`). Neither the visitor's
+address nor a cookie nor any other header is sent. A request with no
+`User-Agent` asks nothing. The filter reads only the three hint properties
+from the answer.
 
 **Consent.** The Fastly adapter hands every request filter the permissions
 resolved for the request, so a filter can skip or narrow what it does when a
@@ -173,12 +176,34 @@ DataDome's service from the `Sec-CH-UA`, `Sec-CH-UA-Arch`,
 (`crates/bot-protection/datadome/src/protection.rs`).
 
 **Open questions for the reviewer.** This change takes no position on two
-things. The first is whether the call to the service needs a permission, and
-if it does which one, with no call, no names and so no headers where it is not
-set. The second is whether the call should send the `User-Agent` alone. The one
-reason the code gives for sending the address and the cookies as well is that
-every 51Degrees module sends the same evidence, and no other module that calls
-the service exists yet.
+things.
+
+The first is whether the call to the service needs a permission, and if it
+does which one, with no call, no names and so no headers where it is not set.
+A module names the data use it needs by an IAB Tech Lab Privacy Taxonomy Data
+Use (`Permission` in `crates/trusted-server-core/src/permissions.rs`), and
+none of them names device detection, client hints or a call that describes the
+browser. The nearest are general ones, which the sample policy
+(`config/permissions/sample.yaml`) treats in opposite ways.
+`functional.performance` and `necessary.operations.website_use` are granted in
+each of its three groups, so a check on either would never refuse there,
+`advertising_marketing.first_party.contextual` needs a signal in `gdpr-eu` and
+`gdpr-uk`, and the umbrella `functional` is denied in all three, so the call
+would never be made. Choosing one is therefore a policy decision rather than a
+reading of the taxonomy, which is what `docs/guide/permission-model.md` asks a
+declaration to be. The nearest precedent in the stack declares none, because
+the built-in and host device modules require no permission and a device module
+a module supplies is refused at startup if it declares one
+(`crates/trusted-server-core/src/integrations/registry.rs`). A request filter
+has no `required_permissions` of its own (`IntegrationRequestFilter` in the
+same file), so this one would read `RequestFilterInput::permissions` itself,
+which no shipped filter does yet.
+
+The second is how long an answer is held. The hour was chosen because the
+visitor's address was in the evidence and an address can be reassigned. The
+evidence now carries no address, so the hour only bounds how long an answer is
+kept before the service is asked again, and whether it should be longer is
+open.
 
 **When it fails.** A service that cannot be reached, answers a status that is
 not a success, answers a list of errors, answers something that is not JSON,
@@ -188,14 +213,15 @@ the next navigation with the same evidence asks again. An answer that names no
 hints is held like any other, for up to an hour. On Fastly a call that cannot
 connect fails after one second, and one that connects waits `timeout_ms` for
 the first byte and for each gap between bytes, so while the service is down
-every page navigation with no held answer waits for those limits before its
-page is built. The other three adapters make no call.
+every page navigation an entry covers with no held answer waits for those
+limits before its page is built. The other three adapters make no call.
 
 **Rollout.** A deployment without `[shared.51degrees]` is unchanged. On any
 adapter but Fastly, adding the table writes nothing on a page and needs only
-the license key. On Fastly, adding the table changes the pages served to a
-browser the service names hints for, whether or not an entry covers the page.
-The filter leaves state on the request, so core keeps the request to the origin
+the license key. On Fastly, adding the table and an entry naming the
+middleware changes the pages that entry covers, served to a browser the service
+names hints for. The filter leaves state on the request, so core keeps the
+request to the origin
 path (`IntegrationRequestState` in
 `crates/trusted-server-core/src/integrations/registry.rs`). The page is then
 never read from a stored template or stored as one, so each reader's copy is
@@ -209,9 +235,9 @@ tests script that answer for a Gecko and a WebKit browser). `critical` makes the
 browser repeat its first navigation to carry the hints, so that page is built
 twice. The license key has to be in the secret store before the deploy that
 carries the table, because the settings look it up as they load. An entry's
-`path` limits only where the headers and the tag are written, so the effect on
-pages reaches the whole site once the table is present, and leaving the table
-out is the only way to limit it.
+`path` limits where the service is asked as well as where the headers and the
+tag are written, so the effect on pages reaches only the paths an entry naming
+the middleware covers.
 
 ## 3. What is not in this change
 
@@ -225,39 +251,37 @@ out is the only way to limit it.
   so the middleware asks the service nothing and writes nothing there. A
   filter step added to them would call the service through HTTP clients that
   apply no `timeout_ms`.
-- **Limiting the filter to the pages an entry covers.** The filter reads no
-  entry and no `path`, so the effects under "Rollout" reach every page
-  navigation on Fastly once the table is present.
-- **Merging the lines of a header.** A header the response carries on several
-  lines keeps only its first line, as "What the headers keep" says.
-- **Code comments that say more than this design.** The comments in
-  `crates/middleware/51degrees/src/lib.rs` that say each header keeps what the
-  response already said, and that the cache answers every reader on the same
-  browser, are left for a later change.
-- **Sending less, or asking permission first.** The two open questions under
-  "Open questions for the reviewer" decide that.
+- **Asking permission first, or holding answers longer.** The two open
+  questions under "Open questions for the reviewer" decide those.
 
 ## 4. Tests
 
 The middleware crate's tests cover the three headers on a document, `critical`
-off, a document with no names, one line of what the response already carried
-being kept, the tag's shape and the origin it delegates to, a name that is not
-a token reaching neither, the request filter against a scripted service for an
-asset request and for a Chromium, a Gecko and a WebKit browser, the
-middleware's own table refusing a key it does not know, a table with no license
-key being refused, that no entry means the headers step asks no middleware, and
-that one shared table runs the middleware while the stock loading cache holds
-its answers. The shared crate's tests cover the table and its defaults and its
-refusal of a key it does not know, the license key's refusals, the call's form
-and credential, what it holds across instances and stores, concurrent requests
-making one call, the refusals it reports, and the hint list read out of an
-answer. The Axum adapter's tests plant an unknown key in the shared table for
+off, a document with no names, what the response already carried being kept,
+every line of it when a response sends each header twice, the tag's shape and
+the origin it delegates to, a name that is not a token reaching neither, the
+request filter against a scripted service for an asset request, for a table
+with no entry and for a path an entry's `path` does not cover, none of which
+asks the service, for a path that entry covers and for a Chromium, a Gecko and
+a WebKit browser, that the filter sends neither the reader's address nor a
+cookie, the middleware's own table refusing a key it does not know, a table
+with no license key being refused, that no entry means the headers step asks
+no middleware, and that one shared table runs the middleware while the stock
+loading cache holds its answers. The shared crate's tests cover the table and
+its defaults and its refusal of a key it does not know, the license key's
+refusals, the call's form and credential, that the evidence is the
+`User-Agent` and the `Sec-CH-UA` hints in name order, that no address and no
+cookie reaches the request the client builds, that two readers on the same
+browser at different addresses make one call, what it holds across instances
+and stores, concurrent requests making one call, the refusals it reports, and
+the hint list read out of an answer. The Axum adapter's tests plant an unknown
+key in the shared table for
 the builder that table runs, check that the example template's `[[serve]]` entry
 and the guide's table of middleware name `51degrees.client_hints`, and check
 that both crates name their maintainers. Each adapter's list test holds the new
 row and the hook order.
 
-Seven things have no test.
+Six things have no test.
 
 1. `crates/middleware/51degrees/src/fixtures/page-change.settings.toml` is
    read by no test, and unlike the other modules' it has no input page or
@@ -266,18 +290,16 @@ Seven things have no test.
    test shows that a page the filter leaves names for skips the stored
    template or is sent `private, no-store`. The tests seed the document state
    by hand where core would copy it from the request's state.
-3. Nothing covers an entry with a `path`, so no test shows that the filter
-   asks the service where no entry covers the page.
-4. Nothing shows that `shared.51degrees.license_key` is among the secret
+3. Nothing shows that `shared.51degrees.license_key` is among the secret
    settings a push treats as naming a key, because the Axum adapter's test
    lists DataDome's two secrets and no others.
-5. No test uncomments the example template's `[shared.51degrees]` and
+4. No test uncomments the example template's `[shared.51degrees]` and
    `[middleware.51degrees.client_hints]` tables to check that they load, as the
    test for the Permutive, lockr and Sourcepoint tables does.
-6. No adapter test runs the filter, and the filter's tests pass
+5. No adapter test runs the filter, and the filter's tests pass
    `permissions: None`, so nothing shows what the filter does with permission
    state.
-7. The two crates' tests run natively under `cargo test-axum`, and their lints
+6. The two crates' tests run natively under `cargo test-axum`, and their lints
    under `cargo clippy-axum`. No alias for the Fastly target lists them, so
    they do not run for `wasm32-wasip1`, although the Fastly adapter is the only
    one that runs the filter.
@@ -294,3 +316,4 @@ Seven things have no test.
 | 2026-10-14 | First draft.                                                                                                                                                                                                                                                                                                                                                                |
 | 2026-10-15 | Fixes from review round 1. What the filter runs on and that only the Fastly adapter runs it, the cost to pages, what each navigation sends and the open questions on consent, how each adapter bounds the call, the answers on failure, the settings, what the headers keep, the definition of a page navigation, the untested paths, the related specs and the review log. |
 | 2026-10-15 | Fixes from review round 2. The pull request that holds the design documents, the wait for the first call in the guide, and the code comments left for a later change.                                                                                                                                                                                                       |
+| 2026-10-15 | Code fixes for the call's scope, what it sends and header merging. The permission question stays open, with what was found, and the answer lifetime is a new open question.                                                                                                                                                                                                 |
