@@ -6935,6 +6935,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sha1-checked",
  "sha2 0.10.9",
  "tempfile",
  "toml",

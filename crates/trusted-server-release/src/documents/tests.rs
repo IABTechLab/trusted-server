@@ -611,8 +611,8 @@ fn index_fixture() -> Value {
     ];
     let artifacts: Vec<_> = identities.iter().map(|(name,target,architecture,runtime,minimum)| {
         let is_server = *runtime == "fastly-compute";
-        let companions: Map<_,_> = ["sbom", "provenance", "sbom_attestation", "build_evidence", "build_recipe", "rebuild_check"].iter()
-            .map(|role| (role.to_string(), json!({"name":format!("{name}.{role}.json"), "size":1, "sha256":"a".repeat(64)}))).collect();
+        let companions: Map<_,_> = [("sbom", ".spdx.json"), ("provenance", ".provenance.sigstore.json"), ("sbom_attestation", ".sbom.sigstore.json"), ("build_evidence", ".build-evidence.json"), ("build_recipe", ".build-recipe.json"), ("rebuild_check", ".rebuild-check.json")].iter()
+            .map(|(role, suffix)| (role.to_string(), json!({"name":format!("{name}{suffix}"), "size":1, "sha256":"a".repeat(64)}))).collect();
         json!({"name":name, "size":1, "sha256":"a".repeat(64), "role":if is_server {"server"} else {"operator-cli"},
             "kind":if is_server {"wasm-core"} else {"native-executable"}, "package":if is_server {"trusted-server-adapter-fastly"} else {"trusted-server-cli"},
             "target":target, "variant":"default", "assurance_profile":if is_server {"provenance-sbom-repeatable"} else {"provenance-sbom"},
@@ -763,5 +763,26 @@ fn failed_rename_removes_private_sibling() {
             .count(),
         1,
         "should leave only existing destination"
+    );
+}
+
+#[test]
+fn index_role_checks_require_role_specific_companion_names() {
+    let good = index_fixture();
+    let mut swapped = good.clone();
+    let sbom = swapped["artifacts"][0]["companions"]["sbom"]["name"].clone();
+    swapped["artifacts"][0]["companions"]["sbom"]["name"] =
+        swapped["artifacts"][0]["companions"]["provenance"]["name"].clone();
+    swapped["artifacts"][0]["companions"]["provenance"]["name"] = sbom;
+    assert!(
+        validate_schema(KnownSchema::ReleaseIndex, &swapped).is_err(),
+        "should reject companion names swapped between roles"
+    );
+    let mut foreign = good;
+    foreign["artifacts"][0]["companions"]["sbom"]["name"] =
+        json!("ts-x86_64-unknown-linux-gnu-other.spdx.json");
+    assert!(
+        validate_schema(KnownSchema::ReleaseIndex, &foreign).is_err(),
+        "should reject companion names not derived from their asset"
     );
 }

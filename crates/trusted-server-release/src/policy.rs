@@ -9,6 +9,7 @@ use std::path::Path;
 
 use error_stack::Report;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
@@ -48,8 +49,10 @@ const CLI_POLICY_FIELDS: [&str; 13] = [
     "repository_owner_id",
     "tool_versions",
 ];
-const NOT_ESTABLISHED: [&str; 2] = [
+const NOT_ESTABLISHED: [&str; 4] = [
     "authenticated acquisition receipts (Task 8)",
+    "git executable identity (Task 8)",
+    "rustup override/toolchain selection (bootstrap, Task 8)",
     "remote branch-tip ancestry and ruleset validation (Task 14)",
 ];
 
@@ -81,6 +84,7 @@ impl ReleaseTarget {
     }
 
     /// Returns whether the target needs the explicit macOS loader floor.
+    // Only the Task 5/7 child-environment builder (`preflight::child`) calls this.
     #[allow(dead_code)]
     pub(crate) fn is_darwin(self) -> bool {
         matches!(self, Self::Aarch64AppleDarwin | Self::X86_64AppleDarwin)
@@ -204,7 +208,6 @@ struct Compatibility {
 }
 
 /// Raw-byte identity of one tracked input file.
-#[derive(Clone)]
 struct InputDigest {
     path: &'static str,
     sha256: String,
@@ -220,10 +223,10 @@ pub(crate) struct ReleaseInputs {
 
 impl ReleaseInputs {
     /// Returns the source-relative path and raw SHA-256 of each input file.
-    pub(crate) fn input_digests(&self) -> [(&'static str, String); 3] {
+    pub(crate) fn input_digests(&self) -> [(&'static str, &str); 3] {
         self.digests
-            .clone()
-            .map(|digest| (digest.path, digest.sha256))
+            .each_ref()
+            .map(|digest| (digest.path, digest.sha256.as_str()))
     }
 
     fn pending_items(&self) -> Vec<String> {
@@ -238,18 +241,18 @@ impl ReleaseInputs {
 pub(crate) enum AcquisitionReceipt {}
 
 /// Production tool selection; constructed only by [`select_qualified`].
-pub(crate) struct QualifiedSelection {
+pub(crate) struct QualifiedSelection<'a> {
     receipts: Vec<String>,
-    inputs: [(&'static str, String); 3],
+    inputs: &'a ReleaseInputs,
 }
 
-impl QualifiedSelection {
+impl QualifiedSelection<'_> {
     /// Summarizes the selected inputs for the caller's diagnostics.
     pub(crate) fn summary(&self) -> String {
         format!(
             "selected {} authenticated pins from {} inputs",
             self.receipts.len(),
-            self.inputs.len()
+            self.inputs.digests.len()
         )
     }
 }
@@ -260,10 +263,10 @@ impl QualifiedSelection {
 ///
 /// Fails on any pending qualification or null pin, and otherwise fails because
 /// authenticated acquisition receipts cannot be constructed yet.
-pub(crate) fn select_qualified(
-    inputs: &ReleaseInputs,
+pub(crate) fn select_qualified<'a>(
+    inputs: &'a ReleaseInputs,
     receipts: &[AcquisitionReceipt],
-) -> Result<QualifiedSelection, Report<ReleaseError>> {
+) -> Result<QualifiedSelection<'a>, Report<ReleaseError>> {
     let pending = inputs.pending_items();
     if !pending.is_empty() {
         return Err(Report::new(ReleaseError::Unqualified).attach(format!(
@@ -281,18 +284,21 @@ pub(crate) fn select_qualified(
     }
     Ok(QualifiedSelection {
         receipts: verified,
-        inputs: inputs.input_digests(),
+        inputs,
     })
 }
 
 /// Diagnostic description of incomplete inputs. It authorizes nothing.
-pub(crate) struct InputAudit {
-    inputs: [(&'static str, String); 3],
+pub(crate) struct InputAudit<'a> {
+    inputs: &'a ReleaseInputs,
     pending: Vec<String>,
 }
 
-impl InputAudit {
+impl InputAudit<'_> {
     /// Returns whether every JSON pin and external authentication is present.
+    ///
+    /// This is always `false` while [`NOT_ESTABLISHED`] lists facts this tool
+    /// cannot yet establish, so the diagnostic can never report completion.
     pub(crate) fn is_complete(&self) -> bool {
         self.pending.is_empty() && NOT_ESTABLISHED.is_empty()
     }
@@ -302,6 +308,7 @@ impl InputAudit {
         json!({
             "inputs": self
                 .inputs
+                .input_digests()
                 .iter()
                 .map(|(path, sha256)| json!({"path": path, "sha256": sha256}))
                 .collect::<Vec<_>>(),
@@ -314,9 +321,9 @@ impl InputAudit {
 }
 
 /// Lists pending and null items for diagnostics without constructing authority.
-pub(crate) fn audit_inputs(inputs: &ReleaseInputs) -> InputAudit {
+pub(crate) fn audit_inputs(inputs: &ReleaseInputs) -> InputAudit<'_> {
     InputAudit {
-        inputs: inputs.input_digests(),
+        inputs,
         pending: inputs.pending_items(),
     }
 }
@@ -365,10 +372,7 @@ pub(crate) fn check_inputs(
     })
 }
 
-fn typed<T: for<'de> Deserialize<'de>>(
-    value: &Value,
-    path: &str,
-) -> Result<T, Report<ReleaseError>> {
+fn typed<T: DeserializeOwned>(value: &Value, path: &str) -> Result<T, Report<ReleaseError>> {
     T::deserialize(value).map_err(|error| rejected(format!("{path}: {error}")))
 }
 
@@ -432,8 +436,29 @@ fn check_artifact(
             "asset {name} must keep default_features true and variant default"
         )));
     }
+    for (field, expected, actual) in identity_fields(fixed, artifact) {
+        if expected != actual {
+            return Err(rejected(format!(
+                "asset {name} changes {field} from {expected} to {actual}"
+            )));
+        }
+    }
+    if artifact.capabilities != [fixed.capability] {
+        return Err(rejected(format!(
+            "asset {name} changes capabilities from [{}]",
+            fixed.capability
+        )));
+    }
+    Ok(())
+}
+
+/// Field name, compiled value and candidate value of each fixed identity field.
+fn identity_fields<'a>(
+    fixed: &FixedArtifact,
+    artifact: &'a CohortArtifact,
+) -> [(&'static str, &'static str, &'a str); 9] {
     let compatibility = &artifact.compatibility;
-    let comparisons = [
+    [
         ("package", fixed.package, artifact.package.as_str()),
         ("bin", fixed.bin, artifact.bin.as_str()),
         ("target", fixed.target.triple(), artifact.target.as_str()),
@@ -459,21 +484,74 @@ fn check_artifact(
             fixed.runtime,
             compatibility.runtime.as_str(),
         ),
-    ];
-    for (field, expected, actual) in comparisons {
-        if expected != actual {
-            return Err(rejected(format!(
-                "asset {name} changes {field} from {expected} to {actual}"
-            )));
-        }
-    }
-    if artifact.capabilities != [fixed.capability] {
-        return Err(rejected(format!(
-            "asset {name} changes capabilities from [{}]",
-            fixed.capability
-        )));
-    }
-    Ok(())
+    ]
+}
+
+/// Every non-artifact field of the tracked consumer release policy.
+fn compiled_consumer_policy() -> Value {
+    let workflow = "https://github.com/IABTechLab/trusted-server/.github/workflows/release-build.yml@refs/tags/<tag>";
+    json!({
+        "bounds": {
+            "attempt_seconds": 900,
+            "bundle_bytes": 33_554_432,
+            "child_seconds": 120,
+            "cohort_executables": FIXED_ARTIFACTS.len(),
+            "companion_bytes": 33_554_432,
+            "executable_bytes": 536_870_912,
+            "index_bytes": 1_048_576,
+            "inventory_bytes": 1_048_576,
+            "json_depth": 64,
+            "matching_attestations_per_bundle": 1,
+            "metadata_bytes": 1_048_576,
+            "policy_bytes": 1_048_576,
+            "spdx_bytes": 16_777_216,
+            "stderr_bytes": 1_048_576,
+            "stdout_bytes": 134_217_728,
+            "trusted_roots_bytes": 1_048_576,
+        },
+        "cohort": COHORT_ID,
+        "github_host": "github.com",
+        "historical_producer_policies": [],
+        "identity": {
+            "builder_id": workflow,
+            "caller_commit": "same-approved-source-commit",
+            "caller_path": ".github/workflows/release.yml",
+            "caller_repository": "https://github.com/IABTechLab/trusted-server",
+            "certificate_fields": [
+                "buildConfigDigest",
+                "buildConfigURI",
+                "buildTrigger",
+                "runInvocationURI",
+                "sourceRepositoryIdentifier",
+                "sourceRepositoryOwnerIdentifier",
+            ],
+            "certificate_san": workflow,
+            "event": "push",
+            "external_parameters": "exact-caller-workflow-only-no-inputs",
+            "invocation": "same-repository-run-and-attempt-across-certificate-and-provenance",
+            "issuer": "https://token.actions.githubusercontent.com",
+            "runner": "github-hosted",
+            "signer_commit": "same-approved-source-commit",
+            "source_commit": "independently-approved-40-lowercase-hex",
+            "source_dependency": "git+https://github.com/IABTechLab/trusted-server@refs/tags/<tag>",
+            "source_ref": "refs/tags/<tag>",
+        },
+        "policy_version": 1,
+        "predicates": {
+            "build_type": "https://actions.github.io/buildtypes/workflow/v1",
+            "provenance": "https://slsa.dev/provenance/v1",
+            "sbom": "https://spdx.dev/Document/v2.3",
+        },
+        "public_actions": READONLY_ACTIONS,
+        "repository": "IABTechLab/trusted-server",
+        "repository_id": "950860906",
+        "repository_owner_id": "82903538",
+        "tool_versions": {
+            "actions_attest": ATTEST_VERSION,
+            "actions_attest_revision": ATTEST_REVISION,
+            "gh": GH_VERSION,
+        },
+    })
 }
 
 fn check_cli_policy(policy: &Value, cohort: &Value) -> Result<(), Report<ReleaseError>> {
@@ -486,33 +564,20 @@ fn check_cli_policy(policy: &Value, cohort: &Value) -> Result<(), Report<Release
             "release-policy must contain exactly the reviewed top-level fields",
         ));
     }
-    if object["cohort"] != COHORT_ID || object["policy_version"] != 1 {
-        return Err(rejected(format!(
-            "release-policy cohort must be {COHORT_ID} with policy_version 1"
-        )));
+    let compiled = compiled_consumer_policy();
+    for key in CLI_POLICY_FIELDS.iter().filter(|key| **key != "artifacts") {
+        if object.get(*key) != compiled.get(*key) {
+            return Err(rejected(format!(
+                "release-policy field {key} differs from the compiled consumer policy"
+            )));
+        }
     }
-    if object["public_actions"] != json!(READONLY_ACTIONS) {
-        return Err(rejected(
-            "release-policy public_actions must be readonly-verify",
-        ));
-    }
-    if object["tool_versions"]
-        != json!({
-            "actions_attest": ATTEST_VERSION,
-            "actions_attest_revision": ATTEST_REVISION,
-            "gh": GH_VERSION,
-        })
-    {
-        return Err(rejected(
-            "release-policy tool_versions must match the compiled gh and attest pins",
-        ));
-    }
-    if object["bounds"]["cohort_executables"] != FIXED_ARTIFACTS.len() {
-        return Err(rejected(
-            "release-policy bounds.cohort_executables must equal the cohort size",
-        ));
-    }
-    let policy_artifacts = object["artifacts"]
+    check_policy_artifacts(&object["artifacts"], cohort)
+}
+
+/// Joins each consumer policy artifact to its cohort artifact plus read-only actions.
+fn check_policy_artifacts(policy: &Value, cohort: &Value) -> Result<(), Report<ReleaseError>> {
+    let policy_artifacts = policy
         .as_array()
         .ok_or_else(|| rejected("release-policy artifacts must be an array"))?;
     let cohort_artifacts = cohort["artifacts"]
@@ -523,18 +588,24 @@ fn check_cli_policy(policy: &Value, cohort: &Value) -> Result<(), Report<Release
             "release-policy artifacts must list exactly the cohort artifacts",
         ));
     }
+    let readonly = json!(READONLY_ACTIONS);
     for (policy_artifact, cohort_artifact) in policy_artifacts.iter().zip(cohort_artifacts) {
-        let mut remainder = policy_artifact
+        let policy_object = policy_artifact
             .as_object()
-            .cloned()
             .ok_or_else(|| rejected("release-policy artifact must be an object"))?;
-        let actions = remainder.remove("actions");
-        if actions != Some(json!(READONLY_ACTIONS)) {
+        let cohort_object = cohort_artifact
+            .as_object()
+            .ok_or_else(|| rejected("cohort artifact must be an object"))?;
+        if policy_object.get("actions") != Some(&readonly) {
             return Err(rejected(
                 "release-policy artifact actions must be exactly [\"readonly-verify\"]",
             ));
         }
-        if Value::Object(remainder) != *cohort_artifact {
+        let joined = policy_object.len() == cohort_object.len() + 1
+            && cohort_object
+                .iter()
+                .all(|(key, value)| key != "actions" && policy_object.get(key) == Some(value));
+        if !joined {
             return Err(rejected(format!(
                 "release-policy artifact {} differs from the cohort artifact",
                 cohort_artifact["name"]

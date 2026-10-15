@@ -59,7 +59,9 @@ fn expect_rejected(result: Result<ReleaseInputs, Report<ReleaseError>>, needle: 
 #[test]
 fn accepts_tracked_inputs_and_preserves_raw_digests() {
     let inputs = check_inputs(COHORT, TOOLS, CLI_POLICY).expect("should accept tracked inputs");
-    let digests = inputs.input_digests();
+    let digests = inputs
+        .input_digests()
+        .map(|(path, sha256)| (path, sha256.to_owned()));
     assert_eq!(
         digests,
         [
@@ -542,5 +544,97 @@ fn audit_stays_incomplete_for_qualified_looking_json() {
     assert!(
         !audit.is_complete(),
         "should remain incomplete without authenticated receipts"
+    );
+}
+
+fn recipe_index(tools: &Value, id: &str) -> usize {
+    tools["recipes"]
+        .as_array()
+        .expect("should contain recipes")
+        .iter()
+        .position(|recipe| recipe["id"] == id)
+        .expect("should contain recipe")
+}
+
+#[test]
+fn requires_exact_recipe_settings() {
+    let mutations: [(&str, &str, Value); 4] = [
+        ("tsjs", "mandatory_tests", json!(false)),
+        ("tsjs", "npm_lifecycle", json!("unrestricted")),
+        (
+            "trusted-server-fastly.wasm",
+            "cargo_args",
+            json!(["--offline"]),
+        ),
+        ("ts-aarch64-apple-darwin", "release_strip", json!("symbols")),
+    ];
+    for (id, key, replacement) in mutations {
+        expect_rejected(
+            tools_with(|tools| {
+                let index = recipe_index(tools, id);
+                tools["recipes"][index]["settings"][key] = replacement;
+            }),
+            "settings",
+        );
+    }
+    expect_rejected(
+        tools_with(|tools| {
+            let index = recipe_index(tools, "ts-x86_64-unknown-linux-gnu");
+            tools["recipes"][index]["settings"]["ambient_profiles"]["B"]["umask"] = json!("000");
+        }),
+        "settings",
+    );
+    expect_rejected(
+        tools_with(|tools| {
+            let index = recipe_index(tools, "tsjs");
+            tools["recipes"][index]["settings"]
+                .as_object_mut()
+                .expect("should be settings")
+                .remove("npm_offline");
+        }),
+        "settings",
+    );
+}
+
+#[test]
+fn requires_exact_consumer_policy_fields() {
+    for (pointer, replacement) in [
+        ("/repository_id", json!("1")),
+        ("/repository_owner_id", json!("2")),
+        ("/repository", json!("example/fictional")),
+        ("/github_host", json!("github.example.com")),
+        ("/identity/issuer", json!("https://issuer.example.com")),
+        ("/identity/builder_id", json!("https://example.com/builder")),
+        ("/predicates/sbom", json!("https://example.com/sbom")),
+        ("/predicates/build_type", json!("https://example.com/build")),
+        ("/bounds/child_seconds", json!(121)),
+        (
+            "/historical_producer_policies",
+            json!([{"policy_sha256": "a".repeat(64)}]),
+        ),
+        ("/policy_version", json!(2)),
+    ] {
+        expect_rejected(
+            policy_with(|policy| {
+                *policy
+                    .pointer_mut(pointer)
+                    .expect("should address a tracked policy field") = replacement;
+            }),
+            "release-policy",
+        );
+    }
+}
+
+#[test]
+fn audit_completion_stays_false_while_facts_are_not_established() {
+    assert!(
+        !NOT_ESTABLISHED.is_empty(),
+        "should still list facts this tool cannot establish"
+    );
+    let inputs = check_inputs(COHORT, &encode(&qualified_looking_tools()), CLI_POLICY)
+        .expect("should parse structurally complete fictional pins");
+    assert!(
+        !audit_inputs(&inputs).is_complete(),
+        "should never report completion while any fact is not established"
     );
 }

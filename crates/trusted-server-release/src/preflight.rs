@@ -4,62 +4,72 @@
 //! cleared, so an empty starting environment cannot hide a rejected channel.
 //! Errors name variables but never print their values, which may be secrets.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use error_stack::Report;
 
-use crate::documents::lower_hex;
 use crate::error::ReleaseError;
-use crate::policy::ReleaseTarget;
-use crate::source::ApprovedSource;
+use crate::policy;
+use crate::source::{self, CommitId};
 
 const RELEASE_BUILD: &str = "TRUSTED_SERVER__RELEASE_BUILD";
 const REMOVED_PREFIXES: [&str; 2] = ["TRUSTED_SERVER__", "EDGEZERO__"];
-const SKIP_BUILD: &str = "TSJS_SKIP_BUILD";
-// The child-environment builder below is consumed by recipe execution (Task 5);
-// until then only tests and the typed preflight interface reference it.
-#[allow(dead_code)]
-const MACOS_DEPLOYMENT_TARGET: &str = "13.0";
 
-/// Exact (uppercase) names that select compilers, flags, loaders, sources or credentials.
-const REJECTED_EXACT: [&str; 27] = [
+/// Exact (uppercase) names that select compilers, flags, loaders, sources or
+/// credentials. Sorted, unique, and never covered by [`REJECTED_PREFIXES`] or
+/// [`NATIVE_SELECTORS`].
+const REJECTED_EXACT: &[&str] = &[
+    "ACTIONS_CACHE_URL",
     "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
     "ACTIONS_ID_TOKEN_REQUEST_URL",
+    "ACTIONS_RESULTS_URL",
     "ACTIONS_RUNTIME_TOKEN",
-    "AWS_ACCESS_KEY_ID",
-    "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN",
+    "ACTIONS_RUNTIME_URL",
+    "BASH_ENV",
     "CARGO",
+    "CLANG_PATH",
     "CRATE_CC_NO_DEFAULTS",
+    "CROSS_COMPILE",
     "DEVELOPER_DIR",
+    "ENV",
+    "GH_ENTERPRISE_TOKEN",
     "GH_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
     "GITHUB_TOKEN",
+    "LIBCLANG_PATH",
+    "LLVM_CONFIG_PATH",
     "MACOSX_DEPLOYMENT_TARGET",
+    "NASM",
+    "NODE_AUTH_TOKEN",
+    "NODE_ENV",
+    "NODE_EXTRA_CA_CERTS",
     "NODE_OPTIONS",
     "NODE_PATH",
+    "NODE_TLS_REJECT_UNAUTHORIZED",
+    "NPM_TOKEN",
+    "PKG_CONFIG",
+    "PROTOC",
+    "PROTOC_INCLUDE",
     "RUSTC",
     "RUSTDOC",
     "RUSTDOCFLAGS",
     "RUSTFLAGS",
     "SDKROOT",
     "SOURCE_DATE_EPOCH",
+    "SSH_AUTH_SOCK",
     "TSJS_SKIP_BUILD",
     "VCPKG_INSTALLATION_ROOT",
     "VCPKG_ROOT",
-    "LD_PRELOAD",
-    "LD_LIBRARY_PATH",
-    "LD_AUDIT",
-    "PKG_CONFIG",
 ];
 
 /// Uppercase prefixes whose whole family is recipe-selected or forbidden.
-const REJECTED_PREFIXES: [&str; 23] = [
-    "AWS_LC_FIPS_SYS_",
-    "AWS_LC_SYS_",
+const REJECTED_PREFIXES: &[&str] = &[
+    "AWS_",
     "BINDGEN_",
     "CARGO_",
+    "CLOUDFLARE_",
     "CMAKE",
     "DYLD_",
     "FASTLY_",
@@ -82,15 +92,26 @@ const REJECTED_PREFIXES: [&str; 23] = [
 ];
 
 /// Native tool selectors; `_<target>`, `-<target>`, `TARGET_` and `HOST_` variants are rejected too.
-const NATIVE_SELECTORS: [&str; 10] = [
-    "AR", "ARFLAGS", "CC", "CFLAGS", "CPPFLAGS", "CXX", "CXXFLAGS", "LD", "LDFLAGS", "RANLIB",
+const NATIVE_SELECTORS: [&str; 11] = [
+    "AR",
+    "ARFLAGS",
+    "CC",
+    "CFLAGS",
+    "CPPFLAGS",
+    "CXX",
+    "CXXFLAGS",
+    "CXXSTDLIB",
+    "LD",
+    "LDFLAGS",
+    "RANLIB",
 ];
 
-/// A hosted setup export accepted only for an exact value and resolved path identity.
+/// A hosted setup export accepted only for an exact value whose path resolves to a
+/// mandatory reviewed identity; value-only exceptions are not representable.
 pub(crate) struct ReviewedException {
     name: &'static str,
     value: &'static str,
-    path_identity: Option<&'static str>,
+    path_identity: &'static str,
 }
 
 /// Reviewed hosted setup values. Empty until values and paths are qualified.
@@ -143,6 +164,11 @@ pub(crate) fn audit_environment(
             .any(|prefix| name.starts_with(prefix))
         {
             removed.insert(name.to_owned());
+        } else if REMOVED_PREFIXES
+            .iter()
+            .any(|prefix| name.to_ascii_uppercase().starts_with(prefix))
+        {
+            rejected.insert(format!("{name} (ambiguous operator prefix casing)"));
         } else if is_rejected(name) && !is_reviewed(name, value) {
             rejected.insert(name.to_owned());
         } else if name == "PATH" {
@@ -163,8 +189,7 @@ pub(crate) fn audit_environment(
 
 fn is_rejected(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
-    upper == SKIP_BUILD
-        || REJECTED_EXACT.contains(&upper.as_str())
+    REJECTED_EXACT.contains(&upper.as_str())
         || REJECTED_PREFIXES
             .iter()
             .any(|prefix| upper.starts_with(prefix))
@@ -184,137 +209,106 @@ fn is_native_variant(upper: &str, selector: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with(['_', '-']))
 }
 
+impl ReviewedException {
+    /// Accepts only the exact name and value whose path resolves to the reviewed identity.
+    fn matches(&self, name: &str, value: &str) -> bool {
+        self.name == name
+            && self.value == value
+            && std::fs::canonicalize(value).is_ok_and(|path| path == Path::new(self.path_identity))
+    }
+}
+
 fn is_reviewed(name: &str, value: &str) -> bool {
-    REVIEWED_SETUP_EXCEPTIONS.iter().any(|exception| {
-        exception.name == name
-            && exception.value == value
-            && exception.path_identity.is_none_or(|identity| {
-                std::fs::canonicalize(value).is_ok_and(|path| path == Path::new(identity))
-            })
-    })
+    REVIEWED_SETUP_EXCEPTIONS
+        .iter()
+        .any(|exception| exception.matches(name, value))
 }
 
-/// A tool directory produced by authenticated acquisition (Task 8).
-#[allow(dead_code)]
-pub(crate) struct ToolDirectory(PathBuf);
-
-/// Recipe-selected private locations for one child build.
-#[allow(dead_code)]
-pub(crate) struct ChildRequest {
-    pub(crate) target: ReleaseTarget,
-    pub(crate) home: PathBuf,
-    pub(crate) cargo_home: PathBuf,
-    pub(crate) tool_directories: Vec<ToolDirectory>,
-}
-
-/// An allowlisted child environment constructed from scratch.
-#[allow(dead_code)]
-pub(crate) struct ChildEnvironment {
-    variables: BTreeMap<String, String>,
-    removed: Vec<String>,
-}
-
-#[allow(dead_code)]
-impl ChildEnvironment {
-    /// Every variable the child receives; nothing is inherited.
-    pub(crate) fn variables(&self) -> &BTreeMap<String, String> {
-        &self.variables
-    }
-
-    /// Sorted names injected by the recipe, recorded as input facts.
-    pub(crate) fn injected_names(&self) -> Vec<&str> {
-        self.variables.keys().map(String::as_str).collect()
-    }
-
-    /// Inherited operator names removed during the audit.
-    pub(crate) fn removed_names(&self) -> &[String] {
-        &self.removed
-    }
-}
-
-#[allow(dead_code)]
-fn absolute_text<'a>(label: &str, path: &'a Path) -> Result<&'a str, Report<ReleaseError>> {
-    path.to_str()
-        .filter(|text| path.is_absolute() && !text.contains([':', '\0']))
-        .ok_or_else(|| {
-            Report::new(ReleaseError::Environment).attach(format!(
-                "{label} must be an absolute UTF-8 path without ':' or NUL"
-            ))
-        })
-}
-
-#[allow(dead_code)]
-fn build_child(
-    audited: &AuditedEnvironment,
-    commit: &str,
-    epoch: u64,
-    request: &ChildRequest,
-) -> Result<ChildEnvironment, Report<ReleaseError>> {
-    if !lower_hex(commit, 40) {
-        return Err(Report::new(ReleaseError::Environment)
-            .attach("approved commit must be 40 lowercase hex digits"));
-    }
-    let mut variables = BTreeMap::from([
-        ("AWS_LC_SYS_USE_SYSTEM".to_owned(), "0".to_owned()),
-        (
-            format!(
-                "AWS_LC_SYS_USE_SYSTEM_{}",
-                request.target.triple().replace('-', "_")
-            ),
-            "0".to_owned(),
-        ),
-        (
-            "CARGO_HOME".to_owned(),
-            absolute_text("CARGO_HOME", &request.cargo_home)?.to_owned(),
-        ),
-        (
-            "HOME".to_owned(),
-            absolute_text("HOME", &request.home)?.to_owned(),
-        ),
-        ("LC_ALL".to_owned(), "C".to_owned()),
-        ("LIBSQLITE3_SYS_USE_PKG_CONFIG".to_owned(), "0".to_owned()),
-        ("SOURCE_DATE_EPOCH".to_owned(), epoch.to_string()),
-        ("TRUSTED_SERVER__GIT_VERSION".to_owned(), commit.to_owned()),
-        (RELEASE_BUILD.to_owned(), "1".to_owned()),
-        ("TZ".to_owned(), "UTC".to_owned()),
-    ]);
-    if !request.tool_directories.is_empty() {
-        let entries = request
-            .tool_directories
-            .iter()
-            .map(|directory| absolute_text("tool directory", &directory.0))
-            .collect::<Result<Vec<_>, _>>()?;
-        variables.insert("PATH".to_owned(), entries.join(":"));
-    }
-    if request.target.is_darwin() {
-        variables.insert(
-            "MACOSX_DEPLOYMENT_TARGET".to_owned(),
-            MACOS_DEPLOYMENT_TARGET.to_owned(),
-        );
-    }
-    Ok(ChildEnvironment {
-        variables,
-        removed: audited.removed.clone(),
-    })
-}
-
-/// Builds the allowlisted child environment for one recipe execution.
-///
-/// Requires both the audited inherited environment and the locally
-/// authenticated source, whose commit and committer epoch are injected.
+/// Resolves the source root, which is always the current directory.
 ///
 /// # Errors
 ///
-/// Fails when a private location or tool directory is not an absolute UTF-8
-/// path without `:` or NUL.
-#[allow(dead_code)]
-pub(crate) fn child_environment(
-    audited: &AuditedEnvironment,
-    source: &ApprovedSource,
-    request: &ChildRequest,
-) -> Result<ChildEnvironment, Report<ReleaseError>> {
-    build_child(audited, source.commit(), source.epoch(), request)
+/// Fails when the current directory cannot be resolved.
+pub(crate) fn source_root() -> Result<PathBuf, Report<ReleaseError>> {
+    std::env::current_dir().map_err(|error| {
+        Report::new(ReleaseError::Source).attach(format!("cannot resolve source root: {error}"))
+    })
 }
+
+fn names_cohort(root: &Path, cohort: &Path) -> bool {
+    !cohort.as_os_str().is_empty()
+        && !cohort
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+        && root
+            .join(cohort)
+            .components()
+            .eq(root.join(policy::COHORT_PATH).components())
+}
+
+/// Runs the complete fail-closed preflight over the current-directory source.
+///
+/// The qualified selector always runs, so omitting `--require-qualified`
+/// can never succeed where passing it would fail.
+///
+/// # Errors
+///
+/// Fails on any rejected inherited variable, a cohort path other than the
+/// source-owned one, unauthenticated source, inputs that differ from the
+/// approved commit, or the closed qualified selector.
+pub(crate) fn run_preflight(
+    inherited: &[(OsString, OsString)],
+    cohort: &Path,
+    commit: &CommitId,
+    require_qualified: bool,
+) -> Result<(), Report<ReleaseError>> {
+    let audited = audit_environment(inherited)?;
+    if !audited.removed_names().is_empty() {
+        crate::notice(format_args!(
+            "removed inherited operator variables: {}",
+            audited.removed_names().join(", ")
+        ));
+    }
+    let root = source_root()?;
+    if !names_cohort(&root, cohort) {
+        return Err(Report::new(ReleaseError::Policy).attach(format!(
+            "--cohort must name {} below the current source root",
+            policy::COHORT_PATH
+        )));
+    }
+    let source = source::authenticate(&root, commit, &audited)?;
+    let inputs = policy::load_inputs(&root)?;
+    for (path, sha256) in inputs.input_digests() {
+        if source.tracked_sha256(path) != Some(sha256) {
+            return Err(Report::new(ReleaseError::Source)
+                .attach(format!("{path} does not match the approved commit")));
+        }
+    }
+    crate::notice(format_args!(
+        "source matched locally; git executable and remote eligibility not established \
+         (commit {}, epoch {}, snapshot {}, helper closure {} over {} paths; \
+         git executable identity: Task 8; remote branch-tip ancestry and rulesets: Task 14)",
+        source.commit(),
+        source.epoch(),
+        source.snapshot().fingerprint(),
+        source.closure_digest(),
+        source.closure_paths().len()
+    ));
+    if !require_qualified {
+        crate::notice(format_args!(
+            "qualified selection is required whether or not --require-qualified is passed"
+        ));
+    }
+    let selection = policy::select_qualified(&inputs, &[])?;
+    source.snapshot().verify_unchanged()?;
+    crate::notice(format_args!("{}", selection.summary()));
+    Ok(())
+}
+
+// Recipe execution (Tasks 5 and 7) is the only production consumer of the
+// child-environment builder; until it lands, only tests reference it.
+#[allow(dead_code)]
+pub(crate) mod child;
 
 #[cfg(test)]
 mod tests;

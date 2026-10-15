@@ -409,21 +409,88 @@ struct FixedRecipe {
     id: &'static str,
     environment: &'static str,
     script: &'static str,
-    settings: Vec<(&'static str, Value)>,
+    settings: Value,
+}
+
+/// Complete effective settings shared by every executable recipe.
+fn artifact_settings() -> Value {
+    let ambient = |checkout, user, jobs, locale, timezone, umask| {
+        json!({
+            "checkout_root": checkout,
+            "execution_user": user,
+            "jobs": jobs,
+            "locale": locale,
+            "timezone": timezone,
+            "umask": umask,
+        })
+    };
+    json!({
+        "ambient_profiles": {
+            "A": ambient("external-release-A", "qualification-selected", 4, "C", "UTC", "022"),
+            "B": ambient(
+                "external-release-B",
+                "qualified-alternate-or-unsupported",
+                2,
+                "qualification-selected-alternate",
+                "qualification-selected-alternate",
+                "027",
+            ),
+        },
+        "aws_lc_target_selector": true,
+        "aws_lc_use_system": false,
+        "cargo_config": ".cargo/config.toml",
+        "cargo_frozen": true,
+        "cargo_home": "private-prepared",
+        "cargo_locked": true,
+        "cargo_message_format": "json-render-diagnostics",
+        "download_control": "actual-cargo-build-script-required",
+        "fresh_target": true,
+        "network_boundary": "source-owned-os-denial-v1",
+        "normalized_inputs": [
+            "compiler-locale-C",
+            "compiler-timezone-UTC",
+            "source-commit-epoch",
+            "remapped-paths",
+        ],
+        "npm_lifecycle": "reviewed-preparation-only",
+        "release_debug": 1,
+        "release_strip": "none",
+        "rust_toolchain": RUST_VERSION,
+        "sqlite_features": ["bundled"],
+        "sqlite_use_pkg_config": false,
+        "sysroot": "authenticated-sdk-required",
+        "tool_paths": "authenticated-absolute-paths-required",
+        "vite_config_loading": false,
+        "vite_env_loading": false,
+        "vite_mode": "production",
+    })
+}
+
+/// Complete effective settings of the shared JS recipe.
+fn js_settings() -> Value {
+    json!({
+        "compare": "all-tracked-final-module-bytes",
+        "fresh_installations": 2,
+        "fresh_private_npm_caches": true,
+        "fresh_source": "tracked-objects-only",
+        "mandatory_tests": true,
+        "network_boundary": "source-owned-os-denial-v1",
+        "node_version": NODE_VERSION,
+        "npm_audit": false,
+        "npm_fund": false,
+        "npm_include_dev": true,
+        "npm_lifecycle": "reviewed-observed-foreground",
+        "npm_offline": true,
+        "npm_version": NPM_VERSION,
+        "publish": "A-only-after-equality",
+        "tool_paths": "authenticated-absolute-paths-required",
+        "vite_config_loading": false,
+        "vite_env_loading": false,
+        "vite_mode": "production",
+    })
 }
 
 fn expected_recipes() -> Vec<FixedRecipe> {
-    let artifact_settings = || {
-        vec![
-            ("aws_lc_use_system", json!(false)),
-            ("cargo_config", json!(".cargo/config.toml")),
-            ("cargo_frozen", json!(true)),
-            ("cargo_locked", json!(true)),
-            ("rust_toolchain", json!(RUST_VERSION)),
-            ("sqlite_use_pkg_config", json!(false)),
-            ("vite_mode", json!("production")),
-        ]
-    };
     let mut recipes: Vec<_> = FIXED_ARTIFACTS
         .iter()
         .map(|fixed| FixedRecipe {
@@ -437,13 +504,19 @@ fn expected_recipes() -> Vec<FixedRecipe> {
         id: JS_RECIPE,
         environment: BUILDER_ENVIRONMENT,
         script: JS_SCRIPT,
-        settings: vec![
-            ("node_version", json!(NODE_VERSION)),
-            ("npm_version", json!(NPM_VERSION)),
-            ("vite_mode", json!("production")),
-        ],
+        settings: js_settings(),
     });
     recipes
+}
+
+/// Names the first settings key whose presence or value differs.
+fn first_settings_difference(expected: &Value, actual: &Map<String, Value>) -> Option<String> {
+    let expected = expected.as_object()?;
+    expected
+        .keys()
+        .chain(actual.keys())
+        .find(|key| expected.get(*key) != actual.get(*key))
+        .cloned()
 }
 
 fn check_recipes(recipes: &[Recipe]) -> Result<(), Report<ReleaseError>> {
@@ -471,12 +544,10 @@ fn check_recipes(recipes: &[Recipe]) -> Result<(), Report<ReleaseError>> {
         if recipe.script != *script {
             return Err(rejected(format!("recipe {id} script must be {script}")));
         }
-        for (key, value) in settings {
-            if recipe.settings.get(*key) != Some(value) {
-                return Err(rejected(format!(
-                    "recipe {id} settings.{key} must be {value}"
-                )));
-            }
+        if let Some(key) = first_settings_difference(settings, &recipe.settings) {
+            return Err(rejected(format!(
+                "recipe {id} settings.{key} differs from the compiled recipe settings"
+            )));
         }
         check_digest(&format!("recipe {id}"), "sha256", recipe.sha256.as_deref())?;
     }

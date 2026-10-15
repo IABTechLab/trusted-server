@@ -2,9 +2,10 @@
 #[derive(Debug, derive_more::Display)]
 pub(crate) enum ReleaseError {
     #[display(
-        "Rust release execution remains disabled pending authenticated bootstrap and preflight"
+        "Invalid release invocation; Rust release execution remains disabled pending \
+         authenticated bootstrap and preflight"
     )]
-    Pending,
+    Usage,
     #[display("Invalid release document")]
     Document,
     #[display("Release input policy rejects the candidate inputs")]

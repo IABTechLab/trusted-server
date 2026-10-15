@@ -1,5 +1,6 @@
 //! Bounded read-only Git plumbing under a cleared, hardened environment.
 
+use std::cell::Cell;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write as _};
@@ -10,21 +11,28 @@ use std::thread;
 
 use error_stack::Report;
 
-use super::{TreeEntry, source_error};
+use super::{checked_sha1, source_error};
 use crate::error::ReleaseError;
 use crate::preflight::AuditedEnvironment;
 
-const STDOUT_LIMIT: u64 = 64 * 1024 * 1024;
 const STDERR_LIMIT: u64 = 64 * 1024;
 const STDERR_SHOWN: usize = 4 * 1024;
-const BLOB_LIMIT: u64 = 64 * 1024 * 1024;
+/// Largest single object read; far above any tracked source file.
+const OBJECT_LIMIT: u64 = 64 * 1024 * 1024;
+/// Total bytes of all objects read in one authentication. The tracked tree is
+/// currently tens of MiB; 2 GiB leaves ample growth while bounding the work a
+/// hostile repository can cause, since objects are held one at a time.
+const AGGREGATE_OBJECT_BUDGET: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Read-only Git plumbing under a cleared, hardened environment.
 pub(super) struct Git {
     program: PathBuf,
-    search_path: String,
+    /// Child `PATH`: only the resolved git executable's own directory.
+    child_path: String,
     root: PathBuf,
     home: tempfile::TempDir,
+    /// Remaining bytes of the aggregate object budget.
+    object_budget: Cell<u64>,
 }
 
 impl Git {
@@ -45,15 +53,21 @@ impl Git {
                 })
             })
             .ok_or_else(|| source_error("git was not found on an absolute PATH entry"))?;
+        let child_path = program
+            .parent()
+            .and_then(Path::to_str)
+            .ok_or_else(|| source_error("git directory must be UTF-8"))?
+            .to_owned();
         let home = tempfile::Builder::new()
             .prefix("release-git-home-")
             .tempdir()
             .map_err(|error| source_error(format!("cannot create private git HOME: {error}")))?;
         Ok(Self {
             program,
-            search_path: search_path.to_owned(),
+            child_path,
             root: root.to_path_buf(),
             home,
+            object_budget: Cell::new(AGGREGATE_OBJECT_BUDGET),
         })
     }
 
@@ -80,7 +94,7 @@ impl Git {
             .args(args)
             .current_dir(&self.root)
             .env_clear()
-            .env("PATH", &self.search_path)
+            .env("PATH", &self.child_path)
             .env("HOME", self.home.path())
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -104,113 +118,157 @@ impl Git {
             .map_err(|error| source_error(format!("cannot run git {}: {error}", args.join(" "))))
     }
 
-    pub(super) fn run(&self, args: &[&str]) -> Result<Vec<u8>, Report<ReleaseError>> {
+    /// Replaces the aggregate object budget so tests can exercise exhaustion.
+    #[cfg(test)]
+    pub(super) fn with_object_budget(self, bytes: u64) -> Self {
+        self.object_budget.set(bytes);
+        self
+    }
+
+    /// Runs one plumbing command whose stdout must fit `stdout_limit` bytes.
+    pub(super) fn run(
+        &self,
+        args: &[&str],
+        stdout_limit: u64,
+    ) -> Result<Vec<u8>, Report<ReleaseError>> {
         let mut child = self.spawn(args, false)?;
         let stderr = capture_stderr(&mut child);
         let mut output = Vec::new();
         let read = match child.stdout.take() {
             Some(stdout) => stdout
-                .take(STDOUT_LIMIT + 1)
+                .take(stdout_limit + 1)
                 .read_to_end(&mut output)
-                .map_err(|error| error.to_string()),
-            None => Err("stdout is unavailable".to_owned()),
+                .map(|_| ())
+                .map_err(|error| source_error(format!("cannot read stdout: {error}"))),
+            None => Err(source_error("stdout is unavailable")),
         };
-        let oversized = output.len() as u64 > STDOUT_LIMIT;
-        finish(
-            child,
-            stderr,
-            args,
-            read.and_then(|_| {
-                if oversized {
-                    Err("stdout exceeds its byte limit".to_owned())
-                } else {
-                    Ok(())
-                }
-            }),
-        )?;
+        let read = read.and_then(|()| {
+            if output.len() as u64 > stdout_limit {
+                Err(source_error("stdout exceeds its byte limit"))
+            } else {
+                Ok(())
+            }
+        });
+        finish(child, stderr, args, read)?;
         Ok(output)
     }
 
-    pub(super) fn read_blobs(
+    /// Reads objects of one `kind` through `cat-file --batch`, rehashing each.
+    ///
+    /// Every returned object must hash to its requested id as
+    /// `sha1("<kind> <length>\0" + bytes)` with collision detection; Git's
+    /// loose-object reads do not verify this themselves.
+    pub(super) fn read_objects(
         &self,
-        entries: &[TreeEntry],
-        mut visit: impl FnMut(&TreeEntry, &[u8]) -> Result<(), Report<ReleaseError>>,
+        kind: &'static str,
+        oids: &[&str],
+        mut visit: impl FnMut(usize, &[u8]) -> Result<(), Report<ReleaseError>>,
     ) -> Result<(), Report<ReleaseError>> {
         let args = ["cat-file", "--batch"];
         let mut child = self.spawn(&args, true)?;
         let stderr = capture_stderr(&mut child);
-        let request: Vec<u8> = entries
+        let request: Vec<u8> = oids
             .iter()
-            .flat_map(|entry| entry.oid.bytes().chain(std::iter::once(b'\n')))
+            .flat_map(|oid| oid.bytes().chain(std::iter::once(b'\n')))
             .collect();
         let writer = child
             .stdin
             .take()
             .map(|mut stdin| thread::spawn(move || stdin.write_all(&request)));
-        let mut visited = Ok(());
         let read = match child.stdout.take() {
-            Some(stdout) => {
-                let mut reader = BufReader::new(stdout);
-                read_batch(&mut reader, entries, &mut |entry, bytes| {
-                    visited = visit(entry, bytes);
-                    visited.is_ok()
-                })
-            }
-            None => Err("stdout is unavailable".to_owned()),
+            Some(stdout) => read_batch(
+                &mut BufReader::new(stdout),
+                &Batch {
+                    kind,
+                    oids,
+                    budget: &self.object_budget,
+                },
+                &mut visit,
+            ),
+            None => Err(source_error("stdout is unavailable")),
         };
         if read.is_err() {
             let _ = child.kill();
         }
         let written = match writer.map(thread::JoinHandle::join) {
             Some(Ok(Ok(()))) => Ok(()),
-            Some(Ok(Err(error))) => Err(error.to_string()),
-            Some(Err(_)) => Err("stdin writer panicked".to_owned()),
-            None => Err("stdin is unavailable".to_owned()),
+            Some(Ok(Err(error))) => Err(source_error(format!("cannot write stdin: {error}"))),
+            Some(Err(_)) => Err(source_error("stdin writer panicked")),
+            None => Err(source_error("stdin is unavailable")),
         };
-        let finished = finish(child, stderr, &args, read.and(written));
-        visited?;
-        finished
+        finish(child, stderr, &args, read.and(written))
     }
+}
+
+/// Collision-checked Git SHA-1 object id of `bytes` stored as an object of `kind`.
+fn object_id(kind: &str, bytes: &[u8]) -> Result<String, Report<ReleaseError>> {
+    let header = format!("{kind} {}\0", bytes.len());
+    checked_sha1(&[header.as_bytes(), bytes])
+}
+
+/// One `cat-file --batch` request and the shared aggregate byte budget.
+struct Batch<'a> {
+    kind: &'a str,
+    oids: &'a [&'a str],
+    budget: &'a Cell<u64>,
 }
 
 fn read_batch(
     reader: &mut impl BufRead,
-    entries: &[TreeEntry],
-    visit: &mut impl FnMut(&TreeEntry, &[u8]) -> bool,
-) -> Result<(), String> {
-    for entry in entries {
-        let mut header = Vec::new();
-        reader
-            .take(128)
-            .read_until(b'\n', &mut header)
-            .map_err(|error| error.to_string())?;
-        let header = std::str::from_utf8(&header).map_err(|_| "batch header is not UTF-8")?;
-        let fields: Vec<&str> = header.trim_end_matches('\n').split(' ').collect();
-        let size = match fields.as_slice() {
-            [oid, "blob", size] if *oid == entry.oid => size
-                .parse::<u64>()
-                .map_err(|_| "batch blob size is malformed".to_owned())?,
-            _ => return Err(format!("object for {} is not a readable blob", entry.path)),
-        };
-        if size > BLOB_LIMIT {
-            return Err(format!(
-                "{} exceeds the tracked blob byte limit",
-                entry.path
-            ));
+    batch: &Batch<'_>,
+    visit: &mut impl FnMut(usize, &[u8]) -> Result<(), Report<ReleaseError>>,
+) -> Result<(), Report<ReleaseError>> {
+    let io_error = |error: io::Error| source_error(format!("cannot read batch output: {error}"));
+    let kind = batch.kind;
+    for (index, oid) in batch.oids.iter().enumerate() {
+        let size = read_header(reader, kind, oid)?;
+        let remaining = batch.budget.get();
+        if size > OBJECT_LIMIT || size > remaining {
+            return Err(source_error(format!(
+                "object {oid} exceeds the per-object or aggregate object byte budget"
+            )));
         }
-        let mut bytes = vec![0; usize::try_from(size).map_err(|_| "blob size overflows")?];
-        reader
-            .read_exact(&mut bytes)
-            .map_err(|error| error.to_string())?;
+        batch.budget.set(remaining - size);
+        let length = usize::try_from(size).map_err(|_| source_error("object size overflows"))?;
+        let mut bytes = vec![0; length];
+        reader.read_exact(&mut bytes).map_err(io_error)?;
         let mut terminator = [0];
-        reader
-            .read_exact(&mut terminator)
-            .map_err(|error| error.to_string())?;
-        if terminator != *b"\n" || !visit(entry, &bytes) {
-            return Err(format!("batch output for {} is rejected", entry.path));
+        reader.read_exact(&mut terminator).map_err(io_error)?;
+        if terminator != *b"\n" {
+            return Err(source_error(format!("batch output for {oid} is malformed")));
         }
+        if object_id(kind, &bytes)? != *oid {
+            return Err(source_error(format!(
+                "object identity mismatch: {kind} {oid} content does not hash to its id"
+            )));
+        }
+        visit(index, &bytes)?;
     }
     Ok(())
+}
+
+/// Reads one `<oid> <kind> <size>` header and returns the object size.
+fn read_header(
+    reader: &mut impl BufRead,
+    kind: &str,
+    oid: &str,
+) -> Result<u64, Report<ReleaseError>> {
+    let mut header = Vec::new();
+    reader
+        .take(128)
+        .read_until(b'\n', &mut header)
+        .map_err(|error| source_error(format!("cannot read batch header: {error}")))?;
+    let header =
+        std::str::from_utf8(&header).map_err(|_| source_error("batch header is not UTF-8"))?;
+    let fields: Vec<&str> = header.trim_end_matches('\n').split(' ').collect();
+    match fields.as_slice() {
+        [returned, returned_kind, size] if *returned == oid && *returned_kind == kind => size
+            .parse::<u64>()
+            .map_err(|_| source_error("batch object size is malformed")),
+        _ => Err(source_error(format!(
+            "object {oid} is not a readable {kind}"
+        ))),
+    }
 }
 
 type StderrCapture = Option<thread::JoinHandle<Vec<u8>>>;
@@ -227,22 +285,34 @@ fn capture_stderr(child: &mut Child) -> StderrCapture {
     })
 }
 
+/// Reaps the child and attaches its bounded stderr to any failure.
 fn finish(
     mut child: Child,
     stderr: StderrCapture,
     args: &[&str],
-    read: Result<(), String>,
+    read: Result<(), Report<ReleaseError>>,
 ) -> Result<(), Report<ReleaseError>> {
     if read.is_err() {
         let _ = child.kill();
     }
+    // Task 7 bounded process module replaces this unbounded wait.
     let status = child
         .wait()
         .map_err(|error| source_error(format!("cannot wait for git: {error}")))?;
+    let detail = bounded_detail(stderr);
+    let context = format!("git {}; stderr: {detail}", args.join(" "));
+    read.map_err(|report| report.attach(context.clone()))?;
+    if !status.success() {
+        return Err(source_error(format!("{context}; exit {status}")));
+    }
+    Ok(())
+}
+
+fn bounded_detail(stderr: StderrCapture) -> String {
     let detail = stderr
         .and_then(|handle| handle.join().ok())
         .unwrap_or_default();
-    let mut detail = String::from_utf8_lossy(&detail).into_owned();
+    let mut detail = String::from_utf8_lossy(&detail).trim().to_owned();
     if detail.len() > STDERR_SHOWN {
         let mut cut = STDERR_SHOWN;
         while !detail.is_char_boundary(cut) {
@@ -251,18 +321,5 @@ fn finish(
         detail.truncate(cut);
         detail.push_str(" [truncated]");
     }
-    let command = format!("git {}", args.join(" "));
-    if let Err(reason) = read {
-        return Err(source_error(format!(
-            "{command} output is rejected: {reason}; stderr: {}",
-            detail.trim()
-        )));
-    }
-    if !status.success() {
-        return Err(source_error(format!(
-            "{command} failed with {status}; stderr: {}",
-            detail.trim()
-        )));
-    }
-    Ok(())
+    detail
 }

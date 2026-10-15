@@ -1,8 +1,16 @@
 use std::os::unix::ffi::OsStringExt as _;
 
+use std::collections::BTreeMap;
+
+use super::child::{ChildRequest, ToolDirectory, build_child};
 use super::*;
+use crate::policy::ReleaseTarget;
 
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
+fn commit() -> CommitId {
+    CommitId::parse(COMMIT).expect("should parse fictional commit")
+}
 
 fn snapshot(entries: &[(&str, &str)]) -> Vec<(OsString, OsString)> {
     entries
@@ -334,7 +342,6 @@ fn removes_operator_prefixes_by_full_prefix() {
         ("EDGEZERO__STORES__CONFIG__ID", "fictional"),
         ("MY_TRUSTED_SERVER__SETTING", "kept-out"),
         ("TRUSTED_SERVERX", "kept-out"),
-        ("trusted_server__lowercase", "kept-out"),
     ]))
     .expect("should accept removable operator variables");
     assert_eq!(
@@ -383,7 +390,7 @@ fn child_environment_contains_exactly_expected_linux_keys() {
     .expect("should audit benign environment");
     let child = build_child(
         &audited,
-        COMMIT,
+        &commit(),
         1_700_000_000,
         &request(ReleaseTarget::X86_64UnknownLinuxGnu),
     )
@@ -432,8 +439,8 @@ fn child_environment_sets_macos_floor_only_for_darwin() {
         ReleaseTarget::Aarch64AppleDarwin,
         ReleaseTarget::X86_64AppleDarwin,
     ] {
-        let child =
-            build_child(&audited, COMMIT, 1, &request(target)).expect("should build darwin child");
+        let child = build_child(&audited, &commit(), 1, &request(target))
+            .expect("should build darwin child");
         assert_eq!(
             child
                 .variables()
@@ -447,7 +454,7 @@ fn child_environment_sets_macos_floor_only_for_darwin() {
         ReleaseTarget::Wasm32Wasip1,
         ReleaseTarget::X86_64UnknownLinuxGnu,
     ] {
-        let child = build_child(&audited, COMMIT, 1, &request(target))
+        let child = build_child(&audited, &commit(), 1, &request(target))
             .expect("should build non-darwin child");
         assert!(
             !child.variables().contains_key("MACOSX_DEPLOYMENT_TARGET"),
@@ -462,19 +469,21 @@ fn child_environment_rejects_unsafe_paths_and_commits() {
     let mut relative = request(ReleaseTarget::Wasm32Wasip1);
     relative.home = PathBuf::from("home");
     assert!(
-        build_child(&audited, COMMIT, 1, &relative).is_err(),
+        build_child(&audited, &commit(), 1, &relative).is_err(),
         "should reject relative HOME"
     );
     let mut colon = request(ReleaseTarget::Wasm32Wasip1);
     colon.tool_directories = vec![ToolDirectory(PathBuf::from("/tools:/usr/bin"))];
     assert!(
-        build_child(&audited, COMMIT, 1, &colon).is_err(),
+        build_child(&audited, &commit(), 1, &colon).is_err(),
         "should reject PATH separator inside a tool directory"
     );
-    assert!(
-        build_child(&audited, "ABC", 1, &request(ReleaseTarget::Wasm32Wasip1)).is_err(),
-        "should reject a malformed commit"
-    );
+    for malformed in ["ABC", "--help", &COMMIT.to_uppercase(), &COMMIT[..39]] {
+        assert!(
+            CommitId::parse(malformed).is_err(),
+            "should reject malformed commit {malformed}"
+        );
+    }
 }
 
 #[test]
@@ -494,7 +503,7 @@ fn child_environment_sets_target_suffixed_aws_lc_selector() {
             "AWS_LC_SYS_USE_SYSTEM_x86_64_apple_darwin",
         ),
     ] {
-        let child = build_child(&audited, COMMIT, 1, &request(target))
+        let child = build_child(&audited, &commit(), 1, &request(target))
             .expect("should build child environment");
         assert_eq!(
             child.variables().get(name).map(String::as_str),
@@ -509,6 +518,125 @@ fn child_environment_sets_target_suffixed_aws_lc_selector() {
                 .count(),
             2,
             "should set only the generic and selected-target selectors"
+        );
+    }
+}
+
+#[test]
+fn rejects_ambiguous_case_operator_prefixes() {
+    for name in [
+        "trusted_server__lowercase",
+        "Trusted_Server__Mixed",
+        "edgezero__stores",
+        "EdgeZero__Stores",
+    ] {
+        let text = rejection(&[(name, "fictional-value")]);
+        assert!(text.contains(name), "should reject ambiguous casing {name}");
+    }
+}
+
+#[test]
+fn rejects_package_registry_and_cloud_credentials() {
+    assert_each_rejected(
+        "registry-credential",
+        &[
+            "NPM_TOKEN",
+            "NODE_AUTH_TOKEN",
+            "AWS_REGION",
+            "AWS_PROFILE",
+            "AWS_CONFIG_FILE",
+            "SSH_AUTH_SOCK",
+            "GH_ENTERPRISE_TOKEN",
+            "GITHUB_ENTERPRISE_TOKEN",
+            "CLOUDFLARE_API_TOKEN",
+            "CLOUDFLARE_ACCOUNT_ID",
+        ],
+    );
+}
+
+#[test]
+fn rejects_hosted_runner_service_endpoints() {
+    assert_each_rejected(
+        "runner-service",
+        &[
+            "ACTIONS_CACHE_URL",
+            "ACTIONS_RESULTS_URL",
+            "ACTIONS_RUNTIME_URL",
+        ],
+    );
+}
+
+#[test]
+fn rejects_shell_startup_injection() {
+    assert_each_rejected("shell", &["BASH_ENV", "ENV"]);
+}
+
+#[test]
+fn rejects_native_toolchain_locators() {
+    assert_each_rejected(
+        "native-locator",
+        &[
+            "CXXSTDLIB",
+            "CXXSTDLIB_x86_64_unknown_linux_gnu",
+            "TARGET_CXXSTDLIB",
+            "CROSS_COMPILE",
+            "LIBCLANG_PATH",
+            "CLANG_PATH",
+            "LLVM_CONFIG_PATH",
+            "PROTOC",
+            "PROTOC_INCLUDE",
+            "NASM",
+        ],
+    );
+}
+
+#[test]
+fn rejects_node_trust_and_mode_overrides() {
+    assert_each_rejected(
+        "node-trust",
+        &[
+            "NODE_EXTRA_CA_CERTS",
+            "NODE_TLS_REJECT_UNAUTHORIZED",
+            "NODE_ENV",
+        ],
+    );
+}
+
+#[test]
+fn reviewed_exceptions_require_a_path_identity() {
+    let exception = ReviewedException {
+        name: "VCPKG_INSTALLATION_ROOT",
+        value: "/fictional/vcpkg",
+        path_identity: "/fictional/vcpkg",
+    };
+    assert!(
+        !exception.matches("VCPKG_INSTALLATION_ROOT", "/fictional/vcpkg"),
+        "should not accept a value whose path identity cannot be resolved"
+    );
+    assert!(
+        !exception.matches("VCPKG_ROOT", "/fictional/vcpkg"),
+        "should not accept a different name"
+    );
+}
+
+#[test]
+fn rejected_exact_names_are_sorted_unique_and_not_covered_elsewhere() {
+    assert!(
+        REJECTED_EXACT.windows(2).all(|pair| pair[0] < pair[1]),
+        "should keep exact names strictly sorted, which also rules out duplicates"
+    );
+    for name in REJECTED_EXACT {
+        assert!(
+            !REJECTED_PREFIXES
+                .iter()
+                .any(|prefix| name.starts_with(prefix)),
+            "{name} is already covered by a rejected prefix"
+        );
+        assert!(
+            !NATIVE_SELECTORS
+                .iter()
+                .any(|selector| is_native_variant(name, selector)),
+            "{name} is already covered by a native selector"
         );
     }
 }

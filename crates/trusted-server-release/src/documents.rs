@@ -16,6 +16,16 @@ use sha2::{Digest as _, Sha256};
 
 use crate::error::ReleaseError;
 
+/// R-INDEX companion role names and their required `<asset>` suffixes.
+const COMPANION_SUFFIXES: [(&str, &str); 6] = [
+    ("sbom", ".spdx.json"),
+    ("provenance", ".provenance.sigstore.json"),
+    ("sbom_attestation", ".sbom.sigstore.json"),
+    ("build_evidence", ".build-evidence.json"),
+    ("build_recipe", ".build-recipe.json"),
+    ("rebuild_check", ".rebuild-check.json"),
+];
+
 /// Byte-limit class selected before a document is read or parsed.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Role {
@@ -369,24 +379,44 @@ fn validate_schema(schema: KnownSchema, value: &Value) -> Result<(), Report<Rele
         validate_safe_integers(value)?;
     }
     if matches!(schema, KnownSchema::ReleaseIndex) {
-        let mut names = BTreeSet::new();
-        FileRecord::fields(&value["tsjs_inventory"])?.check(Role::Metadata, &mut names)?;
-        for artifact in value["artifacts"]
-            .as_array()
-            .ok_or_else(|| invalid("missing artifacts"))?
+        check_index_files(value)?;
+    }
+    Ok(())
+}
+
+/// Checks every index file record and requires role-derived companion names.
+fn check_index_files(value: &Value) -> Result<(), Report<ReleaseError>> {
+    let mut names = BTreeSet::new();
+    FileRecord::fields(&value["tsjs_inventory"])?.check(Role::Metadata, &mut names)?;
+    for artifact in value["artifacts"]
+        .as_array()
+        .ok_or_else(|| invalid("missing artifacts"))?
+    {
+        let asset = FileRecord::fields(artifact)?;
+        asset.check(Role::Executable, &mut names)?;
+        for (kind, companion) in artifact["companions"]
+            .as_object()
+            .ok_or_else(|| invalid("missing companions"))?
         {
-            FileRecord::fields(artifact)?.check(Role::Executable, &mut names)?;
-            for (kind, companion) in artifact["companions"]
-                .as_object()
-                .ok_or_else(|| invalid("missing companions"))?
-            {
-                let role = if kind == "sbom" {
-                    Role::Spdx
-                } else {
-                    Role::Companion
-                };
-                FileRecord::fields(companion)?.check(role, &mut names)?;
+            let suffix = COMPANION_SUFFIXES
+                .iter()
+                .find(|(role, _)| role == kind)
+                .map(|(_, suffix)| *suffix)
+                .ok_or_else(|| invalid("unknown companion role"))?;
+            let derived = companion["name"]
+                .as_str()
+                .and_then(|name| name.strip_prefix(asset.name.as_str()));
+            if derived != Some(suffix) {
+                return Err(invalid(
+                    "companion name must be the asset name plus its role suffix",
+                ));
             }
+            let role = if kind == "sbom" {
+                Role::Spdx
+            } else {
+                Role::Companion
+            };
+            FileRecord::fields(companion)?.check(role, &mut names)?;
         }
     }
     Ok(())

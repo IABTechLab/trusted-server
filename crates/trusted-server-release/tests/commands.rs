@@ -15,6 +15,24 @@ const TOOLS: &str = "scripts/release/release-tools.json";
 const CLI_POLICY: &str = "crates/trusted-server-cli/release-policy.json";
 const BOOTSTRAP: &str = "scripts/release/bootstrap.sh";
 
+/// Preflight rejects any ancestor Cargo configuration layer, so fixtures need a
+/// temporary directory whose ancestry has none; report that host precondition.
+/// Integration tests cannot import the crate-private unit-test fixture, so
+/// this helper and the Git fixture setup are intentionally duplicated here.
+fn assert_clean_ancestry(path: &Path) {
+    let canonical = fs::canonicalize(path).expect("should resolve fixture directory");
+    for ancestor in canonical.ancestors() {
+        for name in ["config", "config.toml"] {
+            let layer = ancestor.join(".cargo").join(name);
+            assert!(
+                !layer.exists(),
+                "fixture temporary directory ancestry must not contain {}; set TMPDIR to a clean directory",
+                layer.display()
+            );
+        }
+    }
+}
+
 fn host_path() -> OsString {
     std::env::var_os("PATH").expect("should have a PATH to locate git")
 }
@@ -39,6 +57,7 @@ struct SourceFixture {
 impl SourceFixture {
     fn new(customize: impl FnOnce(&Path)) -> Self {
         let parent = tempdir().expect("should create fixture parent");
+        assert_clean_ancestry(parent.path());
         let root = parent.path().join("source");
         for path in [COHORT, TOOLS, CLI_POLICY] {
             write(&root, path, &tracked_input(path));
@@ -204,6 +223,16 @@ fn producer_dispatch_remains_closed_for_every_invocation() {
             stderr(&output).contains("release execution remains disabled"),
             "should explain pending execution gate"
         );
+        if !arguments.is_empty() {
+            assert!(
+                stderr(&output).contains("Invalid release invocation"),
+                "should report a usage error for {arguments:?}"
+            );
+            assert!(
+                stderr(&output).contains("invalid invocation:"),
+                "should surface the argument error kind for {arguments:?}"
+            );
+        }
         assert_eq!(
             fs::read_dir(root.path())
                 .expect("should inspect process writes")
@@ -241,8 +270,10 @@ fn clean_fixture_preflight_fails_at_closed_selector_without_writes() {
     let output = fixture.preflight(true, &[]);
     assert_failed_without_output(&output, "Production release selection is not qualified");
     assert!(
-        stderr(&output).contains("authenticated locally"),
-        "should pass every earlier check before the selector"
+        stderr(&output).contains(
+            "source matched locally; git executable and remote eligibility not established"
+        ),
+        "should pass every earlier check before the selector without overclaiming"
     );
     assert_eq!(fixture.listing(), before, "should write no files");
 }
@@ -374,6 +405,16 @@ fn audit_inputs_reports_incomplete_with_distinct_status() {
     );
     let report: Value = serde_json::from_slice(&output.stdout).expect("should print JSON report");
     assert_eq!(report["status"], json!("incomplete"));
+    let not_established = report["not_established"].to_string();
+    for fact in [
+        "git executable identity (Task 8)",
+        "rustup override/toolchain selection (bootstrap, Task 8)",
+    ] {
+        assert!(
+            not_established.contains(fact),
+            "should list {fact} as not established"
+        );
+    }
     assert!(
         report["pending"]
             .as_array()
@@ -411,5 +452,26 @@ fn bootstrap_rejects_extensionless_rust_toolchain_before_closing() {
     assert!(
         stderr(&rejected).contains("rust-toolchain"),
         "should name the extensionless toolchain file"
+    );
+}
+
+#[test]
+fn bootstrap_checks_rust_toolchain_at_its_repository_root() {
+    let tree = tempdir().expect("should create bootstrap tree");
+    let script = tree.path().join(BOOTSTRAP);
+    fs::create_dir_all(script.parent().expect("should have parent")).expect("should create dirs");
+    fs::copy(Path::new(REPOSITORY).join(BOOTSTRAP), &script).expect("should copy bootstrap");
+    fs::write(tree.path().join("rust-toolchain"), b"nightly\n").expect("should write pin");
+    let elsewhere = tempdir().expect("should create unrelated working directory");
+    let output = Command::new("/bin/sh")
+        .arg(&script)
+        .current_dir(elsewhere.path())
+        .env_clear()
+        .output()
+        .expect("should run bootstrap");
+    assert!(!output.status.success(), "should stay closed");
+    assert!(
+        stderr(&output).contains("rust-toolchain"),
+        "should reject the repository-root pin even from another working directory"
     );
 }
