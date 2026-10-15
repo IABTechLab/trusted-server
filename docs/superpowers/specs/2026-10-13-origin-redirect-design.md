@@ -2,7 +2,7 @@
 
 **Status:** Proposed, 2026-10-13. Raised as draft pull request jwrosewell/trusted-server#32, for Tech Lab review.
 **Author:** 51Degrees (contributed), for Tech Lab review
-**Related specs:** `2026-10-13-publisher-object-storage-origin-design.md` and `2026-10-13-request-addressing-design.md`, both in IABTechLab/trusted-server#1084, which holds every design document of the stack
+**Related specs:** `2026-10-13-publisher-object-storage-origin-design.md` and `2026-10-13-request-addressing-design.md`, both in IABTechLab/trusted-server#1342, which holds every design document of the stack
 **Related PRs:** jwrosewell/trusted-server#32
 **Issues:** IABTechLab/trusted-server#1330
 **Last updated:** 2026-10-15
