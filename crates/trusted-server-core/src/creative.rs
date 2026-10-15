@@ -36,7 +36,8 @@
 //!   URLs when [`AuctionConfig::rewrite_creatives`] is on and wrap links when
 //!   [`AuctionConfig::rewrites_auction_clicks`] is on; an unset
 //!   [`AuctionConfig::rewrite_clicks`] follows `rewrite_creatives`. `<base>`
-//!   handling and TSJS injection run when either is on. With both off the
+//!   handling runs when either is on, as does TSJS injection on the
+//!   `POST /auction` path. With both off the
 //!   rewrite pass is skipped.
 //! - HTML fetched through `/first-party/proxy` always rewrites asset URLs and
 //!   wraps links unless `rewrite_clicks` is explicitly `false`
@@ -1243,8 +1244,8 @@ impl CreativeFeatures {
 /// click paths (empty for root-relative, `https://<domain>` for absolute);
 /// `inject_tsjs` controls the `<body>` tsjs bundle injection; `max_output_size`
 /// bounds the rewritten result; `features` selects which handlers run. `<base>`
-/// handling and TSJS injection always run, since callers only invoke the pass
-/// when at least one feature is on. See the public wrappers,
+/// handling always runs, and TSJS injection runs when `inject_tsjs` is set,
+/// since callers only invoke the pass when at least one feature is on. See the public wrappers,
 /// [`rewrite_creative_html`], [`rewrite_inline_creative_html`], and
 /// [`rewrite_proxied_html`], for the supported render contexts.
 fn rewrite_creative_html_impl(
@@ -2061,6 +2062,9 @@ mod tests {
             ("blob:xyz", None),
             ("tel:+123", None),
             ("about:blank", None),
+            ("ftp://cdn.example/x", None),
+            ("ws://cdn.example/x", None),
+            ("file://cdn.example/x", None),
             ("https://exa mple.example/x", None),
         ] {
             assert_eq!(

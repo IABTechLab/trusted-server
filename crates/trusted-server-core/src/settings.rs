@@ -638,7 +638,8 @@ impl Ec {
 #[serde(deny_unknown_fields)]
 pub struct Rewrite {
     /// List of domains to exclude from rewriting. Supports wildcards (e.g., "*.example.com").
-    /// URLs from these domains will not be proxied through first-party endpoints.
+    /// URLs from these domains are neither proxied through first-party
+    /// endpoints nor click-wrapped.
     #[serde(default)]
     pub exclude_domains: Vec<String>,
 }

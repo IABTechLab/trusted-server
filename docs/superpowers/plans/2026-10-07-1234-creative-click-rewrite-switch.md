@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add `[auction] rewrite_clicks` so creative click wrapping (`<a href>` / `<area href>` → signed `/first-party/click`) can be turned on or off independently of asset rewriting, without changing output for any existing config.
+**Goal:** Add `[auction] rewrite_clicks` so creative click wrapping (`<a href>` / `<area href>` → signed `/first-party/click`) can be turned on or off independently of asset rewriting, without changing asset or link output for any existing config (a bidder `<base target>` is now kept).
 
 **Architecture:**
 
@@ -19,7 +19,7 @@
 
 ## Global Constraints
 
-- With `rewrite_clicks` unset, rewritten output must be byte-identical to today for both values of `rewrite_creatives` on `/auction` and inline SSAT/page-bids, and unchanged for `/first-party/proxy` HTML, except for the shared step's CHANGELOG Fixed items.
+- With `rewrite_clicks` unset, rewritten output must be byte-identical to today for both values of `rewrite_creatives` on `/auction` and inline SSAT/page-bids, and unchanged for `/first-party/proxy` HTML, except for the shared step's CHANGELOG Fixed items and the kept `<base target>`.
 - `rewrite_clicks` is `Option<bool>` with `#[serde(default, skip_serializing_if = "Option::is_none")]`. `AuctionConfig` keeps `deny_unknown_fields`.
 - Unset resolution: auction paths use `rewrite_clicks.unwrap_or(rewrite_creatives)`, and proxied HTML uses `rewrite_clicks.unwrap_or(true)`.
 - `exclude_domains` applies to anchors. The #1231 include list never does.

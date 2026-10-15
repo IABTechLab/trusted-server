@@ -90,8 +90,8 @@ const MAX_AUCTION_BODY_SIZE: usize = 256 * 1024;
 /// ([`auction.rewrite_creatives`][`crate::auction_config_types::AuctionConfig::rewrite_creatives`])
 /// and click wrapping
 /// ([`auction.rewrite_clicks`][`crate::auction_config_types::AuctionConfig::rewrite_clicks`])
-/// are enabled by default. Bidder `<base>` removal and creative TSJS injection
-/// run when either is on.
+/// are enabled by default. When either is on, a bidder `<base>` loses its
+/// `href` (a `target` is kept) and creative TSJS is injected.
 ///
 /// ## Scroll, refresh, and SPA navigation
 ///

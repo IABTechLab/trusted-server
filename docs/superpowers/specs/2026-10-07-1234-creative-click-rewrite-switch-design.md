@@ -6,7 +6,7 @@
 
 **Date:** 2026-10-07
 
-**Status:** Draft
+**Status:** Implemented in #1252 (spec PR #1249 was closed in favor of it)
 
 Line numbers below are at `main` 7a0ecb4c.
 
@@ -149,7 +149,7 @@ Resolution:
 | `true`              | `true`           | on             | on             | on                  | on                  |
 | `false`             | `false`          | off            | off            | on                  | off                 |
 
-The first two rows are today's behavior, byte for byte.
+The first two rows are today's behavior, byte for byte, except for the `<base target>` fix below.
 
 `rewrite_creatives` keeps its name and type. Its doc comment, the example TOML and the guides change to say it governs asset rewriting only, plus the shared `<base>` removal and TSJS injection described below.
 
@@ -314,7 +314,7 @@ Callers:
 ### Endpoints and client
 
 - `/first-party/click` and `/first-party/proxy-rebuild` stay routed and ungated.
-- No JavaScript changes. With clicks off no anchor carries `data-tsclick`, so the click guard still installs its listeners and attribute observer (`click.ts:484-512`) but never acts.
+- No JavaScript changes. With clicks off no anchor carries `data-tsclick`, so the click guard still installs its listeners and attribute observer (`click.ts:483-511`) but never acts.
 - No change to `TsCreativeConfig`.
 
 ## Open decisions resolved
@@ -338,7 +338,7 @@ The switch covers it, but only when set explicitly.
 - An explicit `true` wraps everywhere.
 - Asset rewriting in proxied HTML stays unconditional, as today.
 
-The rule for operators is short: unset means "as before" on every path, and a set value applies to every path.
+The rule for operators is short: unset means "as before" on every path (apart from the `<base target>` fix), and a set value applies to every path.
 
 ### 3. `<base>` removal and TSJS injection
 
@@ -361,7 +361,7 @@ They stay independent, and no server setting maps to `clickGuard`.
 
 - `rewrite_clicks` decides whether the server emits signed click URLs and `data-tsclick`.
 - `clickGuard` decides whether the client repairs those URLs when creative script mutates them. It is a client-side opt-out that a creative or publisher can set through `tsCreativeConfig`.
-- With `rewrite_clicks` off there is nothing to guard. The guard still installs its click listeners and attribute observer (`click.ts:484-512`) but never acts, because no anchor carries `data-tsclick` (`click.ts:433-434`, `click.ts:467`), so plumbing the server switch into the client would add config surface with no behavior change.
+- With `rewrite_clicks` off there is nothing to guard. The guard still installs its click listeners and attribute observer (`click.ts:483-511`) but never acts, because no anchor carries `data-tsclick` (`click.ts:433-434`, `click.ts:467`), so plumbing the server switch into the client would add config surface with no behavior change.
 - With `rewrite_clicks` on and `clickGuard = false`, signed click URLs still redirect, but mutated `href` values are not re-signed. That stays a client choice.
 - `creative-processing.md` documents both, and how they interact.
 
@@ -465,11 +465,10 @@ No changes and no new tests. The click guard's early return without `data-tsclic
 
 ## Rollout
 
-1. **Spec PR.** Land this document on its own.
-2. **Implementation PR.** Link this spec. If #1231's implementation has merged, rebase onto its normalizer and policy split and add only `rewrite_clicks` and the anchor gating. Otherwise this PR introduces the split as described above, and #1231 rebases onto it.
-3. **Binary first.** Deploy the new binary with the existing config. `rewrite_clicks` is unset, so behavior is unchanged on every path and old and new binaries accept the same blob during a rolling deploy.
-4. **Config second.** To split the features, set `rewrite_clicks` in `trusted-server.toml`, run `ts config validate`, and push. An environment override needs the leaf present in the TOML first.
-5. **First push after upgrading.** Settings serialize normalized, so the first `ts config push` after upgrading shows a blob diff for configs whose `exclude_domains` carry mixed-case or whitespace entries, `""` or a bare `"*"`. The diff is the normalized list and is expected.
+1. **Spec and implementation.** Both ship in #1252; the separate spec PR (#1249) was closed in favor of it. This PR introduces the normalizer and policy split, and #1231 rebases onto it.
+2. **Binary first.** Deploy the new binary with the existing config. `rewrite_clicks` is unset, so asset and link behavior is unchanged on every path (only the `<base target>` fix applies) and old and new binaries accept the same blob during a rolling deploy.
+3. **Config second.** To split the features, set `rewrite_clicks` in `trusted-server.toml`, run `ts config validate`, and push. An environment override needs the leaf present in the TOML first.
+4. **First push after upgrading.** Settings serialize normalized, so the first `ts config push` after upgrading shows a blob diff for configs whose `exclude_domains` carry mixed-case or whitespace entries, `""` or a bare `"*"`. The diff is the normalized list and is expected.
 
 ### Rollback
 
@@ -490,7 +489,7 @@ No changes and no new tests. The click guard's early return without `data-tsclic
 | -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `trusted-server.example.toml`                            | Reword the `rewrite_creatives` comment (`trusted-server.example.toml:264-267`) to cover assets only. Add `# rewrite_clicks = true` below it, with its unset behavior and the overlay and rollback caveats. Update the `sanitize_creatives` comment, which says only `rewrite_creatives` changes the `adm`, to name both switches.                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `docs/guide/configuration.md`                            | Add `rewrite_clicks` to the `[auction]` table (`configuration.md:1930-1938`). Update the processing paragraph (`configuration.md:1940-1956`) and the upgrade, rollback and overlay warning (`configuration.md:1959-1985`). Correct `configuration.md:1956` ("Neither setting affects HTML or CSS fetched through `/first-party/proxy`"; an explicit `rewrite_clicks` now does) and `configuration.md:2171` ("`rewrite_creatives = false` skips first-party URL rewriting and creative TSJS injection"; false when `rewrite_clicks = true`).                                                                                                                                                                                              |
-| `docs/guide/creative-processing.md`                      | Update Processing Triggers (`creative-processing.md:46-56`). Reword the Auction Rewrite Control intro and table (`creative-processing.md:58-80`) so it names three settings, asset URLs follow `rewrite_creatives` and links follow `rewrite_clicks`, then add the four-combination matrix as an "Assets and clicks" subsection and document the proxied-HTML rule. Add `data-tsclick` and the switch to "Anchors (Click Tracking)" (`creative-processing.md:300-326`) and use an example.com landing URL there. Explain `clickGuard` versus `rewrite_clicks`, and note that with assets off and clicks on the injected TSJS still lets a creative that turns on `renderGuard` proxy script-inserted assets through `/first-party/sign`. |
+| `docs/guide/creative-processing.md`                      | Update Processing Triggers (`creative-processing.md:46-56`). Reword the Auction Rewrite Control intro and table (`creative-processing.md:58-80`) so it names three settings, asset URLs follow `rewrite_creatives` and links follow `rewrite_clicks`, then add the four-combination matrix as an "Assets and clicks" subsection and document the proxied-HTML rule. Add `data-tsclick` and the switch to "Anchors (Click Tracking)" (`creative-processing.md:300-326`) and use an example.com landing URL there. Explain `clickGuard` versus `rewrite_clicks`, and note that with assets off and clicks on the injected TSJS does not reopen asset proxying, because the opaque-origin sandbox makes the render guard skip `/first-party/sign` (decision 3). |
 | `docs/guide/auction-orchestration.md`                    | Update the `rewrite_creatives` references (lines 164, 198, 634-663, the example TOML at 704, the environment-override section at 837-844 and the rollback note at 853) to name both switches.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `docs/guide/api-reference.md`                            | Mention `rewrite_clicks` next to `rewrite_creatives` (line 171).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `crates/trusted-server-core/src/auction/README.md`       | Mention `rewrite_clicks` next to `rewrite_creatives` (line 111).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
@@ -520,7 +519,7 @@ No dependency, adapter, routing or JavaScript changes are expected.
 
 ## Completion criteria
 
-- With `rewrite_clicks` unset, rewritten output is unchanged for both values of `rewrite_creatives` on all three entry points.
+- With `rewrite_clicks` unset, rewritten output is unchanged for both values of `rewrite_creatives` on all three entry points, except for the `<base target>` fix.
 - The four-combination matrix passes on the `/auction` and inline paths, including `<base>` removal and TSJS injection when only one switch is on.
 - With clicks off, anchors keep their raw `href` and get no `data-tsclick`.
 - With clicks on and assets off, anchors are wrapped and asset URLs are untouched.
