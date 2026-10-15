@@ -189,8 +189,18 @@ fn every_linked_module_rejects_a_setting_it_does_not_know() {
             let section = builder
                 .section()
                 .expect("every linked page module has a section");
+            let mut table = json!({ "no_such_setting": true });
+            for secret in builder.secret_settings() {
+                if let Some((last, parents)) = secret.path.split_last() {
+                    let mut at = &mut table;
+                    for parent in parents {
+                        at = &mut at[*parent];
+                    }
+                    at[*last] = json!("example-secret-name");
+                }
+            }
             settings
-                .insert_module_config(section, name, &json!({ "no_such_setting": true }))
+                .insert_module_config(section, name, &table)
                 .expect("should insert the planted table");
             (name, format!("[{section}.{}]", short_form(section, name)))
         };
