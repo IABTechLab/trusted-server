@@ -406,7 +406,7 @@ builder every integration uses.
 | ----------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
 | `.with_proxy(...)`                                    | Routes the paths the proxy declares                                                                             |
 | `.with_request_filter(...)`                           | Inspects a request and can turn it back before it reaches the origin                                            |
-| `.with_identifier_module(...)`                        | Hands core the identifiers the module learned for a request, asked on every request the registration runs for   |
+| `.with_identifier_module(...)`                        | Hands core the identifiers the module learned, asked at each Edge Cookie read when `[ec] module` names a module |
 | `.with_middleware(...)`                               | Offers a page change that an entry may place by the middleware's name                                           |
 | `.with_bundle_tag_attribute(name, value)`             | Puts an attribute on the script bundle's tag, for a browser module that reads a setting from it                 |
 | `.with_js_module(CarriedJsModule { source, sha256 })` | Carries the integration's own browser script, built outside `trusted-server-js`                                 |
