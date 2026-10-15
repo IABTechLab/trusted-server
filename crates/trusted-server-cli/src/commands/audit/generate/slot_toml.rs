@@ -12,7 +12,7 @@ use trusted_server_core::creative_opportunities::{
 
 #[cfg(test)]
 use crate::commands::audit::generate::gpt_slots;
-use crate::error::{CliResult, cli_error, report_error};
+use crate::error::{CliResult, cli_error, report_error, toml_error_location};
 
 /// A slot ready to render — the union of discovered and existing fields, without
 /// the core type's `pub(crate)` compiled-pattern cache.
@@ -627,7 +627,8 @@ pub(super) fn splice_creative_slots(
 ) -> CliResult<String> {
     let mut document = existing.parse::<DocumentMut>().map_err(|error| {
         report_error(format!(
-            "failed to parse target config before updating slots: {error}"
+            "failed to parse target config{} before updating slots",
+            toml_error_location(existing, error.span())
         ))
     })?;
     let had_section = document.get("creative_opportunities").is_some();
