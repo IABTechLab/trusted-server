@@ -287,6 +287,15 @@ mod cookie_tests {
         OwnedRequestInfo::new(String::new(), headers)
     }
 
+    /// A browser lists the cookie with the longer path first, so the
+    /// consent a publisher's tool wrote under its path wins over one of the
+    /// same name under `/`, on an addressed request as on any other.
+    #[test]
+    fn reads_the_first_of_two_cookies_of_one_name() {
+        let info = with_cookie_header("euconsent-v2=CP-publisher; euconsent-v2=CP-root");
+        assert_eq!(info.cookie("euconsent-v2"), Some("CP-publisher"));
+    }
+
     #[test]
     fn reads_a_cookie_by_name_from_among_several() {
         let info = with_cookie_header("a=1; euconsent-v2=CP-abc; b=2");
