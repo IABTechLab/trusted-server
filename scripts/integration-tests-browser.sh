@@ -28,7 +28,7 @@ fi
 
 # --- Build WASM binary ---
 echo "==> Building WASM binary (origin=http://127.0.0.1:$ORIGIN_PORT)..."
-TRUSTED_SERVER__PUBLISHER__ORIGIN_URL="http://127.0.0.1:$ORIGIN_PORT" \
+TRUSTED_SERVER__SOURCE__ORIGIN__URL="http://127.0.0.1:$ORIGIN_PORT" \
 TRUSTED_SERVER__PUBLISHER__PROXY_SECRET="integration-test-proxy-secret" \
 TRUSTED_SERVER__EC__PASSPHRASE="integration-test-ec-secret-padded-32" \
 TRUSTED_SERVER__EC__PARTNERS='[{"name":"Integration Test Partner","source_domain":"inttest.example.com","bidstream_enabled":true,"api_token":"integration-test-token-alpha-32-bytes-ok"},{"name":"Integration Test Partner 2","source_domain":"inttest2.example.com","bidstream_enabled":true,"api_token":"integration-test-token-bravo-32-bytes-ok"}]' \
