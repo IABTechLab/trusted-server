@@ -423,11 +423,10 @@ fn carries_every(headers: &http::HeaderMap, names: &[String]) -> bool {
 /// list, with the hints added after it, because core replaces all of those
 /// lines with the one header written here. So a policy the publisher's origin
 /// sets is kept and the hints it already asks for are still asked for.
-/// `Accept-CH` and
-/// `Critical-CH` name the same hints, because a browser retries only for the
-/// hints it was told are critical. Both are left off when `held`, unless
-/// `existing` names an `Accept-CH` set of its own, which would replace the
-/// one the browser holds.
+/// `Accept-CH` and `Critical-CH` name the same hints, because a browser
+/// retries only for the hints it was told are critical. Both are left off
+/// when `held`, unless `existing` names an `Accept-CH` set of its own, which
+/// would replace the one the browser holds.
 fn client_hint_headers(
     hints: &[String],
     critical: bool,
