@@ -71,9 +71,11 @@ A trusted client address header must start with `x-` or end with `-client-ip`, w
 
 **What changes for an operator.** A document that wrote `module = "fastly"` now writes `module = "platform"`. The old value is refused at startup as a device module no running module supplies.
 
-### 2.5 Later rows
+### 2.5 Names that were not Fastly's
 
-The conversion names follow in the same series, each with its own section here as it lands.
+`platform_response_to_fastly` returned a buffered response and `platform_response_to_fastly_asset` an asset response that keeps a stream, and neither touched Fastly. They are `platform_response_to_buffered` and `platform_response_to_asset`.
+
+**What changes for an operator.** Nothing. Both are internal to core.
 
 ## 3. What is not in this change
 
@@ -87,6 +89,7 @@ The conversion names follow in the same series, each with its own section here a
 - The DataDome test bypass applies while the platform declares staging and not otherwise.
 - A declared TLS header sets the scheme and an undeclared one does not, the declared TLS and spoofable headers are stripped with the standard ones, the auction sees the client's declared TLS header where the origin request does not, a declared internal header is refused as a trusted client address header, and a bare `client-ip` is refused where `example-client-ip` is accepted.
 - The `platform` device selector builds the module the adapter's factory supplies, and no selector builds the built-in one.
+- The asset proxy's tests pass unchanged through the renamed conversions.
 
 ## Review log
 

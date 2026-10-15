@@ -217,7 +217,7 @@ impl AssetProxyResponse {
         self.cache_policy
     }
 
-    /// Consume this wrapper and return a buffered Fastly response.
+    /// Consume this wrapper and return a buffered response.
     ///
     /// # Errors
     ///
@@ -248,7 +248,7 @@ impl AssetProxyResponse {
 ///
 /// Returns [`TrustedServerError::Proxy`] when `platform_resp` carries a
 /// streaming body, which the buffered proxy path cannot materialize.
-pub(crate) fn platform_response_to_fastly(
+pub(crate) fn platform_response_to_buffered(
     platform_resp: PlatformResponse,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let (parts, body) = platform_resp.response.into_parts();
@@ -256,7 +256,7 @@ pub(crate) fn platform_response_to_fastly(
         EdgeBody::Once(bytes) => bytes.to_vec(),
         EdgeBody::Stream(_) => {
             return Err(Report::new(TrustedServerError::Proxy {
-                message: "streaming platform response body is not supported by Fastly response conversion"
+                message: "streaming platform response body is not supported by buffered response conversion"
                     .to_string(),
             }));
         }
@@ -264,7 +264,7 @@ pub(crate) fn platform_response_to_fastly(
     Ok(Response::from_parts(parts, EdgeBody::from(body_bytes)))
 }
 
-fn platform_response_to_fastly_asset(platform_resp: PlatformResponse) -> AssetProxyResponse {
+fn platform_response_to_asset(platform_resp: PlatformResponse) -> AssetProxyResponse {
     let (parts, body) = platform_resp.response.into_parts();
 
     match body {
@@ -970,9 +970,9 @@ async fn send_asset_origin_request(
         })?;
 
     if stream_response {
-        Ok(platform_response_to_fastly_asset(platform_resp))
+        Ok(platform_response_to_asset(platform_resp))
     } else {
-        platform_response_to_fastly(platform_resp).map(AssetProxyResponse::origin_controlled)
+        platform_response_to_buffered(platform_resp).map(AssetProxyResponse::origin_controlled)
     }
 }
 
@@ -1223,9 +1223,9 @@ pub async fn handle_asset_proxy_request(
     };
 
     let mut response = if stream_response {
-        platform_response_to_fastly_asset(platform_resp)
+        platform_response_to_asset(platform_resp)
     } else {
-        platform_response_to_fastly(platform_resp).map(AssetProxyResponse::origin_controlled)?
+        platform_response_to_buffered(platform_resp).map(AssetProxyResponse::origin_controlled)?
     };
     strip_asset_proxy_response_headers(response.response_mut());
 
