@@ -51,6 +51,8 @@ pub(crate) enum Role {
     Bundle,
     Spdx,
     GhOutput,
+    /// Bounded official REST metadata responses.
+    Metadata,
 }
 
 impl Role {
@@ -64,6 +66,7 @@ impl Role {
             Self::Bundle => bounds::BUNDLE_BYTES,
             Self::Spdx => bounds::SPDX_BYTES,
             Self::GhOutput => bounds::STDOUT_BYTES,
+            Self::Metadata => bounds::METADATA_BYTES,
         }
     }
 }

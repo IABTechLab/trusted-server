@@ -83,6 +83,11 @@ pub(crate) struct ApprovedSourceRoot {
 }
 
 impl ApprovedSourceRoot {
+    /// Returns the independently approved source commit.
+    pub(crate) fn commit(&self) -> &ApprovedCommit {
+        &self.commit
+    }
+
     /// Opens an absolute snapshot root directory bound to its approved commit.
     ///
     /// # Errors
@@ -237,7 +242,9 @@ pub(crate) fn policy_client() -> Result<Client, Report<ReleaseError>> {
 /// The shared policy-client configuration: no redirect is ever followed.
 fn no_redirect_builder() -> ClientBuilder {
     crate::tls::install_crypto_provider();
-    Client::builder().redirect(reqwest::redirect::Policy::none())
+    Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
 }
 
 /// Builds the production client configuration without `https_only`, so a

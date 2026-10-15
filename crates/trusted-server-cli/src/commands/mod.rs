@@ -9,3 +9,6 @@ pub(crate) mod pbs;
 pub mod cache;
 pub mod dev;
 pub mod origin;
+
+#[cfg(unix)]
+pub(crate) mod release;

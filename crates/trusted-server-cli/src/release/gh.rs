@@ -25,6 +25,7 @@ use error_stack::Report;
 use serde_json::Value;
 use tempfile::TempDir;
 
+use super::artifact::AssetMeasurement;
 use super::bounds::{self, AttemptDeadline, Cancellation, ProcessBounds};
 use super::documents::{ApprovedRelease, ReleaseTag, Role, parse_json};
 use super::environment::{CallerEnvironment, GithubToken};
@@ -34,6 +35,119 @@ use super::policy::{
     certificate_identity,
 };
 use super::process::supervise;
+
+mod input;
+
+/// Trust context of a successfully verified build attestation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VerificationMode {
+    /// Uses the online verifier trust configuration.
+    Online,
+    /// Uses independently transferred, pinned roots; cannot prove publication.
+    Offline,
+}
+
+/// One successful pinned gh attestation invocation, bound to its exact inputs.
+///
+/// Only this module constructs production proofs. Callers cannot deserialize
+/// or assert a successful verifier result.
+#[derive(Debug)]
+pub(crate) struct VerifiedAttestation {
+    mode: VerificationMode,
+    result: Value,
+    release: ApprovedRelease,
+    predicate: PredicateKind,
+    subject: AssetMeasurement,
+    bundle: AssetMeasurement,
+}
+
+impl VerifiedAttestation {
+    /// Returns the immutable trust context of the verification.
+    pub(crate) fn mode(&self) -> VerificationMode {
+        self.mode
+    }
+    /// Returns verified claims only for the same approved release and bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an evidence error when any invocation input differs.
+    pub(crate) fn for_inputs(
+        &self,
+        release: &ApprovedRelease,
+        predicate: PredicateKind,
+        subject: &AssetMeasurement,
+        bundle: &AssetMeasurement,
+    ) -> Result<&Value, Report<ReleaseError>> {
+        if !same_release(&self.release, release)
+            || self.predicate != predicate
+            || &self.subject != subject
+            || &self.bundle != bundle
+        {
+            return Err(report(
+                ReleaseError::Evidence,
+                "verified gh proof belongs to other inputs",
+            ));
+        }
+        Ok(&self.result)
+    }
+
+    /// Constructs deliberately synthetic evidence for semantic tests only.
+    #[cfg(test)]
+    pub(crate) fn synthetic_for_tests(
+        result: Value,
+        release: ApprovedRelease,
+        predicate: PredicateKind,
+        subject: AssetMeasurement,
+        bundle: AssetMeasurement,
+    ) -> Self {
+        Self {
+            mode: VerificationMode::Online,
+            result,
+            release,
+            predicate,
+            subject,
+            bundle,
+        }
+    }
+}
+
+/// Successful gh release verification, bound to independent release approval.
+#[derive(Debug)]
+pub(crate) struct VerifiedReleaseStatement {
+    result: Value,
+    release: ApprovedRelease,
+}
+
+impl VerifiedReleaseStatement {
+    /// Returns verified claims for the independently approved release.
+    ///
+    /// # Errors
+    ///
+    /// Returns a publication error for a different release.
+    pub(crate) fn for_release(
+        &self,
+        release: &ApprovedRelease,
+    ) -> Result<&Value, Report<ReleaseError>> {
+        if !same_release(&self.release, release) {
+            return Err(report(
+                ReleaseError::Publication,
+                "verified release proof belongs to another release",
+            ));
+        }
+        Ok(&self.result)
+    }
+
+    /// Constructs deliberately synthetic publication evidence for tests only.
+    #[cfg(test)]
+    pub(crate) fn synthetic_for_tests(result: Value, release: ApprovedRelease) -> Self {
+        Self { result, release }
+    }
+}
+
+fn same_release(first: &ApprovedRelease, second: &ApprovedRelease) -> bool {
+    first.tag().as_str() == second.tag().as_str()
+        && first.commit().as_str() == second.commit().as_str()
+}
 
 const MINIMAL_PATH: &str = "/usr/bin:/bin";
 const STDERR_EXCERPT_BYTES: usize = 4096;
@@ -152,6 +266,8 @@ pub(crate) fn release_verify_args(tag: &ReleaseTag) -> Vec<OsString> {
         OsString::from(tag.as_str()),
         OsString::from("-R"),
         OsString::from(release_repository()),
+        OsString::from("--format"),
+        OsString::from("json"),
     ]
 }
 
@@ -234,9 +350,8 @@ fn reject_loader_injection(caller: &CallerEnvironment) -> Result<(), Report<Rele
 }
 
 impl ChildEnvironment {
-    fn isolated(caller: &CallerEnvironment) -> Result<(Self, GithubToken), Report<ReleaseError>> {
+    fn isolated(caller: &CallerEnvironment) -> Result<Self, Report<ReleaseError>> {
         reject_loader_injection(caller)?;
-        let token = GithubToken::select(caller)?;
         let root = tempfile::Builder::new()
             .prefix("ts-release-gh-")
             .tempdir()
@@ -254,7 +369,7 @@ impl ChildEnvironment {
         variables.extend(
             FIXED_VARIABLES.map(|(name, value)| (OsString::from(name), OsString::from(value))),
         );
-        Ok((Self { root, variables }, token))
+        Ok(Self { root, variables })
     }
 }
 
@@ -304,7 +419,7 @@ fn locate(
     Ok(canonical)
 }
 
-fn check_version(stdout: &[u8], token: &GithubToken) -> Result<(), Report<ReleaseError>> {
+fn check_version(stdout: &[u8], token: Option<&GithubToken>) -> Result<(), Report<ReleaseError>> {
     let text = String::from_utf8_lossy(stdout);
     let first = text.lines().next().unwrap_or_default();
     let qualified = first.strip_prefix("gh version ").is_some_and(|rest| {
@@ -315,7 +430,7 @@ fn check_version(stdout: &[u8], token: &GithubToken) -> Result<(), Report<Releas
         return Ok(());
     }
     let excerpt: String = token
-        .redact(first)
+        .map_or_else(|| first.to_owned(), |token| token.redact(first))
         .chars()
         .take(VERSION_EXCERPT_CHARS)
         .collect();
@@ -333,7 +448,8 @@ fn check_version(stdout: &[u8], token: &GithubToken) -> Result<(), Report<Releas
 pub(crate) struct GhRunner {
     executable: PathBuf,
     environment: ChildEnvironment,
-    token: GithubToken,
+    token: Option<GithubToken>,
+    offline_roots: Option<(PathBuf, AssetMeasurement)>,
     bounds: ProcessBounds,
 }
 
@@ -353,16 +469,65 @@ impl GhRunner {
         deadline: AttemptDeadline,
         cancellation: &Cancellation,
     ) -> Result<Self, Report<ReleaseError>> {
-        let (environment, token) = ChildEnvironment::isolated(caller)?;
+        let token = Some(GithubToken::select(caller)?);
+        let environment = ChildEnvironment::isolated(caller)?;
         let executable = locate(location, caller)?;
         let runner = Self {
             executable,
             environment,
             token,
+            offline_roots: None,
             bounds,
         };
         let output = runner.run(&[OsString::from("--version")], deadline, cancellation)?;
-        check_version(&output.stdout, &runner.token)?;
+        check_version(&output.stdout, runner.token.as_ref())?;
+        Ok(runner)
+    }
+
+    /// Resolves a token-free bundle verifier with independently pinned roots.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unsafe environment, missing tools, changed roots or wrong pins.
+    pub(crate) fn resolve_offline(
+        location: GhLocation<'_>,
+        caller: &CallerEnvironment,
+        bounds: ProcessBounds,
+        deadline: AttemptDeadline,
+        cancellation: &Cancellation,
+        roots: &Path,
+        expected_sha256: &str,
+    ) -> Result<Self, Report<ReleaseError>> {
+        if !super::documents::lower_hex(expected_sha256, 64) {
+            return Err(report(
+                ReleaseError::Policy,
+                "independent roots pin must be lowercase SHA-256",
+            ));
+        }
+        let environment = ChildEnvironment::isolated(caller)?;
+        let executable = locate(location, caller)?;
+        let (snapshot, measurement) = input::snapshot(
+            roots,
+            environment.root.path(),
+            bounds::TRUSTED_ROOTS_BYTES,
+            deadline,
+            cancellation,
+        )?;
+        if measurement.sha256() != expected_sha256 {
+            return Err(report(
+                ReleaseError::Policy,
+                "trusted roots differ from independently approved digest",
+            ));
+        }
+        let runner = Self {
+            executable,
+            environment,
+            token: None,
+            offline_roots: Some((snapshot, measurement)),
+            bounds,
+        };
+        let output = runner.run(&[OsString::from("--version")], deadline, cancellation)?;
+        check_version(&output.stdout, None)?;
         Ok(runner)
     }
 
@@ -398,16 +563,20 @@ impl GhRunner {
             .args(args)
             .env_clear()
             .envs(self.environment.variables.iter().cloned())
-            .env("GH_TOKEN", self.token.expose())
             .current_dir(self.environment.root.path())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0);
+        if let Some(token) = &self.token {
+            command.env("GH_TOKEN", token.expose());
+        }
         let completed = supervise(&mut command, &self.bounds, deadline, cancellation)?;
+        let raw_stderr = String::from_utf8_lossy(&completed.stderr);
         let stderr = self
             .token
-            .redact(&String::from_utf8_lossy(&completed.stderr));
+            .as_ref()
+            .map_or_else(|| raw_stderr.to_string(), |token| token.redact(&raw_stderr));
         if !completed.status.success() {
             let excerpt: String = stderr.chars().take(STDERR_EXCERPT_BYTES).collect();
             return Err(report(
@@ -437,9 +606,90 @@ impl GhRunner {
         predicate: PredicateKind,
         deadline: AttemptDeadline,
         cancellation: &Cancellation,
-    ) -> Result<Value, Report<ReleaseError>> {
-        let args = attestation_verify_args(subject, bundle, release, predicate)?;
+    ) -> Result<VerifiedAttestation, Report<ReleaseError>> {
+        attestation_verify_args(subject, bundle, release, predicate)?;
+        let private = tempfile::Builder::new()
+            .prefix("proof-")
+            .tempdir_in(self.environment.root.path())
+            .map_err(|error| report(ReleaseError::Asset, error))?;
+        let subject_limit = if subject
+            .file_name()
+            .is_some_and(|name| name == "release-index.json")
+        {
+            bounds::INDEX_BYTES
+        } else {
+            bounds::EXECUTABLE_BYTES
+        };
+        let (private_subject, subject_measurement) = input::snapshot(
+            subject,
+            private.path(),
+            subject_limit,
+            deadline,
+            cancellation,
+        )?;
+        let (private_bundle, bundle_measurement) = input::snapshot(
+            bundle,
+            private.path(),
+            bounds::BUNDLE_BYTES,
+            deadline,
+            cancellation,
+        )?;
+        let bundle_bytes =
+            std::fs::read(&private_bundle).map_err(|error| report(ReleaseError::Asset, error))?;
+        parse_json(&bundle_bytes, Role::Bundle)?;
+        let mut args =
+            attestation_verify_args(&private_subject, &private_bundle, release, predicate)?;
+        if let Some((roots, measurement)) = &self.offline_roots {
+            input::unchanged(
+                roots,
+                measurement,
+                bounds::TRUSTED_ROOTS_BYTES,
+                deadline,
+                cancellation,
+            )?;
+            args.extend([
+                OsString::from("--custom-trusted-root"),
+                roots.as_os_str().to_owned(),
+            ]);
+        }
         let output = self.run(&args, deadline, cancellation)?;
+        input::unchanged(
+            subject,
+            &subject_measurement,
+            subject_limit,
+            deadline,
+            cancellation,
+        )?;
+        input::unchanged(
+            bundle,
+            &bundle_measurement,
+            bounds::BUNDLE_BYTES,
+            deadline,
+            cancellation,
+        )?;
+        input::unchanged(
+            &private_subject,
+            &subject_measurement,
+            subject_limit,
+            deadline,
+            cancellation,
+        )?;
+        input::unchanged(
+            &private_bundle,
+            &bundle_measurement,
+            bounds::BUNDLE_BYTES,
+            deadline,
+            cancellation,
+        )?;
+        if let Some((roots, measurement)) = &self.offline_roots {
+            input::unchanged(
+                roots,
+                measurement,
+                bounds::TRUSTED_ROOTS_BYTES,
+                deadline,
+                cancellation,
+            )?;
+        }
         let value = parse_json(&output.stdout, Role::GhOutput)?;
         let Value::Array(results) = value else {
             return Err(report(
@@ -456,9 +706,60 @@ impl GhRunner {
                 ),
             ));
         }
-        results
+        let result = results
             .into_iter()
             .next()
-            .ok_or_else(|| report(ReleaseError::Output, "gh returned no attestation result"))
+            .ok_or_else(|| report(ReleaseError::Output, "gh returned no attestation result"))?;
+        Ok(VerifiedAttestation {
+            mode: if self.offline_roots.is_some() {
+                VerificationMode::Offline
+            } else {
+                VerificationMode::Online
+            },
+            result,
+            release: release.clone(),
+            predicate,
+            subject: subject_measurement,
+            bundle: bundle_measurement,
+        })
+    }
+
+    /// Verifies the official release with the pinned tool and bounded JSON.
+    ///
+    /// gh 2.97.0 `pkg/cmd/release/verify/verify.go` exports one processing
+    /// result object with `--format json`, unlike attestation verify's array.
+    ///
+    /// # Errors
+    ///
+    /// Returns runner or strict JSON errors, or an output error for a shape
+    /// outside the pinned contract. Publication semantics are checked later.
+    pub(crate) fn verify_release(
+        &self,
+        release: &ApprovedRelease,
+        deadline: AttemptDeadline,
+        cancellation: &Cancellation,
+    ) -> Result<VerifiedReleaseStatement, Report<ReleaseError>> {
+        if self.offline_roots.is_some() {
+            return Err(report(
+                ReleaseError::Publication,
+                "offline build evidence cannot verify publication",
+            ));
+        }
+        let output = self.run(&release_verify_args(release.tag()), deadline, cancellation)?;
+        let result = parse_json(&output.stdout, Role::GhOutput)?;
+        if !result.is_object()
+            || !result
+                .get("verificationResult")
+                .is_some_and(Value::is_object)
+        {
+            return Err(report(
+                ReleaseError::Output,
+                "gh release output must be one verification result object",
+            ));
+        }
+        Ok(VerifiedReleaseStatement {
+            result,
+            release: release.clone(),
+        })
     }
 }

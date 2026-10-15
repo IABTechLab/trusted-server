@@ -41,6 +41,10 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Verify official release assets without deployment.
+    #[cfg(unix)]
+    #[command(subcommand)]
+    Release(crate::commands::release::ReleaseCommand),
     /// Print the currently active deployment version for a target adapter.
     ActiveVersion(ActiveVersionArgs),
     /// Browser-backed page and ad-template audits.
@@ -138,6 +142,10 @@ pub fn run_from_env() -> Result<RunOutcome, String> {
 
 fn dispatch(args: Args) -> Result<RunOutcome, String> {
     match args.command {
+        #[cfg(unix)]
+        Command::Release(command) => {
+            crate::commands::release::run(command).map(|()| RunOutcome::Success)
+        }
         Command::ActiveVersion(args) => {
             edgezero_cli::run_active_version(&args).map(|()| RunOutcome::Success)
         }

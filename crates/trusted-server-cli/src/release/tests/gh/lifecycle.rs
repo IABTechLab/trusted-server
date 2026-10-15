@@ -6,6 +6,218 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::*;
 
+#[test]
+fn successful_attestation_proof_is_bound_to_exact_measured_inputs() {
+    let fake = Fake::script("echo '[{\"verificationResult\":{}}]'");
+    let subject = fake.file("subject.wasm");
+    let bundle = fake.file("subject.wasm.provenance.sigstore.json");
+    fs::write(&subject, b"synthetic executable").expect("should create subject");
+    fs::write(&bundle, b"{}").expect("should create bundle");
+    let runner = fake.runner(test_bounds()).expect("should resolve fake gh");
+    let proof = runner
+        .verify_attestation(
+            &subject,
+            &bundle,
+            &release(),
+            PredicateKind::Provenance,
+            AttemptDeadline::start(),
+            &Cancellation::default(),
+        )
+        .expect("should obtain typed successful fake-child result");
+    let measured_subject =
+        crate::release::artifact::AssetMeasurement::of_bytes(b"synthetic executable");
+    let measured_bundle = crate::release::artifact::AssetMeasurement::of_bytes(b"{}");
+    let changed = crate::release::artifact::AssetMeasurement::of_bytes(b"changed");
+    assert!(
+        proof
+            .for_inputs(
+                &release(),
+                PredicateKind::Provenance,
+                &measured_subject,
+                &measured_bundle
+            )
+            .is_ok(),
+        "should accept matching invocation inputs"
+    );
+    for (predicate, subject, bundle) in [
+        (PredicateKind::Spdx, &measured_subject, &measured_bundle),
+        (PredicateKind::Provenance, &changed, &measured_bundle),
+        (PredicateKind::Provenance, &measured_subject, &changed),
+    ] {
+        assert!(
+            proof
+                .for_inputs(&release(), predicate, subject, bundle)
+                .is_err(),
+            "should reject changed invocation input"
+        );
+    }
+    let other_release = ApprovedRelease::new(
+        ReleaseTag::parse("v1.2.1").expect("should parse another tag"),
+        ApprovedCommit::parse(COMMIT).expect("should parse commit"),
+    );
+    assert!(
+        proof
+            .for_inputs(
+                &other_release,
+                PredicateKind::Provenance,
+                &measured_subject,
+                &measured_bundle
+            )
+            .is_err(),
+        "should reject another approved release"
+    );
+}
+
+#[test]
+fn attestation_child_reads_private_snapshot_during_transient_substitution() {
+    let fake = Fake::empty();
+    let subject = fake.file("subject.wasm");
+    let original = fake.file("original.wasm");
+    let bundle = fake.file("subject.wasm.provenance.sigstore.json");
+    fs::write(&subject, b"synthetic executable").expect("should create subject");
+    fs::write(&original, b"synthetic executable").expect("should retain original fixture bytes");
+    fs::write(&bundle, b"{}").expect("should create bundle");
+    fake.install(&format!(
+        "printf 'substituted' > '{subject}'\ncmp -s \"$3\" '{original}' || exit 1\ncp '{original}' '{subject}'\necho '[{{\"verificationResult\":{{}}}}]'",
+        subject = subject.display(), original = original.display(),
+    ));
+    let runner = fake.runner(test_bounds()).expect("should resolve fake gh");
+    assert!(
+        runner
+            .verify_attestation(
+                &subject,
+                &bundle,
+                &release(),
+                PredicateKind::Provenance,
+                AttemptDeadline::start(),
+                &Cancellation::default()
+            )
+            .is_ok(),
+        "should verify only private original bytes despite transient caller-path substitution"
+    );
+}
+
+#[test]
+fn release_verification_requires_successful_single_json_object() {
+    for (body, accepted) in [
+        ("echo '{\"verificationResult\":{}}'", true),
+        ("echo '[{\"verificationResult\":{}}]'", false),
+        ("echo '{\"verificationResult\":'", false),
+        ("echo '{\"verificationResult\":{}}'; exit 1", false),
+    ] {
+        let fake = Fake::script(body);
+        let runner = fake.runner(test_bounds()).expect("should resolve fake gh");
+        let result = runner.verify_release(
+            &release(),
+            AttemptDeadline::start(),
+            &Cancellation::default(),
+        );
+        assert_eq!(
+            result.is_ok(),
+            accepted,
+            "should enforce release output contract"
+        );
+        if let Ok(proof) = result {
+            assert!(
+                proof.for_release(&release()).is_ok(),
+                "should bind approved release"
+            );
+            let other = ApprovedRelease::new(
+                ReleaseTag::parse("v1.2.1").expect("should parse another tag"),
+                ApprovedCommit::parse(COMMIT).expect("should parse commit"),
+            );
+            assert!(
+                proof.for_release(&other).is_err(),
+                "should reject another release"
+            );
+        }
+    }
+}
+
+#[test]
+fn rejects_attestation_input_substitution_during_successful_child() {
+    for substituted in ["subject", "bundle"] {
+        let fake = Fake::empty();
+        let subject = fake.file("subject.wasm");
+        let bundle = fake.file("subject.wasm.provenance.sigstore.json");
+        fs::write(&subject, b"original executable").expect("should create subject");
+        fs::write(&bundle, b"{}").expect("should create bundle");
+        let changed = if substituted == "subject" {
+            &subject
+        } else {
+            &bundle
+        };
+        fake.install(&format!(
+            "printf 'substituted' > '{}'\necho '[{{\"verificationResult\":{{}}}}]'",
+            changed.display()
+        ));
+        let runner = fake.runner(test_bounds()).expect("should resolve fake gh");
+        let result = runner.verify_attestation(
+            &subject,
+            &bundle,
+            &release(),
+            PredicateKind::Provenance,
+            AttemptDeadline::start(),
+            &Cancellation::default(),
+        );
+        assert!(
+            result.is_err(),
+            "should reject substituted {substituted} despite child success"
+        );
+    }
+}
+
+#[test]
+fn rejects_oversize_subject_before_invoking_attestation_child() {
+    let fake = Fake::script("echo '[{\"verificationResult\":{}}]'");
+    let subject = fake.file("subject.wasm");
+    File::create(&subject)
+        .expect("should create sparse subject")
+        .set_len(crate::release::bounds::EXECUTABLE_BYTES + 1)
+        .expect("should set oversize length");
+    let bundle = fake.file("subject.wasm.provenance.sigstore.json");
+    fs::write(&bundle, b"{}").expect("should create bundle");
+    let runner = fake.runner(test_bounds()).expect("should resolve fake gh");
+    assert!(
+        runner
+            .verify_attestation(
+                &subject,
+                &bundle,
+                &release(),
+                PredicateKind::Provenance,
+                AttemptDeadline::start(),
+                &Cancellation::default()
+            )
+            .is_err(),
+        "should reject oversize subject"
+    );
+}
+
+#[test]
+fn rejects_symlinked_attestation_input_before_child() {
+    let fake = Fake::script("echo '[{\"verificationResult\":{}}]'");
+    let subject = fake.file("subject.wasm");
+    let actual = fake.file("actual.wasm");
+    fs::write(&actual, b"synthetic executable").expect("should create actual file");
+    symlink(&actual, &subject).expect("should create substituted symlink");
+    let bundle = fake.file("subject.wasm.provenance.sigstore.json");
+    fs::write(&bundle, b"{}").expect("should create bundle");
+    let runner = fake.runner(test_bounds()).expect("should resolve fake gh");
+    assert!(
+        runner
+            .verify_attestation(
+                &subject,
+                &bundle,
+                &release(),
+                PredicateKind::Provenance,
+                AttemptDeadline::start(),
+                &Cancellation::default()
+            )
+            .is_err(),
+        "should reject symlink input"
+    );
+}
+
 // Bounds, termination and reaping.
 
 #[test]
@@ -149,6 +361,11 @@ fn truncated_json_is_rejected() {
     let fake = Fake::script("printf '[{\"verificationResult\":'");
     let runner = fake.runner(test_bounds()).expect("should resolve fake gh");
     let subject = fake.file("subject.wasm");
+    fs::write(&subject, b"original executable").expect("should create subject");
+    fs::write(fake.file("subject.wasm.provenance.sigstore.json"), b"{}")
+        .expect("should create provenance bundle");
+    fs::write(fake.file("subject.wasm.sbom.sigstore.json"), b"{}")
+        .expect("should create SPDX bundle");
 
     let (error, _) = context(runner.verify_attestation(
         &subject,
@@ -173,6 +390,11 @@ fn failed_exit_yields_no_claims_and_redacts_token() {
     );
     let runner = fake.runner(test_bounds()).expect("should resolve fake gh");
     let subject = fake.file("subject.wasm");
+    fs::write(&subject, b"original executable").expect("should create subject");
+    fs::write(fake.file("subject.wasm.provenance.sigstore.json"), b"{}")
+        .expect("should create provenance bundle");
+    fs::write(fake.file("subject.wasm.sbom.sigstore.json"), b"{}")
+        .expect("should create SPDX bundle");
 
     let (error, text) = context(runner.verify_attestation(
         &subject,
@@ -212,6 +434,11 @@ fn requires_exactly_one_attestation_result() {
         let fake = Fake::script(&format!("echo '{output}'"));
         let runner = fake.runner(test_bounds()).expect("should resolve fake gh");
         let subject = fake.file("subject.wasm");
+        fs::write(&subject, b"original executable").expect("should create subject");
+        fs::write(fake.file("subject.wasm.provenance.sigstore.json"), b"{}")
+            .expect("should create provenance bundle");
+        fs::write(fake.file("subject.wasm.sbom.sigstore.json"), b"{}")
+            .expect("should create SPDX bundle");
 
         let result = runner.verify_attestation(
             &subject,

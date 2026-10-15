@@ -52,6 +52,7 @@ commands are shown explicitly.
 | `ts prebid server secrets`       | Linux + macOS | Manage values for existing, explicitly declared Secrets Manager secrets                          | `ts prebid server secrets [OPTIONS] <COMMAND>`                                                                 |
 | `ts prebid server secrets set`   | Linux + macOS | Write a complete JSON credential payload; does not deploy or rotate partner credentials          | `ts prebid server secrets set [OPTIONS] --deployment <DEPLOYMENT> --region <REGION> <BIDDER>`                  |
 | `ts provision`                   | Linux + macOS | Provision platform resources through a target adapter                                            | `ts provision [OPTIONS] --adapter <ADAPTER>`                                                                   |
+| `ts release verify`              | Linux + macOS | Verify one official release asset and its evidence                                               | `ts release verify <TAG> --asset <NAME> --expected-source-commit <COMMIT>`                                     |
 | `ts rollback`                    | Linux + macOS | Roll a service back to a previously active deployment version                                    | `ts rollback [OPTIONS] --adapter <ADAPTER> --service-id <SERVICE_ID> --version <VERSION>`                      |
 | `ts serve`                       | Linux + macOS | Serve the project locally through a target adapter                                               | `ts serve --adapter <ADAPTER>`                                                                                 |
 
@@ -79,6 +80,22 @@ Verify the install:
 ```bash
 ts --help
 ```
+
+## Release verification
+
+Use an independently trusted verifier and gh 2.97.0 to check official release
+assets before running downloaded binaries. See [Release verification](./release-verification.md)
+for trusted bootstrap, required policy joins and offline limits.
+
+```bash
+ts release verify v1.2.0 --asset ts-aarch64-apple-darwin \
+  --expected-source-commit 0123456789abcdef0123456789abcdef01234567
+```
+
+Replace this fictional commit with an independently approved full source commit.
+The command is read-only, uses an explicit read-only `GH_TOKEN` (falling back to
+`GITHUB_TOKEN`), and returns a verification report. It has no deployment or public
+offline option.
 
 ## Common workflow
 

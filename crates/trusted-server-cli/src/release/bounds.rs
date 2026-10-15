@@ -97,6 +97,12 @@ impl AttemptDeadline {
 pub(crate) struct Cancellation(Arc<AtomicBool>);
 
 impl Cancellation {
+    /// Waits for cancellation while leaving stalled HTTP futures interruptible.
+    pub(crate) async fn cancelled(&self) {
+        while !self.is_cancelled() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
     /// Requests cancellation of every child observing this flag.
     pub(crate) fn cancel(&self) {
         self.0.store(true, Ordering::Release);

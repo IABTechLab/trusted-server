@@ -49,6 +49,18 @@ pub(crate) enum ReleaseError {
     /// Successful child output is not exactly one attestation result.
     #[display("GitHub CLI output is rejected")]
     Output,
+    /// A verified proof, document or digest join of the evidence graph is
+    /// missing, extra or mismatched.
+    #[display("release evidence graph is inconsistent")]
+    Evidence,
+    /// The official GitHub release, tag or release statement is not the
+    /// immutable publication of the verified evidence.
+    #[display("official release publication check failed")]
+    Publication,
+    /// A retained release asset exceeds its role bound, cannot be retained or
+    /// no longer matches its verified digest.
+    #[display("release asset retention failed")]
+    Asset,
 }
 
 impl core::error::Error for ReleaseError {}

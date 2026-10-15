@@ -106,7 +106,9 @@ fn release_argv_is_fixed() {
             "verify",
             "v1.2.0",
             "-R",
-            "github.com/IABTechLab/trusted-server"
+            "github.com/IABTechLab/trusted-server",
+            "--format",
+            "json"
         ]),
         "should match reviewed release verify"
     );
