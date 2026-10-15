@@ -1,6 +1,9 @@
 //! Deadlines, cancellation, byte caps, termination, reaping and output
 //! acceptance with real OS fake children.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use super::*;
 
 // Bounds, termination and reaping.
@@ -265,29 +268,180 @@ fn successful_exit_kills_lingering_same_group_descendant() {
 fn escaped_descendant_is_reported_not_awaited() {
     let fake = Fake::empty();
     let pid_file = fake.file("escaped.pid");
-    let script = format!(
-        "set -m\nsleep 30 &\necho $! > '{}'\nexit 0",
-        pid_file.display()
-    );
-    fake.install(&script);
+    fake.install(&helper_exec("escaped", fake.directory.path()));
     let runner = fake.runner(test_bounds()).expect("should resolve fake gh");
     let started = Instant::now();
 
-    let (error, _) = context(run(
-        &runner,
-        AttemptDeadline::start(),
-        &Cancellation::default(),
-    ));
-
+    let result = run(&runner, AttemptDeadline::start(), &Cancellation::default());
+    let elapsed = started.elapsed();
     let escaped = read_pid(&pid_file);
     terminate_process(escaped);
+
     assert_eq!(
-        error,
+        context(result).0,
         ReleaseError::DescendantEscaped,
         "should report escaped descendant"
     );
     assert!(
-        started.elapsed() < Duration::from_secs(5),
+        elapsed < Duration::from_secs(5),
         "should not hang on open pipes"
     );
+}
+
+// Host-independent helper children.
+//
+// `/bin/sh` cannot leave its process group portably (dash ignores `set -m`
+// without a terminal and macOS has no `setsid` binary), so the fake gh execs
+// this test binary in a hidden helper mode that uses libc directly.
+
+/// Environment selector `<mode>:<nonce>`; absent in normal test runs.
+const HELPER_SELECTOR: &str = "TS_CLI_GH_HELPER";
+/// Environment variable carrying the nonce the selector must match.
+const HELPER_NONCE: &str = "TS_CLI_GH_HELPER_NONCE";
+/// Environment variable naming the directory where helpers record pids.
+const HELPER_PIDS: &str = "TS_CLI_GH_HELPER_PIDS";
+/// Exact libtest name of [`helper_entry`].
+const HELPER_TEST: &str = "release::tests::gh::lifecycle::helper_entry";
+/// Exit status of a helper whose fork or pipe setup failed.
+const HELPER_SETUP_FAILED: i32 = 90;
+
+/// Returns a fake gh body that execs this test binary in helper `mode`.
+fn helper_exec(mode: &str, pids: &Path) -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let sequence = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    let nonce = format!("{}-{sequence}-{nanos}", std::process::id());
+    let binary = std::env::current_exe().expect("should locate the test binary");
+    let (binary, pids) = (binary.display().to_string(), pids.display().to_string());
+    assert!(
+        !binary.contains('\'') && !pids.contains('\''),
+        "should quote helper paths safely"
+    );
+    format!(
+        "{HELPER_SELECTOR}='{mode}:{nonce}' {HELPER_NONCE}='{nonce}' {HELPER_PIDS}='{pids}' \
+         exec '{binary}' --exact {HELPER_TEST} --nocapture --test-threads=1"
+    )
+}
+
+/// Returns the helper mode when the selector, nonce and argv all match a
+/// fixture-launched helper run.
+fn authorized_mode(selector: &str, nonce: Option<&str>, arguments: &[String]) -> Option<String> {
+    let (mode, selector_nonce) = selector.rsplit_once(':')?;
+    let exact = arguments.iter().any(|argument| argument == "--exact");
+    let filtered = arguments.iter().any(|argument| argument == HELPER_TEST);
+    let matched = nonce.is_some_and(|nonce| !nonce.is_empty() && nonce == selector_nonce);
+    (exact && filtered && matched).then(|| mode.to_owned())
+}
+
+/// Hidden re-exec entry point; returns immediately in normal test runs.
+///
+/// A selector present without the fixture's exact filter and nonce fails the
+/// run rather than silently acting or passing.
+#[test]
+fn helper_entry() {
+    let Some(selector) = std::env::var_os(HELPER_SELECTOR) else {
+        return;
+    };
+    let nonce = std::env::var(HELPER_NONCE).ok();
+    let arguments: Vec<String> = std::env::args().collect();
+    let mode = authorized_mode(&selector.to_string_lossy(), nonce.as_deref(), &arguments);
+    assert!(
+        mode.is_some(),
+        "should run helper mode only from a fixture-launched exact helper invocation"
+    );
+    let code = match mode.as_deref() {
+        Some("escaped") => {
+            record_helper_pid("escaped.pid", fork_escaped());
+            0
+        }
+        _ => HELPER_SETUP_FAILED,
+    };
+    // SAFETY: `_exit` ends the helper without returning to the harness.
+    unsafe { libc::_exit(code) }
+}
+
+#[test]
+fn helper_selector_fails_closed_without_exact_filter_and_nonce() {
+    let exact = [
+        "binary".to_owned(),
+        "--exact".to_owned(),
+        HELPER_TEST.to_owned(),
+    ];
+
+    assert_eq!(
+        authorized_mode("escaped:n1", Some("n1"), &exact),
+        Some("escaped".to_owned()),
+        "should authorize the exact fixture invocation"
+    );
+    assert_eq!(
+        authorized_mode("escaped:n1", Some("n2"), &exact),
+        None,
+        "should reject a mismatched nonce"
+    );
+    assert_eq!(
+        authorized_mode("escaped:n1", None, &exact),
+        None,
+        "should reject a missing nonce"
+    );
+    assert_eq!(
+        authorized_mode("escaped:n1", Some("n1"), &exact[..2]),
+        None,
+        "should reject a run without the exact helper filter"
+    );
+}
+
+fn helper_setup_failed() -> ! {
+    // SAFETY: `_exit` is async-signal-safe and ends the helper immediately.
+    unsafe { libc::_exit(HELPER_SETUP_FAILED) }
+}
+
+/// Records `pid`; a pid that could address a group or every process ends the
+/// helper instead.
+fn record_helper_pid(name: &str, pid: libc::pid_t) {
+    if pid <= 1 {
+        helper_setup_failed();
+    }
+    if let Some(directory) = std::env::var_os(HELPER_PIDS) {
+        let _ = fs::write(Path::new(&directory).join(name), pid.to_string());
+    }
+}
+
+/// Forks a child that calls `setsid()` (leaving the process group) while
+/// keeping the inherited stdout/stderr open, reports readiness and waits
+/// until killed.
+fn fork_escaped() -> libc::pid_t {
+    let mut ready = [0 as libc::c_int; 2];
+    // SAFETY: `ready` provides space for the two pipe descriptors.
+    if unsafe { libc::pipe(ready.as_mut_ptr()) } != 0 {
+        helper_setup_failed();
+    }
+    let [read_end, write_end] = ready;
+    // SAFETY: the forked child only calls async-signal-safe functions.
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        // SAFETY: setsid/write/close/pause are async-signal-safe and the
+        // descriptors are valid.
+        unsafe {
+            libc::setsid();
+            libc::write(write_end, b"r".as_ptr().cast(), 1);
+            libc::close(write_end);
+            loop {
+                libc::pause();
+            }
+        }
+    }
+    if pid < 0 {
+        helper_setup_failed();
+    }
+    let mut byte = [0_u8; 1];
+    // SAFETY: the descriptors come from `pipe` above and `byte` is writable.
+    unsafe {
+        libc::close(write_end);
+        libc::read(read_end, byte.as_mut_ptr().cast(), 1);
+        libc::close(read_end);
+    }
+    pid
 }
