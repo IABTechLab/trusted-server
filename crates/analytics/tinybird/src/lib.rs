@@ -436,9 +436,11 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
+    use edgezero_core::blob_envelope::BlobEnvelope;
     use error_stack::Report;
     use trusted_server_core::auction::telemetry::{AuctionEventBatch, AuctionEventRow};
     use trusted_server_core::config::validate_settings_for_deploy_with;
+    use trusted_server_core::config_payload::settings_from_config_blob_with;
     use trusted_server_core::integrations::IntegrationRegistry;
     use trusted_server_core::platform::{
         BackendNamingPolicy, ClientInfo, PlatformBackend, PlatformConfigStore, PlatformError,
@@ -1113,6 +1115,93 @@ mod tests {
 
         validate_settings_for_deploy_with(&settings, &[builder()])
             .expect("should validate the token's key name without treating it as the value");
+    }
+
+    /// A document selecting the module by its full name, with `table` as its
+    /// settings at `[analytics.tinybird]`.
+    fn settings_selecting_the_full_name(table: &str) -> Settings {
+        Settings::from_toml(&format!(
+            "{}\n[analytics]\nmodule = \"{MODULE}\"\n\n[analytics.tinybird]\n{table}\n",
+            crate_test_settings_str()
+        ))
+        .expect("the document should parse")
+    }
+
+    #[test]
+    fn the_full_name_s_token_is_checked_at_deploy_in_the_table_the_module_reads() {
+        validate_settings_for_deploy_with(&settings_selecting_the_full_name(TABLE), &[builder()])
+            .expect("should find the token's key name in [analytics.tinybird]");
+
+        let err = validate_settings_for_deploy_with(
+            &settings_selecting_the_full_name("api_host = \"api.tinybird.co\""),
+            &[builder()],
+        )
+        .expect_err("a missing token reference is refused");
+
+        assert!(
+            format!("{err:?}").contains("`analytics.tinybird.auction_token_secret`"),
+            "should name the token in the table the module reads: {err:?}"
+        );
+    }
+
+    /// Answers the keys the test document names, and the token's key with
+    /// the token.
+    struct StoredSecrets;
+
+    impl PlatformSecretStore for StoredSecrets {
+        fn get_bytes(
+            &self,
+            _store_name: &StoreName,
+            key: &str,
+        ) -> Result<Vec<u8>, Report<PlatformError>> {
+            let value = match key {
+                "unit-test-proxy-secret" => "unit-test-proxy-secret-32-bytes-ok",
+                "test-auction-token" => "resolved-auction-token",
+                _ => key,
+            };
+            Ok(value.as_bytes().to_vec())
+        }
+
+        fn create(
+            &self,
+            _store_id: &StoreId,
+            _name: &str,
+            _value: &str,
+        ) -> Result<(), Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+
+        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+    }
+
+    #[test]
+    fn the_full_name_loads_from_the_stored_form_with_its_token() {
+        let stored = serde_json::to_value(settings_selecting_the_full_name(TABLE))
+            .expect("should serialize the settings");
+        let envelope = BlobEnvelope::new(stored, "2026-01-01T00:00:00Z".to_owned());
+
+        let loaded = settings_from_config_blob_with(
+            &serde_json::to_string(&envelope).expect("should serialize the envelope"),
+            &StoredSecrets,
+            &StoreName::from("trusted_server_secrets"),
+            &[builder()],
+        )
+        .expect("should load the stored configuration");
+
+        let config = loaded
+            .module_config::<TinybirdSettings>(MODULE)
+            .expect("should read the table")
+            .expect("should select the module");
+        assert_eq!(
+            config
+                .auction_token_secret
+                .as_ref()
+                .map(|token| token.expose().as_str()),
+            Some("resolved-auction-token"),
+            "should keep the token's key name in the table the module reads and look it up"
+        );
     }
 
     #[test]

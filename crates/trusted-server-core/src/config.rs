@@ -506,13 +506,16 @@ fn validate_secret_key_references(
     // module's table puts it to use.
     for builder in crate::integrations::all_builders(extra_integrations) {
         let secrets = builder.secret_settings();
-        let Some((section, written)) = builder
+        let Some((section, selected)) = builder
             .module_name()
             .filter(|_| !secrets.is_empty())
             .and_then(|name| settings.module_selection(name))
         else {
             continue;
         };
+        // The table is keyed by the name without its type folder, however the
+        // section's selector wrote it, as `Settings::module_config` reads it.
+        let written = crate::module_name::short_form(section, selected);
         let table = settings.section_table(section, written);
         for secret in secrets.iter().filter(|secret| (secret.in_use)(&table)) {
             let path = format!("{section}.{written}.{}", secret.path.join("."));
@@ -1739,6 +1742,50 @@ passphrase = "production-secret-key-32-bytes-min"
                     assert!(
                         format!("{error:?}").contains(path),
                         "should name the setting for {table}: {error:?}"
+                    );
+                }
+                None => result.unwrap_or_else(|error| {
+                    panic!("should accept {table}: {error:?}");
+                }),
+            }
+        }
+    }
+
+    /// A module selected by its full name in its own type's section reads its
+    /// table at the name without the type folder, so its secret settings are
+    /// checked there.
+    #[test]
+    fn deploy_validation_checks_the_secret_of_a_module_selected_by_its_full_name() {
+        for (table, expected) in [
+            (
+                serde_json::json!({ "lock": true }),
+                Some("`testing.probe.spare.key_name`"),
+            ),
+            (
+                serde_json::json!({ "lock": true, "spare": { "key_name": "module_key" } }),
+                None,
+            ),
+        ] {
+            let mut value =
+                serde_json::to_value(valid_settings()).expect("should serialize settings");
+            value
+                .as_object_mut()
+                .expect("settings should serialize as an object")
+                .insert(
+                    "testing".to_owned(),
+                    serde_json::json!({ "module": "testing.probe", "probe": table }),
+                );
+            let settings =
+                Settings::from_json_value(value).expect("should read the module's table");
+
+            let result = validate_settings_for_deploy_with(&settings, &[module_with_a_secret()]);
+
+            match expected {
+                Some(path) => {
+                    let error = result.expect_err("should refuse a setting that names no key");
+                    assert!(
+                        format!("{error:?}").contains(path),
+                        "should name the setting in the table the module reads: {error:?}"
                     );
                 }
                 None => result.unwrap_or_else(|error| {
