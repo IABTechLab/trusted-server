@@ -227,8 +227,11 @@ export type GptDiagnosticsTrustedServerOpportunity =
  *
  * This array is the single source of truth: `GptDiagnosticsCreativeFailure` is
  * derived from it, and the diagnostics store validates against it at runtime.
- * Adding a member here is sufficient; a compile-time union and a hand-written
- * runtime allowlist would otherwise drift, and a dropped reason is silent.
+ * Adding a member here is sufficient for the store to accept it; a
+ * compile-time union and a hand-written runtime allowlist would otherwise
+ * drift, and a dropped reason is silent. An `aps_` member also needs a wire
+ * name in the render path's reason map to be reachable, and every member needs
+ * a case in the overlay's exhaustive switch, which is a compile error by design.
  *
  * The `aps_` members cover the APS render path, where a blank slot is otherwise
  * indistinguishable from a filled one: Ad Manager reports a non-empty 1x1

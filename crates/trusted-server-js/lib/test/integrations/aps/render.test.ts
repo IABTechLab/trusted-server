@@ -986,22 +986,45 @@ describe('APS render failure reason allowlist', () => {
 });
 
 describe('Universal Creative APS failure relay', () => {
-  it('relays the frame failure reason to the top window for diagnostics', async () => {
+  /**
+   * Stand-in for the `sendMessage` helper Universal Creative passes to
+   * `render`. It mirrors the real one: the body is JSON, the helper stamps its
+   * own `adId`, and the payload is applied last so a caller can override both.
+   */
+  function pucHelper(adId: string): { sendMessage: (type: string, payload: object) => void } {
+    return {
+      sendMessage: (type, payload) =>
+        window.postMessage(JSON.stringify({ message: type, adId, ...payload }), '*'),
+    };
+  }
+
+  function captureRelays(): {
+    relayed: Array<Record<string, unknown>>;
+    stop: () => void;
+  } {
+    const relayed: Array<Record<string, unknown>> = [];
+    const capture = (event: MessageEvent): void => {
+      const data =
+        typeof event.data === 'string'
+          ? (JSON.parse(event.data) as Record<string, unknown>)
+          : (event.data as Record<string, unknown>);
+      if (data && data['message'] === APS_RENDER_FAILED_MESSAGE) relayed.push(data);
+    };
+    window.addEventListener('message', capture);
+    return { relayed, stop: () => window.removeEventListener('message', capture) };
+  }
+
+  it('relays the frame failure reason through the creative window helper', async () => {
     const dynamicWindow = window as unknown as {
       render?: (data: Record<string, unknown>, helper: unknown, target: Window) => Promise<void>;
     };
-    const relayed: unknown[] = [];
-    const capture = (event: MessageEvent): void => {
-      const data = event.data as { message?: unknown } | undefined;
-      if (data && data.message === APS_RENDER_FAILED_MESSAGE) relayed.push(data);
-    };
-    window.addEventListener('message', capture);
+    const { relayed, stop } = captureRelays();
     window.eval(APS_UNIVERSAL_CREATIVE_RENDERER);
 
     try {
       const rendered = dynamicWindow.render!(
-        { adId: 'example-ad-id', apsRenderer: descriptor(), rendererUrl: apsRendererUrl() },
-        undefined,
+        { apsRenderer: descriptor(), rendererUrl: apsRendererUrl() },
+        pucHelper('example-ad-id'),
         window
       );
       const iframe = document.body.querySelector('iframe')!;
@@ -1031,7 +1054,7 @@ describe('Universal Creative APS failure relay', () => {
         },
       ]);
     } finally {
-      window.removeEventListener('message', capture);
+      stop();
       delete dynamicWindow.render;
       document.body.innerHTML = '';
     }
@@ -1041,19 +1064,14 @@ describe('Universal Creative APS failure relay', () => {
     const dynamicWindow = window as unknown as {
       render?: (data: Record<string, unknown>, helper: unknown, target: Window) => Promise<void>;
     };
-    const relayed: unknown[] = [];
-    const capture = (event: MessageEvent): void => {
-      const data = event.data as { message?: unknown } | undefined;
-      if (data && data.message === APS_RENDER_FAILED_MESSAGE) relayed.push(data);
-    };
-    window.addEventListener('message', capture);
+    const { relayed, stop } = captureRelays();
     vi.useFakeTimers();
     window.eval(APS_UNIVERSAL_CREATIVE_RENDERER);
 
     try {
       const rendered = dynamicWindow.render!(
-        { adId: 'timeout-ad-id', apsRenderer: descriptor(), rendererUrl: apsRendererUrl() },
-        undefined,
+        { apsRenderer: descriptor(), rendererUrl: apsRendererUrl() },
+        pucHelper('timeout-ad-id'),
         window
       );
       rendered.catch(() => {});
@@ -1067,7 +1085,7 @@ describe('Universal Creative APS failure relay', () => {
       ]);
     } finally {
       vi.useRealTimers();
-      window.removeEventListener('message', capture);
+      stop();
       delete dynamicWindow.render;
       document.body.innerHTML = '';
     }
@@ -1077,17 +1095,40 @@ describe('Universal Creative APS failure relay', () => {
     const dynamicWindow = window as unknown as {
       render?: (data: Record<string, unknown>, helper: unknown, target: Window) => Promise<void>;
     };
-    const relayed: Array<{ reason?: unknown }> = [];
-    const capture = (event: MessageEvent): void => {
-      const data = event.data as { message?: unknown; reason?: unknown } | undefined;
-      if (data && data.message === APS_RENDER_FAILED_MESSAGE) relayed.push(data);
-    };
-    window.addEventListener('message', capture);
+    const { relayed, stop } = captureRelays();
     window.eval(APS_UNIVERSAL_CREATIVE_RENDERER);
 
     try {
       const rendered = dynamicWindow.render!(
-        { adId: 'load-error-ad-id', apsRenderer: descriptor(), rendererUrl: apsRendererUrl() },
+        { apsRenderer: descriptor(), rendererUrl: apsRendererUrl() },
+        pucHelper('load-error-ad-id'),
+        window
+      );
+      rendered.catch(() => {});
+      const iframe = document.body.querySelector('iframe') as HTMLIFrameElement & {
+        onerror?: () => void;
+      };
+      iframe.onerror?.();
+
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(relayed.map((entry) => entry['reason'])).toEqual(['frame_load_error']);
+    } finally {
+      stop();
+      delete dynamicWindow.render;
+      document.body.innerHTML = '';
+    }
+  });
+
+  it('stays silent when Universal Creative provides no message helper', async () => {
+    const dynamicWindow = window as unknown as {
+      render?: (data: Record<string, unknown>, helper: unknown, target: Window) => Promise<void>;
+    };
+    const { relayed, stop } = captureRelays();
+    window.eval(APS_UNIVERSAL_CREATIVE_RENDERER);
+
+    try {
+      const rendered = dynamicWindow.render!(
+        { apsRenderer: descriptor(), rendererUrl: apsRendererUrl() },
         undefined,
         window
       );
@@ -1098,9 +1139,11 @@ describe('Universal Creative APS failure relay', () => {
       iframe.onerror?.();
 
       await new Promise((resolve) => setTimeout(resolve, 0));
-      expect(relayed.map((entry) => entry.reason)).toEqual(['frame_load_error']);
+      // No helper means no relay, and the render still rejects rather than hanging.
+      expect(relayed).toEqual([]);
+      await expect(rendered).rejects.toThrow();
     } finally {
-      window.removeEventListener('message', capture);
+      stop();
       delete dynamicWindow.render;
       document.body.innerHTML = '';
     }

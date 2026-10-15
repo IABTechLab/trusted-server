@@ -232,7 +232,7 @@ function creativeFailureFact(
     case 'aps_frame_timeout':
       return 'APS render failure: renderer frame never acknowledged';
     case 'aps_frame_load_error':
-      return 'APS render failure: renderer frame failed to load';
+      return 'APS render failure: renderer frame raised a load error (rare; an HTTP error on the renderer route reports a timeout instead)';
     case 'aps_frame_reported_failure':
       return 'APS render failure: renderer frame reported an unlabelled failure';
     case 'aps_unknown':

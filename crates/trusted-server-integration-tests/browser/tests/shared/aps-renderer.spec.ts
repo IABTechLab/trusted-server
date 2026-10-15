@@ -924,6 +924,51 @@ parent.postMessage(JSON.stringify({
         expect(runnerRequests).toBe(requestsBeforeInvalid);
         await expect(page.locator("#malformed-slot .existing")).toHaveCount(1);
 
+        // The three rejections above are the only place the renderer document's
+        // wire names are checked by executing it, rather than by matching
+        // substrings in the Rust source. `nonce_mismatch` in particular is only
+        // useful if the frame echoes the nonce its parent expects, so assert the
+        // nonce as well as the reason.
+        const reportedFailures = await page.evaluate(() =>
+            (
+                window as unknown as {
+                    apsMessages: Array<{
+                        slotId: string;
+                        data: Record<string, unknown>;
+                    }>;
+                }
+            ).apsMessages
+                .filter(
+                    ({ data }) =>
+                        data["message"] ===
+                        "trusted-server/aps/renderer-failed",
+                )
+                .map(({ slotId, data }) => ({
+                    slotId,
+                    reason: data["reason"],
+                    nonce: data["nonce"],
+                })),
+        );
+        expect(reportedFailures).toEqual(
+            expect.arrayContaining([
+                {
+                    slotId: "mismatch-slot",
+                    reason: "nonce_mismatch",
+                    nonce: validNonce,
+                },
+                {
+                    slotId: "missing-fragment-slot",
+                    reason: "bad_hash",
+                    nonce: undefined,
+                },
+                {
+                    slotId: "malformed-slot",
+                    reason: "descriptor_keys",
+                    nonce: wrongNonce,
+                },
+            ]),
+        );
+
         const scriptNonce = "0123456789abcdefghijkl";
         await page.evaluate(
             ({ renderer, nonce }) => {
