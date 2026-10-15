@@ -797,6 +797,7 @@ The command is meant to be wired into CI, so the exit code carries the outcome:
 Code 2 is the generic CLI error code (shared with every `ts` command), so a CI
 gate must treat 2 as "the audit could not run", distinct from 3 ("cache
 warnings"). `ts dev audit` is available on all host platforms.
+
 ## Operate a self-hosted Prebid Server
 
 The experimental `ts prebid server` namespace supports four bounded operations:
