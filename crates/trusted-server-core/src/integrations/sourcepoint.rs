@@ -1718,6 +1718,46 @@ mod tests {
     }
 
     #[test]
+    fn handle_rejects_buffered_overflow_without_content_length() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let integration = SourcepointIntegration::new(Arc::new(config(true)));
+            for content_type in ["application/javascript", "text/html"] {
+                let client = Arc::new(StubHttpClient::new());
+                client.push_response_with_headers(
+                    200,
+                    vec![b' '; MAX_REWRITE_BODY_SIZE as usize + 1],
+                    vec![("content-type", content_type)],
+                );
+                let services = build_services_with_http_client(client.clone());
+
+                let error = integration
+                    .handle(
+                        &settings,
+                        &services,
+                        make_req(
+                            Method::GET,
+                            "https://publisher.example.com/integrations/sourcepoint/cdn/asset",
+                        ),
+                    )
+                    .await
+                    .expect_err("should reject a buffered body over the rewrite limit");
+
+                assert_eq!(
+                    client.recorded_stream_response_flags(),
+                    vec![false],
+                    "should exercise the buffered adapter path"
+                );
+                assert_eq!(
+                    error.current_context().status_code(),
+                    StatusCode::BAD_GATEWAY,
+                    "should return 502 for buffered {content_type} overflow"
+                );
+            }
+        });
+    }
+
+    #[test]
     fn handle_javascript_cache_policy_follows_static_path_classification() {
         futures::executor::block_on(async {
             let settings = create_test_settings();
