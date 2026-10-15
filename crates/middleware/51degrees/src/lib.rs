@@ -212,9 +212,10 @@ pub struct ClientHints {
     /// `https://cloud.example.com`. Derived from the configured endpoint, so
     /// a deployment using its own private cloud delegates to that instead.
     endpoint_origin: Option<String>,
-    /// Asks which hints the service wants from the reader's browser, through
-    /// the cache, which answers for every reader on the same browser after the
-    /// first.
+    /// Asks which hints the service wants from the reader's browser, sending
+    /// its `User-Agent` and `Sec-CH-UA` hints alone, through the cache, which
+    /// holds one answer for each set of those values and so answers every
+    /// reader on the same browser after the first.
     hints: ClientHintsCall,
     /// Whether `Critical-CH` is written with `Accept-CH`, so the browser
     /// retries the first navigation carrying its hints. On by default,
@@ -367,14 +368,9 @@ impl IntegrationRequestFilter for ClientHints {
         if asks_for_a_document(input.request)
             && placed_for(input.settings, input.request.uri().path())
         {
-            let client_ip = input
-                .services
-                .client_info()
-                .client_ip
-                .map(|ip| ip.to_string())
-                .unwrap_or_default();
             let names = {
-                let evidence = BorrowedRequestInfo::new(&client_ip, Some(input.request.headers()));
+                // No address, because the hints depend on the browser alone.
+                let evidence = BorrowedRequestInfo::new("", Some(input.request.headers()));
                 self.names(&evidence, input.services).await
             };
             if !names.is_empty() {
@@ -1116,6 +1112,47 @@ mod tests {
 
             assert_eq!(client.sent().len(), usize::from(covered), "{path}");
             assert_eq!(names.is_empty(), !covered, "{path}");
+        }
+    }
+
+    /// The filter hands the service the reader's browser alone, so neither
+    /// the reader's address nor a cookie reaches the request sent.
+    #[tokio::test]
+    async fn the_filter_sends_no_address_and_no_cookie() {
+        let client = Arc::new(ScriptedHttpClient::new(&[DATA]));
+        let services = services_with(client.clone(), Arc::new(MemoryKvStore::default()))
+            .with_client_info(trusted_server_core::platform::ClientInfo {
+                client_ip: Some("2.125.160.216".parse().expect("should parse the address")),
+                ..Default::default()
+            });
+        let mut request = first_view();
+        request.headers_mut().insert(
+            http::header::COOKIE,
+            http::HeaderValue::from_static("51D_ScreenPixelsWidth=1080; ts-ec=an-id"),
+        );
+
+        let names = left_by_the_filter(&middleware(CLOUD), &services, &mut request).await;
+
+        assert!(!names.is_empty());
+        let sent = client.sent();
+        assert_eq!(sent.len(), 1);
+        let body = &sent[0].body;
+        assert!(
+            body.contains("user-agent=") && body.contains("sec-ch-ua-mobile="),
+            "{body}"
+        );
+        for absent in [
+            "client-ip",
+            "2.125.160.216",
+            "51D_",
+            "1080",
+            "ts-ec",
+            "an-id",
+        ] {
+            assert!(
+                !body.contains(absent),
+                "{absent} reached the service: {body}"
+            );
         }
     }
 
