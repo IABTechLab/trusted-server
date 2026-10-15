@@ -109,10 +109,11 @@ it, is never read from a shared template and never stored as one, and is sent
 `private, no-store`.
 
 The first call for an address, `User-Agent` and `51D_` cookies costs one round
-trip to the service before the page, within `timeout_ms`. The answer is held,
-so every later request with the same evidence reads it. A service that does
-not answer leaves the page with no headers and no tag, and a logged line says
-why.
+trip to the service before the page. On Fastly the call fails after one second
+if it cannot connect, and once connected it waits `timeout_ms` for the first
+byte and again for each gap between bytes. The answer is held, so every later
+request with the same evidence reads it. A service that does not answer leaves
+the page with no headers and no tag, and a logged line says why.
 
 ## What is checked
 

@@ -2,7 +2,7 @@
 
 **Status:** Proposed, 2026-10-14. Raised as draft pull request jwrosewell/trusted-server#39, for Tech Lab review.
 **Author:** 51Degrees (contributed), for Tech Lab review
-**Related specs:** `2026-10-12-shared-vendor-tables-design.md` (the `[shared.51degrees]` table), `2026-10-12-loading-cache-design.md` (the `51degrees-answers` cache), `2026-10-12-page-middleware-design.md` (the `[[serve]]` entries) and `2026-10-14-source-modules-design.md` (the source a page is fetched from), all in IABTechLab/trusted-server#1084, which holds every design document of the stack
+**Related specs:** `2026-10-12-shared-vendor-tables-design.md` (the `[shared.51degrees]` table), `2026-10-12-loading-cache-design.md` (the `51degrees-answers` cache), `2026-10-12-page-middleware-design.md` (the `[[serve]]` entries) and `2026-10-14-source-modules-design.md` (the source a page is fetched from), all in IABTechLab/trusted-server#1342, which holds every design document of the stack
 **Related PRs:** jwrosewell/trusted-server#39, IABTechLab/trusted-server#1386
 **Issues:** IABTechLab/trusted-server#1333
 **Last updated:** 2026-10-15
@@ -230,6 +230,10 @@ out is the only way to limit it.
   navigation on Fastly once the table is present.
 - **Merging the lines of a header.** A header the response carries on several
   lines keeps only its first line, as "What the headers keep" says.
+- **Code comments that say more than this design.** The comments in
+  `crates/middleware/51degrees/src/lib.rs` that say each header keeps what the
+  response already said, and that the cache answers every reader on the same
+  browser, are left for a later change.
 - **Sending less, or asking permission first.** The two open questions under
   "Open questions for the reviewer" decide that.
 
@@ -281,6 +285,7 @@ Seven things have no test.
 ## Review log
 
 1. **Round 1, 2026-10-15.** A review in a fresh session, against `split/44-client-hints` at `1f6b83d0c`. Issues found, four of them blocking. The four were that the request filter runs wherever the table is present and not only where an entry covers the page, that the cost to existing pages was not stated, that failure handling and the timeout of each adapter were not stated, and that nothing said what each navigation sends to the service or what consent it needs. This revision states each from the code, which also shows that only the Fastly adapter runs request filters, and it corrects the claims about page navigations, the headers and the tests, replaces a related spec that exists in no branch, and corrects the guide, the changelog and the middleware readme.
+2. **Round 2, 2026-10-15.** A lighter review in a fresh session, against this page at `126347b00`, of the round 1 fixes and the new text. No blocking issues once the pull request number was corrected. This revision names the pull request that now holds every design document, makes the guide's description of the wait for the first call match the one second connection limit and the limit on each gap between bytes, and lists in section 3 the code comments that still say more than the design does.
 
 ## Revision record
 
@@ -288,3 +293,4 @@ Seven things have no test.
 | ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 2026-10-14 | First draft.                                                                                                                                                                                                                                                                                                                                                                |
 | 2026-10-15 | Fixes from review round 1. What the filter runs on and that only the Fastly adapter runs it, the cost to pages, what each navigation sends and the open questions on consent, how each adapter bounds the call, the answers on failure, the settings, what the headers keep, the definition of a page navigation, the untested paths, the related specs and the review log. |
+| 2026-10-15 | Fixes from review round 2. The pull request that holds the design documents, the wait for the first call in the guide, and the code comments left for a later change.                                                                                                                                                                                                       |
