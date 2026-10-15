@@ -628,7 +628,7 @@ pub(super) fn splice_creative_slots(
     let mut document = existing.parse::<DocumentMut>().map_err(|error| {
         report_error(format!(
             "failed to parse target config{} before updating slots",
-            toml_error_location(error.span())
+            toml_error_location(existing, error.span())
         ))
     })?;
     let had_section = document.get("creative_opportunities").is_some();

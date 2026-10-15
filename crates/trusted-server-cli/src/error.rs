@@ -40,9 +40,44 @@ impl Error for CliError {}
 /// Formats a TOML error's location without the parser's message.
 ///
 /// Parser and deserializer messages quote the offending source line or value,
-/// which can hold data an operator keeps private, so only the byte offset of
-/// the error is reported.
-pub(crate) fn toml_error_location(span: Option<core::ops::Range<usize>>) -> String {
-    span.map(|span| format!(" at byte offset {}", span.start))
-        .unwrap_or_default()
+/// which can hold data an operator keeps private, so only the 1-based line and
+/// column of the error within `source` are reported.
+pub(crate) fn toml_error_location(source: &str, span: Option<core::ops::Range<usize>>) -> String {
+    let Some(start) = span.map(|span| span.start) else {
+        return String::new();
+    };
+    let before = source.get(..start).unwrap_or(source);
+    let line = before.matches('\n').count() + 1;
+    let column = before
+        .rsplit('\n')
+        .next()
+        .map_or(0, |tail| tail.chars().count())
+        + 1;
+    format!(" at line {line}, column {column}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toml_error_location_reports_line_and_column() {
+        let source = "a = 1\nb = \"x\n";
+
+        let location = toml_error_location(source, Some(10..11));
+
+        assert_eq!(
+            location, " at line 2, column 5",
+            "should map offset to line and column"
+        );
+    }
+
+    #[test]
+    fn toml_error_location_is_empty_without_span() {
+        assert_eq!(
+            toml_error_location("a = 1", None),
+            "",
+            "should omit location without span"
+        );
+    }
 }
