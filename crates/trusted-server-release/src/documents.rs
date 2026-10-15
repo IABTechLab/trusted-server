@@ -16,8 +16,9 @@ use sha2::{Digest as _, Sha256};
 
 use crate::error::ReleaseError;
 
+/// Byte-limit class selected before a document is read or parsed.
 #[derive(Clone, Copy, Debug)]
-enum Role {
+pub(crate) enum Role {
     Metadata,
     Companion,
     Bundle,
@@ -36,7 +37,8 @@ impl Role {
     }
 }
 
-fn parse_json(bytes: &[u8], role: Role) -> Result<Value, Report<ReleaseError>> {
+/// Parses bounded strict JSON with unique keys and finite numeric tokens.
+pub(crate) fn parse_json(bytes: &[u8], role: Role) -> Result<Value, Report<ReleaseError>> {
     if bytes.len() as u64 > role.limit() {
         return Err(invalid("document exceeds role byte limit"));
     }
@@ -53,12 +55,14 @@ fn parse_json(bytes: &[u8], role: Role) -> Result<Value, Report<ReleaseError>> {
     Ok(value)
 }
 
-struct RawBytes {
-    bytes: Vec<u8>,
-    sha256: String,
+/// Exact bytes read from one held descriptor and their SHA-256.
+pub(crate) struct RawBytes {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) sha256: String,
 }
 
-fn read_bounded(path: &Path, role: Role) -> Result<RawBytes, Report<ReleaseError>> {
+/// Reads one unlinked regular file without following a leaf symlink.
+pub(crate) fn read_bounded(path: &Path, role: Role) -> Result<RawBytes, Report<ReleaseError>> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
@@ -187,7 +191,8 @@ impl Serialize for Canonical<'_> {
     }
 }
 
-fn canonical_json(value: &Value, role: Role) -> Result<Vec<u8>, Report<ReleaseError>> {
+/// Serializes JSON with sorted keys and a trailing newline.
+pub(crate) fn canonical_json(value: &Value, role: Role) -> Result<Vec<u8>, Report<ReleaseError>> {
     let mut output = LimitedBytes {
         bytes: Vec::new(),
         limit: role.limit(),
@@ -300,7 +305,8 @@ impl FileRecord {
     }
 }
 
-fn lower_hex(value: &str, length: usize) -> bool {
+/// Returns whether `value` is exactly `length` lowercase hexadecimal digits.
+pub(crate) fn lower_hex(value: &str, length: usize) -> bool {
     value.len() == length
         && value
             .bytes()

@@ -1,7 +1,12 @@
-// Task 2 utilities remain private until Task 3 wires authenticated preflight.
+// Document, policy and environment utilities stay unwired until source
+// authentication lets preflight dispatch them.
 #[allow(dead_code)]
 mod documents;
 mod error;
+#[allow(dead_code)]
+mod policy;
+#[allow(dead_code)]
+mod preflight;
 
 use error::ReleaseError;
 use error_stack::Report;
