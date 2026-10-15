@@ -364,6 +364,11 @@ jobs:
       - name: Prove two fresh offline JS builds (Linux)
         if: runner.os == 'Linux'
         shell: bash
+        env:
+          # Optimize repeated whole-input hashes with test safety checks retained.
+          CARGO_PROFILE_TEST_OPT_LEVEL: '2'
+          CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: 'true'
+          CARGO_PROFILE_TEST_OVERFLOW_CHECKS: 'true'
         run: |
           set -euo pipefail
           TEST_NAME=preparation::tests::full::real_two_fresh_js_builds
