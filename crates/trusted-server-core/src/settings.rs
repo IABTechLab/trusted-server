@@ -3073,14 +3073,9 @@ impl Settings {
     /// - [`TrustedServerError::Configuration`] if the TOML is invalid or missing required fields
     #[cfg(test)]
     pub fn from_toml_and_env(toml_str: &str) -> Result<Self, Report<TrustedServerError>> {
-        // Cargo supplies build metadata to test processes; it is not app config.
-        let settings_environment = std::env::vars()
-            .filter(|(name, _)| !name.eq_ignore_ascii_case("TRUSTED_SERVER__GIT_VERSION"))
-            .collect();
         let environment = Environment::default()
             .prefix(ENVIRONMENT_VARIABLE_PREFIX)
-            .separator(ENVIRONMENT_VARIABLE_SEPARATOR)
-            .source(Some(settings_environment));
+            .separator(ENVIRONMENT_VARIABLE_SEPARATOR);
 
         let toml = File::from_str(toml_str, FileFormat::Toml);
         let config = Config::builder()
@@ -6338,26 +6333,6 @@ source_domain = "partner.example.com"
                 assert_eq!(
                     settings.expect("should load settings").publisher.origin_url,
                     "https://change-publisher.com"
-                );
-            },
-        );
-    }
-
-    #[test]
-    fn legacy_settings_loader_ignores_build_version_metadata() {
-        temp_env::with_var(
-            "TRUSTED_SERVER__GIT_VERSION",
-            Some("example-revision"),
-            || {
-                let settings = Settings::from_toml_and_env(&crate_test_settings_str())
-                    .expect("should keep build metadata outside application settings");
-                assert_eq!(
-                    settings.publisher.domain,
-                    Settings::from_toml(&crate_test_settings_str())
-                        .expect("should parse the control configuration")
-                        .publisher
-                        .domain,
-                    "should preserve configured publisher settings"
                 );
             },
         );
