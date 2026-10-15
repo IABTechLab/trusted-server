@@ -174,7 +174,7 @@ A request is protected when all of the following are true:
 5. The client IP does not match `protection_excluded_ip_cidrs` or any Config Store-backed CIDR source.
 6. The client ASN is not listed in `protection_excluded_asns`.
 7. No `protection_exclusion_rules` match.
-8. The request does not contain a matching enabled `protection_test_bypass` credential while `FASTLY_IS_STAGING=1`.
+8. The request does not contain a matching enabled `protection_test_bypass` credential in a staging environment.
 
 Static assets are excluded by default using a case-insensitive file-extension regex. Trusted Server internal routes such as `/static/tsjs=`, `/integrations/`, `/first-party/`, discovery routes, and signature-verification routes are also excluded by default.
 
@@ -187,7 +187,7 @@ can configure a static header credential that skips only the server-side
 Protection API:
 
 ```toml
-# Runtime activation also requires FASTLY_IS_STAGING=1.
+# Runtime activation also requires a staging environment.
 [bot-protection]
 module = "datadome"
 
@@ -197,7 +197,8 @@ credential_secret_name = "datadome_test_bypass"
 ```
 
 `protection_test_bypass` requires `enable_protection = true`; it is disabled
-when omitted and is runtime-active only when `FASTLY_IS_STAGING=1`.
+when omitted and is runtime-active only in a staging environment, which only the
+Fastly adapter declares, when `FASTLY_IS_STAGING=1`.
 `FASTLY_IS_STAGING` is supplied at runtime by Fastly (`1` in staging and `0` in
 production); it is not compiled into or promoted with the Wasm artifact. Verify
 staging through the `X-TS-ENV: staging` response signal and the integration
