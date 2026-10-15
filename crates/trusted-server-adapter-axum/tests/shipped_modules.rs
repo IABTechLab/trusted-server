@@ -273,9 +273,7 @@ fn the_template_s_entries_name_the_listed_middleware() {
                 .iter()
                 .filter(|entry| entry.media_type == media_type)
                 .collect();
-            if media_type == HTML_MEDIA_TYPE
-                || covering.iter().any(|entry| entry.path.is_none())
-            {
+            if media_type == HTML_MEDIA_TYPE || covering.iter().any(|entry| entry.path.is_none()) {
                 // One entry covers every page, for HTML and for a media
                 // type a page's own responses come in.
                 assert_eq!(
