@@ -476,6 +476,29 @@ pub fn gate_eids_by_consent<T>(
     }
 }
 
+/// Returns whether consent allows EIDs to be written to the identity graph.
+///
+/// Applies the same decision as [`gate_eids_by_consent`] for a present
+/// [`ConsentContext`], without logging: the effective TCF consent (standalone
+/// TC string or GPP EU TCF section) must grant Purpose 1 (storage/access)
+/// **and** Purpose 4 (personalized ads). With no TCF data, EIDs are allowed
+/// only when GDPR does not apply.
+///
+/// A TCF signal means TCF rules apply. In decode mode a TC signal always sets
+/// `gdpr_applies`, so checking the decoded TCF first is equivalent to checking
+/// `gdpr_applies` first. In [`ConsentMode::Proxy`] the TC string is not
+/// decoded, so a request carrying a TC cookie has no effective TCF and GDPR
+/// applies: EID writes are withheld even when Purpose 4 is granted. This
+/// fails closed, matching how [`gate_eids_by_consent`] strips egress EIDs in
+/// proxy mode.
+#[must_use]
+pub(crate) fn allows_eid_persistence(ctx: &ConsentContext) -> bool {
+    match effective_tcf(ctx) {
+        Some(tcf) => allows_eid_transmission(tcf),
+        None => !ctx.gdpr_applies,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // EC consent gating
 // ---------------------------------------------------------------------------
@@ -659,7 +682,7 @@ mod tests {
     use http::Request;
 
     use super::{
-        ConsentPipelineInput, allows_ec_creation, apply_expiration_check,
+        ConsentPipelineInput, allows_ec_creation, allows_eid_persistence, apply_expiration_check,
         apply_tcf_conflict_resolution, build_consent_context, build_context_from_signals,
         consent_allows_server_side_auction, gate_eids_by_consent, has_explicit_ec_withdrawal,
     };
@@ -759,6 +782,94 @@ mod tests {
                 us_sale_opt_out: None,
             }),
             ..ConsentContext::default()
+        }
+    }
+
+    #[test]
+    fn eid_persistence_matches_gate_eids_by_consent() {
+        let gpp_only = |allows_eids: bool| GppConsent {
+            version: 1,
+            section_ids: vec![2],
+            eu_tcf: Some(make_tcf(0, allows_eids)),
+            us_sale_opt_out: None,
+        };
+        let cases = [
+            (
+                "Purpose 1 + 4 granted",
+                ConsentContext {
+                    gdpr_applies: true,
+                    tcf: Some(make_tcf(0, true)),
+                    ..ConsentContext::default()
+                },
+                true,
+            ),
+            (
+                "Purpose 1 only",
+                ConsentContext {
+                    gdpr_applies: true,
+                    tcf: Some(make_tcf(0, false)),
+                    ..ConsentContext::default()
+                },
+                false,
+            ),
+            (
+                "Purpose 4 only",
+                ConsentContext {
+                    gdpr_applies: true,
+                    tcf: Some(
+                        TcfBuilder::new()
+                            .with_storage(false)
+                            .with_personalized_ads(true)
+                            .build(),
+                    ),
+                    ..ConsentContext::default()
+                },
+                false,
+            ),
+            (
+                "GPP EU TCF section grants Purpose 1 + 4",
+                ConsentContext {
+                    gdpr_applies: true,
+                    gpp: Some(gpp_only(true)),
+                    ..ConsentContext::default()
+                },
+                true,
+            ),
+            (
+                "GPP EU TCF section denies Purpose 4",
+                ConsentContext {
+                    gdpr_applies: true,
+                    gpp: Some(gpp_only(false)),
+                    ..ConsentContext::default()
+                },
+                false,
+            ),
+            (
+                "GDPR applies without TCF",
+                ConsentContext {
+                    gdpr_applies: true,
+                    ..ConsentContext::default()
+                },
+                false,
+            ),
+            (
+                "GDPR does not apply without TCF",
+                ConsentContext::default(),
+                true,
+            ),
+        ];
+
+        for (label, ctx, expected) in cases {
+            assert_eq!(
+                allows_eid_persistence(&ctx),
+                expected,
+                "should decide EID persistence for case: {label}"
+            );
+            assert_eq!(
+                gate_eids_by_consent(Some(vec![1_u8]), Some(&ctx)).is_some(),
+                expected,
+                "should match gate_eids_by_consent for case: {label}"
+            );
         }
     }
 

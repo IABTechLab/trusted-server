@@ -27,7 +27,7 @@ const CI_CONFIG_TEMPLATE: &str = "wrangler.ci.toml";
 const GENERATED_CI_CONFIG: &str = "wrangler.integration.generated.toml";
 const TRUSTED_SERVER_CONFIG_PLACEHOLDER: &str = "TRUSTED_SERVER_CONFIG = \"{}\"";
 
-fn write_generated_ci_config(wrangler_dir: &Path) -> TestResult<String> {
+fn write_generated_ci_config(wrangler_dir: &Path, config_json: &str) -> TestResult<String> {
     let template_path = wrangler_dir.join(CI_CONFIG_TEMPLATE);
     let template = std::fs::read_to_string(&template_path)
         .change_context(TestError::RuntimeSpawn)
@@ -35,8 +35,7 @@ fn write_generated_ci_config(wrangler_dir: &Path) -> TestResult<String> {
             "failed to read Cloudflare CI wrangler config at {}",
             template_path.display()
         ))?;
-    let config_json = cloudflare_config_json(origin_port())?;
-    let generated = inject_cloudflare_config(&template, &config_json)?;
+    let generated = inject_cloudflare_config(&template, config_json)?;
     let output_path = wrangler_dir.join(GENERATED_CI_CONFIG);
     std::fs::write(&output_path, generated)
         .change_context(TestError::RuntimeSpawn)
@@ -69,11 +68,37 @@ impl RuntimeEnvironment for CloudflareWorkers {
     fn spawn(&self, _wasm_path: &Path) -> TestResult<RuntimeProcess> {
         let wrangler_dir = self.wrangler_dir();
         let config = if std::env::var("CI").is_ok() {
-            write_generated_ci_config(&wrangler_dir)?
+            write_generated_ci_config(&wrangler_dir, &cloudflare_config_json(origin_port())?)?
         } else {
             "wrangler.toml".to_string()
         };
+        self.spawn_wrangler(&wrangler_dir, &config)
+    }
 
+    fn health_check_path(&self) -> &str {
+        "/.well-known/trusted-server.json"
+    }
+}
+
+impl CloudflareWorkers {
+    /// Start `wrangler dev` with a test-specific `TRUSTED_SERVER_CONFIG` binding.
+    ///
+    /// Unlike [`RuntimeEnvironment::spawn`], this always renders the CI
+    /// wrangler template, so tests can enable features the shared fixture
+    /// leaves off without changing the other runtimes' configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TestError::RuntimeSpawn`] if the wrangler config cannot be
+    /// written or `wrangler dev` cannot be started, and
+    /// [`TestError::RuntimeNotReady`] if the health check times out.
+    pub fn spawn_with_config_json(&self, config_json: &str) -> TestResult<RuntimeProcess> {
+        let wrangler_dir = self.wrangler_dir();
+        let config = write_generated_ci_config(&wrangler_dir, config_json)?;
+        self.spawn_wrangler(&wrangler_dir, &config)
+    }
+
+    fn spawn_wrangler(&self, wrangler_dir: &Path, config: &str) -> TestResult<RuntimeProcess> {
         let port = super::find_available_port().unwrap_or(CLOUDFLARE_DEFAULT_PORT);
 
         #[cfg(unix)]
@@ -83,13 +108,13 @@ impl RuntimeEnvironment for CloudflareWorkers {
                 .args([
                     "dev",
                     "--config",
-                    config.as_str(),
+                    config,
                     "--port",
                     &port.to_string(),
                     "--ip",
                     "127.0.0.1",
                 ])
-                .current_dir(&wrangler_dir)
+                .current_dir(wrangler_dir)
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
                 .process_group(0)
@@ -108,13 +133,13 @@ impl RuntimeEnvironment for CloudflareWorkers {
             .args([
                 "dev",
                 "--config",
-                config.as_str(),
+                config,
                 "--port",
                 &port.to_string(),
                 "--ip",
                 "127.0.0.1",
             ])
-            .current_dir(&wrangler_dir)
+            .current_dir(wrangler_dir)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -149,12 +174,6 @@ impl RuntimeEnvironment for CloudflareWorkers {
         })
     }
 
-    fn health_check_path(&self) -> &str {
-        "/.well-known/trusted-server.json"
-    }
-}
-
-impl CloudflareWorkers {
     /// Resolve the Cloudflare adapter crate root.
     ///
     /// Respects `CLOUDFLARE_WRANGLER_DIR` for CI overrides; falls back to
