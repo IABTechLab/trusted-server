@@ -1456,10 +1456,10 @@ pub struct DeviceConfig {
     ///
     /// Defaults to the built-in `builtin` module when absent, which classifies
     /// from the User-Agent alone, so device classification itself makes no
-    /// host-specific call. The opt-in `fastly` module strengthens the
-    /// browser/bot gate with the host's TLS and HTTP/2 signals, which the Fastly
-    /// entry point reads on every request regardless of this selector. Override
-    /// it with the
+    /// host-specific call. The opt-in `platform` module, which an adapter
+    /// supplies where its platform reports the signals, strengthens the
+    /// browser/bot gate with the host's TLS and HTTP/2 signals. Override it
+    /// with the
     /// `TRUSTED_SERVER__device__module` environment variable so the same
     /// compiled WebAssembly can switch modules at deployment. An unknown key is
     /// rejected at startup by
@@ -1478,7 +1478,7 @@ impl DeviceConfig {
 
     /// Validates the selected device-detection module.
     ///
-    /// `builtin` and `fastly` are resolved by the core and the Fastly adapter.
+    /// `builtin` and `platform` are resolved by core and by the adapter.
     /// Any other key names an integration module that declares a device
     /// module, and the registry rejects a key no module supplies, so this
     /// cannot be a closed list without shutting modules out of device detection
@@ -7440,12 +7440,12 @@ module = \"none\"",
             .validate_module_selection()
             .expect("should validate the built-in default");
 
-        let fastly = DeviceConfig {
-            module: Some("fastly".to_owned()),
+        let platform = DeviceConfig {
+            module: Some("platform".to_owned()),
         };
-        fastly
+        platform
             .validate_module_selection()
-            .expect("should validate the fastly opt-in");
+            .expect("should validate the platform opt-in");
 
         // As with geo, a key core does not know is not a settings error,
         // because a module's name is a legitimate value here too.

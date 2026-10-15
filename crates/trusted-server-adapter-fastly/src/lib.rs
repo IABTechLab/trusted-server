@@ -1222,8 +1222,8 @@ pub(crate) fn extract_cookie_value(req: &HttpRequest, name: &str) -> Option<Stri
 /// resolved, passed in as `registered`, and it is shown the User-Agent and
 /// the cookies, which carry what a page gathers in the browser. Otherwise
 /// [`build_device_module`] gives the built-in module, which reads only the
-/// User-Agent, or the Fastly module, which also reads the TLS/H2 signals
-/// captured into a [`FastlyHostSignals`]. The Fastly module, and so the
+/// User-Agent, or for `platform` the Fastly module, which also reads the
+/// TLS/H2 signals captured into a [`FastlyHostSignals`]. The Fastly module, and so the
 /// signal capture, is built only when selected, so the default request path
 /// makes no Fastly-specific signal call. The module is handed a module
 /// context carrying the request, that evidence, the settings and the

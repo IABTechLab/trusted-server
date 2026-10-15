@@ -63,9 +63,17 @@ A trusted client address header must start with `x-` or end with `-client-ip`, w
 
 **What changes for an operator.** Nothing on Fastly, where `ip_header = "fastly-client-ip"` stays valid. On the Axum, Cloudflare and Spin adapters a client's `fastly-ssl` is no longer removed from the request to the publisher's origin, and on Spin a client's `fastly-ssl` and `fastly-client-ip` are no longer stripped at entry. None of these adapters reads either header.
 
-### 2.4 Later rows
+### 2.4 The platform's own device module is `platform`
 
-The device selector and the conversion names follow in the same series, each with its own section here as it lands.
+`[device] module = "fastly"` selected the module the Fastly adapter builds from its TLS and HTTP/2 signals, so core's device selection and the registry both named Fastly.
+
+**The interface.** `[device] module = "platform"` selects the platform's own module, as `[geo] module = "platform"` selects the platform's geo lookup, and `build_device_module` builds it through the `build_platform` factory the adapter passes.
+
+**What changes for an operator.** A document that wrote `module = "fastly"` now writes `module = "platform"`. The old value is refused at startup as a device module no running module supplies.
+
+### 2.5 Later rows
+
+The conversion names follow in the same series, each with its own section here as it lands.
 
 ## 3. What is not in this change
 
@@ -78,6 +86,7 @@ The device selector and the conversion names follow in the same series, each wit
 - The Fastly store returns a document that fits, and other JSON at the key, as they are, reads a chunked document back whole, and refuses a pointer whose lengths disagree with the document and a chunk whose hash disagrees.
 - The DataDome test bypass applies while the platform declares staging and not otherwise.
 - A declared TLS header sets the scheme and an undeclared one does not, the declared TLS and spoofable headers are stripped with the standard ones, the auction sees the client's declared TLS header where the origin request does not, a declared internal header is refused as a trusted client address header, and a bare `client-ip` is refused where `example-client-ip` is accepted.
+- The `platform` device selector builds the module the adapter's factory supplies, and no selector builds the built-in one.
 
 ## Review log
 

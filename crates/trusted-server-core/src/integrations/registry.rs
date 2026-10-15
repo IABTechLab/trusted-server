@@ -1087,11 +1087,12 @@ const GEO_MODULE_PLATFORM: &str = "platform";
 /// The same choice as leaving the selector unset, spelled explicitly.
 const DEVICE_MODULE_BUILTIN: &str = "builtin";
 
-/// `[device] module` value opting in to the host module the adapter builds.
+/// `[device] module` value opting in to the host platform's own module, which
+/// the adapter builds.
 ///
 /// Resolved by `build_device_module` in [`device`](crate::ec::device) rather
 /// than by a module, so the registry supplies nothing for it.
-const DEVICE_MODULE_FASTLY: &str = "fastly";
+const DEVICE_MODULE_PLATFORM: &str = "platform";
 
 /// The type folder each of these kinds of module is selected in, which a name
 /// written in its section may leave off.
@@ -1317,9 +1318,9 @@ fn resolve_device_module(
     let selector = settings.device.module.as_deref();
     let resolved = match selector {
         // Unset and `builtin` both name the module core supplies itself, and
-        // `fastly` names the host module the adapter builds, so the registry
-        // supplies nothing for any of the three.
-        None | Some(DEVICE_MODULE_BUILTIN) | Some(DEVICE_MODULE_FASTLY) => None,
+        // `platform` names the host platform's own module the adapter builds,
+        // so the registry supplies nothing for any of the three.
+        None | Some(DEVICE_MODULE_BUILTIN) | Some(DEVICE_MODULE_PLATFORM) => None,
         Some(written) => Some(named_module(
             DEVICE_TYPE,
             "device",
