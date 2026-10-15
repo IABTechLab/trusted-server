@@ -6,6 +6,18 @@ mod app_config;
 mod error;
 #[cfg(not(target_arch = "wasm32"))]
 mod prebid_bundle;
+// Consumer-side release attestation verification. Unix-only because the gh
+// runner terminates whole process groups. Dispatch wiring arrives with the
+// `ts release verify` command, so the internals are not yet reachable.
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "release verification is reachable only from tests until `ts release verify` dispatch lands"
+    )
+)]
+mod release;
 #[cfg(not(target_arch = "wasm32"))]
 mod run;
 #[cfg(not(target_arch = "wasm32"))]
