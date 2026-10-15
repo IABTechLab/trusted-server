@@ -45,9 +45,27 @@ Core named Fastly's `FASTLY_IS_STAGING` variable, and the DataDome module read i
 
 **What changes for an operator.** Nothing on Fastly. On the other adapters the DataDome bypass no longer follows a `FASTLY_IS_STAGING` variable.
 
-### 2.3 Later rows
+### 2.3 The platform names the request headers it sets
 
-The request headers, the device selector and the conversion names follow in the same series, each with its own section here as it lands.
+Core read Fastly's `fastly-ssl` header for the scheme and kept it from the origin, stripped `fastly-ssl` and `fastly-client-ip` as headers a client could send, accepted `fastly-client-ip` by name as a trusted client address header, and listed `x-debug-fastly-pop` among the headers never passed to a third party.
+
+**The interface.** An adapter declares three lists before it serves.
+
+- `platform::declare_platform_tls_headers` names a header its platform sets on a request that arrived over TLS. Core reads it for the scheme after the TLS status the adapter reports and the standard forwarding headers, and removes it from every request to an origin.
+- `platform::declare_platform_spoofable_headers` names the platform's other headers a client could also send. `sanitize_forwarded_headers` strips them, and the TLS headers, with the three standard forwarding headers.
+- `platform::declare_platform_internal_headers` names headers never passed to a third party. `constants::is_internal_header` answers for core's fixed list and these together, and the trusted client address settings refuse any of them.
+
+The Fastly adapter makes its declarations in `app::declare_platform()`, which `run()` calls before it serves and every state build also calls, because settings are validated as they load.
+
+A trusted client address header must start with `x-` or end with `-client-ip`, which is the shape a platform's own client address header takes, because `ts config validate` checks the settings where no adapter has declared anything.
+
+**What each adapter declares.** The Fastly adapter declares `fastly-ssl`, `fastly-client-ip` and `x-debug-fastly-pop`, and strips its own two at entry by name. The Axum, Cloudflare and Spin adapters declare nothing.
+
+**What changes for an operator.** Nothing on Fastly, where `ip_header = "fastly-client-ip"` stays valid. On the Axum, Cloudflare and Spin adapters a client's `fastly-ssl` is no longer removed from the request to the publisher's origin, and on Spin a client's `fastly-ssl` and `fastly-client-ip` are no longer stripped at entry. None of these adapters reads either header.
+
+### 2.4 Later rows
+
+The device selector and the conversion names follow in the same series, each with its own section here as it lands.
 
 ## 3. What is not in this change
 
@@ -59,6 +77,7 @@ The request headers, the device selector and the conversion names follow in the 
 
 - The Fastly store returns a document that fits, and other JSON at the key, as they are, reads a chunked document back whole, and refuses a pointer whose lengths disagree with the document and a chunk whose hash disagrees.
 - The DataDome test bypass applies while the platform declares staging and not otherwise.
+- A declared TLS header sets the scheme and an undeclared one does not, the declared TLS and spoofable headers are stripped with the standard ones, the auction sees the client's declared TLS header where the origin request does not, a declared internal header is refused as a trusted client address header, and a bare `client-ip` is refused where `example-client-ip` is accepted.
 
 ## Review log
 

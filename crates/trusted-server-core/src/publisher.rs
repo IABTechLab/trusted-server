@@ -3682,26 +3682,27 @@ fn should_preload_ec_snapshot(input: &EcSnapshotPreloadInput) -> bool {
     eligible && !marker_can_skip
 }
 
+/// Removes every TLS header the platform declared from `req`, being an
+/// internal scheme signal its entry point sets.
+fn remove_platform_tls_headers(req: &mut Request<EdgeBody>) {
+    for name in crate::platform::platform_tls_headers() {
+        req.headers_mut().remove(name);
+    }
+}
+
 /// Rewrites a downstream request into an outbound publisher-origin request.
 ///
 /// Restricts advertised encodings to those the rewrite pipeline can handle,
-/// strips the internal `fastly-ssl` scheme signal so it never leaks to the
-/// backend, and retargets the URI and `Host` header at the origin.
+/// strips the platform's TLS headers so that internal scheme signal never
+/// leaks to the backend, and retargets the URI and `Host` header at the
+/// origin.
 fn rewrite_origin_request(
     req: &mut Request<EdgeBody>,
     target_uri: Uri,
     origin_host_header: &str,
 ) -> Result<(), Report<TrustedServerError>> {
     restrict_accept_encoding(req);
-    // Layering wart: `fastly-ssl` is a vendor-specific header name. Core only
-    // knows it because the Fastly adapter re-injects it from trusted TLS
-    // metadata and `detect_scheme` (see `http_util`) still reads it as a
-    // fallback scheme signal. The neutral signal (`ClientInfo::tls_protocol`)
-    // is already the primary path, so this strip — and the whole `fastly-ssl`
-    // coupling in core — should move behind a platform-neutral header in a
-    // separate change. Until then we strip it here so the edge signal never
-    // reaches publisher backends.
-    req.headers_mut().remove("fastly-ssl");
+    remove_platform_tls_headers(req);
     *req.uri_mut() = target_uri;
     req.headers_mut().insert(
         header::HOST,
@@ -5605,12 +5606,9 @@ pub async fn handle_publisher_request(
     if matches!(assembly_mode, AssemblyMode::Esi) && !reader_supports_assembly {
         log::debug!("template_cache bypass: reader accepts no representation TS can assemble");
     }
-    // Strip the internal `fastly-ssl` scheme signal before forwarding to the
-    // origin. On the EdgeZero path the entry point re-injects this header from
-    // trusted Fastly TLS metadata so in-process scheme detection works; the
-    // legacy path never sets it. Either way it is an internal edge signal that
-    // must not leak to publisher backends.
-    req.headers_mut().remove("fastly-ssl");
+    // The platform's TLS headers are an internal scheme signal its entry point
+    // sets, which must not leak to publisher backends.
+    remove_platform_tls_headers(&mut req);
     // The template cache key is built here, before the request is consumed, because every field
     // is request-derived and this is the last point where the request is in hand.
     //
@@ -9430,7 +9428,7 @@ mod tests {
             .method(Method::GET)
             .uri("https://publisher.example/article?x=1")
             .header(header::HOST, "publisher.example")
-            .header("fastly-ssl", "1")
+            .header("example-platform-tls", "1")
             .header(header::USER_AGENT, "test-browser")
             .body(EdgeBody::from("ignored-body"))
             .expect("should build request");
@@ -9574,12 +9572,16 @@ mod tests {
 
     const SCHEDULING_PROVIDER: &str = "scheduling_capture";
 
+    /// A TLS header the scheduling tests declare for the platform, which the
+    /// auction sees on the client's request and the origin never does.
+    const SCHEDULING_TLS_HEADER: &str = "example-scheduling-tls";
+
     #[derive(Debug)]
     struct CapturedSchedulingAuction {
         request: AuctionRequest,
         client_uri: String,
         client_host: Option<String>,
-        client_fastly_ssl: Option<String>,
+        client_platform_tls: Option<String>,
         client_user_agent: Option<String>,
         http_calls_at_dispatch: usize,
         lookups_at_dispatch: usize,
@@ -9615,7 +9617,7 @@ mod tests {
                     request: request.clone(),
                     client_uri: context.request.uri().to_string(),
                     client_host: header_value(header::HOST.as_str()),
-                    client_fastly_ssl: header_value("fastly-ssl"),
+                    client_platform_tls: header_value(SCHEDULING_TLS_HEADER),
                     client_user_agent: header_value(header::USER_AGENT.as_str()),
                     http_calls_at_dispatch: self.http.recorded_backend_names().len(),
                     lookups_at_dispatch: self.lookups.load(Ordering::SeqCst),
@@ -9698,12 +9700,13 @@ mod tests {
     }
 
     fn navigation_request() -> Request<EdgeBody> {
+        crate::platform::declare_platform_tls_headers(&[SCHEDULING_TLS_HEADER]);
         let mut request = HttpRequest::builder()
             .method(Method::GET)
             .uri("https://publisher.example/article")
             .header(header::HOST, "publisher.example")
             .header("sec-fetch-dest", "document")
-            .header("fastly-ssl", "1")
+            .header(SCHEDULING_TLS_HEADER, "1")
             .header(header::IF_NONE_MATCH, "\"cached-page\"")
             .header(header::RANGE, "bytes=0-18")
             .header(header::USER_AGENT, "scheduling-browser")
@@ -9856,7 +9859,7 @@ mod tests {
                         .map(|(_, value)| value.as_str())
                 };
                 header_value(header::HOST.as_str()) == Some("origin.test-publisher.com")
-                    && header_value("fastly-ssl").is_none()
+                    && header_value(SCHEDULING_TLS_HEADER).is_none()
                     && header_value(header::IF_NONE_MATCH.as_str()).is_none()
                     && header_value(header::RANGE.as_str()).is_none()
             });
@@ -9868,7 +9871,7 @@ mod tests {
         let auction_preserved_client_snapshot = captured_auction.as_ref().is_some_and(|captured| {
             captured.client_uri == "https://publisher.example/article"
                 && captured.client_host.as_deref() == Some("publisher.example")
-                && captured.client_fastly_ssl.as_deref() == Some("1")
+                && captured.client_platform_tls.as_deref() == Some("1")
                 && captured.client_user_agent.as_deref() == Some("scheduling-browser")
                 && captured
                     .request

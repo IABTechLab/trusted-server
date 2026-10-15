@@ -44,6 +44,7 @@ mod http;
 mod image_optimizer;
 mod kv;
 mod loading_cache;
+mod request_headers;
 mod server_key;
 mod staging;
 mod template_assembly;
@@ -78,6 +79,11 @@ pub use kv::UnavailableKvStore;
 pub use loading_cache::{
     CacheLifetimes, CacheSpec, LoadError, LoadFuture, LoadedValue, Loader, LoadingCaches,
     NoLoadingCache, PlatformLoadingCache, StoreKey,
+};
+pub use request_headers::{
+    declare_platform_internal_headers, declare_platform_spoofable_headers,
+    declare_platform_tls_headers, is_platform_internal_header, platform_spoofable_headers,
+    platform_tls_headers,
 };
 pub use server_key::ServerKeyPrefix;
 pub use staging::{declare_platform_staging, platform_is_staging};
