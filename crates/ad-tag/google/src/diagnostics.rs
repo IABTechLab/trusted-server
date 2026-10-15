@@ -669,6 +669,10 @@ mod tests {
 
     #[test]
     fn finalization_sets_cookie_and_strips_shared_cache_headers() {
+        // The header a platform's adapter declares before it serves.
+        trusted_server_core::platform::declare_platform_cache_headers(&[
+            "example-platform-cache-control",
+        ]);
         let mut request = navigation("https://publisher.example/?ts_console=1", None);
         let decision = prepare_request(&settings(), &mut request).expect("should prepare");
         let mut response = Response::builder()
@@ -676,8 +680,8 @@ mod tests {
             .header(header::ETAG, "\"origin\"")
             .header(header::LAST_MODIFIED, "Wed, 12 Aug 2026 00:00:00 GMT")
             .header("surrogate-control", "max-age=60")
-            .header("fastly-surrogate-control", "max-age=60")
-            .header("cloudflare-cdn-cache-control", "public, max-age=60")
+            .header("cdn-cache-control", "public, max-age=60")
+            .header("example-platform-cache-control", "public, max-age=60")
             .body(EdgeBody::empty())
             .expect("should build response");
 
@@ -690,11 +694,11 @@ mod tests {
         );
         assert_eq!(response.headers()[header::SET_COOKIE], SET_CONSOLE_COOKIE);
         assert!(!response.headers().contains_key("surrogate-control"));
-        assert!(!response.headers().contains_key("fastly-surrogate-control"));
+        assert!(!response.headers().contains_key("cdn-cache-control"));
         assert!(
             !response
                 .headers()
-                .contains_key("cloudflare-cdn-cache-control")
+                .contains_key("example-platform-cache-control")
         );
         assert!(
             !response.headers().contains_key(header::ETAG),
