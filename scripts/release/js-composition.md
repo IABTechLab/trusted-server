@@ -266,4 +266,4 @@ Private fixtures belong alongside their registered modules; public process tests
 use `tests/commands.rs`. Full local two-installation/native-probe execution MUST be
 selected explicitly through reviewed test paths and cannot waive hosted gates.
 
-The committed Node collector/composition fixtures are current local interface checks. Task 7's real two-installation orchestration and Task 8's selected native qualification remain pending; utility fixtures do not construct producer completion.
+The committed Node collector/composition fixtures are current local interface checks; utility fixtures do not construct producer completion. Task 7's real two-installation orchestration passed its full Linux execution test in ordinary PR CI; see the [two-build evidence report](qualification/2026-10-15-js-two-builds.md). That candidate run is not release qualification: Task 8's selected hosted/native qualification, authenticated bootstrap and tool pins remain pending.

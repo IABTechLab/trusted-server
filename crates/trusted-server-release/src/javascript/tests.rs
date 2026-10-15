@@ -54,6 +54,35 @@ fn full_suite_report_rejects_zero_selection_or_missing_typecheck_file() {
     );
 }
 #[test]
+fn full_suite_report_rejects_failed_pending_or_unregistered_results() {
+    let expected = BTreeSet::from(["test/example.test.ts".to_owned()]);
+    let passing = json!({"success":true,"numTotalTests":1,"numPassedTests":1,"numFailedTests":0,"numPendingTests":0,"testResults":[{"name":"/example/lib/test/example.test.ts","status":"passed"}]});
+    let encode = |value: &Value| serde_json::to_vec(value).expect("should encode test report");
+    test_report(&encode(&passing), &expected, Path::new("/example/lib"))
+        .expect("should accept the passing control report");
+    let changes: [(&str, Value); 6] = [
+        ("/success", json!(false)),
+        ("/numFailedTests", json!(1)),
+        ("/numPassedTests", json!(0)),
+        ("/numPendingTests", json!(1)),
+        ("/testResults/0/status", json!("failed")),
+        (
+            "/testResults/0/name",
+            json!("/example/lib/test/other.test.ts"),
+        ),
+    ];
+    for (pointer, value) in changes {
+        let mut report = passing.clone();
+        *report
+            .pointer_mut(pointer)
+            .expect("should select an existing report field") = value;
+        assert!(
+            test_report(&encode(&report), &expected, Path::new("/example/lib")).is_err(),
+            "should reject a report with changed {pointer}"
+        );
+    }
+}
+#[test]
 fn parsed_inventory_cannot_choose_an_untracked_module_or_filename() {
     let mut inventory = json!({"modules":[{"id":"core","filename":"tsjs-core.js","size":1,"sha256":"a".repeat(64)}]});
     let expected = vec!["core".to_owned()];

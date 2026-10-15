@@ -71,24 +71,52 @@ fn real_two_fresh_js_builds() {
         stop_timeout_seconds: 5,
         host_limits: host_limits(),
     };
+    let first_roots = prepared
+        .boundary_roots(0)
+        .expect("should select only A roots");
+    let second_roots = prepared
+        .boundary_roots(1)
+        .expect("should select only B roots");
     let first = Boundary::linux_container(
-        prepared
-            .boundary_roots(0)
-            .expect("should select only A roots"),
+        first_roots.clone(),
         settings.clone(),
         image.clone(),
         host.path(),
     )
     .expect("should configure A owned PID/network boundary");
-    let second = Boundary::linux_container(
-        prepared
-            .boundary_roots(1)
-            .expect("should select only B roots"),
-        settings,
-        image,
-        host.path(),
-    )
-    .expect("should configure B disjoint boundary");
+    let second = Boundary::linux_container(second_roots.clone(), settings, image, host.path())
+        .expect("should configure B disjoint boundary");
+    for (own, other) in [(&first_roots, &second_roots), (&second_roots, &first_roots)] {
+        let mut shared = 0;
+        for (_, _, root) in other.entries() {
+            if own.entries().any(|(_, _, own_root)| own_root == root) {
+                shared += 1;
+                assert!(
+                    !own.writable().iter().any(|path| path == root),
+                    "should share only read-only roots between A and B"
+                );
+            } else {
+                assert!(
+                    own.entries()
+                        .all(|(_, _, own_root)| !own_root.starts_with(root)
+                            && !root.starts_with(own_root)),
+                    "should never expose the other side's private source, installation or metadata root"
+                );
+            }
+        }
+        assert_eq!(
+            shared, 2,
+            "should share exactly the read-only originals and selected tool roots"
+        );
+    }
+    assert!(
+        first.matches_roots(&first_roots) && second.matches_roots(&second_roots),
+        "should bind each boundary to exactly its own selected roots"
+    );
+    assert!(
+        !first.matches_roots(&second_roots) && !second.matches_roots(&first_roots),
+        "should refuse either side's commands inside the other side's boundary"
+    );
     let probe = ProbeProgram::from_staged_release_binary(&fixture.join("tools/probe"))
         .expect("should select staged native producer probe");
     let limits = ProcessLimits {
