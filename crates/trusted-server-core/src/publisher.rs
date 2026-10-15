@@ -5227,6 +5227,7 @@ pub async fn handle_publisher_request(
         response.headers_mut(),
         &OriginHeaderRewrite {
             origin_host: &origin_host,
+            origin_host_header: &origin_host_header,
             request_host,
             request_scheme,
             origin_scheme: &origin_scheme,
@@ -16421,16 +16422,49 @@ mod tests {
     async fn cookieless_get_redirect_to_current_url_is_not_rewritten_into_a_loop() {
         // A canonical-host redirect triggered by `origin_host_header_override`
         // answers the retry through Trusted Server the same way, so it must leave.
-        let location = redirect_location_for_current_url(
-            "https://origin.test-publisher.com",
-            Method::GET,
-            "https://origin.test-publisher.com/redirect",
-        )
-        .await;
+        for method in [Method::GET, Method::HEAD] {
+            let location = redirect_location_for_current_url(
+                "https://origin.test-publisher.com",
+                method.clone(),
+                "https://origin.test-publisher.com/redirect",
+            )
+            .await;
+
+            assert_eq!(
+                location, "https://origin.test-publisher.com/redirect",
+                "should not redirect a cookieless {method} back to the URL it requested"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn overridden_host_redirect_with_cookie_is_not_rewritten_into_a_loop() {
+        let mut settings = create_test_settings();
+        settings.publisher.origin_host_header_override = Some("publisher.example".to_string());
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            301,
+            Vec::new(),
+            vec![
+                (
+                    header::LOCATION.as_str(),
+                    "https://origin.test-publisher.com/redirect",
+                ),
+                (header::SET_COOKIE.as_str(), "AWSALB=abc123; Path=/"),
+            ],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+
+        let response = run_publisher_proxy(&settings, &services, publisher_page_request()).await;
 
         assert_eq!(
-            location, "https://origin.test-publisher.com/redirect",
-            "should not redirect a cookieless GET back to the URL it requested"
+            proxy_response_headers(&response)
+                .get(header::LOCATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("https://origin.test-publisher.com/redirect"),
+            "should not send a host-change redirect back to the URL it requested"
         );
     }
 

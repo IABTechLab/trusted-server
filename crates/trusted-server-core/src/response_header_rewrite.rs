@@ -43,6 +43,13 @@ const CSP_NON_SOURCE_DIRECTIVES: &[&str] = &["report-uri", "report-to"];
 pub(crate) struct OriginHeaderRewrite<'a> {
     /// Publisher origin authority (`host` or `host:port`).
     pub origin_host: &'a str,
+    /// `Host` header Trusted Server sends to the origin (`host` or `host:port`).
+    ///
+    /// When it differs from [`Self::origin_host`], a `Location` naming the
+    /// origin host and the current path is a host change from the origin's
+    /// point of view, so the retry through Trusted Server is redirected again
+    /// whatever cookies the response sets.
+    pub origin_host_header: &'a str,
     /// Serving host authority the browser addressed.
     pub request_host: &'a str,
     /// Scheme the browser used to reach the serving host.
@@ -60,8 +67,10 @@ pub(crate) struct OriginHeaderRewrite<'a> {
     /// Whether the request being answered is a `GET` or `HEAD`.
     ///
     /// A same-scheme `Location` to the current URL is left unchanged for these
-    /// methods when the response sets no cookie. The retry through Trusted
-    /// Server would repeat the same request, so the origin would redirect again.
+    /// methods when the response sets no cookie, or whatever cookies it sets
+    /// when [`Self::origin_host_header`] differs from [`Self::origin_host`].
+    /// The retry through Trusted Server would repeat the same request, so the
+    /// origin would redirect again.
     pub request_is_get_or_head: bool,
 }
 
@@ -124,10 +133,18 @@ impl OriginHeaderRewrite<'_> {
     /// `GET` or `HEAD` to the current URL is left unchanged when the response
     /// sets no cookie. Nothing the browser sends on the retry would differ, so
     /// the origin is redirecting because of something Trusted Server sends
-    /// unchanged, such as `publisher.origin_host_header_override`.
+    /// unchanged. When the outbound `Host` differs from the origin host (from
+    /// `publisher.origin_host_header_override`), the redirect is a host change
+    /// that a retry cannot satisfy, so it is left unchanged even if the
+    /// response sets a cookie.
     fn rewrite_location(&self, url: &str, response_sets_cookie: bool) -> Option<String> {
         let rewritten = self.rewrite_navigation_url(url)?;
-        if self.request_is_get_or_head && !response_sets_cookie && self.targets_current_request(url)
+        let host_redirect = !self
+            .origin_host_header
+            .eq_ignore_ascii_case(self.origin_host);
+        if self.request_is_get_or_head
+            && (host_redirect || !response_sets_cookie)
+            && self.targets_current_request(url)
         {
             log::warn!(
                 "Keeping origin redirect to the current request URL; the browser leaves \
@@ -206,6 +223,7 @@ impl OriginHeaderRewrite<'_> {
 /// ```ignore
 /// let rewrite = OriginHeaderRewrite {
 ///     origin_host: "origin.example.com",
+///     origin_host_header: "origin.example.com",
 ///     request_host: "www.example.com",
 ///     request_scheme: "https",
 ///     origin_scheme: "https",
@@ -537,6 +555,7 @@ mod tests {
 
     const REWRITE: OriginHeaderRewrite<'static> = OriginHeaderRewrite {
         origin_host: "origin.example.com",
+        origin_host_header: "origin.example.com",
         request_host: "www.example.com",
         request_scheme: "https",
         origin_scheme: "http",
@@ -617,6 +636,7 @@ mod tests {
     fn origin_with_port_requires_matching_port() {
         let rewrite = OriginHeaderRewrite {
             origin_host: "127.0.0.1:8301",
+            origin_host_header: "127.0.0.1:8301",
             request_host: "127.0.0.1:3031",
             request_scheme: "http",
             origin_scheme: "http",
@@ -755,6 +775,34 @@ mod tests {
             rewrite_refresh("60; url=http://origin.example.com/current?page=1", &rewrite),
             Some("60; url=https://www.example.com/current?page=1".to_string()),
             "should keep a periodic GET reload on the serving host"
+        );
+    }
+
+    #[test]
+    fn location_keeps_cookie_setting_redirect_under_host_override() {
+        let rewrite = OriginHeaderRewrite {
+            origin_host_header: "publisher.example.com",
+            request_is_get_or_head: true,
+            ..REWRITE
+        };
+        let mut headers = HeaderMap::new();
+        headers.append(
+            header::LOCATION,
+            HeaderValue::from_static("http://origin.example.com/current?page=1"),
+        );
+        headers.append(
+            header::SET_COOKIE,
+            HeaderValue::from_static("AWSALB=abc123; Path=/"),
+        );
+
+        rewrite_origin_urls_in_headers(&mut headers, &rewrite);
+
+        assert_eq!(
+            headers.get(header::LOCATION),
+            Some(&HeaderValue::from_static(
+                "http://origin.example.com/current?page=1"
+            )),
+            "should keep a host-change redirect to the current URL despite a cookie"
         );
     }
 

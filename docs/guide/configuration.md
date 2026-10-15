@@ -815,12 +815,13 @@ browser back to the same URL, and the origin would redirect again:
   scheme from `publisher.origin_url` (for example, an `http://` origin forcing
   HTTPS), the `Location` or `Refresh` target is left unchanged.
 - When the origin answers a `GET` or `HEAD` with a `Location` to the URL being
-  requested and sets no cookie, the target is left unchanged. The origin is
-  redirecting because of something Trusted Server sends unchanged on every
-  retry, such as the `Host` from `publisher.origin_host_header_override`.
+  requested, the target is left unchanged if the response sets no cookie, or
+  whatever cookies it sets when `publisher.origin_host_header_override` sends a
+  different `Host`. The origin is redirecting because of something Trusted
+  Server sends unchanged on every retry, such as that `Host`.
 
 Other same-scheme redirects to the current URL, such as after a form POST or
-one that sets a cookie, are rewritten as usual, as is a `Refresh` reload.
+one that sets a cookie without a `Host` override, are rewritten as usual, as is a `Refresh` reload.
 
 `Set-Cookie` headers are not rewritten. If the origin sets a cookie with a
 `Domain` attribute that does not cover the serving host (for example,
