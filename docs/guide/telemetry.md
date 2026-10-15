@@ -5,7 +5,9 @@ Trusted Server can emit bounded auction observations to an analytics module.
 rows to the sink that module supplies. Without the section nothing is sent,
 through core's no-op sink. The one module a stock build ships is Tinybird,
 `crates/analytics/tinybird`, which each adapter lists among the modules it
-links.
+links. Only the Fastly adapter hands that sink to the auction. The Axum,
+Cloudflare and Spin adapters link the module and check its settings, and use
+core's no-op sink, so they send nothing.
 
 ## Data path
 

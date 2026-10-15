@@ -28,10 +28,9 @@ Each stub defines nothing where a page already has its interface. Nothing
 else of the page is changed, and the module serves no browser module of its
 own, because the two stubs and the Choice script are the whole client side.
 
-The prompt writes the reader's answer to the `euconsent-v2` cookie, which
-core reads on the next request. The TCF permission signal module reads the
-record core decodes from it, so the answer reaches the permission model the
-way every signal does.
+The prompt writes the reader's answer to the `euconsent-v2` cookie, which the
+TCF permission signal module reads and decodes on the next request, so the
+answer reaches the permission model the way every signal does.
 
 ## Configuration
 
