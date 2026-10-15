@@ -16,6 +16,11 @@ mod policy;
 mod preflight;
 #[allow(dead_code, reason = "production JS tool qualification remains closed")]
 mod preparation;
+#[allow(
+    dead_code,
+    reason = "Task 9 slice 1 recipe layer has no production caller yet"
+)]
+mod recipe;
 // `expect` would be unfulfilled in the test build, where the tests use it.
 #[allow(dead_code, reason = "consumed by Task 7 boundary and preparation")]
 mod process;

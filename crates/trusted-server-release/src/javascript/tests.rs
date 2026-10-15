@@ -97,38 +97,7 @@ fn parsed_inventory_cannot_choose_an_untracked_module_or_filename() {
 }
 
 fn retained_fixture() -> JsBuildCompleted {
-    let directory = tempfile::tempdir().expect("should create retained fixture");
-    fs::create_dir(directory.path().join("bundles")).expect("should create bundle root");
-    let inventory = b"fictional original inventory";
-    let observation = b"fictional private observation";
-    let module = b"fictional module";
-    fs::write(directory.path().join("tsjs-inventory.json"), inventory)
-        .expect("should write exact fixture inventory");
-    fs::write(directory.path().join("npm-observation.json"), observation)
-        .expect("should write exact fixture observation");
-    fs::write(directory.path().join("bundles/tsjs-core.js"), module)
-        .expect("should write fixture module");
-    JsBuildCompleted {
-        directory,
-        source_commit: "a".repeat(40),
-        tools_sha256: "b".repeat(64),
-        settings_sha256: "c".repeat(64),
-        inventory_sha256: hex::encode(Sha256::digest(inventory)),
-        observation_sha256: hex::encode(Sha256::digest(observation)),
-        modules: BTreeMap::from([(
-            "core".to_owned(),
-            Module {
-                filename: "tsjs-core.js".to_owned(),
-                size: module.len() as u64,
-                sha256: hex::encode(Sha256::digest(module)),
-            },
-        )]),
-        tests: [1, 1],
-        attempt: JsAttempt::new(
-            std::time::Instant::now() + std::time::Duration::from_secs(30),
-            crate::process::Cancellation::default(),
-        ),
-    }
+    JsBuildCompleted::fixture_for_tests(&"a".repeat(40))
 }
 
 #[test]

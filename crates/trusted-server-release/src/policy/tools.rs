@@ -14,6 +14,7 @@ use super::{
 };
 use crate::documents::lower_hex;
 use crate::error::ReleaseError;
+use crate::recipe::AmbientProfile;
 
 const RUST_VERSION: &str = "1.95.0";
 const NODE_VERSION: &str = "24.12.0";
@@ -414,27 +415,10 @@ struct FixedRecipe {
 
 /// Complete effective settings shared by every executable recipe.
 fn artifact_settings() -> Value {
-    let ambient = |checkout, user, jobs, locale, timezone, umask| {
-        json!({
-            "checkout_root": checkout,
-            "execution_user": user,
-            "jobs": jobs,
-            "locale": locale,
-            "timezone": timezone,
-            "umask": umask,
-        })
-    };
     json!({
         "ambient_profiles": {
-            "A": ambient("external-release-A", "qualification-selected", 4, "C", "UTC", "022"),
-            "B": ambient(
-                "external-release-B",
-                "qualified-alternate-or-unsupported",
-                2,
-                "qualification-selected-alternate",
-                "qualification-selected-alternate",
-                "027",
-            ),
+            "A": AmbientProfile::A.to_json(),
+            "B": AmbientProfile::B_PENDING.to_json(),
         },
         "aws_lc_target_selector": true,
         "aws_lc_use_system": false,

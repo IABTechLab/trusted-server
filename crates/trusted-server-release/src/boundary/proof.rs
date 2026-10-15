@@ -44,6 +44,15 @@ impl DenialProof {
         &self.fingerprint == fingerprint
     }
 
+    /// Builds a proof for unit tests that never run a confined command.
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Self {
+        Self {
+            fingerprint: [0; 32],
+            denied_errno: 1,
+        }
+    }
+
     /// Returns the real errno the confined probe observed.
     #[must_use]
     pub(crate) fn denied_errno(&self) -> i32 {

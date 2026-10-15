@@ -181,6 +181,47 @@ impl JsBuildCompleted {
     }
 }
 
+#[cfg(test)]
+impl JsBuildCompleted {
+    /// Builds a retained fixture bound to `source_commit` without executing a build.
+    ///
+    /// Only tests construct this; production completion stays on the real path.
+    pub(crate) fn fixture_for_tests(source_commit: &str) -> Self {
+        let directory = tempfile::tempdir().expect("should create retained fixture");
+        fs::create_dir(directory.path().join("bundles")).expect("should create bundle root");
+        let inventory = b"fictional original inventory";
+        let observation = b"fictional private observation";
+        let module = b"fictional module";
+        fs::write(directory.path().join("tsjs-inventory.json"), inventory)
+            .expect("should write exact fixture inventory");
+        fs::write(directory.path().join("npm-observation.json"), observation)
+            .expect("should write exact fixture observation");
+        fs::write(directory.path().join("bundles/tsjs-core.js"), module)
+            .expect("should write fixture module");
+        JsBuildCompleted {
+            directory,
+            source_commit: source_commit.to_owned(),
+            tools_sha256: "b".repeat(64),
+            settings_sha256: "c".repeat(64),
+            inventory_sha256: hex::encode(Sha256::digest(inventory)),
+            observation_sha256: hex::encode(Sha256::digest(observation)),
+            modules: BTreeMap::from([(
+                "core".to_owned(),
+                Module {
+                    filename: "tsjs-core.js".to_owned(),
+                    size: module.len() as u64,
+                    sha256: hex::encode(Sha256::digest(module)),
+                },
+            )]),
+            tests: [1, 1],
+            attempt: JsAttempt::new(
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+                crate::process::Cancellation::default(),
+            ),
+        }
+    }
+}
+
 fn filenames(root: &Path, limit: usize) -> Result<BTreeSet<String>, Report<ReleaseError>> {
     if !fs::symlink_metadata(root)
         .map_err(preparation_error)?

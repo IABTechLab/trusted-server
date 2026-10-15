@@ -137,3 +137,21 @@ pub(crate) fn child_environment(
 ) -> Result<ChildEnvironment, Report<ReleaseError>> {
     build_child(audited, source.commit(), source.epoch(), request)
 }
+
+/// Builds a child environment from explicit facts, for recipe tests only.
+///
+/// Production code must go through [`child_environment`], which takes the
+/// commit and epoch from an [`ApprovedSource`].
+///
+/// # Errors
+///
+/// As [`child_environment`].
+#[cfg(test)]
+pub(crate) fn build_child_for_tests(
+    audited: &AuditedEnvironment,
+    commit: &CommitId,
+    epoch: u64,
+    request: &ChildRequest,
+) -> Result<ChildEnvironment, Report<ReleaseError>> {
+    build_child(audited, commit, epoch, request)
+}

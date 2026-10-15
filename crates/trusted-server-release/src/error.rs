@@ -28,6 +28,8 @@ pub(crate) enum ReleaseError {
     Process,
     #[display("Release network-denial boundary rejected the execution")]
     Boundary,
+    #[display("Release recipe inputs or execution plan are rejected")]
+    Recipe,
 }
 
 impl core::error::Error for ReleaseError {}
