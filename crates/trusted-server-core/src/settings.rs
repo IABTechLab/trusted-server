@@ -19,7 +19,7 @@ use validator::{Validate, ValidationError, ValidationErrors, ValidationErrorsKin
 use crate::auction_config_types::AuctionConfig;
 use crate::cache_policy::{CachePolicy, CacheVisibility};
 use crate::consent_config::ConsentConfig;
-use crate::constants::INTERNAL_HEADERS;
+use crate::constants::is_internal_header;
 use crate::creative_opportunities::CreativeOpportunitiesConfig;
 use crate::ec::module::{
     EcModuleSelection, HMAC_MODULE_KEY, HOST_SIGNALS_MODULE_KEY, check_named_module_configuration,
@@ -1456,10 +1456,10 @@ pub struct DeviceConfig {
     ///
     /// Defaults to the built-in `builtin` module when absent, which classifies
     /// from the User-Agent alone, so device classification itself makes no
-    /// host-specific call. The opt-in `fastly` module strengthens the
-    /// browser/bot gate with the host's TLS and HTTP/2 signals, which the Fastly
-    /// entry point reads on every request regardless of this selector. Override
-    /// it with the
+    /// host-specific call. The opt-in `platform` module, which an adapter
+    /// supplies where its platform reports the signals, strengthens the
+    /// browser/bot gate with the host's TLS and HTTP/2 signals. Override it
+    /// with the
     /// `TRUSTED_SERVER__device__module` environment variable so the same
     /// compiled WebAssembly can switch modules at deployment. An unknown key is
     /// rejected at startup by
@@ -1478,7 +1478,7 @@ impl DeviceConfig {
 
     /// Validates the selected device-detection module.
     ///
-    /// `builtin` and `fastly` are resolved by the core and the Fastly adapter.
+    /// `builtin` and `platform` are resolved by core and by the adapter.
     /// Any other key names an integration module that declares a device
     /// module, and the registry rejects a key no module supplies, so this
     /// cannot be a closed list without shutting modules out of device detection
@@ -3941,7 +3941,7 @@ impl TrustedClientIpConfig {
     /// use trusted_server_core::settings::TrustedClientIpConfig;
     ///
     /// let config = TrustedClientIpConfig {
-    ///     ip_header: "fastly-client-ip".to_owned(),
+    ///     ip_header: "x-ts-client-ip".to_owned(),
     ///     auth_header: "x-trusted-client-auth".to_owned(),
     ///     shared_secret: Redacted::new("fictional-shared-secret-0123456789".to_owned()),
     /// };
@@ -3969,12 +3969,14 @@ fn validate_trusted_client_ip(config: &TrustedClientIpConfig) -> Result<(), Vali
     }
 
     for header in [&ip_header, &auth_header] {
-        if INTERNAL_HEADERS.contains(&header.as_str()) {
+        if is_internal_header(header.as_str()) {
             return Err(ValidationError::new("reserved_trusted_client_ip_header"));
         }
     }
 
-    if ip_header.as_str() != "fastly-client-ip" && !ip_header.as_str().starts_with("x-") {
+    // A dedicated `x-` header, or a platform's own client address header,
+    // which by convention ends `-client-ip`.
+    if !ip_header.as_str().starts_with("x-") && !ip_header.as_str().ends_with("-client-ip") {
         return Err(ValidationError::new("unsafe_trusted_client_ip_header"));
     }
     if !auth_header.as_str().starts_with("x-") {
@@ -5521,7 +5523,7 @@ module = \"none\"",
     #[test]
     fn trusted_client_ip_parses_and_redacts_shared_secret_in_debug_output() {
         let settings = Settings::from_toml(&trusted_client_ip_toml(
-            "fastly-client-ip",
+            "example-client-ip",
             "x-trusted-client-auth",
             "fictional-shared-secret-0123456789",
         ))
@@ -5530,7 +5532,7 @@ module = \"none\"",
             .trusted_client_ip
             .expect("should retain trusted client IP configuration");
 
-        assert_eq!(config.ip_header, "fastly-client-ip");
+        assert_eq!(config.ip_header, "example-client-ip");
         assert_eq!(config.auth_header, "x-trusted-client-auth");
         let debug = format!("{config:?}");
         assert!(
@@ -5590,7 +5592,7 @@ module = \"none\"",
         }];
 
         settings.trusted_client_ip = Some(TrustedClientIpConfig {
-            ip_header: "fastly-client-ip".to_string(),
+            ip_header: "example-client-ip".to_string(),
             auth_header: "x-trusted-client-auth".to_string(),
             shared_secret: Redacted::new(CANARY_TRUSTED_CLIENT_IP_SHARED_SECRET.to_string()),
         });
@@ -5683,7 +5685,7 @@ module = \"none\"",
     #[test]
     fn trusted_client_ip_authentication_requires_an_exact_match() {
         let settings = Settings::from_toml(&trusted_client_ip_toml(
-            "fastly-client-ip",
+            "example-client-ip",
             "x-trusted-client-auth",
             "fictional-shared-secret-0123456789",
         ))
@@ -5739,7 +5741,12 @@ module = \"none\"",
                 "unsafe_trusted_client_ip_header",
             ),
             (
-                "fastly-client-ip",
+                "client-ip",
+                "x-trusted-client-auth",
+                "unsafe_trusted_client_ip_header",
+            ),
+            (
+                "example-client-ip",
                 "authorization",
                 "unsafe_trusted_client_ip_auth_header",
             ),
@@ -5764,15 +5771,32 @@ module = \"none\"",
     }
 
     #[test]
+    fn trusted_client_ip_rejects_an_internal_header_the_platform_declared() {
+        crate::platform::declare_platform_internal_headers(&["x-example-platform-debug"]);
+
+        let error = Settings::from_toml(&trusted_client_ip_toml(
+            "example-client-ip",
+            "x-example-platform-debug",
+            "fictional-shared-secret-0123456789",
+        ))
+        .expect_err("should reject an internal header the platform declared");
+
+        assert!(
+            format!("{error:?}").contains("reserved_trusted_client_ip_header"),
+            "should identify the platform's internal header as reserved"
+        );
+    }
+
+    #[test]
     fn trusted_client_ip_rejects_reserved_internal_headers() {
         for (ip_header, auth_header) in [
             ("x-ts-tls-protocol", "x-trusted-client-auth"),
             ("x-ts-tls-cipher", "x-trusted-client-auth"),
-            ("fastly-client-ip", "x-ts-tls-protocol"),
-            ("fastly-client-ip", "x-ts-tls-cipher"),
+            ("example-client-ip", "x-ts-tls-protocol"),
+            ("example-client-ip", "x-ts-tls-cipher"),
             ("x-forwarded-for", "x-trusted-client-auth"),
             ("x-geo-info-available", "x-trusted-client-auth"),
-            ("fastly-client-ip", "x-ts-ec"),
+            ("example-client-ip", "x-ts-ec"),
         ] {
             let error = Settings::from_toml(&trusted_client_ip_toml(
                 ip_header,
@@ -5791,7 +5815,7 @@ module = \"none\"",
     #[test]
     fn trusted_client_ip_rejects_empty_secret_malformed_names_and_incomplete_sections() {
         let empty_secret = Settings::from_toml(&trusted_client_ip_toml(
-            "fastly-client-ip",
+            "example-client-ip",
             "x-trusted-client-auth",
             "",
         ));
@@ -5807,7 +5831,7 @@ module = \"none\"",
                 "invalid_trusted_client_ip_header",
             ),
             (
-                "fastly-client-ip",
+                "example-client-ip",
                 "invalid header",
                 "invalid_trusted_client_ip_auth_header",
             ),
@@ -5826,9 +5850,9 @@ module = \"none\"",
 
         for section in [
             "[trusted_client_ip]\nauth_header = \"x-trusted-client-auth\"\nshared_secret = \"fictional-shared-secret-0123456789\"",
-            "[trusted_client_ip]\nip_header = \"fastly-client-ip\"\nshared_secret = \"fictional-shared-secret-0123456789\"",
-            "[trusted_client_ip]\nip_header = \"fastly-client-ip\"\nauth_header = \"x-trusted-client-auth\"",
-            "[trusted_client_ip]\nip_header = \"fastly-client-ip\"\nauth_header = \"x-trusted-client-auth\"\nshared_secret = \"fictional-shared-secret-0123456789\"\nunknown_field = true",
+            "[trusted_client_ip]\nip_header = \"example-client-ip\"\nshared_secret = \"fictional-shared-secret-0123456789\"",
+            "[trusted_client_ip]\nip_header = \"example-client-ip\"\nauth_header = \"x-trusted-client-auth\"",
+            "[trusted_client_ip]\nip_header = \"example-client-ip\"\nauth_header = \"x-trusted-client-auth\"\nshared_secret = \"fictional-shared-secret-0123456789\"\nunknown_field = true",
         ] {
             let result =
                 Settings::from_toml(&format!("{}\n{section}\n", crate_test_settings_str()));
@@ -5847,7 +5871,7 @@ module = \"none\"",
         )
         .expect("should serialize base settings for JSON validation");
         settings["trusted_client_ip"] = json!({
-            "ip_header": "fastly-client-ip",
+            "ip_header": "example-client-ip",
             "auth_header": "x-trusted\u{0000}client-auth",
             "shared_secret": "fictional-control-byte-secret-0123",
         });
@@ -5870,7 +5894,7 @@ module = \"none\"",
     fn trusted_client_ip_rejects_a_31_byte_shared_secret_without_exposing_it() {
         let shared_secret = "1234567890123456789012345678901";
         let error = Settings::from_toml(&trusted_client_ip_toml(
-            "fastly-client-ip",
+            "example-client-ip",
             "x-trusted-client-auth",
             shared_secret,
         ))
@@ -5891,7 +5915,7 @@ module = \"none\"",
     fn trusted_client_ip_accepts_an_exactly_32_byte_ascii_graphic_shared_secret() {
         let shared_secret = "0123456789abcdef0123456789ABCDEF";
         let settings = Settings::from_toml(&trusted_client_ip_toml(
-            "fastly-client-ip",
+            "example-client-ip",
             "x-trusted-client-auth",
             shared_secret,
         ))
@@ -5911,7 +5935,7 @@ module = \"none\"",
     fn trusted_client_ip_rejects_a_non_ascii_shared_secret_without_exposing_it() {
         let shared_secret = "ascii-graphic-secret-0123456789é";
         let error = Settings::from_toml(&trusted_client_ip_toml(
-            "fastly-client-ip",
+            "example-client-ip",
             "x-trusted-client-auth",
             shared_secret,
         ))
@@ -5932,7 +5956,7 @@ module = \"none\"",
     fn trusted_client_ip_rejects_a_shared_secret_with_an_embedded_space_without_exposing_it() {
         let shared_secret = "valid-shared-secret-with space-012345";
         let error = Settings::from_toml(&trusted_client_ip_toml(
-            "fastly-client-ip",
+            "example-client-ip",
             "x-trusted-client-auth",
             shared_secret,
         ))
@@ -5958,7 +5982,7 @@ module = \"none\"",
         )
         .expect("should serialize base settings for JSON validation");
         settings["trusted_client_ip"] = json!({
-            "ip_header": "fastly-client-ip",
+            "ip_header": "example-client-ip",
             "auth_header": "x-trusted-client-auth",
             "shared_secret": shared_secret,
         });
@@ -5986,7 +6010,7 @@ module = \"none\"",
         )
         .expect("should serialize base settings for JSON validation");
         settings["trusted_client_ip"] = json!({
-            "ip_header": "fastly-client-ip",
+            "ip_header": "example-client-ip",
             "auth_header": "x-trusted-client-auth",
             "shared_secret": shared_secret,
         });
@@ -6014,7 +6038,7 @@ module = \"none\"",
         )
         .expect("should serialize base settings for JSON validation");
         settings["trusted_client_ip"] = json!({
-            "ip_header": "fastly-client-ip",
+            "ip_header": "example-client-ip",
             "auth_header": "x-trusted-client-auth",
             "shared_secret": shared_secret,
         });
@@ -6046,7 +6070,7 @@ module = \"none\"",
             );
 
             let settings = Settings::from_toml(&trusted_client_ip_toml(
-                "fastly-client-ip",
+                "example-client-ip",
                 "x-trusted-client-auth",
                 placeholder,
             ))
@@ -7416,12 +7440,12 @@ module = \"none\"",
             .validate_module_selection()
             .expect("should validate the built-in default");
 
-        let fastly = DeviceConfig {
-            module: Some("fastly".to_owned()),
+        let platform = DeviceConfig {
+            module: Some("platform".to_owned()),
         };
-        fastly
+        platform
             .validate_module_selection()
-            .expect("should validate the fastly opt-in");
+            .expect("should validate the platform opt-in");
 
         // As with geo, a key core does not know is not a settings error,
         // because a module's name is a legitimate value here too.

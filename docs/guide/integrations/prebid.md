@@ -1050,7 +1050,7 @@ The browser integration lives in
 while provider execution uses
 [crates/trusted-server-core/src/auction/provider.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/auction/provider.rs)
 and shared request construction uses
-[crates/trusted-server-core/src/auction/openrtb.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/auction/openrtb.rs).
+[crates/auction-protocol/openrtb/src/request.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/auction-protocol/openrtb/src/request.rs).
 `PrebidAuctionProvider` remains test-only legacy parity code.
 
 ### OpenRTB request construction

@@ -13,9 +13,7 @@ use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderValue, Response, StatusCode};
 use edgezero_core::middleware::{Middleware, Next};
 use edgezero_core::response::IntoResponse;
-use trusted_server_core::constants::{
-    ENV_FASTLY_IS_STAGING, HEADER_X_GEO_INFO_AVAILABLE, HEADER_X_TS_ENV,
-};
+use trusted_server_core::constants::{HEADER_X_GEO_INFO_AVAILABLE, HEADER_X_TS_ENV};
 use trusted_server_core::geo::GeoInfo;
 use trusted_server_core::http_util::{ROUTE_NAMESPACE, strip_deployment_headers};
 use trusted_server_core::integrations::IntegrationRegistry;
@@ -226,7 +224,7 @@ pub(crate) fn apply_finalize_headers(
         );
     }
 
-    if std::env::var(ENV_FASTLY_IS_STAGING).as_deref() == Ok("1") {
+    if crate::app::fastly_is_staging() {
         response
             .headers_mut()
             .insert(HEADER_X_TS_ENV, HeaderValue::from_static("staging"));

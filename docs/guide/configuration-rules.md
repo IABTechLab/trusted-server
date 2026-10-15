@@ -50,7 +50,7 @@ setting = "value"
 | `source`            | one               | `module`, a string | `origin`, an HTTP origin, or a module that supplies a source                                            |
 | `ec`                | one               | `module`, a string | `hmac`, `host_signals`, `client_fixed` (demonstration builds), or an integration that supplies identity |
 | `geo`               | one               | `module`, a string | `platform`, `none`, or an integration that supplies location                                            |
-| `device`            | one               | `module`, a string | `builtin` (the default), `fastly`, or an integration that supplies device signals                       |
+| `device`            | one               | `module`, a string | `builtin` (the default), `platform`, or an integration that supplies device signals                     |
 | `permission-signal` | several, in order | `modules`, a list  | `gpc`, `gpp`, `us-privacy`, `tcf`                                                                       |
 | `demand`            | several           | `modules`, a list  | `auction-protocol.openrtb`, `auction.prebid-server`, `auction.aps`                                      |
 | `ad-server`         | one               | `module`, a string | `iabtl`                                                                                                 |
