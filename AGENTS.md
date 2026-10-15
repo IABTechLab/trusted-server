@@ -364,9 +364,13 @@ Every PR must pass:
 8. Markdown format outside `docs/` (requires `cd docs && npm ci` first): `docs/node_modules/.bin/prettier --config docs/.prettierrc --check "*.md" ".claude/**/*.md" ".github/**/*.md" "crates/**/*.md" "scripts/**/*.md" "tinybird/**/*.md"`; fix with `--write` in place of `--check`
 9. Native core build-digest test and lint (`cargo test -p trusted-server-core --test template_build_digest` and `cargo clippy -p trusted-server-core --test template_build_digest -- -D warnings`)
 10. Wasm clock lint: `scripts/lint-wasm-clock.sh` (crates built into the Cloudflare Worker must use `web_time`, not the `std::time::{Instant,SystemTime}` `now`/`elapsed` methods, which panic there)
-11. Native Rust HTML EOF harness configuration, timing and cleanup: `cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --features html-eof-runtime --test html_eof_runtime` and `cargo clippy --manifest-path crates/trusted-server-integration-tests/Cargo.toml --features html-eof-runtime --test html_eof_runtime -- -D warnings`
-12. Actual Axum EOF/auction controls: `./scripts/async-html-finalization-local-test.sh axum --auction`
-13. Actual Fastly EOF/auction controls with isolated Viceroy 0.19+: `PATH="/tmp/example-eof-viceroy/bin:$PATH" ./scripts/async-html-finalization-local-test.sh fastly --release --auction`; install with `cargo install viceroy --version 0.19.0 --locked --root /tmp/example-eof-viceroy`. Ordinary tests retain pinned Viceroy 0.17. See `scripts/README.md` for retained diagnostics and other runtimes.
+
+CI also runs these HTML EOF checks. Run them locally only when changing EOF
+finalization, publisher or HTML-processor code:
+
+- Native Rust HTML EOF harness configuration, timing and cleanup: `cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --features html-eof-runtime --test html_eof_runtime` and `cargo clippy --manifest-path crates/trusted-server-integration-tests/Cargo.toml --features html-eof-runtime --test html_eof_runtime -- -D warnings`
+- Actual Axum EOF/auction controls: `./scripts/async-html-finalization-local-test.sh axum --auction`
+- Actual Fastly EOF/auction controls with isolated Viceroy 0.19+: `PATH="/tmp/example-eof-viceroy/bin:$PATH" ./scripts/async-html-finalization-local-test.sh fastly --release --auction`; install with `cargo install viceroy --version 0.19.0 --locked --root /tmp/example-eof-viceroy`. Ordinary tests retain pinned Viceroy 0.17. See `scripts/README.md` for retained diagnostics and other runtimes.
 
 ---
 
