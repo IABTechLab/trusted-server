@@ -250,7 +250,7 @@ fn mount_argument(mount: &Mount) -> OsString {
     value.push(",target=");
     value.push(&mount.target);
     if mount.read_only {
-        value.push(",readonly,bind-recursive=readonly");
+        value.push(",readonly,bind-propagation=rprivate,bind-recursive=readonly");
     }
     value
 }

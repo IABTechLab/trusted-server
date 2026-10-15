@@ -171,9 +171,9 @@ fn expected_run_arguments(root: &str, image: &str) -> Vec<String> {
     .iter()
     .map(|part| (*part).to_owned())
     .chain([
-        format!("type=bind,source={root}/immutable,target=/boundary/immutable/0,readonly,bind-recursive=readonly"),
+        format!("type=bind,source={root}/immutable,target=/boundary/immutable/0,readonly,bind-propagation=rprivate,bind-recursive=readonly"),
         String::from("--mount"),
-        format!("type=bind,source={root}/tool,target=/boundary/tool/0,readonly,bind-recursive=readonly"),
+        format!("type=bind,source={root}/tool,target=/boundary/tool/0,readonly,bind-propagation=rprivate,bind-recursive=readonly"),
         String::from("--mount"),
         format!("type=bind,source={root}/writable,target=/boundary/writable/0"),
     ])
