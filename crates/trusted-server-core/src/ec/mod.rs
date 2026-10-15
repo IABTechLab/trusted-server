@@ -2571,6 +2571,47 @@ pub(crate) mod tests {
         );
     }
 
+    /// A withdrawal on a request addressed by path expires the Edge Cookie
+    /// and its resolved marker under the removed prefix and under `/`, so a
+    /// copy the browser holds under `/` does not survive it. With no removed
+    /// prefix each is expired once, under `/`.
+    #[tokio::test]
+    async fn a_withdrawal_under_a_removed_prefix_also_expires_the_root_cookies() {
+        let mut settings = create_test_settings();
+        settings.ec.module = None;
+        settings.ec.module_blocks.clear();
+        let cookie = format!("ts-ec={}", valid_ec_id("a", "abcXYZ"));
+        let graph = KvIdentityGraph::in_memory("test-ec-store");
+
+        for (req, expected) in [
+            (
+                addressed_test_request(&[("cookie", &cookie)]),
+                vec![
+                    ("ts-ec", "/publisher-a.example"),
+                    ("ts-ecr", "/publisher-a.example"),
+                    ("ts-ec", "/"),
+                    ("ts-ecr", "/"),
+                ],
+            ),
+            (
+                create_test_request(&[("cookie", &cookie)]),
+                vec![("ts-ec", "/"), ("ts-ecr", "/")],
+            ),
+        ] {
+            let mut ec = EcContext::read_from_request(&settings, &req, &noop_services())
+                .expect("should read EC context")
+                .with_storage_withdrawn_for_test(true);
+
+            let cookies = finalized_set_cookies(&settings, &mut ec, &graph).await;
+
+            assert!(
+                cookies.iter().all(|cookie| cookie.contains("Max-Age=0")),
+                "a withdrawal should only expire cookies, got: {cookies:?}"
+            );
+            assert_eq!(names_and_paths(&cookies), expected);
+        }
+    }
+
     /// A cookie a module may set for itself, used to check which module
     /// responses keep their headers.
     const MODULE_EVIDENCE_COOKIE: &str = "acme-evidence=abc123; Path=/; Secure";

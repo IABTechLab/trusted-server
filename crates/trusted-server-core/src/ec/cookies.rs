@@ -7,7 +7,8 @@
 //! - `Domain` is computed as `.{publisher.domain}` for subdomain coverage
 //! - `Path` is the prefix's cookie path, `/` unless request addressing
 //!   removed a prefix, so publishers served from one host by path keep
-//!   their cookies apart
+//!   these cookies apart. An expiry under a removed prefix also expires
+//!   the cookies of the same names under `/`
 //! - `Secure` restricts to HTTPS
 //! - `SameSite=Lax` provides CSRF protection while allowing top-level navigations
 //! - `Max-Age` of 1 year (or 0 to expire)
@@ -118,11 +119,27 @@ pub fn set_ec_cookie(
     }
 }
 
-/// Expires the EC cookie by setting `Max-Age=0`.
+/// Expires the EC cookie and its resolved marker by setting `Max-Age=0`.
 ///
-/// Used when a user revokes consent — the browser will delete the cookie
-/// on receipt of this header.
+/// Used when a user withdraws consent, and the browser deletes the cookies
+/// on receipt of these headers. Where `public` writes under a removed
+/// prefix, the cookies of the same names under `/` are expired too, so a
+/// withdrawal also reaches the copy the browser sends on every path of the
+/// host. That copy is shared by every publisher on the host whose cookies
+/// take the same names.
 pub fn expire_ec_cookie(
+    settings: &Settings,
+    public: &PublicPrefix,
+    response: &mut Response<EdgeBody>,
+) {
+    expire_ec_cookie_under_path(settings, public, response);
+    if public.cookie_path() != "/" {
+        expire_ec_cookie_under_path(settings, &public.clone().under_path(None), response);
+    }
+}
+
+/// Expires the EC cookie and its resolved marker under `public`'s path only.
+fn expire_ec_cookie_under_path(
     settings: &Settings,
     public: &PublicPrefix,
     response: &mut Response<EdgeBody>,
@@ -304,12 +321,58 @@ mod tests {
     }
 
     /// On a request addressed by path, every cookie this file writes is
-    /// under the removed prefix, so another publisher's pages never get it.
+    /// under the removed prefix, so another publisher's pages never get it,
+    /// and the expiry also covers the cookies of the same names under `/`.
     #[test]
     fn each_cookie_is_under_the_removed_prefix_on_an_addressed_request() {
         let public = PublicPrefix::default().under_path(Some("/publisher-a.example"));
 
-        assert_eq!(set_cookie_paths(&public), ["/publisher-a.example"; 4]);
+        assert_eq!(
+            set_cookie_paths(&public),
+            [
+                "/publisher-a.example",
+                "/publisher-a.example",
+                "/publisher-a.example",
+                "/publisher-a.example",
+                "/",
+                "/"
+            ]
+        );
+    }
+
+    /// A withdrawal under a removed prefix expires the Edge Cookie and its
+    /// marker under that prefix and under `/`, each otherwise as written
+    /// with no prefix.
+    #[test]
+    fn an_expiry_under_a_removed_prefix_also_expires_the_root_cookies() {
+        let settings = create_test_settings();
+        let domain = settings.publisher.ec_cookie_domain();
+        let public = PublicPrefix::default().under_path(Some("/publisher-a.example"));
+        let mut response = empty_response();
+
+        expire_ec_cookie(&settings, &public, &mut response);
+
+        let written: Vec<&str> = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().expect("should be valid UTF-8"))
+            .collect();
+        let expected: Vec<String> = ["/publisher-a.example", "/"]
+            .into_iter()
+            .flat_map(|path| {
+                [
+                    format!(
+                        "ts-ec=; Domain={domain}; Path={path}; Secure; SameSite=Lax; Max-Age=0; \
+                         HttpOnly"
+                    ),
+                    format!(
+                        "ts-ecr=; Domain={domain}; Path={path}; Secure; SameSite=Lax; Max-Age=0"
+                    ),
+                ]
+            })
+            .collect();
+        assert_eq!(written, expected);
     }
 
     #[test]
