@@ -164,7 +164,7 @@ smoke_initialize_config() {
     "$SMOKE_TS_BIN" config init --app-config "$SMOKE_APP_CONFIG"
     export TRUSTED_SERVER__PUBLISHER__DOMAIN="127.0.0.1"
     export TRUSTED_SERVER__PUBLISHER__COOKIE_DOMAIN="127.0.0.1"
-    export TRUSTED_SERVER__PUBLISHER__ORIGIN_URL="http://127.0.0.1:$origin_port"
+    export TRUSTED_SERVER__SOURCE__ORIGIN__URL="http://127.0.0.1:$origin_port"
     "$SMOKE_TS_BIN" config validate \
         --manifest "$repository/edgezero.toml" \
         --app-config "$SMOKE_APP_CONFIG" \
