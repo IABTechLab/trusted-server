@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use edgezero_core::body::Body;
 use edgezero_core::error::EdgeError;
 use edgezero_core::request::RequestIngress;
@@ -105,6 +105,16 @@ impl PreDispatchHook for TracePreDispatchHook {
         &self,
         request: &mut Request<Body>,
     ) -> Result<Option<Response<Body>>, EdgeError> {
+        self.handle_with_clock(request, Utc::now).await
+    }
+}
+
+impl TracePreDispatchHook {
+    async fn handle_with_clock(
+        &self,
+        request: &mut Request<Body>,
+        clock: impl FnOnce() -> DateTime<Utc>,
+    ) -> Result<Option<Response<Body>>, EdgeError> {
         prepare_trusted_forwarder(request, &self.settings);
         let dispatch = match preflight(&self.settings, request) {
             TracePreflight::NotTrace => {
@@ -144,19 +154,29 @@ impl PreDispatchHook for TracePreDispatchHook {
                 );
                 state_response(&cookies)
             }
-            TraceRoute::Shell if request.method() == Method::HEAD => Response::new(Body::empty()),
             TraceRoute::Shell => {
                 let cookies = inspect_cookies(
                     request.headers(),
                     request.extensions().get::<RequestIngress>(),
                 );
-                let metadata = (self.metadata)(request);
+                // HEAD validates the same bounded projection without fetching geo
+                // or other platform metadata that cannot affect the response status.
+                let is_head = request.method() == Method::HEAD;
+                let metadata = if is_head {
+                    TraceMetadata {
+                        client_info: ClientInfo::default(),
+                        geo: None,
+                    }
+                } else {
+                    (self.metadata)(request)
+                };
                 match project_request_context(
                     &metadata.client_info,
                     metadata.geo.as_ref(),
                     &cookies,
-                    Utc::now(),
+                    clock(),
                 ) {
+                    Ok(_) if is_head => Response::new(Body::empty()),
                     Ok(context) => match render_setup_shell(&context) {
                         Ok(shell) => Response::new(Body::from(shell)),
                         Err(_) => unavailable_response(),
@@ -179,6 +199,7 @@ fn unavailable_response() -> Response<Body> {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use chrono::TimeZone as _;
     use edgezero_core::context::RequestContext;
     use edgezero_core::middleware::{Middleware, Next};
     use edgezero_core::router::RouterService;
@@ -237,6 +258,51 @@ mod tests {
                 "should sanitize credentials before any preflight return"
             );
         }
+    }
+
+    #[test]
+    fn trace_shell_head_matches_get_status_with_unrepresentable_clock() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let hook = hook(true, Arc::clone(&calls));
+        let clock = Utc
+            .with_ymd_and_hms(10_000, 1, 1, 0, 0, 0)
+            .single()
+            .expect("should construct a clock outside the trace schema");
+        let mut responses = Vec::new();
+        for method in [Method::GET, Method::HEAD] {
+            calls.store(0, Ordering::SeqCst);
+            let is_head = method == Method::HEAD;
+            let mut request = Request::builder()
+                .method(method)
+                .uri("/_ts/trace")
+                .body(Body::empty())
+                .expect("should construct a shell request");
+            let response = block_on(hook.handle_with_clock(&mut request, || clock))
+                .expect("should dispatch the trace shell")
+                .expect("should intercept the shell");
+            assert_eq!(
+                response.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "should reject an unrepresentable clock on GET and HEAD"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                usize::from(!is_head),
+                "should retain lazy metadata and avoid a HEAD geo lookup"
+            );
+            if is_head {
+                assert!(
+                    response.body().as_bytes().is_some_and(<[u8]>::is_empty),
+                    "should omit the HEAD body on errors"
+                );
+            }
+            responses.push(response);
+        }
+        assert_eq!(
+            responses[0].headers(),
+            responses[1].headers(),
+            "should match GET error headers on HEAD"
+        );
     }
 
     #[test]
