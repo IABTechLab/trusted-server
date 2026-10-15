@@ -41,15 +41,19 @@ fn main() {
 /// Run the actual build script with a crate-private post-copy race fixture.
 pub(crate) fn run_with_hook(hook: impl FnMut(&Path, &Path)) {
     // Cargo scans directories recursively, so these cover every TS source.
+    // Every path must exist: a missing entry makes Cargo rerun this script on
+    // every build, the opposite of the intent.
     for path in [
         "lib/src",
         "lib/build-all.mjs",
         "lib/build-module-options.mjs",
+        "lib/build-prebid-external.mjs",
         "lib/release-composition.mjs",
         "lib/vitest.config.ts",
         "lib/package.json",
         "lib/package-lock.json",
         "lib/tsconfig.json",
+        "lib/vite.config.ts",
     ] {
         println!("cargo:rerun-if-changed={path}");
     }
