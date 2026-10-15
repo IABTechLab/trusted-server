@@ -99,13 +99,17 @@ impl RequestAddress {
     ///
     /// Returns [`AddressingError::InvalidPath`] when `path` does not start
     /// with `/`, is not percent-encoded ASCII, carries a `?` or a `#`, or is
-    /// not a valid URI path.
+    /// not a valid URI path, or when `removed_prefix` is neither empty nor a
+    /// cookie path, as [`is_cookie_path`] says, because core writes it as
+    /// the `Path` of its cookies.
     pub fn new(
         selector_values: Vec<String>,
         path: String,
         removed_prefix: String,
     ) -> Result<Self, Report<AddressingError>> {
-        if !is_continuing_path(&path) {
+        if !is_continuing_path(&path)
+            || !(removed_prefix.is_empty() || is_cookie_path(&removed_prefix))
+        {
             return Err(Report::new(AddressingError::InvalidPath));
         }
         Ok(Self {
@@ -279,6 +283,19 @@ fn addressed_handler(
 /// Whether `path` is one a request can continue with, which is a
 /// percent-encoded ASCII path as a request carries it, so every adapter
 /// routes the same path.
+/// Whether `path` can be the `Path` attribute of a cookie.
+///
+/// It starts with `/` and holds only visible ASCII other than `;`, so
+/// written into a `Set-Cookie` header it cannot end the attribute and add
+/// another.
+#[must_use]
+pub fn is_cookie_path(path: &str) -> bool {
+    path.starts_with('/')
+        && path
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && byte != b';')
+}
+
 fn is_continuing_path(path: &str) -> bool {
     path.starts_with('/')
         && path.is_ascii()
@@ -411,6 +428,26 @@ mod tests {
                 AddressingError::InvalidPath,
                 "should refuse `{path}` as an invalid path"
             );
+        }
+    }
+
+    #[test]
+    fn a_removed_prefix_is_empty_or_a_cookie_path() {
+        for prefix in ["", "/publisher-a.example", "/a%3Bb"] {
+            assert!(
+                RequestAddress::new(Vec::new(), "/news".to_owned(), prefix.to_owned()).is_ok(),
+                "should accept `{prefix}`"
+            );
+        }
+        for prefix in [
+            "publisher-a.example",
+            "/a;Domain=example.com",
+            "/a b",
+            "/\u{e9}",
+        ] {
+            let error = RequestAddress::new(Vec::new(), "/news".to_owned(), prefix.to_owned())
+                .expect_err("should refuse a prefix that cannot be a cookie path");
+            assert_eq!(*error.current_context(), AddressingError::InvalidPath);
         }
     }
 
