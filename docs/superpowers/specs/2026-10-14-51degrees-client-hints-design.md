@@ -43,6 +43,9 @@ state the serve middleware share. From that list the middleware writes
 carries under that name as "What the headers keep" says, and the
 `Delegate-CH` tag in the head through its action. It reads `critical` from its
 own table, `[middleware.51degrees.client_hints]`, on by default.
+`Accept-CH` and `Critical-CH` are left off where the request already carries
+every hint the service names and the response names no `Accept-CH` set of its
+own, because a browser keeps an origin's set until a response names another.
 
 The three parts run in different places.
 
