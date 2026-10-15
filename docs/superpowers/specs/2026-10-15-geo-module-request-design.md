@@ -1,4 +1,4 @@
-# Design Spec: A geo module is called with the request, as a device module is
+# Design Spec: A geo module is called with the request
 
 **Status:** Proposed, 2026-10-15. Written after the code, for draft pull request IABTechLab/trusted-server#1374
 **Author:** 51Degrees (contributed), for Tech Lab review
@@ -11,7 +11,9 @@
 
 ## 1. Problem
 
-A geo module was called as `PlatformGeo::lookup(client_ip, services)`, so the module was handed the client address and the services and nothing else of the request. A device module is called as `DeviceModule::detect(call)`, with a module call that carries the request's evidence (its headers, path and query), the settings and the services.
+A geo module was called as `PlatformGeo::lookup(client_ip, services)`, so the module was handed the client address and the services and nothing else of the request.
+
+A device module is called as `DeviceModule::detect(call)`, with a module call that carries the request's view (its method, host, scheme, path and query), the request's evidence, the settings and the services. The evidence is narrow. On Fastly, the only adapter that calls `detect`, the evidence is the client address, the `User-Agent` header and, for a device module that a registration supplies, the `Cookie` header, and the evidence holds no path or query (`derive_device_signals` in `crates/trusted-server-adapter-fastly/src/lib.rs`). A device module's `advertising_attributes`, unlike `detect`, is handed every request header (`attach_device_attributes` in `crates/trusted-server-core/src/auction/formats.rs`).
 
 A vendor whose one service answers location and device from the same request, keyed on the whole request, could not make the geo answer come from the same call as the device answer. The geo module never saw the evidence. The vendor therefore asked its service twice, or the geo answer depended on the device module having run first on the same adapter.
 
@@ -19,9 +21,11 @@ Six places ask for a location with the request in hand, and section 2.2 lists th
 
 A second fault sat in the Fastly adapter. The step that writes the `x-geo-*` headers on every response built its module with `build_geo_module` alone. That function cannot see the registry, so the function answers the host's own lookup for `platform` and the module that resolves nothing for every other name. A deployment whose `[geo] module` named a module from the registry got no location on that path, and every page carried `x-geo-info-available: false`, while the same module answered the request path.
 
+The issue that asked for this change (IABTechLab/trusted-server#1321) does not ask for the fix to this second fault. The issue asks for the call to be built where each adapter resolves geo, and says nothing of the response headers. The fix changes the `x-geo-*` headers that responses carry on a deployment whose `[geo] module` names a module from the registry, so the open questions at the end of section 2 ask whether the fix is a pull request of its own.
+
 ## 2. Design
 
-A geo module becomes a `GeoModule`, called with the same module call as a device module. A lookup that needs the client address alone stays a `PlatformGeo` and is wrapped.
+A geo module becomes a `GeoModule`, called with a module call, the type a device module is called with. A lookup that needs the client address alone stays a `PlatformGeo` and is wrapped.
 
 ### 2.1 The interface
 
@@ -81,16 +85,24 @@ The method builds the call and calls `locate` with the module's own `id()` and `
 
 With `headers` as `None`, the evidence still carries the address, the path and the query, and has no headers.
 
-One function builds the call so that a module is handed the same kinds of evidence wherever core asks for a location. Six callers use it.
+One function builds the call, so that a module is handed the same kinds of evidence from every caller. Six callers use that function.
 
-| Caller                                                                                                   | Function                                                                                         | Headers passed                                           | Settings passed                 | When the module fails                                                             |
-| -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ | -------------------------------------------------------- | ------------------------------- | --------------------------------------------------------------------------------- |
-| The Edge Cookie state, which every adapter reads before routing, and the permissions inspection endpoint | `EcContext::read_from_request_resolving_geo` in `crates/trusted-server-core/src/ec/mod.rs`       | The request's                                            | Yes                             | Logged at error level, and every permission resolves to the requires-signal floor |
-| The auction endpoint                                                                                     | `handle_auction` in `crates/trusted-server-core/src/auction/endpoints.rs`                        | The request's                                            | Yes                             | Logged as a warning, and the auction goes on with no location                     |
-| The Didomi notice loader                                                                                 | `DidomiIntegration::route` in `crates/cmp/didomi/src/lib.rs`                                     | The request's                                            | No, the route is not handed any | The loader answers with a geo failure response                                    |
-| The seam probe's report                                                                                  | `SeamProbeProxy::route` in `crates/testing/seam-probe/src/lib.rs`                                | The request's                                            | No                              | Logged as a warning, and the report's country is null                             |
-| Fastly response headers, router path                                                                     | `FinalizeResponseMiddleware::handle` in `crates/trusted-server-adapter-fastly/src/middleware.rs` | The request's, kept before the handler takes the request | Yes                             | Logged as a warning, and the response carries `x-geo-info-available: false`       |
-| Fastly response headers, entry-point path                                                                | `apply_entry_point_finalize_headers` in `crates/trusted-server-adapter-fastly/src/lib.rs`        | None                                                     | Yes                             | The same                                                                          |
+| Caller                                                         | Function                                                                                         | Headers passed               | Settings passed                 | When the module fails                                                             |
+| -------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ | ---------------------------- | ------------------------------- | --------------------------------------------------------------------------------- |
+| The Edge Cookie state, and the permissions inspection endpoint | `EcContext::read_from_request_resolving_geo` in `crates/trusted-server-core/src/ec/mod.rs`       | The request's                | Yes                             | Logged at error level, and every permission resolves to the requires-signal floor |
+| The auction endpoint                                           | `handle_auction` in `crates/trusted-server-core/src/auction/endpoints.rs`                        | The request's                | Yes                             | Logged as a warning, and the auction goes on with no location                     |
+| The Didomi notice loader                                       | `DidomiIntegration::route` in `crates/cmp/didomi/src/lib.rs`                                     | The request's                | No, the route is not handed any | The loader answers with a geo failure response                                    |
+| The seam probe's report                                        | `SeamProbeProxy::route` in `crates/testing/seam-probe/src/lib.rs`                                | The request's                | No                              | Logged as a warning, and the report's country is null                             |
+| Fastly response headers, router path                           | `FinalizeResponseMiddleware::handle` in `crates/trusted-server-adapter-fastly/src/middleware.rs` | The request's, as it arrived | Yes                             | Logged as a warning, and the response carries `x-geo-info-available: false`       |
+| Fastly response headers, entry-point path                      | `apply_entry_point_finalize_headers` in `crates/trusted-server-adapter-fastly/src/lib.rs`        | None                         | Yes                             | The same                                                                          |
+
+Fastly reads the Edge Cookie state on the fallback (except for a closed path) and on the routes of its named route table other than config, batch sync and data. The read comes after the request preparers have run, except on the permissions route. A request preparer is a function that an integration registers with `with_request_preparer` to clean or change a request before routing, and `IntegrationRegistry::prepare_request` runs each one. Axum, Cloudflare and Spin read the state only in the handlers that need the state, being the auction, page bids, the integration proxy routes and the publisher fallback.
+
+**How the callers differ.** The six callers do not build the call alike.
+
+1. The Edge Cookie state, the auction endpoint and the seam probe build the request's view with `ModuleRequest::of`, which reads the host from `Forwarded`, then `X-Forwarded-Host`, then `Host`, and the scheme from the client's TLS metadata, then `Forwarded`, then `X-Forwarded-Proto`, then `fastly-ssl`, and gives `http` when none of them says otherwise. The other three build the view by hand. The Didomi loader and the Fastly middleware read the `Host` header and take the scheme from the request's URI, or `https` when the URI has none. The Fastly entry-point step reads the `Host` header and gives `https` when the `fastly-ssl` header is present and `http` otherwise.
+2. The services of the first four callers carry all the client's metadata that the entry point captured. The two Fastly finalize steps set the services' client metadata to the client address alone.
+3. The two Fastly finalize steps are given a smaller services graph than the request path (`build_finalize_services` in `crates/trusted-server-adapter-fastly/src/app.rs`). The graph has the config, secret and key-value stores, the value cache, the loading caches, the backend, the HTTP client and the geo module, and each step adds the publisher's prefixes. The graph has no host signals, no device module, no Edge Cookie module, no permission signal modules and no template cache or assembler, and its auction telemetry sink records nothing. A geo module that reads any of these from the services finds nothing there on those two steps.
 
 ### 2.3 A lookup that needs only the address
 
@@ -130,10 +142,17 @@ Every adapter builds the services for a request with `build_geo_module`, wrappin
 
 The adapter writes the `x-geo-*` headers on every response, from the location a module resolves for the request. Two steps do this.
 
-1. `FinalizeResponseMiddleware` finishes every response that passes through the router's middleware chain. The router is given `finalize_geo_module(state)` in `app.rs`, which is the registry's module when `[geo] module` names one and otherwise what `build_geo_module` returns. Before the handler takes the request, `handle` keeps the request's method, headers, URI, scheme and host. After the handler, `handle` calls `locate_request` with those and the settings. `handle` skips the call when `geo_allowed_for_response` is false, which is the case for a 401 response. The headers are copied on every request, before the middleware knows whether the response will be looked up.
-2. `apply_entry_point_finalize_headers` finishes a response that did not pass through the middleware, such as the 405 the router returns for a method no route accepts. The middleware marks the responses it finished, and the entry point runs this step for those without the mark. The step builds its module with `build_geo_module`, so the module is the host's lookup or the module that resolves nothing, and never one from the registry. The step calls `locate_request` with the request's view from the copy the entry point kept (method, host, scheme, path and query) and with the settings. The step passes no headers, because the entry point keeps only the request's view.
+1. `FinalizeResponseMiddleware` finishes every response that passes through the router's middleware chain. The router is given `finalize_geo_module(state)` in `app.rs`, which is the module `IntegrationRegistry::geo_module()` returns, and what `build_geo_module` returns when that call returns `None`. Before the handler takes the request, `handle` keeps the request's method, headers and URI as the request arrived and builds the host and scheme by hand. After the handler, `handle` calls `locate_request` with the kept method, headers and URI, the host and scheme, the settings and the client address alone as the client's metadata. `handle` skips the call when `geo_allowed_for_response` is false, which is the case for a 401 response. The method, headers and URI are copied on every request, before the middleware knows the response's status, and the copy is made for a deployment whose `[geo] module` is unset too.
+2. `apply_entry_point_finalize_headers` finishes a response that did not pass through the middleware, such as the 405 the router returns for a method no route accepts. The middleware marks the responses it finished, and the entry point runs this step for those without the mark. The step builds its module with `build_geo_module`, so the module is the host's lookup or the module that resolves nothing, and never one from the registry. The step calls `locate_request` with the request's view from the copy the entry point kept (method, host, scheme, path and query), the settings and the client address alone as the client's metadata. The step passes no headers, because the entry point keeps only the request's view.
 
-Core does not carry the location from the request path to either step, so each step calls the module again. On the router path the evidence is the same as on the request path, so a module that holds its answers by evidence gives the answer it already holds. On the entry-point path the evidence has no headers, so such a module sees different evidence.
+**Why the entry-point step does not use `finalize_geo_module`.** The comment on the step says the headers do not survive to the step, so the module the step calls is the host's own lookup or the module that resolves nothing, and both read the address alone. The entry point holds the application state as an `Option` that is `None` when the state failed to build, and runs the step in that case too, with no registry to ask. When the state exists the entry point holds the registry, so the code could give the step the module `finalize_geo_module` returns, and does not.
+
+**Why each step asks the module again.** The response already carries the location the request path resolved, inside `EcFinalizeState` in `app.rs`, on the responses whose handler read the Edge Cookie state. Neither step reads that location. The middleware keeps the request's headers so that a module that holds its answers by evidence gives the answer it already holds. The headers help only when the middleware's call carries what the request path's call carried, and four differences between the two calls can stop the middleware's call from carrying the same things.
+
+1. A request preparer runs inside the handler (`prepare_request` in `execute_named` and `dispatch_fallback`), before the Edge Cookie state is read, and a preparer can change the request. The GPT diagnostics preparer (`crates/ad-tag/google/src/diagnostics.rs`) removes its reserved query parameter and cookie, and `IntegrationRegistry::prepare_request` runs every preparer whether or not its integration is switched on. The middleware keeps the headers and URI as the request arrived, before any preparer. When a preparer changes the request, the middleware's call therefore carries the unchanged request where the request path's call carries the changed one, and a module that holds its answers by the evidence it was given finds no answer held for the middleware's call.
+2. The middleware builds the host and scheme by hand, and the request path's call builds them with `ModuleRequest::of` (section 2.2).
+3. The middleware's call carries the client address alone as the client's metadata, and the request path's call carries what the entry point captured (section 2.2).
+4. The middleware's services graph is the smaller one (section 2.2).
 
 **Axum, Cloudflare and Spin.** Each builds the request's services in `build_runtime_services` in its `platform.rs`, and `services_for_request` in its `app.rs` replaces the module with the registry's. This series changes no non-test line in these three adapters, because `build_geo_module` and `RuntimeServices::with_geo` carry the new type. None of the three adapters calls the geo module when writing response headers, so a registry module reaches them only through the core callers in section 2.2.
 
@@ -163,23 +182,25 @@ No setting is added or changed. The `[geo]` section keeps its two keys.
 
 - The client address and the client's metadata.
 - The request's method, host, scheme, path and query.
-- Every request header the caller passes, which a module reads by name. The `Cookie` header is among them, and `RequestInfo::cookie` reads one cookie from it. Core removes no header before the call.
+- Every request header the caller passes, which a module reads by name. The `Cookie` and `Authorization` headers are among the headers passed, and `RequestInfo::cookie` reads one cookie from the `Cookie` header. On Fastly the headers also include the ones the entry point sets from the platform's TLS metadata, when the platform supplies the metadata, being `fastly-ssl`, `x-ts-tls-protocol`, `x-ts-tls-cipher`, `x-ts-tls-ja4` and `x-ts-h2-fingerprint`. Core removes no header before the call.
 - The services, which a lookup was already handed.
 - The settings, when the caller has them.
 
-Each caller passes the headers of the request it is serving, except `apply_entry_point_finalize_headers`, which passes none.
+Five of the six callers pass the headers of the request they are serving. `apply_entry_point_finalize_headers` passes none.
 
-**What a geo module is not handed.** The call carries no decoded consent, no resolved permissions, no location, no device signals and no Edge Cookie identifier. On the Edge Cookie path none of these exists yet, because the location is resolved first and then chooses which permission rules apply to the request.
+**What a device module is handed.** On Fastly, `detect` is shown the client address, the `User-Agent` header and, for a device module that a registration supplies, the `Cookie` header, and its evidence holds no path or query. Only `advertising_attributes`, which the auction code calls, is handed every request header. A geo module is therefore handed more of the request than `detect` is, and that includes what the device signals are made from, being the `User-Agent` header and, on Fastly, the TLS and HTTP/2 fingerprint headers.
 
-**No permission check guards the call.** The evidence is handed to a geo module without a check, as it is handed to a device module.
+**What a geo module is not handed.** The call carries no decoded consent, no resolved permissions, no location, no `DeviceSignals` value and no Edge Cookie identifier as values. The headers still carry what some of these values are made from, because the `Cookie` header holds the consent cookies and the Edge Cookie and a module reads each by name. On the Edge Cookie path none of these values exists yet, because the location is resolved first and then chooses which permission rules apply to the request.
 
-**A permission guards the answer.** When a geo module declares permissions, the location is passed on to another module only if that module declares every one of them and the request has been granted them. When `required_permissions` is empty, which is the default, the location is passed to every module. `ModuleContext::with_request_state` in `crates/trusted-server-core/src/module_context.rs` and the permission step of the Edge Cookie state in `crates/trusted-server-core/src/ec/mod.rs` set the requirement from `services.geo().required_permissions()`. `PlatformGeoModule` gives the wrapped lookup's declaration.
+**No permission check guards the call.** The evidence is handed to a geo module without a check. A device module's `detect` is also called without one, before permissions are resolved, but `detect` is handed fewer headers.
+
+**A permission guards the answer, for other modules only.** When a geo module declares permissions, the location is passed on to another module only if that module declares every one of them and the request has been granted them. When `required_permissions` is empty, which is the default, the location is passed to every module. `ModuleContext::with_request_state` in `crates/trusted-server-core/src/module_context.rs` and the permission step of the Edge Cookie state in `crates/trusted-server-core/src/ec/mod.rs` set the requirement from `services.geo().required_permissions()`. `PlatformGeoModule` gives the wrapped lookup's declaration. No permission guards the response headers. On Fastly, `apply_finalize_headers` writes the answer's city, country, continent and coordinates, and the metro code and region when the answer has them, into the `x-geo-*` headers of every response except a 401, whatever permissions the module declares and whatever the request has been granted (`GeoInfo::set_response_headers` in `crates/trusted-server-core/src/geo.rs`).
 
 **What the built-in lookups read.** The Fastly lookup reads the client address alone, so a deployment on `platform` or `none` sends no more to a host service than before. The Cloudflare lookup reads the platform's `cf-*` request headers when the services are built, as before. `PlatformGeoModule` hands each lookup the address and nothing else of the evidence.
 
 **What a module does with the evidence.** Core filters nothing from the evidence, and a module that sends any of it to another service decides what to send. The operator controls what is sent by choosing the module with `[geo] module`. With the key unset or `none`, the module called uses none of the request's data and answers nothing.
 
-**Responses that get no lookup.** On both Fastly steps, `geo_allowed_for_response` stops the call for a 401 response, so no module is called and no header is handed to one for a response that did not authenticate.
+**Responses that get no lookup.** On both Fastly steps, `geo_allowed_for_response` stops the finalize call for a 401 response, so no module is called a second time and the response carries `x-geo-info-available: false` in place of a location. The rule does not stop the call on the request path, and that call has run before the response exists. On Fastly, a request to `/_ts/api/v1/identify` with an invalid token and a request that the origin answers with a 401 have both already handed the module every request header, `Authorization` included, through the Edge Cookie state before the 401 exists.
 
 ### 2.8 Failure handling
 
@@ -189,29 +210,41 @@ The Edge Cookie state resolves permissions at the top node of the `permissions.y
 
 - A call with no services reaches `PlatformGeoModule` and answers `Ok(None)`. It is not an error.
 - `locate_request` always supplies the evidence, so a module called through it always finds the evidence. A call built by hand without evidence withholds it, and the test modules return `PlatformError::Geo` for that.
-- Core adds no timeout, retry or cache around the call. Each caller calls once and uses the answer. A module that reaches a service applies its own timeout and holds its own answers.
+- Core adds no timeout, retry or cache around the call. Each caller calls once, waits for the answer and uses the answer, so a slow module delays the caller. On Fastly both finalize steps wait before the response headers are sent, so a slow module delays every response except a 401. A module that reaches a service applies its own timeout and holds its own answers.
 
 ### 2.9 Rollout for existing deployments
 
-**Deployments.** No settings document and no stored data changes. A deployment on `none` or `platform` behaves as before, because the wrapped lookups read the same address and the built-in lookups ignore the added evidence.
+**Deployments.** No settings document and no stored data changes. A deployment on `none` or `platform` behaves as before, apart from the cost below, because the wrapped lookups read the same address and the built-in lookups ignore the added evidence.
 
-**One difference.** On Fastly, a deployment whose `[geo] module` names a module from the registry now gets that module's location in the `x-geo-*` headers of every response the middleware finishes. Before, those responses carried `x-geo-info-available: false`. Responses finished by the entry-point step are unchanged.
+**One difference.** On Fastly, a deployment whose `[geo] module` names a module from the registry now gets that module's location in the `x-geo-*` headers of every response the middleware finishes. Before, those responses carried `x-geo-info-available: false`. Those headers carry the module's city, coordinates, metro code and region as well as its country, and no permission guards them (section 2.7). Responses finished by the entry-point step are unchanged.
+
+**One cost.** On Fastly, `FinalizeResponseMiddleware` copies the request's method, headers and URI before the handler runs, on every request and whatever `[geo] module` selects, and when the key is unset.
 
 **Crates outside core** that use the items below stop compiling until they change, and `CHANGELOG.md` marks the change as breaking for them.
 
 - `RuntimeServicesBuilder::geo`, `RuntimeServices::with_geo`, `IntegrationRegistrationBuilder::with_geo_module` and the Fastly adapter's `FinalizeResponseMiddleware::new` take an `Arc<dyn GeoModule>` where they took an `Arc<dyn PlatformGeo>`, and `build_geo_module` returns one.
 - `RuntimeServices::geo()` returns `&dyn GeoModule`. A caller that called `lookup` on it calls `locate_request`.
+- `IntegrationRegistry::geo_module()` returns an `Option<Arc<dyn GeoModule>>`, and the public field `IntegrationRegistration::geo_module` holds an `Arc<dyn GeoModule>`, where each had an `Arc<dyn PlatformGeo>`.
 - A crate that passed a `PlatformGeo` wraps it in `PlatformGeoModule::new(name, module)`. A crate that wants the request implements `GeoModule`.
 
 In this repository the converted code is the six callers in section 2.2, the `ts` command line tool's local services in `crates/trusted-server-cli/src/commands/keys.rs`, the seam probe's registration, the example in the integration guide, and the test services in core, the Fastly adapter, the Axum adapter, the Prebid server crate, the 51Degrees loading cache crate and the Didomi crate.
+
+**Open questions.** Each of these waits for a decision and for a code change, and this revision changes no code.
+
+1. Whether `FinalizeResponseMiddleware` reads the location that `EcFinalizeState` carries on the response and asks the module only for a response that carries none. Today a request that reads the Edge Cookie state asks the module a second time at the finalize step unless the response is a 401, and the second call carries the differences listed in section 2.5. Reading the carried location would also remove those differences for the responses that carry one.
+2. Whether `apply_entry_point_finalize_headers` uses the module `finalize_geo_module` returns when application state was built, so that a response the router did not finish follows `[geo] module` as the middleware's responses do. The step would hand the module the request's view and no headers.
+3. Whether the `x-geo-*` response headers are written only when the request has been granted the permissions the module declares, as the location handed to another module is. Today the headers carry the answer's city, coordinates, metro code and region whatever the module declares.
+4. Whether the Didomi loader, the Fastly middleware and the Fastly entry-point step build the request's view the way `ModuleRequest::of` does, so that all six callers read the host and scheme by one rule.
+5. Whether the middleware copies the request's method, headers and URI only when `[geo] module` selects a module from the registry, since the host's lookup and the module that resolves nothing read the address alone.
+6. Whether the fix for the second fault, which changes the `x-geo-*` headers of a deployment's responses and which the issue for this change (IABTechLab/trusted-server#1321) does not ask for, is a pull request of its own.
 
 ## 3. What is not in this change
 
 - **A geo module in the stock list that reads more than the address.** The host lookups for Fastly, Axum, Cloudflare and Spin stay `PlatformGeo` and are wrapped. The only module this repository offers through the registry is the seam probe's, which wraps a lookup that answers a fixed country.
 - **The Fastly entry-point step.** `apply_entry_point_finalize_headers` still builds its module with `build_geo_module` and passes no headers. When `[geo] module` names a registry module, a response that reaches that step carries `x-geo-info-available: false`.
 - **Geo in the response headers of Axum, Cloudflare and Spin.** Their `x-geo-info-available` does not follow the module, as the table in section 2.5 shows.
-- **Making core share one answer between the geo call and the device call.** A vendor crate whose one service answers both holds the answer itself and returns it from `locate` and from `detect`.
-- **Checking permissions before the evidence is handed over.** A geo module is handed the evidence without a check, as a device module is.
+- **Making core share one answer between the geo call and the device call.** A vendor crate whose one service answers both holds the answer itself and returns it from `locate` and from `detect`. The device call carries less evidence than the geo call (section 2.7), so a held answer can be keyed only on what both calls carry.
+- **Checking permissions before the evidence is handed over.** A geo module is handed the evidence without a check, and so is a device module's `detect`, which is handed less (section 2.7).
 - **Any change to `PlatformGeo`, `GeoInfo`, the permission rules or the headers written.**
 
 ## 4. Acceptance
@@ -225,6 +258,7 @@ In this repository the converted code is the six callers in section 2.2, the `ts
 - `crates/trusted-server-adapter-fastly/src/middleware.rs` has `finalize_handle_hands_the_geo_module_the_request_headers`, where a module records one header of its evidence. The existing finalize tests in that file now run through the wrapper.
 - `crates/trusted-server-adapter-fastly/src/app/seam_probe_tests.rs` and `crates/trusted-server-adapter-axum/tests/seam_probe.rs` each have `proxy_route_reports_the_modules_geo_and_that_the_preparer_ran`, where a route reaches the registry's module selected by `[geo] module` and gets its country back. Each also has `geo_selector_naming_a_module_without_a_geo_module_fails_at_startup`.
 - `crates/trusted-server-adapter-spin/src/platform.rs` has `build_runtime_services_uses_noop_native_stores_without_handles`, which checks that the default module is named `none`.
+- `crates/trusted-server-integration-tests/tests/documentation_snippets.rs` has `integration_guide_runtime_services_fixture_compiles`, which compiles the runtime services example in the integration guide, the example that wraps `FixtureGeo` in `PlatformGeoModule::new`.
 
 The Cloudflare adapter's tests are unchanged and call its lookup directly.
 
@@ -241,15 +275,18 @@ The Cloudflare adapter's tests are unchanged and call its lookup directly.
 9. `PlatformGeoModule::required_permissions` returning the lookup's declaration, and the gate on the location that follows from it. The only test of a declaration is for `DisabledGeo`, which declares none.
 10. A registry geo module answering a request on Cloudflare or Spin. The seam probe tests that do this run on Fastly and Axum only.
 11. The wrapped Axum, Cloudflare and Spin lookups reaching a request through `build_runtime_services`. Their tests call the lookup directly, and the Spin test checks the name of the default module only.
+12. A located answer reaching the Fastly response headers. Every finalize test in the Fastly adapter's `middleware.rs` and `lib.rs` has the module answer nothing, so none checks an `x-geo-*` header with a location in it. `proxy_route_reports_the_modules_geo_and_that_the_preparer_ran` passes through `FinalizeResponseMiddleware` with the registry's module selected, and checks the body and not the response's headers.
+13. A request that a preparer changes, sent through the router with a geo module that reads its evidence. No test compares the evidence the request path's call carries with the evidence the middleware's call carries.
 
 The pull request records the fork's CI green on all 19 checks at 1b8b43858. Its checklist leaves the manual check under `fastly compute serve` unticked.
 
 ## Review log
 
-No review rounds yet.
+1. **Round 1, 2026-10-15.** A review in a fresh session, against `split/33-geo-call` at `c5b04c263`. Issues found, three of them blocking. The three were the claim that a geo module is called with the request as a device module is, when a device module's `detect` is shown at most two headers and five of the six geo callers hand the module every header, the claim that the router path carries the same evidence as the request path, when a request preparer changes the request after the middleware has kept it, and the claim that no header is handed to a module for a response that did not authenticate, when the request path has already handed the module every header. This revision states what the code does in each case, retitles the page, and adds the services the finalize steps get, the response headers that no permission guards, the wait for the module, the missing breaking items and the missing tests, while the code changes the round points to wait under Open questions.
 
 ## Revision record
 
-| Date       | Change                               |
-| ---------- | ------------------------------------ |
-| 2026-10-15 | First draft, written after the code. |
+| Date       | Change                                                                                                                                                                                                                                                                                                                                              |
+| ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 2026-10-15 | First draft, written after the code.                                                                                                                                                                                                                                                                                                                |
+| 2026-10-15 | Fixes from review round 1. The title, what a device module and a geo module are each handed, the evidence the router path's call carries, the 401 rule, the services the finalize steps get, the response headers that no permission guards, the wait for the module, the breaking items, the missing tests, the open questions and the review log. |
