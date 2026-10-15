@@ -887,9 +887,10 @@ settings of its table that hold the name of a secret, each with the key name
 it takes when left out, and builds the signer from its table. The offer is not
 a selection. The registry builds the signer where a source names it, so a
 `type` nothing offers is refused at startup naming the signers on offer, and a
-table the signer cannot use is refused naming the setting. The builder's
-validate function checks the same tables when a deployment is validated, so a
-bad table fails `ts config validate` and not the first start.
+table the signer cannot use is refused naming the setting. Core checks the
+same tables when a deployment is validated, by building each signer a builder
+offers from the tables that name it, so a bad table fails `ts config validate`
+and not the first start, provided the validating build offers that signer.
 
 ```rust
 pub static EXAMPLE_SIGNER: OriginSignerModule = OriginSignerModule {

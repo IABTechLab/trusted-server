@@ -91,8 +91,10 @@ publisher, trusted-client-IP, EC, Tinybird, DataDome, and S3 fields:
 Their values belong in the logical `trusted_server_secrets` store and are
 resolved only while an instance builds runtime settings. An adapter can map the
 logical ID to a different physical name. For example, Fastly commonly maps
-`trusted_server_secrets` to physical store `ts_secrets`. A blank
-`session_token` in either signing table is read as no token.
+`trusted_server_secrets` to physical store `ts_secrets`. A `session_token`
+that is empty or only spaces in either signing table is refused by
+`ts config validate`, naming its path, so leave the key out when there is no
+token.
 
 Two accepted secret-shaped fields are deliberately different:
 
