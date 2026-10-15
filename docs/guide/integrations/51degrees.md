@@ -32,11 +32,15 @@ names in the request's state. On the way out it writes:
    the lower case hint names each followed by the origin and separated by
    semicolons.
 
-Each header keeps what the response already said under that name, with the
-hints added after it, so a policy the publisher's origin sets is kept and a
-hint the origin already asks for is named once. A browser engine the service
-names no hints for, such as Firefox or Safari, is given none of them. A
-request that is not a page navigation asks the service nothing.
+Each header keeps the first line the response already carries under that
+name, with the hints added after it, so a policy the publisher's origin sets
+is kept and a hint the origin already asks for is named once. A delegation
+comes after the origin's own policy members, so for a hint the service names
+it overrides an origin policy that denies the hint, such as `ch-ua-model=()`.
+A browser engine the service names no hints for, such as Firefox or Safari,
+is given none of them. A request that is not a page navigation asks the
+service nothing, and a page navigation is a `GET` or `HEAD` with
+`Sec-Fetch-Dest: document` or an `Accept` naming `text/html`.
 
 The origin the hints are delegated to is the origin of the configured
 `endpoint`, so a deployment using a private cloud delegates to that, and an
@@ -86,23 +90,29 @@ copies, as for every declared cache. An answer is held for an hour at most.
 
 ## Placing the middleware
 
-The middleware runs where a `[[serve]]` entry names `51degrees.client_hints`,
-and in no other phase, because the list is the service's answer for one
-reader's browser and what the fetch phase leaves is stored for every reader.
-A deployment that names it in no entry sends no client hints headers and no
-tag, as before. The headers are written on every response the publisher path
+The middleware writes its headers and tag where a `[[serve]]` entry names
+`51degrees.client_hints`, and in no other phase, because the list is the
+service's answer for one reader's browser and what the fetch phase leaves is
+stored for every reader. A deployment that names it in no entry sends no
+client hints headers and no tag, but the request filter that asks the service
+is run by `[shared.51degrees]` alone and reads no entry or `path`, so it asks
+about every page navigation. Only the Fastly adapter runs request filters, so
+on Axum, Cloudflare and Spin the middleware asks the service nothing and
+writes nothing. The headers are written on every response the publisher path
 sends for a path the entry covers, a redirect included, and the tag on each
 page.
 
 A page the middleware leaves names for keeps to the origin path, because the
 names are left in the request's state, which is what core does for every
-request a module leaves a value on. That page is never read from a shared
-template and never stored as one, and is sent `private, no-store`.
+request a module leaves a value on. That page, whether or not an entry covers
+it, is never read from a shared template and never stored as one, and is sent
+`private, no-store`.
 
-The first call for a browser costs one round trip to the service before the
-page, within `timeout_ms`. The answer is held, so every later request with
-the same evidence reads it. A service that does not answer leaves the page
-with no headers and no tag, and a logged line says why.
+The first call for an address, `User-Agent` and `51D_` cookies costs one round
+trip to the service before the page, within `timeout_ms`. The answer is held,
+so every later request with the same evidence reads it. A service that does
+not answer leaves the page with no headers and no tag, and a logged line says
+why.
 
 ## What is checked
 
