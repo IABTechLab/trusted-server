@@ -10,6 +10,7 @@ use super::config::check_git_config;
 use super::git::Git;
 use super::tree::{TreeLimits, parse_tree_object};
 use super::*;
+use crate::git_objects::checked_sha1;
 use crate::policy::ReleaseTarget;
 use crate::preflight::audit_environment;
 use crate::preflight::child::{ChildRequest, child_environment};

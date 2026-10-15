@@ -370,26 +370,7 @@ fn commit_tree(raw: &[u8]) -> Result<String, Report<ReleaseError>> {
         .ok_or_else(|| source_error("commit object must start with a SHA-1 tree line"))
 }
 
-/// Collision-checked SHA-1 over the concatenation of `parts`.
-///
-/// # Errors
-///
-/// Fails when SHA-1 collision detection flags the input, including inputs
-/// the detector would otherwise silently mitigate.
-fn checked_sha1(parts: &[&[u8]]) -> Result<String, Report<ReleaseError>> {
-    let mut hasher = sha1_checked::Sha1::new();
-    for part in parts {
-        sha1_checked::Digest::update(&mut hasher, part);
-    }
-    let result = hasher.try_finalize();
-    if result.has_collision() {
-        return Err(source_error(
-            "SHA-1 collision detection flags a Git object; its identity is not trusted",
-        ));
-    }
-    Ok(hex::encode(result.hash()))
-}
-
+/// Records the verified tracked blob identities and original root manifest.
 fn tracked_records(
     git: &Git,
     entries: &[TreeEntry],

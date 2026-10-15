@@ -5,6 +5,7 @@ mod boundary;
 #[allow(dead_code)]
 mod documents;
 mod error;
+mod git_objects;
 #[allow(dead_code, reason = "consumed by Task 9 recipes")]
 mod inspect;
 #[allow(dead_code, reason = "consumed by Task 7 material preparation")]

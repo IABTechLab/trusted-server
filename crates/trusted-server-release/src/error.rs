@@ -14,6 +14,8 @@ pub(crate) enum ReleaseError {
     Environment,
     #[display("Release source is not authenticated")]
     Source,
+    #[display("Git object verification failed")]
+    GitObject,
     #[display("Production release selection is not qualified")]
     Unqualified,
     #[display("Release inputs are incomplete")]
