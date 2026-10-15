@@ -108,13 +108,19 @@ fn evaluate(
 fn observe(
     probe: &ProbeProgram,
     listener: &LoopbackListener,
-    result: &ProcessResult,
+    result: ProcessResult,
 ) -> Result<Observation, Report<ReleaseError>> {
-    Ok(Observation {
+    let observation = Observation {
         outcome: result.outcome(),
         report: probe.parse(result.stdout()),
         accepts: listener.drain_accepts()?,
-    })
+    };
+    match observation.outcome {
+        ProcessOutcome::Exited { code } if code == 0 || code == i32::from(DENIED_STATUS) => {
+            Ok(observation)
+        }
+        _ => result.require_success().map(|_| observation),
+    }
 }
 
 fn unconfined_command(
@@ -168,16 +174,50 @@ pub(super) fn establish(
         ));
     }
     let control_result = unconfined_command(probe, &listener, limits)?.run()?;
-    let control = observe(probe, &listener, &control_result)?;
+    let control = observe(probe, &listener, control_result)?;
     let confined_result =
         boundary.execute(&confined_command(boundary, probe, &listener, limits)?)?;
-    let confined = observe(probe, &listener, &confined_result)?;
+    let confined = observe(probe, &listener, confined_result)?;
     evaluate(boundary.fingerprint, control, confined)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
+    use std::time::Duration;
+
     use super::*;
+
+    #[test]
+    fn unexpected_probe_exit_keeps_bounded_startup_diagnostic() {
+        let probe = ProbeProgram::release_binary().expect("should locate probe executable");
+        let listener = LoopbackListener::bind().expect("should bind fixture listener");
+        let result = BoundedCommand::new(
+            Path::new("/bin/sh"),
+            Path::new("/"),
+            ProcessLimits {
+                wall: Duration::from_secs(5),
+                stdout_max: 1024,
+                stderr_max: 1024,
+            },
+        )
+        .expect("should select fixture command")
+        .arguments(
+            [
+                "-c",
+                "printf 'fictional container startup failure' >&2; exit 125",
+            ]
+            .map(OsString::from),
+        )
+        .run()
+        .expect("should supervise fixture child");
+        let error = observe(&probe, &listener, result)
+            .expect_err("should reject failed probe child before protocol evaluation");
+        assert!(
+            format!("{error:?}").contains("fictional container startup failure"),
+            "should preserve bounded child failure diagnostic"
+        );
+    }
 
     fn observation(code: i32, report: Option<ProbeReport>, accepts: usize) -> Observation {
         Observation {
