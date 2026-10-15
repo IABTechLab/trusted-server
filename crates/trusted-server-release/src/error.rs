@@ -11,8 +11,12 @@ pub(crate) enum ReleaseError {
     Policy,
     #[display("Inherited release environment is rejected")]
     Environment,
+    #[display("Release source is not authenticated")]
+    Source,
     #[display("Production release selection is not qualified")]
     Unqualified,
+    #[display("Release inputs are incomplete")]
+    Incomplete,
 }
 
 impl core::error::Error for ReleaseError {}

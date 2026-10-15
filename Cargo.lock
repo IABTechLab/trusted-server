@@ -6923,6 +6923,7 @@ dependencies = [
 name = "trusted-server-release"
 version = "0.1.0"
 dependencies = [
+ "clap",
  "derive_more",
  "error-stack",
  "hex",
@@ -6932,6 +6933,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "toml",
 ]
 
 [[package]]

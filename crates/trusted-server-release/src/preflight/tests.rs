@@ -173,6 +173,65 @@ fn rejects_native_build_selectors_and_target_variants() {
 }
 
 #[test]
+fn rejects_sqlite_selectors() {
+    assert_each_rejected(
+        "sqlite",
+        &[
+            "LIBSQLITE3_FLAGS",
+            "SQLITE_MAX_VARIABLE_NUMBER",
+            "SQLCIPHER_LIB_DIR",
+        ],
+    );
+}
+
+#[test]
+fn rejects_ring_and_openssl_selectors() {
+    assert_each_rejected(
+        "crypto",
+        &["RING_PREGENERATE_ASM", "OPENSSL_DIR", "OPENSSL_STATIC"],
+    );
+}
+
+#[test]
+fn rejects_cmake_selectors() {
+    assert_each_rejected(
+        "cmake",
+        &["CMAKE", "CMAKE_TOOLCHAIN_FILE", "CMAKE_GENERATOR"],
+    );
+}
+
+#[test]
+fn rejects_vcpkg_rs_selectors() {
+    assert_each_rejected("vcpkg", &["VCPKGRS_DYNAMIC", "VCPKGRS_TRIPLET"]);
+}
+
+#[test]
+fn rejects_cc_crate_controls() {
+    assert_each_rejected(
+        "cc-crate",
+        &[
+            "CRATE_CC_NO_DEFAULTS",
+            "CC_ENABLE_DEBUG_OUTPUT",
+            "CC_FORCE_DISABLE",
+            "CC_SHELL_ESCAPED_FLAGS",
+        ],
+    );
+}
+
+#[test]
+fn rejects_lowercase_target_suffixed_native_flags() {
+    assert_each_rejected(
+        "target-suffixed",
+        &[
+            "CFLAGS_aarch64_apple_darwin",
+            "CXXFLAGS_x86_64_unknown_linux_gnu",
+            "AWS_LC_SYS_USE_SYSTEM_aarch64_apple_darwin",
+            "AWS_LC_SYS_STATIC_x86_64_apple_darwin",
+        ],
+    );
+}
+
+#[test]
 fn rejects_loader_injection() {
     assert_each_rejected(
         "loader",
@@ -331,6 +390,7 @@ fn child_environment_contains_exactly_expected_linux_keys() {
     .expect("should build child environment");
     let expected = BTreeMap::from([
         ("AWS_LC_SYS_USE_SYSTEM", "0"),
+        ("AWS_LC_SYS_USE_SYSTEM_x86_64_unknown_linux_gnu", "0"),
         ("CARGO_HOME", "/private/release/cargo-home"),
         ("HOME", "/private/release/home"),
         ("LC_ALL", "C"),
@@ -415,4 +475,40 @@ fn child_environment_rejects_unsafe_paths_and_commits() {
         build_child(&audited, "ABC", 1, &request(ReleaseTarget::Wasm32Wasip1)).is_err(),
         "should reject a malformed commit"
     );
+}
+
+#[test]
+fn child_environment_sets_target_suffixed_aws_lc_selector() {
+    let audited = audit_environment(&[]).expect("should audit empty snapshot");
+    for (target, name) in [
+        (
+            ReleaseTarget::Wasm32Wasip1,
+            "AWS_LC_SYS_USE_SYSTEM_wasm32_wasip1",
+        ),
+        (
+            ReleaseTarget::Aarch64AppleDarwin,
+            "AWS_LC_SYS_USE_SYSTEM_aarch64_apple_darwin",
+        ),
+        (
+            ReleaseTarget::X86_64AppleDarwin,
+            "AWS_LC_SYS_USE_SYSTEM_x86_64_apple_darwin",
+        ),
+    ] {
+        let child = build_child(&audited, COMMIT, 1, &request(target))
+            .expect("should build child environment");
+        assert_eq!(
+            child.variables().get(name).map(String::as_str),
+            Some("0"),
+            "should pin the target-suffixed selector for {target:?}"
+        );
+        assert_eq!(
+            child
+                .variables()
+                .keys()
+                .filter(|key| key.starts_with("AWS_LC_SYS_USE_SYSTEM"))
+                .count(),
+            2,
+            "should set only the generic and selected-target selectors"
+        );
+    }
 }

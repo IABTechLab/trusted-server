@@ -81,6 +81,7 @@ impl ReleaseTarget {
     }
 
     /// Returns whether the target needs the explicit macOS loader floor.
+    #[allow(dead_code)]
     pub(crate) fn is_darwin(self) -> bool {
         matches!(self, Self::Aarch64AppleDarwin | Self::X86_64AppleDarwin)
     }

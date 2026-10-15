@@ -13,14 +13,18 @@ use error_stack::Report;
 use crate::documents::lower_hex;
 use crate::error::ReleaseError;
 use crate::policy::ReleaseTarget;
+use crate::source::ApprovedSource;
 
 const RELEASE_BUILD: &str = "TRUSTED_SERVER__RELEASE_BUILD";
 const REMOVED_PREFIXES: [&str; 2] = ["TRUSTED_SERVER__", "EDGEZERO__"];
 const SKIP_BUILD: &str = "TSJS_SKIP_BUILD";
+// The child-environment builder below is consumed by recipe execution (Task 5);
+// until then only tests and the typed preflight interface reference it.
+#[allow(dead_code)]
 const MACOS_DEPLOYMENT_TARGET: &str = "13.0";
 
 /// Exact (uppercase) names that select compilers, flags, loaders, sources or credentials.
-const REJECTED_EXACT: [&str; 26] = [
+const REJECTED_EXACT: [&str; 27] = [
     "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
     "ACTIONS_ID_TOKEN_REQUEST_URL",
     "ACTIONS_RUNTIME_TOKEN",
@@ -28,6 +32,7 @@ const REJECTED_EXACT: [&str; 26] = [
     "AWS_SECRET_ACCESS_KEY",
     "AWS_SESSION_TOKEN",
     "CARGO",
+    "CRATE_CC_NO_DEFAULTS",
     "DEVELOPER_DIR",
     "GH_TOKEN",
     "GITHUB_TOKEN",
@@ -50,23 +55,29 @@ const REJECTED_EXACT: [&str; 26] = [
 ];
 
 /// Uppercase prefixes whose whole family is recipe-selected or forbidden.
-const REJECTED_PREFIXES: [&str; 17] = [
+const REJECTED_PREFIXES: [&str; 23] = [
     "AWS_LC_FIPS_SYS_",
     "AWS_LC_SYS_",
     "BINDGEN_",
     "CARGO_",
+    "CMAKE",
     "DYLD_",
     "FASTLY_",
     "GIT_",
     "LD_",
-    "LIBSQLITE3_SYS_",
+    "LIBSQLITE3_",
     "NPM_CONFIG_",
+    "OPENSSL_",
     "PKG_CONFIG_",
+    "RING_",
     "RUSTC_",
     "RUSTDOC_",
     "RUSTUP_",
     "SIGSTORE_",
+    "SQLCIPHER_",
     "SQLITE3_",
+    "SQLITE_",
+    "VCPKGRS_",
     "VITE_",
 ];
 
@@ -184,9 +195,11 @@ fn is_reviewed(name: &str, value: &str) -> bool {
 }
 
 /// A tool directory produced by authenticated acquisition (Task 8).
+#[allow(dead_code)]
 pub(crate) struct ToolDirectory(PathBuf);
 
 /// Recipe-selected private locations for one child build.
+#[allow(dead_code)]
 pub(crate) struct ChildRequest {
     pub(crate) target: ReleaseTarget,
     pub(crate) home: PathBuf,
@@ -195,11 +208,13 @@ pub(crate) struct ChildRequest {
 }
 
 /// An allowlisted child environment constructed from scratch.
+#[allow(dead_code)]
 pub(crate) struct ChildEnvironment {
     variables: BTreeMap<String, String>,
     removed: Vec<String>,
 }
 
+#[allow(dead_code)]
 impl ChildEnvironment {
     /// Every variable the child receives; nothing is inherited.
     pub(crate) fn variables(&self) -> &BTreeMap<String, String> {
@@ -217,6 +232,7 @@ impl ChildEnvironment {
     }
 }
 
+#[allow(dead_code)]
 fn absolute_text<'a>(label: &str, path: &'a Path) -> Result<&'a str, Report<ReleaseError>> {
     path.to_str()
         .filter(|text| path.is_absolute() && !text.contains([':', '\0']))
@@ -227,6 +243,7 @@ fn absolute_text<'a>(label: &str, path: &'a Path) -> Result<&'a str, Report<Rele
         })
 }
 
+#[allow(dead_code)]
 fn build_child(
     audited: &AuditedEnvironment,
     commit: &str,
@@ -239,6 +256,13 @@ fn build_child(
     }
     let mut variables = BTreeMap::from([
         ("AWS_LC_SYS_USE_SYSTEM".to_owned(), "0".to_owned()),
+        (
+            format!(
+                "AWS_LC_SYS_USE_SYSTEM_{}",
+                request.target.triple().replace('-', "_")
+            ),
+            "0".to_owned(),
+        ),
         (
             "CARGO_HOME".to_owned(),
             absolute_text("CARGO_HOME", &request.cargo_home)?.to_owned(),
@@ -272,6 +296,24 @@ fn build_child(
         variables,
         removed: audited.removed.clone(),
     })
+}
+
+/// Builds the allowlisted child environment for one recipe execution.
+///
+/// Requires both the audited inherited environment and the locally
+/// authenticated source, whose commit and committer epoch are injected.
+///
+/// # Errors
+///
+/// Fails when a private location or tool directory is not an absolute UTF-8
+/// path without `:` or NUL.
+#[allow(dead_code)]
+pub(crate) fn child_environment(
+    audited: &AuditedEnvironment,
+    source: &ApprovedSource,
+    request: &ChildRequest,
+) -> Result<ChildEnvironment, Report<ReleaseError>> {
+    build_child(audited, source.commit(), source.epoch(), request)
 }
 
 #[cfg(test)]
