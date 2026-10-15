@@ -1995,11 +1995,13 @@ no path, and a folder is written with its closing slash, because `/news` also
 begins `/newsletter`.
 
 A serve middleware may set response headers as well as change the page. For
-that it is asked about every response the publisher path sends for a request
-path its entry covers, whatever the response's media type and whether or not
-it has a body, with the response's status and headers in hand, so a redirect
+that it is asked about a response the publisher path sends for a request path
+its entry covers, whatever the response's media type and whether or not it
+has a body, with the response's status and headers in hand, so a redirect
 reaches a middleware that rewrites its `Location`. A header it sets replaces
-one of the same name.
+one of the same name. A serve middleware is not asked about a refusal made
+before the origin is asked, such as the `405` for a method a signed origin
+does not take, or about a page served from the template cache.
 
 ```toml
 [[fetch]]
