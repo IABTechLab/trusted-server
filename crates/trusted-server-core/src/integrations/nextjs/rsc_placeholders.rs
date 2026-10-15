@@ -1,6 +1,7 @@
 use std::sync::{Arc, LazyLock};
 
 use regex::Regex;
+use serde::de::IgnoredAny;
 
 use crate::integrations::{
     IntegrationScriptContext, IntegrationScriptRewriter, ScriptRewriteAction,
@@ -29,17 +30,30 @@ static QUALIFIED_FLIGHT_PUSH_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
         .expect("should compile qualified Flight push observation")
 });
 
+// A missed data push may open a T row that a later captured script continues.
+// Generic push hints still protect only their current script from ordinary GTM.
+static QUALIFIED_FLIGHT_DATA_HEAD: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:self|window)\.__next_f\s*(?:\.\s*push|=\s*(?:self|window)\.__next_f\s*\|\|\s*\[\]\s*\)\s*\.\s*push)\s*\(\s*\[\s*1\s*,")
+        .expect("should compile qualified Flight data head")
+});
+
 // The receiver may already have streamed, leaving a verified trimmed head.
 static TRIMMED_FLIGHT_PUSH_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^__next_f\s*(?:\.\s*push\s*\(|=\s*(?:self|window)\.__next_f\s*\|\|\s*\[\]\s*\)\s*\.\s*push\s*\()")
         .expect("should compile trimmed Flight push observation")
 });
 
-// Only completed inert bootstrap controls may be skipped. Opaque channel-2
-// strings and incomplete calls must retain the conservative raw fallback.
+// Fast path for the small bootstrap controls. Next.js writeInitialInstructions
+// serializes channel 2 form state; nextServerDataCallback stores it separately
+// from the Flight row stream. Other serialized form values are recognized below.
+// Incomplete calls and binary channels retain conservative raw fallback.
 static INERT_FLIGHT_CONTROL_ARGUMENTS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^\s*\[\s*(?:0|2\s*,\s*null)\s*\]\s*\)")
         .expect("should compile inert Flight control arguments")
+});
+
+static FLIGHT_FORM_STATE_ARGUMENTS: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s*\[\s*2\s*,").expect("should compile Flight form-state arguments")
 });
 
 // Collapsing whitespace runs bounds either supported call head well below this
@@ -64,6 +78,11 @@ impl NextJsRscPlaceholderRewriter {
         max_queued_payload_bytes: usize,
     ) -> ScriptRewriteAction {
         let code = state.rsc_lexical_start.clone().mask(content);
+        debug_assert_eq!(
+            code.len(),
+            content.len(),
+            "should preserve masked byte offsets"
+        );
         if !code.contains("__next_f") {
             return if was_buffered {
                 ScriptRewriteAction::replace(content.to_owned())
@@ -77,6 +96,7 @@ impl NextJsRscPlaceholderRewriter {
         let mut ranges = Vec::new();
         let mut cursor = 0;
         let mut unclaimed_raw_flight = false;
+        let mut unclaimed_raw_data = state.raw_data_unclaimed;
         let mut trimmed = std::mem::take(&mut state.rsc_receiver_trimmed);
         let mut queued_bytes = state.captured_payload_bytes;
         loop {
@@ -92,10 +112,12 @@ impl NextJsRscPlaceholderRewriter {
             let Some(head) = head else {
                 break;
             };
-            if let Some(arguments) = INERT_FLIGHT_CONTROL_ARGUMENTS.find(&remaining[head.end()..]) {
+            if let Some(arguments_end) = inert_flight_control_end(&remaining[head.end()..]) {
                 unclaimed_raw_flight |=
                     contains_qualified_flight(&content[cursor..cursor + head.start()]);
-                cursor += head.end() + arguments.end();
+                unclaimed_raw_data |=
+                    contains_qualified_flight_data(&content[cursor..cursor + head.start()]);
+                cursor += head.end() + arguments_end;
                 trimmed = false;
                 continue;
             }
@@ -147,9 +169,25 @@ impl NextJsRscPlaceholderRewriter {
             queued_bytes = total.expect("should have validated queue size");
             unclaimed_raw_flight |=
                 contains_qualified_flight(&content[cursor..cursor + head.start()]);
+            unclaimed_raw_data |=
+                contains_qualified_flight_data(&content[cursor..cursor + head.start()]);
             ranges.push((start, end));
             cursor = end + 1;
         }
+        // Account for every raw data head outside the captured strings and inert
+        // controls before committing placeholders. A later capture cannot repair
+        // a header that has already streamed from an uncaptured push.
+        unclaimed_raw_data |= contains_qualified_flight_data(&content[cursor..]);
+        if unclaimed_raw_data {
+            state.bypass_rsc = true;
+            state.current_fragment_protected = true;
+            return if was_buffered {
+                ScriptRewriteAction::replace(content.to_owned())
+            } else {
+                ScriptRewriteAction::Keep
+            };
+        }
+        state.raw_data_seen = false;
         if ranges.is_empty() {
             return if was_buffered {
                 ScriptRewriteAction::replace(content.to_owned())
@@ -219,9 +257,15 @@ impl NextJsRscPlaceholderRewriter {
                 }
                 if is_last && content.len() > limit && content.contains("__next_f") {
                     let code = state.rsc_lexical_start.clone().mask(content);
+                    debug_assert_eq!(
+                        code.len(),
+                        content.len(),
+                        "should preserve masked byte offsets"
+                    );
                     let mut remaining = content;
                     let mut remaining_code = code.as_str();
                     let mut receiver_trimmed = trimmed;
+                    let mut unclaimed_raw_data = state.raw_data_unclaimed;
                     let unsafe_continuation = loop {
                         let range =
                             executable_payload_range(remaining, remaining_code, receiver_trimmed);
@@ -234,6 +278,15 @@ impl NextJsRscPlaceholderRewriter {
                         ) {
                             break true;
                         }
+                        let head_start = if receiver_trimmed {
+                            0
+                        } else {
+                            first_qualified_flight_push(remaining_code)
+                                .expect("should retain the matched qualified head")
+                                .start()
+                        };
+                        unclaimed_raw_data |=
+                            contains_qualified_flight_data(&remaining[..head_start]);
                         // Skip the entire string so push-like text inside a
                         // payload is not classified as another call. Only the
                         // first receiver can have streamed in an earlier fragment.
@@ -241,9 +294,14 @@ impl NextJsRscPlaceholderRewriter {
                         remaining_code = &remaining_code[end + 1..];
                         receiver_trimmed = false;
                         if !contains_qualified_flight(remaining_code) {
-                            break false;
+                            break unclaimed_raw_data || contains_qualified_flight_data(remaining);
                         }
                     };
+                    if !unsafe_continuation {
+                        // A recognized oversized push containing only complete
+                        // rows cannot leave a continuation in another script.
+                        state.raw_data_seen = false;
+                    }
                     state.bypass_rsc |= unsafe_continuation
                         || state.captured_payload_bytes > 0
                         || !state.captured_payloads.is_empty();
@@ -421,6 +479,9 @@ impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
             state.raw_flight_seen = false;
             state.raw_flight_unclaimed = false;
             state.raw_qualifier_tail.clear();
+            state.raw_data_seen = false;
+            state.raw_data_unclaimed = false;
+            state.raw_data_tail.clear();
             state.flight_lexical = ScriptLexer::default();
             return ScriptRewriteAction::Keep;
         }
@@ -435,25 +496,43 @@ impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
             content,
             &mut state.raw_qualifier_tail,
             &mut state.raw_flight_seen,
+            &QUALIFIED_FLIGHT_PUSH_PATTERN,
+            '(',
+        );
+        let raw_data_head_end = observe_flight_qualifier(
+            content,
+            &mut state.raw_data_tail,
+            &mut state.raw_data_seen,
+            &QUALIFIED_FLIGHT_DATA_HEAD,
+            ',',
         );
         let previously_owned = state.flight_node_owned;
         let lexical_start = state.flight_lexical.clone();
         let code = state.flight_lexical.mask(content);
+        debug_assert_eq!(
+            code.len(),
+            content.len(),
+            "should preserve masked byte offsets"
+        );
         let code_head_end = if state.flight_lexical.is_opaque() {
-            // At the lexical nesting limit, retain the existing conservative raw
-            // qualification. Ordinary scripts without a push do not bypass Flight.
+            // Opaque source still needs per-script protection, but a generic
+            // push hint cannot open a T row. Only data heads bypass later scripts.
             let head_end = observe_flight_qualifier(
                 content,
                 &mut state.flight_qualifier_tail,
                 &mut state.flight_node_owned,
+                &QUALIFIED_FLIGHT_PUSH_PATTERN,
+                '(',
             );
-            state.bypass_rsc |= state.flight_node_owned;
+            state.bypass_rsc |= state.raw_data_seen;
             head_end
         } else {
             observe_flight_qualifier(
                 &code,
                 &mut state.flight_qualifier_tail,
                 &mut state.flight_node_owned,
+                &QUALIFIED_FLIGHT_PUSH_PATTERN,
+                '(',
             )
         };
         // An unclaimed raw head may precede this fragment's capture buffer.
@@ -461,6 +540,12 @@ impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
         // does not prove an earlier raw head safe, nor does a later fragment.
         state.raw_flight_unclaimed |= !previously_owned
             && raw_head_end
+                .is_some_and(|raw_end| code_head_end.is_none_or(|code_end| raw_end < code_end));
+        // A data head before the first executable push cannot belong to that
+        // capture, even if its receiver streamed in a prior fragment. Comparing
+        // against any executable push also excludes hints inside form state.
+        state.raw_data_unclaimed |= !previously_owned
+            && raw_data_head_end
                 .is_some_and(|raw_end| code_head_end.is_none_or(|code_end| raw_end < code_end));
         // A call head can complete after a tentative property probe overflowed.
         // Once it proves Flight, preserve its entire raw continuation/group.
@@ -486,7 +571,22 @@ impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
         {
             state.raw_flight_unclaimed = true;
         }
+        if !ctx.is_last_in_text_node
+            && state.raw_data_seen
+            && !matches!(
+                state.rsc_script,
+                super::rsc_stream::FragmentState::Buffering(_)
+            )
+        {
+            state.raw_data_unclaimed = true;
+        }
         if ctx.is_last_in_text_node {
+            // Raw data can continue a row in the next script. Keep the entire
+            // remaining Flight stream raw, not merely this GTM snapshot.
+            state.bypass_rsc |= state.raw_data_seen || state.raw_data_unclaimed;
+            state.raw_data_seen = false;
+            state.raw_data_unclaimed = false;
+            state.raw_data_tail.clear();
             state.flight_node_owned = false;
             state.flight_qualifier_tail.clear();
             state.raw_flight_seen = false;
@@ -500,6 +600,27 @@ impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
         }
         action
     }
+}
+
+/// Recognize complete bootstrap/form-state arguments without changing their bytes.
+/// The containing script is already bounded by the capture limit. `IgnoredAny`
+/// checks serialized Next.js form state without allocating its values; binary
+/// channel 3 is deliberately not accepted because it belongs to the row stream.
+fn inert_flight_control_end(arguments: &str) -> Option<usize> {
+    if let Some(control) = INERT_FLIGHT_CONTROL_ARGUMENTS.find(arguments) {
+        return Some(control.end());
+    }
+    FLIGHT_FORM_STATE_ARGUMENTS.find(arguments)?;
+    let mut values = serde_json::Deserializer::from_str(arguments).into_iter::<(u8, IgnoredAny)>();
+    let (channel, _) = values.next()?.ok()?;
+    if channel != 2 {
+        return None;
+    }
+    let end = values.byte_offset();
+    let remaining = &arguments[end..];
+    let closing = remaining.trim_start();
+    closing.strip_prefix(')')?;
+    Some(end + remaining.len() - closing.len() + 1)
 }
 
 /// Match a call head only in executable source, then read its original string.
@@ -521,23 +642,35 @@ fn contains_qualified_flight(source: &str) -> bool {
     first_qualified_flight_push(source).is_some()
 }
 
+fn contains_qualified_flight_data(source: &str) -> bool {
+    first_qualified_flight_head(source, &QUALIFIED_FLIGHT_DATA_HEAD).is_some()
+}
+
 fn first_qualified_flight_push(source: &str) -> Option<regex::Match<'_>> {
-    QUALIFIED_FLIGHT_PUSH_PATTERN
-        .find_iter(source)
-        .find(|call| {
-            let identifier = call.start()
-                + call
-                    .as_str()
-                    .find("__next_f")
-                    .expect("should find identifier in qualified push pattern");
-            receiver_context_is_flight_push(&source[..identifier])
-        })
+    first_qualified_flight_head(source, &QUALIFIED_FLIGHT_PUSH_PATTERN)
+}
+
+fn first_qualified_flight_head<'a>(source: &'a str, pattern: &Regex) -> Option<regex::Match<'a>> {
+    pattern.find_iter(source).find(|call| {
+        let identifier = call.start()
+            + call
+                .as_str()
+                .find("__next_f")
+                .expect("should find identifier in qualified push pattern");
+        receiver_context_is_flight_push(&source[..identifier])
+    })
 }
 
 /// Observe a bounded whitespace-normalized call head without buffering script
 /// source, including initializer heads split after document bypass. Return its
 /// original fragment byte-end so raw and masked observations can be compared.
-fn observe_flight_qualifier(content: &str, tail: &mut String, seen: &mut bool) -> Option<usize> {
+fn observe_flight_qualifier(
+    content: &str,
+    tail: &mut String,
+    seen: &mut bool,
+    pattern: &Regex,
+    trigger: char,
+) -> Option<usize> {
     if *seen {
         return None;
     }
@@ -558,10 +691,10 @@ fn observe_flight_qualifier(content: &str, tail: &mut String, seen: &mut bool) -
                 .expect("should find bounded qualifier character boundary");
             tail.drain(..start);
         }
-        if character == '(' && contains_qualified_flight(tail) {
+        if character == trigger && first_qualified_flight_head(tail, pattern).is_some() {
             *seen = true;
             tail.clear();
-            return Some(offset + 1);
+            return Some(offset + character.len_utf8());
         }
     }
     None
@@ -645,6 +778,97 @@ mod tests {
     }
 
     #[test]
+    fn serialized_form_state_requires_complete_arguments() {
+        for arguments in [
+            "[2,42])tail",
+            "[2,true])tail",
+            r#"[2,"quoted \" ) ] é😀"] )tail"#,
+            r#"[2,[{"message":"Saved"},"k1","7f3a",0]])tail"#,
+            r#"[2,{"nested":[null,false,{"url":"https://origin.example.com/form"}]}])tail"#,
+        ] {
+            let end = inert_flight_control_end(arguments)
+                .expect("should recognize complete serialized form state");
+            assert_eq!(
+                &arguments[end..],
+                "tail",
+                "should consume exactly the control arguments"
+            );
+        }
+        for arguments in [
+            "[2] )",
+            "[2,null,null])",
+            "[2,null]",
+            "[2,computeState()])",
+            "[2,{'message':'Saved'}])",
+            r#"[2,{"message":"Saved"})"#,
+            r#"[3,"AAECAw=="])"#,
+        ] {
+            assert!(
+                inert_flight_control_end(arguments).is_none(),
+                "should preserve fallback for malformed, dynamic, incomplete and binary arguments"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_data_observation_is_bounded_and_distinguishes_controls_from_data() {
+        let whitespace = " ".repeat(128);
+        for head in [
+            "self.__next_f.push([1,".to_owned(),
+            "window.__next_f . push ( [ 1 ,".to_owned(),
+            "(self.__next_f=self.__next_f||[]).push([1,".to_owned(),
+            format!(
+                "(window.__next_f{whitespace}={whitespace}window.__next_f{whitespace}||{whitespace}[]{whitespace}){whitespace}.{whitespace}push{whitespace}({whitespace}[{whitespace}1{whitespace},"
+            ),
+        ] {
+            for split in 0..=head.len() {
+                let mut tail = String::new();
+                let mut seen = false;
+                for fragment in [&head[..split], &head[split..]] {
+                    let _ = observe_flight_qualifier(
+                        fragment,
+                        &mut tail,
+                        &mut seen,
+                        &QUALIFIED_FLIGHT_DATA_HEAD,
+                        ',',
+                    );
+                    assert!(
+                        tail.len() <= FLIGHT_QUALIFIER_TAIL_BYTES,
+                        "should bound the data observer"
+                    );
+                }
+                assert!(
+                    seen,
+                    "should detect a qualified channel-1 head at split {split}"
+                );
+            }
+        }
+        for source in [
+            "self.__next_f.push(",
+            "self.__next_f.push([0])",
+            "self.__next_f.push([2,null])",
+            "self.__next_f.push([3,",
+            "self.__next_f.push([10,",
+            "myself.__next_f.push([1,",
+            "foreign.__next_f.push([1,",
+        ] {
+            let mut tail = String::new();
+            let mut seen = false;
+            let _ = observe_flight_qualifier(
+                source,
+                &mut tail,
+                &mut seen,
+                &QUALIFIED_FLIGHT_DATA_HEAD,
+                ',',
+            );
+            assert!(
+                !seen,
+                "should not treat generic, control or unqualified heads as data"
+            );
+        }
+    }
+
+    #[test]
     fn raw_qualifier_observation_is_bounded_and_survives_every_split() {
         for head in [
             "self.__next_f . push (",
@@ -656,14 +880,32 @@ mod tests {
             for split in 0..=head.len() {
                 let mut tail = String::new();
                 let mut seen = false;
-                let _ = observe_flight_qualifier(&"é😀".repeat(1000), &mut tail, &mut seen);
+                let _ = observe_flight_qualifier(
+                    &"é😀".repeat(1000),
+                    &mut tail,
+                    &mut seen,
+                    &QUALIFIED_FLIGHT_PUSH_PATTERN,
+                    '(',
+                );
                 assert!(
                     tail.len() <= FLIGHT_QUALIFIER_TAIL_BYTES,
                     "should bound raw tail"
                 );
                 assert!(!seen, "ordinary source must not protect Flight");
-                let _ = observe_flight_qualifier(&head[..split], &mut tail, &mut seen);
-                let _ = observe_flight_qualifier(&head[split..], &mut tail, &mut seen);
+                let _ = observe_flight_qualifier(
+                    &head[..split],
+                    &mut tail,
+                    &mut seen,
+                    &QUALIFIED_FLIGHT_PUSH_PATTERN,
+                    '(',
+                );
+                let _ = observe_flight_qualifier(
+                    &head[split..],
+                    &mut tail,
+                    &mut seen,
+                    &QUALIFIED_FLIGHT_PUSH_PATTERN,
+                    '(',
+                );
                 assert!(
                     seen,
                     "should recognize normalized raw head at split {split}"
@@ -680,7 +922,7 @@ mod tests {
     fn unrecognized_qualified_prefix_makes_the_whole_batch_raw_and_protected() {
         let state = IntegrationDocumentState::default();
         let rewriter = NextJsRscPlaceholderRewriter::new(test_config());
-        let script = r#"self.__next_f.push([2,"1:T40,'http://www.googletagmanager.com/gtm.js'"]);self.__next_f.push([1,"later"])"#;
+        let script = r#"self.__next_f.push([3,"AAECAw=="]);self.__next_f.push([1,"later"])"#;
         assert_eq!(
             rewriter.rewrite(script, &ctx(true, &state)),
             ScriptRewriteAction::Keep,
@@ -688,14 +930,20 @@ mod tests {
         );
         let shared = document_state(&state);
         let state = shared.lock().expect("should lock state");
-        assert!(state.captured_payloads.is_empty());
-        assert!(state.current_fragment_protected);
+        assert!(
+            state.captured_payloads.is_empty(),
+            "should not capture any payload from an unsupported batch"
+        );
+        assert!(
+            state.current_fragment_protected,
+            "should protect the unsupported batch from ordinary GTM rewriting"
+        );
     }
 
     #[test]
     fn inert_controls_do_not_make_unsafe_batches_partially_capturable() {
         for unsafe_call in [
-            r#"self.__next_f.push([2,"1:T40,'http://www.googletagmanager.com/gtm.js'"])"#,
+            r#"self.__next_f.push([3,"AAECAw=="])"#,
             "self.__next_f.push([0,1])",
             "self.__next_f.push([2,null",
             "self.__next_f.push([0]",
@@ -717,9 +965,18 @@ mod tests {
                 );
                 let shared = document_state(&state);
                 let state = shared.lock().expect("should lock state");
-                assert!(state.captured_payloads.is_empty());
-                assert!(state.current_fragment_protected);
-                assert!(state.bypass_rsc);
+                assert!(
+                    state.captured_payloads.is_empty(),
+                    "should not capture any payload from an unsafe batch"
+                );
+                assert!(
+                    state.current_fragment_protected,
+                    "should protect the unsafe batch from ordinary GTM rewriting"
+                );
+                assert!(
+                    state.bypass_rsc,
+                    "should bypass later Flight after an unsupported or incomplete push"
+                );
             }
         }
     }
@@ -729,18 +986,30 @@ mod tests {
         for script in [
             "(self.__next_f=self.__next_f||[]).push([0]);self.__next_f.push([2,null])",
             "window.__next_f . push ( [ 0 ] );window.__next_f.push( [ 2 , null ] )",
+            r#"self.__next_f.push([2,[{"message":"Saved","hint":"self.__next_f.push([1,"},"k1","7f3a",0]])"#,
+            r#"self.__next_f.push([2,"1:T40,'http://www.googletagmanager.com/gtm.js'"])"#,
         ] {
             let state = IntegrationDocumentState::default();
             let rewriter = NextJsRscPlaceholderRewriter::new(test_config());
             assert_eq!(
                 rewriter.rewrite(script, &ctx(true, &state)),
-                ScriptRewriteAction::Keep
+                ScriptRewriteAction::Keep,
+                "should preserve completed control arguments verbatim"
             );
             let shared = document_state(&state);
             let state = shared.lock().expect("should lock state");
-            assert!(state.captured_payloads.is_empty());
-            assert!(state.current_fragment_protected);
-            assert!(!state.bypass_rsc);
+            assert!(
+                state.captured_payloads.is_empty(),
+                "should keep completed controls out of the Flight payload queue"
+            );
+            assert!(
+                state.current_fragment_protected,
+                "should protect completed controls from ordinary GTM rewriting"
+            );
+            assert!(
+                !state.bypass_rsc,
+                "should allow later Flight rewriting after completed controls"
+            );
         }
     }
 
@@ -768,10 +1037,15 @@ mod tests {
                 captured,
                 "should commit every push or none"
             );
-            assert_eq!(state.captured_payload_bytes, captured * payload.len());
+            assert_eq!(
+                state.captured_payload_bytes,
+                captured * payload.len(),
+                "should account for exactly the captured payload bytes"
+            );
             assert_eq!(
                 matches!(action, ScriptRewriteAction::Replace(_)),
-                captured > 0
+                captured > 0,
+                "should replace source only when a qualified payload was captured"
             );
             assert_eq!(
                 state.current_fragment_protected,
@@ -792,7 +1066,8 @@ mod tests {
                 .lock()
                 .expect("should lock state")
                 .captured_payloads
-                .is_empty()
+                .is_empty(),
+            "should discard every capture when a later push is incomplete"
         );
     }
 
@@ -843,7 +1118,8 @@ mod tests {
                     let final_fragment = fragment.is_empty();
                     assert_eq!(
                         rewriter.rewrite(fragment, &ctx(final_fragment, &state)),
-                        ScriptRewriteAction::Keep
+                        ScriptRewriteAction::Keep,
+                        "should preserve every raw fragment during document bypass"
                     );
                     assert_eq!(
                         IntegrationScriptRewriter::rewrite(
@@ -867,10 +1143,12 @@ mod tests {
                 let ordinary = "var ordinary='http://www.googletagmanager.com/gtm.js';";
                 assert_eq!(
                     rewriter.rewrite(ordinary, &ctx(true, &state)),
-                    ScriptRewriteAction::Keep
+                    ScriptRewriteAction::Keep,
+                    "should leave ordinary script source to the GTM stage"
                 );
                 assert!(
-                    matches!(IntegrationScriptRewriter::rewrite(&*gtm, ordinary, &ctx(true, &state)), ScriptRewriteAction::Replace(ref text) if text.contains("/integrations/google_tag_manager/gtm.js"))
+                    matches!(IntegrationScriptRewriter::rewrite(&*gtm, ordinary, &ctx(true, &state)), ScriptRewriteAction::Replace(ref text) if text.contains("/integrations/google_tag_manager/gtm.js")),
+                    "should permit GTM rewriting when there is no qualified Flight head"
                 );
             }
         }
@@ -903,7 +1181,8 @@ mod tests {
         let raw = r#"self.__next_f.push([1,"1:T2,'http://www.googletagmanager.com/gtm.js?id=GTM-MIX1'"] )"#;
         assert_eq!(
             rewriter.rewrite(raw, &ctx(true, &state)),
-            ScriptRewriteAction::Keep
+            ScriptRewriteAction::Keep,
+            "should preserve raw Flight bytes on fallback"
         );
         assert_eq!(
             IntegrationScriptRewriter::rewrite(&*gtm, raw, &ctx(true, &state)),
@@ -918,7 +1197,8 @@ mod tests {
             let last = part.ends_with(")");
             assert_eq!(
                 rewriter.rewrite(part, &ctx(last, &state)),
-                ScriptRewriteAction::Keep
+                ScriptRewriteAction::Keep,
+                "should preserve raw Flight continuations across fragments"
             );
             assert_eq!(
                 IntegrationScriptRewriter::rewrite(&*gtm, part, &ctx(last, &state)),
@@ -929,16 +1209,19 @@ mod tests {
         let prefix = "var before='google";
         assert_eq!(
             rewriter.rewrite(prefix, &ctx(false, &state)),
-            ScriptRewriteAction::Keep
+            ScriptRewriteAction::Keep,
+            "should leave the ordinary prefix to the GTM stage"
         );
         assert_eq!(
             IntegrationScriptRewriter::rewrite(&*gtm, prefix, &ctx(false, &state)),
-            ScriptRewriteAction::RemoveNode
+            ScriptRewriteAction::RemoveNode,
+            "should allow GTM to buffer the ordinary prefix"
         );
         let flight = r#"';self.__next_f.push([1,"1:T2,'http://www.googletagmanager.com/gtm.js'"])"#;
         assert_eq!(
             rewriter.rewrite(flight, &ctx(false, &state)),
-            ScriptRewriteAction::Keep
+            ScriptRewriteAction::Keep,
+            "should preserve raw Flight when its stage is bypassed"
         );
         assert_eq!(
             IntegrationScriptRewriter::rewrite(&*gtm, flight, &ctx(false, &state)),
@@ -947,7 +1230,8 @@ mod tests {
         );
         assert_eq!(
             rewriter.rewrite("", &ctx(true, &state)),
-            ScriptRewriteAction::Keep
+            ScriptRewriteAction::Keep,
+            "should complete the empty final Flight fragment without replacement"
         );
         assert_eq!(
             IntegrationScriptRewriter::rewrite(&*gtm, "", &ctx(true, &state)),
@@ -957,7 +1241,8 @@ mod tests {
         let ordinary = "var url='http://www.googletagmanager.com/gtm.js';";
         assert_eq!(
             rewriter.rewrite(ordinary, &ctx(true, &state)),
-            ScriptRewriteAction::Keep
+            ScriptRewriteAction::Keep,
+            "should leave the later ordinary script to the GTM stage"
         );
         assert!(
             matches!(IntegrationScriptRewriter::rewrite(&*gtm, ordinary, &ctx(true, &state)), ScriptRewriteAction::Replace(ref value) if value.contains("/integrations/google_tag_manager/gtm.js")),

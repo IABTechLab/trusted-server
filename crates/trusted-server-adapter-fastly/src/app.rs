@@ -3719,14 +3719,22 @@ mod tests {
                 .body(Body::empty())
                 .expect("should build navigation");
             let response = block_on(super::dispatch_fallback(&state, &services, request));
-            assert_eq!(response.status(), StatusCode::OK);
-            assert!(!response.headers().contains_key(header::CONTENT_LENGTH));
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "should return a successful composed publisher response"
+            );
+            assert!(
+                !response.headers().contains_key(header::CONTENT_LENGTH),
+                "should drop the stale content length after streaming rewrites"
+            );
             assert_eq!(
                 response
                     .headers()
                     .get(header::CONTENT_ENCODING)
                     .map(|value| value.to_str().expect("should have ASCII coding")),
-                gzip.then_some("gzip")
+                gzip.then_some("gzip"),
+                "should retain the requested response compression"
             );
             let Body::Stream(mut stream) = response.into_body() else {
                 panic!("should retain lazy Fastly body");

@@ -1139,13 +1139,18 @@ async fn nextjs_gtm_html_response_is_complete() {
             .call(request)
             .await
             .expect("should serve HTML");
-        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "should return a successful composed publisher response"
+        );
         assert_eq!(
             response
                 .headers()
                 .get("content-encoding")
                 .map(|value| value.to_str().expect("should have ASCII coding")),
-            gzip.then_some("gzip")
+            gzip.then_some("gzip"),
+            "should retain the requested response compression"
         );
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await

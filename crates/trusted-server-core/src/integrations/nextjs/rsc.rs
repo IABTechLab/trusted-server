@@ -404,11 +404,12 @@ fn rewrite_span(
     origin_host: &str,
     request_host: &str,
     request_scheme: &str,
-    transform: Option<fn(&str) -> String>,
+    transform: Option<fn(&str, bool) -> String>,
+    record_text: bool,
 ) -> String {
     let rewritten = rewriter.rewrite_to_string(content, origin_host, request_host, request_scheme);
     match transform {
-        Some(transform) => transform(&rewritten),
+        Some(transform) => transform(&rewritten, record_text),
         None => rewritten,
     }
 }
@@ -437,7 +438,7 @@ fn rewrite_rsc_tchunks_with_transform(
     origin_host: &str,
     request_host: &str,
     request_scheme: &str,
-    transform: Option<fn(&str) -> String>,
+    transform: Option<fn(&str, bool) -> String>,
 ) -> String {
     let Some(chunks) = find_tchunks(content) else {
         log::warn!(
@@ -454,6 +455,7 @@ fn rewrite_rsc_tchunks_with_transform(
             request_host,
             request_scheme,
             transform,
+            false,
         );
     }
 
@@ -469,6 +471,7 @@ fn rewrite_rsc_tchunks_with_transform(
             request_host,
             request_scheme,
             transform,
+            false,
         ));
 
         let chunk_content = &content[chunk.header_end..chunk.content_end];
@@ -479,6 +482,7 @@ fn rewrite_rsc_tchunks_with_transform(
             request_host,
             request_scheme,
             transform,
+            true,
         );
 
         let new_length = calculate_unescaped_byte_length(&rewritten_content);
@@ -501,6 +505,7 @@ fn rewrite_rsc_tchunks_with_transform(
         request_host,
         request_scheme,
         transform,
+        false,
     ));
 
     result
@@ -591,7 +596,7 @@ pub(super) fn rewrite_rsc_scripts_combined_with_transform(
     request_host: &str,
     request_scheme: &str,
     max_combined_payload_bytes: usize,
-    transform: Option<fn(&str) -> String>,
+    transform: Option<fn(&str, bool) -> String>,
 ) -> Vec<String> {
     let Some((_, preceding_payloads)) = payloads.split_last() else {
         return Vec::new();
@@ -698,6 +703,7 @@ pub(super) fn rewrite_rsc_scripts_combined_with_transform(
                     request_host,
                     request_scheme,
                     transform,
+                    false,
                 )
             })
             .collect();
@@ -715,6 +721,7 @@ pub(super) fn rewrite_rsc_scripts_combined_with_transform(
             request_host,
             request_scheme,
             transform,
+            false,
         ));
 
         let chunk_content = &combined[chunk.header_end..chunk.content_end];
@@ -725,6 +732,7 @@ pub(super) fn rewrite_rsc_scripts_combined_with_transform(
             request_host,
             request_scheme,
             transform,
+            true,
         );
 
         let new_length = calculate_unescaped_byte_length_skip_markers(&rewritten_content);
@@ -747,6 +755,7 @@ pub(super) fn rewrite_rsc_scripts_combined_with_transform(
         request_host,
         request_scheme,
         transform,
+        false,
     ));
 
     result.split(RSC_MARKER).map(String::from).collect()

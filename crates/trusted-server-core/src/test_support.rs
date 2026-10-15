@@ -333,12 +333,22 @@ pub mod nextjs_auction {
             "should rewrite origin"
         );
         assert_eq!(
-            data["tag"],
-            "/integrations/google_tag_manager/gtm.js?q=\"x\"&v=é"
+            data["tag"], "/integrations/google_tag_manager/gtm.js?q=\"x\"&v=é",
+            "should preserve query quotes and Unicode while routing the GTM tag"
         );
-        assert_eq!(data["ga"], "/integrations/google_tag_manager/g/collect?v=2");
-        assert_eq!(data["text"], "é😀</body>");
-        assert_eq!(data["padding"], "_".repeat(11000));
+        assert_eq!(
+            data["ga"], "/integrations/google_tag_manager/g/collect?v=2",
+            "should route the GA collect endpoint"
+        );
+        assert_eq!(
+            data["text"], "é😀</body>",
+            "should preserve Unicode and literal closing-tag text"
+        );
+        assert_eq!(
+            data["padding"],
+            "_".repeat(11000),
+            "should preserve all model padding"
+        );
     }
 
     /// Upstream that serves [`origin_html`] and one deterministic bid.
