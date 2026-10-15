@@ -10,9 +10,12 @@ use crate::release::source_policy::ApprovedSourceRoot;
 use crate::release::tests::online::Case;
 use crate::release::tests::verification::fixture::{self, ASSET, COMMIT};
 use std::fs;
+#[cfg(target_os = "macos")]
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt as _;
+#[cfg(target_os = "macos")]
 use std::process::Command;
+#[cfg(target_os = "macos")]
 use std::time::Duration;
 
 #[test]
