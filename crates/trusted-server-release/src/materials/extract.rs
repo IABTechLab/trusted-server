@@ -19,10 +19,16 @@ use crate::error::ReleaseError;
 pub(super) struct Selection<'a> {
     pub(super) root: &'a str,
     pub(super) index_alias: bool,
+    pub(super) node_tar_timestamps: bool,
+    pub(super) local_pax: bool,
 }
 
+mod compatibility;
+
 const DECODED_LIMIT: u64 = 512 * 1024 * 1024;
-const MEMBER_LIMIT: u64 = 64 * 1024 * 1024;
+// The approved npm lock includes a 110,275,248-byte optional native member.
+// Keep the compressed-original and total decoded limits independent.
+const MEMBER_LIMIT: u64 = 128 * 1024 * 1024;
 const ENTRY_LIMIT: usize = 100_000;
 const DEPTH_LIMIT: usize = 64;
 const PATH_LIMIT: usize = 4096;
@@ -242,11 +248,19 @@ fn field(bytes: &[u8]) -> Result<&str, Report<ReleaseError>> {
 }
 
 /// Uses raw fields because [`tar::Entry::path_bytes`] normalizes backslashes.
-fn raw_name(header: &tar::Header) -> Result<String, Report<ReleaseError>> {
+fn raw_name(
+    header: &tar::Header,
+    selection: &Selection<'_>,
+) -> Result<String, Report<ReleaseError>> {
     let name = field(&header.as_old().name)?;
     match header.as_ustar() {
         Some(ustar) => {
-            let prefix = field(&ustar.prefix)?;
+            let prefix =
+                if selection.node_tar_timestamps && ustar.prefix.iter().any(|byte| *byte != 0) {
+                    compatibility::timestamp_prefix(header)?
+                } else {
+                    field(&ustar.prefix)?
+                };
             Ok(if prefix.is_empty() {
                 name.to_owned()
             } else {
@@ -333,7 +347,7 @@ impl State {
                 "TAR member is not a regular file or directory",
             ));
         }
-        let raw = raw_name(header)?;
+        let raw = raw_name(header, selection)?;
         let name = member_name(&raw, directory, selection)?;
         if !self.spellings.insert(raw.clone()) {
             return Err(material_error("TAR repeats a member spelling"));
@@ -341,10 +355,15 @@ impl State {
         self.portable_name(&name)?;
         let mode = header.mode().map_err(material_error)?;
         let size = entry.size();
-        if mode & !0o777 != 0 || size > MEMBER_LIMIT || (directory && size != 0) {
-            return Err(material_error(
-                "TAR member has privileged mode or invalid size",
-            ));
+        if mode & !0o777 != 0 || (directory && size != 0) {
+            return Err(material_error(format!(
+                "TAR member `{name}` has privileged mode {mode:o} or invalid size {size}",
+            )));
+        }
+        if size > MEMBER_LIMIT {
+            return Err(material_error(format!(
+                "TAR member `{name}` size {size} exceeds member byte limit {MEMBER_LIMIT}",
+            )));
         }
         let path = self.directory.path().join(&name);
         if directory {
@@ -458,6 +477,7 @@ fn extract_bounded(
         first_spelling: BTreeMap::new(),
         directories: BTreeSet::new(),
     };
+    let mut pending_pax: Option<compatibility::LocalPax> = None;
     for (index, entry) in archive
         .entries()
         .map_err(material_error)?
@@ -467,7 +487,40 @@ fn extract_bounded(
         if index >= entry_limit {
             return Err(material_error("TAR exceeds entry count limit"));
         }
-        state.entry(entry.map_err(material_error)?, &selection)?;
+        let mut entry = entry.map_err(material_error)?;
+        if entry.header().entry_type().as_byte() == b'x' {
+            if !selection.local_pax || pending_pax.is_some() || entry.size() > 64 * 1024 {
+                return Err(material_error(
+                    "unreviewed, consecutive or oversized local PAX header",
+                ));
+            }
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).map_err(material_error)?;
+            let pax = compatibility::parse_pax(&bytes)?;
+            if raw_name(entry.header(), &selection)? != pax.header_name()
+                || entry.header().mode().map_err(material_error)? & !0o777 != 0
+                || !field(&entry.header().as_old().linkname)?.is_empty()
+            {
+                return Err(material_error("unsafe reviewed local PAX header"));
+            }
+            pending_pax = Some(pax);
+            continue;
+        }
+        if let Some(pax) = pending_pax.take() {
+            if !entry.header().entry_type().is_file() {
+                return Err(material_error(
+                    "local PAX must immediately precede a regular file",
+                ));
+            }
+            pax.join(
+                &raw_name(entry.header(), &selection)?,
+                entry.header().size().map_err(material_error)?,
+            )?;
+        }
+        state.entry(entry, &selection)?;
+    }
+    if pending_pax.is_some() {
+        return Err(material_error("dangling local PAX header"));
     }
     if state.spellings.contains("package/./dist/index.js")
         && !state.spellings.contains("package/dist/index.js")

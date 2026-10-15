@@ -113,6 +113,7 @@ fn real_two_fresh_js_builds() {
             ]
         })
         .collect();
+    let module_count = prepared.module_ids.len();
     let completed=prepared.run([&first,&second],[&first_proof,&second_proof]).expect("should complete both actual fresh offline installations, lifecycle observations, negative tool controls, full suites and final-byte equality");
     assert!(
         owned_roots.iter().all(|root| !root.exists()),
@@ -145,4 +146,21 @@ fn real_two_fresh_js_builds() {
     completed
         .rehash_for_handoff()
         .expect("should rejoin retained A bytes before downstream handoff");
+    let measurement = json!({
+        "schema_version": 1,
+        "kind": "ordinary-ci-two-fresh-js-builds",
+        "source_commit": completed.source_commit(),
+        "test_counts": completed.test_counts(),
+        "module_count": module_count,
+        "tools_sha256": completed.tools_sha256(),
+        "settings_sha256": completed.settings_sha256(),
+        "inventory_sha256": completed.inventory_sha256(),
+        "private_roots_removed": owned_roots.len(),
+        "release_qualification": false,
+    });
+    fs::write(
+        fixture.join("js-execution-measurement.json"),
+        serde_json::to_vec_pretty(&measurement).expect("should encode actual CI measurement"),
+    )
+    .expect("should retain actual CI measurement after successful handoff");
 }

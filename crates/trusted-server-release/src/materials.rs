@@ -123,11 +123,24 @@ impl LockedMaterials {
                 | ("http-proxy-agent", "7.0.2")
                 | ("https-proxy-agent", "7.0.6")
         );
+        let (root, node_tar_timestamps) = match (locked.name.as_str(), locked.version.as_str()) {
+            ("@types/chai", "5.2.3") => ("chai", true),
+            ("@types/deep-eql", "4.0.2") => ("deep-eql", true),
+            ("@types/estree", "1.0.8") => ("estree", true),
+            ("@types/jsdom", "27.0.0") => ("jsdom", true),
+            ("@types/json-schema", "7.0.15") => ("json-schema", true),
+            ("@types/json5", "0.0.29") => ("json5", false),
+            ("@types/node", "24.10.13") => ("node v24.10", true),
+            ("@types/tough-cookie", "4.0.5") => ("tough-cookie", true),
+            _ => ("package", false),
+        };
         extract::extract(
             original,
             extract::Selection {
-                root: "package",
+                root,
                 index_alias,
+                node_tar_timestamps,
+                local_pax: locked.name == "gulp-wrap" && locked.version == "0.15.0",
             },
         )
     }
@@ -156,6 +169,8 @@ impl LockedMaterials {
             extract::Selection {
                 root: &format!("{name}-{version}"),
                 index_alias: false,
+                node_tar_timestamps: false,
+                local_pax: false,
             },
         )
     }

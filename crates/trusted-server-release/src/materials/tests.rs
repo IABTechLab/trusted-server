@@ -1,6 +1,7 @@
 use crate::process::Cancellation;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
+use flate2::{Compression, write::GzEncoder};
 use serde_json::json;
 use sha2::{Digest as _, Sha512};
 use std::ffi::CString;
@@ -9,6 +10,93 @@ use std::os::unix::fs::symlink;
 use std::time::{Duration, Instant};
 
 use super::*;
+
+fn compatibility_original(root: &str, local_pax: bool) -> Vec<u8> {
+    let encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    let mut builder = tar::Builder::new(encoder);
+    if local_pax {
+        let mut body = String::new();
+        for assignment in ["path=package/file", "size=1", "NODETAR.type=File"] {
+            let mut length = assignment.len() + 3;
+            loop {
+                let record = format!("{length} {assignment}\n");
+                if record.len() == length {
+                    body.push_str(&record);
+                    break;
+                }
+                length = record.len();
+            }
+        }
+        let mut header = tar::Header::new_ustar();
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::XHeader);
+        header.set_size(body.len() as u64);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "PaxHeader/package/file", body.as_bytes())
+            .expect("should append fictional local metadata");
+    }
+    let mut header = tar::Header::new_ustar();
+    header.set_mode(0o644);
+    header.set_size(1);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, format!("{root}/file"), b"x".as_slice())
+        .expect("should append fictional regular member");
+    builder
+        .into_inner()
+        .expect("should finish fictional TAR")
+        .finish()
+        .expect("should finish fictional gzip")
+}
+
+#[test]
+fn legacy_root_and_pax_compatibility_require_exact_locked_versions() {
+    for (name, accepted, rejected, root, pax) in [
+        ("@types/chai", "5.2.3", "5.2.4", "chai", false),
+        ("@types/node", "24.10.13", "24.10.14", "node v24.10", false),
+        ("gulp-wrap", "0.15.0", "0.15.1", "package", true),
+    ] {
+        let bytes = compatibility_original(root, pax);
+        let directory = tempfile::tempdir().expect("should own fictional distribution");
+        let path = directory.path().join("original.tgz");
+        std::fs::write(&path, &bytes).expect("should retain fictional original");
+        for (version, allowed) in [(accepted, true), (rejected, false)] {
+            let location = format!("node_modules/{name}");
+            let locked = LockedMaterials {
+                source_commit: "a".repeat(40),
+                cargo_lock_sha256: "b".repeat(64),
+                npm_lock_sha256: "c".repeat(64),
+                cargo: CargoMaterials {
+                    registry: BTreeMap::new(),
+                    git: Default::default(),
+                },
+                npm: BTreeMap::from([(
+                    location.clone(),
+                    NpmMaterial {
+                        name: name.to_owned(),
+                        version: version.to_owned(),
+                        resolved: "https://example.com/fixture.tgz".to_owned(),
+                        sha512: Sha512::digest(&bytes).into(),
+                    },
+                )]),
+            };
+            let original = locked
+                .verify_npm(
+                    &location,
+                    &path,
+                    Instant::now() + Duration::from_secs(10),
+                    &Cancellation::default(),
+                )
+                .expect("should authenticate exact fictional bytes before selection");
+            assert_eq!(
+                locked.extract_npm(&location, original).is_ok(),
+                allowed,
+                "should restrict legacy extraction to reviewed package/version: {name}@{version}"
+            );
+        }
+    }
+}
 
 fn npm_lock(integrity: &str) -> Vec<u8> {
     serde_json::to_vec(&json!({

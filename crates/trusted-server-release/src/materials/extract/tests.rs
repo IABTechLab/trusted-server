@@ -45,6 +45,10 @@ fn tar_bytes(entries: &[(&str, u8, u32, &[u8])]) -> Vec<u8> {
 }
 
 fn original(bytes: &[u8]) -> VerifiedOriginal {
+    original_with_timeout(bytes, Duration::from_secs(10))
+}
+
+fn original_with_timeout(bytes: &[u8], timeout: Duration) -> VerifiedOriginal {
     let directory = tempfile::tempdir().expect("should create archive directory");
     let path = directory.path().join("original.tgz");
     fs::write(&path, bytes).expect("should write archive");
@@ -53,7 +57,7 @@ fn original(bytes: &[u8]) -> VerifiedOriginal {
         Expected::Sha256(&hex::encode(Sha256::digest(bytes))),
         &"a".repeat(40),
         "npm:node_modules/fictional-package",
-        Instant::now() + Duration::from_secs(10),
+        Instant::now() + timeout,
         &Cancellation::default(),
     )
     .expect("should verify original bytes")
@@ -72,6 +76,8 @@ fn extracts_verified_regular_files_and_preserves_original_bytes() {
         Selection {
             root: "package",
             index_alias: false,
+            node_tar_timestamps: false,
+            local_pax: false,
         },
     )
     .expect("should extract verified regular file");
@@ -86,6 +92,45 @@ fn extracts_verified_regular_files_and_preserves_original_bytes() {
         .copy_verified(&mut retained)
         .expect("should retain authenticated compressed original");
     assert_eq!(retained, bytes, "should preserve exact compressed bytes");
+}
+
+#[test]
+fn accepts_bounded_native_members_above_64_mib() {
+    let size = 64 * 1024 * 1024 + 1;
+    let encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    let mut builder = tar::Builder::new(encoder);
+    let mut header = tar::Header::new_ustar();
+    header.set_mode(0o644);
+    header.set_size(size);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, "package/native.node", io::repeat(0).take(size))
+        .expect("should stream a bounded large native member");
+    let bytes = builder
+        .into_inner()
+        .expect("should finish native fixture TAR")
+        .finish()
+        .expect("should finish native fixture gzip");
+    let extracted = extract(
+        original_with_timeout(&bytes, Duration::from_secs(60)),
+        Selection {
+            root: "package",
+            index_alias: false,
+            node_tar_timestamps: false,
+            local_pax: false,
+        },
+    )
+    .expect("should support authenticated native members larger than 64 MiB");
+    assert_eq!(
+        fs::metadata(extracted.root().join("native.node"))
+            .expect("should inspect native member")
+            .len(),
+        size,
+        "should retain every original native byte"
+    );
+    extracted
+        .verify_unchanged()
+        .expect("should stream recheck the entire large native member");
 }
 
 #[test]
@@ -124,7 +169,9 @@ fn rejects_unsafe_paths_types_modes_duplicates_and_collisions() {
                 original(&compressed(&tar_bytes(&entries))),
                 Selection {
                     root: "package",
-                    index_alias: false
+                    index_alias: false,
+                    node_tar_timestamps: false,
+                    local_pax: false,
                 }
             )
             .is_err(),
@@ -142,7 +189,9 @@ fn rejects_excessive_depth_member_size_and_cancelled_extraction() {
             original(&bytes),
             Selection {
                 root: "package",
-                index_alias: false
+                index_alias: false,
+                node_tar_timestamps: false,
+                local_pax: false,
             }
         )
         .is_err(),
@@ -154,16 +203,23 @@ fn rejects_excessive_depth_member_size_and_cancelled_extraction() {
     header.set_size(MEMBER_LIMIT + 1);
     header.set_cksum();
     tar[..512].copy_from_slice(header.as_bytes());
+    let rejected = extract(
+        original(&compressed(&tar)),
+        Selection {
+            root: "package",
+            index_alias: false,
+            node_tar_timestamps: false,
+            local_pax: false,
+        },
+    )
+    .err()
+    .expect("should reject oversized member before reading body");
+    let diagnostic = format!("{rejected:?}");
     assert!(
-        extract(
-            original(&compressed(&tar)),
-            Selection {
-                root: "package",
-                index_alias: false
-            }
-        )
-        .is_err(),
-        "should reject oversized member before reading body"
+        diagnostic.contains("package/file")
+            && diagnostic.contains("134217729")
+            && diagnostic.contains("134217728"),
+        "should identify the rejected member, actual size and enforced bound"
     );
     let bytes = compressed(&tar_bytes(&[("package/file", b'0', 0o644, b"x")]));
     let cancellation = Cancellation::default();
@@ -186,7 +242,9 @@ fn rejects_excessive_depth_member_size_and_cancelled_extraction() {
             original,
             Selection {
                 root: "package",
-                index_alias: false
+                index_alias: false,
+                node_tar_timestamps: false,
+                local_pax: false,
             }
         )
         .is_err(),
@@ -206,7 +264,9 @@ fn index_alias_exception_requires_identical_pair_and_no_third_entry() {
             original(&compressed(&tar_bytes(&pair[..1]))),
             Selection {
                 root: "package",
-                index_alias: true
+                index_alias: true,
+                node_tar_timestamps: false,
+                local_pax: false,
             }
         )
         .is_err(),
@@ -217,7 +277,9 @@ fn index_alias_exception_requires_identical_pair_and_no_third_entry() {
             original(&bytes),
             Selection {
                 root: "package",
-                index_alias: true
+                index_alias: true,
+                node_tar_timestamps: false,
+                local_pax: false,
             }
         )
         .is_ok(),
@@ -228,7 +290,9 @@ fn index_alias_exception_requires_identical_pair_and_no_third_entry() {
             original(&bytes),
             Selection {
                 root: "package",
-                index_alias: false
+                index_alias: false,
+                node_tar_timestamps: false,
+                local_pax: false,
             }
         )
         .is_err(),
@@ -241,7 +305,9 @@ fn index_alias_exception_requires_identical_pair_and_no_third_entry() {
             original(&compressed(&tar_bytes(&changed))),
             Selection {
                 root: "package",
-                index_alias: true
+                index_alias: true,
+                node_tar_timestamps: false,
+                local_pax: false,
             }
         )
         .is_err(),
@@ -254,7 +320,9 @@ fn index_alias_exception_requires_identical_pair_and_no_third_entry() {
             original(&compressed(&tar_bytes(&third))),
             Selection {
                 root: "package",
-                index_alias: true
+                index_alias: true,
+                node_tar_timestamps: false,
+                local_pax: false,
             }
         )
         .is_err(),
@@ -269,7 +337,9 @@ fn index_alias_exception_requires_identical_pair_and_no_third_entry() {
             original(&compressed(&tar_bytes(&directory_alias))),
             Selection {
                 root: "package",
-                index_alias: true
+                index_alias: true,
+                node_tar_timestamps: false,
+                local_pax: false,
             }
         )
         .is_err(),
@@ -303,7 +373,9 @@ fn rejects_hidden_data_bad_trailers_concatenation_and_truncation() {
                 original(&bad),
                 Selection {
                     root: "package",
-                    index_alias: false
+                    index_alias: false,
+                    node_tar_timestamps: false,
+                    local_pax: false,
                 }
             )
             .is_err(),
@@ -439,7 +511,9 @@ fn enforces_decoded_byte_and_entry_budgets() {
             original(&bytes),
             Selection {
                 root: "package",
-                index_alias: false
+                index_alias: false,
+                node_tar_timestamps: false,
+                local_pax: false,
             },
             1
         )
@@ -471,6 +545,8 @@ fn extracted_tree_review_rejects_changed_or_added_members() {
         Selection {
             root: "package",
             index_alias: false,
+            node_tar_timestamps: false,
+            local_pax: false,
         },
     )
     .expect("should extract original");
@@ -548,6 +624,8 @@ fn extraction_recheck_rejects_root_alias_and_missing_empty_directory() {
         Selection {
             root: "package",
             index_alias: false,
+            node_tar_timestamps: false,
+            local_pax: false,
         },
     )
     .expect("should extract original");
@@ -567,5 +645,177 @@ fn extraction_recheck_rejects_root_alias_and_missing_empty_directory() {
     assert!(
         extracted.verify_unchanged().is_err(),
         "should reject replaced extraction root even with identical members"
+    );
+}
+
+#[test]
+fn accepts_only_reviewed_node_tar_timestamp_layout() {
+    let mut header = tar::Header::new_ustar();
+    header.as_mut_bytes()[476..488].copy_from_slice(b"15075543223\0");
+    header.as_mut_bytes()[488..500].copy_from_slice(b"15075543223\0");
+    header.as_mut_bytes()[..12].copy_from_slice(b"chai/file.js");
+    let selection = Selection {
+        root: "chai",
+        index_alias: false,
+        node_tar_timestamps: true,
+        local_pax: false,
+    };
+    assert_eq!(
+        raw_name(&header, &selection).expect("should parse reviewed layout"),
+        "chai/file.js"
+    );
+    assert!(
+        raw_name(
+            &header,
+            &Selection {
+                node_tar_timestamps: false,
+                ..selection
+            }
+        )
+        .is_err(),
+        "should reject layout outside approved tuple"
+    );
+    header.as_mut_bytes()[475] = b'x';
+    assert!(
+        raw_name(&header, &selection).is_err(),
+        "should reject hidden prefix bytes"
+    );
+    header.as_mut_bytes()[475] = 0;
+    header.as_mut_bytes()[476] = b'9';
+    assert!(
+        raw_name(&header, &selection).is_err(),
+        "should reject nonoctal timestamps"
+    );
+}
+
+fn pax_record(key: &str, value: &str) -> Vec<u8> {
+    let content = format!(" {key}={value}\n");
+    let mut length = content.len() + 1;
+    loop {
+        let next = content.len() + length.to_string().len();
+        if next == length {
+            return format!("{length}{content}").into_bytes();
+        }
+        length = next;
+    }
+}
+#[test]
+fn reviewed_local_pax_never_overrides_member_selection() {
+    let mut body = pax_record("path", "package/file.js");
+    body.extend(pax_record("size", "3"));
+    body.extend(pax_record("NODETAR.type", "File"));
+    let parsed = compatibility::parse_pax(&body).expect("should parse reviewed metadata");
+    assert!(
+        parsed.join("package/file.js", 3).is_ok(),
+        "should accept redundant selectors"
+    );
+    assert!(
+        parsed.join("package/other.js", 3).is_err(),
+        "should reject path override"
+    );
+    assert!(
+        parsed.join("package/file.js", 4).is_err(),
+        "should reject size override"
+    );
+    for (key, value) in [
+        ("linkpath", "package/other"),
+        ("GNU.sparse.size", "3"),
+        ("size", "03"),
+    ] {
+        let mut invalid = body.clone();
+        invalid.extend(pax_record(key, value));
+        assert!(
+            compatibility::parse_pax(&invalid).is_err(),
+            "should reject semantic or duplicate fields"
+        );
+    }
+    assert!(
+        compatibility::parse_pax(b"99 path=package/file.js\n").is_err(),
+        "should reject malformed framing"
+    );
+}
+
+#[test]
+fn reviewed_pax_is_local_bounded_and_never_redirects_extraction() {
+    let metadata = |path: &str, size: &str| {
+        let mut bytes = pax_record("path", path);
+        bytes.extend(pax_record("size", size));
+        bytes.extend(pax_record("NODETAR.type", "File"));
+        bytes
+    };
+    let valid = metadata("package/file.js", "3");
+    let selection = Selection {
+        root: "package",
+        index_alias: false,
+        node_tar_timestamps: false,
+        local_pax: true,
+    };
+    let archive = compressed(&tar_bytes(&[
+        ("PaxHeader/package/file.js", b'x', 0o644, &valid),
+        ("package/file.js", b'0', 0o644, b"abc"),
+    ]));
+    let extracted =
+        extract(original(&archive), selection).expect("should extract redundant local metadata");
+    extracted
+        .verify_unchanged()
+        .expect("should preserve regular member facts");
+    let bad_path = metadata("package/other.js", "3");
+    let bad_size = metadata("package/file.js", "4");
+    let cases = [
+        vec![("PaxHeader/package/file.js", b'x', 0o644, valid.as_slice())],
+        vec![
+            ("PaxHeader/package/file.js", b'x', 0o644, valid.as_slice()),
+            ("PaxHeader/other.js", b'x', 0o644, valid.as_slice()),
+        ],
+        vec![
+            ("PaxHeader/package/file.js", b'g', 0o644, valid.as_slice()),
+            ("package/file.js", b'0', 0o644, b"abc"),
+        ],
+        vec![
+            (
+                "PaxHeader/package/file.js",
+                b'x',
+                0o644,
+                bad_path.as_slice(),
+            ),
+            ("package/file.js", b'0', 0o644, b"abc"),
+        ],
+        vec![
+            (
+                "PaxHeader/package/file.js",
+                b'x',
+                0o644,
+                bad_size.as_slice(),
+            ),
+            ("package/file.js", b'0', 0o644, b"abc"),
+        ],
+    ];
+    for entries in cases {
+        let bytes = compressed(&tar_bytes(&entries));
+        assert!(
+            extract(original(&bytes), selection).is_err(),
+            "should reject nonlocal or overriding metadata"
+        );
+    }
+    for (name, mode) in [
+        ("PaxHeader/../file.js", 0o644),
+        ("PaxHeader/package/file.js", 0o4644),
+    ] {
+        let bytes = compressed(&tar_bytes(&[
+            (name, b'x', mode, &valid),
+            ("package/file.js", b'0', 0o644, b"abc"),
+        ]));
+        assert!(
+            extract(original(&bytes), selection).is_err(),
+            "should reject unsafe PAX header itself"
+        );
+    }
+    let unreviewed = Selection {
+        local_pax: false,
+        ..selection
+    };
+    assert!(
+        extract(original(&archive), unreviewed).is_err(),
+        "should reject PAX outside exact approved tuple"
     );
 }

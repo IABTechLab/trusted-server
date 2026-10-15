@@ -159,15 +159,9 @@ fn scripts(document: &Value) -> Result<Option<&Map<String, Value>>, Report<Relea
         .ok_or_else(|| material_error("package manifest must be an object"))?;
     match object.get("scripts") {
         None => Ok(None),
-        Some(Value::Object(scripts))
-            if scripts
-                .values()
-                .all(|value| value.as_str().is_some_and(|value| !value.is_empty())) =>
-        {
-            Ok(Some(scripts))
-        }
+        Some(Value::Object(scripts)) if scripts.values().all(Value::is_string) => Ok(Some(scripts)),
         Some(_) => Err(material_error(
-            "manifest scripts must contain nonempty command strings",
+            "manifest scripts must contain command strings",
         )),
     }
 }
@@ -235,6 +229,31 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn empty_development_script_does_not_authorize_a_lifecycle_hook() {
+        let mut manifest =
+            json!({"name":"fictional-package","version":"1.0.0","scripts":{"test":""}});
+        assert!(
+            declared_hooks(&manifest, "fictional-package", "1.0.0", false)
+                .expect("should accept an unused empty development script")
+                .is_empty(),
+            "should declare no install execution from a development script"
+        );
+        assert!(
+            review_root_document(&manifest, false).is_ok(),
+            "should allow a root development script without lifecycle declarations"
+        );
+        manifest["scripts"]["postinstall"] = json!("");
+        assert!(
+            declared_hooks(&manifest, "fictional-package", "1.0.0", false).is_err(),
+            "should still reject an unreviewed empty lifecycle declaration"
+        );
+        assert!(
+            review_root_document(&manifest, false).is_err(),
+            "should still reject root lifecycle declarations"
+        );
+    }
 
     #[test]
     fn root_review_allows_build_scripts_but_rejects_all_ci_hooks() {

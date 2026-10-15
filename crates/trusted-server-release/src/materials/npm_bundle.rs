@@ -129,11 +129,24 @@ impl LockedMaterials {
         for (location, locked) in &self.npm {
             check_attempt(deadline, cancellation)?;
             let name = format!("{}.tgz", hex::encode(locked.sha512));
-            let verified =
-                self.verify_npm(location, &inputs.join(&name), deadline, cancellation)?;
+            let verified = self
+                .verify_npm(location, &inputs.join(&name), deadline, cancellation)
+                .map_err(|report| {
+                    report.attach(format!(
+                        "authenticating locked npm package `{location}` original `{name}`"
+                    ))
+                })?;
             let expected_sha256 = verified.sha256().to_owned();
-            let extracted = self.extract_npm(location, verified)?;
-            let mut reviewed = self.review_npm(location, extracted)?;
+            let extracted = self.extract_npm(location, verified).map_err(|report| {
+                report.attach(format!(
+                    "extracting authenticated locked npm package `{location}`"
+                ))
+            })?;
+            let mut reviewed = self.review_npm(location, extracted).map_err(|report| {
+                report.attach(format!(
+                    "reviewing authenticated locked npm package `{location}`"
+                ))
+            })?;
             reviewed.verify_unchanged()?;
             if let Entry::Vacant(entry) = originals.entry(name) {
                 let name = entry.key();
@@ -242,5 +255,59 @@ mod tests {
             prepared.verify_unchanged().is_err(),
             "should reject oversized retained archives before allocation"
         );
+    }
+
+    #[test]
+    #[ignore = "requires explicitly supplied current-lock original archives; no acquisition qualification"]
+    fn actual_current_lock_npm_originals() {
+        let inputs = std::env::var_os("TS_RELEASE_NPM_ORIGINALS")
+            .map(PathBuf::from)
+            .expect("should explicitly supply current locked compressed originals");
+        let bytes = include_bytes!("../../../trusted-server-js/lib/package-lock.json");
+        let npm = crate::materials::locked::parse_npm(bytes)
+            .expect("should parse every actual current npm lock identity");
+        let count = npm.len();
+        let archives: std::collections::BTreeSet<_> =
+            npm.values().map(|entry| entry.sha512).collect();
+        assert!(count > 0, "should select nonzero current locked packages");
+        let locked = LockedMaterials {
+            // This original-format diagnostic supplies no official source approval.
+            source_commit: "a".repeat(40),
+            cargo_lock_sha256: "b".repeat(64),
+            npm_lock_sha256: hex::encode(Sha256::digest(bytes)),
+            cargo: crate::materials::locked::CargoMaterials {
+                registry: BTreeMap::new(),
+                git: std::collections::BTreeSet::new(),
+            },
+            npm,
+        };
+        let prepared = locked
+            .prepare_npm_originals(
+                &inputs,
+                Instant::now() + Duration::from_secs(600),
+                &Cancellation::default(),
+            )
+            .expect("should authenticate, extract and review every actual current npm original");
+        assert_eq!(
+            prepared.reviews.len(),
+            count,
+            "should review every locked package including optional platform entries"
+        );
+        assert_eq!(
+            prepared.archive_paths().len(),
+            archives.len(),
+            "should retain every distinct original compressed distribution"
+        );
+        assert_eq!(
+            prepared.source_binding(),
+            (
+                "a".repeat(40).as_str(),
+                hex::encode(Sha256::digest(bytes)).as_str()
+            ),
+            "should retain the diagnostic source and exact current raw lock binding"
+        );
+        prepared
+            .verify_unchanged()
+            .expect("should rejoin every retained original and complete reviewed extraction");
     }
 }

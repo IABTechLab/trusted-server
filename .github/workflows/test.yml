@@ -372,6 +372,7 @@ jobs:
           cargo test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --list > "$TEST_LIST"
           awk '/: test$/ { count++ } END { if (count != 1) { print "Expected exactly one full JS execution fixture"; exit 1 } }' "$TEST_LIST"
           cargo test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --nocapture
+          cat "$TS_RELEASE_JS_FIXTURE_ROOT/js-execution-measurement.json"
 
       - name: Guard and run native JS prebuilt tests
         shell: bash

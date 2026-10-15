@@ -132,7 +132,27 @@ exception for three exact locked npm archives containing identical
 http-proxy-agent 7.0.2 and https-proxy-agent 7.0.6. Resolve their original locked
 SHA-512 identities and require matching regular type, size, mode and bytes;
 materialize the canonical file once. Other duplicates, dot aliases, traversal,
-links, devices and privileged modes fail. Registry archive SHA-256/exact-root and
+links, devices and privileged modes fail. Eight exact locked type-package
+versions use reviewed legacy roots: `@types/chai` 5.2.3 (`chai`),
+`@types/deep-eql` 4.0.2 (`deep-eql`), `@types/estree` 1.0.8 (`estree`),
+`@types/jsdom` 27.0.0 (`jsdom`), `@types/json-schema` 7.0.15 (`json-schema`),
+`@types/json5` 0.0.29 (`json5`), `@types/node` 24.10.13 (`node v24.10`),
+and `@types/tough-cookie` 4.0.5 (`tough-cookie`). Seven of these originals
+(all except json5) may use the observed node-tar timestamp layout: empty
+130-byte prefix, a zero separator, two eleven-digit octal timestamps with
+NUL terminators, and zero remaining reserved bytes. No timestamp propagates
+to extracted files. Other hidden name/prefix bytes fail.
+
+Only locked `gulp-wrap` 0.15.0 may carry local PAX metadata. Each bounded
+record uses the reviewed metadata-key allowlist; duplicate, unknown and
+malformed fields fail. Its path and size must exactly match the immediately
+following raw regular-file header, and its own name must be
+`PaxHeader/<that-path>`. Global, consecutive and dangling records and any
+path/size override fail. These exceptions apply only after original-byte
+authentication and exact name/version selection; they are not general
+extension support.
+
+Registry archive SHA-256/exact-root and
 Git revision/whole-tree validation remain available to Cargo preparation. Query
 selected Git object identity/type/size before body acquisition: reject objects
 over 32 MiB or cumulative bodies over 512 MiB, then rejoin exact body headers.
@@ -140,13 +160,16 @@ This reader assumes the sanitized trusted Git implementation and an immutable
 object store, rather than claiming adversarial race-proof streaming.
 
 The Rust dependency archive inspector limits each authenticated compressed
-original to 64 MiB, decoded TAR bytes to 512 MiB, each member to 64 MiB,
+original to 64 MiB, decoded TAR bytes to 512 MiB, each member to 128 MiB,
 entries to 100,000, path depth to 64 and path text to 4,096 bytes. It accepts
 ASCII regular-file and directory names under the exact locked root, rejects
-case aliases and unsupported extension records (including PAX, GNU long-name
-and sparse records), and requires a single complete gzip member with complete
+case aliases and unsupported extension records (including unreviewed PAX,
+GNU long-name and sparse records), and requires a single complete gzip member with complete
 TAR zero terminators and no hidden trailing data. These are dependency archive
-limits, separate from toolchain distributions and Git object limits. Extraction
+limits, separate from toolchain distributions and Git object limits. The
+128 MiB member limit accommodates the current locked optional OpenBSD Rollup
+binary expands to 110,275,248 bytes. Hashing and extraction remain streamed;
+this does not increase the compressed-original or total decoded-byte limits. Extraction
 owns a fresh private directory and preserves original compressed bytes. File
 permissions become owner read/write plus the archive's executable bits; archive
 ownership, timestamps and other permission bits do not propagate. This stage

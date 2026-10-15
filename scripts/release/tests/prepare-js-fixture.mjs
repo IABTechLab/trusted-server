@@ -57,7 +57,11 @@ const npm = JSON.parse(
   fs.readFileSync(path.join(nodeRoot, 'lib/node_modules/npm/package.json'))
 )
 if (npm.version !== '11.6.2') throw new Error('Fixture requires npm 11.6.2')
-fs.cpSync(nodeRoot, tools, { recursive: true, dereference: false })
+fs.cpSync(nodeRoot, tools, {
+  recursive: true,
+  dereference: false,
+  verbatimSymlinks: true,
+})
 fs.copyFileSync(producer, path.join(tools, 'probe'), fs.constants.COPYFILE_EXCL)
 fs.chmodSync(path.join(tools, 'probe'), 0o700)
 if (!execute('rustc', ['--version']).startsWith('rustc 1.95.0 '))
