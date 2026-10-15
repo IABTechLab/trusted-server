@@ -635,3 +635,41 @@ fn programs_outside_the_roots_are_rejected() {
         "should reject a program outside every root"
     );
 }
+
+/// Reads the umask a helper inherits from this process, outside any sandbox.
+fn unconfined_umask() -> String {
+    let mut command = StdCommand::new(test_binary());
+    command
+        .args(helper_arguments(&[]))
+        .env_clear()
+        .stdin(std::process::Stdio::null());
+    for (name, value) in helper_environment("umask") {
+        command.env(name, value);
+    }
+    let output = command.output().expect("should run the unconfined helper");
+    helper_report(&output.stdout)
+}
+
+#[test]
+fn confined_command_reports_the_requested_umask() {
+    let fixture = Fixture::new();
+    let proof = fixture.prove();
+    let report = |umask: Option<u32>| {
+        let mut command = fixture.command("umask", &[]);
+        if let Some(mask) = umask {
+            command = command.umask(Umask::new(mask).expect("should accept mask"));
+        }
+        let result = fixture
+            .boundary
+            .run_confined(&command, &proof)
+            .expect("should run confined helper");
+        helper_report(result.stdout())
+    };
+    assert_eq!(
+        report(None),
+        unconfined_umask(),
+        "should inherit the orchestrator umask without a request"
+    );
+    assert_eq!(report(Some(0o027)), "027", "should apply umask 027");
+    assert_eq!(report(Some(0o077)), "077", "should apply umask 077");
+}

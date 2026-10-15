@@ -200,3 +200,32 @@ fn harmless_names_are_accepted() {
         );
     }
 }
+
+#[test]
+fn aws_lc_sys_build_switches_are_plain_variables() {
+    let dir = workspace();
+    for name in [
+        "AWS_LC_SYS_USE_SYSTEM",
+        "AWS_LC_SYS_USE_SYSTEM_aarch64_apple_darwin",
+    ] {
+        let plain = BoundedCommand::new(&test_binary(), dir.path(), limits(SLACK))
+            .expect("should accept an absolute program")
+            .environment(name, "0");
+        assert!(plain.is_ok(), "should accept {name} as a plain variable");
+    }
+    for name in [
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_LC_SYS_OTHER",
+        "AWS_LC_SYS_USE_SYSTEM_",
+        "AWS_LC_SYS_USE_SYSTEMX",
+        "AWS_LC_SYS_USE_SYSTEM_x86-64",
+    ] {
+        let credential = BoundedCommand::new(&test_binary(), dir.path(), limits(SLACK))
+            .expect("should accept an absolute program")
+            .environment(name, "fictional");
+        assert!(
+            credential.is_err(),
+            "should still refuse {name} as a plain variable"
+        );
+    }
+}

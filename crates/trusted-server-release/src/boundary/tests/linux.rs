@@ -351,3 +351,27 @@ fn docker_client_rehash_rejects_tampering_between_commands() {
         "should refuse the next host command after tampering"
     );
 }
+
+#[test]
+fn container_command_reports_the_requested_umask() {
+    let fixture = Fixture::new();
+    let proof = fixture.prove();
+    let report = |umask: Option<u32>| {
+        let mut command = fixture.command("umask", &[]);
+        if let Some(mask) = umask {
+            command = command.umask(Umask::new(mask).expect("should accept mask"));
+        }
+        let result = fixture
+            .boundary
+            .run_confined(&command, &proof)
+            .expect("should run confined helper");
+        helper_report(result.stdout())
+    };
+    let default = report(None);
+    assert!(
+        default.len() == 3 && default.bytes().all(|digit| (b'0'..=b'7').contains(&digit)),
+        "should report the runtime default as three octal digits: {default}"
+    );
+    assert_eq!(report(Some(0o027)), "027", "should apply umask 027");
+    assert_eq!(report(Some(0o077)), "077", "should apply umask 077");
+}

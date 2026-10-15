@@ -108,6 +108,7 @@ fn docker_run_arguments_are_exact() {
         program: Path::new("/boundary/tool/0"),
         arguments: &arguments,
         interactive: false,
+        umask: None,
     };
     let actual: Vec<String> = run_arguments(&docker_settings(Path::new("/usr/bin/docker")), &plan)
         .iter()
@@ -501,4 +502,123 @@ fn effective_seccomp_has_no_process_memory_or_descriptor_transfer_allowance() {
             );
         }
     }
+}
+
+/// Returns the argv tail after the image for a fixture plan.
+fn argv_after_image(umask: Option<Umask>, program: &str, arguments: &[&str]) -> Vec<String> {
+    let (_directory, base) = canonical_tempdir();
+    let roots = sample_roots(&base);
+    let mounts = mounts(&roots).expect("should build mounts");
+    let image = format!("sha256:{}", "b".repeat(64));
+    let arguments: Vec<OsString> = arguments.iter().map(OsString::from).collect();
+    let plan = RunPlan {
+        config: Path::new("/host/config"),
+        seccomp: Path::new("/host/seccomp.json"),
+        name: "ts-release-boundary-fixture",
+        image: &image,
+        mounts: &mounts,
+        environment: &[],
+        working_directory: Path::new("/boundary/writable/0"),
+        program: Path::new(program),
+        arguments: &arguments,
+        interactive: false,
+        umask,
+    };
+    let argv: Vec<String> = run_arguments(&docker_settings(Path::new("/usr/bin/docker")), &plan)
+        .iter()
+        .map(|part| part.to_string_lossy().into_owned())
+        .collect();
+    let position = argv
+        .iter()
+        .position(|part| *part == image)
+        .expect("should place the image in argv");
+    argv[position + 1..].to_vec()
+}
+
+#[test]
+fn umask_validation_accepts_only_permission_bits() {
+    for valid in [0, 0o022, 0o027, 0o777] {
+        assert_eq!(
+            Umask::new(valid)
+                .expect("should accept a permission mask")
+                .mask(),
+            valid,
+            "should round-trip {valid:#o}"
+        );
+    }
+    for invalid in [0o1000, 0o4777, 0x1_0000, u32::MAX] {
+        assert!(
+            Umask::new(invalid).is_err(),
+            "should reject {invalid:#o} outside 0..=0o777"
+        );
+    }
+}
+
+#[test]
+fn umask_displays_as_three_octal_digits() {
+    let rendered: Vec<String> = [0, 0o7, 0o022, 0o027, 0o777]
+        .into_iter()
+        .map(|mask| Umask::new(mask).expect("should accept mask").to_string())
+        .collect();
+    assert_eq!(
+        rendered,
+        ["000", "007", "022", "027", "777"],
+        "should render zero-padded three-digit octal"
+    );
+}
+
+#[test]
+fn docker_argv_without_umask_runs_the_program_directly() {
+    assert_eq!(
+        argv_after_image(None, "/boundary/tool/0", &["--flag"]),
+        ["/boundary/tool/0", "--flag"],
+        "should not involve a shell without a umask"
+    );
+}
+
+#[test]
+fn docker_argv_with_umask_uses_the_fixed_shell_idiom() {
+    let umask = Umask::new(0o027).expect("should accept mask");
+    assert_eq!(
+        argv_after_image(Some(umask), "/boundary/tool/0", &["--flag", "value"]),
+        [
+            "/bin/sh",
+            "-c",
+            "umask 027 && exec \"$@\"",
+            "sh",
+            "/boundary/tool/0",
+            "--flag",
+            "value"
+        ],
+        "should wrap the program in the fixed umask script with positional arguments"
+    );
+}
+
+#[test]
+fn docker_argv_keeps_shell_metacharacters_positional() {
+    let umask = Umask::new(0o022).expect("should accept mask");
+    let hostile = [
+        "$(touch /boundary/writable/0/pwned)",
+        "`id`",
+        "a; rm -rf /",
+        "'quoted' \"double\" && || | > <",
+        "-c",
+        "$@",
+        "",
+    ];
+    let tail = argv_after_image(Some(umask), "/boundary/tool/0;$(id)", &hostile);
+    assert_eq!(
+        tail[..4],
+        ["/bin/sh", "-c", "umask 022 && exec \"$@\"", "sh"],
+        "should keep the script fixed whatever the program and arguments are"
+    );
+    assert_eq!(
+        tail[4], "/boundary/tool/0;$(id)",
+        "should pass the program as one positional word"
+    );
+    assert_eq!(
+        tail[5..],
+        hostile,
+        "should pass every hostile argument verbatim as its own word"
+    );
 }

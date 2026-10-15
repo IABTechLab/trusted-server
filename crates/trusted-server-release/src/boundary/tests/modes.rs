@@ -83,6 +83,7 @@ pub(super) fn run(mode: &str, arguments: &[String]) -> i32 {
         "escape-connect" => escape_connect(argument(0)),
         "unix-exchange" => unix_exchange(argument(0)),
         "socket" => socket(argument(0)),
+        "umask" => umask(),
         _ => HELPER_SETUP_FAILED,
     }
 }
@@ -321,4 +322,19 @@ fn socket(domain: &str) -> i32 {
         }
     }
     report_errno("created", errno)
+}
+
+/// Reports this process's umask as three octal digits.
+///
+/// Reading requires setting; the previous value is restored at once, and the
+/// helper is single-threaded.
+fn umask() -> i32 {
+    // SAFETY: `umask` has no memory-safety preconditions and cannot fail; the
+    // second call restores the value the first call returned.
+    let current = unsafe {
+        let current = libc::umask(0);
+        libc::umask(current);
+        current
+    };
+    report(&format!("{current:03o}"), 0)
 }

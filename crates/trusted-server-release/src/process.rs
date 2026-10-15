@@ -189,6 +189,37 @@ pub(crate) enum ProcessFailure {
     Unsuccessful,
 }
 
+/// A file-mode creation mask a child runs under, restricted to permission bits.
+///
+/// Rendered as three octal digits such as `022` or `027`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, derive_more::Display)]
+#[display("{_0:03o}")]
+pub(crate) struct Umask(u16);
+
+impl Umask {
+    /// The largest valid mask, `0o777`.
+    const MAX: u32 = 0o777;
+
+    /// Accepts a numeric mask of at most `0o777`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReleaseError::Process`] with [`ProcessFailure::InvalidCommand`]
+    /// for any value above `0o777`.
+    pub(crate) fn new(mask: u32) -> Result<Self, Report<ReleaseError>> {
+        match u16::try_from(mask) {
+            Ok(mask) if u32::from(mask) <= Self::MAX => Ok(Self(mask)),
+            _ => Err(invalid(format!("umask {mask:#o} is not within 0..=0o777"))),
+        }
+    }
+
+    /// Returns the numeric mask.
+    #[must_use]
+    pub(crate) fn mask(self) -> u32 {
+        u32::from(self.0)
+    }
+}
+
 /// A fully specified child command executed under [`ProcessLimits`].
 pub(crate) struct BoundedCommand {
     program: PathBuf,
@@ -197,6 +228,7 @@ pub(crate) struct BoundedCommand {
     environment: BTreeMap<OsString, EnvironmentValue>,
     stdin: Option<Vec<u8>>,
     limits: ProcessLimits,
+    umask: Option<Umask>,
     cancellation: Option<Cancellation>,
 }
 
@@ -239,6 +271,7 @@ impl BoundedCommand {
             stdin: None,
             limits,
             cancellation: None,
+            umask: None,
         })
     }
 
@@ -312,6 +345,13 @@ impl BoundedCommand {
         self
     }
 
+    /// Sets the child's umask before it executes; the parent's is untouched.
+    #[must_use]
+    pub(crate) fn umask(mut self, umask: Umask) -> Self {
+        self.umask = Some(umask);
+        self
+    }
+
     fn secrets(&self) -> Vec<Vec<u8>> {
         self.environment
             .values()
@@ -345,6 +385,18 @@ impl BoundedCommand {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0);
+        if let Some(umask) = self.umask {
+            let mode = libc::mode_t::from(umask.0);
+            // SAFETY: the closure runs in the forked child before exec and
+            // only calls `umask`, which is async-signal-safe, touches no
+            // memory and cannot fail; it captures one `Copy` integer.
+            unsafe {
+                command.pre_exec(move || {
+                    libc::umask(mode);
+                    Ok(())
+                });
+            }
+        }
         command
     }
 

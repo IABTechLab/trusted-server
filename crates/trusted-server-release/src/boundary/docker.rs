@@ -29,9 +29,9 @@ use std::path::{Path, PathBuf};
 use error_stack::Report;
 use sha2::{Digest as _, Sha256};
 
-use super::ConfinedCommand;
 use super::daemon::{DOCKER_SOCKET, DockerClient, check_daemon_socket, host_arguments};
 use super::roots::{BoundaryRoots, RootRole, validate_path_text};
+use super::{ConfinedCommand, Umask};
 use crate::error::ReleaseError;
 use crate::process::{ProcessLimits, ProcessOutcome, ProcessResult};
 
@@ -39,6 +39,10 @@ use crate::process::{ProcessLimits, ProcessOutcome, ProcessResult};
 const MOUNT_PREFIX: &str = "/boundary";
 /// Configuration fingerprint domain.
 const FINGERPRINT_DOMAIN: &[u8] = b"trusted-server-boundary-docker-v1\n";
+/// Fixed absolute shell of the selected image that applies a requested umask.
+const SHELL: &str = "/bin/sh";
+/// Fixed `argv[0]` of [`SHELL`]; the program and its arguments follow it.
+const SHELL_NAME: &str = "sh";
 
 fn docker_error(message: impl std::fmt::Display) -> Report<ReleaseError> {
     Report::new(ReleaseError::Boundary).attach(message.to_string())
@@ -242,6 +246,8 @@ pub(crate) struct RunPlan<'a> {
     pub(crate) program: &'a Path,
     pub(crate) arguments: &'a [OsString],
     pub(crate) interactive: bool,
+    /// Mask applied before the program through [`SHELL`], when set.
+    pub(crate) umask: Option<Umask>,
 }
 
 fn mount_argument(mount: &Mount) -> OsString {
@@ -288,6 +294,26 @@ fn limit_arguments(settings: &DockerSettings) -> [String; 10] {
     ]
 }
 
+/// Returns the fixed shell words that apply `umask` before `exec "$@"`.
+///
+/// The script is built only from the validated octal digits; the program and
+/// its arguments follow as positional parameters and are never interpolated.
+fn umask_prefix(umask: Option<Umask>) -> Vec<OsString> {
+    umask
+        .map(|umask| {
+            [
+                String::from(SHELL),
+                String::from("-c"),
+                format!("umask {umask} && exec \"$@\""),
+                String::from(SHELL_NAME),
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Returns the complete fixed `docker` argument vector for `plan`.
 #[must_use]
 pub(crate) fn run_arguments(settings: &DockerSettings, plan: &RunPlan<'_>) -> Vec<OsString> {
@@ -314,8 +340,9 @@ pub(crate) fn run_arguments(settings: &DockerSettings, plan: &RunPlan<'_>) -> Ve
         OsString::from("--workdir"),
         plan.working_directory.as_os_str().to_os_string(),
         OsString::from(plan.image),
-        plan.program.as_os_str().to_os_string(),
     ]);
+    arguments.extend(umask_prefix(plan.umask));
+    arguments.push(plan.program.as_os_str().to_os_string());
     arguments.extend(plan.arguments.iter().cloned());
     arguments
 }
@@ -394,6 +421,7 @@ impl DockerBoundary {
             program: Path::new("/"),
             arguments: &[],
             interactive: false,
+            umask: None,
         };
         let mut hasher = Sha256::new();
         hasher.update(FINGERPRINT_DOMAIN);
@@ -435,6 +463,7 @@ impl DockerBoundary {
             program: &program,
             arguments: &command.arguments,
             interactive: command.stdin.is_some(),
+            umask: command.umask,
         };
         let arguments = run_arguments(&self.settings, &plan);
         let outcome = self

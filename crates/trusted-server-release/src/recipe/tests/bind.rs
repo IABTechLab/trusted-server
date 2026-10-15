@@ -534,3 +534,89 @@ fn tampered_program_or_working_directory_is_rejected() {
         "should reject a swapped working directory"
     );
 }
+
+fn confinement_limits() -> ProcessLimits {
+    ProcessLimits {
+        wall: std::time::Duration::from_secs(60),
+        stdout_max: 1024,
+        stderr_max: 1024,
+    }
+}
+
+#[test]
+fn plan_carries_the_role_umask() {
+    for (role, expected) in [(Role::A, 0o022), (Role::B, 0o027)] {
+        let fixture = Fixture::new(COMMIT);
+        let prepared = fixture
+            .bind("ts-aarch64-apple-darwin", role)
+            .expect("should bind the recipe");
+        assert_eq!(
+            prepared.plan().umask,
+            Umask::new(expected).expect("should accept mask"),
+            "should derive the umask of role {role:?} from its ambient profile"
+        );
+    }
+}
+
+#[test]
+fn tampered_umask_is_rejected_by_the_plan_recheck() {
+    let fixture = Fixture::new(COMMIT);
+    let mut prepared = fixture
+        .bind("ts-aarch64-apple-darwin", Role::A)
+        .expect("should bind the recipe");
+    prepared.plan.umask = Umask::new(0o000).expect("should accept mask");
+    assert!(
+        plan_error(&prepared).contains("differs"),
+        "should reject a weakened umask"
+    );
+    prepared.plan.umask = Umask::new(0o027).expect("should accept mask");
+    assert!(
+        plan_error(&prepared).contains("differs"),
+        "should reject another role's umask"
+    );
+    prepared.plan.umask = Umask::new(0o022).expect("should accept mask");
+    prepared
+        .check_plan()
+        .expect("should accept the restored umask");
+}
+
+#[test]
+fn confined_command_applies_the_role_umask() {
+    for (role, expected) in [(Role::A, "022"), (Role::B, "027")] {
+        let fixture = Fixture::new(COMMIT);
+        let prepared = fixture
+            .bind("ts-aarch64-apple-darwin", role)
+            .expect("should bind the recipe");
+        let command = prepared
+            .plan()
+            .confined_command(confinement_limits())
+            .expect("should describe the confined command");
+        assert_eq!(
+            command
+                .requested_umask()
+                .map(|umask| umask.to_string())
+                .as_deref(),
+            Some(expected),
+            "should set the umask of role {role:?} on the confined command"
+        );
+        let described = format!("{command:?}");
+        for part in [
+            format!("{:?}", prepared.plan().program),
+            format!("{:?}", prepared.plan().working_directory),
+            format!(
+                "{:?}",
+                prepared
+                    .plan()
+                    .arguments
+                    .iter()
+                    .map(OsString::from)
+                    .collect::<Vec<_>>()
+            ),
+        ] {
+            assert!(
+                described.contains(&part),
+                "should describe {part} in {described}"
+            );
+        }
+    }
+}

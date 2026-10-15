@@ -234,6 +234,9 @@ impl MacProfile {
         )?
         .arguments(arguments)
         .environment(RUN_NONCE_VARIABLE, &run.nonce)?;
+        if let Some(umask) = command.umask {
+            bounded = bounded.umask(umask);
+        }
         for (name, value) in &command.environment {
             bounded = bounded.environment(name, value)?;
         }

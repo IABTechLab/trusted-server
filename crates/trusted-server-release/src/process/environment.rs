@@ -68,6 +68,9 @@ const INJECTION_EXACT: [&str; 42] = [
 ];
 /// Uppercased credential name prefixes accepted only as secrets.
 const CREDENTIAL_PREFIXES: [&str; 2] = ["AWS_", "FASTLY_"];
+/// Uppercased `aws-lc-sys` system-library switch, also per target as
+/// `<name>_<triple>`. It shares the `AWS_` prefix but carries no credential.
+const BUILD_SWITCH: &str = "AWS_LC_SYS_USE_SYSTEM";
 /// Uppercased `CARGO_REGISTRIES_<name>_TOKEN` registry credential affixes.
 const CARGO_REGISTRIES_TOKEN: (&str, &str) = ("CARGO_REGISTRIES_", "_TOKEN");
 /// Uppercased credential names accepted only as secrets.
@@ -110,10 +113,21 @@ pub(super) fn is_credential(name: &OsStr) -> bool {
     let upper = upper_name(name);
     let (registries, token) = CARGO_REGISTRIES_TOKEN;
     let registry_token = upper.starts_with(registries) && upper.ends_with(token);
+    let build_switch = upper == BUILD_SWITCH
+        || upper
+            .strip_prefix(BUILD_SWITCH)
+            .and_then(|suffix| suffix.strip_prefix('_'))
+            .is_some_and(|triple| {
+                !triple.is_empty()
+                    && triple
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            });
     registry_token
-        || CREDENTIAL_PREFIXES
-            .iter()
-            .any(|prefix| upper.starts_with(prefix))
+        || (!build_switch
+            && CREDENTIAL_PREFIXES
+                .iter()
+                .any(|prefix| upper.starts_with(prefix)))
         || CREDENTIAL_EXACT.contains(&upper.as_str())
 }
 

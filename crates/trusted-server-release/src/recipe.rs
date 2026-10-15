@@ -5,16 +5,18 @@
 //! otherwise reports the closed production selection.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use error_stack::Report;
 
-use crate::boundary::{Boundary, BoundaryRoots, DenialProof};
+use crate::boundary::{Boundary, BoundaryRoots, ConfinedCommand, DenialProof, Umask};
 use crate::error::ReleaseError;
 use crate::javascript::JsBuildCompleted;
 use crate::policy::{FIXED_ARTIFACTS, FixedArtifact};
 use crate::preflight::AuditedEnvironment;
 use crate::preflight::child::{ChildEnvironment, ChildRequest, child_environment};
+use crate::process::ProcessLimits;
 use crate::source::{ApprovedSource, CommitId, FreshSource};
 use fresh::{
     absent_in_real_parent, disjoint, empty_directory, normal_absolute, real_directory, real_file,
@@ -261,6 +263,28 @@ pub(crate) struct CargoPlan {
     arguments: Vec<String>,
     environment: BTreeMap<String, String>,
     working_directory: PathBuf,
+    umask: Umask,
+}
+
+impl CargoPlan {
+    /// Describes the plan as a confined command running under the role's umask.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReleaseError::Boundary`] for a non-normal program or working
+    /// directory, or [`ReleaseError::Process`] for a rejected variable.
+    pub(crate) fn confined_command(
+        &self,
+        limits: ProcessLimits,
+    ) -> Result<ConfinedCommand, Report<ReleaseError>> {
+        let mut command = ConfinedCommand::new(&self.program, &self.working_directory, limits)?
+            .arguments(self.arguments.iter().map(OsString::from))
+            .umask(self.umask);
+        for (name, value) in &self.environment {
+            command = command.environment(name, value)?;
+        }
+        Ok(command)
+    }
 }
 
 /// Returns the fixed argument vector of the release Cargo build.
@@ -428,7 +452,7 @@ impl PreparedRecipe {
     /// # Errors
     ///
     /// Returns [`ReleaseError::Recipe`] when the held plan's program,
-    /// arguments, environment or working directory differ from the derivation.
+    /// arguments, environment, working directory or umask differ from the derivation.
     pub(crate) fn check_plan(&self) -> Result<(), Report<ReleaseError>> {
         let expected = plan_for(&self.request, &self.tools, &self.ambient, &self.child)?;
         if self.plan != expected {
@@ -547,6 +571,7 @@ fn plan_for(
         arguments: cargo_arguments(request.asset, ambient.jobs()),
         environment,
         working_directory: ambient.checkout_root().to_owned(),
+        umask: ambient.umask()?,
     })
 }
 

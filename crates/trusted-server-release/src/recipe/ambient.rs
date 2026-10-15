@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 
 use super::fresh::{disjoint, normal_absolute};
 use super::{Role, recipe_error};
+use crate::boundary::Umask;
 use crate::error::ReleaseError;
 
 /// Locale every compiler child sees, whatever the host reports.
@@ -243,6 +244,16 @@ impl CheckedAmbient {
     /// Returns the Cargo job count the profile fixes.
     pub(crate) fn jobs(&self) -> u32 {
         self.profile.jobs
+    }
+
+    /// Returns the umask the profile fixes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReleaseError::Process`] when the compiled mask is not a
+    /// valid permission mask.
+    pub(crate) fn umask(&self) -> Result<Umask, Report<ReleaseError>> {
+        Umask::new(self.profile.umask)
     }
 
     /// Returns the checkout root this build runs in.

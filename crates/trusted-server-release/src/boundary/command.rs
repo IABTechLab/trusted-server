@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use error_stack::Report;
 
 use crate::error::ReleaseError;
+pub(crate) use crate::process::Umask;
 use crate::process::{BoundedCommand, Cancellation, ProcessLimits};
 
 /// A child to run inside a [`Boundary`](super::Boundary), described by host
@@ -28,6 +29,7 @@ pub(crate) struct ConfinedCommand {
     pub(super) stdin: Option<Vec<u8>>,
     pub(super) limits: ProcessLimits,
     pub(super) cancellation: Option<Cancellation>,
+    pub(super) umask: Option<Umask>,
 }
 
 impl fmt::Debug for ConfinedCommand {
@@ -48,6 +50,7 @@ impl fmt::Debug for ConfinedCommand {
             .field("stdin_bytes", &self.stdin.as_ref().map(Vec::len))
             .field("limits", &self.limits)
             .field("cancellation", &self.cancellation)
+            .field("umask", &self.umask)
             .finish()
     }
 }
@@ -97,6 +100,7 @@ impl ConfinedCommand {
             stdin: None,
             limits,
             cancellation: None,
+            umask: None,
         })
     }
 
@@ -156,6 +160,23 @@ impl ConfinedCommand {
     pub(crate) fn cancellation(mut self, cancellation: Cancellation) -> Self {
         self.cancellation = Some(cancellation);
         self
+    }
+
+    /// Runs the child under `umask`.
+    ///
+    /// macOS sets it in the child just before `sandbox-exec` executes; Linux
+    /// runs the program through `/bin/sh` of the selected image, which must
+    /// exist there. The orchestrator's own umask is never changed.
+    #[must_use]
+    pub(crate) fn umask(mut self, umask: Umask) -> Self {
+        self.umask = Some(umask);
+        self
+    }
+
+    /// Returns the requested umask, for tests of command construction.
+    #[cfg(test)]
+    pub(crate) fn requested_umask(&self) -> Option<Umask> {
+        self.umask
     }
 
     /// Applies stdin and cancellation to the wrapping bounded command.

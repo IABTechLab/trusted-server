@@ -74,7 +74,7 @@ use std::path::Path;
 use error_stack::Report;
 use sha2::{Digest as _, Sha256};
 
-pub(crate) use command::ConfinedCommand;
+pub(crate) use command::{ConfinedCommand, Umask};
 pub(crate) use docker::{DockerSettings, ImageSelection};
 pub(crate) use probe::{DENIED_STATUS, ProbeProgram, ProbeReport, connect_probe, parse_loopback};
 pub(crate) use proof::DenialProof;
