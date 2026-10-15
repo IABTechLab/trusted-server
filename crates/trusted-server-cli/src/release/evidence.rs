@@ -25,10 +25,14 @@
 //! - The GitHub workflow provenance predicate layout follows the
 //!   `@actions/attest` builder:
 //!   <https://github.com/actions/toolkit/blob/main/packages/attest/src/provenance.ts>.
-//!   It was read at the toolkit's default branch, not at the pinned
-//!   `actions/attest` 4.2.2 dependency; real pinned fixtures must confirm it.
+//!   Real attest 4.2.2 provenance/SPDX fixtures were verified with gh 2.97.0;
+//!   the measured consumer qualification report records their identities,
+//!   digests and replay commands. Official project first-use remains separate.
 
 mod joins;
+
+#[cfg(test)]
+mod upstream_format_tests;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;

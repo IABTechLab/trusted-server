@@ -52,16 +52,16 @@ Current implementation includes strict documents/policy, local source/preflight 
 ## Current task status — 2026-10-15
 
 Count complete task exits separately from implemented code awaiting external
-qualification. There are **6 complete tasks and 16 open tasks**. Two open tasks
-have their implementation finished; eight tasks therefore have completed code.
+qualification. There are **7 complete tasks and 15 open tasks**. One open task
+has its implementation finished; eight tasks therefore have completed code.
 Task counts do not measure remaining effort.
 
-| Status                                         | Count | Tasks              | Remaining exit work                                                                                                                                                              |
-| ---------------------------------------------- | ----- | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Complete                                       | 6     | 2, 4, 5, 6, 17, 20 | Implementation, local verification and independent review completed                                                                                                              |
-| Implementation complete; qualification pending | 2     | 18, 19             | Pinned real signed fixture and independent first-use verification                                                                                                                |
-| Partial or prerequisite approval pending       | 5     | 1, 3, 7, 8, 9      | Maintainer scope approval; authenticated bootstrap/tool selection; Git materials, actual JS lifecycle and A/B runs; platform qualification; full Rust recipes/runtime acceptance |
-| Pending implementation                         | 9     | 10–16, 21–22       | Cargo/native composition, SPDX, transfers, evidence collector, trusted workflows, immutable publication, manual Fastly route and final qualification                             |
+| Status                                         | Count | Tasks                  | Remaining exit work                                                                                                                                                              |
+| ---------------------------------------------- | ----- | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Complete                                       | 7     | 2, 4, 5, 6, 17, 18, 20 | Implementation, local verification, real pinned-verifier public-fixture validation where required, and independent review completed                                              |
+| Implementation complete; qualification pending | 1     | 19                     | Official Trusted Server signed-release first-use verification; upstream provenance/SPDX format compatibility has been measured                                                   |
+| Partial or prerequisite approval pending       | 5     | 1, 3, 7, 8, 9          | Maintainer scope approval; authenticated bootstrap/tool selection; Git materials, actual JS lifecycle and A/B runs; platform qualification; full Rust recipes/runtime acceptance |
+| Pending implementation                         | 9     | 10–16, 21–22           | Cargo/native composition, SPDX, transfers, evidence collector, trusted workflows, immutable publication, manual Fastly route and final qualification                             |
 
 Task 7's archive and declaration checks are prerequisites. They do not construct
 `JsBuildCompleted`, prove hook execution or complete that task. Task 9's
@@ -414,13 +414,13 @@ Implementation sequencing: review the local validation framework and candidate b
 
 **Modify:** CLI `src/release/mod.rs`, `src/release/tests/mod.rs`.
 
-- [ ] Register the new gh production modules and `mod gh` test module before the first focused run. Apply the nonzero-selection guard; missing module registration or zero matches MUST never report a passing security check.
+- [x] Register the new gh production modules and `mod gh` test module before the first focused run. Apply the nonzero-selection guard; missing module registration or zero matches MUST never report a passing security check.
 
-- [ ] Write fake-child tests for hangs/cancellation, simultaneous stdout/stderr saturation, malformed/truncated JSON, exit failure, multiple attestations, token precedence, host/config overrides and log redaction.
-- [ ] Run `cargo test -p trusted-server-cli --target "$HOST_TARGET" release::tests::gh`; expect absent runner.
-- [ ] Resolve gh once through trusted PATH/explicit trusted installer configuration, require 2.97.0, and retain that executable target. Pass fixed argument vectors with exact certificate identity; never arbitrary forwarded verifier flags. Accept explicit GH_TOKEN then GITHUB_TOKEN, pass only GH_TOKEN, isolate home/config/state, disable prompts, reject loader injection and keep provider credentials out.
-- [ ] Concurrently drain bounded pipes: 120 seconds per child, 15 minutes per attempt, 128 MiB stdout/1 MiB stderr. Kill/reap on either limit/cancellation. Use real OS fake-child fixtures, not mocks that omit pipe pressure. Failed exit never yields trusted parsed claims.
-- [ ] Re-run runner negatives and an approved signed public fixture under the pinned gh binary. Commit `Bound and isolate release verification subprocesses`.
+- [x] Write fake-child tests for hangs/cancellation, simultaneous stdout/stderr saturation, malformed/truncated JSON, exit failure, multiple attestations, token precedence, host/config overrides and log redaction.
+- [x] Run `cargo test -p trusted-server-cli --target "$HOST_TARGET" release::tests::gh`; expect absent runner.
+- [x] Resolve gh once through trusted PATH/explicit trusted installer configuration, require 2.97.0, and retain that executable target. Pass fixed argument vectors with exact certificate identity; never arbitrary forwarded verifier flags. Accept explicit GH_TOKEN then GITHUB_TOKEN, pass only GH_TOKEN, isolate home/config/state, disable prompts, reject loader injection and keep provider credentials out.
+- [x] Concurrently drain bounded pipes: 120 seconds per child, 15 minutes per attempt, 128 MiB stdout/1 MiB stderr. Kill/reap on either limit/cancellation. Use real OS fake-child fixtures, not mocks that omit pipe pressure. Failed exit never yields trusted parsed claims.
+- [x] Re-run runner negatives and an approved signed public fixture under the pinned gh binary. Actual attest 4.2.2 provenance and SPDX signatures, isolated token-free replay, offline SPDX replay and signed release output were measured; see [consumer qualification report](../../../scripts/release/qualification/2026-10-15-consumer-real-fixtures.md). Commit `Bound and isolate release verification subprocesses`.
 
 ### Task 19: Verify signatures, evidence joins and official publication
 
@@ -428,14 +428,14 @@ Implementation sequencing: review the local validation framework and candidate b
 
 **Modify:** CLI `src/release/mod.rs`, `src/release/tests/mod.rs`.
 
-- [ ] Register the new evidence/github/artifact production modules and `mod verification` test module before the first focused run. Apply the nonzero-selection guard; missing module registration or zero matches MUST never report a passing security check.
+- [x] Register the new evidence/github/artifact production modules and `mod verification` test module before the first focused run. Apply the nonzero-selection guard; missing module registration or zero matches MUST never report a passing security check.
 
-- [ ] Add a valid graph and independently altered edges for index, all provenance subjects, SPDX subject/document/root, JS prepared/retained records, policy/source/run/caller identities, signed names, REST lengths/immutability and tag object type.
-- [ ] Run verification tests; expect no implemented evidence graph.
-- [ ] Verify index provenance before trusting fields. Obtain only approved official GitHub host/repository data with explicit read-only credential and bounded responses. Validate lightweight source target, source approval, independently acquired fixed-path producer policy bytes at that commit, exact signed release names/digests and actual/index/REST sizes. Primitive gh success is insufficient.
-- [ ] Check verified certificate numeric IDs, exact SAN/issuer/build config/digest/trigger/run URI in both proofs, and provenance build type/caller/external parameters/resolved source/invocation. SPDX lacks SLSA caller fields; use its certificate plus subject/document constraints.
-- [ ] Separate BuildEvidenceVerified, PublicationVerified and consumer ActionAuthorized states; constructors remain private. A retained verified-release-asset owns private bytes/handle and source/policy/role evidence. Read-only CLI verification returns a VerificationReport, not deployment authorization. The linked integration plan adds the private action-scoped VerifiedArtifact only after concrete context approval; an asserted path/hash cannot construct it. Stream bounded asset responses into retained files, enforcing each role limit while downloading; do not buffer a 512 MiB executable through the gh JSON pipe or check limits only after writing it. Rehash before later use and reject offline official-deploy construction.
-- [ ] Exercise first-use verification using an independently trusted previous verifier or source-built verifier from independently approved source, never the downloaded executable verifying itself. Commit `Verify complete official release evidence before authorization`.
+- [x] Add a valid graph and independently altered edges for index, all provenance subjects, SPDX subject/document/root, JS prepared/retained records, policy/source/run/caller identities, signed names, REST lengths/immutability and tag object type.
+- [x] Run verification tests; expect no implemented evidence graph.
+- [x] Verify index provenance before trusting fields. Obtain only approved official GitHub host/repository data with explicit read-only credential and bounded responses. Validate lightweight source target, source approval, independently acquired fixed-path producer policy bytes at that commit, exact signed release names/digests and actual/index/REST sizes. Primitive gh success is insufficient.
+- [x] Check verified certificate numeric IDs, exact SAN/issuer/build config/digest/trigger/run URI in both proofs, and provenance build type/caller/external parameters/resolved source/invocation. SPDX lacks SLSA caller fields; use its certificate plus subject/document constraints.
+- [x] Separate BuildEvidenceVerified, PublicationVerified and consumer ActionAuthorized states; constructors remain private. A retained verified-release-asset owns private bytes/handle and source/policy/role evidence. Read-only CLI verification returns a VerificationReport, not deployment authorization. The linked integration plan adds the private action-scoped VerifiedArtifact only after concrete context approval; an asserted path/hash cannot construct it. Stream bounded asset responses into retained files, enforcing each role limit while downloading; do not buffer a 512 MiB executable through the gh JSON pipe or check limits only after writing it. Rehash before later use and reject offline official-deploy construction.
+- [ ] Official project first-use remains pending: upstream attest 4.2.2 formats and both real predicate signatures are measured in the report above, but third-party fixtures cannot satisfy the official repository/index policy. Exercise first-use verification using an independently trusted previous verifier or source-built verifier from independently approved source, never the downloaded executable verifying itself. Commit `Verify complete official release evidence before authorization`.
 
 ### Task 20: Expose read-only CLI verification and bootstrap instructions
 
