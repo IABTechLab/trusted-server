@@ -2669,7 +2669,7 @@ fn build_template_assembly_params(
         seam_ad_slots: None,
         policy_headers: Vec::new(),
         content_encoding: entry.metadata.content_encoding.clone(),
-        origin_host: location.host(),
+        origin_host: location.host_header(),
         origin_url: location.url().to_owned(),
         request_host: request_host.to_string(),
         request_scheme: request_scheme.to_string(),
@@ -5383,6 +5383,10 @@ pub async fn handle_publisher_request(
             message: "backend registration failed".to_string(),
         })?;
     let origin_host = location.host();
+    // The name the origin answers to, sent as its `Host`. A page names itself
+    // by it, so its own addresses are looked for under this name and not the
+    // address's host, which differ where the source fetches through another
+    // host.
     let origin_host_header = location.host_header();
     if let Some(status) = refused_origin_request(&location, parsed_origin.path(), &req) {
         log::debug!("Publisher origin request refused before sending: {status}");
@@ -6029,7 +6033,7 @@ pub async fn handle_publisher_request(
                     let module_context = ModuleContext::new(module_request)
                         .with_settings(settings)
                         .with_request_state(ec_context, services);
-                    let stored_origin_host = location.host();
+                    let stored_origin_host = location.host_header();
                     let document = TextResponse {
                         content_type: crate::middleware::HTML_MEDIA_TYPE,
                         request_path: &request_path,
@@ -6213,7 +6217,7 @@ pub async fn handle_publisher_request(
     let header_reader = crate::html_processor::ReaderDocument {
         request_host,
         request_scheme,
-        origin_host: &origin_host,
+        origin_host: &origin_host_header,
         platform: integration_registry.platform(),
         request_state: &request_state,
         max_buffered_script_bytes: settings.publisher.max_buffered_body_bytes,
@@ -6442,7 +6446,7 @@ pub async fn handle_publisher_request(
             request_path: &request_path,
             request_host,
             request_scheme,
-            origin_host: &origin_host,
+            origin_host: &origin_host_header,
             request_state: &request_state,
             max_buffered_script_bytes: settings.publisher.max_buffered_body_bytes,
             prepared: &prepared,
@@ -6571,7 +6575,7 @@ pub async fn handle_publisher_request(
                     seam_ad_slots,
                     policy_headers,
                     content_encoding,
-                    origin_host,
+                    origin_host: origin_host_header,
                     origin_url: location.url().to_owned(),
                     request_host: request_host.to_string(),
                     request_scheme: request_scheme.to_string(),
@@ -24204,6 +24208,61 @@ mod tests {
             Some("www.example.com"),
             "should send configured host override to outbound request"
         );
+    }
+
+    #[tokio::test]
+    async fn a_page_fetched_through_another_host_is_rewritten_under_its_own_name() {
+        let mut settings = create_test_settings();
+        edit_origin(&mut settings, |origin| {
+            origin.url = "https://fetch.example/through".to_string();
+            origin.host_header = Some("www.example.com".to_string());
+        });
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            200,
+            br#"<html><body><a href="https://www.example.com/news">news</a></body></html>"#
+                .to_vec(),
+            vec![(header::CONTENT_TYPE.as_str(), "text/html; charset=utf-8")],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let req = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/page")
+            .header(header::HOST, "publisher.example")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let PublisherResponse::Stream { body, params, .. } =
+            run_publisher_proxy(&settings, &services, req).await
+        else {
+            panic!("should stream the page through the page pipeline");
+        };
+        assert_eq!(
+            stub.recorded_request_uris(),
+            vec!["https://fetch.example/through/page"],
+            "should fetch the page from the source's address"
+        );
+        assert_eq!(
+            params.origin_host, "www.example.com",
+            "the page's own host is the Host its source sends"
+        );
+        let mut output = Vec::new();
+        stream_publisher_body(
+            body,
+            &mut output,
+            &params,
+            &settings,
+            &test_registry(&settings),
+        )
+        .expect("should rewrite the page");
+        let html = String::from_utf8(output).expect("should be UTF-8");
+        assert!(
+            html.contains("publisher.example/news"),
+            "should point the page's own address at the request host: {html}"
+        );
+        assert!(!html.contains("www.example.com"), "{html}");
     }
 
     /// The publisher origin request as `origin_url`'s path, `directory_index`
