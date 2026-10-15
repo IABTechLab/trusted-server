@@ -28,6 +28,7 @@ use brotli::Decompressor;
 use brotli::enc::BrotliEncoderParams;
 use brotli::enc::writer::CompressorWriter;
 use chrono::{DateTime, Utc};
+use cookie::CookieJar;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use flate2::read::ZlibDecoder;
@@ -37,7 +38,7 @@ use http::{HeaderValue, Method, Request, Response, StatusCode, Uri, header};
 use sha2::Digest as _;
 use web_time::Instant;
 
-use crate::auction::endpoints::resolve_and_merge_auction_eids;
+use crate::auction::endpoints::{resolve_and_merge_auction_eids, resolve_client_auction_eids};
 use crate::auction::formats::sanitize_publisher_page_url;
 use crate::auction::orchestrator::{
     AuctionOrchestrator, DispatchAuctionOutcome, DispatchedAuction, ERROR_TYPE_ALL,
@@ -55,7 +56,7 @@ use crate::cache_policy::{
     CachePolicy, EdgeCacheHeader, cache_control_headers_are_private_or_no_store,
 };
 use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
-use crate::constants::{COOKIE_SHAREDID, HEADER_X_COMPRESS_HINT};
+use crate::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS, HEADER_X_COMPRESS_HINT};
 use crate::cookies::handle_request_cookies;
 use crate::cookies::template_cache_policy::{TemplateCookieDecision, evaluate_cookie_policy};
 use crate::creative_opportunities::{
@@ -5078,7 +5079,7 @@ pub async fn handle_publisher_request(
     let mut origin_request = Some(req);
     let eid_cookie_may_need_persistence = cookie_jar
         .as_ref()
-        .is_some_and(|jar| jar.get(COOKIE_SHAREDID).is_some());
+        .is_some_and(|jar| jar.get(COOKIE_TS_EIDS).is_some() || jar.get(COOKIE_SHAREDID).is_some());
     // This decision also gates the concurrent origin send below. A marker skip
     // cannot currently delay the origin behind an auction because marker
     // validation requires a non-empty registry, and every such auction sets
@@ -5240,6 +5241,7 @@ pub async fn handle_publisher_request(
             apply_auction_eids_and_device(
                 &mut auction_request,
                 &AuctionEidTargeting {
+                    cookie_jar: cookie_jar.as_ref(),
                     kv_snapshot: ec_context.kv_snapshot(),
                     partner_registry: auction.registry,
                     ec_context,
@@ -5906,6 +5908,7 @@ pub(crate) struct MatchedSlotsContext<'a> {
 /// Borrowed inputs for [`apply_auction_eids_and_device`], bundled to keep the
 /// helper within the project's 7-argument cap.
 struct AuctionEidTargeting<'a> {
+    cookie_jar: Option<&'a CookieJar>,
     kv_snapshot: &'a crate::ec::EcKvSnapshot,
     partner_registry: Option<&'a PartnerRegistry>,
     ec_context: &'a EcContext,
@@ -5925,8 +5928,20 @@ fn apply_auction_eids_and_device(
     auction_request: &mut AuctionRequest,
     targeting: &AuctionEidTargeting<'_>,
 ) {
+    let client_eids =
+        if targeting.ec_context.ec_allowed() && targeting.ec_context.ec_value().is_some() {
+            resolve_client_auction_eids(
+                None,
+                targeting
+                    .cookie_jar
+                    .and_then(|jar| jar.get(COOKIE_TS_EIDS))
+                    .map(cookie::Cookie::value),
+            )
+        } else {
+            None
+        };
     let merged_eids = resolve_and_merge_auction_eids(
-        None,
+        client_eids,
         targeting.kv_snapshot,
         targeting.partner_registry,
         targeting.ec_context,
@@ -7443,8 +7458,8 @@ fn normalize_page_bids_path(raw: &str) -> String {
 ///
 /// `kv` enriches the bid request with server-side EIDs from the EC identity
 /// graph. Only the Fastly adapter has a KV identity store, so Axum, Cloudflare,
-/// and Spin pass `None` and cannot resolve server-side EIDs. Retired EID cookies
-/// are ignored on every adapter.
+/// and Spin pass `None`; consented browser cookie EIDs remain available on
+/// every adapter through the same expiry-aware merge.
 ///
 /// # Errors
 ///
@@ -7578,6 +7593,7 @@ pub async fn handle_page_bids(
         .map(str::to_owned);
     let consent_context = ec_context.consent().clone();
     let geo = ec_context.geo_info().cloned();
+    let cookie_jar = handle_request_cookies(&req)?;
 
     // Same fail-closed jurisdiction-aware gate the publisher navigation path
     // uses — relies on the adapter's geo-aware EC context.
@@ -7686,7 +7702,7 @@ pub async fn handle_page_bids(
             };
             // Hand the loaded row to the request context so response
             // finalization — which runs on an EC context the adapter owns,
-            // after this handler returns — ingests sharedId updates
+            // after this handler returns — ingests ts-eids/sharedId updates
             // from this read instead of paying for a second lookup.
             if !matches!(page_bids_kv_snapshot, crate::ec::EcKvSnapshot::NotRead) {
                 ec_context.set_kv_snapshot(page_bids_kv_snapshot.clone());
@@ -7704,6 +7720,7 @@ pub async fn handle_page_bids(
             apply_auction_eids_and_device(
                 &mut auction_request,
                 &AuctionEidTargeting {
+                    cookie_jar: cookie_jar.as_ref(),
                     kv_snapshot: &page_bids_kv_snapshot,
                     partner_registry: auction.registry,
                     ec_context,
@@ -8796,7 +8813,7 @@ mod tests {
     }
 
     #[test]
-    fn publisher_and_page_bids_ignore_retired_cookie_ids() {
+    fn publisher_and_page_bids_filter_matching_expired_cookie_ids() {
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let context = EcContext::new_for_test(
             Some(ec_id.clone()),
@@ -8850,6 +8867,7 @@ mod tests {
                 apply_auction_eids_and_device(
                     &mut request,
                     &AuctionEidTargeting {
+                        cookie_jar: Some(&jar),
                         kv_snapshot: &snapshot,
                         partner_registry: Some(&registry),
                         ec_context: &context,
@@ -8866,9 +8884,14 @@ mod tests {
                     .flat_map(|eid| &eid.uids)
                     .map(|uid| uid.id.as_str())
                     .collect();
-                assert!(
-                    uids.is_empty(),
-                    "publisher and SPA must not consume retired EID cookies"
+                let expected = if uid == "expired-uid" {
+                    Vec::new()
+                } else {
+                    vec![uid]
+                };
+                assert_eq!(
+                    uids, expected,
+                    "publisher and SPA should forward valid cookie IDs without reviving expired UIDs"
                 );
                 assert_eq!(
                     snapshot.entry_for(&ec_id),
@@ -8904,10 +8927,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn valid_marker_ignores_retired_eid_cookie() {
+    async fn valid_marker_does_not_skip_browser_eid_cookie_snapshot_lookup() {
         assert_eq!(
             run_marker_lookup_probe(MarkerProbe::Valid, true, false).await,
-            0
+            1,
+            "browser cookie enrichment still requires the shared EC snapshot"
         );
     }
 

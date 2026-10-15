@@ -934,11 +934,15 @@ not passed by this implementation.
 ## Identity forwarding
 
 Prebid.js sends current EIDs from `pbjs.getUserIdsAsEids()` in the `/auction`
-body. Trusted Server merges them with usable registered IDs from the current
-EC/KV row, applies consent gating, and forwards `user.ext.eids` to Prebid Server.
+body. When no usable body EIDs are supplied, Trusted Server falls back to the
+browser-written `ts-eids` cookie. It merges the selected client EIDs with usable
+registered IDs from the current EC/KV row, applies consent gating, and forwards
+`user.ext.eids` to Prebid Server. A valid body takes precedence as a complete set;
+missing body sources are not merged from the cookie.
 
 Registered body sources are staged before provider dispatch. Response finalization
-combines them with the separate `sharedId` cookie in one conservative mutation,
+combines `ts-eids`, staged body updates and the separate `sharedId` cookie in one
+conservative mutation (body beats `ts-eids`; direct `sharedId` wins last),
 using the auction's KV snapshot. No bid and handled provider-error responses still
 finalize these updates. Browser input fills absent sources only. It cannot replace
 stored IDs, forge lifecycle metadata, create a root, recover a missing root, or
@@ -946,36 +950,42 @@ revive a withdrawal tombstone. Unknown sources remain current-request-only.
 
 This persistence requires EC KV support. Fastly supports it; adapters without an
 EC identity graph can forward permitted body EIDs but do not persist them.
-Publisher and SPA page-bid auctions use KV IDs only. An ID arriving late needs
-another `/auction` body submission; there is no page-exit beacon or cookie repair.
+Publisher and SPA page-bid auctions also read permitted `ts-eids` cookie EIDs
+through the same expiry-aware merge. IDs discovered after request construction
+can reach a later navigation through that cookie. There is no page-exit beacon.
 
 ### Identity flow
 
 ```mermaid
 flowchart TD
-    A[Prebid User ID modules resolve EIDs] --> B[POST auction with current body EIDs]
-    B --> C[Stage registered UID-only updates on EC context]
-    C --> D[Read current EC row and merge usable KV EIDs]
+    A[Prebid resolves current EIDs] --> B[POST auction with untrimmed body EIDs]
+    A --> C[Bid callback writes bounded ts-eids cookie]
+    B --> D[Merge body or cookie EIDs with usable KV IDs]
+    C -->|Later request without body EIDs| D
     D --> E[Consent-gated OpenRTB request to Prebid Server]
     E --> F[Bid, no-bid, or handled error response]
-    F --> G[Finalize body plus sharedId on existing consenting root]
+    F --> G[Finalize cookie plus body plus sharedId on consenting root]
     G --> H[Send response]
     G --> I[Later auctions read stored IDs from KV]
 ```
 
-### Cookie and diagnostic retirement
+### Browser cookie and diagnostics
 
-New servers ignore `ts-eids`, including writes by cached older bundles. No TS EID
-cookie replaces it. The transition JS bundle expires the old host-only `Path=/`
-cookie once installed. Remove that cleanup only after writing bundles have aged
-past both the old cookie's one-day max-age and the deployment cache lifetime.
-The server does not emit unconditional cleanup `Set-Cookie` headers.
+The Prebid bid callback writes a one-day, host-only `ts-eids` cookie with
+`Path=/; Secure; SameSite=Lax`. Its base64 payload is capped at 3,072 bytes,
+trimming UIDs and then sources from the tail deterministically. The auction body
+remains untrimmed. Empty or unavailable IDs clear stale cookie state; installation
+alone does not expire it. This unsigned cookie is browser input, not authenticated
+capture authority, and cannot strip stored or pending capture lifecycle metadata.
 
-`x-ts-eids` and `x-ts-eids-truncated` are no longer emitted and remain stripped
-from inbound requests. Check external diagnostic consumers before rollout.
-`/_ts/admin/eids` remains authenticated and returns a local `410 Gone` with
-`Cache-Control: no-store`, never publisher fallback. Use `/_ts/admin/ec` to inspect
-persisted state on adapters with EC KV support. EC and consent headers remain.
+Auction responses emit base64 `x-ts-eids` diagnostics capped at 4,096 bytes;
+`x-ts-eids-truncated: true` appears only when tail sources were removed. Both
+names remain stripped from inbound requests. `/_ts/admin/eids` remains an
+authenticated local cookie diagnostic with `Cache-Control: no-store` and
+`X-Content-Type-Options: nosniff`, never publisher fallback. Use `/_ts/admin/ec`
+to inspect persisted lifecycle state on adapters with EC KV support. EC and
+consent headers remain independent. Cookie and diagnostic retirement is deferred
+to a separate PR.
 
 Deploy metadata-preserving readers and writers everywhere and drain old invocations
 before activating body writer/revision metadata. Old binaries can erase metadata
@@ -991,7 +1001,7 @@ on a new binary is not deployment-drain evidence.
 - Supplied `inserter`, `matcher`, and integer `mm` remain current-request provenance,
   including empty `matcher` and zero `mm`; they are not stored in KV
 - UID `ext` remains current-request-only; existing UID merge precedence is unchanged
-- Known-expired KV IDs are omitted, including an identical body UID for that source
+- Known-expired KV IDs are omitted, including an identical body or cookie UID for that source
 - Consent gating is applied to the merged set before forwarding
 
 ### What reaches Prebid Server

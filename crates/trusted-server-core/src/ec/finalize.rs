@@ -42,7 +42,7 @@ const EC_RESPONSE_HEADERS: &[&str] = &[
 /// immediately and the EC identity-graph KV tombstone is the authoritative
 /// revocation marker. There is no separate consent KV store to clean up.
 ///
-/// Staged auction body updates and sharedId are combined into one browser mutation.
+/// Browser cookie, staged auction body and sharedId updates are combined once.
 pub fn ec_finalize_response(
     settings: &Settings,
     ec_context: &mut EcContext,
@@ -85,7 +85,12 @@ pub fn ec_finalize_response(
             let source = ec_context.eid_sync_source();
             let mut collected = source
                 .map(|_| {
-                    collect_browser_eid_updates(body_updates.clone(), sharedid_cookie, registry)
+                    collect_browser_eid_updates(
+                        body_updates.clone(),
+                        ec_context.prebid_eids_cookie(),
+                        sharedid_cookie,
+                        registry,
+                    )
                 })
                 .unwrap_or_default();
             protect_pending_capture_updates(&mut collected, ec_context, response);
@@ -140,7 +145,12 @@ pub fn ec_finalize_response(
         };
 
         let updates = gate_eid_updates_by_consent(
-            collect_browser_eid_updates(body_updates, sharedid_cookie, registry),
+            collect_browser_eid_updates(
+                body_updates,
+                ec_context.prebid_eids_cookie(),
+                sharedid_cookie,
+                registry,
+            ),
             ec_context.consent(),
         );
         sync_eid_cookie_updates(graph, ec_context, &ec_id, &updates, EidSyncSource::NewEc);
@@ -1367,6 +1377,151 @@ mod tests {
     }
 
     #[test]
+    fn finalize_restored_cookie_combines_with_body_and_sharedid_once() {
+        for source in [
+            EidSyncSource::Navigation,
+            EidSyncSource::PageBids,
+            EidSyncSource::Auction,
+        ] {
+            let settings = create_test_settings();
+            let ec_id = sample_ec_id("cook01");
+            let graph = KvIdentityGraph::in_memory("restored-cookie");
+            let root = KvEntry::new(
+                &granting_consent(),
+                None,
+                current_timestamp(),
+                &settings.publisher.domain,
+            );
+            graph.create(&ec_id, &root).expect("should seed live root");
+            let value = base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                serde_json::to_vec(&serde_json::json!([
+                    {"source":"id5-sync.com", "uids":[{"id":"cookie-id5"}]},
+                    {"source":"ids.example.com", "uids":[{"id":"cookie-only"}]},
+                    {"source":"sharedid.org", "uids":[{"id":"cookie-shared"}]}
+                ]))
+                .expect("should encode browser cookie"),
+            );
+            let request = http::Request::builder()
+                .header("cookie", format!("ts-ec={ec_id}; ts-eids={value}"))
+                .body(EdgeBody::empty())
+                .expect("should build request");
+            let mut context = EcContext::read_from_request(
+                &settings,
+                &request,
+                &crate::platform::test_support::noop_services(),
+            )
+            .expect("should read browser cookie");
+            *context.consent_mut() = granting_consent();
+            context.set_kv_snapshot(graph.load_snapshot(&ec_id));
+            context.set_eid_sync_source(source);
+            context.stage_browser_eid_updates(vec![
+                PartnerIdUpdate::new("id5-sync.com", "body-id5"),
+                PartnerIdUpdate::new("sharedid.org", "body-shared"),
+            ]);
+            let registry = PartnerRegistry::from_config(&[
+                make_partner("id5-sync.com"),
+                make_partner("ids.example.com"),
+                make_partner("sharedid.org"),
+            ])
+            .expect("should build registry");
+            let mut response = empty_response();
+            ec_finalize_response(
+                &settings,
+                &mut context,
+                Some(&graph),
+                &registry,
+                Some("direct-shared"),
+                &mut response,
+            );
+            let stored = graph
+                .get(&ec_id)
+                .expect("should read combined write")
+                .expect("should retain root")
+                .0;
+            assert_eq!(
+                stored.ids["id5-sync.com"].uid, "body-id5",
+                "body must override browser cookie"
+            );
+            assert_eq!(
+                stored.ids["ids.example.com"].uid, "cookie-only",
+                "cookie-only source must still persist"
+            );
+            assert_eq!(
+                stored.ids["sharedid.org"].uid, "direct-shared",
+                "direct sharedId must retain final precedence"
+            );
+        }
+    }
+
+    #[test]
+    fn restored_cookie_cannot_replace_managed_or_expired_metadata() {
+        for cookie_uid in ["stored-id", "different-browser-id"] {
+            let settings = create_test_settings();
+            let ec_id = sample_ec_id("cook02");
+            let graph = KvIdentityGraph::in_memory("cookie-metadata");
+            let mut root = KvEntry::minimal("ids.example.com", "stored-id", current_timestamp());
+            root.consent.ok = true;
+            let record = root
+                .ids
+                .get_mut("ids.example.com")
+                .expect("should get managed record");
+            record.expires_at = Some(1);
+            record.writer = Some("lockr".to_owned());
+            record.revision = Some("stored-revision".to_owned());
+            let original_record = record.clone();
+            graph
+                .create(&ec_id, &root)
+                .expect("should seed managed record");
+            let value = base64::Engine::encode(&base64::engine::general_purpose::STANDARD,
+                serde_json::to_vec(&serde_json::json!([
+                    {"source":"ids.example.com", "uids":[{"id":cookie_uid}], "writer":"forged", "expires_at":9999999999_u64},
+                    {"source":"browser.example.com", "uids":[{"id":"new-browser-id"}]}
+                ])).expect("should encode browser cookie"));
+            let request = http::Request::builder()
+                .header("cookie", format!("ts-ec={ec_id}; ts-eids={value}"))
+                .body(EdgeBody::empty())
+                .expect("should build request");
+            let mut context = EcContext::read_from_request(
+                &settings,
+                &request,
+                &crate::platform::test_support::noop_services(),
+            )
+            .expect("should read cookie");
+            *context.consent_mut() = granting_consent();
+            context.set_kv_snapshot(graph.load_snapshot(&ec_id));
+            context.set_eid_sync_source(EidSyncSource::Navigation);
+            let registry = PartnerRegistry::from_config(&[
+                make_partner("ids.example.com"),
+                make_partner("browser.example.com"),
+            ])
+            .expect("should build registry");
+            let mut response = empty_response();
+            ec_finalize_response(
+                &settings,
+                &mut context,
+                Some(&graph),
+                &registry,
+                None,
+                &mut response,
+            );
+            let stored = graph
+                .get(&ec_id)
+                .expect("should read store")
+                .expect("should retain root")
+                .0;
+            assert_eq!(
+                stored.ids["ids.example.com"], original_record,
+                "browser cookie must preserve managed lifecycle metadata"
+            );
+            assert_eq!(
+                stored.ids["browser.example.com"].uid, "new-browser-id",
+                "independent absent source may still fill"
+            );
+        }
+    }
+
+    #[test]
     fn finalize_navigation_routes_persist_returning_user_eid_updates() {
         for (source, suffix, cookie_id) in [
             (EidSyncSource::Navigation, "naveid", "navigation-cookie-id"),
@@ -1600,7 +1755,7 @@ mod tests {
     #[test]
     fn finalize_persists_every_configured_partner_from_staged_body_eids() {
         // Regression test for #1184: persistence must use the full auction body,
-        // without depending on the retired size-capped EID cookie.
+        // without depending on the size-capped EID cookie.
         let settings = create_test_settings();
         let ec_id = sample_ec_id("cleids1");
         let graph = KvIdentityGraph::in_memory("test_store");

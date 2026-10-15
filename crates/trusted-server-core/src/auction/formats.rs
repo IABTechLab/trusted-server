@@ -15,8 +15,9 @@ use uuid::Uuid;
 
 use crate::auction::context::ContextValue;
 use crate::consent::ConsentContext;
-use crate::constants::HEADER_X_TS_EC_CONSENT;
+use crate::constants::{HEADER_X_TS_EC_CONSENT, HEADER_X_TS_EIDS, HEADER_X_TS_EIDS_TRUNCATED};
 use crate::creative;
+use crate::ec::eids::encode_eids_header;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
 use crate::openrtb::{
@@ -565,6 +566,20 @@ pub(crate) fn convert_to_openrtb_response_with_trace(
             .insert(HEADER_X_TS_EC_CONSENT, HeaderValue::from_static("ok"));
     }
 
+    if let Some(eids) = &auction_request.user.eids {
+        let (encoded, truncated) = encode_eids_header(eids)?;
+        let value =
+            HeaderValue::from_str(&encoded).change_context(TrustedServerError::Auction {
+                message: "Failed to encode EIDs header value".to_owned(),
+            })?;
+        response.headers_mut().insert(HEADER_X_TS_EIDS, value);
+        if truncated {
+            response
+                .headers_mut()
+                .insert(HEADER_X_TS_EIDS_TRUNCATED, HeaderValue::from_static("true"));
+        }
+    }
+
     if trace.is_some() {
         enforce_terminal_private_cache_privacy(&mut response);
     }
@@ -582,7 +597,6 @@ mod tests {
     use crate::auction::types::{
         ApsRendererV1, ApsTagType, AuctionResponse, Bid, BidRenderer, BidStatus,
     };
-    use crate::constants::{HEADER_X_TS_EIDS, HEADER_X_TS_EIDS_TRUNCATED};
     use crate::openrtb::{Eid, Uid};
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::create_test_settings;
@@ -833,7 +847,7 @@ mod tests {
     }
 
     #[test]
-    fn response_keeps_eid_diagnostics_retired_when_eids_present() {
+    fn response_includes_eid_headers_when_eids_present() {
         let mut request = make_auction_request();
         request.user.eids = Some(vec![Eid {
             inserter: None,
@@ -853,10 +867,19 @@ mod tests {
         let response = convert_to_openrtb_response(&result, &settings, &request, true)
             .expect("should build response");
 
-        assert!(
-            response.headers().get(&HEADER_X_TS_EIDS).is_none(),
-            "EID diagnostic headers stay retired even when EIDs are present"
-        );
+        let encoded = response
+            .headers()
+            .get(&HEADER_X_TS_EIDS)
+            .expect("should include x-ts-eids when EIDs are present");
+        let decoded = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            encoded.as_bytes(),
+        )
+        .expect("should decode EID diagnostic header");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&decoded).expect("should parse diagnostic EID JSON");
+        assert_eq!(payload[0]["source"], "ssp.com");
+        assert_eq!(payload[0]["uids"][0]["id"], "uid-1");
         assert_eq!(
             response
                 .headers()
@@ -870,8 +893,47 @@ mod tests {
                 .headers()
                 .get(&HEADER_X_TS_EIDS_TRUNCATED)
                 .is_none(),
-            "should never emit the retired truncation header"
+            "should omit the truncation header when all EIDs fit"
         );
+    }
+
+    #[test]
+    fn response_marks_truncated_eid_diagnostic_header() {
+        let mut request = make_auction_request();
+        request.user.eids = Some(
+            (0..64)
+                .map(|index| Eid {
+                    source: format!("{index}-{}", "s".repeat(120)),
+                    uids: vec![Uid {
+                        id: format!("{}-{index}", "u".repeat(100)),
+                        atype: Some(1),
+                        ext: None,
+                    }],
+                    ..Eid::default()
+                })
+                .collect(),
+        );
+
+        let response =
+            convert_to_openrtb_response(&make_empty_result(), &make_settings(), &request, true)
+                .expect("should build response with truncated EID diagnostics");
+
+        assert_eq!(
+            response.headers().get(&HEADER_X_TS_EIDS_TRUNCATED),
+            Some(&HeaderValue::from_static("true")),
+        );
+        let encoded = response
+            .headers()
+            .get(&HEADER_X_TS_EIDS)
+            .expect("should retain a bounded EID header");
+        let decoded = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            encoded.as_bytes(),
+        )
+        .expect("should decode truncated EID header");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&decoded).expect("should parse truncated EID payload");
+        assert!(payload.as_array().unwrap().len() < 64);
     }
 
     #[test]

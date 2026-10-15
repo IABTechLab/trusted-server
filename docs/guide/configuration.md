@@ -721,12 +721,14 @@ Provider expiry, writer and opaque revision are optional schema-v1 KV fields.
 Known-expired IDs are omitted from auctions and `identify` without cleanup
 writes. Unowned legacy pull remains fill-missing-only even for expired records.
 Drain metadata-unaware readers and writers before enabling managed capture.
-`/auction` body EIDs enrich existing consenting rows conservatively; the retired
-`ts-eids` cookie and EID diagnostic response headers are no longer identity
-transport. The optional `ts-eids-s` cookie is an authenticated server-capture
-handoff only. It does not restore `ts-eids` or collect browser IDs. Inbound
-diagnostic headers remain stripped. See the
-[Prebid transport migration](./integrations/prebid.md) and
+`/auction` body EIDs and the browser-written `ts-eids` cookie enrich existing
+consenting rows conservatively. Body EIDs take precedence for auction forwarding;
+publisher and SPA auctions retain cookie fallback. EID diagnostic response headers
+and authenticated `/_ts/admin/eids` remain available. Their retirement is deferred
+to a separate PR; inbound diagnostic headers remain stripped. The optional
+`ts-eids-s` cookie is a separate authenticated server-capture handoff only and does
+not collect browser IDs. See the
+[Prebid identity transport](./integrations/prebid.md) and
 [Lockr capture gates](./integrations/lockr.md).
 
 **Example**:
@@ -788,15 +790,19 @@ signs new envelopes; retained keys verify envelopes created before the switch.
 
 The cookie value has a fixed five-minute maximum lifetime and a 2,048-byte
 encoded-value limit. Provider expiry may shorten the lifetime. The handoff is
-eligible only for an absent registered source on an existing live, consenting
-EC root. Current consent, source ownership, bidstream policy, the integration's
-capture switch, and the shared handoff switch all still apply. Existing,
-expired, invalidated, or conflicting stored records win.
+eligible for an absent or known-expired registered source on an existing live,
+consenting EC root. Current consent, source ownership, bidstream policy, the
+integration's capture switch, and the shared handoff switch all still apply.
+Usable stored IDs win. A valid capture can supply an auction ID over an expired
+record without changing KV or renewing its handoff deadline. A matching
+known-expired UID requires a known refreshed provider expiry. Empty or invalidated
+records still block fallback.
 
 Persistence retry is best-effort. A later qualifying request may stage one
 bounded fill-absent attempt after the response is sent on Fastly. There is no
-durable queue, recursive retry, root creation, existing-source refresh, or
-first-auction guarantee. Keep rollout and live acceptance gated as described in
+durable queue, recursive retry, root creation, existing-source persistence
+refresh, or first-auction guarantee. Expired-source auction fallback never stages
+a replacement write; persistence replay remains absent-source-only. Keep rollout and live acceptance gated as described in
 the [Lockr integration guide](./integrations/lockr.md).
 
 **Environment Override**:

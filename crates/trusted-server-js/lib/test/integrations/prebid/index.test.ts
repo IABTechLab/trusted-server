@@ -2551,9 +2551,9 @@ describe('prebid/installPrebidNpm', () => {
       expect(logged.some((value) => JSON.stringify(value).includes(sentinel))).toBe(false);
     });
 
-    it('installation expires the retired ts-eids cookie when EIDs are absent', () => {
-      document.cookie = 'ts-eids=stale-value';
+    it('buildRequests clears a stale ts-eids cookie when current Prebid EIDs are absent', () => {
       const spec = getAdapterSpec();
+      document.cookie = 'ts-eids=stale-value';
       mockGetUserIdsAsEids.mockReturnValue([]);
 
       spec.buildRequests([
@@ -3204,7 +3204,7 @@ describe('prebid/installPrebidNpm', () => {
       expect(hasTsBidder).toBe(true);
     });
 
-    it('never writes a ts-eids cookie after bidsBackHandler', () => {
+    it('syncs a structured ts-eids cookie after bidsBackHandler', () => {
       mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
         opts?.bidsBackHandler?.();
       });
@@ -3223,10 +3223,20 @@ describe('prebid/installPrebidNpm', () => {
         adUnits: [{ bids: [{ bidder: 'appnexus', params: {} }] }],
       } as unknown as RequestBidsArg);
 
-      expect(document.cookie).not.toMatch(/(?:^|; )ts-eids=/);
+      const cookieValue = document.cookie.match(/(?:^|; )ts-eids=([^;]+)/)?.[1];
+      expect(cookieValue).toBeDefined();
+      expect(JSON.parse(atob(cookieValue!))).toEqual([
+        {
+          source: 'sharedid.org',
+          uids: [
+            { id: 'shared_123', atype: 3 },
+            { id: 'shared_456', ext: { provider: 'example' } },
+          ],
+        },
+      ]);
     });
 
-    it('does not persist an opaque LiveRamp envelope in a cookie', () => {
+    it('preserves an opaque LiveRamp envelope in the ts-eids cookie', () => {
       mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
         opts?.bidsBackHandler?.();
       });
@@ -3242,10 +3252,69 @@ describe('prebid/installPrebidNpm', () => {
         adUnits: [{ bids: [{ bidder: 'appnexus', params: {} }] }],
       } as unknown as RequestBidsArg);
 
-      expect(document.cookie).not.toMatch(/(?:^|; )ts-eids=/);
+      const cookieValue = document.cookie.match(/(?:^|; )ts-eids=([^;]+)/)?.[1];
+      expect(cookieValue).toBeDefined();
+      expect(JSON.parse(atob(cookieValue!))).toEqual([
+        {
+          source: 'liveramp.com',
+          uids: [{ id: 'opaque-test-envelope', atype: 3 }],
+        },
+      ]);
     });
 
-    it('expires the retired cookie on installation before any auction', () => {
+    it('trims an oversized ts-eids cookie without trimming /auction body EIDs', () => {
+      const debugSpy = vi.spyOn(log, 'debug').mockImplementation(() => {});
+      mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
+        opts?.bidsBackHandler?.();
+      });
+      const longUid = 'x'.repeat(400);
+      const inputEids = [
+        { source: 'id5-sync.com', uids: [{ id: longUid, atype: 1 }] },
+        { source: 'liveramp.com', uids: [{ id: longUid, atype: 3 }] },
+        { source: 'criteo.com', uids: [{ id: longUid, atype: 1 }] },
+        { source: 'uidapi.com', uids: [{ id: longUid, atype: 3 }] },
+        { source: 'pubcid.org', uids: [{ id: longUid, atype: 1 }] },
+        { source: 'sharedid.org', uids: [{ id: longUid, atype: 1 }] },
+        { source: 'dropped.example', uids: [{ id: longUid, atype: 1 }] },
+      ];
+      mockGetUserIdsAsEids.mockReturnValue(inputEids);
+      const pbjs = installPrebidNpm();
+      const spec = mockRegisterBidAdapter.mock.calls[0][2] as TestAdapterSpec;
+
+      const request = spec.buildRequests([
+        {
+          adUnitCode: 'slot',
+          bidder: 'trustedServer',
+          mediaTypes: { banner: { sizes: [[300, 250]] } },
+          params: {},
+        },
+      ]);
+      expect(JSON.parse(request.data).eids).toEqual(inputEids);
+
+      pbjs.requestBids({
+        adUnits: [{ bids: [{ bidder: 'appnexus', params: {} }] }],
+      } as unknown as RequestBidsArg);
+
+      const cookieValue = document.cookie.match(/(?:^|; )ts-eids=([^;]+)/)?.[1];
+      expect(cookieValue).toBeDefined();
+      expect(cookieValue!.length).toBeLessThanOrEqual(3072);
+      const cookieEids = JSON.parse(atob(cookieValue!)) as Array<{ source: string }>;
+      expect(cookieEids.map((eid) => eid.source)).toEqual([
+        'id5-sync.com',
+        'liveramp.com',
+        'criteo.com',
+        'uidapi.com',
+        'pubcid.org',
+      ]);
+      const loggedMessage = debugSpy.mock.calls
+        .map((call) => call.at(-1))
+        .find(
+          (arg): arg is string => typeof arg === 'string' && arg.includes('ts-eids cookie exceeded')
+        );
+      expect(loggedMessage).toContain('dropped.example');
+    });
+
+    it('clears ts-eids cookie after bidsBackHandler when no current EIDs remain', () => {
       document.cookie = `ts-eids=${btoa(JSON.stringify([{ source: 'sharedid.org', uids: [{ id: 'stale' }] }]))}`;
       mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
         opts?.bidsBackHandler?.();

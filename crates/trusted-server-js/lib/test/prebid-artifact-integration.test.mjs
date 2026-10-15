@@ -333,8 +333,9 @@ describe('tsjs-prebid production artifacts', () => {
     expect(analyticsArtifact.bundleCode.length).toBeGreaterThan(200_000);
     // The original shim measures 40,354 characters. Shared strict trace JSON
     // validation, request-ID hook association, and bounded pending lifecycle add
-    // 11,676 characters (52,030 total). Auction diagnostics evidence adds 2,829
-    // more in this release candidate (54,859 total). Keep a narrow 55.5 KB guard: Prebid remains a separate artifact above 200 KB, and importing
+    // 11,676 characters (52,030 total). In this release candidate, auction
+    // diagnostics evidence and the bounded EID cookie writer bring it to 54,603.
+    // Keep a narrow 55.5 KB guard: Prebid remains a separate artifact above 200 KB, and importing
     // its runtime or private rendering helpers must still fail this regression.
     expect(shimCode.length).toBeLessThan(55_500);
     expect(shimCode).toContain('markWinningBidAsUsed');

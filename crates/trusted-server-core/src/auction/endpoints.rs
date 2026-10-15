@@ -10,13 +10,15 @@ use serde_json::Value as JsonValue;
 use crate::auction::formats::AdRequest;
 use crate::auction::orchestrator::OrchestrationResult;
 use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
+use crate::constants::COOKIE_TS_EIDS;
+use crate::cookies::extract_cookie_value;
 use crate::ec::EcContext;
 use crate::ec::EcKvSnapshot;
 use crate::ec::eids::{resolve_partner_ids, to_eids};
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::kv_types::MAX_UID_LENGTH;
 use crate::ec::partner::normalize_partner_source_domain;
-use crate::ec::prebid_eids::collect_prebid_eid_updates_from_eids;
+use crate::ec::prebid_eids::{collect_prebid_eid_updates_from_eids, parse_prebid_eids_cookie};
 use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
 use crate::openrtb::{Eid, Uid};
@@ -208,7 +210,10 @@ pub async fn handle_auction(
     // Keep normalized body updates on the adapter-owned context, not the
     // response, so handled provider errors cannot lose persistence work.
     let client_eids = if ec_id.is_some() {
-        parse_client_auction_eids(body.eids.as_ref())
+        resolve_client_auction_eids(
+            body.eids.as_ref(),
+            extract_cookie_value(&http_req, COOKIE_TS_EIDS).as_deref(),
+        )
     } else {
         None
     };
@@ -344,7 +349,7 @@ pub async fn handle_auction(
     };
     // Hand the loaded row to the request context so response finalization —
     // which runs on an EC context the adapter owns, after this handler returns
-    // — ingests body/sharedId updates from this read instead of paying
+    // — ingests cookie/body/sharedId updates from this read instead of paying
     // for a second lookup.
     if !matches!(auction_kv_snapshot, EcKvSnapshot::NotRead) {
         ec_context.set_kv_snapshot(auction_kv_snapshot.clone());
@@ -582,6 +587,23 @@ pub(crate) fn resolve_and_merge_auction_eids(
     merge_auction_eids(client_eids, resolved)
 }
 
+/// Prefers the current body EID set, falling back to the browser-written cookie.
+pub(crate) fn resolve_client_auction_eids(
+    raw: Option<&JsonValue>,
+    cookie_value: Option<&str>,
+) -> Option<Vec<Eid>> {
+    parse_client_auction_eids(raw).or_else(|| {
+        let cookie = cookie_value?;
+        match parse_prebid_eids_cookie(cookie) {
+            Ok(eids) if !eids.is_empty() => Some(eids),
+            _ => {
+                log::trace!("Auction EIDs: empty or invalid ts-eids cookie; dropping");
+                None
+            }
+        }
+    })
+}
+
 fn parse_client_auction_eids(raw: Option<&JsonValue>) -> Option<Vec<Eid>> {
     let Some(JsonValue::Array(entries)) = raw else {
         return None;
@@ -769,7 +791,6 @@ mod tests {
     use crate::auction::types::{AuctionRequest, AuctionResponse};
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::ConsentContext;
-    use crate::constants::COOKIE_TS_EIDS;
     use crate::ec::kv_backend::test_support::InMemoryEcKv;
     use crate::ec::kv_backend::{
         EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome,
@@ -1074,7 +1095,7 @@ mod tests {
             }});
             let cookie = BASE64.encode(
                 serde_json::to_vec(&json!([
-                    {"source":"id5-sync.com", "uids":[{"id":"retired-cookie-id"}]}
+                    {"source":"id5-sync.com", "uids":[{"id":"cookie-id"}]}
                 ]))
                 .expect("should encode legacy cookie"),
             );
@@ -1107,7 +1128,7 @@ mod tests {
             );
             assert_eq!(
                 writes.lock().expect("should lock writes").len(),
-                usize::from(case == "live"),
+                usize::from(matches!(case, "live" | "cookie-only")),
                 "{case}"
             );
             // A Missing point-read snapshot is revalidated once by the
@@ -1123,10 +1144,15 @@ mod tests {
                 "{case}: auction must not create or recover roots"
             );
             let stored = graph.get(&ec_id).expect("should inspect row");
-            if case == "live" {
+            if matches!(case, "live" | "cookie-only") {
                 assert_eq!(
-                    stored.expect("live root remains").0.ids["id5-sync.com"].uid,
-                    "body-id"
+                    stored.expect("should retain live root").0.ids["id5-sync.com"].uid,
+                    if case == "live" {
+                        "body-id"
+                    } else {
+                        "cookie-id"
+                    },
+                    "body or cookie fallback must enrich only existing live roots"
                 );
             } else if let Some((entry, _)) = stored {
                 assert!(entry.ids.is_empty(), "{case}: no browser enrichment");
@@ -2049,6 +2075,7 @@ mod tests {
             (vec!["expired-uid"], false, vec![]),
             (vec!["expired-uid"], true, vec![]),
             (vec!["different-uid"], false, vec!["different-uid"]),
+            (vec!["different-uid"], true, vec!["different-uid"]),
             (
                 vec!["expired-uid", "different-uid"],
                 false,
@@ -2436,6 +2463,44 @@ mod tests {
         assert_eq!(output[0]["uids"][0]["atype"], 1);
         assert_eq!(output[0]["uids"][0]["ext"]["linkType"], 1);
         assert!(parse_client_auction_eids(None).is_none());
+    }
+
+    #[test]
+    fn restored_cookie_fallback_keeps_body_first_semantics() {
+        let cookie = BASE64.encode(
+            serde_json::to_vec(&json!([
+                {"source":"ids.example.com", "uids":[{"id":"cookie-id"}]},
+                {"source":"extra.example.com", "uids":[{"id":"cookie-only"}]}
+            ]))
+            .expect("should encode cookie"),
+        );
+        let body = json!([{ "source":"ids.example.com", "uids":[{"id":"body-id"}] }]);
+        let from_body = resolve_client_auction_eids(Some(&body), Some(&cookie))
+            .expect("should prefer body EIDs");
+        assert_eq!(
+            from_body.len(),
+            1,
+            "valid body must not merge missing cookie sources"
+        );
+        assert_eq!(
+            from_body[0].uids[0].id, "body-id",
+            "body must win over cookie"
+        );
+        let fallback =
+            resolve_client_auction_eids(None, Some(&cookie)).expect("should fall back to cookie");
+        assert_eq!(
+            fallback.len(),
+            2,
+            "cookie-only request must retain its full EID set"
+        );
+        assert_eq!(
+            fallback[0].uids[0].id, "cookie-id",
+            "should retain cookie UID"
+        );
+        assert!(
+            resolve_client_auction_eids(None, Some("invalid-cookie")).is_none(),
+            "malformed cookie must not become auction input"
+        );
     }
 
     #[test]

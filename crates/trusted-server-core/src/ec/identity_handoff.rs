@@ -17,6 +17,7 @@ use crate::settings::Settings;
 use super::eids::{ResolvedPartnerId, to_eids};
 use super::identity::IdentityEffects;
 use super::identity_handoff_codec::{self as codec, HANDOFF_TTL_SECS, HandoffEntry};
+use super::kv_types::KvPartnerId;
 use super::partner::normalize_partner_source_domain;
 use super::registry::PartnerRegistry;
 use super::{EcContext, EcKvSnapshot, checked_current_timestamp};
@@ -127,7 +128,22 @@ fn live(entry: &HandoffEntry, now: u64) -> bool {
     now < entry.deadline && entry.expires_at.is_none_or(|expiry| now < expiry)
 }
 
-/// Resolves handoff IDs only for absent sources in the current live root.
+/// Allows auction fallback for absent or known-expired IDs, not empty records.
+///
+/// A matching UID needs a refreshed known expiry; omission cannot revive it.
+fn stored_source_allows_handoff(
+    record: Option<&KvPartnerId>,
+    entry: &HandoffEntry,
+    now: u64,
+) -> bool {
+    record.is_none_or(|record| {
+        !record.uid.is_empty()
+            && record.expires_at.is_some_and(|expiry| now >= expiry)
+            && (record.uid != entry.uid || entry.expires_at.is_some_and(|expiry| now < expiry))
+    })
+}
+
+/// Resolves handoff IDs for absent or expired sources in the current live root.
 pub(crate) fn resolve_eids(
     context: &EcContext,
     snapshot: &EcKvSnapshot,
@@ -155,7 +171,7 @@ pub(crate) fn resolve_eids(
             (live(entry, now)
                 && partner.bidstream_enabled
                 && partner.identity_owner.as_deref() == Some(entry.module.as_str())
-                && !root.ids.contains_key(&entry.source))
+                && stored_source_allows_handoff(root.ids.get(&entry.source), entry, now))
             .then(|| ResolvedPartnerId {
                 source_domain: entry.source.clone(),
                 uid: entry.uid.clone(),
@@ -233,7 +249,7 @@ pub(crate) fn finalize_response(
             if !partner_owned {
                 continue;
             }
-            match context.kv_snapshot() {
+            let source_absent = match context.kv_snapshot() {
                 EcKvSnapshot::Present { .. } => {
                     let Some(root) = context
                         .kv_snapshot()
@@ -242,11 +258,11 @@ pub(crate) fn finalize_response(
                     else {
                         continue;
                     };
-                    // Both acknowledgement and conflict retire the handoff. An
-                    // expired record is still an existing record, never a hole.
-                    if root.ids.contains_key(&entry.source) {
+                    if !stored_source_allows_handoff(root.ids.get(&entry.source), entry, now) {
                         continue;
                     }
+                    // An expired record permits auction fallback, not persistence replay.
+                    !root.ids.contains_key(&entry.source)
                 }
                 EcKvSnapshot::Missing { .. } => continue,
                 EcKvSnapshot::Failed { .. } => {
@@ -255,10 +271,12 @@ pub(crate) fn finalize_response(
                     pending.insert(entry.source.clone(), entry.clone());
                     continue;
                 }
-                EcKvSnapshot::NotRead => {}
-            }
+                EcKvSnapshot::NotRead => true,
+            };
             pending.insert(entry.source.clone(), entry.clone());
-            if context.eid_sync_source().is_some() || context.identity_handoff.proxy_replay_allowed
+            if source_absent
+                && (context.eid_sync_source().is_some()
+                    || context.identity_handoff.proxy_replay_allowed)
             {
                 replay.push(entry.clone());
             }
@@ -282,7 +300,7 @@ pub(crate) fn finalize_response(
                 else {
                     continue;
                 };
-                if root.ids.contains_key(&entry.source) {
+                if !stored_source_allows_handoff(root.ids.get(&entry.source), &entry, now) {
                     continue;
                 }
             }

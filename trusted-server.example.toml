@@ -639,9 +639,9 @@ geo_query_parameters = false
 # capture_global_withdrawal = false                  # require confirmed global revoke semantics
 
 # The separate [ec.identity_handoff] opt-in stays off until its synthetic and
-# live acceptance gates pass. It is absent-source-only, expires within five
-# minutes, and provides only best-effort after-send retry. It does not restore
-# the retired browser-written ts-eids cookie.
+# live acceptance gates pass. It supplies auction IDs for absent or expired
+# sources, expires within five minutes, and retries persistence only for absent
+# sources. The browser-written ts-eids cookie remains a separate legacy path.
 
 # DataDome bot protection. Proxies tags.js + signal-collection API first-party.
 # Kept active but disabled so `ts audit` can flip `enabled` when detected.

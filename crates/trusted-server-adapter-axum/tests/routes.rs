@@ -414,7 +414,7 @@ async fn admin_ec_route_without_credentials_returns_401() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn retired_admin_eids_route_still_requires_authentication() {
+async fn admin_eids_route_still_requires_authentication() {
     let req = Request::builder()
         .method("GET")
         .uri("/_ts/admin/eids")
@@ -432,8 +432,8 @@ async fn retired_admin_eids_route_still_requires_authentication() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn authenticated_admin_eids_route_returns_local_retirement_denial() {
-    // Retired routes must not forward admin credentials to publisher fallback.
+async fn authenticated_admin_eids_route_returns_diagnostic_locally() {
+    // The diagnostic is served locally, never via publisher fallback.
     let mut svc = make_service();
     let req = Request::builder()
         .method("GET")
@@ -449,10 +449,13 @@ async fn authenticated_admin_eids_route_returns_local_retirement_denial() {
         .call(req)
         .await
         .expect("should respond");
+    assert_eq!(resp.status().as_u16(), 200);
     assert_eq!(
-        resp.status().as_u16(),
-        410,
-        "/_ts/admin/eids should deny locally after authentication"
+        resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.split(';').next().unwrap_or(v)),
+        Some("application/json")
     );
     assert_eq!(
         resp.headers()
@@ -465,6 +468,18 @@ async fn authenticated_admin_eids_route_returns_local_retirement_denial() {
             .get("x-content-type-options")
             .and_then(|v| v.to_str().ok()),
         Some("nosniff")
+    );
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("should read admin EIDs response body");
+    let body = std::str::from_utf8(&body).expect("should read UTF-8 admin EIDs response");
+    assert!(
+        body.contains("\"cookie_present\":true"),
+        "should inspect the request cookie locally"
+    );
+    assert!(
+        body.contains("ts-eids"),
+        "should include the cookie diagnostic"
     );
 }
 

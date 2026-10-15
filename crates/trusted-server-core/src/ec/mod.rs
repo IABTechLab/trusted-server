@@ -76,12 +76,15 @@ use error_stack::Report;
 use http::Request;
 
 use crate::consent::{self as consent_mod, ConsentContext, ConsentPipelineInput};
-use crate::constants::{COOKIE_TS_EC, COOKIE_TS_EC_PULL_COMPLETE, COOKIE_TS_EIDS_SERVER};
+use crate::constants::{
+    COOKIE_TS_EC, COOKIE_TS_EC_PULL_COMPLETE, COOKIE_TS_EIDS, COOKIE_TS_EIDS_SERVER,
+};
 use crate::cookies::handle_request_cookies;
 use crate::ec::cookies::ec_id_has_only_allowed_chars;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
 use crate::platform::RuntimeServices;
+use crate::redacted::Redacted;
 use crate::settings::Settings;
 use device::DeviceSignals;
 
@@ -278,6 +281,8 @@ pub struct EcContext {
     pull_sync_marker: PullSyncMarkerState,
     /// Allowed returning-user EID persistence source, assigned only after request filters pass.
     eid_sync_source: Option<EidSyncSource>,
+    /// Browser-written EID cookie retained for response-time ingestion, never logging.
+    prebid_eids_cookie: Option<Redacted<String>>,
     /// Normalized browser body updates retained even when auction dispatch fails.
     browser_eid_updates: Vec<kv::PartnerIdUpdate>,
     /// Authenticated capture observations, bound to the incoming full EC ID.
@@ -350,6 +355,11 @@ impl EcContext {
             consent.jurisdiction,
         );
 
+        let prebid_eids_cookie = parsed
+            .jar
+            .as_ref()
+            .and_then(|jar| jar.get(COOKIE_TS_EIDS))
+            .map(|cookie| Redacted::new(cookie.value().to_owned()));
         let identity_handoff = identity_handoff::HandoffState::from_cookie(
             settings,
             ec_value.as_deref(),
@@ -361,6 +371,7 @@ impl EcContext {
         );
         Ok(Self {
             identity_handoff,
+            prebid_eids_cookie,
             ec_value,
             cookie_ec_value: parsed.cookie_ec,
             ec_was_present,
@@ -569,6 +580,13 @@ impl EcContext {
         self.eid_sync_source = Some(source);
     }
 
+    /// Returns the browser-written cookie for decoding and consent-gated use.
+    pub(crate) fn prebid_eids_cookie(&self) -> Option<&str> {
+        self.prebid_eids_cookie
+            .as_ref()
+            .map(|cookie| cookie.expose().as_str())
+    }
+
     /// Stages registered browser body updates before dispatch. No root is created.
     pub(crate) fn stage_browser_eid_updates(&mut self, updates: Vec<kv::PartnerIdUpdate>) {
         self.browser_eid_updates = updates;
@@ -667,6 +685,7 @@ impl EcContext {
     #[must_use]
     pub fn new_for_test(ec_value: Option<String>, consent: ConsentContext) -> Self {
         Self {
+            prebid_eids_cookie: None,
             identity_handoff: identity_handoff::HandoffState::default(),
             browser_eid_updates: Vec::new(),
             ec_was_present: ec_value.is_some(),
@@ -693,6 +712,7 @@ impl EcContext {
         client_ip: Option<String>,
     ) -> Self {
         Self {
+            prebid_eids_cookie: None,
             identity_handoff: identity_handoff::HandoffState::default(),
             browser_eid_updates: Vec::new(),
             ec_was_present: ec_value.is_some(),
@@ -722,6 +742,7 @@ impl EcContext {
         consent: ConsentContext,
     ) -> Self {
         Self {
+            prebid_eids_cookie: None,
             identity_handoff: identity_handoff::HandoffState::default(),
             browser_eid_updates: Vec::new(),
             ec_value,
@@ -1003,6 +1024,26 @@ mod tests {
         assert!(!ec.ec_was_present(), "should not detect EC from header");
         assert!(!ec.cookie_was_present(), "should not detect cookie");
         assert!(!ec.ec_generated(), "should not mark as generated");
+    }
+
+    #[test]
+    fn read_from_request_retains_browser_eid_cookie_without_debug_disclosure() {
+        let settings = create_test_settings();
+        let ec_id = valid_ec_id("a", "Eids01");
+        let value = "synthetic-encoded-cookie-content";
+        let cookies = format!("ts-ec={ec_id}; ts-eids={value}");
+        let req = create_test_request(&[("cookie", &cookies)]);
+        let context = EcContext::read_from_request(&settings, &req, &noop_services())
+            .expect("should read browser cookie");
+        assert_eq!(
+            context.prebid_eids_cookie(),
+            Some(value),
+            "should retain request-local cookie for ingestion"
+        );
+        assert!(
+            !format!("{context:?}").contains(value),
+            "should redact browser EID cookie from debug output"
+        );
     }
 
     #[test]
