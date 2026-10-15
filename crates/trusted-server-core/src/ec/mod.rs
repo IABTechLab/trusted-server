@@ -574,7 +574,7 @@ impl EcContext {
             response_headers: Vec::new(),
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
-            public_prefix: services.public_prefix().clone(),
+            public_prefix: services.public_prefix().for_request(req),
             client_eids: None,
             module_eids,
             pull_sync_marker: PullSyncMarkerState::from_cookie(parsed.pull_sync_marker),

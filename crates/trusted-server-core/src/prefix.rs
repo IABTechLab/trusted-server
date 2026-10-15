@@ -65,6 +65,7 @@ pub const PUBLIC_PREFIX_ATTRIBUTE: &str = "data-ts-public-prefix";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicPrefix {
     dotted: String,
+    cookie_path: Option<String>,
 }
 
 impl PublicPrefix {
@@ -96,6 +97,7 @@ impl PublicPrefix {
         }
         Some(Self {
             dotted: parts.join("."),
+            cookie_path: None,
         })
     }
 
@@ -111,6 +113,48 @@ impl PublicPrefix {
     #[must_use]
     pub fn cookie_name(&self, name: &str) -> String {
         format!("{}-{name}", self.dotted)
+    }
+
+    /// The same prefix, its cookies written under `path`.
+    ///
+    /// `None` or an empty path writes them under `/`. So does a path that
+    /// cannot be a cookie's `Path`, logged, so a value written into a
+    /// `Set-Cookie` header can never add an attribute.
+    #[must_use]
+    pub fn under_path(self, path: Option<&str>) -> Self {
+        let cookie_path = match path {
+            None | Some("") => None,
+            Some(path) if crate::addressing::is_cookie_path(path) => Some(path.to_owned()),
+            Some(_) => {
+                log::warn!("Writing cookies under / as the removed prefix is not a cookie path");
+                None
+            }
+        };
+        Self {
+            cookie_path,
+            ..self
+        }
+    }
+
+    /// The prefix for `request`, its cookies written under the prefix
+    /// request addressing removed, or under `/` when none was removed.
+    ///
+    /// A browser sends a cookie only under its `Path`, so publishers served
+    /// from one host by path never receive each other's cookies.
+    #[must_use]
+    pub fn for_request<B>(&self, request: &http::Request<B>) -> Self {
+        self.clone().under_path(
+            request
+                .extensions()
+                .get::<crate::addressing::RemovedPathPrefix>()
+                .map(crate::addressing::RemovedPathPrefix::as_str),
+        )
+    }
+
+    /// The `Path` attribute of every cookie written under this prefix.
+    #[must_use]
+    pub fn cookie_path(&self) -> &str {
+        self.cookie_path.as_deref().unwrap_or("/")
     }
 
     /// Whether `cookie` is in the namespace this prefix starts, which is every
@@ -180,6 +224,7 @@ impl TrustedServerPrefix {
     pub fn public() -> PublicPrefix {
         PublicPrefix {
             dotted: TRUSTED_SERVER_HEAD.to_owned(),
+            cookie_path: None,
         }
     }
 
@@ -358,6 +403,46 @@ pub mod test_support {
 mod tests {
     use super::*;
     use crate::module_context::test_support::request;
+
+    #[test]
+    fn cookies_are_under_the_root_with_no_removed_prefix() {
+        assert_eq!(PublicPrefix::default().cookie_path(), "/");
+        assert_eq!(
+            PublicPrefix::default().under_path(Some("")).cookie_path(),
+            "/"
+        );
+    }
+
+    #[test]
+    fn cookies_are_under_the_prefix_the_request_had_removed() {
+        let mut addressed = http::Request::new(());
+        addressed
+            .extensions_mut()
+            .insert(crate::addressing::RemovedPathPrefix::new(
+                "/publisher-a.example".to_owned(),
+            ));
+        let public = PublicPrefix::default();
+
+        assert_eq!(
+            public.for_request(&addressed).cookie_path(),
+            "/publisher-a.example"
+        );
+        assert_eq!(
+            public.for_request(&http::Request::new(())).cookie_path(),
+            "/"
+        );
+    }
+
+    #[test]
+    fn a_prefix_that_is_not_a_cookie_path_keeps_the_root() {
+        for path in ["/a; Domain=example.com", "a", "/a b", "/\u{e9}"] {
+            assert_eq!(
+                PublicPrefix::default().under_path(Some(path)).cookie_path(),
+                "/",
+                "{path}"
+            );
+        }
+    }
 
     fn settings_for(domain: &str) -> Settings {
         let mut settings = Settings::default();

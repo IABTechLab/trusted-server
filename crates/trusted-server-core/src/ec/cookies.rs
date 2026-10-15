@@ -5,7 +5,9 @@
 //! Cookie attributes follow current best practices:
 //!
 //! - `Domain` is computed as `.{publisher.domain}` for subdomain coverage
-//! - `Path=/` makes the cookie available on all paths
+//! - `Path` is the prefix's cookie path, `/` unless request addressing
+//!   removed a prefix, so publishers served from one host by path keep
+//!   their cookies apart
 //! - `Secure` restricts to HTTPS
 //! - `SameSite=Lax` provides CSRF protection while allowing top-level navigations
 //! - `Max-Age` of 1 year (or 0 to expire)
@@ -53,8 +55,9 @@ pub(crate) fn ec_id_has_only_allowed_chars(ec_id: &str) -> bool {
 /// attributes (e.g. adding `Partitioned`) only need updating in one place.
 fn format_set_cookie(public: &PublicPrefix, domain: &str, value: &str, max_age: i32) -> String {
     format!(
-        "{}={value}; Domain={domain}; Path=/; Secure; SameSite=Lax; Max-Age={max_age}; HttpOnly",
+        "{}={value}; Domain={domain}; Path={}; Secure; SameSite=Lax; Max-Age={max_age}; HttpOnly",
         public.cookie_name(COOKIE_EC),
+        public.cookie_path(),
     )
 }
 
@@ -161,9 +164,10 @@ pub fn expire_ec_resolved_marker(
     response: &mut Response<EdgeBody>,
 ) {
     let marker = format!(
-        "{}=; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age=0",
+        "{}=; Domain={}; Path={}; Secure; SameSite=Lax; Max-Age=0",
         public.cookie_name(COOKIE_EC_RESOLVED),
         settings.publisher.ec_cookie_domain(),
+        public.cookie_path(),
     );
     match HeaderValue::from_str(&marker) {
         Ok(val) => {
@@ -190,9 +194,10 @@ pub(crate) fn set_resolved_marker_cookie(
     response: &mut Response<EdgeBody>,
 ) {
     let cookie = format!(
-        "{}=1; Domain={}; Path=/; Secure; SameSite=Lax; Max-Age={COOKIE_MAX_AGE}",
+        "{}=1; Domain={}; Path={}; Secure; SameSite=Lax; Max-Age={COOKIE_MAX_AGE}",
         public.cookie_name(COOKIE_EC_RESOLVED),
         settings.publisher.ec_cookie_domain(),
+        public.cookie_path(),
     );
     match HeaderValue::from_str(&cookie) {
         Ok(val) => {
@@ -276,6 +281,40 @@ mod tests {
             })
             .collect();
         assert_eq!(names, ["_ex-ec", "_ex-ecr", "_ex-ec", "_ex-ecr"]);
+    }
+
+    fn set_cookie_paths(public: &PublicPrefix) -> Vec<String> {
+        let settings = create_test_settings();
+        let mut response = empty_response();
+        set_ec_cookie(&settings, public, &mut response, TEST_EC_ID);
+        set_resolved_marker_cookie(&settings, public, &mut response);
+        expire_ec_cookie(&settings, public, &mut response);
+        response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| {
+                let text = value.to_str().expect("should be valid UTF-8");
+                text.split("; ")
+                    .find_map(|attribute| attribute.strip_prefix("Path="))
+                    .expect("should carry a Path")
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    /// On a request addressed by path, every cookie this file writes is
+    /// under the removed prefix, so another publisher's pages never get it.
+    #[test]
+    fn each_cookie_is_under_the_removed_prefix_on_an_addressed_request() {
+        let public = PublicPrefix::default().under_path(Some("/publisher-a.example"));
+
+        assert_eq!(set_cookie_paths(&public), ["/publisher-a.example"; 4]);
+    }
+
+    #[test]
+    fn each_cookie_is_under_the_root_with_no_removed_prefix() {
+        assert_eq!(set_cookie_paths(&PublicPrefix::default()), ["/"; 4]);
     }
 
     /// A valid EC ID for use in cookie tests.

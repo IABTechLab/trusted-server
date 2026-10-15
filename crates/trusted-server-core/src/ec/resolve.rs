@@ -243,11 +243,11 @@ pub async fn handle_ec_resolve(
     // carry, which a replacing write would drop.
     apply_module_response_headers(response.headers_mut(), generated.response_headers);
 
-    set_ec_cookie(settings, services.public_prefix(), &mut response, &ec_id);
+    set_ec_cookie(settings, ec_context.public_prefix(), &mut response, &ec_id);
     // The Edge Cookie is HttpOnly, so the page script cannot see it; the
     // non-HttpOnly marker tells the script the resolve succeeded so it does
     // not post again on every page view.
-    set_resolved_marker_cookie(settings, services.public_prefix(), &mut response);
+    set_resolved_marker_cookie(settings, ec_context.public_prefix(), &mut response);
 
     Ok(response)
 }
