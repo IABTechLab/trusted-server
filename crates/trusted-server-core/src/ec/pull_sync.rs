@@ -13,6 +13,7 @@ use http::{Method, StatusCode, header};
 use serde::Deserialize;
 use url::Url;
 
+use crate::consent::allows_eid_persistence;
 use crate::platform::{
     DEFAULT_FIRST_BYTE_TIMEOUT, PlatformBackendSpec, PlatformHttpRequest, PlatformPendingRequest,
     PlatformResponse, RuntimeServices,
@@ -65,7 +66,14 @@ pub fn build_pull_sync_context(
     ec_context: &EcContext,
     registry: &PartnerRegistry,
 ) -> Option<PullSyncContext> {
-    if registry.pull_enabled_partners().is_empty() || !ec_context.ec_allowed() {
+    // Without EID-persistence consent (TCF Purpose 1 + 4), finalization
+    // withholds browser-supplied partner UIDs. That leaves partner slots empty,
+    // which pull sync would otherwise read as eligible and disclose the EC ID
+    // to partners for exactly the users who opted out.
+    if registry.pull_enabled_partners().is_empty()
+        || !ec_context.ec_allowed()
+        || !allows_eid_persistence(ec_context.consent())
+    {
         return None;
     }
 
@@ -513,6 +521,7 @@ mod tests {
     use crate::ec::kv_types::KvEntry;
     use crate::platform::PlatformResponse;
     use crate::redacted::Redacted;
+    use crate::test_support::tests::purpose_one_only_consent;
 
     fn make_response(status: u16, body: &[u8]) -> PlatformResponse {
         PlatformResponse::new(
@@ -590,6 +599,31 @@ mod tests {
         assert!(
             context.is_none(),
             "should reject pull sync context when EC ID format is invalid"
+        );
+    }
+
+    #[test]
+    fn build_pull_sync_context_skips_when_eid_persistence_is_denied() {
+        // Purpose 1 granted keeps the EC, but Purpose 4 denied withholds EID
+        // writes and leaves partner slots empty. Pull sync must not read those
+        // empty slots as eligible and disclose the EC ID to partners.
+        let consent = purpose_one_only_consent();
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let mut ec_context = EcContext::new_for_test(Some(ec_id.clone()), consent);
+        let graph = KvIdentityGraph::in_memory("pull_store");
+        ec_context.set_kv_snapshot(seed_present_snapshot(&graph, &ec_id));
+        let registry = PartnerRegistry::from_config(&[pull_enabled_ec_partner("ssp.example.com")])
+            .expect("should build registry");
+        assert!(
+            ec_context.ec_allowed(),
+            "should keep the EC allowed when Purpose 1 is granted"
+        );
+
+        let context = build_pull_sync_context(&ec_context, &registry);
+
+        assert!(
+            context.is_none(),
+            "should skip pull sync when TCF Purpose 4 is denied"
         );
     }
 

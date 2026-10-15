@@ -58,8 +58,9 @@ cargo build --package trusted-server-adapter-fastly --release --target wasm32-wa
 # Run locally with Fastly simulator
 fastly compute serve
 
-# Deploy to Fastly
-fastly compute publish
+# Deploy to Fastly (managed path; links logical stores to the version)
+EDGEZERO_MANIFEST="<release-root>/edgezero.toml" \
+  ts deploy --adapter fastly --service-id <service-id> --application-release "<release-root>"
 
 # Run Axum dev server (native — no Viceroy)
 cargo run -p trusted-server-adapter-axum
@@ -329,7 +330,7 @@ IntegrationRegistration::builder(ID)
 ## JS Build Pipeline
 
 - `build-all.mjs` discovers `src/integrations/*/index.ts` and builds each as a separate IIFE.
-- Output: `dist/tsjs-core.js`, `dist/tsjs-{integration}.js`.
+- Output: `dist/tsjs-core.js`, `dist/tsjs-{integration}.js` from `npm run build`. `build.rs` passes `--out-dir` to build the same files into a private `OUT_DIR/tsjs-dist`, validates the set, and never reads `dist/`.
 - `build.rs` auto-generates `tsjs_modules.rs` with `include_str!()` for each discovered file.
 - `bundle.rs` provides `concatenate_modules(ids)` and `concatenated_hash(ids)` APIs.
 - Runtime: Rust server concatenates core + enabled integration JS files at request time.
@@ -362,7 +363,8 @@ Every PR must pass:
 7. Docs format (`cd docs && npm run format`)
 8. Markdown format outside `docs/` (requires `cd docs && npm ci` first): `docs/node_modules/.bin/prettier --config docs/.prettierrc --check "*.md" ".claude/**/*.md" ".github/**/*.md" "crates/**/*.md" "scripts/**/*.md" "tinybird/**/*.md"`; fix with `--write` in place of `--check`
 9. Native core build-digest test and lint (`cargo test -p trusted-server-core --test template_build_digest` and `cargo clippy -p trusted-server-core --test template_build_digest -- -D warnings`)
-10. URL-host linter on lines the PR adds (`lint-domains` job, PRs only); run it locally with `cargo run --manifest-path crates/trusted-server-cli/Cargo.toml --target <host-triple> --bin ts -- dev lint domains --changed-vs origin/main`
+10. Wasm clock lint: `scripts/lint-wasm-clock.sh` (crates built into the Cloudflare Worker must use `web_time`, not the `std::time::{Instant,SystemTime}` `now`/`elapsed` methods, which panic there)
+11. URL-host linter on lines the PR adds (`lint-domains` job, PRs only); run it locally with `cargo run --manifest-path crates/trusted-server-cli/Cargo.toml --target <host-triple> --bin ts -- dev lint domains --changed-vs origin/main`
 
 ---
 
@@ -461,7 +463,7 @@ both runtime behavior and build/tooling changes.
 | `crates/trusted-server-core/src/cookies.rs`               | Cookie handling                                      |
 | `crates/trusted-server-core/src/consent/mod.rs`           | GDPR and broader consent management                  |
 | `crates/trusted-server-core/src/http_util.rs`             | HTTP abstractions and request utilities              |
-| `crates/trusted-server-js/build.rs`                       | Discovers dist files, generates `tsjs_modules.rs`    |
+| `crates/trusted-server-js/build.rs`                       | Builds into `OUT_DIR`, generates `tsjs_modules.rs`   |
 | `crates/trusted-server-js/src/bundle.rs`                  | Module map, concatenation, hashing                   |
 
 ---
