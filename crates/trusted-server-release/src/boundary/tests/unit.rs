@@ -479,3 +479,33 @@ fn sbpl_profile_denies_group_escape_and_scopes_unix_sockets() {
         assert!(!text.contains(absent), "should not allow {absent}");
     }
 }
+
+#[test]
+fn sibling_lifetime_is_owned_by_the_parent_pipe() {
+    let mut sibling = spawn_sibling();
+    let controlled = sibling.stdin.is_some();
+    if controlled {
+        drop(sibling.stdin.take());
+    } else {
+        sibling
+            .kill()
+            .expect("should stop the old timer-based fixture");
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(status) = sibling.try_wait().expect("should poll sibling") {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            sibling.kill().expect("should stop a failed fixture");
+            sibling.wait().expect("should reap a failed fixture");
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(controlled, "should retain a parent-owned lifetime pipe");
+    assert!(
+        status.is_some_and(|status| status.success()),
+        "should exit successfully when the parent closes the pipe"
+    );
+}

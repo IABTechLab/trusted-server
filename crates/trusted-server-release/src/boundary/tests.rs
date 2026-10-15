@@ -134,14 +134,15 @@ fn helper_report(stdout: &[u8]) -> String {
         .to_owned()
 }
 
-/// Spawns an unconfined same-user sibling helper that sleeps.
+/// Spawns a same-user sibling that lives until killed or its parent pipe closes.
 fn spawn_sibling() -> std::process::Child {
     let mut command = StdCommand::new(test_binary());
     command
-        .args(helper_arguments(&["30000"]))
+        .args(helper_arguments(&[]))
         .env_clear()
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null());
-    for (name, value) in helper_environment("sleep") {
+    for (name, value) in helper_environment("wait-for-eof") {
         command.env(name, value);
     }
     command.spawn().expect("should spawn sibling")

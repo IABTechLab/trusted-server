@@ -53,6 +53,10 @@ pub(super) fn run(mode: &str, arguments: &[String]) -> i32 {
         ),
         "signal" => signal(argument(0), argument(1)),
         "signal-own-child" => signal_own_child(),
+        "wait-for-eof" => match std::io::copy(&mut std::io::stdin(), &mut std::io::sink()) {
+            Ok(_) => 0,
+            Err(_) => HELPER_SETUP_FAILED,
+        },
         "sleep" => {
             std::thread::sleep(Duration::from_millis(argument(0).parse().unwrap_or(0)));
             0
