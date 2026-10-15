@@ -194,6 +194,7 @@ impl Git {
                 &Batch {
                     kind,
                     oids: &oids[start..end],
+                    sizes: &sizes[start..end],
                     budget: &self.object_budget,
                 },
                 &mut |index, bytes| visit(start + index, bytes),
@@ -249,6 +250,7 @@ fn object_id(kind: &str, bytes: &[u8]) -> Result<String, Report<ReleaseError>> {
 struct Batch<'a> {
     kind: &'a str,
     oids: &'a [&'a str],
+    sizes: &'a [u64],
     budget: &'a Cell<u64>,
 }
 
@@ -259,8 +261,18 @@ fn read_batch(
 ) -> Result<(), Report<ReleaseError>> {
     let io_error = |error: io::Error| source_error(format!("cannot read batch output: {error}"));
     let kind = batch.kind;
+    if batch.sizes.len() != batch.oids.len() {
+        return Err(source_error(
+            "Git preflight size count differs from requested object count",
+        ));
+    }
     for (index, oid) in batch.oids.iter().enumerate() {
         let size = read_header(reader, kind, oid)?;
+        if size != batch.sizes[index] {
+            return Err(source_error(
+                "Git object body size differs from preflight metadata",
+            ));
+        }
         let remaining = batch.budget.get();
         if size > OBJECT_LIMIT || size > remaining {
             return Err(source_error(format!(
@@ -307,5 +319,44 @@ fn read_header(
         _ => Err(source_error(format!(
             "object {oid} is not a readable {kind}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn batch_body_size_must_match_the_preflight_size() {
+        let bytes = b"fictional object";
+        let oid = object_id("blob", bytes).expect("should hash fixture blob");
+        let mut raw = format!("{oid} blob {}\n", bytes.len()).into_bytes();
+        raw.extend_from_slice(bytes);
+        raw.push(b'\n');
+        let budget = Cell::new(1024);
+        let batch = Batch {
+            kind: "blob",
+            oids: &[oid.as_str()],
+            sizes: &[1],
+            budget: &budget,
+        };
+        let mut delivered = false;
+        let result = read_batch(&mut Cursor::new(raw), &batch, &mut |_, _| {
+            delivered = true;
+            Ok(())
+        });
+        assert!(
+            result.is_err(),
+            "should reject body header inconsistent with preflight metadata"
+        );
+        assert!(
+            !delivered,
+            "should reject before delivering any object bytes"
+        );
+        assert_eq!(
+            budget.get(),
+            1024,
+            "should reject before consuming object budget"
+        );
     }
 }

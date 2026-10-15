@@ -290,19 +290,52 @@ mod tests {
 
     #[test]
     fn rejects_malformed_scripts_and_hashes_the_exact_declared_command() {
-        for scripts in [Value::Null, json!([]), json!({"postinstall":42}), json!({"postinstall":""})] {
-            let manifest = json!({"name":"fictional-package", "version":"1.0.0", "scripts":scripts});
-            assert!(declared_hooks(&manifest, "fictional-package", "1.0.0", false).is_err(), "should reject malformed script declarations");
+        for scripts in [
+            Value::Null,
+            json!([]),
+            json!({"postinstall":42}),
+            json!({"postinstall":""}),
+        ] {
+            let manifest =
+                json!({"name":"fictional-package", "version":"1.0.0", "scripts":scripts});
+            assert!(
+                declared_hooks(&manifest, "fictional-package", "1.0.0", false).is_err(),
+                "should reject malformed script declarations"
+            );
         }
         let manifest = json!({"name":"esbuild", "version":"0.27.3", "scripts":{"postinstall":"node install.js"}});
-        let declarations = declared_hooks(&manifest, "esbuild", "0.27.3", false).expect("should match reviewed command");
-        assert_eq!(declarations[0].event(), "postinstall", "should preserve declared event");
-        assert_eq!(declarations[0].script_sha256(), "912d4d8f507b7b392ae422a459f98da94669a742e4cc43cfe061e630ee2846fe", "should hash exact UTF-8 command bytes");
+        let declarations = declared_hooks(&manifest, "esbuild", "0.27.3", false)
+            .expect("should match reviewed command");
+        assert_eq!(
+            declarations[0].event(),
+            "postinstall",
+            "should preserve declared event"
+        );
+        assert_eq!(
+            declarations[0].script_sha256(),
+            "912d4d8f507b7b392ae422a459f98da94669a742e4cc43cfe061e630ee2846fe",
+            "should hash exact UTF-8 command bytes"
+        );
         let mut changed = manifest;
         changed["version"] = json!("0.27.4");
-        assert!(declared_hooks(&changed, "esbuild", "0.27.4", false).is_err(), "should reject unreviewed locked version");
+        assert!(
+            declared_hooks(&changed, "esbuild", "0.27.4", false).is_err(),
+            "should reject unreviewed locked version"
+        );
         let prepare = json!({"name":"fictional-package", "version":"1.0.0", "scripts":{"prepare":"node source-only.mjs"}});
-        assert!(declared_hooks(&prepare, "fictional-package", "1.0.0", false).expect("should parse registry manifest").is_empty(), "should not infer registry prepare execution");
-        assert!(parse_json(br#"{"name":"fictional-package","name":"substitute","version":"1.0.0"}"#, Role::Metadata).is_err(), "should reject duplicate manifest keys before selection");
+        assert!(
+            declared_hooks(&prepare, "fictional-package", "1.0.0", false)
+                .expect("should parse registry manifest")
+                .is_empty(),
+            "should not infer registry prepare execution"
+        );
+        assert!(
+            parse_json(
+                br#"{"name":"fictional-package","name":"substitute","version":"1.0.0"}"#,
+                Role::Metadata
+            )
+            .is_err(),
+            "should reject duplicate manifest keys before selection"
+        );
     }
 }
