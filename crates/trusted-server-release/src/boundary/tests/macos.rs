@@ -5,13 +5,14 @@
 //! constructed and the tests fail instead of passing vacuously.
 
 use std::fs;
-use std::os::unix::fs::{PermissionsExt as _, symlink};
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
 use std::time::SystemTime;
 
 use tempfile::{TempDir, tempdir};
 
-use super::super::macos::MacProfile;
+use super::super::macos::{MacProfile, RunIdentity};
 use super::super::probe::LoopbackListener;
+use super::super::survivors::{RunSignature, matching};
 use super::*;
 use crate::process::ProcessOutcome;
 
@@ -264,32 +265,178 @@ fn group_escape_keeping_the_run_nonce_is_killed_and_rejected() {
     assert!(wait_gone(pid), "should kill the escaped descendant {pid}");
 }
 
-/// Documents the residual: an escape that also scrubs its environment is not
-/// found. The test kills the survivor itself.
 #[test]
-fn group_escape_with_scrubbed_environment_is_the_documented_residual() {
+fn group_escape_with_scrubbed_environment_is_killed_and_rejected() {
     let fixture = Fixture::new();
     let proof = fixture.prove();
-    let pid_file = fixture.writable.join("residual.pid");
+    let pid_file = fixture.writable.join("scrubbed.pid");
     let outcome = fixture.boundary.run_confined(
         &fixture.command("escape", &[path_text(&pid_file), "scrub"]),
         &proof,
     );
     let pid = read_pid(&pid_file);
     let survived = process_exists(pid);
-    // SAFETY: `pid` is the fixture's own escaped helper (> 1).
-    unsafe {
-        libc::kill(pid, libc::SIGKILL);
+    if survived {
+        // SAFETY: `pid` is the fixture's own escaped helper (> 1).
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
     }
+    let error = outcome.expect_err("should reject a run whose scrubbed descendant escaped");
     assert!(
-        outcome.is_ok(),
-        "should not detect a scrubbed escape: {outcome:?}"
+        format!("{error:?}").contains("escaped"),
+        "should name the escape: {error:?}"
     );
     assert!(
-        survived,
-        "should leave the scrubbed escapee alive (documented residual)"
+        !survived,
+        "should kill the scrubbed escaped descendant {pid} before returning"
     );
-    assert!(wait_gone(pid), "should be killed by the test");
+}
+
+/// Collect-only: lists matches without signalling anything.
+#[test]
+fn fresh_run_signature_matches_no_existing_process() {
+    let directory = tempdir().expect("should create marker directory");
+    let base = fs::canonicalize(directory.path()).expect("should canonicalize markers");
+    let allow = base.join("allow");
+    let deny = base.join("deny");
+    fs::write(&allow, b"").expect("should write allow marker");
+    fs::write(&deny, b"").expect("should write deny marker");
+    let matches = matching(&RunSignature {
+        variable: "TS_RELEASE_BOUNDARY_RUN",
+        nonce: "fictional-unused-nonce",
+        allow: &allow,
+        deny: &deny,
+        started_after_micros: 0,
+    })
+    .expect("should query every process without signalling it");
+    assert!(
+        matches.is_empty(),
+        "should match no unrelated sandboxed or unsandboxed process: {matches:?}"
+    );
+}
+
+/// Collect-only: the single carrier is this test's own child.
+#[test]
+fn processes_started_before_the_run_are_never_matched() {
+    let directory = tempdir().expect("should create marker directory");
+    let base = fs::canonicalize(directory.path()).expect("should canonicalize markers");
+    let allow = base.join("allow");
+    let deny = base.join("deny");
+    fs::write(&allow, b"").expect("should write allow marker");
+    fs::write(&deny, b"").expect("should write deny marker");
+    let nonce = "fictional-start-guard-nonce";
+    // Apple platform binaries hide their environment from KERN_PROCARGS2.
+    let sleeper = base.join("sleep");
+    fs::copy("/bin/sleep", &sleeper).expect("should copy a visible sleeper");
+    let mut carrier = std::process::Command::new(&sleeper)
+        .arg("30")
+        .env("TS_RELEASE_BOUNDARY_RUN", nonce)
+        .spawn()
+        .expect("should start an own nonce carrier");
+    let carrier_pid = libc::pid_t::try_from(carrier.id()).expect("should fit a pid");
+    std::thread::sleep(Duration::from_millis(100));
+    let signature = |started_after_micros| RunSignature {
+        variable: "TS_RELEASE_BOUNDARY_RUN",
+        nonce,
+        allow: &allow,
+        deny: &deny,
+        started_after_micros,
+    };
+    let future = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|now| now + Duration::from_secs(3600))
+        .ok()
+        .and_then(|future| u64::try_from(future.as_micros()).ok());
+    let eligible = matching(&signature(0));
+    let later = future.map(|future| matching(&signature(future)));
+    // Stop the own carrier before any assertion can unwind.
+    carrier.kill().expect("should stop own carrier");
+    carrier.wait().expect("should reap own carrier");
+    let eligible = eligible.expect("should list eligible carriers");
+    let later = later
+        .expect("should compute a later run start")
+        .expect("should list carriers started after a later run");
+    assert_eq!(
+        eligible,
+        vec![carrier_pid],
+        "should match exactly the own carrier"
+    );
+    assert!(
+        later.is_empty(),
+        "should never match a process that started before the run: {later:?}"
+    );
+}
+
+#[test]
+fn concurrent_run_of_another_instance_is_not_reaped() {
+    let first = Fixture::new();
+    let first_proof = first.prove();
+    let second = Fixture::new();
+    let second_proof = second.prove();
+    std::thread::scope(|scope| {
+        let long = scope.spawn(|| {
+            second
+                .boundary
+                .run_confined(&second.command("sleep", &["1500"]), &second_proof)
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        let short = first
+            .boundary
+            .run_confined(&first.command("sleep", &["0"]), &first_proof)
+            .expect("should not count another instance's live run as a survivor");
+        assert_eq!(
+            short.outcome(),
+            ProcessOutcome::Exited { code: 0 },
+            "should complete the short run"
+        );
+        let long = long
+            .join()
+            .expect("should join the concurrent run")
+            .expect("should leave the other instance's run untouched");
+        assert_eq!(
+            long.outcome(),
+            ProcessOutcome::Exited { code: 0 },
+            "should let the other instance finish normally"
+        );
+    });
+}
+
+#[test]
+fn escaped_scrubbed_descendant_inherits_denial() {
+    let fixture = Fixture::new();
+    let proof = fixture.prove();
+    let listener = LoopbackListener::bind().expect("should bind listener");
+    let address = listener.address().to_string();
+    assert_eq!(
+        fixture.run(&proof, "escape-connect", &[&address]),
+        "denied errno=1",
+        "should deny a new-group descendant with a scrubbed environment"
+    );
+    assert_eq!(
+        listener.drain_accepts().expect("should drain"),
+        0,
+        "should see no accept from the escaped descendant"
+    );
+}
+
+#[test]
+fn runtime_hard_link_from_immutable_root_is_denied() {
+    let fixture = Fixture::new();
+    let proof = fixture.prove();
+    let source = fixture.immutable.join("src/a.txt");
+    let alias = fixture.writable.join("runtime-link");
+    assert_eq!(
+        fixture.run(&proof, "link", &[path_text(&source), path_text(&alias)]),
+        "denied errno=1",
+        "should deny creating a write-through alias during the run"
+    );
+    assert!(!alias.exists(), "should leave no alias behind");
+    assert_eq!(
+        fs::metadata(&source).expect("should stat source").nlink(),
+        1,
+        "should keep the immutable file single-linked"
+    );
 }
 
 #[test]
@@ -343,11 +490,9 @@ fn hard_link_write_through_bypasses_path_denial_and_restoration_hides_it() {
 
     // Deliberately skip the boundary's nlink scan to show what it prevents.
     let profile = MacProfile::generate(&fixture.boundary.roots).expect("should generate");
+    let run = RunIdentity::new(&profile).expect("should create run markers");
     let result = profile
-        .wrap(
-            &fixture.command("write", &[path_text(&alias)]),
-            "fixture-run",
-        )
+        .wrap(&fixture.command("write", &[path_text(&alias)]), &run)
         .expect("should wrap")
         .run()
         .expect("should run unscanned helper");

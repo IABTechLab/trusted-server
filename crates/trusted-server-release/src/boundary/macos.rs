@@ -17,9 +17,16 @@
 //! `setpgid` system calls are not filtered; `(allow syscall-unix)` followed by
 //! `(deny syscall-unix (syscall-number …))` makes both fail with `EPERM` in
 //! the confined process and its descendants.
+//!
+//! Each run also binds two fresh empty marker files, created outside every
+//! root: the profile allows reading one and denies reading the other. That
+//! pair of rules identifies processes of exactly this run's sandbox instance
+//! to the survivor check, independent of their environment.
 
 use std::ffi::OsString;
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use error_stack::Report;
 use sha2::{Digest as _, Sha256};
@@ -69,6 +76,16 @@ const PROFILE_HEADER: &str = r#"(version 1)
 "#;
 /// Network denial; later SBPL rules take precedence over earlier ones.
 const NETWORK_DENIAL: &str = "(deny network*)\n";
+/// Profile parameter naming the run marker the instance may read.
+pub(crate) const RUN_MARK_ALLOW: &str = "RUN_MARK_ALLOW";
+/// Profile parameter naming the run marker the instance must not read.
+pub(crate) const RUN_MARK_DENY: &str = "RUN_MARK_DENY";
+/// Instance-identifying marker rules, last so that they take precedence.
+const RUN_MARK_RULES: &str = "(allow file-read-data (literal (param \"RUN_MARK_ALLOW\")))\n\
+                              (deny file-read* (literal (param \"RUN_MARK_DENY\")))\n";
+/// Allowance before a run's recorded start. It only widens eligibility;
+/// identity checks still gate every match.
+const START_MARGIN: Duration = Duration::from_secs(1);
 /// Profile identity domain for the configuration fingerprint.
 const FINGERPRINT_DOMAIN: &[u8] = b"trusted-server-boundary-macos-sbpl-v2\n";
 
@@ -149,6 +166,7 @@ impl MacProfile {
         text.push_str(&denials);
         text.push_str(NETWORK_DENIAL);
         text.push_str(&sockets);
+        text.push_str(RUN_MARK_RULES);
         Ok(Self { text, defines })
     }
 
@@ -175,7 +193,8 @@ impl MacProfile {
         arguments
     }
 
-    /// Returns the profile fingerprint (before the instance nonce).
+    /// Returns the profile fingerprint (before the instance nonce). The marker
+    /// rules are covered; per-run marker paths are not.
     #[must_use]
     pub(crate) fn fingerprint(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
@@ -188,7 +207,8 @@ impl MacProfile {
         hasher.finalize().into()
     }
 
-    /// Wraps `command` in `sandbox-exec`, adding the run nonce variable.
+    /// Wraps `command` in `sandbox-exec`, adding the run's marker defines and
+    /// nonce variable.
     ///
     /// # Errors
     ///
@@ -198,9 +218,13 @@ impl MacProfile {
     pub(crate) fn wrap(
         &self,
         command: &ConfinedCommand,
-        run_nonce: &str,
+        run: &RunIdentity,
     ) -> Result<BoundedCommand, Report<ReleaseError>> {
         let mut arguments = self.arguments();
+        for (name, value) in &run.defines {
+            arguments.push(OsString::from("-D"));
+            arguments.push(OsString::from(format!("{name}={value}")));
+        }
         arguments.push(command.program.clone().into_os_string());
         arguments.extend(command.arguments.iter().cloned());
         let mut bounded = BoundedCommand::new(
@@ -209,27 +233,28 @@ impl MacProfile {
             command.limits,
         )?
         .arguments(arguments)
-        .environment(RUN_NONCE_VARIABLE, run_nonce)?;
+        .environment(RUN_NONCE_VARIABLE, &run.nonce)?;
         for (name, value) in &command.environment {
             bounded = bounded.environment(name, value)?;
         }
         Ok(command.finish(bounded))
     }
 
-    /// Runs `command` confined, then kills and rejects any descendant that
-    /// escaped the process group while keeping the run nonce.
+    /// Runs `command` confined, then kills and rejects any process of this
+    /// run's sandbox instance, or carrying its nonce, that outlived it.
     ///
     /// # Errors
     ///
-    /// Returns [`ReleaseError::Boundary`] when an escaped descendant was found
-    /// (even if the run itself succeeded), or the run's own error.
+    /// Returns [`ReleaseError::Boundary`] when the run identity cannot be
+    /// created or an escaped descendant was found (even if the run itself
+    /// succeeded), or the run's own error.
     pub(crate) fn run(
         &self,
         command: &ConfinedCommand,
     ) -> Result<ProcessResult, Report<ReleaseError>> {
-        let nonce = run_nonce()?;
-        let outcome = self.wrap(command, &nonce).and_then(|bounded| bounded.run());
-        let survivors = reap_survivors(&nonce);
+        let run = RunIdentity::new(self)?;
+        let outcome = self.wrap(command, &run).and_then(|bounded| bounded.run());
+        let survivors = reap_survivors(&run);
         match (outcome, survivors) {
             (Ok(result), Ok(())) => Ok(result),
             (Err(run), Ok(())) => Err(run),
@@ -241,12 +266,76 @@ impl MacProfile {
     }
 }
 
+/// One run's survivor identity: an environment nonce and two private marker
+/// files outside every boundary root.
+pub(crate) struct RunIdentity {
+    nonce: String,
+    started_after_micros: u64,
+    defines: [(String, String); 2],
+    allow: PathBuf,
+    deny: PathBuf,
+    _directory: tempfile::TempDir,
+}
+
+impl RunIdentity {
+    /// Creates fresh markers for one run of `profile`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReleaseError::Boundary`] when the markers cannot be created,
+    /// are not safe define text, or overlap a boundary root.
+    pub(crate) fn new(profile: &MacProfile) -> Result<Self, Report<ReleaseError>> {
+        let directory = tempfile::Builder::new()
+            .prefix("ts-boundary-run-")
+            .tempdir()
+            .map_err(super::boundary_error)?;
+        let base = fs::canonicalize(directory.path()).map_err(super::boundary_error)?;
+        if profile.defines.iter().any(|(_, root)| {
+            let root = Path::new(root);
+            base.starts_with(root) || root.starts_with(&base)
+        }) {
+            return Err(super::boundary_error("run markers overlap a boundary root"));
+        }
+        let allow = base.join("allow");
+        let deny = base.join("deny");
+        for marker in [&allow, &deny] {
+            fs::write(marker, b"").map_err(super::boundary_error)?;
+        }
+        Ok(Self {
+            nonce: run_nonce()?,
+            started_after_micros: started_after_micros()?,
+            defines: [
+                define(RUN_MARK_ALLOW, &allow)?,
+                define(RUN_MARK_DENY, &deny)?,
+            ],
+            allow,
+            deny,
+            _directory: directory,
+        })
+    }
+}
+
+/// Returns the earliest process start this run may own: now, less a
+/// [`START_MARGIN`], in microseconds since the epoch.
+fn started_after_micros() -> Result<u64, Report<ReleaseError>> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(super::boundary_error)?;
+    u64::try_from(now.saturating_sub(START_MARGIN).as_micros()).map_err(super::boundary_error)
+}
+
 #[cfg(target_os = "macos")]
-fn reap_survivors(nonce: &str) -> Result<(), Report<ReleaseError>> {
-    super::survivors::reap(RUN_NONCE_VARIABLE, nonce)
+fn reap_survivors(run: &RunIdentity) -> Result<(), Report<ReleaseError>> {
+    super::survivors::reap(&super::survivors::RunSignature {
+        variable: RUN_NONCE_VARIABLE,
+        nonce: &run.nonce,
+        allow: &run.allow,
+        deny: &run.deny,
+        started_after_micros: run.started_after_micros,
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
-fn reap_survivors(_nonce: &str) -> Result<(), Report<ReleaseError>> {
+fn reap_survivors(_run: &RunIdentity) -> Result<(), Report<ReleaseError>> {
     Err(Report::new(ReleaseError::Boundary).attach("sandbox-exec survivor checks are macOS-only"))
 }

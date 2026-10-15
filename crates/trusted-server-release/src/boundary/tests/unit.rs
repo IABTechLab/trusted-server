@@ -478,6 +478,13 @@ fn sbpl_profile_denies_group_escape_and_scopes_unix_sockets() {
     for absent in ["(subpath \"/usr\")", "/usr/local"] {
         assert!(!text.contains(absent), "should not allow {absent}");
     }
+    assert!(
+        text.ends_with(
+            "(allow file-read-data (literal (param \"RUN_MARK_ALLOW\")))\n\
+             (deny file-read* (literal (param \"RUN_MARK_DENY\")))\n"
+        ),
+        "should end with the run instance marker rules so that they take precedence"
+    );
 }
 
 #[test]

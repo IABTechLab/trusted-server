@@ -33,13 +33,14 @@
 //!   process module's group kill reaps it.
 //! - `posix_spawn` with `POSIX_SPAWN_SETPGROUP`/`POSIX_SPAWN_SETSID` (Rust's
 //!   `Command::process_group`) bypasses that syscall filter (observed). As a
-//!   fail-closed backstop, each run carries a unique nonce in its environment
-//!   and, after the run, every same-user process whose exec-time environment
-//!   holds it is killed and the run rejected.
-//! - Residual: a descendant that escapes the group **and** execs with that
-//!   variable scrubbed is not found. It stays inside the same sandbox
-//!   instance (network-denied, writes only in the writable roots), but may
-//!   outlive the run.
+//!   fail-closed backstop, after each run every process that started during
+//!   it and belongs to that run's sandbox instance (identified by per-run
+//!   marker rules through `sandbox_check`) or carries its environment nonce is
+//!   killed and the run rejected. Scrubbing the environment does not hide a
+//!   descendant, and a confined process cannot re-apply a sandbox.
+//! - Survivors are found only after the run exits, so the macOS backend
+//!   still does not own descendant cleanup the way a container does
+//!   ([`Boundary::has_owned_descendant_cleanup`] stays false).
 //!
 //! # What this module does not prove
 //!

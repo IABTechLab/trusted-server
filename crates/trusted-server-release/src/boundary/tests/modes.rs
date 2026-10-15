@@ -74,6 +74,13 @@ pub(super) fn run(mode: &str, arguments: &[String]) -> i32 {
                 scrub: argument(1) == "scrub",
             },
         ),
+        "link" => report_errno(
+            "linked",
+            std::fs::hard_link(argument(0), argument(1))
+                .err()
+                .map(|error| error.raw_os_error().unwrap_or(-1)),
+        ),
+        "escape-connect" => escape_connect(argument(0)),
         "unix-exchange" => unix_exchange(argument(0)),
         "socket" => socket(argument(0)),
         _ => HELPER_SETUP_FAILED,
@@ -233,6 +240,23 @@ fn leave_child(pid_file: &str, departure: Departure) -> i32 {
         return HELPER_SETUP_FAILED;
     }
     report("spawned", 0)
+}
+
+/// Runs `connect` in a `posix_spawn(POSIX_SPAWN_SETPGROUP)` child whose
+/// environment keeps only the helper selector, and waits for its report.
+fn escape_connect(address: &str) -> i32 {
+    let Some(mut command) = self_command("connect", &[address]) else {
+        return HELPER_SETUP_FAILED;
+    };
+    command.process_group(0).env_clear();
+    for (name, value) in inherited_helper_environment("connect") {
+        command.env(name, value);
+    }
+    command
+        .status()
+        .ok()
+        .and_then(|status| status.code())
+        .unwrap_or(HELPER_SETUP_FAILED)
 }
 
 /// Binds a Unix socket at `path`, connects to it and echoes four bytes.
