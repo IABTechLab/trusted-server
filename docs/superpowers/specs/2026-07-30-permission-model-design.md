@@ -1,19 +1,26 @@
 # Design Spec: Jurisdiction Permission Model
 
-**Status:** Proposed. PR #1045 carries the implementation and is not yet
-merged to main. Revised against that implementation, 2026-08-25. Revised again
-on 2026-09-01 for the `rules:` tree, which replaces the flat rule keys and
-retires `[geo] default_country` (§3.2, §5.4, and the §12 record). Revised again
-on 2026-09-14 for permission signal modules, which replace the fixed signal
-precedence with a configured order (§4, and the §13 record). Revised on
+**Status:** Proposed. The implementation is on the branch
+`split/3-permissions`, which is row 4 of the stack of draft pull requests that
+builds this design. The stack starts at the pull request that carries the
+design documents (IABTechLab/trusted-server#1342), and the draft for row 4
+(IABTechLab/trusted-server#1345) is not yet merged to main. The pull request
+that carried the implementation before (#1045) was closed on 2026-10-15
+without merging. Revised against that implementation, 2026-08-25. Revised
+again on 2026-09-01 for the `rules:` tree, which replaces the flat rule keys
+and retires `[geo] default_country` (§3.2, §5.4, and the §12 record). Revised
+again on 2026-09-14 for permission signal modules, which replace the fixed
+signal precedence with a configured order (§4, and the §13 record). Revised on
 2026-10-06 to say module for what an operator selects, and on 2026-10-07 to
 name a module by its crate folder, so the selector reads
-`[permission-signal] modules`.
+`[permission-signal] modules`. Revised on 2026-10-15 after a review of this
+page against the code at `split/3-permissions` (see the Review log), so that
+§1 to §8 and the records in §10 to §13 state what that code does.
 **Author:** Engineering
 **Issue references:** #779
 **Related specs:** `2026-07-30-pluggable-providers-design.md`,
 `2026-07-30-provider-migration-rollout-design.md`
-**Last updated:** 2026-10-06
+**Last updated:** 2026-10-15
 
 > **Context.** PR #838 proposed a permission model whose review surfaced two
 > classes of defect this spec exists to prevent. The first was silent
@@ -55,30 +62,42 @@ The set is resolved from three inputs:
 2. **Policy**, a declarative map from jurisdiction to a baseline acquisition
    rule per permission, plus a declared signal policy (§3).
 3. **Signals**, answered by the permission signal modules a deployment
-   configures, in the order it configures (§4). Four implementations ship,
-   one per scheme, being `gpc`, `gpp`, `us-privacy` and `tcf`,
-   each a crate under `crates/permission-signal/`.
+   configures, in the order it configures (§4). Five implementations ship,
+   being `gpc`, `gpp`, `us-privacy`, `tcf` and `mtm`, each a crate under
+   `crates/permission-signal/`. The first four read the `Sec-GPC` header and the
+   IAB GPP, US Privacy and TCF strings, and `mtm` reads the answer of the
+   Preference Management Platform (PMP) under the Model Terms for Marketing
+   (§4.6).
 
 Issues #777 and #779 also envision publisher interaction and external services
 as permission sources. The module seam is that source interface. A module
 is a crate implementing `PermissionSignalModule`
 (`crates/trusted-server-core/src/permission_signal/mod.rs`) that answers
 `Grant`, `Revoke` or `Neutral` for each permission, so a new source is a new
-module rather than a new resolution algorithm. Core names none of the four
-shipped schemes. Each is registered by an integration builder, which is the
-same seam a vendor crate uses, and a builder that supplies a permission
-signal implementation does not have to be a page integration, so none of
-these four crates ships browser JavaScript and none is selected in a page
-integration's section. §10 and §13 record the change.
+module rather than a new resolution algorithm. Each adapter links the module
+crates and lists them, in the default order, in its own
+`shipped_signal_modules()` function, and `build_permission_signal_modules` in
+core selects and orders them from `[permission-signal] modules` (§4, §4.7). A
+module is not an integration, so none of the five crates registers through the
+integration registry, ships browser JavaScript, or is selected in a page
+integration's section.
+
+Core is not silent about the schemes. Its consent pipeline (`consent/`) decodes
+TCF, GPP and US Privacy strings, and the policy vocabulary in `permissions.rs`
+names the opt-out sources (`gpc`, `gpp_sale_opt_out` and `us_privacy_opt_out`)
+and the `signals.tcf` block. What each scheme says about each Data Use, such as
+the TCF purpose map, lives in the module crate for that scheme, and core
+answers for no scheme ahead of the modules (§4). §10 and §13 record the change.
 
 Scope. The model governs decisions Trusted Server makes. A downstream protocol
 receives the full regulatory context only where that protocol defines fields
-for it (OpenRTB consent fields, and proxy-mode forwarding of raw strings).
-The draft's stronger rule, that identity rows carry normalized per-permission
-provenance and a digest and never a raw string, is **not yet true**: the
-identity-graph entry (`KvEntry` in `ec/kv_types.rs`) stores the raw TCF and
-GPP strings alongside the row today. The normalized provenance model travels
-with the providers-spec storage work and is recorded as deferred (§11).
+for it, being the OpenRTB consent fields, which carry only the raw strings a
+signal module vouched for (§4.4). The draft's stronger rule, that identity rows
+carry normalized per-permission provenance and a digest and never a raw string,
+is **not yet true**, because the identity-graph entry (`KvEntry` in
+`ec/kv_types.rs`) stores the raw TCF and GPP strings that a module vouched for
+alongside the row today. The normalized provenance model travels with the
+providers-spec storage work and is recorded as deferred (§11).
 
 ## 2. Vocabulary: the IAB Privacy Taxonomy Data Uses
 
@@ -93,16 +112,23 @@ The implementation (`crates/trusted-server-core/src/permissions.rs`) models
 the vocabulary in two tiers:
 
 - **Eleven named permissions**, one per TCF purpose 1 through 11, each with a
-  Data Use identifier. All eleven are resolved against the session signal
-  (§4): a present TCF record grants or revokes each mapped purpose. Two
+  Data Use identifier. All eleven are resolved against the session signals
+  (§4). A present TCF record grants or revokes each mapped purpose, and `mtm`
+  answers for all eleven when the PMP cookie is present (§4.6). Two
   purposes have no published Data Use yet, so purpose 1 uses a proposed
   `necessary.operations.storage` key and purpose 11 keeps its TCF identifier
   `select-basic-content`, both flagged for an upstream taxonomy addition.
 - **Fifty-three additional taxonomy Data Uses**, carried so `permissions.yaml`
   can declare a policy flag for the whole taxonomy. No module gates on them
-  today and no signal maps to them, so their configured baseline stands.
-  They exist for completeness, testing, and demonstration, and where no
-  informed policy decision has been made the shipped file sets them `denied`.
+  today, and a signal reaches only some of them. The TCF module maps eight of
+  them to a TCF purpose (`crates/permission-signal/tcf/src/mapping.rs`), and
+  the opt-out list in the sample policy names four (`disclosure.sale`,
+  `disclosure.share`, `disclosure.third_party_sale` and
+  `advertising_marketing.third_party.targeted`), one of which TCF also maps. A
+  signal therefore reaches eleven of the fifty-three under the sample policy,
+  and the other forty-two keep their configured baseline. They exist for
+  completeness, testing, and demonstration, and where no informed policy
+  decision has been made the shipped file sets them `denied`.
 
 The two Data Uses that carry enforcement weight today are
 `necessary.operations.storage` (TCF Purpose 1, storage) and
@@ -113,12 +139,13 @@ gates on the storage plus personalized-ad pair (§7).
 
 This is a deliberate departure from the draft's rule that a permission appears
 only when it has both a signal mapping and an enforcement point. The eleven
-named Data Uses all have the signal mapping, and the fifty-three baseline-only
-Data Uses are declared policy rather than enforced policy. The file header of
-`permissions.yaml` states this plainly, and the `denied` default means an
-undeployed flag cannot silently authorize anything. Policy validation still
-**rejects** any rule or flag that references an identifier outside the modeled
-vocabulary, so a policy cannot name a Data Use the code does not know.
+named Data Uses all have the signal mapping, and the fifty-three further
+Data Uses are declared policy rather than enforced policy, as no module gates
+on them. The file header of `permissions.yaml` states this plainly, and the
+`denied` default means an undeployed flag cannot silently authorize anything.
+Policy validation still **rejects** any rule or flag that references an
+identifier outside the modeled vocabulary, so a policy cannot name a Data Use
+the code does not know.
 
 The eleven named Data Uses, with the TCF purpose each maps from:
 
@@ -143,13 +170,14 @@ spelling.)
 
 ### 3.1 Location: `permissions.yaml`, compiled into the build
 
-Policy lives in a human-editable permissions YAML document (the repository
-sample is `config/permissions/sample.yaml`, for testing and evaluation
-only),
-compiled into the binary with `include_str!` and parsed once per instance
-(cached behind a `OnceLock` in `PermissionMaps::standard`). A deployer edits
-or replaces the file and rebuilds to change policy. The file is not read at
-runtime.
+Policy lives in a human-editable permissions YAML document, which this spec
+calls `permissions.yaml` after the name the code and the guides use. The
+repository file the build compiles in is `config/permissions/sample.yaml`, a
+sample for testing and evaluation only, and no other file or setting supplies
+policy on this row. The build embeds the file with `include_str!`, and the
+embedded text is parsed once per instance (cached behind a `OnceLock` in
+`PermissionMaps::standard`). A deployer edits or replaces the file and
+rebuilds to change policy. The file is not read at runtime.
 
 This keeps the mechanism the draft rejected, for a reason the draft's own
 premise no longer supports. The draft required policy to flow through the
@@ -167,8 +195,17 @@ Within the embedded model, the draft's specific complaints are answered:
   test suite rather than surfacing as a per-request failure. The documented
   panic on a malformed embedded file is a build defect signal, not a runtime
   condition.
-- Unknown fields on a detailed rule are rejected (`deny_unknown_fields`), so
-  a misspelled override key fails loudly instead of being swallowed.
+- The draft's complaint about unknown fields is only partly answered, because
+  the parser does not reject unknown keys as such. Any key beside `group`,
+  `jurisdiction` and `permissions` in a node of the `rules:` tree is read as a
+  place code, since the tree has no other way to name a child. Under a region
+  that is refused as a place written under a region. At the top and under a
+  country, a misspelled key fails only when its value is neither the name of a
+  defined group nor a block carrying `group:`, and otherwise it becomes a place
+  that no request matches. A key outside `groups`, `rules` and `signals` is
+  ignored, and so is a key inside `signals`, `signals.tcf` or
+  `signals.us_opt_out` that the parser does not define. No test covers a
+  misspelled key (Open questions, item 3).
 - Two rule keys naming the same location in different case are rejected at
   parse, so one spelling cannot silently overwrite another.
 - Auditability lives where the draft placed it, in version control. The file
@@ -269,7 +306,10 @@ Format rules, as implemented:
   `us-state`, `non-regulated`, and `unknown`. Any other value is a
   configuration error. `us-state` carries **no** state code, because the region
   node it sits on already names the state, so the value is valid only on a
-  region node under `US` and is rejected at the top and on a country node.
+  region node and is rejected at the top and on a country node. The parser does
+  not check the country above the region, so `us-state` is also accepted on a
+  region under a country other than `US`, and names that region's code (Open
+  questions, item 4).
 - Matching is most specific wins with fallback to the parent, being region,
   then country, then the top node. `group` and `jurisdiction` fall back
   independently, so the two answers need not come from the same node.
@@ -281,7 +321,8 @@ Format rules, as implemented:
 - The **signals** section is new relative to the draft. The opt-out source
   list and the opt-out revoke set are data in the file, and the
   `signals.tcf.authoritative` flag governs only whether a present TCF
-  record's own grants and revokes apply. The TCF purpose to Data Use mapping
+  record's own grants and revokes apply, and not whether a record refusing
+  storage withdraws (§4.2). The TCF purpose to Data Use mapping
   is not in the file. It lives in the TCF module crate
   (`crates/permission-signal/tcf/src/mapping.rs`), so a deployment that runs
   no TCF carries no table of another scheme's numbers. Nor is the order the
@@ -325,21 +366,27 @@ be inert today. It returns with the dispatch migration.
 Validation runs where the policy actually enters the system:
 
 - **At parse**, meaning the unit tests and any `PermissionMaps::from_yaml`
-  caller, the file is rejected for: malformed YAML, a rule referencing an
+  caller, the file is rejected for malformed YAML, a node that is neither a
+  group name nor a block with a `group:` line, a rule referencing an
   undefined group, an unknown Data Use identifier anywhere (group flag,
   detailed-rule entry, or revoke list), an acquisition
   value outside `granted | requires_signal | denied`, a group without
   `default` that does not list every permission, duplicate rule keys under
-  case-insensitive comparison (`us` and `US`), unknown fields on a detailed
-  rule, and a `revokes` keyword other than `all`.
+  case-insensitive comparison (`us` and `US`), a `jurisdiction` value the
+  `Jurisdiction` type cannot represent, `us-state` on the top node or a
+  country node, a place written under a region, and a `revokes` keyword other
+  than `all`. An unknown key is not rejected (§3.1).
 - **At startup**, the top node of the compiled `permissions.yaml` must carry
   both a `group` naming a defined group and a `jurisdiction`, and the no-geo
   acknowledgment must be present where required (§5.3). A file whose top node
   is missing either key is rejected exactly as a missing
   `[geo] default_country` was rejected before. Both are settings-construction
   failures, never per-request failures. A name in `[permission-signal] modules`
-  that the build does not carry, or a name given twice, fails when the
-  adapter builds its state at startup, also never per request (§4).
+  that the adapter does not link, or a name given twice, fails when the
+  adapter builds its application state (§4), and the adapter then serves its
+  startup error router in place of the application. Settings validation
+  cannot check the names, because only an adapter knows which crates it links,
+  and the `ts` command line tool links none of them (§6.1).
 
 Not implemented from the draft's list, and recorded as future hardening
 (§11): checking rule-key country parts against the assigned ISO 3166-1 list,
@@ -376,10 +423,10 @@ Implemented as a unit test
 members (IS, LI, NO), 30 codes in all, must have a rule, and each must
 resolve `necessary.operations.storage` as `requires_signal`. A mistyped
 member-state key fails this test rather than silently diverting the country
-to the deployer default. The shipped table maps the EU 27 and EEA to
-`gdpr-eu`, the UK to `gdpr-uk` (storage `granted`, a baseline the rollout
-ledger row 4 asks the task force to confirm with its citation, everything
-else opt-in), and the US and Australia to
+to the top node's group. The shipped table maps the EU 27 and EEA to
+`gdpr-eu`, the UK to `gdpr-uk` (storage `granted`, a baseline that row 4 of the
+rollout design's behavior-preservation matrix, §2, flags for the task force to
+confirm with its citation, everything else opt-in), and the US and Australia to
 `us-opt-out`. Countries with no node of their own fall to the tree's top
 `group` (§5.4).
 
@@ -393,29 +440,48 @@ modules are asked in. Each permission resolves in these steps.
 
 1. **Policy `denied`** is never set, regardless of any signal. (Enforced in
    the resolver, `PermissionMaps::resolve_with`.)
-2. **A consent record present but undecodable revokes everything**, ahead of
-   every configured module and whichever of them are configured
-   (`permission_signal` in `crates/trusted-server-core/src/ec/consent.rs`). A
-   malformed record is a preference that could not be read, so it fails
-   closed rather than degrading to the no-signal baseline, which under a
-   `granted` baseline would turn garbage into a grant. It is error handling
-   rather than a signaling scheme, so it takes no place in the order and
-   cannot be removed, which also stops a readable record from one scheme
-   overwriting the refusal an unreadable record from another caused. It never
-   withdraws (§4.2). An **expired** TCF record is deliberately a distinct
-   state, not malformed. The decoded record is cleared, the raw string is kept
-   for proxy forwarding, and acquisition proceeds as if the record were
-   absent, so the baseline applies.
-3. **The configured modules are asked in order** (`combine` in
+2. **The configured modules are asked in order** (`combine` in
    `crates/trusted-server-core/src/permission_signal/mod.rs`). Each sees the
    baseline and what the modules before it settled on, and answers `Grant`,
    `Revoke` or `Neutral` for the permission. A `Neutral` answer leaves the
    prior value standing and any other answer replaces it, so **the last
    module with an opinion decides**. Every module is asked, because a
    later one may amend what an earlier one settled.
-4. **No module with an opinion leaves the baseline standing**, so `granted`
+3. **No module with an opinion leaves the baseline standing**, so `granted`
    sets the permission and `requires_signal` leaves it unset. A `Revoke` drops
    a `granted` baseline, and only a `Grant` sets a `requires_signal` one.
+
+**Core answers nothing ahead of the modules.** No step revokes every
+permission because some consent record could not be decoded, and no part of
+the order is fixed where a deployment cannot change it (`assemble_permissions`
+in `crates/trusted-server-core/src/ec/consent.rs`, and the test
+`core_answers_nothing_ahead_of_the_modules` beside it). A string that arrived
+and could not be decoded is answered by the module for its own scheme. Each
+shipped module reads such a string as the refusal or opt-out the string may
+have carried, and only for the Data Uses its scheme covers.
+
+- `tcf` answers `Revoke` for the 19 Data Uses a TCF purpose maps to, being the
+  eleven named ones and eight further ones (§2), and only while
+  `signals.tcf.authoritative` is true.
+- `gpp` and `us-privacy` answer `Revoke` for each Data Use in the policy's
+  opt-out revoke set (seven in the sample policy), and only while the policy
+  lists their source in `signals.us_opt_out.sources`.
+- `gpc` and `mtm` decode nothing. A `__mtm_pref` value that is not one of the
+  three words `mtm` knows is read as absent.
+
+A later module overrides an earlier one, as it does for any answer. Under the
+default order a readable TC string that consents to storage therefore sets
+storage over an unreadable GPP string, and a deployment that leaves `tcf` out
+of the list removes the effect of an unreadable TC string. The Axum tests
+`an_unreadable_tcf_record_is_the_tcf_modules_refusal` and
+`an_unreadable_gpp_string_is_the_gpp_modules_opt_out_and_the_order_decides`
+(`crates/trusted-server-adapter-axum/tests/permission_signals.rs`) run the real
+modules for both. An unreadable string never withdraws (§4.2), and no module
+vouches for it, so it reaches neither the page nor a bid request (§4.4). An
+**expired** TCF record is deliberately a distinct state, not an unreadable one.
+The pipeline clears the decoded record and sets the `expired` flag, the `tcf`
+module answers `Neutral`, and acquisition proceeds as if the record were
+absent, so the baseline applies.
 
 The order is set by `[permission-signal] modules`, which takes a list rather
 than a single name because several permission signal modules run, and the
@@ -423,33 +489,44 @@ list is the order they run in:
 
 ```toml
 [permission-signal]
-modules = ["gpc", "gpp", "us-privacy", "tcf"]
+modules = ["gpc", "gpp", "us-privacy", "tcf", "mtm"]
 ```
 
-- **Omitted**, every module the build carries runs, in the order the
-  adapter offers them, so a signal is never ignored because nobody listed it.
+- **Omitted**, every module the adapter links runs, in the order the adapter
+  offers them, so a signal is never ignored because nobody listed it.
 - **An empty list** runs no module, and every permission stays at its
   country and region baseline.
-- **A name the build does not carry, or a name given twice**, fails startup
-  with a message listing the modules that are available.
-- The modules acted on, and any the list leaves out, are written to the log
-  once at startup.
+- **A name** is the module's crate folder below `crates/permission-signal`,
+  such as `gpp`, and may also be written in full, as `permission-signal.gpp`.
+- **A name the adapter does not link, or a name given twice**, fails when the
+  adapter builds its application state (§3.3). The message for an unknown name
+  lists the modules that are available.
+- The modules acted on are written to the log once at startup, and a warning
+  lists any module the list leaves out. Open questions, item 1, concerns how
+  that warning compares names.
 
-None of the four takes a `[permission_signal.<name>]` table, because none of
-them has a setting to carry. A scheme that did would take one, under the rule
-in the providers spec §2.1.
+The section takes `modules` and nothing else. A block named for a module,
+`[permission-signal.<name>]`, is refused today as an unknown field, because
+none of the five modules has a setting to carry. A module that gained a
+setting would take such a block, under the rule in the providers spec §2.1. The
+earlier table name `[permission_signal]` and the earlier keys `sources` and
+`module` are refused with a message that names `[permission-signal] modules`
+(§6.1).
 
-Every adapter offers the four shipped modules in the same default order,
-being `gpc`, `gpp`, `us-privacy` and `tcf`. Global Privacy
+Every adapter offers the five shipped modules in the same default order,
+being `gpc`, `gpp`, `us-privacy`, `tcf` and `mtm` (§4.7). Global Privacy
 Control is a browser setting with no interface of its own, so it is asked
-first, and the three schemes that carry an answer a person gave through an
-interface are asked after it. Under that default a TCF record consenting to a
-mapped purpose sets a permission that a GPC header, a GPP sale opt-out or a US
-Privacy opt-out revoked, and a deployment that wants the opt-out to stand
-lists it after `tcf`. Which scheme wins is a question about a jurisdiction and
-a publisher, so the deployment decides it. The `signals.tcf.authoritative`
-flag governs only TCF's own effect, and with it false the TCF module has no
-opinion.
+first, and the schemes that carry an answer a person gave through an interface
+are asked after it. Under that default a TCF record consenting to a mapped
+purpose sets a permission that a GPC header, a GPP sale opt-out or a US Privacy
+opt-out revoked, and a deployment that wants the opt-out to stand lists it
+after `tcf`. A PMP answer read by `mtm` is asked after `tcf`, so it answers
+over `tcf` and over every opt-out for the eleven named Data Uses (§4.6). Which
+scheme wins is a question about a jurisdiction and a publisher, so the
+deployment decides it. The `signals.tcf.authoritative` flag governs only the
+answers the `tcf` module gives about permissions. With the flag false the
+module answers `Neutral` for every permission and declares nothing grantable,
+but a record refusing storage still withdraws (§4.2).
 
 A module is also given the whole ordered list and its own place in it, and
 may ask a named peer what that peer makes of a permission. That makes a rule
@@ -461,39 +538,47 @@ Removing `gpc` from the list stops the GPC module running, but the consent
 pipeline can still synthesize a US Privacy opt-out from the same header for a
 US privacy state (§4.4), which the `us-privacy` module then acts on. A
 deployment that wants the header to have no effect also turns that synthesis
-off.
+off with `[consent.us_privacy_defaults] gpc_implies_optout = false`.
 
 Two simplifications against the draft's taxonomy, both recorded in §11:
 
-- **Of the shipped modules, TCF is the only grant-class signal.** The
+- **Of the shipped modules, TCF and `mtm` are the grant-class signals.** The
   draft's grant class also admitted explicit GPP/USP non-opt-out values,
   regime-scoped, so a US rule could be `requires_signal` yet grant on
   signal-carrying traffic. The implementation instead expresses the US posture
   as a `granted` baseline that opt-outs revoke, so no-signal US traffic is
   allowed rather than blocked pending a signal. Explicit non-opt-out GPP/USP
   values grant nothing on their own.
-- **Malformed-present blocks everything, not per family.** Any present but
-  undecodable record (TCF, GPP, or US Privacy) revokes every Data Use for
-  the request, rather than blocking only the permissions mapped to the
-  malformed source. This is strictly more restrictive than the draft's
-  per-family rule.
+- **An unreadable record is answered per scheme, not per section.** The draft
+  blocked grants per record family and per mapped section of a GPP string. The
+  implementation scopes the answer to the Data Uses of the scheme whose record
+  could not be read, and does not look inside the sections of a GPP string
+  (§4.5), so an unreadable record from one scheme leaves the other schemes'
+  answers alone.
 
 ### 4.1 Decision matrix
 
 For each permission, with baseline _B_ from the resolved rule, under the
-default order:
+default order and a request with no `__mtm_pref` cookie, so that `mtm` is
+silent:
 
-| Signal state                                                            | B = granted | B = requires_signal | B = denied |
-| ----------------------------------------------------------------------- | ----------- | ------------------- | ---------- |
-| Any record present but undecodable                                      | unset       | unset               | unset      |
-| TCF present, consents to the mapped purpose, with or without an opt-out | set         | set                 | unset      |
-| TCF present, refuses the mapped purpose                                 | unset       | unset               | unset      |
-| Opt-out present, Data Use in the revoke set, no TCF answer              | unset       | unset               | unset      |
-| No signal (or neutral for this Data Use)                                | set         | unset               | unset      |
+| Signal state                                                                         | B = granted | B = requires_signal | B = denied |
+| ------------------------------------------------------------------------------------ | ----------- | ------------------- | ---------- |
+| TC string present but undecodable, Data Use mapped by a TCF purpose                  | unset       | unset               | unset      |
+| TCF present, consents to the mapped purpose, with or without an opt-out              | set         | set                 | unset      |
+| TCF present, refuses the mapped purpose                                              | unset       | unset               | unset      |
+| Opt-out present or its string undecodable, Data Use in the revoke set, no TCF answer | unset       | unset               | unset      |
+| No signal (or neutral for this Data Use)                                             | set         | unset               | unset      |
 
 With an opt-out listed after `tcf`, a request carrying both resolves unset
 under every baseline for the Data Uses that opt-out revokes. An expired TCF
-record resolves as the "no signal" row. Whether an unset outcome is also a
+record resolves as the "no signal" row. A `__mtm_pref` cookie of `standard` or
+`personalized` adds a last answer for the eleven named Data Uses under the
+default order, which replaces the result in every row above for those Data
+Uses (§4.6). A permission whose baseline is `requires_signal` and that no
+module has answered is also listed as `awaiting` on the page when some
+configured module could still grant it, and a permission that a signal refused
+is never listed as awaiting (§13). Whether an unset outcome is also a
 **withdrawal** is a separate, narrower question (§4.2).
 
 ### 4.2 Withdrawal vs. absence
@@ -515,16 +600,18 @@ The implemented trigger, exhaustively (nothing else withdraws):
    the record, so the refusal suppresses use without destroying the
    identifier. Tombstones are irreversible, and PR #838 wrote them for
    visitors in unregulated jurisdictions whose global CMP emitted a
-   purpose-refusing string. The `EcContext` consent pipeline runs without
-   the persisted-KV inputs, so the withdrawal decision sees live request
-   signals only, satisfying the draft's live-request constraint by
-   construction.
+   purpose-refusing string. The consent pipeline reads only the live request
+   (its cookies, its headers and the resolved location), so the withdrawal
+   decision sees live request signals only, satisfying the draft's
+   live-request constraint by construction.
 2. **US-style opt-outs never withdraw.** GPC and sale opt-outs are use
    restrictions, which suppress the permissions the policy revokes (EC
    headers stripped, nothing egressed) but never trigger destruction, so
    lifting the opt-out restores the identity.
-3. **A malformed record never withdraws.** It suppresses only (§4, step 2).
-   Destruction requires an affirmative, decodable signal.
+3. **An unreadable record never withdraws.** The `tcf` module reads the record
+   the consent pipeline decoded, so a TC string that could not be decoded
+   withdraws nothing, whatever the module answers for the permissions it maps
+   (§4). Destruction requires an affirmative, decodable signal.
 4. **Absence of signal never destroys identity.** A visitor who has not yet
    made a choice is never stripped of an existing identity.
 5. **A policy change is not a user signal.** There are no runtime policy
@@ -540,13 +627,22 @@ implemented carrier, as no such endpoint exists. It is recorded as deferred
 A module answers withdrawal separately from its signal, through
 `withdraws` on `PermissionSignalModule`, and core scopes any answer to the
 baseline (`withdrawn` in `permission_signal/mod.rs`), carrying the result as
-`PermissionState::storage_withdrawn`. Of the shipped modules only TCF
-answers it. Every arm above has direct coverage in
-`crates/trusted-server-adapter-axum/tests/permission_signals.rs`, with the
-real modules assembled. Refusal under `requires_signal` withdraws, refusal
-under `granted` does not, consent does not, GPC alone does not, sale opt-outs
-do not, and no signal does not. A malformed record does not (`ec/consent.rs`),
-and a deployment whose list leaves out `tcf` cannot withdraw at all.
+`PermissionState::storage_withdrawn`. Of the shipped modules only TCF answers
+it, and its answer does not read `signals.tcf.authoritative`, so with the flag
+false a record refusing storage still withdraws while the module's answers
+about permissions are silenced (the test
+`a_non_authoritative_policy_silences_the_record_but_not_the_withdrawal` in
+`crates/permission-signal/tcf/src/lib.rs`). The response path acts on the
+answer only where `ec_allowed` is false (`ec_finalize_response` in
+`ec/finalize.rs`), so a request on which a later module such as `mtm` sets
+storage after a TCF refusal withdraws nothing. Arms 1 to 4 above have direct
+coverage in `crates/trusted-server-adapter-axum/tests/permission_signals.rs`,
+with the real modules assembled. Refusal under `requires_signal` withdraws,
+refusal under `granted` does not, consent does not, GPC alone does not, sale
+opt-outs do not, and no signal does not. An unreadable record does not
+(`ec/consent.rs` and the same Axum file), and a deployment whose list leaves
+out `tcf` cannot withdraw at all. No test covers a withdrawal beside an `mtm`
+grant of storage.
 
 ### 4.3 Withdrawal durability (largely deferred)
 
@@ -555,8 +651,9 @@ withdrawal signal and the client presented a cookie, the response expires
 the EC cookie, and the identity-graph tombstone is written for each
 presented identifier the module accepts (the incoming cookie value and
 the active value). The tombstone is the authoritative revocation marker for
-subsequent EC behavior. A tombstone write failure is logged at error level
-and the request completes, so the write is best effort.
+subsequent EC behavior. A tombstone write failure is logged at warn level,
+saying the row may still be live with consent granted, and the request
+completes, so the write is best effort.
 
 The draft's durability protocol is **not implemented** and is recorded as
 deferred follow-up in full: the family ID with deterministic derivation for
@@ -575,61 +672,79 @@ commit, and revocation durability is bounded by the KV store's behavior.
 
 The consent subsystem (`consent/mod.rs`) remains the decoder and
 normalizer. A module reads its output as the decoded consent record on
-`SignalInput`, and a module for a scheme the pipeline does not decode reads
-the request evidence instead. The implemented pipeline:
+`SignalInput`, and a module for a scheme the pipeline does not decode (`mtm`)
+reads the request evidence instead. The pipeline reads the live request only,
+being its cookies, its headers and the resolved location. The implemented
+pipeline:
 
 1. Extract raw signals from cookies and headers, and decode TCF v2, GPP,
    and US Privacy. A decode failure keeps the raw string and leaves the
-   decoded field empty, which the permission layer reads as
-   malformed-present (§4, step 2).
+   decoded field empty, which the module for that scheme reads as an
+   unreadable record (§4).
 2. Resolve standalone-TCF vs GPP-embedded-TCF conflicts per the configured
    mode (`restrictive`, `permissive`, `newest`), preserving the pre-epic
    selection algorithm.
 3. Apply the expiry check, where a TCF record older than the configured maximum
    age has its decoded form cleared, the `expired` flag set, and its raw
-   string preserved. Expiry is its own state, excluded from
-   malformed-present, and resolves as absent for acquisition.
+   string left in place. Expiry is its own state, excluded from the
+   unreadable case, and resolves as absent for acquisition.
 4. Construct a US Privacy string from GPC for US privacy states with no
-   explicit USP cookie, so the opt-out also travels in transport fields.
+   explicit USP cookie, so the opt-out also travels in transport fields. The
+   setting `[consent.us_privacy_defaults] gpc_implies_optout`, true by default,
+   controls it.
+
+**Raw strings after assembly.** Once the permission state is assembled,
+`EcContext` keeps only the raw consent strings that a module vouched for
+(`ConsentContext::keep_only`, called when `EcContext` is built in
+`ec/mod.rs`). A module vouches for a string by reporting it through
+`valid_signal` as one it read and used, and the `tcf`, `gpp` and `us-privacy`
+modules do so only for a string the pipeline decoded. An unreadable string, an
+expired one and one whose module is not listed are therefore removed, and the
+auction paths, the publisher paths and the identity-graph row (§1) see only the
+raw strings that were read and used. The same list reaches the page as
+`signals` (§13).
 
 The draft's declared reordering, expiry filtering **before** conflict
 resolution, was **not implemented**: conflict resolution still runs first,
 so the pre-epic order stands. Recorded in §11.
 
-**Persisted-KV consent.** When the pipeline runs with an EC ID and a KV
-store (not on the `EcContext` construction path), a request carrying no
-consent signals falls back to the consent persisted for that EC ID, with
-the jurisdiction re-derived from the current request's geo. Staleness is
-enforced by the store, where entries are written with a TTL equal to
-`max_consent_age_days`, so an entry older than a live record's allowed age
-has expired out of the store. A live signal always wins because the
-fallback is consulted only when the request carries none. The draft's
-declared change, running the loaded record through the full normalization
-pipeline, is not implemented. The loaded record substitutes directly. The
-narrow read is permission-exempt by construction, since determining
-storage cannot itself require storage.
+**Persisted-KV consent (not built).** The draft's fallback to the consent
+persisted for an EC ID does not exist on this row. `ConsentPipelineInput`
+takes no identity-graph input, `ConsentSource` has no persisted variant, and
+`consent_store` is refused as an unknown key in `[consent]`. The plan that
+removed the path is
+`docs/superpowers/plans/2026-07-13-issue-883-remove-legacy-consent-store.md`
+(IABTechLab/trusted-server#883). A request that carries no consent signals
+therefore resolves from the place baseline and whatever the modules read from
+the request. The identity graph keeps only the `consent.ok` flag and the raw
+strings of the row (§1).
 
 **Proxy mode.** Proxy mode still skips semantic decoding entirely. The
-draft's minimal opt-out extraction was not implemented, but the fail-open
-consequence the draft feared does not arise under the permission model. A
-present record in proxy mode is present-but-undecoded, which blocks every
-baseline grant (§4, step 2), and the GPC header needs no decoding, so the
-GPC opt-out is honored directly. No grants are ever derived in proxy mode.
-The net posture is equal to or more restrictive than the draft's row.
-Absent records resolve to the baseline.
+draft's minimal opt-out extraction was not implemented, and the fail-open
+consequence the draft feared does not arise. A TC, GPP or US Privacy string in
+proxy mode is present but undecoded, so the module for its scheme reads it as
+unreadable (§4) and revokes the Data Uses that scheme covers. The GPC header
+needs no decoding, so the GPC opt-out is honored directly. No grant is derived
+from a TC, GPP or US Privacy string in proxy mode, and `mtm` still answers from
+its cookie. Absent records resolve to the baseline. No module vouches for an
+undecoded string, so `keep_only` removes the raw strings, and by reading the
+code the OpenRTB consent fields on the auction and publisher paths carry none
+in proxy mode. No test covers proxy mode through `EcContext`, and Open
+questions, item 2, asks whether that is intended.
 
 ### 4.5 US signal field mapping
 
 Implemented sources, as declared in the shipped `signals` section:
 
-| Source                             | Effect                                  |
-| ---------------------------------- | --------------------------------------- |
-| `Sec-GPC` request header           | US-style opt-out                        |
-| GPP US section sale opt-out        | US-style opt-out                        |
-| US Privacy `opt_out_sale = Y`      | US-style opt-out                        |
-| US Privacy `opt_out_sale = N`      | Nothing (no grant class exists for USP) |
-| Any explicit Not Applicable value  | Nothing                                 |
-| Absent / unknown / reserved values | Nothing                                 |
+| Source                                             | Effect                                   |
+| -------------------------------------------------- | ---------------------------------------- |
+| `Sec-GPC` request header                           | US-style opt-out                         |
+| GPP US section sale opt-out                        | US-style opt-out                         |
+| US Privacy `opt_out_sale = Y`                      | US-style opt-out                         |
+| GPP or US Privacy string that could not be decoded | US-style opt-out for its own source (§4) |
+| US Privacy `opt_out_sale = N`                      | Nothing (no grant class exists for USP)  |
+| Any explicit Not Applicable value                  | Nothing                                  |
+| Absent / unknown / reserved values                 | Nothing                                  |
 
 An opt-out revokes the Data Uses the policy's `revokes` value names. The
 sample, `config/permissions/sample.yaml`, lists device storage, sale,
@@ -662,6 +777,66 @@ accepted versions, the provenance manifest, and the fixture corpus travel
 with the §4.5 decoder work. The 2026-07-31 draft's §4.5.1, including the
 pinned upstream commit, remains the reference for that effort.
 
+### 4.6 The Model Terms for Marketing module
+
+The `mtm` crate (`crates/permission-signal/mtm`) reads the answer of the
+Preference Management Platform (PMP). The PMP asks a visitor one question and
+keeps one of three words, and its page script mirrors the word into the first
+party cookie `__mtm_pref` (`COOKIE_MTM_PREF` in core) so that the server can
+see it. A value that is not one of the three words is read as absent. The
+module does not read the policy, so the `signals` section of `permissions.yaml`
+cannot silence it, and it reads the cookie from the request evidence, so proxy
+mode does not affect it.
+
+| Word            | Answers `Grant` for                                | Answers `Revoke` for    |
+| --------------- | -------------------------------------------------- | ----------------------- |
+| `standard`      | Data Uses 1, 2, 7, 8, 9, 10 and 11 of the §2 table | Data Uses 3, 4, 5 and 6 |
+| `personalized`  | All eleven                                         | None                    |
+| `non-marketing` | None                                               | None                    |
+
+The word `non-marketing` is a recorded answer that changes no permission, so
+the baseline stands. Under the shipped `gdpr-eu` and `gdpr-uk` groups the
+baseline grants no marketing Data Use, and under `us-opt-out` the baseline
+grants them. The module also:
+
+- declares the eleven Data Uses grantable (`grants`), so a page waits for them
+  while the PMP question is open (§13),
+- reports the word as a valid signal of scheme `mtm`,
+- declares the versioned Model Terms for Marketing,
+  `https://m4ow.uk/mtm/2.txt`, as the terms the data is available under
+  whenever a word is present, `non-marketing` included, and
+- never withdraws.
+
+The cookie is written by script and is not `HttpOnly`, by design, because the
+script that owns the question has to read and replace the cookie (the test
+`the_preference_cookie_is_never_httponly` in the crate checks the PMP's own
+`Set-Cookie` strings for `HttpOnly`). The server therefore cannot tell the
+PMP's write from another script's. Under the default order `mtm` is asked
+last, so a request carrying `standard` or `personalized` has `mtm` answer after
+`tcf` and after every opt-out, and replace their results for the eleven named
+Data Uses. A deployment that wants a TCF record or an opt-out to stand over a
+PMP answer lists `mtm` before `tcf` and the opt-outs. The Axum test for `mtm`
+(`a_pmp_answer_in_the_eu_settles_what_the_model_terms_cover_and_declares_them`)
+gives `mtm` no TCF record or opt-out to answer over, so no test covers that
+order (Open questions, item 5).
+
+### 4.7 What each adapter runs
+
+| Adapter    | Signal modules offered, in the default order | Geo when `[geo] module = "platform"`                                                                                                                                      |
+| ---------- | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Fastly     | `gpc`, `gpp`, `us-privacy`, `tcf`, `mtm`     | `crates/geo/fastly` wraps the SDK's `geo_lookup`, which returns an `Option` and turns every failure into `None`                                                           |
+| Cloudflare | The same five                                | Reads `cf-ipcountry` on every plan and `cf-region-code` only with an Enterprise plan and the visitor-location managed transform, so without them no region rule can match |
+| Axum       | The same five                                | Resolves nothing                                                                                                                                                          |
+| Spin       | The same five                                | Resolves nothing                                                                                                                                                          |
+
+With `[geo] module` unset or `none`, every adapter uses `DisabledGeo`, which
+resolves nothing (§5.2). Each adapter holds its own copy of the module list in
+the `shipped_signal_modules()` function of its `app.rs`. No test compares the
+copies with one another or with the order the Axum tests assume, and only the
+Axum adapter's tests (`tests/permission_signals.rs`) assemble the real modules.
+The permissions inspector (`tools/permissions-inspector`) holds a list of its
+own that leaves out `mtm`.
+
 ## 5. Jurisdiction resolution
 
 ### 5.1 Order
@@ -685,7 +860,7 @@ jurisdiction to `unknown`, never the tree's top node. The failure is logged at e
 level so it is visible. The storage-withdrawal baseline follows the same
 floor, so a failed lookup cannot widen destructive withdrawal either. The
 rule is proven through the seam by
-`a_geo_provider_failure_resolves_permissions_at_the_requires_signal_floor`
+`a_geo_module_failure_resolves_permissions_at_the_requires_signal_floor`
 in `ec/mod.rs`, which drives a `PlatformGeo` that returns an error rather
 than constructing the status by hand.
 
@@ -708,7 +883,7 @@ that in mind. The floor becomes reachable when a vendor geo crate under
 At the floor, an explicit valid grant still counts. A TCF record consenting
 to a mapped purpose sets that permission under `requires_signal`, exactly
 the divergence-from-deny-all the draft declared for this row. Absent,
-malformed, or refusing evidence sets nothing.
+unreadable, or refusing evidence sets nothing.
 
 Not implemented: a lookup-failure metric (the error log is the signal
 today) and the draft's `regime = "gdpr"` component of the failure profile,
@@ -780,22 +955,55 @@ requires a live user signal (§4.2), never a policy change.
 
 ## 6. Failure-mode matrix (normative, implemented)
 
-| Condition                                       | Resolution behavior                                                                                                                                                                                                              |
-| ----------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Geo lookup reports a failure                    | Requires-signal floor for every permission and an `unknown` jurisdiction, never the top-node baseline, with the error logged. No module shipped today can report one, so a host geo outage lands on the row above instead (§5.2) |
-| No geo module configured                        | Top-node baseline, guarded by `assume_single_jurisdiction` (§5.3)                                                                                                                                                                |
-| Country resolved, no matching node              | Top-node baseline (§5.4)                                                                                                                                                                                                         |
-| Region resolved, no region node                 | Country node's group, and the nearest ancestor's `jurisdiction`                                                                                                                                                                  |
-| Top node missing `group` or `jurisdiction`      | Startup failure (§3.3)                                                                                                                                                                                                           |
-| EC module configured, no geo, no acknowledgment | Startup failure (§5.3)                                                                                                                                                                                                           |
-| Malformed `permissions.yaml`                    | Parse error at settings load, once per instance, because the embedded file is a build-time constant, never per-request                                                                                                           |
-| Undecodable record present (TCF, GPP, or USP)   | Revokes every Data Use (fail-closed acquisition), never withdraws, and still honors opt-outs                                                                                                                                     |
-| Expired TCF record                              | Distinct state, not malformed, and treated as absent, so the baseline applies                                                                                                                                                    |
-| Signals contradict (opt-out plus consent)       | The later module in the configured order decides, so under the default order a TCF consent amends an earlier opt-out (§4)                                                                                                        |
-| No EC module selected                           | Identity fails closed, with nothing created and an incoming cookie value never used or egressed (§7)                                                                                                                             |
+| Condition                                                    | Resolution behavior                                                                                                                                                                                                                                          |
+| ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Geo lookup reports a failure                                 | Requires-signal floor for every permission and an `unknown` jurisdiction, never the top-node baseline, with the error logged. No module shipped today can report one, so a host geo outage resolves as no location, at the top-node baseline, instead (§5.2) |
+| No geo module configured                                     | Top-node baseline, guarded by `assume_single_jurisdiction` (§5.3)                                                                                                                                                                                            |
+| Country resolved, no matching node                           | Top-node baseline (§5.4)                                                                                                                                                                                                                                     |
+| Region resolved, no region node                              | Country node's group, and the nearest ancestor's `jurisdiction`                                                                                                                                                                                              |
+| Top node missing `group` or `jurisdiction`                   | Startup failure (§3.3)                                                                                                                                                                                                                                       |
+| EC module configured, no geo, no acknowledgment              | Startup failure (§5.3)                                                                                                                                                                                                                                       |
+| Module name the adapter does not link, or a name given twice | Startup failure when the adapter builds its application state, and not at settings validation (§3.3)                                                                                                                                                         |
+| Malformed `permissions.yaml`                                 | Parse error at settings load, once per instance, because the embedded file is a build-time constant, never per-request                                                                                                                                       |
+| Undecodable record present (TCF, GPP, or USP)                | Read by the module for that scheme as the refusal or opt-out it may have carried, on the Data Uses that scheme covers, and never a withdrawal. Core answers nothing ahead of the modules, so the order decides against the other schemes (§4)                |
+| Expired TCF record                                           | Distinct state, not unreadable. The decoded record is cleared, the `tcf` module answers `Neutral`, and the baseline applies                                                                                                                                  |
+| Signals contradict (opt-out plus consent)                    | The later module in the configured order decides, so under the default order a TCF consent amends an earlier opt-out and a PMP answer read by `mtm` amends both (§4)                                                                                         |
+| No EC module selected                                        | Identity fails closed, with nothing created and an incoming cookie value never used or egressed (§7)                                                                                                                                                         |
 
 The posture is fail-closed. Every ambiguous state resolves to the
 configured baseline or more restrictive.
+
+### 6.1 Upgrading from the earlier settings
+
+A configuration written for the earlier model fails at startup on this row,
+each time with a message that names what to write instead. The rollout design,
+`2026-07-30-provider-migration-rollout-design.md` (§4 and §5), carries the full
+migration for `[ec]`, `[device]` and `[geo]`. For the permission model:
+
+1. Remove `[geo] default_country`. `[geo]` refuses any key other than `module`
+   and `assume_single_jurisdiction`, and the top node of the `rules:` tree takes
+   the place of the old key (§5.4).
+2. Remove `[consent.gdpr]`, `[consent.us_states]` and `consent_store`.
+   `[consent]` refuses a key it does not define, and the `rules:` tree holds the
+   two lists (§3.4). The configuration guide, `docs/guide/configuration.md`,
+   still lists the two lists and `consent_store`.
+3. Set `[geo] assume_single_jurisdiction = true` where an Edge Cookie module
+   runs and no geo module is selected (§5.3).
+4. Write the table as `[permission-signal]`, with `modules` for the earlier
+   `module` or `sources`. The earlier forms are refused with a message that
+   names the new one.
+5. Check the names in `modules` against the crates the adapter links. Only an
+   adapter finds a wrong or repeated name, because settings validation and the
+   `ts` command line tool link none of the module crates. When an adapter cannot
+   build its state it serves its startup error router in place of the
+   application.
+6. Decide the order. The default order lets a TCF answer amend an opt-out,
+   which is the opposite of the earlier fixed rule, and a deployment that wants
+   the earlier outcome lists the opt-outs after `tcf` (§4).
+7. Put the policy in the build. The build compiles in
+   `config/permissions/sample.yaml`, a sample for testing and evaluation, and
+   no other file or setting supplies policy on this row (§3.1). A deployment
+   replaces that file and rebuilds.
 
 ## 7. Enforcement points
 
@@ -810,12 +1018,15 @@ Consumers of the resolved set in the implementation:
    **Device** is ungated by a separate, deliberate decision, because its
    security-classification role must run for traffic that has granted
    nothing, and operator selection is the recorded authorization (modules
-   spec §5) for the built-in and host modules, which declare nothing. A
-   device module an integration module supplies may not declare a
-   permission at all: a nonempty declaration is refused at startup, naming
-   the module and the Data Uses, because no per-request device gate exists
-   to honor it (registry `resolve_device_provider`). The built-in Edge
-   Cookie modules declare `necessary.operations.storage`.
+   spec §5) for the built-in and host modules, which declare nothing. No code
+   on this row reads the `required_permissions()` of a device or geo module. A
+   device module that an integration module supplies arrives with row 7 of the
+   stack (`split/7-integration-seam-impl`, IABTechLab/trusted-server#1348),
+   where `resolve_device_module` in
+   `crates/trusted-server-core/src/integrations/registry.rs` refuses at startup
+   a device module that declares a permission, naming the module and the Data
+   Uses, because no per-request device gate exists to honor the declaration.
+   The built-in Edge Cookie modules declare `necessary.operations.storage`.
 
 2. **EC lifecycle.** Creation requires the module's declared permissions
    through the gate above. Withdrawal follows §4.2. Recognition and
@@ -845,18 +1056,15 @@ Consumers of the resolved set in the implementation:
    value present on the request is treated as absent and never used or
    egressed. This replaces PR #838's vacuously-true `is_none_or` check.
 
-   **Follow-up note (recorded, not silent).** The publisher navigation and
-   page-bids paths attach the EC-derived request ID and `user.id` under
-   the module gate (`ec_allowed`) rather than the sharing pair, while
-   their EIDs are pair-gated. With the built-in modules (storage-only
-   requirement), a storage-only grant can therefore still place the EC in
-   `user.id` on those paths. Aligning them with the `/auction` endpoint's
-   pair gate is recorded follow-up (§11). The draft's fuller inventory
-   (proxy/click/Testlight forwarding gates, the observability denylist
-   with typed redaction boundaries, the raw-regulatory-transport
-   destination allowlist, integration response cookies) is deferred with
-   it. Today EC values are truncated (`log_id`) before logging as the
-   observability mitigation.
+   **Navigation and page-bids.** Both attach the EC-derived request ID and
+   `user.id` under the sharing pair (`ec_sharing_allowed`), as the table above
+   lists (`handle_publisher_request` and `handle_page_bids` in `publisher.rs`),
+   so a storage-only grant keeps first-party use and places no EC in `user.id`
+   on those paths. The draft's fuller inventory (proxy/click/Testlight
+   forwarding gates, the observability denylist with typed redaction
+   boundaries, the raw-regulatory-transport destination allowlist, integration
+   response cookies) is deferred (§11). Today EC values are truncated
+   (`log_id`) before logging as the observability mitigation.
 
 4. **Server-side auction dispatch (not migrated).** Dispatch is still gated
    by the consent subsystem (`consent_allows_server_side_auction`), not by
@@ -872,9 +1080,12 @@ Consumers of the resolved set in the implementation:
    ordinary request, not a contextual projection. Recorded as deferred
    (§11) together with §3.4.
 
-The client-cycle resolve endpoint (`/_ts/api/v1/ec/resolve`) is a further
-consumer, where a module-derived identifier posted by the page is accepted only
-through the same module and permission gates.
+The client-cycle resolve endpoint (`POST /_ts/api/v1/ec/resolve`) is a
+further consumer, and this row does not build it. Row 5 of the stack builds it
+(`split/4-client-resolve`, IABTechLab/trusted-server#1346), where
+`handle_ec_resolve` in `ec/resolve.rs` answers 204 and accepts no identifier
+while `ec_allowed` is false. Its design is
+`2026-07-30-client-cycle-ec-resolve-design.md`.
 
 ### 7.1 Contextual OpenRTB v1 allowlist (deferred)
 
@@ -887,34 +1098,49 @@ work.
 ## 8. Testing strategy
 
 Implemented, in `permissions.rs`, `permission_signal/mod.rs`,
-`ec/consent.rs`, `ec/mod.rs`, `ec/finalize.rs`, `consent/mod.rs`, the four
-module crates, and `crates/trusted-server-adapter-axum/tests/permission_signals.rs`:
+`ec/consent.rs`, `ec/mod.rs`, `ec/finalize.rs`, `consent/mod.rs`, the five
+module crates, the page script, and
+`crates/trusted-server-adapter-axum/tests/permission_signals.rs`:
 
 - **Signal order.** The last module with an opinion decides, silence
   leaves an earlier answer standing, and silence from every module is not
   a refusal. One test per opt-out source shows a TCF answer applied over it
   under the default order (`a_prompt_answer_applies_over_a_gpc_signal` and
   companions), and `the_opt_out_wins_when_a_deployment_puts_it_last` shows
-  the reverse. An omitted `module` runs every module in the offered order,
+  the reverse. An omitted `modules` runs every module in the offered order,
   a configured list is the order they run in, an empty list is accepted, and
-  an unknown or repeated name is refused.
+  an unknown or repeated name is refused. The tests in
+  `permission_signal/mod.rs` use stand-in modules named `gpc` and `tcf`,
+  whereas the real crates answer to `permission-signal.gpc` and
+  `permission-signal.tcf`, and the Axum test
+  `the_documented_names_select_every_shipped_module_in_order` is the one that
+  selects the real crates by name.
 - **Withdrawal scoping.** One test per §4.2 arm: refusal under
   `requires_signal` withdraws, refusal under `granted` suppresses without
   destroying, consent is not a withdrawal, GPC alone never withdraws, sale
-  opt-outs never withdraw, no signal never withdraws, malformed never
-  withdraws.
-- **Fail-closed acquisition.** Malformed records block baseline grants,
-  each undecodable record family is detected, and an expired TCF record is not
-  treated as malformed and resolves at the baseline.
+  opt-outs never withdraw, no signal never withdraws, an unreadable record
+  never withdraws.
+- **Unreadable and expired records.** Each of the `tcf`, `gpp` and
+  `us-privacy` crates tests that an unreadable string of its own scheme is read
+  as that module's refusal or opt-out, and core is tested to answer nothing
+  ahead of the modules
+  (`core_answers_nothing_ahead_of_the_modules`). The Axum tests show the order
+  deciding between a readable and an unreadable record, and an expired TC
+  string is not treated as unreadable
+  (`an_expired_tcf_record_is_not_treated_as_malformed`).
 - **Geo status.** A failed lookup resolves at the requires-signal floor
   (permissions and the storage baseline both), driven through a
-  `PlatformGeo` that returns an error rather than from a hand-built status,
-  and no-location falls back to the configured default.
+  `PlatformGeo` that returns an error rather than from a hand-built status
+  (`a_geo_module_failure_resolves_permissions_at_the_requires_signal_floor`),
+  and no location falls back to the top node of the `rules:` tree.
 - **Policy parsing and validation.** Groups, rules, detailed-rule
-  acquisition maps (including `requires_signal` per rule), rejection of
+  acquisition maps (including `requires_signal` per rule), and the
+  signals-section round trip. One table of fifteen cases
+  (`from_yaml_rejects_each_malformed_policy`) checks the refusals, being
   unknown groups, unknown permissions, unknown acquisitions, incomplete
-  groups, case-insensitive duplicate rule keys, unknown revoke keywords,
-  and the signals-section round trip.
+  groups, case-insensitive duplicate rule keys, unknown revoke keywords, the
+  jurisdiction rules and places written under a region. No test covers a
+  misspelled key in a node, or `us-state` under a country other than `US`.
 - **Shipped-table coverage.** All 30 EU/EEA codes lock storage to
   requires-signal (§3.5).
 - **Vocabulary breadth.** A TCF record grants or revokes every one of the
@@ -923,6 +1149,22 @@ module crates, and `crates/trusted-server-adapter-axum/tests/permission_signals.
   the sharing pair withheld on a storage-only grant, EIDs stripped when
   either permission of the pair is unset, and the no-module stateless
   posture.
+- **The `mtm` crate.** Fourteen tests in the crate cover the three words, the
+  Data Uses each answers for, the terms it declares, and that no word
+  withdraws. The PMP's own `Set-Cookie` strings are parsed to the word they
+  carry, and the cookie is pinned as never `HttpOnly`. One Axum test runs all
+  five modules for a PMP answer in the EU.
+- **Page script.** `crates/trusted-server-js/lib/test/core/permissions.test.ts`
+  covers how the snapshot, with its signals and terms, reaches page code in
+  every order of arrival.
+- **Not covered by a test.** The order between `mtm` and `tcf` or an opt-out in
+  one request. A withdrawal beside an `mtm` grant of storage. The startup
+  warning with the real module names. Proxy mode through `EcContext` and
+  `keep_only`. A misspelled key in a policy node, and `us-state` under a
+  country other than `US`. The module lists of the four adapters, which no test
+  compares. The permissions inspector, whose CI job
+  (`.github/workflows/inspector.yml`) builds the engine and runs nothing
+  against it.
 
 The draft's fuller matrices (the complete normalization matrix as
 table-driven tests, the per-row egress inventory with a denylist check, the
@@ -945,44 +1187,84 @@ their deferred features.
 - An authenticated deletion or explicit storage-withdrawal endpoint:
   deferred (§4.2).
 
+**Open questions.** Each of these waits for a decision and for a code change,
+and this revision changes no code.
+
+1. Whether the startup warning that lists the modules a list leaves out should
+   compare names the way selection does. `omitted` in
+   `permission_signal/mod.rs` compares each written name with the full module
+   name, and every shipped module is named `permission-signal.<folder>`. By
+   reading, a list written as `["gpc", "tcf"]` therefore reports all five
+   modules as not acted on, those listed included. The tests use stand-in
+   names equal to the written ones, so they cannot show it.
+2. Whether `proxy` mode should keep passing the raw consent strings on. By
+   reading, it passes none, because the pipeline decodes nothing in that mode,
+   no module vouches for an undecoded string, and `keep_only` removes the raw
+   strings (§4.4). `docs/guide/configuration.md` and the comments on
+   `ConsentContext::expired` and `build_consent_context` still say that proxy
+   mode forwards them.
+3. Whether the policy parser should refuse a key it does not define (§3.1).
+   A key beside `group`, `jurisdiction` and `permissions` is read as a place
+   code, a key outside `groups`, `rules` and `signals` is ignored (the sample
+   file carries `name:`), and so is an unknown key inside `signals`,
+   `signals.tcf` or `signals.us_opt_out`.
+4. Whether `us-state` should be refused on a region under a country other than
+   `US` (§3.2).
+5. Whether the default order should keep `mtm` last. A script can write
+   `__mtm_pref`, and under the default order a `standard` or `personalized`
+   word replaces a TCF refusal and every opt-out for the eleven named Data
+   Uses, and stops a TCF refusal of storage from withdrawing (§4.2 and §4.6).
+6. Whether to correct, with the code, the text that now says otherwise.
+   - `trusted-server.example.toml` lists four modules and says that an
+     unreadable record revokes whichever modules are configured.
+   - The comments in `config/permissions/sample.yaml` name
+     `[permission_signal] module`.
+   - `docs/guide/configuration.md` lists `gdpr.applies_in`,
+     `us_states.privacy_states` and `consent_store`.
+   - The comment on `request_jurisdiction` in `consent/mod.rs` mentions a KV
+     read fallback that no longer exists.
+   - The header of `permission_signals.rs` in the Axum tests counts four
+     modules, and the comment on `shipped_signal_modules()` in each adapter
+     counts three after the first.
+
 ## 10. Divergences from issue #779
 
 This spec supersedes #779 on the following points, so there is one
 acceptance contract, not two:
 
-| #779 says                                                                                    | This spec says                                                                                                                                                                                                     | Why                                                                                                                                                                        |
-| -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Unmatched countries fall to `default_country`                                                | Adopted, with a changed mechanism since 2026-09-01. Unmatched and unresolved requests both fall to the required top node of the `rules:` tree, and a **failed** lookup floors instead (§5, §12)                    | The failure state is the one that must never reach a permissive default, and the draft's `rules.default` split was not kept                                                |
-| The full TCF purpose vocabulary is modeled                                                   | Adopted and extended. All eleven purposes are signal-resolved, and the full Privacy Taxonomy is carried as declared baseline (§2)                                                                                  | The joint taxonomy work made whole-taxonomy declaration the goal, and `denied` defaults keep undeclared uses inert                                                         |
-| Policy is an embedded file                                                                   | Adopted. `permissions.yaml` is compiled into the build (§3.1), and runtime configuration is deferred follow-up                                                                                                     | The runtime push and activation pipeline does not exist, and version control is the audit trail meanwhile                                                                  |
-| Permission sources are open-ended (#777: publisher interaction, external services may grant) | Adopted as a seam. A source is a permission signal module, a crate implementing `PermissionSignalModule`, registered by an integration builder and asked in the order `[permission-signal] modules` gives (§1, §4) | The four shipped schemes already use it from outside core, so the interface has real consumers, and publisher interaction or an external service arrives as another module |
+| #779 says                                                                                    | This spec says                                                                                                                                                                                                                     | Why                                                                                                                                                                        |
+| -------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Unmatched countries fall to `default_country`                                                | Adopted, with a changed mechanism since 2026-09-01. Unmatched and unresolved requests both fall to the required top node of the `rules:` tree, and a **failed** lookup floors instead (§5, §12)                                    | The failure state is the one that must never reach a permissive default, and the draft's `rules.default` split was not kept                                                |
+| The full TCF purpose vocabulary is modeled                                                   | Adopted and extended. All eleven purposes are signal-resolved, and the full Privacy Taxonomy is carried as declared baseline (§2)                                                                                                  | The joint taxonomy work made whole-taxonomy declaration the goal, and `denied` defaults keep undeclared uses inert                                                         |
+| Policy is an embedded file                                                                   | Adopted. `permissions.yaml` is compiled into the build (§3.1), and runtime configuration is deferred follow-up                                                                                                                     | The runtime push and activation pipeline does not exist, and version control is the audit trail meanwhile                                                                  |
+| Permission sources are open-ended (#777: publisher interaction, external services may grant) | Adopted as a seam. A source is a permission signal module, a crate implementing `PermissionSignalModule`, listed by each adapter in `shipped_signal_modules()` and asked in the order `[permission-signal] modules` gives (§1, §4) | The five shipped schemes already use it from outside core, so the interface has real consumers, and publisher interaction or an external service arrives as another module |
 
 ## 11. Revision record vs the 2026-07-31 draft
 
 One row per divergence between the draft and the implementation this
-revision was verified against (branch `split/5-response-hook-docs`,
-PR #1045).
+revision was verified against (branch `split/3-permissions` at `a028c00da`,
+row 4 of the stack).
 
 | Draft position                                                                                                                                            | Implemented position                                                                                                                                                                                                                                                                  | Why                                                                                                                                                                                           |
 | --------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Vocabulary is two TCF-purpose identifiers, enforced permissions only (§2)                                                                                 | IAB Privacy Taxonomy Data Uses, with eleven named purposes all signal-resolved, plus 53 taxonomy Data Uses carried as declared but unenforced baseline flags                                                                                                                          | The joint taxonomy adoption postdates the draft, and whole-taxonomy declaration serves completeness and demonstration, with `denied` defaults keeping unenforced flags inert                  |
+| Vocabulary is two TCF-purpose identifiers, enforced permissions only (§2)                                                                                 | IAB Privacy Taxonomy Data Uses, with eleven named purposes all signal-resolved, plus 53 further taxonomy Data Uses that no module gates on and that a signal reaches for eleven of them under the sample policy (§2)                                                                  | The joint taxonomy adoption postdates the draft, and whole-taxonomy declaration serves completeness and demonstration, with `denied` defaults keeping unenforced flags inert                  |
 | Policy lives in `[permissions]` in `trusted-server.toml`, published via `ts config push` (§3.1)                                                           | Policy is `permissions.yaml`, compiled into the build with `include_str!`, parsed once and covered by tests                                                                                                                                                                           | The runtime config push and activation apparatus does not exist, so publishing runtime policy without it would recreate the hazards the draft cataloged. Runtime policy is deferred follow-up |
 | Every group carries a required `regime` class read by auction dispatch (§3.2)                                                                             | No regime field exists                                                                                                                                                                                                                                                                | Its only consumer, regime-gated dispatch, was not migrated, and the field returns with that work                                                                                              |
 | Overrides name explicit acquisition rules, replacing the `+`/`-` sigils (§3.2)                                                                            | Adopted. A detailed rule's `permissions` map assigns `granted`, `requires_signal`, or `denied` per Data Use                                                                                                                                                                           | The draft's requirement, expressed in the YAML schema. `requires_signal` is now expressible per rule                                                                                          |
 | Two fallbacks: policy `rules.default` for unmatched countries, `default_country` only for the static no-geo mode (§5.4)                                   | One required fallback covers unmatched and unresolved requests in every mode, startup-validated, and a failed lookup floors separately. It was `[geo] default_country` until 2026-09-01 and is now the top node of the `rules:` tree (§12)                                            | One deployer knob is simpler, and the safety-critical separation kept is failure vs absence, carried by `GeoStatus`                                                                           |
-| Validation checks assigned ISO 3166-1 codes, assigned subdivisions, and a group identifier grammar (§3.3)                                                 | Validation covers unknown groups, permissions, acquisitions, revoke rules, incomplete groups, case-duplicate rule keys, and unknown fields on detailed rules                                                                                                                          | Smaller surface shipped first, and the EU/EEA coverage test guards the shipped table against the typo class. ISO-assignment checks are future hardening                                       |
-| Three-class signal taxonomy with regime-scoped grant acceptance, where the US posture is `requires_signal` with GPP/USP non-opt-out values as grants (§4) | Of the shipped modules TCF is the only grant source, the US posture is a `granted` baseline that opt-outs revoke, and explicit non-opt-out values grant nothing                                                                                                                       | A simpler two-signal model without regimes. The cost, no-signal US traffic is allowed by baseline rather than blocked pending a signal, is a deliberate policy choice in the shipped file     |
-| Malformed-present blocks grants per record family and mapped section (§4.4, §4.5)                                                                         | Any present-but-undecodable record revokes every Data Use for the request                                                                                                                                                                                                             | Strictly more restrictive simplification, and per-family scoping needs the full §4.5 decoder work                                                                                             |
-| Normalization runs expiry before conflict resolution, a declared change (§4.4)                                                                            | Conflict resolution still runs before the expiry check                                                                                                                                                                                                                                | The reordering was not implemented, though the expired state itself (distinct from malformed, absent for acquisition) was adopted                                                             |
-| Persisted-KV consent flows through the full normalization pipeline with an explicit TTL comparison (§4.4)                                                 | The loaded record substitutes directly when the request carries no signals, jurisdiction re-derived, and staleness is enforced by the store TTL (`max_consent_age_days`)                                                                                                              | The store-level TTL delivers the staleness bound without a second normalization pass                                                                                                          |
-| Proxy mode gains minimal opt-out extraction (§4.4)                                                                                                        | Proxy mode still skips decoding, so a present record blocks all grants via the malformed-present rule and the GPC header opt-out is honored without decoding                                                                                                                          | The permission-layer outcome is equally or more restrictive with no new decode paths, and this is revisited with the §4.5 decoder work                                                        |
-| Withdrawal has four triggers including an explicit storage-withdrawal or authenticated deletion request (§4.2)                                            | The TCF Purpose 1 refusal under a non-granted baseline is the only trigger, and opt-outs, malformed records, absence, and policy changes never withdraw (adopted)                                                                                                                     | No deletion endpoint exists to carry the extra trigger, so the narrowest destructive surface shipped first                                                                                    |
+| Validation checks assigned ISO 3166-1 codes, assigned subdivisions, and a group identifier grammar (§3.3)                                                 | Validation covers unknown groups, permissions, acquisitions, revoke rules, incomplete groups, case-duplicate rule keys, and the jurisdiction values. The parser does not reject an unknown key in a node (§3.1)                                                                       | Smaller surface shipped first, and the EU/EEA coverage test guards the shipped table against the typo class. ISO-assignment checks are future hardening                                       |
+| Three-class signal taxonomy with regime-scoped grant acceptance, where the US posture is `requires_signal` with GPP/USP non-opt-out values as grants (§4) | Of the shipped modules TCF and `mtm` are the grant sources, the US posture is a `granted` baseline that opt-outs revoke, and explicit non-opt-out values grant nothing                                                                                                                | A simpler two-signal model without regimes. The cost, no-signal US traffic is allowed by baseline rather than blocked pending a signal, is a deliberate policy choice in the shipped file     |
+| Malformed-present blocks grants per record family and mapped section (§4.4, §4.5)                                                                         | Each module answers for its own scheme's unreadable record, as a refusal or opt-out on the Data Uses that scheme covers, and core answers nothing ahead of the modules (§4)                                                                                                           | The scope is the Data Uses of the scheme whose record could not be read, because per-section scoping needs the full §4.5 decoder work                                                         |
+| Normalization runs expiry before conflict resolution, a declared change (§4.4)                                                                            | Conflict resolution still runs before the expiry check                                                                                                                                                                                                                                | The reordering was not implemented, though the expired state itself (distinct from unreadable, absent for acquisition) was adopted                                                            |
+| Persisted-KV consent flows through the full normalization pipeline with an explicit TTL comparison (§4.4)                                                 | Not built. No persisted-KV consent exists on this row, the consent pipeline reads the live request only, and `consent_store` is refused (§4.4)                                                                                                                                        | The legacy consent store was removed (IABTechLab/trusted-server#883), so live consent is interpreted on each request                                                                          |
+| Proxy mode gains minimal opt-out extraction (§4.4)                                                                                                        | Proxy mode still skips decoding, so a present TC, GPP or US Privacy string is unreadable to its module and revokes the Data Uses that scheme covers, and the GPC header opt-out is honored without decoding. By reading, no raw string reaches the auction and publisher paths (§4.4) | The permission-layer outcome is equally or more restrictive with no new decode paths, and this is revisited with the §4.5 decoder work                                                        |
+| Withdrawal has four triggers including an explicit storage-withdrawal or authenticated deletion request (§4.2)                                            | The TCF Purpose 1 refusal under a non-granted baseline is the only trigger, and opt-outs, unreadable records, absence, and policy changes never withdraw (adopted)                                                                                                                    | No deletion endpoint exists to carry the extra trigger, so the narrowest destructive surface shipped first                                                                                    |
 | §4.3 durability protocol: family records first, suppression and authority-state records, outbox, breaker, strong reads                                    | Cookie expiry plus best-effort identity-graph tombstones per presented identifier, with failures logged                                                                                                                                                                               | The protocol requires storage primitives (linearizable CAS, independent durability domains) the adapters do not yet qualify, so it is deferred with the providers-spec storage work           |
 | §4.5 field mapping and §4.5.1 vendored registry snapshot (sharing/targeted opt-outs, embedded GPC, applicability, derived `gpp_sid`)                      | Opt-out sources are the GPC header, a GPP sale opt-out, and a USP sale opt-out. The revoke set is policy-declared, and the shipped file lists device storage, sale, sharing, third-party sale, targeted advertising and profiling (§4.5)                                              | The full decoder and registry vendoring are their own project, and the policy-declared revoke set gives deployers the scoping lever meanwhile                                                 |
 | §5.5 activation: JCS policy digests, ordinals, activation register, journal, drains, admission leases                                                     | None of it exists, and the built binary is the policy identity                                                                                                                                                                                                                        | With no runtime policy there is nothing to activate, and the draft remains the reference design for the runtime-config follow-up                                                              |
 | §3.4 single jurisdiction truth, and §7 dispatch gated on the policy regime with a contextual projection                                                   | Half adopted. Since 2026-09-01 the `rules:` tree carries regime applicability and the two `[consent]` lists retire into it (§3.4), while auction dispatch still keeps the consent-subsystem gate (effective TCF Purpose 1 for GDPR or unknown jurisdictions), with no contextual view | Dispatch migration is follow-up. The legacy-list drift risk the draft named still stands and is recorded rather than resolved                                                                 |
 | Every raw-EC egress path is pair-gated, with per-row tests and a denylist check (§7)                                                                      | Pair gating is centralized in `ec_sharing_allowed` (auction endpoint `user.id`, publisher navigation and page-bids `user.id`, identify, pull sync) and `gate_eids_by_permissions` (EIDs everywhere). Batch sync checks row state only                                                 | Partial adoption. Aligning the remaining paths, the S2S stored-provenance authority, and the inventory tests is recorded follow-up                                                            |
-| Identity rows never store raw consent strings, only normalized provenance and a digest (§1)                                                               | The identity-graph entry stores the raw TCF and GPP strings with the row                                                                                                                                                                                                              | The normalized provenance schema belongs to the providers-spec storage work, and until then rows carry the raw strings                                                                        |
+| Identity rows never store raw consent strings, only normalized provenance and a digest (§1)                                                               | The identity-graph entry stores the raw TCF and GPP strings that a module vouched for with the row                                                                                                                                                                                    | The normalized provenance schema belongs to the providers-spec storage work, and until then rows carry the raw strings                                                                        |
 | No signals block in policy, and the signal mapping is fixed in the spec                                                                                   | New. A `signals` section in `permissions.yaml` declares the opt-out sources and revoke set, with `tcf.authoritative` governing only TCF's own effect. The TCF purpose map has since moved into the TCF module crate (§13)                                                             | Moves signal policy from code into deployer-editable data, while what a scheme's own signal means stays with that scheme's module                                                             |
 | The §5.3 no-geo guard covers every jurisdiction consumer                                                                                                  | The guard fires when an Edge Cookie module is configured with no geo module                                                                                                                                                                                                           | The EC module is the only policy-gated consumer today, and the trigger list grows when dispatch and further egress paths join the model                                                       |
 | `default_country` is required only in the acknowledged static no-geo mode (§5.4)                                                                          | Required always and startup-validated. Since 2026-09-01 the requirement sits on the `rules:` tree's top node, which must carry a `group` and a `jurisdiction` (§12)                                                                                                                   | It is the baseline for unmatched requests in every mode, so it must always exist                                                                                                              |
@@ -1003,7 +1285,7 @@ change.
 | The consent handling for an unresolved request follows from the chosen default country                           | The top node requires `jurisdiction:` beside `group:`, with the values of the `Jurisdiction` type (§3.2)                                                                                                | The unknown case deserves its own stated answer rather than one inherited from a stand-in country                                                                                               |
 | Startup rejects a missing or unresolvable `default_country`                                                      | Startup rejects a top node missing `group` or `jurisdiction`, and reserved keys cannot collide with place codes because ISO codes are short                                                             | The same loud failure, moved to where the policy now lives                                                                                                                                      |
 | `jurisdiction` is written at the top of the tree only                                                            | Any node may carry `jurisdiction:` beside `group:`, and a node carrying none inherits the nearest ancestor that does. The top node must carry both, so the inheritance always terminates                | A country or a state often needs its own regime, and inheritance states the common case once while leaving the exceptions visible where a reader meets them                                     |
-| The US-state value carries the state code, as `us-state/<CODE>`                                                  | The value is bare `us-state`, valid only on a region node under `US`, and rejected at the top and on a country node                                                                                     | The matched node already names the state, so repeating the code in the value invites the two disagreeing                                                                                        |
+| The US-state value carries the state code, as `us-state/<CODE>`                                                  | The value is bare `us-state`, valid only on a region node, and rejected at the top and on a country node. The parser does not check the country above the region (§3.2)                                 | The matched node already names the state, so repeating the code in the value invites the two disagreeing                                                                                        |
 | `consent.gdpr.applies_in` and `consent.us_states.privacy_states` in the operator TOML carry regime applicability | Both retire into the tree, where the shipped file holds the same 31 GDPR countries inheriting `gdpr` and the same 20 privacy-law states as region children of `US` with `jurisdiction: us-state` (§3.4) | One document carries the baselines and the applicability together, so a policy owner keeps one list rather than two in step, and the drift risk §3.4 recorded has nothing left to drift against |
 
 This revision leaves unchanged the group vocabulary and flags, the signal
@@ -1015,16 +1297,35 @@ it out.
 ## 13. Revision record: permission signal modules (2026-09-14)
 
 Signal precedence moves from a fixed rule in code to the order a deployment
-configures, and the four shipped schemes move out of core into module
-crates. One row per change.
+configures, and the shipped schemes move out of core into module crates. One
+row per change. The rows describe the code on `split/3-permissions`, so they
+include the changes that followed the first revision of this section on
+2026-09-14, being an unreadable record answered by its own module, `awaiting`,
+`signals` and `mtm`.
 
-| Before                                                                                                                 | After                                                                                                                                                                                                                                                                                | Why                                                                                                                                                                                                                    |
-| ---------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Precedence fixed in code, most restrictive first, so an opt-out always beat a consenting TCF record                    | The order in `[permission-signal] modules`, where the last module with an opinion decides, validated and logged at startup (§4)                                                                                                                                                      | Which scheme wins is a question about a jurisdiction and a publisher, and a fixed rule answers it in code for every deployment                                                                                         |
-| A GPC header suppressed a Data Use that a TCF record consented to                                                      | The default order is `gpc`, `gpp`, `us-privacy`, `tcf`, so a TCF answer amends an earlier opt-out, and listing the opt-out after `tcf` restores the previous outcome                                                                                                                 | Global Privacy Control is a browser setting with no interface of its own, and the other three carry an answer a person gave through an interface, so by default that answer amends the header the visitor arrived with |
-| Signals resolved inside core through a per-permission `ConsentSignal` closure, with further sources deferred (§1, §10) | A `PermissionSignalModule` trait in core, with GPC, the GPP sale opt-out, US Privacy and TCF each a crate under `crates/permission-signal/` that core does not name, registered through an integration builder                                                                       | A scheme core has never heard of plugs in without a change to core, and none of the four is privileged by being built in                                                                                               |
-| The TCF purpose to Data Use map in the `signals` section of `permissions.yaml` (§3.2)                                  | The map in the TCF module crate, `crates/permission-signal/tcf/src/mapping.rs`                                                                                                                                                                                                       | A deployment that runs no TCF carries no table of another scheme's numbers                                                                                                                                             |
-| Malformed-present as step 3 of the fixed order                                                                         | Ahead of every module and not configurable (§4, step 2)                                                                                                                                                                                                                              | It is error handling rather than a signaling scheme, and a place in the order would let a readable record from one scheme overwrite the refusal an unreadable record from another caused                               |
-| Withdrawal decided in core from the TCF record                                                                         | A `withdraws` answer on the module trait, scoped by core to the storage baseline, and given today only by TCF (§4.2)                                                                                                                                                                 | Revoking and withdrawing stay different questions, and a new scheme can carry its own withdrawal                                                                                                                       |
-| The permission state carries the resolved set only                                                                     | It also carries `tdls`, the terms documents the configured modules declare, in module order with duplicates removed, and the page receives `{"set":[],"tdls":[]}`. Each entry must address a document never edited once published, which the `Tdl` type documents and cannot enforce | A recipient needs the exact terms the data is available under, and an empty list says no terms were declared rather than that anything is permitted                                                                    |
-| Opt-out-beats-TCF pinning tests                                                                                        | Order tests in both directions, per-source tests, and selection tests (§8)                                                                                                                                                                                                           | The tests pin the configured behavior rather than the retired rule                                                                                                                                                     |
+| Before                                                                                                                 | After                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | Why                                                                                                                                                                                                                                                                                         |
+| ---------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Precedence fixed in code, most restrictive first, so an opt-out always beat a consenting TCF record                    | The order in `[permission-signal] modules`, where the last module with an opinion decides, validated and logged at startup (§4)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | Which scheme wins is a question about a jurisdiction and a publisher, and a fixed rule answers it in code for every deployment                                                                                                                                                              |
+| A GPC header suppressed a Data Use that a TCF record consented to                                                      | The default order is `gpc`, `gpp`, `us-privacy`, `tcf` and `mtm`, so a TCF answer amends an earlier opt-out, and listing the opt-out after `tcf` restores the previous outcome                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | Global Privacy Control is a browser setting with no interface of its own, and the schemes after it carry an answer a person gave through an interface, so by default that answer amends the header the visitor arrived with                                                                 |
+| Signals resolved inside core through a per-permission `ConsentSignal` closure, with further sources deferred (§1, §10) | A `PermissionSignalModule` trait in core, with GPC, the GPP sale opt-out, US Privacy, TCF and MTM each a crate under `crates/permission-signal/`, linked and listed by each adapter in `shipped_signal_modules()` and selected from `[permission-signal] modules`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | A scheme core has never heard of plugs in without a change to core, and none of the five is privileged by being built in                                                                                                                                                                    |
+| The TCF purpose to Data Use map in the `signals` section of `permissions.yaml` (§3.2)                                  | The map in the TCF module crate, `crates/permission-signal/tcf/src/mapping.rs`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | A deployment that runs no TCF carries no table of another scheme's numbers                                                                                                                                                                                                                  |
+| Malformed-present as step 3 of the fixed order                                                                         | Each module answers for its own scheme's unreadable record, in the configured order, and core answers nothing ahead of the modules (§4)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | Core no longer reads any scheme, so what an unreadable, absent or expired signal means is each module's decision, and the order decides between schemes                                                                                                                                     |
+| Withdrawal decided in core from the TCF record                                                                         | A `withdraws` answer on the module trait, scoped by core to the storage baseline, and given today only by TCF (§4.2)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | Revoking and withdrawing stay different questions, and a new scheme can carry its own withdrawal                                                                                                                                                                                            |
+| The permission state carries the resolved set only                                                                     | It also carries `awaiting`, the permissions that need a signal no module has given and that some configured module could still grant (each module declares what it can grant through `grants` on the trait), `signals`, one entry for each signal a module read and found valid, as received (each entry carries the module, the scheme and the raw string, so the page receives the raw strings the modules used), and `tdls`, the terms documents the configured modules declare, in module order with duplicates removed. The page receives all four, and an empty state is `{"awaiting":[],"set":[],"signals":[],"tdls":[]}`. Each `tdls` entry must address a document never edited once published, which the `Tdl` type documents and cannot enforce | A page has to tell a prompt that has not run from a visitor who refused, a bid request has to carry only signals a module could read, and a recipient needs the exact terms the data is available under. An empty `tdls` says no terms were declared rather than that anything is permitted |
+| Opt-out-beats-TCF pinning tests                                                                                        | Order tests in both directions, per-source tests, and selection tests (§8)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | The tests pin the configured behavior rather than the retired rule                                                                                                                                                                                                                          |
+| No scheme read the PMP's answer                                                                                        | `mtm` reads the PMP's `__mtm_pref` cookie, answers for the eleven named Data Uses, and declares the versioned Model Terms for Marketing as the terms the data is available under (§4.6)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | The PMP keeps its own copy of the answer and mirrors it into the cookie, which is what lets the server see the answer at all                                                                                                                                                                |
+
+## Review log
+
+1. **Round 1, 2026-10-15.** A review in a fresh session, against `split/3-permissions` at `a028c00da`. Issues found, nine of them blocking. The nine were the claim that an unreadable record revokes everything ahead of the modules, four shipped modules where five ship, registration through an integration builder, a page state described with two members where it has four, a follow-up note that gave `ec_allowed` for two paths that use `ec_sharing_allowed`, the persisted consent, the resolve endpoint and the device module check that this row does not build, unknown rule fields that the parser does not reject, the Data Uses said to have no signal, and raw strings said to be kept for forwarding. This revision states what the code does in each case, adds the fifth module `mtm`, a table of what each adapter runs, an upgrade list and the privacy effects the round found, names the row that builds each item this row lacks, and leaves the code changes the round asks for under Open questions.
+
+## Revision record
+
+| Date       | Change                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 2026-08-25 | Revised against the implementation, with a row for each divergence from the 2026-07-31 draft (§11).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| 2026-09-01 | The `rules:` tree replaced the flat rule keys and retired `[geo] default_country` (§12).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| 2026-09-14 | Permission signal modules replaced the fixed signal precedence with a configured order (§13).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| 2026-10-06 | Module became the word for what an operator selects.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| 2026-10-07 | A module is named by its crate folder, so the selector reads `[permission-signal] modules`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| 2026-10-15 | Fixes from review round 1. An unreadable record answered by its own module with nothing ahead of the modules, the fifth module `mtm` with its own section, registration through each adapter, the four members of the page state, the sharing pair on navigation and page-bids, the persisted consent, resolve endpoint and device module check named as built by other rows or not at all, what the policy parser does not reject, the Data Uses a signal reaches, the raw strings removed after assembly, a table of what each adapter runs, the upgrade list, the open questions and the review log. |
