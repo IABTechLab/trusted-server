@@ -18,10 +18,10 @@ auction_dataset = "auction_events_raw"
 auction_token_secret = "tinybird_auction_append_token"
 ```
 
-The module is offered by `crates/trusted-server-modules`, so every adapter
-that builds its state from that list links it. The settings, what each one
-accepts and what is refused are in the configuration guide under "Analytics
-Configuration", and the data path in the telemetry guide.
+Each adapter, and the `ts` tool, lists the module's builder among the
+modules it links. The settings, what each one accepts and what is refused are
+in the configuration guide under "Analytics Configuration", and the data path
+in the telemetry guide.
 
 Build and test from the repository root:
 
