@@ -1,58 +1,56 @@
 //! Structured cache-policy rendering helpers.
 //!
 //! Cache policy is expressed once as typed data and then rendered into the
-//! runtime-specific headers used by each edge platform. The helpers in this
-//! module only write cache-control headers; response privacy hardening still
-//! runs later so personalized or cookie-bearing responses cannot be made
-//! shared-cacheable by accident.
+//! header the running platform reads a shared cache policy from. The helpers
+//! in this module only write cache-control headers; response privacy
+//! hardening still runs later so personalized or cookie-bearing responses
+//! cannot be made shared-cacheable by accident.
 
 use std::time::Duration;
 
 use http::header::{self, HeaderName};
 use http::{HeaderMap, HeaderValue};
 
-/// String name Fastly uses for shared-cache control.
+use crate::platform::platform_cache_headers;
+
+/// String name of the shared-cache control header from the Edge Architecture
+/// Specification, which core reads for every platform.
 pub const HEADER_SURROGATE_CONTROL_NAME: &str = "surrogate-control";
-/// String name Fastly may use for shared-cache control in some configurations.
-pub const HEADER_FASTLY_SURROGATE_CONTROL_NAME: &str = "fastly-surrogate-control";
-/// String name for the standards-track CDN-only shared-cache control header.
+/// String name of the CDN-only shared-cache control header from RFC 9213,
+/// which core reads for every platform.
 pub const HEADER_CDN_CACHE_CONTROL_NAME: &str = "cdn-cache-control";
-/// String name for Cloudflare-specific CDN-only shared-cache control.
-pub const HEADER_CLOUDFLARE_CDN_CACHE_CONTROL_NAME: &str = "cloudflare-cdn-cache-control";
 
-/// Runtime edge-cache header names owned by this crate.
-pub const EDGE_CACHE_HEADER_NAMES: &[&str] = &[
-    HEADER_SURROGATE_CONTROL_NAME,
-    HEADER_FASTLY_SURROGATE_CONTROL_NAME,
-    HEADER_CDN_CACHE_CONTROL_NAME,
-    HEADER_CLOUDFLARE_CDN_CACHE_CONTROL_NAME,
-];
-
-/// Header name Fastly uses for shared-cache control.
+/// Header name of the shared-cache control header from the Edge Architecture
+/// Specification.
 pub const HEADER_SURROGATE_CONTROL: HeaderName =
     HeaderName::from_static(HEADER_SURROGATE_CONTROL_NAME);
-/// Header name Fastly may use for shared-cache control in some configurations.
-pub const HEADER_FASTLY_SURROGATE_CONTROL: HeaderName =
-    HeaderName::from_static(HEADER_FASTLY_SURROGATE_CONTROL_NAME);
-/// Standards-track header name for CDN-only shared-cache control.
+/// Header name of the CDN-only shared-cache control header from RFC 9213.
 pub const HEADER_CDN_CACHE_CONTROL: HeaderName =
     HeaderName::from_static(HEADER_CDN_CACHE_CONTROL_NAME);
-/// Cloudflare-specific header name for CDN-only shared-cache control.
-pub const HEADER_CLOUDFLARE_CDN_CACHE_CONTROL: HeaderName =
-    HeaderName::from_static(HEADER_CLOUDFLARE_CDN_CACHE_CONTROL_NAME);
+
+/// Every header that carries a shared cache policy: the two core reads for
+/// every platform, then the ones the running platform declared through
+/// [`crate::platform::declare_platform_cache_headers`].
+#[must_use]
+pub fn edge_cache_header_names() -> Vec<&'static str> {
+    let mut names = vec![HEADER_SURROGATE_CONTROL_NAME, HEADER_CDN_CACHE_CONTROL_NAME];
+    names.extend(platform_cache_headers());
+    names
+}
 
 /// Cache-control value used when a response must not be stored.
 pub const NO_STORE_PRIVATE_CACHE_CONTROL: &str = "no-store, private";
 
-/// Shared-cache header family emitted for the current runtime.
+/// The header the running platform reads a shared cache policy from.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum EdgeCacheHeader {
-    /// Emit Fastly's `Surrogate-Control` header.
+    /// Emit the `Surrogate-Control` header.
     SurrogateControl,
-    /// Emit the standards-track `CDN-Cache-Control` header.
+    /// Emit the `CDN-Cache-Control` header.
     CdnCacheControl,
-    /// Emit Cloudflare's `Cloudflare-CDN-Cache-Control` header.
-    CloudflareCdnCacheControl,
+    /// Emit the platform's own header, named in lower case, which its adapter
+    /// declared through [`crate::platform::declare_platform_cache_headers`].
+    Platform(&'static str),
     /// Put `s-maxage` into `Cache-Control` instead of emitting a separate edge header.
     SMaxageFallback,
     /// Do not emit edge-cache directives.
@@ -82,7 +80,13 @@ impl EdgeCacheHeader {
         match self {
             Self::SurrogateControl => Some(HEADER_SURROGATE_CONTROL),
             Self::CdnCacheControl => Some(HEADER_CDN_CACHE_CONTROL),
-            Self::CloudflareCdnCacheControl => Some(HEADER_CLOUDFLARE_CDN_CACHE_CONTROL),
+            Self::Platform(name) => {
+                let parsed = HeaderName::from_bytes(name.as_bytes()).ok();
+                if parsed.is_none() {
+                    log::warn!("the platform's cache header `{name}` is not a header name");
+                }
+                parsed
+            }
             Self::SMaxageFallback | Self::None => None,
         }
     }
@@ -268,17 +272,19 @@ impl From<CachePolicy> for CacheControlPolicy {
     }
 }
 
-/// Remove every runtime-specific shared-cache header owned by this crate.
+/// Remove every header that carries a shared cache policy, see
+/// [`edge_cache_header_names`].
 pub fn remove_edge_cache_headers(headers: &mut HeaderMap) {
-    for name in EDGE_CACHE_HEADER_NAMES {
-        headers.remove(*name);
+    for name in edge_cache_header_names() {
+        headers.remove(name);
     }
 }
 
-/// Return true when `name` is an edge-cache header owned by this crate.
+/// Return true when `name` is a header that carries a shared cache policy,
+/// see [`edge_cache_header_names`].
 #[must_use]
 pub fn is_edge_cache_header_name(name: &str) -> bool {
-    EDGE_CACHE_HEADER_NAMES
+    edge_cache_header_names()
         .iter()
         .any(|candidate| name.eq_ignore_ascii_case(candidate))
 }
@@ -359,7 +365,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn public_immutable_renders_browser_and_fastly_headers() {
+    fn public_immutable_renders_browser_and_surrogate_control_headers() {
         let policy = CachePolicy::public_immutable(Duration::from_secs(31_536_000));
         let mut headers = HeaderMap::new();
 
@@ -377,7 +383,7 @@ mod tests {
                 .get(HEADER_SURROGATE_CONTROL)
                 .and_then(|v| v.to_str().ok()),
             Some("max-age=31536000"),
-            "should render Fastly edge TTL"
+            "should render the edge TTL in Surrogate-Control"
         );
     }
 
@@ -424,7 +430,7 @@ mod tests {
     }
 
     #[test]
-    fn cloudflare_specific_header_renders_cdn_only_policy() {
+    fn a_platform_header_renders_cdn_only_policy() {
         let policy = CachePolicy::public_short_with_stale(
             Duration::from_secs(300),
             Duration::from_secs(60),
@@ -432,7 +438,10 @@ mod tests {
         );
         let mut headers = HeaderMap::new();
 
-        policy.apply_to_headers(&mut headers, EdgeCacheHeader::CloudflareCdnCacheControl);
+        policy.apply_to_headers(
+            &mut headers,
+            EdgeCacheHeader::Platform("example-cdn-cache-control"),
+        );
 
         assert_eq!(
             headers
@@ -443,14 +452,37 @@ mod tests {
         );
         assert_eq!(
             headers
-                .get(HEADER_CLOUDFLARE_CDN_CACHE_CONTROL)
+                .get("example-cdn-cache-control")
                 .and_then(|v| v.to_str().ok()),
             Some("max-age=300, stale-while-revalidate=60, stale-if-error=86400"),
-            "should render Cloudflare-specific CDN cache policy"
+            "should render the policy in the platform's own header"
         );
         assert!(
             headers.get(HEADER_CDN_CACHE_CONTROL).is_none(),
             "should not also emit the generic CDN cache header"
+        );
+    }
+
+    #[test]
+    fn a_declared_platform_header_is_stripped_with_the_standard_ones() {
+        crate::platform::declare_platform_cache_headers(&["example-platform-cache-control"]);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HEADER_SURROGATE_CONTROL,
+            HeaderValue::from_static("max-age=60"),
+        );
+        headers.insert(
+            "example-platform-cache-control",
+            HeaderValue::from_static("max-age=60"),
+        );
+
+        assert!(is_edge_cache_header_name("Example-Platform-Cache-Control"));
+        CacheControlPolicy::NoStorePrivate.apply_to_headers(&mut headers, EdgeCacheHeader::None);
+
+        assert!(
+            headers.get(HEADER_SURROGATE_CONTROL).is_none()
+                && headers.get("example-platform-cache-control").is_none(),
+            "should remove the platform's own header as it removes the standard ones"
         );
     }
 
@@ -466,10 +498,6 @@ mod tests {
             HEADER_CDN_CACHE_CONTROL,
             HeaderValue::from_static("max-age=60"),
         );
-        headers.insert(
-            HEADER_CLOUDFLARE_CDN_CACHE_CONTROL,
-            HeaderValue::from_static("max-age=60"),
-        );
 
         policy.apply_to_headers(&mut headers, EdgeCacheHeader::SurrogateControl);
 
@@ -482,15 +510,11 @@ mod tests {
         );
         assert!(
             headers.get(HEADER_SURROGATE_CONTROL).is_none(),
-            "should remove Fastly shared-cache headers for private responses"
+            "should remove Surrogate-Control for private responses"
         );
         assert!(
             headers.get(HEADER_CDN_CACHE_CONTROL).is_none(),
             "should remove generic CDN cache headers for private responses"
-        );
-        assert!(
-            headers.get(HEADER_CLOUDFLARE_CDN_CACHE_CONTROL).is_none(),
-            "should remove Cloudflare cache headers for private responses"
         );
     }
 
@@ -502,15 +526,7 @@ mod tests {
             HeaderValue::from_static("max-age=60"),
         );
         headers.insert(
-            HEADER_FASTLY_SURROGATE_CONTROL,
-            HeaderValue::from_static("max-age=60"),
-        );
-        headers.insert(
             HEADER_CDN_CACHE_CONTROL,
-            HeaderValue::from_static("max-age=60"),
-        );
-        headers.insert(
-            HEADER_CLOUDFLARE_CDN_CACHE_CONTROL,
             HeaderValue::from_static("max-age=60"),
         );
 
@@ -525,9 +541,7 @@ mod tests {
         );
         assert!(
             headers.get(HEADER_SURROGATE_CONTROL).is_none()
-                && headers.get(HEADER_FASTLY_SURROGATE_CONTROL).is_none()
-                && headers.get(HEADER_CDN_CACHE_CONTROL).is_none()
-                && headers.get(HEADER_CLOUDFLARE_CDN_CACHE_CONTROL).is_none(),
+                && headers.get(HEADER_CDN_CACHE_CONTROL).is_none(),
             "should remove all shared-cache headers"
         );
     }

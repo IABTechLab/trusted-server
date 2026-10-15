@@ -111,16 +111,6 @@ pub fn settings_from_config_blob_with(
 }
 
 fn remove_inactive_secret_references(data: &mut serde_json::Value) {
-    // References of a table `[analytics]` does not select are cleared before resolution.
-    if !crate::settings::document_selects_analytics_module(data)
-        && let Some(table) = data
-            .pointer_mut("/analytics/tinybird")
-            .and_then(serde_json::Value::as_object_mut)
-    {
-        table.remove("auction_token_secret");
-        table.remove("access_token_secret");
-    }
-
     if let Some(partners) = data
         .pointer_mut("/ec/partners")
         .and_then(serde_json::Value::as_array_mut)
@@ -148,9 +138,7 @@ mod tests {
     use crate::origin_auth::fixture;
     use crate::platform::{PlatformError, StoreId};
     use crate::redacted::Redacted;
-    use crate::settings::{
-        AnalyticsConfig, EcPartner, ProxyAssetRoute, TinybirdSettings, TrustedClientIpConfig,
-    };
+    use crate::settings::{EcPartner, ProxyAssetRoute, TrustedClientIpConfig};
     use crate::test_support::tests::{
         crate_test_settings_str, edit_origin, hmac_passphrase, select_hmac_module,
         select_host_signals_module, set_route_auth,
@@ -515,14 +503,6 @@ mod tests {
     #[test]
     fn resolves_all_static_credentials_from_the_mapped_default_store() {
         let mut original = test_settings();
-        original.analytics = Some(AnalyticsConfig {
-            module: Some("analytics.tinybird".to_string()),
-            tinybird: Some(TinybirdSettings {
-                api_host: "api.example.com".to_string(),
-                auction_token_secret: Some(Redacted::new("tinybird-token-key".to_string())),
-                ..TinybirdSettings::default()
-            }),
-        });
         let mut route = ProxyAssetRoute::new("/assets/", "https://assets.example.com");
         set_route_auth(
             &mut route,
@@ -546,14 +526,6 @@ mod tests {
         )
         .expect("should resolve every static credential from the mapped store");
 
-        assert_eq!(
-            reconstructed
-                .analytics_module()
-                .and_then(|module| module.auction_token_secret.as_ref())
-                .map(Redacted::expose)
-                .map(String::as_str),
-            Some("resolved-tinybird-token")
-        );
         let auth = reconstructed.proxy.asset_routes[0]
             .origin_source()
             .and_then(|origin| origin.auth)
@@ -969,40 +941,6 @@ mod tests {
         assert!(reconstructed.ec.partners[0].ts_pull_token.is_none());
     }
 
-    #[test]
-    fn an_unselected_analytics_module_table_is_refused_without_resolving_its_secret() {
-        let mut original = test_settings();
-        original.analytics = Some(AnalyticsConfig {
-            module: None,
-            tinybird: Some(TinybirdSettings {
-                api_host: "api.example.com".to_string(),
-                auction_token_secret: Some(Redacted::new("unused-telemetry-key".to_string())),
-                ..TinybirdSettings::default()
-            }),
-        });
-
-        let error = settings_from_config_blob(
-            &envelope_json(&original),
-            &UnifiedSecretStore,
-            &StoreName::from("ts_secrets"),
-        )
-        .expect_err("should refuse a table nothing selects");
-        let rendered = format!("{error:?}");
-
-        assert!(
-            rendered.contains("[analytics] selects no module"),
-            "should name the section and why: {rendered}"
-        );
-        assert!(
-            !rendered.contains("unused-telemetry-key") && !rendered.contains("secret reference"),
-            "should not have tried to resolve the stale secret reference: {rendered}"
-        );
-    }
-
-    /// A table for a module its section does not select is refused, and its
-    /// secret references are dropped before resolution, so the operator reads
-    /// the table's own fault rather than a secret-store failure that follows
-    /// from it.
     #[test]
     fn an_unselected_module_s_table_is_refused_without_resolving_its_secrets() {
         let original = test_settings();

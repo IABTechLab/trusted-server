@@ -60,7 +60,6 @@ pub mod middleware;
 pub mod module_context;
 pub mod module_name;
 pub(crate) mod module_secrets;
-pub mod openrtb;
 pub mod origin_auth;
 pub mod permission_signal;
 pub mod permissions;

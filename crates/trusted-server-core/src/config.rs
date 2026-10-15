@@ -271,14 +271,6 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
                 ],
                 false,
             ),
-            field(
-                vec![
-                    optional_object("analytics"),
-                    optional_object("tinybird"),
-                    object("auction_token_secret"),
-                ],
-                true,
-            ),
         ];
         // The settings a module declares in its own table, and the ones an
         // origin signer declares in its `auth` table, for core's modules and
@@ -548,7 +540,7 @@ mod tests {
     use crate::integrations::js_asset_proxy::JS_ASSET_PROXY_INTEGRATION_ID;
     use crate::origin_auth::fixture;
     use crate::redacted::Redacted;
-    use crate::settings::{AnalyticsConfig, TinybirdSettings, TrustedClientIpConfig};
+    use crate::settings::TrustedClientIpConfig;
     use crate::test_support::template::{template_with_resolved_required_secrets, uncomment_block};
     use crate::test_support::tests::{
         crate_test_settings_str, crate_test_settings_str_with_ec_section, edit_origin,
@@ -692,19 +684,6 @@ formats = [{ width = 300, height = 250 }]
                 "should produce one envelope hash for equal settings"
             );
         }
-    }
-
-    #[test]
-    fn documented_analytics_block_validates_when_uncommented() {
-        let toml = uncomment_block(&template_with_resolved_required_secrets(), "[analytics]");
-        let settings = Settings::from_toml(&toml)
-            .expect("uncommented [analytics] with documented api_host should parse and validate");
-        assert!(
-            settings
-                .analytics_module()
-                .is_some_and(|module| !module.api_host.is_empty()),
-            "the selected analytics module should have a non-empty api_host"
-        );
     }
 
     #[test]
@@ -977,7 +956,6 @@ formats = [{ width = 300, height = 250 }]
                 ("ec.partners[*].api_token".to_owned(), true),
                 ("ec.partners[*].ts_pull_token".to_owned(), true),
                 ("trusted_client_ip.shared_secret".to_owned(), false),
-                ("analytics.tinybird.auction_token_secret".to_owned(), true),
                 (
                     "proxy.asset_routes[*].source.origin.auth.access_key_id".to_owned(),
                     true
@@ -1022,40 +1000,9 @@ formats = [{ width = 300, height = 250 }]
         }
     }
 
-    /// An `[analytics]` section selecting the analytics module with `settings`.
-    fn analytics_selecting(settings: TinybirdSettings) -> AnalyticsConfig {
-        AnalyticsConfig {
-            module: Some("analytics.tinybird".to_string()),
-            tinybird: Some(settings),
-        }
-    }
-
-    #[test]
-    fn legacy_static_secret_store_selectors_are_accepted_but_not_serialized() {
-        let mut settings = valid_settings();
-        settings.analytics = Some(analytics_selecting(TinybirdSettings {
-            secret_store: Some("legacy-tinybird-store".to_string()),
-            ..TinybirdSettings::default()
-        }));
-
-        settings
-            .normalize_deserialized()
-            .expect("should normalize settings without key collisions");
-        let serialized = serde_json::to_string(&settings).expect("should serialize settings");
-
-        assert!(
-            !serialized.contains("legacy-tinybird-store"),
-            "serialized config should omit the deprecated selector"
-        );
-    }
-
     #[test]
     fn settings_debug_redacts_resolved_static_credentials() {
         let mut settings = valid_settings();
-        settings.analytics = Some(analytics_selecting(TinybirdSettings {
-            auction_token_secret: Some(Redacted::new("resolved-tinybird-secret".to_string())),
-            ..TinybirdSettings::default()
-        }));
         settings
             .insert_module_config(
                 "testing",
@@ -1068,7 +1015,6 @@ formats = [{ width = 300, height = 250 }]
 
         let debug = format!("{settings:?}");
 
-        assert!(!debug.contains("resolved-tinybird-secret"));
         assert!(!debug.contains("resolved-module-secret"));
         assert!(debug.contains("example"));
     }
@@ -1194,50 +1140,6 @@ gam_network_id = "99999"
             err.to_string().contains("publisher.proxy_secret"),
             "error should identify the whitespace-only secret reference: {err:?}"
         );
-    }
-
-    /// The analytics module's token is a secret reference like every other,
-    /// so an empty or absent one is refused for deploy, by its path.
-    #[test]
-    fn app_config_new_rejects_an_analytics_secret_key_reference_that_is_empty_or_absent() {
-        for (case, reference) in [
-            ("an empty reference", Some(Redacted::new(String::new()))),
-            (
-                "a whitespace reference",
-                Some(Redacted::new(" 	 ".to_owned())),
-            ),
-            ("no reference", None),
-        ] {
-            let mut settings = valid_settings();
-            settings.analytics = Some(analytics_selecting(TinybirdSettings {
-                api_host: "api.tinybird.co".to_owned(),
-                auction_token_secret: reference,
-                ..TinybirdSettings::default()
-            }));
-
-            let err = TrustedServerAppConfig::new(settings)
-                .err()
-                .unwrap_or_else(|| panic!("{case}: should refuse the telemetry secret reference"));
-
-            assert!(
-                err.to_string()
-                    .contains("analytics.tinybird.auction_token_secret"),
-                "{case}: the error should identify the telemetry secret reference: {err:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn app_config_new_accepts_an_analytics_secret_key_reference() {
-        let mut settings = valid_settings();
-        settings.analytics = Some(analytics_selecting(TinybirdSettings {
-            api_host: "api.tinybird.co".to_owned(),
-            auction_token_secret: Some(Redacted::new("tinybird_auction_token".to_owned())),
-            ..TinybirdSettings::default()
-        }));
-
-        TrustedServerAppConfig::new(settings)
-            .expect("should validate the token's key name without treating it as the value");
     }
 
     #[test]
