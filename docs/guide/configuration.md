@@ -583,7 +583,13 @@ with its port, or by `host_header` where one is set. When `url` has a path, a
 `Location` under that path comes back without it, and one outside it is left
 as the origin wrote it. A `Location` naming any other host, one that names no
 host (such as `/news/`), and the `Location` of a response that is not a
-redirect are also left as the origin wrote them.
+redirect are also left as the origin wrote them. An origin reached over
+plain HTTP that redirects each request to the same address on `https`, and
+one that redirects its `directory_index` file back to its folder, make the
+reader's browser loop. Where a request addressing hook removes a path
+prefix, the reader is sent to an address without the prefix, which a Fastly
+service whose `__KEY` selector carries `{host}` answers `421` if every
+selector value misses (see One blob for each path).
 
 #### `host_header`
 
@@ -1144,22 +1150,22 @@ The country and region permission rules are defined in a human-editable permissi
 ## Consent Configuration
 
 `[consent]` controls request-local interpretation and forwarding of privacy
-signals. It does not create a second consent database. The core reads `mode`,
+signals. It does not create a second consent database. The core parses `mode`,
 and every other key is read by the permission signal module for the scheme it
 concerns, so a key no linked module reads is kept as written and not refused.
 
 ### `[consent]`
 
-| Field                                          | Type    | Default         | Read by      | Contract                                                       |
-| ---------------------------------------------- | ------- | --------------- | ------------ | -------------------------------------------------------------- |
-| `mode`                                         | String  | `"interpreter"` | every module | `interpreter` decodes signals; `proxy` leaves them as received |
-| `check_expiration`                             | Boolean | `true`          | `tcf`        | Expire a record older than `max_consent_age_days`              |
-| `max_consent_age_days`                         | Integer | `395`           | `tcf`        | Clamped to `1..=3650`                                          |
-| `us_privacy_defaults.notice_given`             | Boolean | `true`          | `us-privacy` | Publisher policy used for a string constructed from `Sec-GPC`  |
-| `us_privacy_defaults.lspa_covered`             | Boolean | `false`         | `us-privacy` | Publisher LSPA posture                                         |
-| `us_privacy_defaults.gpc_implies_optout`       | Boolean | `true`          | `us-privacy` | Treat `Sec-GPC: 1` in a US state as a sale opt-out             |
-| `conflict_resolution.mode`                     | String  | `"restrictive"` | `tcf`        | `restrictive`, `newest`, or `permissive`                       |
-| `conflict_resolution.freshness_threshold_days` | Integer | `30`            | `tcf`        | Age difference required by `newest`                            |
+| Field                                          | Type    | Default         | Read by                    | Contract                                                       |
+| ---------------------------------------------- | ------- | --------------- | -------------------------- | -------------------------------------------------------------- |
+| `mode`                                         | String  | `"interpreter"` | `tcf`, `gpp`, `us-privacy` | `interpreter` decodes signals; `proxy` leaves them as received |
+| `check_expiration`                             | Boolean | `true`          | `tcf`                      | Expire a record older than `max_consent_age_days`              |
+| `max_consent_age_days`                         | Integer | `395`           | `tcf`                      | Clamped to `1..=3650`                                          |
+| `us_privacy_defaults.notice_given`             | Boolean | `true`          | `us-privacy`               | Publisher policy used for a string constructed from `Sec-GPC`  |
+| `us_privacy_defaults.lspa_covered`             | Boolean | `false`         | `us-privacy`               | Publisher LSPA posture                                         |
+| `us_privacy_defaults.gpc_implies_optout`       | Boolean | `true`          | `us-privacy`               | Treat `Sec-GPC: 1` in a US state as a sale opt-out             |
+| `conflict_resolution.mode`                     | String  | `"restrictive"` | `tcf`                      | `restrictive`, `newest`, or `permissive`                       |
+| `conflict_resolution.freshness_threshold_days` | Integer | `30`            | `tcf`                      | Age difference required by `newest`                            |
 
 In `proxy` mode no module decodes its string, so a string that arrived is a
 preference the module cannot see and fails closed on the permissions its
@@ -2119,11 +2125,14 @@ no path, and a folder is written with its closing slash, because `/news` also
 begins `/newsletter`.
 
 A serve middleware may set response headers as well as change the page. For
-that it is asked about every response the publisher path sends for a request
-path its entry covers, whatever the response's media type and whether or not
-it has a body, with the response's status and headers in hand, so a redirect
+that it is asked about a response the publisher path sends for a request path
+its entry covers, whatever the response's media type and whether or not it
+has a body, with the response's status and headers in hand, so a redirect
 reaches a middleware that rewrites its `Location`. A header it sets replaces
-one of the same name.
+one of the same name. A serve middleware is not asked about a refusal made
+before the origin is asked, such as the `405` for a method a signed origin
+does not take, about a page served from the template cache or the refusal of
+such a page, or about an answer made from an error.
 
 ```toml
 [[fetch]]
