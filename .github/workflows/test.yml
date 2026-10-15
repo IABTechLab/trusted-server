@@ -314,7 +314,11 @@ jobs:
       - name: Set up Rust toolchain
         uses: ./.github/actions/setup-rust
         with:
-          cache-key: cargo-lint-domains
+          # Restore `test-cli`'s cache read-only. This job never runs on main,
+          # so a key of its own is only ever saved in PR scope, where no other
+          # PR can restore it.
+          cache-key: cargo-cli
+          save-cache: "false"
 
       - name: Read pinned Node.js version
         id: node-version
