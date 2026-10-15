@@ -1298,7 +1298,7 @@ A middleware's own settings, one `[middleware.<name>]` table per middleware,
 written with the middleware's full name, so `[middleware.example.cleanup]` is
 the `example.cleanup` middleware's table. Core reads none of a table. The
 middleware reads its own through `Settings::middleware_config`, and refuses a
-key it does not know.
+key it does not know only when its settings type denies unknown fields.
 
 A table holds values and arrays. A table within one is the table of the
 longer name it spells and never a setting, so `[middleware.example.cleanup]`
