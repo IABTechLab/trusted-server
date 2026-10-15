@@ -94,7 +94,7 @@ impl CloudflareWorkers {
         } else {
             "wrangler.toml".to_string()
         };
-        self.spawn_wrangler(&wrangler_dir, &config)
+        self.spawn_wrangler(&wrangler_dir, &config, ready)
     }
 
     fn health_check_path(&self) -> &str {
@@ -117,10 +117,17 @@ impl CloudflareWorkers {
     pub fn spawn_with_config_json(&self, config_json: &str) -> TestResult<RuntimeProcess> {
         let wrangler_dir = self.wrangler_dir();
         let config = write_generated_ci_config(&wrangler_dir, config_json)?;
-        self.spawn_wrangler(&wrangler_dir, &config)
+        self.spawn_wrangler(&wrangler_dir, &config, |base_url| {
+            super::wait_for_ready(base_url, self.health_check_path(), true)
+        })
     }
 
-    fn spawn_wrangler(&self, wrangler_dir: &Path, config: &str) -> TestResult<RuntimeProcess> {
+    fn spawn_wrangler(
+        &self,
+        wrangler_dir: &Path,
+        config: &str,
+        ready: impl FnOnce(&str) -> TestResult<()>,
+    ) -> TestResult<RuntimeProcess> {
         let port = super::find_available_port().unwrap_or(CLOUDFLARE_DEFAULT_PORT);
 
         #[cfg(unix)]
