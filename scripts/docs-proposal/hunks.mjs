@@ -205,7 +205,9 @@ function commentBody(cited, body) {
   const source = cited?.source
     ? `\`${cited.source}\``
     : "none cited — verify this hunk against the merged code.";
-  const reason = cited?.reason ? ` — ${cited.reason}` : "";
+  // The reason is model output; inline code keeps its links, images, HTML,
+  // and issue references inert (sanitize already removed backticks).
+  const reason = cited?.reason ? ` — \`${cited.reason}\`` : "";
   const heading = `**Source:** ${source}${reason}`;
   if (body === null) {
     return [

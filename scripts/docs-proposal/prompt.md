@@ -35,3 +35,6 @@ sources to documentation pages appear at the end of this file.
   relative paths.
 - Do not edit files outside `docs/guide/`, `docs/index.md`, and
   `<work-dir>/`. Do not commit, push, or create branches.
+- Prefer extending an existing page. The sidebar is in
+  `docs/.vitepress/config.mts`, which you cannot edit, so when a new page is
+  unavoidable, say in the rationale that it needs a sidebar entry.

@@ -8,6 +8,12 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/docs-proposal/lib.sh
 source "$here/lib.sh"
 
+# The gh stub runs the real --jq filters through jq.
+if ! command -v jq > /dev/null; then
+  printf 'test.sh needs jq on PATH for its gh stub.\n' >&2
+  exit 1
+fi
+
 failures=0
 
 assert_eq() {
