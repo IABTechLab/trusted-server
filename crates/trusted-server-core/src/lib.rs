@@ -75,6 +75,7 @@ pub mod test_support;
 pub mod tester_cookie;
 pub mod trace;
 pub mod tsjs;
+pub mod version_header;
 
 #[cfg(test)]
 mod migration_guards;
