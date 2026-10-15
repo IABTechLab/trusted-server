@@ -17,7 +17,7 @@ flowchart TB
     A[Adapter app.rs routes POST /auction] --> B[endpoints::handle_auction]
     B --> C[endpoints::convert_tsjs_to_auction_request]
     C --> D[routing::route_auction]
-    D --> E[provider::GenericOpenRtbProvider builds requests]
+    D --> E[provider::RoutedDemandProvider sends the requests sources build]
     E --> F[orchestrator::AuctionOrchestrator dispatches demand sources]
     F --> G[Demand responses are normalized]
     G --> H{Ad server configured?}
@@ -61,7 +61,7 @@ startup and operator validation. It reads `[demand]`, `[ad-server]` and
 Adapters then call `AuctionPlan::validate_for_target` for backend naming,
 fan-out support, and target resource limits.
 
-A plan-backed orchestrator contains generic OpenRTB demand sources compiled from
+A plan-backed orchestrator contains the demand sources compiled from
 the plan. `AuctionOrchestrator::register_provider` and the old concrete Prebid
 provider remain test-only parity code. They are not extension APIs.
 
@@ -84,7 +84,7 @@ Each `[auction.bidders.<bidder-id>]` route has one owner, named by its
 
 ## Demand execution
 
-`provider::GenericOpenRtbProvider` owns the shared transport path for the
+`provider::RoutedDemandProvider` owns the shared transport path for the
 `auction-protocol.openrtb`, `auction.prebid-server` and `auction.aps` implementations. An implementation receives
 routed and privacy-approved facts, not the raw inbound request.
 
@@ -169,7 +169,7 @@ as `iabtl`. Endpoints must be HTTPS, or HTTP to `127.0.0.1`, `::1` or
 - `plan.rs` owns plan validation and target capability checks.
 - `demand.rs` owns the demand and ad server implementation seam.
 - `routing.rs` assigns slots and bidder params to demand sources.
-- `openrtb.rs` builds shared requests and parses standard responses.
+- `admission.rs` holds the rules a response reader admits a bid by.
 - `provider.rs` runs plan-backed demand requests and per-implementation parsing.
 - `orchestrator.rs` owns fan-out, deadlines, the ad server call, and local
   ranking.
