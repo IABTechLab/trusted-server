@@ -329,7 +329,8 @@ pub struct ReaderDocument<'a> {
     pub request_host: &'a str,
     /// Publisher-facing scheme the reader asked for.
     pub request_scheme: &'a str,
-    /// Host the document was fetched from.
+    /// The host the document names as its own, being the `Host` its source
+    /// sends.
     pub origin_host: &'a str,
     /// What the adapter reports about the platform the deployment runs on.
     pub platform: &'a PlatformIdentity,
