@@ -1,0 +1,364 @@
+//! Extracts authenticated originals into fresh private state, without execution.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File};
+use std::io::{self, BufReader, Read, Seek as _, Write as _};
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+use std::path::{Path, PathBuf};
+
+use error_stack::Report;
+use flate2::bufread::GzDecoder;
+use sha2::{Digest as _, Sha256};
+use tempfile::TempDir;
+
+use super::{VerifiedOriginal, material_error};
+use crate::error::ReleaseError;
+
+#[derive(Clone, Copy)]
+pub(super) struct Selection<'a> {
+    pub(super) root: &'a str,
+    pub(super) index_alias: bool,
+}
+
+const DECODED_LIMIT: u64 = 512 * 1024 * 1024;
+const MEMBER_LIMIT: u64 = 64 * 1024 * 1024;
+const ENTRY_LIMIT: usize = 100_000;
+const DEPTH_LIMIT: usize = 64;
+const PATH_LIMIT: usize = 4096;
+
+#[derive(PartialEq, Eq)]
+struct MemberFacts {
+    size: u64,
+    mode: u32,
+    sha256: String,
+}
+
+/// A privately extracted original, without installation or execution authority.
+pub(crate) struct ExtractedOriginal {
+    original: VerifiedOriginal,
+    directory: TempDir,
+    root: PathBuf,
+    files: BTreeMap<String, MemberFacts>,
+}
+
+impl ExtractedOriginal {
+    /// Returns the privately owned package root for later preparation checks.
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Returns the approved source identity of the retained original.
+    pub(crate) fn source_commit(&self) -> &str {
+        self.original.source_commit()
+    }
+}
+
+/// Checks cancellation and decoded expansion on every bounded read.
+struct Decoded<'a, R> {
+    reader: R,
+    original: &'a VerifiedOriginal,
+    count: u64,
+}
+
+impl<R: Read> Read for Decoded<'_, R> {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        self.original
+            .check()
+            .map_err(|_| io::Error::other("archive cancelled or timed out"))?;
+        let maximum = bytes.len().min(64 * 1024);
+        let count = self.reader.read(&mut bytes[..maximum])?;
+        self.count += count as u64;
+        if self.count > DECODED_LIMIT {
+            return Err(io::Error::other("archive exceeds decoded byte limit"));
+        }
+        Ok(count)
+    }
+}
+
+fn field(bytes: &[u8]) -> Result<&str, Report<ReleaseError>> {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    if bytes[end..].iter().any(|byte| *byte != 0) {
+        return Err(material_error(
+            "TAR name has hidden bytes after its terminator",
+        ));
+    }
+    std::str::from_utf8(&bytes[..end]).map_err(material_error)
+}
+
+/// Uses raw fields because [`tar::Entry::path_bytes`] normalizes backslashes.
+fn raw_name(header: &tar::Header) -> Result<String, Report<ReleaseError>> {
+    let name = field(&header.as_old().name)?;
+    match header.as_ustar() {
+        Some(ustar) => {
+            let prefix = field(&ustar.prefix)?;
+            Ok(if prefix.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{prefix}/{name}")
+            })
+        }
+        None => Ok(name.to_owned()),
+    }
+}
+
+fn member_name(
+    raw: &str,
+    directory: bool,
+    selection: &Selection<'_>,
+) -> Result<String, Report<ReleaseError>> {
+    if raw.is_empty()
+        || raw.len() > PATH_LIMIT
+        || !raw.is_ascii()
+        || raw
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || matches!(byte, b'\\' | b':'))
+    {
+        return Err(material_error("TAR path is not a bounded portable name"));
+    }
+    let name = if directory {
+        raw.strip_suffix('/').unwrap_or(raw)
+    } else {
+        raw
+    };
+    let name = if !directory && selection.index_alias && name == "package/./dist/index.js" {
+        "package/dist/index.js"
+    } else {
+        name
+    };
+    let parts: Vec<&str> = name.split('/').collect();
+    if parts.len() > DEPTH_LIMIT
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || *part == "." || *part == "..")
+        || parts[0] != selection.root
+        || (!directory && parts.len() == 1)
+    {
+        return Err(material_error("TAR path leaves its exact locked root"));
+    }
+    Ok(name.to_owned())
+}
+
+struct State {
+    directory: TempDir,
+    spellings: BTreeSet<String>,
+    portable: BTreeMap<String, String>,
+    files: BTreeMap<String, MemberFacts>,
+    first_spelling: BTreeMap<String, String>,
+    directories: BTreeSet<String>,
+}
+
+impl State {
+    fn portable_name(&mut self, name: &str) -> Result<(), Report<ReleaseError>> {
+        let mut prefix = String::new();
+        for part in name.split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(part);
+            let lower = prefix.to_ascii_lowercase();
+            if let Some(previous) = self.portable.insert(lower, prefix.clone())
+                && previous != prefix
+            {
+                return Err(material_error("TAR has case-aliased paths"));
+            }
+        }
+        Ok(())
+    }
+
+    fn entry<R: Read>(
+        &mut self,
+        mut entry: tar::Entry<'_, R>,
+        selection: &Selection<'_>,
+    ) -> Result<(), Report<ReleaseError>> {
+        let header = entry.header();
+        let directory = header.entry_type().is_dir();
+        if !directory && !header.entry_type().is_file() {
+            return Err(material_error(
+                "TAR member is not a regular file or directory",
+            ));
+        }
+        let raw = raw_name(header)?;
+        let name = member_name(&raw, directory, selection)?;
+        if !self.spellings.insert(raw.clone()) {
+            return Err(material_error("TAR repeats a member spelling"));
+        }
+        self.portable_name(&name)?;
+        let mode = header.mode().map_err(material_error)?;
+        let size = entry.size();
+        if mode & !0o777 != 0 || size > MEMBER_LIMIT || (directory && size != 0) {
+            return Err(material_error(
+                "TAR member has privileged mode or invalid size",
+            ));
+        }
+        let path = self.directory.path().join(&name);
+        if directory {
+            if !self.directories.insert(name) {
+                return Err(material_error("TAR repeats a directory path"));
+            }
+            fs::create_dir_all(&path).map_err(material_error)?;
+            return Ok(());
+        }
+        let duplicate = self.files.contains_key(&name);
+        if duplicate
+            && !(selection.index_alias
+                && name == "package/dist/index.js"
+                && matches!(
+                    (
+                        self.first_spelling.get(&name).map(String::as_str),
+                        raw.as_str()
+                    ),
+                    (Some("package/./dist/index.js"), "package/dist/index.js")
+                        | (Some("package/dist/index.js"), "package/./dist/index.js")
+                ))
+        {
+            return Err(material_error("TAR has an unreviewed duplicate path"));
+        }
+        let mut file = if duplicate {
+            None
+        } else {
+            fs::create_dir_all(
+                path.parent()
+                    .ok_or_else(|| material_error("member has no parent"))?,
+            )
+            .map_err(material_error)?;
+            Some(
+                File::options()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&path)
+                    .map_err(material_error)?,
+            )
+        };
+        let mut hasher = Sha256::new();
+        let mut count = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = entry.read(&mut buffer).map_err(material_error)?;
+            if read == 0 {
+                break;
+            }
+            count += read as u64;
+            if count > size {
+                return Err(material_error("TAR member exceeds declared size"));
+            }
+            hasher.update(&buffer[..read]);
+            if let Some(file) = &mut file {
+                file.write_all(&buffer[..read]).map_err(material_error)?;
+            }
+        }
+        if count != size {
+            return Err(material_error("TAR member is truncated"));
+        }
+        let facts = MemberFacts {
+            size,
+            mode,
+            sha256: hex::encode(hasher.finalize()),
+        };
+        if duplicate {
+            if self.files.get(&name) != Some(&facts) {
+                return Err(material_error("reviewed TAR aliases differ"));
+            }
+        } else {
+            // Only executable bits carry across; ownership and ambient write access do not.
+            file.as_ref()
+                .expect("should have exclusively created member")
+                .set_permissions(fs::Permissions::from_mode(0o600 | (mode & 0o111)))
+                .map_err(material_error)?;
+            self.first_spelling.insert(name.clone(), raw);
+            self.files.insert(name, facts);
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn extract(
+    original: VerifiedOriginal,
+    selection: Selection<'_>,
+) -> Result<ExtractedOriginal, Report<ReleaseError>> {
+    extract_bounded(original, selection, ENTRY_LIMIT)
+}
+
+fn extract_bounded(
+    mut original: VerifiedOriginal,
+    selection: Selection<'_>,
+    entry_limit: usize,
+) -> Result<ExtractedOriginal, Report<ReleaseError>> {
+    let mut compressed = tempfile::tempfile().map_err(material_error)?;
+    original.copy_verified(&mut compressed)?;
+    compressed.rewind().map_err(material_error)?;
+    let decoder = GzDecoder::new(BufReader::new(compressed));
+    let decoded = Decoded {
+        reader: decoder,
+        original: &original,
+        count: 0,
+    };
+    let mut archive = tar::Archive::new(decoded);
+    let mut state = State {
+        directory: tempfile::tempdir().map_err(material_error)?,
+        spellings: BTreeSet::new(),
+        portable: BTreeMap::new(),
+        files: BTreeMap::new(),
+        first_spelling: BTreeMap::new(),
+        directories: BTreeSet::new(),
+    };
+    for (index, entry) in archive
+        .entries()
+        .map_err(material_error)?
+        .raw(true)
+        .enumerate()
+    {
+        if index >= entry_limit {
+            return Err(material_error("TAR exceeds entry count limit"));
+        }
+        state.entry(entry.map_err(material_error)?, &selection)?;
+    }
+    if state.spellings.contains("package/./dist/index.js")
+        && !state.spellings.contains("package/dist/index.js")
+    {
+        return Err(material_error(
+            "reviewed dot alias lacks its canonical partner",
+        ));
+    }
+    // The parser consumed the first zero header. Require at least the second,
+    // then only complete zero blocks through the checked gzip trailer.
+    let mut decoded = archive.into_inner();
+    let mut tail = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = decoded.read(&mut buffer).map_err(material_error)?;
+        if count == 0 {
+            break;
+        }
+        tail += count as u64;
+        if buffer[..count].iter().any(|byte| *byte != 0) {
+            return Err(material_error("TAR hides data after its terminator"));
+        }
+    }
+    if tail < 512 || !tail.is_multiple_of(512) {
+        return Err(material_error("TAR lacks complete terminator blocks"));
+    }
+    let mut compressed = decoded.reader.into_inner();
+    if compressed.read(&mut buffer[..1]).map_err(material_error)? != 0 {
+        return Err(material_error(
+            "gzip has additional members or trailing bytes",
+        ));
+    }
+    original.check()?;
+    let root = state.directory.path().join(selection.root);
+    if !root.is_dir() || state.files.is_empty() {
+        return Err(material_error("archive has no package files"));
+    }
+    Ok(ExtractedOriginal {
+        original,
+        root,
+        directory: state.directory,
+        files: state.files,
+    })
+}
+
+#[cfg(test)]
+mod tests;

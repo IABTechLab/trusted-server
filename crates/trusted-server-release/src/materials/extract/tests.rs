@@ -1,0 +1,387 @@
+use std::fs;
+use std::io;
+use std::io::Write as _;
+use std::time::{Duration, Instant};
+
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use flate2::{Compression, write::GzEncoder};
+use serde_json::json;
+use sha2::{Digest as _, Sha256, Sha512};
+
+use super::*;
+use crate::materials::archive::{Expected, verify};
+use crate::materials::{LockedMaterials, locked};
+use crate::process::Cancellation;
+
+fn compressed(tar: &[u8]) -> Vec<u8> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(tar).expect("should compress TAR bytes");
+    encoder.finish().expect("should finish gzip trailer")
+}
+
+fn tar_bytes(entries: &[(&str, u8, u32, &[u8])]) -> Vec<u8> {
+    let mut builder = tar::Builder::new(Vec::new());
+    for (name, kind, mode, bytes) in entries {
+        let mut header = tar::Header::new_ustar();
+        header.set_entry_type(tar::EntryType::new(*kind));
+        header.set_mode(*mode);
+        header.set_size(bytes.len() as u64);
+        if name.len() <= 100 {
+            header.as_mut_bytes()[..name.len()].copy_from_slice(name.as_bytes());
+        } else {
+            let (prefix, leaf) = name
+                .rsplit_once('/')
+                .expect("should split long fixture name");
+            let ustar = header.as_ustar_mut().expect("should have USTAR header");
+            ustar.prefix[..prefix.len()].copy_from_slice(prefix.as_bytes());
+            ustar.name[..leaf.len()].copy_from_slice(leaf.as_bytes());
+        }
+        header.set_cksum();
+        builder
+            .append(&header, *bytes)
+            .expect("should append fixture entry");
+    }
+    builder.into_inner().expect("should finish TAR")
+}
+
+fn original(bytes: &[u8]) -> VerifiedOriginal {
+    let directory = tempfile::tempdir().expect("should create archive directory");
+    let path = directory.path().join("original.tgz");
+    fs::write(&path, bytes).expect("should write archive");
+    verify(
+        &path,
+        Expected::Sha256(&hex::encode(Sha256::digest(bytes))),
+        &"a".repeat(40),
+        "npm:node_modules/fictional-package",
+        Instant::now() + Duration::from_secs(10),
+        &Cancellation::default(),
+    )
+    .expect("should verify original bytes")
+}
+
+#[test]
+fn extracts_verified_regular_files_and_preserves_original_bytes() {
+    let bytes = compressed(&tar_bytes(&[(
+        "package/bin/tool",
+        b'0',
+        0o755,
+        b"fictional executable",
+    )]));
+    let extracted = extract(
+        original(&bytes),
+        Selection {
+            root: "package",
+            index_alias: false,
+        },
+    )
+    .expect("should extract verified regular file");
+    assert_eq!(
+        fs::read(extracted.directory.path().join("package/bin/tool")).expect("should read file"),
+        b"fictional executable",
+        "should retain exact member bytes"
+    );
+    let mut retained = Vec::new();
+    let mut original = extracted.original;
+    original
+        .copy_verified(&mut retained)
+        .expect("should retain authenticated compressed original");
+    assert_eq!(retained, bytes, "should preserve exact compressed bytes");
+}
+
+#[test]
+fn rejects_unsafe_paths_types_modes_duplicates_and_collisions() {
+    for entries in [
+        vec![("other/file", b'0', 0o644, b"x".as_slice())],
+        vec![("package/../file", b'0', 0o644, b"x".as_slice())],
+        vec![("package/./file", b'0', 0o644, b"x".as_slice())],
+        vec![("package\\file", b'0', 0o644, b"x".as_slice())],
+        vec![("/package/file", b'0', 0o644, b"x".as_slice())],
+        vec![("package/file", b'0', 0o4644, b"x".as_slice())],
+        vec![("package/file", b'2', 0o644, b"".as_slice())],
+        vec![("package/file", b'1', 0o644, b"".as_slice())],
+        vec![("package/file", b'6', 0o644, b"".as_slice())],
+        vec![("package/file", b'x', 0o644, b"x".as_slice())],
+        vec![
+            ("package/file", b'0', 0o644, b"x".as_slice()),
+            ("package/file", b'0', 0o644, b"x".as_slice()),
+        ],
+        vec![
+            ("package/file", b'0', 0o644, b"x".as_slice()),
+            ("package/file/child", b'0', 0o644, b"x".as_slice()),
+        ],
+        vec![
+            ("package/File", b'0', 0o644, b"x".as_slice()),
+            ("package/file", b'0', 0o644, b"x".as_slice()),
+        ],
+        vec![
+            ("package/", b'5', 0o755, b"".as_slice()),
+            ("package", b'5', 0o755, b"".as_slice()),
+            ("package/file", b'0', 0o644, b"x".as_slice()),
+        ],
+    ] {
+        assert!(
+            extract(
+                original(&compressed(&tar_bytes(&entries))),
+                Selection {
+                    root: "package",
+                    index_alias: false
+                }
+            )
+            .is_err(),
+            "should reject unsafe member set"
+        );
+    }
+}
+
+#[test]
+fn rejects_excessive_depth_member_size_and_cancelled_extraction() {
+    let name = format!("package/{}file", "a/".repeat(64));
+    let bytes = compressed(&tar_bytes(&[(&name, b'0', 0o644, b"x")]));
+    assert!(
+        extract(
+            original(&bytes),
+            Selection {
+                root: "package",
+                index_alias: false
+            }
+        )
+        .is_err(),
+        "should reject excessive member depth"
+    );
+    let mut tar = tar_bytes(&[("package/file", b'0', 0o644, b"x")]);
+    let mut header = tar::Header::new_ustar();
+    header.as_mut_bytes().copy_from_slice(&tar[..512]);
+    header.set_size(MEMBER_LIMIT + 1);
+    header.set_cksum();
+    tar[..512].copy_from_slice(header.as_bytes());
+    assert!(
+        extract(
+            original(&compressed(&tar)),
+            Selection {
+                root: "package",
+                index_alias: false
+            }
+        )
+        .is_err(),
+        "should reject oversized member before reading body"
+    );
+    let bytes = compressed(&tar_bytes(&[("package/file", b'0', 0o644, b"x")]));
+    let cancellation = Cancellation::default();
+    // Reverification binds the extraction to the same cancellation token.
+    let directory = tempfile::tempdir().expect("should create archive directory");
+    let path = directory.path().join("original.tgz");
+    fs::write(&path, &bytes).expect("should write archive");
+    let original = verify(
+        &path,
+        Expected::Sha256(&hex::encode(Sha256::digest(&bytes))),
+        &"a".repeat(40),
+        "npm:node_modules/fictional-package",
+        Instant::now() + Duration::from_secs(10),
+        &cancellation,
+    )
+    .expect("should verify original");
+    cancellation.cancel();
+    assert!(
+        extract(
+            original,
+            Selection {
+                root: "package",
+                index_alias: false
+            }
+        )
+        .is_err(),
+        "should carry cancellation into extraction"
+    );
+}
+
+#[test]
+fn index_alias_exception_requires_identical_pair_and_no_third_entry() {
+    let pair = [
+        ("package/./dist/index.js", b'0', 0o644, b"same".as_slice()),
+        ("package/dist/index.js", b'0', 0o644, b"same".as_slice()),
+    ];
+    let bytes = compressed(&tar_bytes(&pair));
+    assert!(
+        extract(
+            original(&compressed(&tar_bytes(&pair[..1]))),
+            Selection {
+                root: "package",
+                index_alias: true
+            }
+        )
+        .is_err(),
+        "should require canonical partner for dot alias"
+    );
+    assert!(
+        extract(
+            original(&bytes),
+            Selection {
+                root: "package",
+                index_alias: true
+            }
+        )
+        .is_ok(),
+        "should allow exactly reviewed identical pair"
+    );
+    assert!(
+        extract(
+            original(&bytes),
+            Selection {
+                root: "package",
+                index_alias: false
+            }
+        )
+        .is_err(),
+        "should reject pair for other locked identities"
+    );
+    let mut changed = pair;
+    changed[1].3 = b"evil";
+    assert!(
+        extract(
+            original(&compressed(&tar_bytes(&changed))),
+            Selection {
+                root: "package",
+                index_alias: true
+            }
+        )
+        .is_err(),
+        "should reject different alias bytes"
+    );
+    let mut third = pair.to_vec();
+    third.push(pair[0]);
+    assert!(
+        extract(
+            original(&compressed(&tar_bytes(&third))),
+            Selection {
+                root: "package",
+                index_alias: true
+            }
+        )
+        .is_err(),
+        "should reject third occurrence"
+    );
+    let directory_alias = [
+        ("package/./dist/index.js/", b'5', 0o755, b"".as_slice()),
+        ("package/file", b'0', 0o644, b"x".as_slice()),
+    ];
+    assert!(
+        extract(
+            original(&compressed(&tar_bytes(&directory_alias))),
+            Selection {
+                root: "package",
+                index_alias: true
+            }
+        )
+        .is_err(),
+        "should restrict dot alias exception to regular files"
+    );
+}
+
+#[test]
+fn rejects_hidden_data_bad_trailers_concatenation_and_truncation() {
+    let tar = tar_bytes(&[("package/file", b'0', 0o644, b"x")]);
+    let mut hidden = tar.clone();
+    hidden.extend_from_slice(&tar);
+    let bytes = compressed(&tar);
+    let mut corrupt = bytes.clone();
+    let last = corrupt.len() - 8;
+    corrupt[last] ^= 1;
+    let mut concatenated = bytes.clone();
+    concatenated.extend_from_slice(&bytes);
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    for bad in [
+        compressed(&hidden),
+        corrupt,
+        concatenated,
+        trailing,
+        bytes[..bytes.len() - 1].to_vec(),
+        compressed(&tar[..512]),
+    ] {
+        assert!(
+            extract(
+                original(&bad),
+                Selection {
+                    root: "package",
+                    index_alias: false
+                }
+            )
+            .is_err(),
+            "should reject incomplete or ambiguous archive"
+        );
+    }
+}
+
+#[test]
+fn catalog_extraction_rejoins_source_and_locked_acquisition_identity() {
+    let bytes = compressed(&tar_bytes(&[("package/file", b'0', 0o644, b"x")]));
+    let lock = serde_json::to_vec(&json!({"lockfileVersion":3, "packages": {
+        "": {}, "node_modules/fictional-package": {
+            "version":"1.0.0", "resolved":format!("{}fictional-package/-/fictional-package-1.0.0.tgz", locked::NPM_REGISTRY),
+            "integrity":format!("sha512-{}", STANDARD.encode(Sha512::digest(&bytes)))
+        }
+    }})).expect("should encode locked original identity");
+    let mut catalog = LockedMaterials {
+        source_commit: "a".repeat(40),
+        cargo_lock_sha256: "0".repeat(64),
+        npm_lock_sha256: "0".repeat(64),
+        cargo: locked::parse_cargo(b"version = 4\npackage = []\n")
+            .expect("should parse empty Cargo lock"),
+        npm: locked::parse_npm(&lock).expect("should parse fixture npm lock"),
+    };
+    assert!(
+        catalog
+            .extract_npm("node_modules/fictional-package", original(&bytes))
+            .is_ok(),
+        "should extract bound locked original"
+    );
+    assert!(
+        catalog
+            .extract_npm("node_modules/other", original(&bytes))
+            .is_err(),
+        "should reject unknown installation identity"
+    );
+    assert!(
+        catalog
+            .extract_registry("fictional-package", "1.0.0", original(&bytes))
+            .is_err(),
+        "should reject npm original as a crate"
+    );
+    catalog.source_commit = "b".repeat(40);
+    assert!(
+        catalog
+            .extract_npm("node_modules/fictional-package", original(&bytes))
+            .is_err(),
+        "should reject original bound to different approved source"
+    );
+}
+
+#[test]
+fn enforces_decoded_byte_and_entry_budgets() {
+    let bytes = compressed(&tar_bytes(&[
+        ("package/file", b'0', 0o644, b"x"),
+        ("package/other", b'0', 0o644, b"y"),
+    ]));
+    assert!(
+        extract_bounded(
+            original(&bytes),
+            Selection {
+                root: "package",
+                index_alias: false
+            },
+            1
+        )
+        .is_err(),
+        "should reject entry exceeding bounded parser budget"
+    );
+    let original = original(&bytes);
+    let mut decoded = Decoded {
+        reader: io::repeat(0).take(DECODED_LIMIT + 1),
+        original: &original,
+        count: 0,
+    };
+    assert!(
+        io::copy(&mut decoded, &mut io::sink()).is_err(),
+        "should stop unbounded decoded expansion"
+    );
+}

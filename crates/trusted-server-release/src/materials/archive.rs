@@ -62,6 +62,10 @@ fn check_limits(
 }
 
 impl VerifiedOriginal {
+    pub(super) fn check(&self) -> Result<(), Report<ReleaseError>> {
+        check_limits(self.deadline, &self.cancellation)
+    }
+
     /// Copies the retained original after checking its exact bytes again.
     ///
     /// # Errors

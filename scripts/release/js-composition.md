@@ -134,6 +134,19 @@ over 32 MiB or cumulative bodies over 512 MiB, then rejoin exact body headers.
 This reader assumes the sanitized trusted Git implementation and an immutable
 object store, rather than claiming adversarial race-proof streaming.
 
+The Rust dependency archive inspector limits each authenticated compressed
+original to 64 MiB, decoded TAR bytes to 512 MiB, each member to 64 MiB,
+entries to 100,000, path depth to 64 and path text to 4,096 bytes. It accepts
+ASCII regular-file and directory names under the exact locked root, rejects
+case aliases and unsupported extension records (including PAX, GNU long-name
+and sparse records), and requires a single complete gzip member with complete
+TAR zero terminators and no hidden trailing data. These are dependency archive
+limits, separate from toolchain distributions and Git object limits. Extraction
+owns a fresh private directory and preserves original compressed bytes. File
+permissions become owner read/write plus the archive's executable bits; archive
+ownership, timestamps and other permission bits do not propagate. This stage
+does not establish an installed dependency, executed hook or completed JS build.
+
 Seed each private cache through selected npm's public `cache add` API with only
 verified archives, offline and scripts disabled. Run fresh pinned npm 11.6.2
 `ci --offline --include=dev --no-audit --no-fund` with hooks in the foreground

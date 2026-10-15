@@ -5,6 +5,7 @@
 //! build completion.
 
 mod archive;
+mod extract;
 mod locked;
 
 use std::collections::BTreeMap;
@@ -19,6 +20,7 @@ use crate::error::ReleaseError;
 use crate::process::Cancellation;
 use crate::source::ApprovedSource;
 pub(crate) use archive::VerifiedOriginal;
+pub(crate) use extract::ExtractedOriginal;
 use locked::{CargoMaterials, NpmMaterial, parse_cargo, parse_npm};
 
 const NPM_LOCK: &str = "crates/trusted-server-js/lib/package-lock.json";
@@ -39,6 +41,78 @@ pub(crate) struct LockedMaterials {
 }
 
 impl LockedMaterials {
+    /// Extracts a verified npm original into new private state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a material error if the original is not bound to this source
+    /// and locked location, or its archive violates the extraction policy.
+    pub(crate) fn extract_npm(
+        &self,
+        location: &str,
+        original: VerifiedOriginal,
+    ) -> Result<ExtractedOriginal, Report<ReleaseError>> {
+        let locked = self
+            .npm
+            .get(location)
+            .ok_or_else(|| material_error("unknown npm location"))?;
+        self.join_original(&original, &format!("npm:{location}"))?;
+        let index_alias = matches!(
+            (locked.name.as_str(), locked.version.as_str()),
+            ("agent-base", "7.1.4")
+                | ("http-proxy-agent", "7.0.2")
+                | ("https-proxy-agent", "7.0.6")
+        );
+        extract::extract(
+            original,
+            extract::Selection {
+                root: "package",
+                index_alias,
+            },
+        )
+    }
+
+    /// Extracts a verified registry crate under its exact locked root.
+    ///
+    /// # Errors
+    ///
+    /// Returns a material error for a mismatched identity or unsafe archive.
+    pub(crate) fn extract_registry(
+        &self,
+        name: &str,
+        version: &str,
+        original: VerifiedOriginal,
+    ) -> Result<ExtractedOriginal, Report<ReleaseError>> {
+        if !self
+            .cargo
+            .registry
+            .contains_key(&(name.to_owned(), version.to_owned()))
+        {
+            return Err(material_error("unknown registry identity"));
+        }
+        self.join_original(&original, &format!("crate:{name}@{version}"))?;
+        extract::extract(
+            original,
+            extract::Selection {
+                root: &format!("{name}-{version}"),
+                index_alias: false,
+            },
+        )
+    }
+
+    fn join_original(
+        &self,
+        original: &VerifiedOriginal,
+        identity: &str,
+    ) -> Result<(), Report<ReleaseError>> {
+        if original.source_commit() != self.source_commit || original.identity() != identity {
+            return Err(material_error(
+                "original is not bound to this approved locked identity",
+            ));
+        }
+        Ok(())
+    }
+
     /// Loads only the approved tracked lockfiles and derives their identities.
     ///
     /// # Errors
