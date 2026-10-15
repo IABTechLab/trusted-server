@@ -2515,6 +2515,62 @@ pub(crate) mod tests {
         );
     }
 
+    /// The request `create_test_request` builds, addressed by path with
+    /// `/publisher-a.example` removed.
+    fn addressed_test_request(headers: &[(&str, &str)]) -> Request<EdgeBody> {
+        let mut req = create_test_request(headers);
+        req.extensions_mut()
+            .insert(crate::addressing::RemovedPathPrefix::new(
+                "/publisher-a.example".to_owned(),
+            ));
+        req
+    }
+
+    /// The name and the `Path` of each `Set-Cookie` value in `cookies`.
+    fn names_and_paths(cookies: &[String]) -> Vec<(&str, &str)> {
+        cookies
+            .iter()
+            .map(|cookie| {
+                let name = cookie.split('=').next().unwrap_or_default();
+                let path = cookie
+                    .split("; ")
+                    .find_map(|attribute| attribute.strip_prefix("Path="))
+                    .unwrap_or_default();
+                (name, path)
+            })
+            .collect()
+    }
+
+    /// The context takes the removed prefix from the request it reads, so
+    /// on a request addressed by path the Edge Cookie the finalize step
+    /// writes is under that prefix.
+    #[tokio::test]
+    async fn finalize_writes_the_edge_cookie_under_the_removed_prefix() {
+        use crate::platform::test_support::noop_services_with_ec_module;
+
+        let mut settings = create_test_settings();
+        settings.ec.module = Some(EcModuleSelection::from("header_setting"));
+        let services = noop_services_with_ec_module(Arc::new(HeaderSettingModule {
+            name: "set-cookie",
+            value: MODULE_EVIDENCE_COOKIE,
+            id: Some("module-value"),
+        }));
+        let req = addressed_test_request(&[]);
+        let mut ec = EcContext::read_from_request(&settings, &req, &services)
+            .expect("should read EC context");
+        let graph = KvIdentityGraph::in_memory("test-ec-store");
+        ec.generate_if_needed(&settings, Some(&graph), &services)
+            .await
+            .expect("should generate an identifier");
+
+        let cookies = finalized_set_cookies(&settings, &mut ec, &graph).await;
+
+        assert!(
+            names_and_paths(&cookies).contains(&("ts-ec", "/publisher-a.example")),
+            "the Edge Cookie should be under the removed prefix, got: {cookies:?}"
+        );
+    }
+
     /// A cookie a module may set for itself, used to check which module
     /// responses keep their headers.
     const MODULE_EVIDENCE_COOKIE: &str = "acme-evidence=abc123; Path=/; Secure";
