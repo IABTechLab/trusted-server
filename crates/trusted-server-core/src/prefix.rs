@@ -117,21 +117,17 @@ impl PublicPrefix {
 
     /// The same prefix, its cookies written under `path`.
     ///
-    /// `None` or an empty path writes them under `/`. So does a path that
-    /// cannot be a cookie's `Path`, logged, so a value written into a
+    /// `None`, an empty path or `/` writes them under `/`. So does a path
+    /// that cannot be a cookie's `Path`, logged, so a value written into a
     /// `Set-Cookie` header can never add an attribute.
     #[must_use]
     pub fn under_path(self, path: Option<&str>) -> Self {
-        let cookie_path = match path {
-            None | Some("") => None,
-            Some(path) if crate::addressing::is_cookie_path(path) => Some(path.to_owned()),
-            Some(_) => {
-                log::warn!("Writing cookies under / as the removed prefix is not a cookie path");
-                None
-            }
-        };
+        let cookie_path = path.and_then(crate::addressing::cookie_path_for);
+        if cookie_path.is_none() && path.is_some_and(|path| !matches!(path, "" | "/")) {
+            log::warn!("Writing cookies under / as the removed prefix is not a cookie path");
+        }
         Self {
-            cookie_path,
+            cookie_path: cookie_path.map(str::to_owned),
             ..self
         }
     }
@@ -407,10 +403,13 @@ mod tests {
     #[test]
     fn cookies_are_under_the_root_with_no_removed_prefix() {
         assert_eq!(PublicPrefix::default().cookie_path(), "/");
-        assert_eq!(
-            PublicPrefix::default().under_path(Some("")).cookie_path(),
-            "/"
-        );
+        for path in ["", "/"] {
+            assert_eq!(
+                PublicPrefix::default().under_path(Some(path)),
+                PublicPrefix::default(),
+                "`{path}` should count as no removed prefix"
+            );
+        }
     }
 
     #[test]

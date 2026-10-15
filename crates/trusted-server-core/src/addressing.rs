@@ -294,6 +294,17 @@ pub fn is_cookie_path(path: &str) -> bool {
             .all(|byte| byte.is_ascii_graphic() && byte != b';')
 }
 
+/// The `Path` core writes its cookies under on a request whose removed
+/// prefix is `prefix`, or `None` for `/`.
+///
+/// An empty prefix, `/` itself and a prefix that cannot be a cookie's `Path`
+/// all give `None`, so such a request writes and reads its cookies as a
+/// request with no removed prefix does.
+#[must_use]
+pub(crate) fn cookie_path_for(prefix: &str) -> Option<&str> {
+    (prefix != "/" && is_cookie_path(prefix)).then_some(prefix)
+}
+
 /// Whether `path` is one a request can continue with, which is a
 /// percent-encoded ASCII path as a request carries it, so every adapter
 /// routes the same path.

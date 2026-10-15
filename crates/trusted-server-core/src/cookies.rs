@@ -32,9 +32,11 @@ pub fn parse_cookies_to_jar(s: &str) -> CookieJar {
 /// Parses a cookie string into a [`CookieJar`] that keeps the first cookie
 /// of each name.
 ///
-/// A browser lists the cookie with the longer `Path` first, so on a request
-/// under a publisher's path this keeps the publisher's cookie over one of
-/// the same name written under `/`.
+/// RFC 6265 section 5.4 says a browser SHOULD list the cookie with the
+/// longer `Path` first. In a browser that does, on a request under a
+/// publisher's path this keeps the publisher's cookie over one of the same
+/// name written under `/`. A browser that does not may list the root cookie
+/// first, and the root cookie is then the one kept.
 fn parse_cookies_to_jar_keeping_first(s: &str) -> CookieJar {
     let mut jar = CookieJar::new();
     for cookie in Cookie::split_parse(s.trim().to_owned()).filter_map(Result::ok) {
@@ -48,10 +50,12 @@ fn parse_cookies_to_jar_keeping_first(s: &str) -> CookieJar {
 /// Extracts and parses cookies from an HTTP request.
 ///
 /// Attempts to parse the Cookie header into a [`CookieJar`] for easy access
-/// to individual cookies. On a request request addressing gave a removed
-/// prefix, the first cookie of each name is kept, the one under the
-/// publisher's path. Otherwise the last is kept, as [`parse_cookies_to_jar`]
-/// keeps it.
+/// to individual cookies. Where core writes its cookies under the prefix
+/// request addressing removed, the first cookie of each name is kept, which
+/// is the one under the publisher's path in a browser that lists longer
+/// paths first. Otherwise the last is kept, as [`parse_cookies_to_jar`]
+/// keeps it, which covers a request with no removed prefix and one whose
+/// removed prefix is empty, `/` or not a cookie path.
 ///
 /// # Errors
 ///
@@ -66,11 +70,12 @@ pub fn handle_request_cookies(
                 .change_context(TrustedServerError::InvalidHeaderValue {
                     message: "Cookie header contains invalid UTF-8".to_owned(),
                 })?;
-        let addressed = req
+        let under_removed_prefix = req
             .extensions()
             .get::<crate::addressing::RemovedPathPrefix>()
+            .and_then(|prefix| crate::addressing::cookie_path_for(prefix.as_str()))
             .is_some();
-        let jar = if addressed {
+        let jar = if under_removed_prefix {
             parse_cookies_to_jar_keeping_first(header_value_str)
         } else {
             parse_cookies_to_jar(header_value_str)
@@ -155,8 +160,9 @@ mod tests {
         assert_eq!(jar.get("c1").expect("should have cookie c1").value(), "v2");
     }
 
-    /// A browser lists the cookie with the longer path first, so on an
-    /// addressed request the publisher's own cookie is the one read.
+    /// A browser that lists the cookie with the longer path first sends the
+    /// publisher's own cookie first, so on an addressed request that cookie
+    /// is the one read.
     #[test]
     fn an_addressed_request_reads_the_first_cookie_of_a_name() {
         let mut req = build_request(Some("ts-ec=publisher; ts-ec=root; other=1"));
@@ -180,6 +186,27 @@ mod tests {
             .expect("should have cookie jar");
 
         assert_eq!(jar.get("ts-ec").map(Cookie::value), Some("root"));
+    }
+
+    /// An empty removed prefix, `/`, or a prefix that cannot be a cookie's
+    /// `Path` puts core's cookies under `/`, so the request reads them as a
+    /// request with no removed prefix does.
+    #[test]
+    fn a_removed_prefix_whose_cookies_go_under_the_root_reads_the_last_cookie_of_a_name() {
+        for prefix in ["", "/", "/a;b"] {
+            let mut req = build_request(Some("ts-ec=publisher; ts-ec=root"));
+            req.extensions_mut()
+                .insert(crate::addressing::RemovedPathPrefix::new(prefix.to_owned()));
+            let jar = handle_request_cookies(&req)
+                .expect("should parse cookies")
+                .expect("should have cookie jar");
+
+            assert_eq!(
+                jar.get("ts-ec").map(Cookie::value),
+                Some("root"),
+                "removed prefix `{prefix}`"
+            );
+        }
     }
 
     #[test]
