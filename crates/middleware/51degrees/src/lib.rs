@@ -13,9 +13,9 @@
 //! names it for, leaves the names in the request's state, and writes them on
 //! that page, the first request included: the `Delegate-CH` tag in the head,
 //! and `Accept-CH`, `Critical-CH` and `Permissions-Policy` on the response,
-//! each keeping what the response already said. The tag's content follows
-//! 51Degrees' published example, lower case hint names, a space and the
-//! origin, separated by semicolons.
+//! each keeping every line the response already carries under its name. The
+//! tag's content follows 51Degrees' published example, lower case hint
+//! names, a space and the origin, separated by semicolons.
 //!
 //! `Critical-CH` is written when `critical` in
 //! `[middleware.51degrees.client_hints]` is on, which it is unless the table
@@ -419,9 +419,11 @@ fn carries_every(headers: &http::HeaderMap, names: &[String]) -> bool {
 /// `critical` is on, and `Permissions-Policy` delegating each to `origin`
 /// when there is one, or nothing for no hints.
 ///
-/// Each keeps what `existing` already says under that name, with the hints
-/// added after it, so a policy the publisher's origin sets is kept and the
-/// hints it already asks for are still asked for. `Accept-CH` and
+/// Each keeps every line `existing` carries under that name, joined into one
+/// list, with the hints added after it, because core replaces all of those
+/// lines with the one header written here. So a policy the publisher's origin
+/// sets is kept and the hints it already asks for are still asked for.
+/// `Accept-CH` and
 /// `Critical-CH` name the same hints, because a browser retries only for the
 /// hints it was told are critical. Both are left off when `held`, unless
 /// `existing` names an `Accept-CH` set of its own, which would replace the
@@ -437,23 +439,34 @@ fn client_hint_headers(
     if hints.is_empty() {
         return Vec::new();
     }
-    let said = |name: &str| existing.get(name).and_then(|value| value.to_str().ok());
+    let said = |name: &str| {
+        let lines: Vec<&str> = existing
+            .get_all(name)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect();
+        (!lines.is_empty()).then(|| lines.join(", "))
+    };
     let mut headers = Vec::new();
     let mut write = |name: &'static str, value: String| {
         if let Ok(value) = http::HeaderValue::from_str(&value) {
             headers.push((http::HeaderName::from_static(name), value));
         }
     };
-    if !held || said("accept-ch").is_some() {
-        write("accept-ch", with_hints(said("accept-ch"), &hints));
+    let accept_ch = said("accept-ch");
+    if !held || accept_ch.is_some() {
+        write("accept-ch", with_hints(accept_ch.as_deref(), &hints));
         if critical {
-            write("critical-ch", with_hints(said("critical-ch"), &hints));
+            write(
+                "critical-ch",
+                with_hints(said("critical-ch").as_deref(), &hints),
+            );
         }
     }
     if let Some(origin) = origin {
         write(
             "permissions-policy",
-            with_delegation(said("permissions-policy"), origin, &hints),
+            with_delegation(said("permissions-policy").as_deref(), origin, &hints),
         );
     }
     headers
@@ -679,7 +692,7 @@ mod tests {
         let context = serve_context(&state, &prepared, names);
         let mut headers = http::HeaderMap::new();
         for (name, value) in existing {
-            headers.insert(
+            headers.append(
                 http::HeaderName::from_static(name),
                 http::HeaderValue::from_static(value),
             );
@@ -800,6 +813,42 @@ mod tests {
             ]),
             "a hint the origin already asks for is named once, and the delegation comes \
              after the origin's own member so it is the one that stands"
+        );
+    }
+
+    /// A response may send each header on several lines, and core replaces
+    /// them all with the one written, so every line is kept, in order.
+    #[test]
+    fn every_line_the_response_sends_is_kept() {
+        let headers = headers_for(
+            &middleware(CLOUD),
+            &["sec-ch-ua-model"],
+            &[
+                ("accept-ch", "Sec-CH-Prefers-Color-Scheme"),
+                ("accept-ch", "Sec-CH-Viewport-Width"),
+                ("critical-ch", "Sec-CH-Prefers-Color-Scheme"),
+                ("critical-ch", "Sec-CH-Viewport-Width"),
+                ("permissions-policy", "camera=()"),
+                ("permissions-policy", "geolocation=(self)"),
+            ],
+        );
+
+        assert_eq!(
+            headers,
+            pairs(&[
+                (
+                    "accept-ch",
+                    "Sec-CH-Prefers-Color-Scheme, Sec-CH-Viewport-Width, sec-ch-ua-model"
+                ),
+                (
+                    "critical-ch",
+                    "Sec-CH-Prefers-Color-Scheme, Sec-CH-Viewport-Width, sec-ch-ua-model"
+                ),
+                (
+                    "permissions-policy",
+                    r#"camera=(), geolocation=(self), ch-ua-model=(self "https://cloud.example.com")"#
+                ),
+            ])
         );
     }
 
