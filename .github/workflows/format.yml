@@ -45,6 +45,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Rust jobs must set up the toolchain through ./.github/actions/setup-rust,
+      # which removes the image's stable and only saves caches from main. A
+      # direct setup-rust-toolchain or rust-cache step skips both silently.
+      - name: Require the shared Rust setup action
+        shell: bash
+        run: |
+          if grep -rnE 'uses:[[:space:]]*(actions-rust-lang/setup-rust-toolchain|Swatinem/rust-cache)@' .github \
+              | grep -v '^\.github/actions/setup-rust/action\.yml:'; then
+            echo "::error::Set up Rust with ./.github/actions/setup-rust, not setup-rust-toolchain or rust-cache directly."
+            exit 1
+          fi
+
       - name: Set up rust toolchain
         uses: ./.github/actions/setup-rust
         with:
