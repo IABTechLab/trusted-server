@@ -42,6 +42,14 @@ is given none of them. A request that is not a page navigation asks the
 service nothing, and a page navigation is a `GET` or `HEAD` with
 `Sec-Fetch-Dest: document` or an `Accept` naming `text/html`.
 
+A browser keeps the hints an origin asked for until a response from that
+origin names a different set, so `Accept-CH` and `Critical-CH` are left off
+the response to a request that already carries every hint the service names.
+They are still written where the response names an `Accept-CH` set of its
+own, because that set would replace the one the browser holds.
+`Permissions-Policy` and the `Delegate-CH` tag apply to their own page only,
+so every page gets them.
+
 The origin the hints are delegated to is the origin of the configured
 `endpoint`, so a deployment using a private cloud delegates to that, and an
 endpoint on the page's own origin delegates nothing.

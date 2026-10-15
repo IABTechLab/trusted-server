@@ -20,6 +20,13 @@
 //! `Critical-CH` is written when `critical` in
 //! `[middleware.51degrees.client_hints]` is on, which it is unless the table
 //! turns it off.
+//!
+//! A browser keeps an origin's `Accept-CH` set until a response names
+//! another, so `Accept-CH` and `Critical-CH` are left off the response to a
+//! request that already carries every hint the service names, unless the
+//! response names a set of its own, which would replace the one held. The tag
+//! and `Permissions-Policy` apply to their own page only, and are written on
+//! every page.
 
 use std::sync::Arc;
 
@@ -246,6 +253,11 @@ impl ClientHints {
     }
 }
 
+/// Left beside the names when the request already carried every one of them,
+/// so the browser holds them for the origin.
+#[derive(Debug)]
+struct HintsHeld;
+
 /// The names the filter left for this request, which core copies into the
 /// document state from the request's state on serve, or none for a document
 /// with no request behind it.
@@ -287,8 +299,10 @@ impl Middleware for ClientHints {
 
     /// Writes `Accept-CH`, `Critical-CH` and `Permissions-Policy` for the
     /// names the filter left for this request, each keeping what the
-    /// response already carries. The headers ask the browser to send the
-    /// hints with its next request as well as with the ones the tag covers.
+    /// response already carries, with the first two left off where the
+    /// browser holds the names already. The headers ask the browser to send
+    /// the hints with its later requests as well as with the ones the tag
+    /// covers.
     fn response_headers(
         &self,
         context: &MiddlewareContext<'_>,
@@ -297,6 +311,10 @@ impl Middleware for ClientHints {
         client_hint_headers(
             &names_in(context.document_state),
             self.critical,
+            context
+                .document_state
+                .get::<HintsHeld>(BUILDER_ID)
+                .is_some(),
             delegated_origin(self.endpoint_origin.as_deref(), context.request_host),
             response.headers,
         )
@@ -347,6 +365,9 @@ impl IntegrationRequestFilter for ClientHints {
                 self.names(&evidence, input.services).await
             };
             if !names.is_empty() {
+                if carries_every(input.request.headers(), &names) {
+                    IntegrationRequestState::insert(input.request, BUILDER_ID, HintsHeld);
+                }
                 IntegrationRequestState::insert(
                     input.request,
                     BUILDER_ID,
@@ -376,6 +397,15 @@ fn tokens(hints: &[String]) -> Vec<&str> {
         .collect()
 }
 
+/// Whether `headers` carry every one of `names`. A browser sends a high
+/// entropy hint only once a response from the origin has named it in
+/// `Accept-CH`, and the low entropy ones always, so only the whole list shows
+/// the set is held. A header counts whatever its value, because
+/// `Sec-CH-UA-Model` is an empty string on a desktop.
+fn carries_every(headers: &http::HeaderMap, names: &[String]) -> bool {
+    !names.is_empty() && names.iter().all(|name| headers.contains_key(name.as_str()))
+}
+
 /// `Accept-CH` naming `hints`, with `Critical-CH` naming the same when
 /// `critical` is on, and `Permissions-Policy` delegating each to `origin`
 /// when there is one, or nothing for no hints.
@@ -384,10 +414,13 @@ fn tokens(hints: &[String]) -> Vec<&str> {
 /// added after it, so a policy the publisher's origin sets is kept and the
 /// hints it already asks for are still asked for. `Accept-CH` and
 /// `Critical-CH` name the same hints, because a browser retries only for the
-/// hints it was told are critical.
+/// hints it was told are critical. Both are left off when `held`, unless
+/// `existing` names an `Accept-CH` set of its own, which would replace the
+/// one the browser holds.
 fn client_hint_headers(
     hints: &[String],
     critical: bool,
+    held: bool,
     origin: Option<&str>,
     existing: &http::HeaderMap,
 ) -> Vec<ResponseHeader> {
@@ -402,9 +435,11 @@ fn client_hint_headers(
             headers.push((http::HeaderName::from_static(name), value));
         }
     };
-    write("accept-ch", with_hints(said("accept-ch"), &hints));
-    if critical {
-        write("critical-ch", with_hints(said("critical-ch"), &hints));
+    if !held || said("accept-ch").is_some() {
+        write("accept-ch", with_hints(said("accept-ch"), &hints));
+        if critical {
+            write("critical-ch", with_hints(said("critical-ch"), &hints));
+        }
     }
     if let Some(origin) = origin {
         write(
@@ -616,7 +651,21 @@ mod tests {
         names: &[&str],
         existing: &[(&'static str, &'static str)],
     ) -> Vec<(String, String)> {
+        headers_with(middleware, names, existing, false)
+    }
+
+    /// As [`headers_for`], for a document whose request carried every name
+    /// when `held`.
+    fn headers_with(
+        middleware: &ClientHints,
+        names: &[&str],
+        existing: &[(&'static str, &'static str)],
+        held: bool,
+    ) -> Vec<(String, String)> {
         let state = IntegrationDocumentState::default();
+        if held {
+            state.get_or_insert_with(BUILDER_ID, || HintsHeld);
+        }
         let prepared = Prepared::default();
         let context = serve_context(&state, &prepared, names);
         let mut headers = http::HeaderMap::new();
@@ -1128,6 +1177,122 @@ mod tests {
 
         assert!(inserts.is_empty(), "{inserts:?}");
         assert_eq!(accept_ch, None);
+    }
+
+    // A browser that holds the hints.
+
+    /// The names `DATA` gives.
+    const DATA_NAMES: &[&str] = &[
+        "sec-ch-ua",
+        "sec-ch-ua-platform",
+        "sec-ch-ua-model",
+        "sec-ch-ua-platform-version",
+    ];
+
+    /// A Chromium page request carrying `hints`, as a browser does once a
+    /// response from the origin named them in `Accept-CH`. Each is the empty
+    /// string Chromium sends for `Sec-CH-UA-Model` on a desktop.
+    fn later_view(hints: &[&str]) -> http::Request<Body> {
+        let mut request = first_view_from(CHROMIUM);
+        for hint in hints {
+            request.headers_mut().insert(
+                http::HeaderName::from_bytes(hint.as_bytes()).expect("a hint is a header name"),
+                http::HeaderValue::from_static("\"\""),
+            );
+        }
+        request
+    }
+
+    /// Whether the filter marks `request` as carrying every name the service
+    /// answers with `DATA`.
+    async fn held_after_filter(mut request: http::Request<Body>) -> bool {
+        let client = Arc::new(ScriptedHttpClient::new(&[DATA]));
+        let services = services_with(client, Arc::new(MemoryKvStore::default()));
+
+        let names = left_by_the_filter(&middleware(CLOUD), &services, &mut request).await;
+
+        assert!(!names.is_empty(), "the service names hints for Chromium");
+        IntegrationRequestState::of(&request)
+            .get::<HintsHeld>(BUILDER_ID)
+            .is_some()
+    }
+
+    #[tokio::test]
+    async fn a_request_carrying_every_hint_is_held() {
+        assert!(held_after_filter(later_view(DATA_NAMES)).await);
+    }
+
+    #[tokio::test]
+    async fn a_request_missing_one_hint_is_not_held() {
+        // As when the service starts naming a hint, so the headers replace
+        // the set the browser holds.
+        assert!(!held_after_filter(later_view(&DATA_NAMES[..3])).await);
+    }
+
+    #[tokio::test]
+    async fn the_hints_sent_unasked_do_not_count_as_held() {
+        // Chromium sends these three on every request, asked or not.
+        assert!(!held_after_filter(first_view()).await);
+    }
+
+    #[test]
+    fn a_held_set_gets_the_policy_and_the_tag_without_accept_ch() {
+        let headers = headers_with(
+            &middleware(CLOUD),
+            &["sec-ch-ua", "sec-ch-ua-model"],
+            &[],
+            true,
+        );
+        let state = IntegrationDocumentState::default();
+        state.get_or_insert_with(BUILDER_ID, || HintsHeld);
+        let prepared = Prepared::default();
+        let context = serve_context(&state, &prepared, &["sec-ch-ua-model"]);
+
+        assert_eq!(
+            headers,
+            pairs(&[(
+                "permissions-policy",
+                r#"ch-ua=(self "https://cloud.example.com"), ch-ua-model=(self "https://cloud.example.com")"#
+            )]),
+            "the browser holds the set, and the policy applies to this page alone"
+        );
+        assert_eq!(
+            middleware(CLOUD).create(&context).head_inserts.len(),
+            1,
+            "the tag applies to this page alone"
+        );
+    }
+
+    #[test]
+    fn a_response_naming_its_own_set_still_gets_the_hints_added() {
+        // The response's set would replace the one the browser holds.
+        let headers = headers_with(
+            &middleware(CLOUD),
+            &["sec-ch-ua-model"],
+            &[("accept-ch", "Sec-CH-Prefers-Color-Scheme")],
+            true,
+        );
+
+        assert_eq!(
+            headers,
+            pairs(&[
+                ("accept-ch", "Sec-CH-Prefers-Color-Scheme, sec-ch-ua-model"),
+                ("critical-ch", "sec-ch-ua-model"),
+                (
+                    "permissions-policy",
+                    r#"ch-ua-model=(self "https://cloud.example.com")"#
+                ),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_hint_counts_as_carried_whatever_its_value() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("sec-ch-ua-model", http::HeaderValue::from_static("\"\""));
+
+        assert!(carries_every(&headers, &["sec-ch-ua-model".to_owned()]));
+        assert!(!carries_every(&headers, &[]), "no names is never held");
     }
 
     // The tables.
