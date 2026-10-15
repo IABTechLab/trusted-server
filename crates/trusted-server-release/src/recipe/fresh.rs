@@ -112,3 +112,20 @@ pub(super) fn disjoint(paths: &[(&str, &Path)]) -> Result<(), Report<ReleaseErro
     }
     Ok(())
 }
+
+/// Requires the prepared materials root: a real directory holding exactly the
+/// `vendor` directory, which is itself a real directory.
+pub(super) fn prepared_materials(label: &str, path: &Path) -> Result<(), Report<ReleaseError>> {
+    real_directory(label, path)?;
+    let names = fs::read_dir(path)
+        .map_err(|error| recipe_error(format!("{label} cannot be listed: {error}")))?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| recipe_error(format!("{label} cannot be listed: {error}")))?;
+    if names != [std::ffi::OsString::from("vendor")] {
+        return Err(recipe_error(format!(
+            "{label} must hold exactly the prepared vendor directory"
+        )));
+    }
+    real_directory("vendor directory", &path.join("vendor"))
+}

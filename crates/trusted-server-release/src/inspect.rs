@@ -106,6 +106,10 @@ pub(crate) enum Violation {
     /// The module imports from an unreviewed module or a non-function item.
     #[display("WebAssembly import is outside the reviewed host ABI")]
     WasmImport,
+    /// A required DWARF custom section is missing or empty, so the module
+    /// was stripped.
+    #[display("WebAssembly module lacks a required nonempty debug section")]
+    WasmDebugInfo,
 }
 
 /// Builds the inspection rejection carrying `violation` and a detail line.
@@ -349,15 +353,65 @@ impl MachoFacts {
     }
 }
 
+/// One custom section observed in a core Wasm module.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WasmCustomSection {
+    name: String,
+    size: usize,
+}
+
+impl WasmCustomSection {
+    /// Section name as encoded in the module.
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Payload length in bytes, excluding the name.
+    pub(crate) fn size(&self) -> usize {
+        self.size
+    }
+}
+
 /// Facts observed in an accepted core Wasm module.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WasmFacts {
     sha256: String,
     import_modules: Vec<String>,
     function_imports: usize,
+    custom_sections: Vec<WasmCustomSection>,
 }
 
+/// DWARF sections whose presence proves the module was not stripped.
+const REQUIRED_DEBUG_SECTIONS: [&str; 2] = [".debug_info", ".debug_line"];
+
 impl WasmFacts {
+    /// Custom sections in file order.
+    pub(crate) fn custom_sections(&self) -> &[WasmCustomSection] {
+        &self.custom_sections
+    }
+
+    /// Requires nonempty `.debug_info` and `.debug_line` custom sections.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Violation::WasmDebugInfo`] naming the first required section
+    /// that is absent or has an empty payload in every occurrence.
+    pub(crate) fn require_debug_sections(&self) -> Result<(), Report<ReleaseError>> {
+        for required in REQUIRED_DEBUG_SECTIONS {
+            let present = self
+                .custom_sections
+                .iter()
+                .any(|section| section.name == required && section.size > 0);
+            if !present {
+                return Err(rejected(
+                    Violation::WasmDebugInfo,
+                    format!("missing or empty custom section {required}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Lowercase hex SHA-256 of the inspected bytes.
     pub(crate) fn sha256(&self) -> &str {
         &self.sha256

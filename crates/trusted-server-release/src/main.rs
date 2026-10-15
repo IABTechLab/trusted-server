@@ -26,6 +26,7 @@ mod recipe;
 mod process;
 #[allow(dead_code)]
 mod source;
+mod tool_tree;
 
 use std::ffi::OsString;
 use std::io::Write as _;

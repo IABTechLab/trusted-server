@@ -1,161 +1,10 @@
-use std::collections::BTreeMap;
-use std::ffi::OsString;
 use std::fs;
-use std::path::{Path, PathBuf};
 
+use super::fixture::*;
 use super::*;
-use crate::policy::ReleaseTarget;
-use crate::preflight::audit_environment;
-use crate::preflight::child::build_child_for_tests;
-
-const OTHER_COMMIT: &str = "fedcba9876543210fedcba9876543210fedcba98";
-
-fn audited() -> AuditedEnvironment {
-    let snapshot: Vec<(OsString, OsString)> = [
-        ("PATH", "/usr/bin"),
-        ("TRUSTED_SERVER__PROXY__SECRET", "fictional"),
-        ("LANG", "en_US.UTF-8"),
-    ]
-    .into_iter()
-    .map(|(name, value)| (OsString::from(name), OsString::from(value)))
-    .collect();
-    audit_environment(&snapshot).expect("should audit benign environment")
-}
-
-/// A fictional layout with a completed JS handoff and every recipe root.
-struct Fixture {
-    _directory: tempfile::TempDir,
-    base: PathBuf,
-    completed: JsBuildCompleted,
-}
-
-impl Fixture {
-    fn new(js_commit: &str) -> Self {
-        let directory = tempfile::tempdir().expect("should create fixture directory");
-        let base = fs::canonicalize(directory.path()).expect("should canonicalize fixture");
-        for relative in [
-            "materials",
-            "output",
-            "checkout-a",
-            "checkout-b",
-            "tools/bin",
-            "other-source",
-            "other-work",
-        ] {
-            fs::create_dir_all(base.join(relative)).expect("should create fixture directory");
-        }
-        for tool in ["tools/bin/cargo", "tools/bin/rustc"] {
-            fs::write(base.join(tool), b"fictional tool").expect("should write fictional tool");
-        }
-        Self {
-            _directory: directory,
-            base,
-            completed: JsBuildCompleted::fixture_for_tests(js_commit),
-        }
-    }
-
-    fn retained(&self) -> PathBuf {
-        fs::canonicalize(
-            self.completed
-                .rehash_for_handoff()
-                .expect("should rehash the fixture handoff"),
-        )
-        .expect("should canonicalize the retained root")
-    }
-
-    fn request(&self, asset: &str, role: &str, commit: &str) -> RecipeRequest {
-        self.request_at(asset, role, commit, &self.base.join("target"))
-    }
-
-    fn request_at(
-        &self,
-        asset: &str,
-        role: &str,
-        commit: &str,
-        target_dir: &Path,
-    ) -> RecipeRequest {
-        let retained = self.retained();
-        let js_dir = retained.join("bundles");
-        let js_inventory = retained.join("tsjs-inventory.json");
-        RecipeRequest::parse(&RecipeInput {
-            asset,
-            variant: "default",
-            role,
-            commit,
-            js_dir: &js_dir,
-            js_inventory: &js_inventory,
-            materials: &self.base.join("materials"),
-            output: &self.base.join("output"),
-            target_dir,
-        })
-        .expect("should parse the fixture request")
-    }
-
-    fn ambient(&self, role: Role) -> CheckedAmbient {
-        match role {
-            Role::A => CheckedAmbient::check(
-                Role::A,
-                &AmbientProfile::A,
-                ObservedAmbient {
-                    checkout_root: self.base.join("checkout-a"),
-                    ..observed_a()
-                },
-            ),
-            Role::B => CheckedAmbient::check(
-                Role::B,
-                &AmbientProfile::alternate_for_tests(),
-                ObservedAmbient {
-                    checkout_root: self.base.join("checkout-b"),
-                    ..observed_b()
-                },
-            ),
-        }
-        .expect("should check the fixture ambient")
-    }
-
-    fn tools(&self) -> SelectedRustTools {
-        SelectedRustTools::for_tests(&self.base.join("tools")).expect("should select fixture tools")
-    }
-
-    fn bind_with(
-        &self,
-        request: RecipeRequest,
-        role: Role,
-        commit: &str,
-    ) -> Result<PreparedRecipe, Report<ReleaseError>> {
-        let commit = CommitId::parse(commit).expect("should parse fixture commit");
-        let child =
-            build_child_for_tests(&audited(), &commit, 1_700_000_000, &child_request(&request))
-                .expect("should build the fixture child environment");
-        PreparedRecipe::bind(BindInputs {
-            commit: &commit,
-            child,
-            completed: &self.completed,
-            tools: self.tools(),
-            ambient: self.ambient(role),
-            request,
-        })
-    }
-
-    fn bind(&self, asset: &str, role: Role) -> Result<PreparedRecipe, Report<ReleaseError>> {
-        let text = if role == Role::A { "A" } else { "B" };
-        self.bind_with(self.request(asset, text, COMMIT), role, COMMIT)
-    }
-}
-
-fn plan_error(prepared: &PreparedRecipe) -> String {
-    match prepared.check_plan() {
-        Ok(()) => panic!("should reject the plan"),
-        Err(error) => format!("{error:?}"),
-    }
-}
-
-fn bind_error(result: Result<PreparedRecipe, Report<ReleaseError>>) -> String {
-    match result {
-        Ok(_) => panic!("should reject the binding"),
-        Err(error) => format!("{error:?}"),
-    }
-}
+use crate::boundary::BoundaryRoots;
+#[cfg(target_os = "macos")]
+use crate::boundary::{Boundary, DenialProof};
 
 #[test]
 fn js_handoff_for_other_source_commit_is_rejected() {
@@ -220,188 +69,28 @@ fn request_for_other_js_directory_or_role_is_rejected() {
 }
 
 #[test]
-fn cargo_plan_has_fixed_release_frozen_json_flags() {
-    for (index, artifact) in FIXED_ARTIFACTS.iter().enumerate() {
-        let role = if index % 2 == 0 { Role::A } else { Role::B };
-        let jobs = if role == Role::A { "4" } else { "2" };
-        let fixture = Fixture::new(COMMIT);
-        let prepared = fixture
-            .bind(artifact.name, role)
-            .expect("should bind every fixed asset");
-        let expected_arguments = [
-            "build",
-            "--package",
-            artifact.package,
-            "--bin",
-            artifact.bin,
-            "--target",
-            artifact.target.triple(),
-            "--release",
-            "--frozen",
-            "--message-format=json-render-diagnostics",
-            "--jobs",
-            jobs,
-        ];
-        assert_eq!(
-            prepared.plan().arguments,
-            expected_arguments,
-            "should use the exact fixed arguments for {}",
-            artifact.name
-        );
-        assert_eq!(
-            prepared.plan().program,
-            fixture.base.join("tools/bin/cargo"),
-            "should run the selected Cargo"
-        );
-        let checkout = if role == Role::A {
-            "checkout-a"
-        } else {
-            "checkout-b"
-        };
-        assert_eq!(
-            prepared.plan().working_directory,
-            fixture.base.join(checkout),
-            "should run in the role checkout"
-        );
-        assert_environment(&fixture, &prepared, artifact.target);
+fn bind_creates_fresh_target_and_private_cargo_state() {
+    let fixture = Fixture::new(COMMIT);
+    fixture
+        .bind("ts-aarch64-apple-darwin", Role::A)
+        .expect("should bind the recipe");
+    for relative in [
+        "target",
+        "cargo-state/home",
+        "cargo-state/cargo-home",
+        "cargo-state/tmp",
+    ] {
         assert!(
-            fixture.base.join("target").is_dir(),
-            "should create the fresh target directory"
+            fixture.base.join(relative).is_dir(),
+            "should create {relative}"
         );
-        prepared
-            .check_plan()
-            .expect("should accept the untouched plan");
-    }
-}
-
-fn assert_environment(fixture: &Fixture, prepared: &PreparedRecipe, target: ReleaseTarget) {
-    let retained = fixture.retained();
-    let path = |path: PathBuf| path.to_str().expect("should be UTF-8").to_owned();
-    let mut expected = BTreeMap::from([
-        ("AWS_LC_SYS_USE_SYSTEM".to_owned(), "0".to_owned()),
-        (
-            format!(
-                "AWS_LC_SYS_USE_SYSTEM_{}",
-                target.triple().replace('-', "_")
-            ),
-            "0".to_owned(),
-        ),
-        (
-            "CARGO_HOME".to_owned(),
-            path(fixture.base.join("materials")),
-        ),
-        (
-            "CARGO_TARGET_DIR".to_owned(),
-            path(fixture.base.join("target")),
-        ),
-        ("HOME".to_owned(), path(fixture.base.join("materials/home"))),
-        ("LC_ALL".to_owned(), "C".to_owned()),
-        ("LIBSQLITE3_SYS_USE_PKG_CONFIG".to_owned(), "0".to_owned()),
-        ("SOURCE_DATE_EPOCH".to_owned(), "1700000000".to_owned()),
-        ("TRUSTED_SERVER__GIT_VERSION".to_owned(), COMMIT.to_owned()),
-        ("TRUSTED_SERVER__RELEASE_BUILD".to_owned(), "1".to_owned()),
-        (
-            "TRUSTED_SERVER__TSJS_PREBUILT_INVENTORY".to_owned(),
-            path(retained.join("tsjs-inventory.json")),
-        ),
-        (
-            "TSJS_PREBUILT_DIR".to_owned(),
-            path(retained.join("bundles")),
-        ),
-        ("TZ".to_owned(), "UTC".to_owned()),
-    ]);
-    if target.is_darwin() {
-        expected.insert("MACOSX_DEPLOYMENT_TARGET".to_owned(), "13.0".to_owned());
     }
     assert_eq!(
-        prepared.plan().environment,
-        expected,
-        "should hold exactly the child environment plus three recipe variables"
-    );
-}
-
-#[test]
-fn cargo_plan_rejects_inherited_rustflags_and_selectors() {
-    for name in [
-        "RUSTFLAGS",
-        "CARGO_ENCODED_RUSTFLAGS",
-        "CARGO_BUILD_TARGET",
-        "RUSTUP_TOOLCHAIN",
-        "CC",
-        "TSJS_SKIP_BUILD",
-    ] {
-        let snapshot = [(OsString::from(name), OsString::from("fictional"))];
-        let rejection = match audit_environment(&snapshot) {
-            Ok(_) => panic!("should reject inherited {name}"),
-            Err(error) => format!("{error:?}"),
-        };
-        assert!(
-            rejection.contains(name),
-            "should reject inherited {name} before any plan exists"
-        );
-    }
-    let fixture = Fixture::new(COMMIT);
-    let mut prepared = fixture
-        .bind("ts-x86_64-unknown-linux-gnu", Role::A)
-        .expect("should bind from a benign environment");
-    let plan = prepared.plan();
-    for name in plan.environment.keys() {
-        assert!(
-            !name.starts_with("RUST") && !name.starts_with("CARGO_BUILD"),
-            "should not carry selector {name}"
-        );
-    }
-    for argument in &plan.arguments {
-        assert!(
-            ![
-                "--config",
-                "--features",
-                "--all-features",
-                "--no-default-features",
-                "--manifest-path"
-            ]
-            .iter()
-            .any(|selector| argument.starts_with(selector))
-                && !argument.starts_with('+'),
-            "should not carry selector argument {argument}"
-        );
-    }
-    prepared
-        .plan
-        .environment
-        .insert("RUSTFLAGS".to_owned(), "--cfg fictional".to_owned());
-    assert!(
-        plan_error(&prepared).contains("differs"),
-        "should reject an injected RUSTFLAGS"
-    );
-    prepared.plan.environment.remove("RUSTFLAGS");
-    prepared
-        .check_plan()
-        .expect("should accept the restored plan");
-    prepared.plan.environment.remove("LC_ALL");
-    assert!(
-        plan_error(&prepared).contains("differs"),
-        "should reject a removed normalization variable"
-    );
-    let fixture = Fixture::new(COMMIT);
-    let mut prepared = fixture
-        .bind("ts-x86_64-unknown-linux-gnu", Role::A)
-        .expect("should bind again");
-    for change in ["--features=fictional", "+nightly", "--config=fictional"] {
-        prepared.plan.arguments.push(change.to_owned());
-        assert!(
-            plan_error(&prepared).contains("differs"),
-            "should reject added argument {change}"
-        );
-        prepared.plan.arguments.pop();
-    }
-    prepared
-        .plan
-        .arguments
-        .retain(|argument| argument != "--release");
-    assert!(
-        plan_error(&prepared).contains("differs"),
-        "should reject a dropped --release"
+        fs::read_dir(fixture.base.join("output"))
+            .expect("should list output")
+            .count(),
+        0,
+        "should leave the unmounted output root empty"
     );
 }
 
@@ -423,8 +112,8 @@ fn execute_rejects_boundary_with_other_roots() {
         .execute(&boundary, &DenialProof::for_tests())
         .expect_err("should reject a boundary over other roots");
     assert!(
-        format!("{error:?}").contains("roots differ"),
-        "should name the root mismatch"
+        format!("{error:?}").contains("outside the boundary roots"),
+        "should reject plan paths outside the other roots: {error:?}"
     );
 }
 
@@ -468,8 +157,24 @@ fn qualified_rust_tools_constructor_is_uninhabited() {
 }
 
 #[test]
+fn ordinary_ci_selection_carries_no_release_authority() {
+    let fixture = Fixture::new(COMMIT);
+    let tools = fixture.tools_for(ReleaseTarget::Aarch64AppleDarwin);
+    assert_eq!(
+        tools.authority(),
+        Authority::Unqualified,
+        "should never report a test selection as qualified"
+    );
+    assert_eq!(
+        ToolSelection::OrdinaryCi.authority(),
+        Authority::Unqualified,
+        "should report the ordinary CI selection as unqualified"
+    );
+}
+
+#[test]
 fn root_filled_between_parse_and_bind_is_rejected() {
-    for (relative, label) in [("materials", "materials"), ("output", "output")] {
+    for (relative, label) in [("cargo-state", "cargo state"), ("output", "output")] {
         let fixture = Fixture::new(COMMIT);
         let request = fixture.request("ts-aarch64-apple-darwin", "A", COMMIT);
         fs::write(
@@ -497,6 +202,53 @@ fn root_filled_between_parse_and_bind_is_rejected() {
 }
 
 #[test]
+fn materials_changed_or_foreign_after_preparation_are_rejected() {
+    let fixture = Fixture::new(COMMIT);
+    let request = fixture.request("ts-aarch64-apple-darwin", "A", COMMIT);
+    let materials = fixture.materials(COMMIT);
+    fs::write(
+        fixture
+            .base
+            .join("materials/vendor/example-1.0.0/Cargo.toml"),
+        b"tampered after preparation",
+    )
+    .expect("should edit a vendored file");
+    let tools = fixture.tools_for(ReleaseTarget::Aarch64AppleDarwin);
+    assert!(
+        bind_error(fixture.bind_parts(request, Role::A, COMMIT, tools, materials))
+            .contains("no longer rehash"),
+        "should reject materials edited after preparation"
+    );
+    assert!(
+        !fixture.base.join("target").exists(),
+        "should not create the target after a rejection"
+    );
+
+    let fixture = Fixture::new(COMMIT);
+    let request = fixture.request("ts-aarch64-apple-darwin", "A", COMMIT);
+    let foreign = fixture.materials(OTHER_COMMIT);
+    let tools = fixture.tools_for(ReleaseTarget::Aarch64AppleDarwin);
+    assert!(
+        bind_error(fixture.bind_parts(request, Role::A, COMMIT, tools, foreign))
+            .contains("another source commit"),
+        "should reject materials derived from another commit"
+    );
+}
+
+#[test]
+fn tools_selected_for_another_target_are_rejected() {
+    let fixture = Fixture::new(COMMIT);
+    let request = fixture.request("ts-aarch64-apple-darwin", "A", COMMIT);
+    let tools = fixture.tools_for(ReleaseTarget::X86_64UnknownLinuxGnu);
+    let materials = fixture.materials(COMMIT);
+    assert!(
+        bind_error(fixture.bind_parts(request, Role::A, COMMIT, tools, materials))
+            .contains("another target"),
+        "should reject tools whose standard library was checked for another target"
+    );
+}
+
+#[test]
 fn target_inside_checkout_is_rejected_before_creation() {
     let fixture = Fixture::new(COMMIT);
     let inside = fixture.base.join("checkout-a/target");
@@ -517,106 +269,47 @@ fn target_inside_checkout_is_rejected_before_creation() {
 }
 
 #[test]
-fn tampered_program_or_working_directory_is_rejected() {
+fn boundary_roots_mount_materials_read_only_state_and_target_writable_output_unmounted() {
     let fixture = Fixture::new(COMMIT);
-    let mut prepared = fixture
+    let prepared = fixture
         .bind("ts-aarch64-apple-darwin", Role::A)
         .expect("should bind the recipe");
-    prepared.plan.program = fixture.base.join("tools/bin/rustc");
-    assert!(
-        plan_error(&prepared).contains("differs"),
-        "should reject a swapped program"
+    let expected = BoundaryRoots::new(
+        &[
+            fixture.base.join("checkout-a"),
+            fixture.retained(),
+            fixture.base.join("materials"),
+        ],
+        &[fixture.base.join("tools")],
+        &[
+            fixture.base.join("cargo-state"),
+            fixture.base.join("target"),
+        ],
+    )
+    .expect("should build the expected roots");
+    assert_eq!(
+        prepared.boundary_roots().expect("should derive roots"),
+        expected,
+        "should mount exactly the planned roles"
     );
-    prepared.plan.program = fixture.base.join("tools/bin/cargo");
-    prepared.plan.working_directory = fixture.base.join("checkout-b");
+    let all: Vec<_> = expected
+        .entries()
+        .map(|(_, _, path)| path.to_owned())
+        .collect();
     assert!(
-        plan_error(&prepared).contains("differs"),
-        "should reject a swapped working directory"
+        !all.iter()
+            .any(|path| path.starts_with(fixture.base.join("output"))),
+        "should not mount the output root"
     );
-}
-
-fn confinement_limits() -> ProcessLimits {
-    ProcessLimits {
-        wall: std::time::Duration::from_secs(60),
-        stdout_max: 1024,
-        stderr_max: 1024,
-    }
-}
-
-#[test]
-fn plan_carries_the_role_umask() {
-    for (role, expected) in [(Role::A, 0o022), (Role::B, 0o027)] {
-        let fixture = Fixture::new(COMMIT);
-        let prepared = fixture
-            .bind("ts-aarch64-apple-darwin", role)
-            .expect("should bind the recipe");
-        assert_eq!(
-            prepared.plan().umask,
-            Umask::new(expected).expect("should accept mask"),
-            "should derive the umask of role {role:?} from its ambient profile"
-        );
-    }
-}
-
-#[test]
-fn tampered_umask_is_rejected_by_the_plan_recheck() {
-    let fixture = Fixture::new(COMMIT);
-    let mut prepared = fixture
-        .bind("ts-aarch64-apple-darwin", Role::A)
-        .expect("should bind the recipe");
-    prepared.plan.umask = Umask::new(0o000).expect("should accept mask");
+    assert_eq!(
+        expected.writable().len(),
+        2,
+        "should expose exactly two writable roots"
+    );
     assert!(
-        plan_error(&prepared).contains("differs"),
-        "should reject a weakened umask"
+        expected
+            .immutable()
+            .contains(&fixture.base.join("materials")),
+        "should mount the vendor materials read-only"
     );
-    prepared.plan.umask = Umask::new(0o027).expect("should accept mask");
-    assert!(
-        plan_error(&prepared).contains("differs"),
-        "should reject another role's umask"
-    );
-    prepared.plan.umask = Umask::new(0o022).expect("should accept mask");
-    prepared
-        .check_plan()
-        .expect("should accept the restored umask");
-}
-
-#[test]
-fn confined_command_applies_the_role_umask() {
-    for (role, expected) in [(Role::A, "022"), (Role::B, "027")] {
-        let fixture = Fixture::new(COMMIT);
-        let prepared = fixture
-            .bind("ts-aarch64-apple-darwin", role)
-            .expect("should bind the recipe");
-        let command = prepared
-            .plan()
-            .confined_command(confinement_limits())
-            .expect("should describe the confined command");
-        assert_eq!(
-            command
-                .requested_umask()
-                .map(|umask| umask.to_string())
-                .as_deref(),
-            Some(expected),
-            "should set the umask of role {role:?} on the confined command"
-        );
-        let described = format!("{command:?}");
-        for part in [
-            format!("{:?}", prepared.plan().program),
-            format!("{:?}", prepared.plan().working_directory),
-            format!(
-                "{:?}",
-                prepared
-                    .plan()
-                    .arguments
-                    .iter()
-                    .map(OsString::from)
-                    .collect::<Vec<_>>()
-            ),
-        ] {
-            assert!(
-                described.contains(&part),
-                "should describe {part} in {described}"
-            );
-        }
-    }
 }

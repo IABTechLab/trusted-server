@@ -206,6 +206,63 @@ pub(crate) fn container_path(
     })
 }
 
+/// Returns the host path of a container path inside a writable root.
+///
+/// Only writable roots map back: a build must never name an immutable or tool
+/// file as its output. Dot segments are rejected rather than resolved.
+///
+/// # Errors
+///
+/// Returns [`ReleaseError::Boundary`] when `container` is not an absolute
+/// path below `/boundary/writable/<index>` with a canonical decimal index of
+/// an existing writable root and only normal components after it.
+pub(crate) fn host_path(
+    roots: &BoundaryRoots,
+    container: &Path,
+) -> Result<PathBuf, Report<ReleaseError>> {
+    // `components` silently drops `.`, doubled and trailing separators, so
+    // lexical normal form is checked against the original text.
+    if container.components().collect::<PathBuf>().as_os_str() != container.as_os_str() {
+        return Err(docker_error("container path is not in lexical normal form"));
+    }
+    let prefix = Path::new(MOUNT_PREFIX).join(role_directory(RootRole::Writable));
+    let relative = container.strip_prefix(&prefix).map_err(|_| {
+        docker_error(format!(
+            "{} is not below the writable mount prefix",
+            container.display()
+        ))
+    })?;
+    let mut components = relative.components();
+    let index = components
+        .next()
+        .and_then(|component| match component {
+            std::path::Component::Normal(text) => text.to_str(),
+            _ => None,
+        })
+        .filter(|text| {
+            text.bytes().all(|byte| byte.is_ascii_digit())
+                && (*text == "0" || !text.starts_with('0'))
+        })
+        .and_then(|text| text.parse::<usize>().ok())
+        .ok_or_else(|| docker_error("container path has no canonical writable root index"))?;
+    let root = roots
+        .writable()
+        .get(index)
+        .ok_or_else(|| docker_error(format!("no writable root has index {index}")))?;
+    let mut host = root.clone();
+    for component in components {
+        match component {
+            std::path::Component::Normal(part) => host.push(part),
+            _ => {
+                return Err(docker_error(
+                    "container path has a dot segment after its root",
+                ));
+            }
+        }
+    }
+    Ok(host)
+}
+
 /// Builds the bind mounts for `roots`.
 ///
 /// # Errors
@@ -511,3 +568,6 @@ impl DockerBoundary {
         aggregate(failures)
     }
 }
+
+#[cfg(test)]
+mod host_path_tests;

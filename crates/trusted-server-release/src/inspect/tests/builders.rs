@@ -491,3 +491,19 @@ fn name_bytes(out: &mut Vec<u8>, text: &str) {
     out.push(u8::try_from(text.len()).expect("should fit one LEB128 byte"));
     out.extend_from_slice(text.as_bytes());
 }
+
+/// Builds a core Wasm module importing `() -> ()` functions, then appending
+/// custom sections `(name, payload)` in order.
+pub(super) fn wasm_module_with_customs(
+    imports: &[(&str, &str)],
+    customs: &[(&str, &[u8])],
+) -> Vec<u8> {
+    let mut out = wasm_module(imports);
+    for (name, payload) in customs {
+        let mut body = Vec::new();
+        name_bytes(&mut body, name);
+        body.extend_from_slice(payload);
+        section(&mut out, 0, &body);
+    }
+    out
+}

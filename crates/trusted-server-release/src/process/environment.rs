@@ -131,12 +131,54 @@ pub(super) fn is_credential(name: &OsStr) -> bool {
         || CREDENTIAL_EXACT.contains(&upper.as_str())
 }
 
+/// Exact names an orchestrator may set explicitly through
+/// [`BoundedCommand::tool_selector_environment`] despite the injection denylist.
+const TOOL_SELECTORS: [&str; 1] = ["RUSTC"];
+
 impl BoundedCommand {
     pub(super) fn insert_environment(
+        self,
+        name: &OsStr,
+        value: &OsStr,
+        secret: bool,
+    ) -> Result<Self, Report<ReleaseError>> {
+        self.insert_checked(name, value, secret, false)
+    }
+
+    /// Adds one explicitly selected tool path, such as the compiler.
+    ///
+    /// The generic [`Self::environment`] keeps rejecting every tool selector,
+    /// because an inherited or attacker-chosen `RUSTC` swaps the compiler.
+    /// This method accepts only the names in [`TOOL_SELECTORS`], only with an
+    /// absolute path, and only once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReleaseError::Process`] for any other name, a relative or
+    /// empty value, or a repeated name.
+    pub(crate) fn tool_selector_environment(
+        self,
+        name: impl AsRef<OsStr>,
+        value: impl AsRef<OsStr>,
+    ) -> Result<Self, Report<ReleaseError>> {
+        let (name, value) = (name.as_ref(), value.as_ref());
+        let selectable = TOOL_SELECTORS
+            .iter()
+            .any(|selector| name == OsStr::new(selector));
+        if !selectable || !value.as_bytes().starts_with(b"/") {
+            return Err(invalid(format!(
+                "{name:?} is not an explicitly selectable tool with an absolute path"
+            )));
+        }
+        self.insert_checked(name, value, false, true)
+    }
+
+    fn insert_checked(
         mut self,
         name: &OsStr,
         value: &OsStr,
         secret: bool,
+        tool_selector: bool,
     ) -> Result<Self, Report<ReleaseError>> {
         let name_bytes = name.as_bytes();
         if name_bytes.is_empty() || name_bytes.contains(&b'=') || name_bytes.contains(&0) {
@@ -149,7 +191,7 @@ impl BoundedCommand {
                 "environment variable {name:?} value contains NUL"
             )));
         }
-        if is_injection(name) {
+        if !tool_selector && is_injection(name) {
             return Err(invalid(format!(
                 "environment variable {name:?} injects code or configuration"
             )));
@@ -169,3 +211,6 @@ impl BoundedCommand {
         Ok(self)
     }
 }
+
+#[cfg(test)]
+mod selector_tests;

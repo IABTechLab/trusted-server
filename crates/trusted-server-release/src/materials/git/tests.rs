@@ -51,6 +51,7 @@ fn locked(revision: &str) -> LockedMaterials {
         cargo: CargoMaterials {
             registry: BTreeMap::new(),
             git: BTreeSet::from([(SELECTOR.to_owned(), revision.to_owned())]),
+            git_packages: Vec::new(),
         },
         npm: BTreeMap::new(),
     }

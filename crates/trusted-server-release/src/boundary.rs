@@ -122,6 +122,15 @@ pub(crate) struct Boundary {
     fingerprint: [u8; 32],
 }
 
+/// Reports whether `path` equals its rebuilt components, so it has no `.`,
+/// doubled or trailing separators (`components` silently drops them).
+fn lexically_normal(path: &Path) -> bool {
+    path.components()
+        .collect::<std::path::PathBuf>()
+        .as_os_str()
+        == path.as_os_str()
+}
+
 /// Binds a platform fingerprint to a fresh per-instance nonce.
 fn instance_fingerprint(platform: &[u8; 32]) -> Result<[u8; 32], Report<ReleaseError>> {
     let nonce: [u8; 16] = random_bytes()?;
@@ -169,6 +178,36 @@ impl Boundary {
             _ => Err(boundary_error("execution path is outside boundary roots")),
         }
     }
+    /// Translates a path reported by a confined command back to the host.
+    ///
+    /// Only paths inside writable roots translate: a build output may not
+    /// name an immutable or tool file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path is not inside a writable root.
+    pub(crate) fn host_path(
+        &self,
+        execution: &Path,
+    ) -> Result<std::path::PathBuf, Report<ReleaseError>> {
+        match &self.platform {
+            Platform::LinuxContainer(_) => docker::host_path(&self.roots, execution),
+            Platform::MacSandbox(_) if !lexically_normal(execution) => Err(boundary_error(
+                "execution path is not in lexical normal form",
+            )),
+            Platform::MacSandbox(_) => match self.roots.locate(execution) {
+                Some((RootRole::Writable, _, relative))
+                    if relative
+                        .components()
+                        .all(|component| matches!(component, std::path::Component::Normal(_))) =>
+                {
+                    Ok(execution.to_owned())
+                }
+                _ => Err(boundary_error("execution path is outside writable roots")),
+            },
+        }
+    }
+
     /// Configures the qualified macOS `sandbox-exec` boundary.
     ///
     /// # Errors
@@ -321,12 +360,30 @@ impl Boundary {
         self.scan_writable(ScanPolicy::AliasesOnly)
     }
 
+    /// Requires every tool selector to name exactly `<tool root>/bin/rustc`
+    /// in the execution namespace, so a build cannot select another compiler.
+    fn check_tool_selectors(&self, command: &ConfinedCommand) -> Result<(), Report<ReleaseError>> {
+        for (name, value) in command.tool_selector_entries() {
+            let allowed = self.roots.tools().iter().any(|tool_root| {
+                self.execution_path(&tool_root.join("bin").join("rustc"))
+                    .is_ok_and(|expected| expected.as_os_str() == value.as_os_str())
+            });
+            if !allowed {
+                return Err(boundary_error(format!(
+                    "tool selector {name:?} is not the bin/rustc of a tool root"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn check_placement(&self, command: &ConfinedCommand) -> Result<(), Report<ReleaseError>> {
         if self.roots.locate(&command.program).is_none() {
             return Err(boundary_error(
                 "confined program is outside every boundary root",
             ));
         }
+        self.check_tool_selectors(command)?;
         match self.roots.locate(&command.working_directory) {
             Some((RootRole::Immutable | RootRole::Writable, _, _)) => Ok(()),
             _ => Err(boundary_error(
@@ -335,3 +392,6 @@ impl Boundary {
         }
     }
 }
+
+#[cfg(test)]
+mod selector_placement_tests;

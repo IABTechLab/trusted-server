@@ -50,6 +50,27 @@ pub(crate) struct VerifiedGitMaterial {
 }
 
 impl VerifiedGitMaterial {
+    /// Wraps a hand-built loose-object store without verifying it, for tests.
+    #[cfg(test)]
+    pub(super) fn for_tests(
+        source_commit: &str,
+        cargo_lock_sha256: &str,
+        selector: &str,
+        revision: &str,
+        root_tree: &str,
+        store: tempfile::TempDir,
+    ) -> Self {
+        Self {
+            source_commit: source_commit.to_owned(),
+            cargo_lock_sha256: cargo_lock_sha256.to_owned(),
+            selector: selector.to_owned(),
+            revision: revision.to_owned(),
+            root_tree: root_tree.to_owned(),
+            store,
+            object_ids: BTreeSet::new(),
+        }
+    }
+
     /// Returns the independently approved source binding.
     pub(crate) fn source_commit(&self) -> &str {
         &self.source_commit

@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use error_stack::Report;
 use wasmparser::{Parser, Payload, TypeRef, Validator, WasmFeatures};
 
-use super::{Violation, WasmFacts, rejected, sha256_hex};
+use super::{Violation, WasmCustomSection, WasmFacts, rejected, sha256_hex};
 use crate::error::ReleaseError;
 
 /// Reviewed import modules of the Fastly Compute host ABI.
@@ -74,7 +74,23 @@ pub(crate) fn inspect_wasm(bytes: &[u8]) -> Result<WasmFacts, Report<ReleaseErro
         sha256: sha256_hex(bytes),
         import_modules: import_modules.into_iter().collect(),
         function_imports,
+        custom_sections: custom_sections(bytes)?,
     })
+}
+
+/// Returns every custom section in file order.
+fn custom_sections(bytes: &[u8]) -> Result<Vec<WasmCustomSection>, Report<ReleaseError>> {
+    let mut sections = Vec::new();
+    for payload in Parser::new(0).parse_all(bytes) {
+        let payload = payload.map_err(|error| rejected(Violation::WasmValidation, error))?;
+        if let Payload::CustomSection(reader) = payload {
+            sections.push(WasmCustomSection {
+                name: reader.name().to_owned(),
+                size: reader.data().len(),
+            });
+        }
+    }
+    Ok(sections)
 }
 
 /// Returns the distinct import modules and the function import count.

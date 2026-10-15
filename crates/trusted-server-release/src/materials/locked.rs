@@ -30,10 +30,22 @@ pub(super) struct RegistryMaterial {
     pub(super) sha256: String,
 }
 
+/// One Git package's exact locked identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct GitPackage {
+    pub(super) name: String,
+    pub(super) version: String,
+    /// Lock source without its `#<commit>` suffix, for example
+    /// `git+https://example.com/org/repo?tag=v1`.
+    pub(super) selector: String,
+    pub(super) revision: String,
+}
+
 /// Cargo acquisition expectations, not verified dependency trees.
 pub(super) struct CargoMaterials {
     pub(super) registry: BTreeMap<(String, String), RegistryMaterial>,
     pub(super) git: BTreeSet<(String, String)>,
+    pub(super) git_packages: Vec<GitPackage>,
 }
 
 fn text<'a>(value: &'a Value, field: &str) -> Result<&'a str, Report<ReleaseError>> {
@@ -185,6 +197,7 @@ pub(super) fn parse_cargo(bytes: &[u8]) -> Result<CargoMaterials, Report<Release
     let mut result = CargoMaterials {
         registry: BTreeMap::new(),
         git: BTreeSet::new(),
+        git_packages: Vec::new(),
     };
     let mut identities = BTreeSet::new();
     for package in packages {
@@ -235,6 +248,12 @@ pub(super) fn parse_cargo(bytes: &[u8]) -> Result<CargoMaterials, Report<Release
                 result
                     .git
                     .insert((repository.to_owned(), commit.to_owned()));
+                result.git_packages.push(GitPackage {
+                    name: name.to_owned(),
+                    version: version.to_owned(),
+                    selector: repository.to_owned(),
+                    revision: commit.to_owned(),
+                });
             }
             Some(_) => return Err(material_error("unsupported Cargo material source")),
         }

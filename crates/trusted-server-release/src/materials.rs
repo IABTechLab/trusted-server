@@ -5,6 +5,7 @@
 //! build completion.
 
 mod archive;
+mod cargo_vendor;
 mod extract;
 mod git;
 mod locked;
@@ -23,6 +24,10 @@ use crate::error::ReleaseError;
 use crate::process::Cancellation;
 use crate::source::ApprovedSource;
 pub(crate) use archive::VerifiedOriginal;
+#[allow(unused_imports, reason = "consumed by the Task 9 recipe")]
+pub(crate) use cargo_vendor::{
+    GitSourceConfig, GitVendorInput, NormalizedManifest, PreparedCargoMaterials, VendorInputs,
+};
 pub(crate) use extract::ExtractedOriginal;
 use locked::{CargoMaterials, NpmMaterial, parse_cargo, parse_npm};
 pub(crate) use manifest::{ReviewedNpmManifest, RootManifestReview};

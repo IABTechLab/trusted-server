@@ -278,6 +278,7 @@ mod tests {
             cargo: crate::materials::locked::CargoMaterials {
                 registry: BTreeMap::new(),
                 git: std::collections::BTreeSet::new(),
+                git_packages: Vec::new(),
             },
             npm,
         };

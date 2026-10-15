@@ -35,12 +35,14 @@ pub(crate) enum Role {
     Bundle,
     Spdx,
     Executable,
+    /// One Cargo `--message-format=json` line.
+    CargoMessage,
 }
 
 impl Role {
     fn limit(self) -> u64 {
         match self {
-            Self::Metadata => 1024 * 1024,
+            Self::Metadata | Self::CargoMessage => 1024 * 1024,
             Self::Source => 64 * 1024 * 1024,
             Self::Companion | Self::Bundle => 32 * 1024 * 1024,
             Self::Spdx => 16 * 1024 * 1024,

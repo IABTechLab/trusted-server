@@ -26,6 +26,8 @@ pub(crate) struct ConfinedCommand {
     pub(super) arguments: Vec<OsString>,
     pub(super) working_directory: PathBuf,
     pub(super) environment: Vec<(OsString, OsString)>,
+    /// Names in `environment` added through [`Self::tool_environment`].
+    tool_selectors: Vec<OsString>,
     pub(super) stdin: Option<Vec<u8>>,
     pub(super) limits: ProcessLimits,
     pub(super) cancellation: Option<Cancellation>,
@@ -97,11 +99,32 @@ impl ConfinedCommand {
             arguments: Vec::new(),
             working_directory: working_directory.to_path_buf(),
             environment: Vec::new(),
+            tool_selectors: Vec::new(),
             stdin: None,
             limits,
             cancellation: None,
             umask: None,
         })
+    }
+
+    /// Adds an explicitly selected tool path such as `RUSTC`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReleaseError::Process`] for any name or value
+    /// [`BoundedCommand::tool_selector_environment`] rejects, including a
+    /// duplicate.
+    pub(crate) fn tool_environment(
+        mut self,
+        name: impl AsRef<OsStr>,
+        value: impl AsRef<OsStr>,
+    ) -> Result<Self, Report<ReleaseError>> {
+        self.validated(None)?
+            .tool_selector_environment(name.as_ref(), value.as_ref())?;
+        self.environment
+            .push((name.as_ref().to_os_string(), value.as_ref().to_os_string()));
+        self.tool_selectors.push(name.as_ref().to_os_string());
+        Ok(self)
     }
 
     /// Appends fixed arguments.
@@ -131,6 +154,19 @@ impl ConfinedCommand {
         Ok(self)
     }
 
+    /// Returns whether `name` was added through [`Self::tool_environment`].
+    pub(super) fn is_tool_selector(&self, name: &OsStr) -> bool {
+        self.tool_selectors.iter().any(|selected| selected == name)
+    }
+
+    /// Returns the tool-selector entries, for the boundary's placement check.
+    pub(super) fn tool_selector_entries(&self) -> impl Iterator<Item = (&OsString, &OsString)> {
+        self.environment
+            .iter()
+            .filter(|(name, _)| self.is_tool_selector(name))
+            .map(|(name, value)| (name, value))
+    }
+
     /// Validates the environment plus `extra` through a scratch
     /// [`BoundedCommand`].
     pub(super) fn validated(
@@ -140,7 +176,11 @@ impl ConfinedCommand {
         let mut validator =
             BoundedCommand::new(&self.program, &self.working_directory, self.limits)?;
         for (name, value) in self.environment.iter() {
-            validator = validator.environment(name, value)?;
+            validator = if self.tool_selectors.contains(name) {
+                validator.tool_selector_environment(name, value)?
+            } else {
+                validator.environment(name, value)?
+            };
         }
         if let Some((name, value)) = extra {
             validator = validator.environment(name, value)?;
@@ -190,3 +230,6 @@ impl ConfinedCommand {
         bounded
     }
 }
+
+#[cfg(test)]
+mod selector_tests;

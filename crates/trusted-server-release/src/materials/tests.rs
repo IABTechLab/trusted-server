@@ -70,6 +70,7 @@ fn legacy_root_and_pax_compatibility_require_exact_locked_versions() {
                 cargo: CargoMaterials {
                     registry: BTreeMap::new(),
                     git: Default::default(),
+                    git_packages: Vec::new(),
                 },
                 npm: BTreeMap::from([(
                     location.clone(),

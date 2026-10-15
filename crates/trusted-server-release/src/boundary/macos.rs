@@ -238,7 +238,11 @@ impl MacProfile {
             bounded = bounded.umask(umask);
         }
         for (name, value) in &command.environment {
-            bounded = bounded.environment(name, value)?;
+            bounded = if command.is_tool_selector(name) {
+                bounded.tool_selector_environment(name, value)?
+            } else {
+                bounded.environment(name, value)?
+            };
         }
         Ok(command.finish(bounded))
     }

@@ -4,7 +4,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::Read as _;
-use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -16,11 +15,14 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
 use crate::boundary::{Boundary, BoundaryRoots, ConfinedCommand, DenialProof};
-use crate::documents::{Role, hash_bounded_with_check, parse_json};
+#[cfg(test)]
+use crate::documents::hash_bounded_with_check;
+use crate::documents::{Role, parse_json};
 use crate::error::ReleaseError;
 use crate::materials::{LockedMaterials, PreparedNpmOriginals, RootManifestReview};
 use crate::process::{Cancellation, ProcessLimits};
 use crate::source::{ApprovedSource, FreshSource};
+use crate::tool_tree::tool_tree_digest;
 
 pub(super) const LIB: &str = "crates/trusted-server-js/lib";
 const PREFIX: &[u8] = b"TS_RELEASE_NPM_OBSERVATION_V1 ";
@@ -76,75 +78,7 @@ impl SelectedJsTools {
     }
 
     fn digest(&self, attempt: &JsAttempt) -> Result<String, Report<ReleaseError>> {
-        let mut digest = Sha256::new();
-        let mut total_bytes = 0_u64;
-        let mut pending = vec![self.root.clone()];
-        let mut facts = BTreeMap::new();
-        while let Some(directory) = pending.pop() {
-            for entry in fs::read_dir(directory).map_err(preparation_error)? {
-                attempt.check()?;
-                let entry = entry.map_err(preparation_error)?;
-                let path = entry.path();
-                let relative = path
-                    .strip_prefix(&self.root)
-                    .map_err(preparation_error)?
-                    .to_str()
-                    .ok_or_else(|| preparation_error("tool path is not UTF-8"))?
-                    .to_owned();
-                let metadata = fs::symlink_metadata(&path).map_err(preparation_error)?;
-                let fact = if metadata.is_dir() {
-                    pending.push(path.clone());
-                    format!("directory:{}", metadata.permissions().mode() & 0o7777)
-                } else if metadata.is_file() && metadata.nlink() == 1 {
-                    let raw =
-                        hash_bounded_with_check(&path, 512 * 1024 * 1024, &|| attempt.check())?;
-                    total_bytes += raw.size;
-                    if total_bytes > 2 * 1024 * 1024 * 1024 {
-                        return Err(preparation_error(
-                            "selected tool tree exceeds total byte limit",
-                        ));
-                    }
-                    format!(
-                        "file:{}:{}:{}",
-                        metadata.permissions().mode() & 0o7777,
-                        raw.size,
-                        raw.sha256
-                    )
-                } else if metadata.file_type().is_symlink() {
-                    let target = fs::read_link(&path).map_err(preparation_error)?;
-                    if target.is_absolute()
-                        || !fs::canonicalize(&path)
-                            .map_err(preparation_error)?
-                            .starts_with(&self.root)
-                    {
-                        return Err(preparation_error(
-                            "selected tool alias escapes its owned root",
-                        ));
-                    }
-                    format!(
-                        "alias:{}",
-                        target
-                            .to_str()
-                            .ok_or_else(|| preparation_error("tool alias is not UTF-8"))?
-                    )
-                } else {
-                    return Err(preparation_error(
-                        "selected tool contains an unsafe file type or hardlink",
-                    ));
-                };
-                facts.insert(relative, fact);
-                if facts.len() > 100_000 {
-                    return Err(preparation_error("selected tool tree exceeds file limit"));
-                }
-            }
-        }
-        for (relative, fact) in facts {
-            digest.update(relative.as_bytes());
-            digest.update([0]);
-            digest.update(fact.as_bytes());
-            digest.update([0]);
-        }
-        Ok(hex::encode(digest.finalize()))
+        tool_tree_digest(&self.root, &|| attempt.check())
     }
 }
 

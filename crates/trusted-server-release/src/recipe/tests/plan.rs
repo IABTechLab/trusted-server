@@ -1,0 +1,499 @@
+use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::path::PathBuf;
+
+use super::super::paths::PrefixPaths;
+use super::fixture::*;
+use super::*;
+use crate::policy::FIXED_ARTIFACTS;
+use crate::preflight::audit_environment;
+
+/// The exact source-replacement pairs for the fixture's fictional Git source.
+fn expected_replacement() -> Vec<String> {
+    [
+        "--config",
+        "source.crates-io.replace-with=\"ts-vendor\"",
+        "--config",
+        "source.\"git+https://example.com/org/workspace?tag=v1\".git=\"https://example.com/org/workspace\"",
+        "--config",
+        "source.\"git+https://example.com/org/workspace?tag=v1\".tag=\"v1\"",
+        "--config",
+        "source.\"git+https://example.com/org/workspace?tag=v1\".replace-with=\"ts-vendor\"",
+        "--config",
+        "source.ts-vendor.directory=\"/boundary/immutable/2/vendor\"",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect()
+}
+
+#[test]
+fn cargo_plan_has_fixed_release_frozen_json_flags_and_exact_source_replacement() {
+    assert!(
+        !FIXED_ARTIFACTS.is_empty(),
+        "should select a nonzero number of assets"
+    );
+    for (index, artifact) in FIXED_ARTIFACTS.iter().enumerate() {
+        let role = if index % 2 == 0 { Role::A } else { Role::B };
+        let jobs = if role == Role::A { "4" } else { "2" };
+        let fixture = Fixture::new(COMMIT);
+        let prepared = fixture
+            .bind(artifact.name, role)
+            .expect("should bind every fixed asset");
+        let plan = prepared
+            .plan(&fixture.paths(role))
+            .expect("should derive the plan");
+        let mut expected_arguments: Vec<String> = [
+            "build",
+            "--package",
+            artifact.package,
+            "--bin",
+            artifact.bin,
+            "--target",
+            artifact.target.triple(),
+            "--release",
+            "--frozen",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        expected_arguments.extend(expected_replacement());
+        expected_arguments.extend(
+            ["--message-format=json-render-diagnostics", "--jobs", jobs]
+                .into_iter()
+                .map(str::to_owned),
+        );
+        assert_eq!(
+            plan.arguments, expected_arguments,
+            "should use the exact fixed arguments for {}",
+            artifact.name
+        );
+        assert_eq!(
+            plan.program,
+            fixture.base.join("tools/bin/cargo"),
+            "should run the selected Cargo by its host path"
+        );
+        let checkout = if role == Role::A {
+            "checkout-a"
+        } else {
+            "checkout-b"
+        };
+        assert_eq!(
+            plan.working_directory,
+            fixture.base.join(checkout),
+            "should run in the role checkout by its host path"
+        );
+        assert_environment(&plan.environment, &fixture, artifact.target);
+        prepared
+            .plan(&fixture.paths(role))
+            .expect("should derive the plan again");
+    }
+}
+
+fn assert_environment(actual: &BTreeMap<String, String>, fixture: &Fixture, target: ReleaseTarget) {
+    let mut expected: BTreeMap<String, String> = [
+        ("AWS_LC_SYS_USE_SYSTEM", "0"),
+        ("CARGO_HOME", "/boundary/writable/0/cargo-home"),
+        ("CARGO_TARGET_DIR", "/boundary/writable/1"),
+        ("HOME", "/boundary/writable/0/home"),
+        ("LC_ALL", "C"),
+        ("LIBSQLITE3_SYS_USE_PKG_CONFIG", "0"),
+        ("PATH", "/boundary/tool/0/bin:/usr/bin:/bin"),
+        ("RUSTC", "/boundary/tool/0/bin/rustc"),
+        ("SOURCE_DATE_EPOCH", "1700000000"),
+        ("TMPDIR", "/boundary/writable/0/tmp"),
+        ("TRUSTED_SERVER__GIT_VERSION", COMMIT),
+        ("TRUSTED_SERVER__RELEASE_BUILD", "1"),
+        (
+            "TRUSTED_SERVER__TSJS_PREBUILT_INVENTORY",
+            "/boundary/immutable/1/tsjs-inventory.json",
+        ),
+        ("TSJS_PREBUILT_DIR", "/boundary/immutable/1/bundles"),
+        ("TZ", "UTC"),
+    ]
+    .into_iter()
+    .map(|(name, value)| (name.to_owned(), value.to_owned()))
+    .collect();
+    expected.insert(
+        format!(
+            "AWS_LC_SYS_USE_SYSTEM_{}",
+            target.triple().replace('-', "_")
+        ),
+        "0".to_owned(),
+    );
+    if target.is_darwin() {
+        expected.insert("MACOSX_DEPLOYMENT_TARGET".to_owned(), "13.0".to_owned());
+    }
+    assert_eq!(
+        actual, &expected,
+        "should hold exactly the child environment with every path in the execution namespace"
+    );
+    for (name, value) in actual {
+        assert!(
+            !value.contains(fixture.base.to_str().expect("should be UTF-8")),
+            "should not leak a host path into {name}"
+        );
+    }
+}
+
+/// One mapped location per path-carrying variable, so each can be omitted alone.
+fn granular(fixture: &Fixture, omit: &[&str]) -> PrefixPaths {
+    let retained = fixture.retained();
+    let all: [(&str, PathBuf, &str, bool); 9] = [
+        ("target", fixture.base.join("target"), "/c/target", true),
+        (
+            "cargo-home",
+            fixture.base.join("cargo-state/cargo-home"),
+            "/c/cargo-home",
+            true,
+        ),
+        (
+            "home",
+            fixture.base.join("cargo-state/home"),
+            "/c/home",
+            true,
+        ),
+        ("tmp", fixture.base.join("cargo-state/tmp"), "/c/tmp", true),
+        ("bundles", retained.join("bundles"), "/c/bundles", false),
+        (
+            "inventory",
+            retained.join("tsjs-inventory.json"),
+            "/c/inventory.json",
+            false,
+        ),
+        (
+            "rustc",
+            fixture.base.join("tools/bin/rustc"),
+            "/c/rustc",
+            false,
+        ),
+        ("bin", fixture.base.join("tools/bin"), "/c/bin", false),
+        (
+            "vendor",
+            fixture.base.join("materials/vendor"),
+            "/c/vendor",
+            false,
+        ),
+    ];
+    all.iter().filter(|(name, ..)| !omit.contains(name)).fold(
+        PrefixPaths::new(),
+        |paths, (_, host, execution, writable)| paths.with(host, execution, *writable),
+    )
+}
+
+#[test]
+fn path_variables_outside_every_root_are_rejected() {
+    let fixture = Fixture::new(COMMIT);
+    let prepared = fixture
+        .bind("ts-aarch64-apple-darwin", Role::A)
+        .expect("should bind the recipe");
+    prepared
+        .plan(&granular(&fixture, &[]))
+        .expect("should derive the plan when every location is mapped");
+    let cases: [(&str, &[&str]); 8] = [
+        ("CARGO_TARGET_DIR", &["target"]),
+        ("CARGO_HOME", &["cargo-home"]),
+        ("HOME", &["home"]),
+        ("TMPDIR", &["tmp"]),
+        ("TSJS_PREBUILT_DIR", &["bundles"]),
+        ("TRUSTED_SERVER__TSJS_PREBUILT_INVENTORY", &["inventory"]),
+        ("RUSTC", &["rustc", "bin"]),
+        ("vendor directory", &["vendor"]),
+    ];
+    for (label, omit) in cases {
+        let message = plan_error(&prepared, &granular(&fixture, omit));
+        assert!(
+            message.contains(label) && message.contains("outside the boundary roots"),
+            "should reject {label} outside the roots: {message}"
+        );
+    }
+    let message = plan_error(&prepared, &granular(&fixture, &["bin"]));
+    assert!(
+        message.contains("PATH") && message.contains("outside the boundary roots"),
+        "should reject the tool directory in PATH outside the roots: {message}"
+    );
+}
+
+#[test]
+fn child_home_and_cargo_home_must_be_the_request_state() {
+    let fixture = Fixture::new(COMMIT);
+    let request = fixture.request("ts-aarch64-apple-darwin", "A", COMMIT);
+    let commit = CommitId::parse(COMMIT).expect("should parse commit");
+    let mut forged = child_request(&request);
+    forged.home = fixture.base.join("other-work/home");
+    let child =
+        crate::preflight::child::build_child_for_tests(&audited(), &commit, 1_700_000_000, &forged)
+            .expect("should build a child with another HOME");
+    let error = PreparedRecipe::bind(BindInputs {
+        commit: &commit,
+        child,
+        completed: &fixture.completed,
+        tools: fixture.tools_for(ReleaseTarget::Aarch64AppleDarwin),
+        materials: fixture.materials(COMMIT),
+        ambient: fixture.ambient(Role::A),
+        request,
+    });
+    assert!(
+        bind_error(error).contains("HOME is not the request's private cargo state"),
+        "should reject a child HOME outside the request state"
+    );
+}
+
+#[test]
+fn cargo_plan_rejects_inherited_rustflags_and_selectors() {
+    for name in [
+        "RUSTFLAGS",
+        "CARGO_ENCODED_RUSTFLAGS",
+        "CARGO_BUILD_TARGET",
+        "RUSTUP_TOOLCHAIN",
+        "CC",
+        "TSJS_SKIP_BUILD",
+    ] {
+        let snapshot = [(OsString::from(name), OsString::from("fictional"))];
+        let rejection = match audit_environment(&snapshot) {
+            Ok(_) => panic!("should reject inherited {name}"),
+            Err(error) => format!("{error:?}"),
+        };
+        assert!(
+            rejection.contains(name),
+            "should reject inherited {name} before any plan exists"
+        );
+    }
+    let fixture = Fixture::new(COMMIT);
+    let prepared = fixture
+        .bind("ts-x86_64-unknown-linux-gnu", Role::A)
+        .expect("should bind from a benign environment");
+    let plan = prepared
+        .plan(&fixture.paths(Role::A))
+        .expect("should derive the plan");
+    for name in plan.environment.keys() {
+        assert!(
+            name == "RUSTC" || (!name.starts_with("RUST") && !name.starts_with("CARGO_BUILD")),
+            "should carry no selector besides the explicit RUSTC: {name}"
+        );
+    }
+    let configs: Vec<&String> = plan
+        .arguments
+        .iter()
+        .enumerate()
+        .filter(|(_, argument)| *argument == "--config")
+        .filter_map(|(index, _)| plan.arguments.get(index + 1))
+        .collect();
+    assert_eq!(
+        configs.len(),
+        expected_replacement().len() / 2,
+        "should carry only the exact source-replacement configs"
+    );
+    for argument in &plan.arguments {
+        assert!(
+            ![
+                "--features",
+                "--all-features",
+                "--no-default-features",
+                "--manifest-path",
+                "--config=",
+            ]
+            .iter()
+            .any(|selector| argument.starts_with(selector))
+                && !argument.starts_with('+'),
+            "should not carry selector argument {argument}"
+        );
+    }
+    assert!(
+        plan.arguments
+            .iter()
+            .any(|argument| argument == "--release")
+            && plan.arguments.iter().any(|argument| argument == "--frozen"),
+        "should keep the release and frozen flags"
+    );
+}
+
+#[test]
+fn plan_digest_binds_every_part_of_the_plan() {
+    let fixture = Fixture::new(COMMIT);
+    let prepared = fixture
+        .bind("ts-aarch64-apple-darwin", Role::A)
+        .expect("should bind the recipe");
+    let paths = fixture.paths(Role::A);
+    let plan = prepared.plan(&paths).expect("should derive the plan");
+    let digest = plan.digest().expect("should digest the plan");
+    assert_eq!(digest.len(), 64, "should be a SHA-256 hex digest");
+    assert_eq!(
+        digest,
+        prepared
+            .plan(&paths)
+            .expect("should derive the plan again")
+            .digest()
+            .expect("should digest again"),
+        "should be a pure function of the bound inputs"
+    );
+    type Edit = fn(&mut CargoPlan);
+    let edits: [(&str, Edit); 6] = [
+        ("argument", |p| p.arguments.push("--offline".to_owned())),
+        ("dropped argument", |p| {
+            p.arguments.retain(|argument| argument != "--release");
+        }),
+        ("environment value", |p| {
+            p.environment
+                .insert("RUSTC".to_owned(), "/other/rustc".to_owned());
+        }),
+        ("injected variable", |p| {
+            p.environment
+                .insert("RUSTFLAGS".to_owned(), "--cfg x".to_owned());
+        }),
+        ("program", |p| p.program = PathBuf::from("/other/cargo")),
+        ("umask", |p| p.umask = umask(0o000)),
+    ];
+    for (label, edit) in edits {
+        let mut changed = prepared.plan(&paths).expect("should derive the plan");
+        edit(&mut changed);
+        assert_ne!(
+            changed.digest().expect("should digest the edited plan"),
+            digest,
+            "should change the digest for an edited {label}"
+        );
+    }
+    let mut moved = prepared.plan(&paths).expect("should derive the plan");
+    moved.working_directory = fixture.base.join("checkout-b");
+    assert_ne!(
+        moved.digest().expect("should digest the moved plan"),
+        digest,
+        "should change the digest for another working directory"
+    );
+}
+
+#[test]
+fn plan_carries_the_role_umask() {
+    for (role, expected) in [(Role::A, 0o022), (Role::B, 0o027)] {
+        let fixture = Fixture::new(COMMIT);
+        let prepared = fixture
+            .bind("ts-aarch64-apple-darwin", role)
+            .expect("should bind the recipe");
+        assert_eq!(
+            prepared
+                .plan(&fixture.paths(role))
+                .expect("should derive the plan")
+                .umask,
+            umask(expected),
+            "should derive the umask of role {role:?} from its ambient profile"
+        );
+    }
+}
+
+#[test]
+fn confined_command_applies_the_role_umask_and_keeps_host_program_paths() {
+    for (role, expected) in [(Role::A, "022"), (Role::B, "027")] {
+        let fixture = Fixture::new(COMMIT);
+        let prepared = fixture
+            .bind("ts-aarch64-apple-darwin", role)
+            .expect("should bind the recipe");
+        let plan = prepared
+            .plan(&fixture.paths(role))
+            .expect("should derive the plan");
+        let command = plan
+            .confined_command(confinement_limits())
+            .expect("should describe the confined command");
+        assert_eq!(
+            command
+                .requested_umask()
+                .map(|umask| umask.to_string())
+                .as_deref(),
+            Some(expected),
+            "should set the umask of role {role:?} on the confined command"
+        );
+        let described = format!("{command:?}");
+        for part in [
+            format!("{:?}", plan.program),
+            format!("{:?}", plan.working_directory),
+            format!(
+                "{:?}",
+                plan.arguments
+                    .iter()
+                    .map(OsString::from)
+                    .collect::<Vec<_>>()
+            ),
+        ] {
+            assert!(
+                described.contains(&part),
+                "should describe {part} in {described}"
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn real_boundary_translates_every_plan_path() {
+    use crate::boundary::Boundary;
+    let fixture = Fixture::new(COMMIT);
+    let prepared = fixture
+        .bind("ts-aarch64-apple-darwin", Role::A)
+        .expect("should bind the recipe");
+    let roots = prepared.boundary_roots().expect("should derive roots");
+    let boundary = Boundary::mac_sandbox_for_tests(roots).expect("should configure, not run");
+    let plan = prepared
+        .plan(&boundary)
+        .expect("should derive the plan through the boundary");
+    assert_eq!(
+        plan.environment.get("CARGO_TARGET_DIR").map(String::as_str),
+        fixture.base.join("target").to_str(),
+        "should map writable roots to themselves on macOS"
+    );
+    assert!(
+        plan.environment["PATH"].starts_with(
+            fixture
+                .base
+                .join("tools/bin")
+                .to_str()
+                .expect("should be UTF-8")
+        ),
+        "should put the selected tool directory first in PATH"
+    );
+}
+
+#[test]
+fn execution_paths_with_control_characters_or_separators_are_rejected() {
+    let fixture = Fixture::new(COMMIT);
+    let prepared = fixture
+        .bind("ts-aarch64-apple-darwin", Role::A)
+        .expect("should bind the recipe");
+    for bad in [
+        "/c/bin\nx",
+        "/c/bin\tx",
+        "/c/bin\u{7f}x",
+        "/c/bi:n",
+        "/c/bi\"n",
+        "/c/bi\\n",
+    ] {
+        let paths = PrefixPaths::new()
+            .with(&fixture.base.join("tools"), bad, false)
+            .with(&fixture.retained(), "/c/retained", false)
+            .with(&fixture.base, "/c/base", true);
+        let message = plan_error(&prepared, &paths);
+        assert!(
+            message.contains("not plain absolute UTF-8"),
+            "should reject execution path {bad:?}: {message}"
+        );
+    }
+}
+
+#[test]
+fn fake_host_path_rejects_non_normal_components_like_the_real_inverse() {
+    let paths = PrefixPaths::new().with(std::path::Path::new("/host/target"), "/c/target", true);
+    assert!(
+        paths
+            .host_path(std::path::Path::new("/c/target/release/ts"))
+            .is_ok()
+    );
+    for bad in [
+        "/c/target/../target/ts",
+        "/c/target/./ts",
+        "/c/target//ts",
+        "/c/target/ts/",
+    ] {
+        assert!(
+            paths.host_path(std::path::Path::new(bad)).is_err(),
+            "should reject {bad}"
+        );
+    }
+}

@@ -102,7 +102,8 @@ impl Workspace {
             .expect("should write JS module");
         fs::write(root.join("js/tsjs-inventory.json"), b"fictional inventory")
             .expect("should write JS inventory");
-        fs::create_dir(root.join("materials")).expect("should create materials root");
+        fs::create_dir_all(root.join("materials/vendor")).expect("should create materials root");
+        fs::create_dir(root.join("cargo-state")).expect("should create cargo state root");
         fs::create_dir(root.join("output")).expect("should create output root");
         Self { directory, root }
     }
@@ -111,7 +112,7 @@ impl Workspace {
         self.root.join(relative)
     }
 
-    fn input<'a>(&'a self, paths: &'a [PathBuf; 5]) -> RecipeInput<'a> {
+    fn input<'a>(&'a self, paths: &'a [PathBuf; 6]) -> RecipeInput<'a> {
         RecipeInput {
             asset: "ts-aarch64-apple-darwin",
             variant: "default",
@@ -120,16 +121,18 @@ impl Workspace {
             js_dir: &paths[0],
             js_inventory: &paths[1],
             materials: &paths[2],
-            output: &paths[3],
-            target_dir: &paths[4],
+            cargo_state: &paths[3],
+            output: &paths[4],
+            target_dir: &paths[5],
         }
     }
 
-    fn defaults(&self) -> [PathBuf; 5] {
+    fn defaults(&self) -> [PathBuf; 6] {
         [
             self.path("js/bundles"),
             self.path("js/tsjs-inventory.json"),
             self.path("materials"),
+            self.path("cargo-state"),
             self.path("output"),
             self.path("target"),
         ]
@@ -138,7 +141,7 @@ impl Workspace {
 
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
 
-fn parse_error(paths: &[PathBuf; 5], workspace: &Workspace) -> String {
+fn parse_error(paths: &[PathBuf; 6], workspace: &Workspace) -> String {
     let error = match RecipeRequest::parse(&workspace.input(paths)) {
         Ok(_) => panic!("should reject the request"),
         Err(error) => error,
@@ -156,7 +159,7 @@ fn relative_or_dotted_paths_are_rejected() {
         workspace.path("output/../output"),
         workspace.path("./output"),
     ];
-    for index in 0..5 {
+    for index in 0..6 {
         for bad in &bad_values {
             let mut paths = workspace.defaults();
             paths[index] = bad.clone();
@@ -178,7 +181,7 @@ fn existing_nonempty_output_root_is_rejected() {
         "should reject an output root with prior entries"
     );
     let mut absent = workspace.defaults();
-    absent[3] = workspace.path("missing-output");
+    absent[4] = workspace.path("missing-output");
     assert!(
         parse_error(&absent, &workspace).contains("cannot be resolved"),
         "should reject an output root that does not exist"
@@ -203,8 +206,47 @@ fn symlinked_or_preexisting_materials_root_is_rejected() {
     fs::write(workspace.path("materials/cache"), b"prepared earlier")
         .expect("should populate materials");
     assert!(
+        parse_error(&workspace.defaults(), &workspace).contains("exactly the prepared vendor"),
+        "should reject a materials root holding more than the vendor directory"
+    );
+}
+
+#[test]
+fn materials_root_must_hold_exactly_a_vendor_directory() {
+    let workspace = Workspace::new();
+    RecipeRequest::parse(&workspace.input(&workspace.defaults()))
+        .expect("should accept the prepared layout");
+    fs::remove_dir(workspace.path("materials/vendor")).expect("should remove vendor");
+    assert!(
+        parse_error(&workspace.defaults(), &workspace).contains("exactly the prepared vendor"),
+        "should reject an empty materials root"
+    );
+    fs::write(workspace.path("materials/vendor"), b"not a directory")
+        .expect("should write a vendor file");
+    assert!(
+        parse_error(&workspace.defaults(), &workspace).contains("vendor directory"),
+        "should reject a vendor entry that is a file"
+    );
+    fs::remove_file(workspace.path("materials/vendor")).expect("should remove vendor file");
+    fs::create_dir_all(workspace.path("elsewhere")).expect("should create alias target");
+    symlink(
+        workspace.path("elsewhere"),
+        workspace.path("materials/vendor"),
+    )
+    .expect("should alias vendor");
+    assert!(
+        parse_error(&workspace.defaults(), &workspace).contains("symlink"),
+        "should reject a symlinked vendor directory"
+    );
+}
+
+#[test]
+fn reused_cargo_state_root_is_rejected() {
+    let workspace = Workspace::new();
+    fs::create_dir(workspace.path("cargo-state/home")).expect("should create previous state");
+    assert!(
         parse_error(&workspace.defaults(), &workspace).contains("cannot be reused"),
-        "should reject a pre-populated materials root"
+        "should reject a cargo state root with prior entries"
     );
 }
 
@@ -221,11 +263,13 @@ fn reused_target_directory_is_rejected() {
 #[test]
 fn overlapping_roots_are_rejected() {
     let workspace = Workspace::new();
-    let cases: [(usize, &str); 4] = [
-        (3, "materials"),
-        (4, "output/target"),
-        (4, "materials/target"),
-        (4, "js/target"),
+    let cases: [(usize, &str); 6] = [
+        (3, "output"),
+        (4, "cargo-state"),
+        (5, "output/target"),
+        (5, "cargo-state/target"),
+        (5, "materials/target"),
+        (5, "js/target"),
     ];
     for (index, relative) in cases {
         let mut paths = workspace.defaults();
@@ -281,6 +325,11 @@ fn checked_b() -> CheckedAmbient {
 
 mod ambient;
 mod bind;
+mod complete;
+mod fixture;
+mod plan;
+mod sources;
+mod tools;
 
 #[test]
 fn symlinked_ancestor_of_target_parent_is_rejected() {
@@ -293,7 +342,7 @@ fn symlinked_ancestor_of_target_parent_is_rejected() {
     .expect("should create parent alias");
     fs::create_dir(workspace.path("real-parent/inner")).expect("should create inner parent");
     let mut paths = workspace.defaults();
-    paths[4] = workspace.path("linked-parent/inner/target");
+    paths[5] = workspace.path("linked-parent/inner/target");
     assert!(
         parse_error(&paths, &workspace).contains("symlink"),
         "should reject a target below a symlinked ancestor"

@@ -1,6 +1,6 @@
 //! Core Wasm inspection tests.
 
-use super::builders::{section, wasm_module};
+use super::builders::{section, wasm_module, wasm_module_with_customs};
 use super::*;
 
 #[test]
@@ -122,6 +122,74 @@ fn truncated_modules_are_handled_without_panic() {
         assert!(
             result.is_err() || SECTION_BOUNDARIES.contains(&length),
             "should reject the module truncated to {length} bytes"
+        );
+    }
+}
+
+#[test]
+fn custom_sections_are_recorded_in_file_order_with_sizes() {
+    let bytes = wasm_module_with_customs(
+        &[("fastly_log", "write")],
+        &[
+            (".debug_info", b"info"),
+            ("name", b"xy"),
+            (".debug_info", b""),
+        ],
+    );
+
+    let facts = inspect_wasm(&bytes).expect("should accept a module with custom sections");
+
+    let observed: Vec<(&str, usize)> = facts
+        .custom_sections()
+        .iter()
+        .map(|section| (section.name(), section.size()))
+        .collect();
+    assert_eq!(
+        observed,
+        [(".debug_info", 4), ("name", 2), (".debug_info", 0)],
+        "should record every custom section name and payload size in order"
+    );
+    assert!(
+        inspect_wasm(&wasm_module(&[]))
+            .expect("should accept an empty module")
+            .custom_sections()
+            .is_empty(),
+        "should record no custom sections for a bare module"
+    );
+}
+
+#[test]
+fn debug_sections_are_required_and_nonempty() {
+    let complete = wasm_module_with_customs(
+        &[],
+        &[(".debug_info", b"i"), (".debug_line", b"l"), ("name", b"n")],
+    );
+    inspect_wasm(&complete)
+        .expect("should accept a module with debug sections")
+        .require_debug_sections()
+        .expect("should accept both debug sections");
+
+    let cases: [(&str, Vec<u8>); 4] = [
+        ("stripped", wasm_module_with_customs(&[], &[("name", b"n")])),
+        (
+            "missing line",
+            wasm_module_with_customs(&[], &[(".debug_info", b"i")]),
+        ),
+        (
+            "missing info",
+            wasm_module_with_customs(&[], &[(".debug_line", b"l")]),
+        ),
+        (
+            "empty info",
+            wasm_module_with_customs(&[], &[(".debug_info", b""), (".debug_line", b"l")]),
+        ),
+    ];
+    for (label, bytes) in cases {
+        let facts = inspect_wasm(&bytes).expect("should accept the module itself");
+        assert_eq!(
+            violation(facts.require_debug_sections()),
+            Violation::WasmDebugInfo,
+            "should reject a {label} module for the no-strip check"
         );
     }
 }
