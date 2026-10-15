@@ -4,7 +4,7 @@
 
 **Date:** 2026-10-07
 
-**Status:** Draft (design validated by an exploratory implementation; see the plan, `docs/superpowers/plans/2026-10-07-1231-creative-asset-host-allowlist.md`)
+**Status:** Implemented in #1253 (see the plan, `docs/superpowers/plans/2026-10-07-1231-creative-asset-host-allowlist.md`)
 
 **Related:** [#1234](https://github.com/IABTechLab/trusted-server/issues/1234) (separate click-rewriting switch). Both issues replace `to_abs`; see [Coordination with #1234](#coordination-with-1234).
 
@@ -134,13 +134,13 @@ Add `Rewrite::normalize(&mut self)` and call it from `Settings::normalize_deseri
 - `include_domains`: keep entries as normalized. `validate_include_domains` rejects every entry that can never equal `Url::host_str()`: after its syntactic checks, each entry must round-trip unchanged through `url::Host::parse` (the parser behind `host_str()`), with brackets kept for IPv6. The key is new, so no existing config can trip this. A malformed allowlist is better caught at `ts config push` than silently widened to "proxy everything", or silently narrowed to "proxy nothing" by an entry that never matches.
 
   An accepted entry is one of:
-  - a DNS name, optionally prefixed with `*.`, made of `.`-separated, non-empty labels of `[a-z0-9-]`;
+  - a DNS name, optionally prefixed with `*.`, made of `.`-separated, non-empty labels of `[a-z0-9_-]`;
   - an IPv4 address in dotted-quad form, such as `192.0.2.1`;
   - an IPv6 address in brackets and compressed form, such as `[2001:db8::1]`, which is how `host_str()` renders it.
 
   Rejected entries fail with `invalid_rewrite_include_domain`:
   - an empty entry, a bare `*`, `*.` with an empty suffix, and any `*` other than a leading `*.`;
-  - a scheme, a port, a path, and spaces or any other character outside `[a-z0-9.-]` after the optional `*.`;
+  - a scheme, a port, a path, and spaces or any other character outside `[a-z0-9._-]` after the optional `*.`;
   - a leading or trailing `.`, or an empty label;
   - an unbracketed or non-compressed IPv6 address, a wildcard IP address, and a host whose last label is numeric but is not a dotted-quad IPv4 address (`host_str()` would render it as IPv4).
 
@@ -374,7 +374,7 @@ No changes. `proxy_sign.test.ts` already covers non-`403` fallback.
 
 ## Rollout and rollback
 
-1. Deploy the binary. With no `include_domains`, asset behavior is unchanged except for the `exclude_domains` case fix.
+1. Deploy the binary. With no `include_domains`, asset behavior is unchanged except for the `exclude_domains` case fix, the inline `<link imagesrcset>` double-proxy fix, leaving unparseable absolute URLs untouched, and the new `exclude_domains` load warnings.
 2. Add `include_domains` to `trusted-server.toml` and `ts config push`. `ts config push` validates entries before publishing.
 
 Rollback is the reverse: remove `include_domains` and push, then roll back the binary. `Rewrite` uses `deny_unknown_fields` (`settings.rs:637`), so an older binary rejects a blob that carries the key. The CHANGELOG Added entry and a warning box in `configuration.md`'s `[rewrite]` section state this order, mirroring the existing `[auction] rewrite_creatives` upgrade and rollback box (and #1234's `[auction] rewrite_clicks` box if that has landed). A blob written by the new binary with the list empty omits the key and stays readable. Rolling the binary back also restores the case-sensitive `exclude_domains` match.

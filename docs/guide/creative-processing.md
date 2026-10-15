@@ -782,7 +782,8 @@ include_domains = ["assets.example.com", "*.img.example.com"]
   directly, and do not receive the EC ID that proxied fetches append.
 - `exclude_domains` wins when a host matches both lists.
 - Click-through links (`<a href>`, `<area href>`) are not affected. Whether
-  they are wrapped in `/first-party/click` depends only on `rewrite_clicks` and
+  they are wrapped in `/first-party/click` depends only on `rewrite_clicks`
+  (which follows `rewrite_creatives` on the auction paths when unset) and
   `exclude_domains`.
 - HTML and CSS fetched through `/first-party/proxy` go through the same rewrite
   pass and follow the same list.

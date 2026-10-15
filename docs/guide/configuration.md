@@ -1180,7 +1180,7 @@ Matches:
 - `exclude_domains` wins when a host matches both lists.
 - Each `include_domains` entry must be able to equal a URL host. After
   lowercasing, an entry must be one of:
-  - a host name of ASCII letters, digits, `-` and `.`, optionally prefixed with
+  - a host name of ASCII letters, digits, `-`, `_` and `.`, optionally prefixed with
     `*.`, with no leading or trailing `.` and no empty label;
   - an IPv4 address in dotted-quad form, such as `192.0.2.1`;
   - an IPv6 address in brackets, written the way URL hosts render it, such as
@@ -1195,7 +1195,13 @@ Matches:
   because they never match a host. Other `exclude_domains` entries that can
   never match a host (for example `https://cdn.example.com` or
   `cdn.example.com:443`) are kept but logged with a warning at load; fix them,
-  or their hosts stay proxied.
+  or their hosts stay proxied. This check is looser than the `include_domains`
+  grammar: a trailing `.` (such as `blocked.example.com.`), a `_` and a
+  wildcard IP address all match real URL hosts and are not flagged.
+- `include_domains` controls which asset URLs are newly rewritten or signed. It
+  is not enforced when a proxy URL is fetched: a proxy URL issued before a host
+  was removed from the list (for example, in a cached creative) still forwards
+  the EC ID to that host, subject only to `proxy.allowed_domains`.
 
 ::: tip
 When both `include_domains` and `proxy.allowed_domains` are set, keep every

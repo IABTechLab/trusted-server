@@ -752,11 +752,29 @@ impl Rewrite {
         // host proxied and receiving `ts-ec`. Rejecting it would stop existing
         // blobs from loading, so warn once per entry and keep it.
         for pattern in &self.exclude_domains {
-            if let Err(reason) = check_include_domain(pattern) {
+            if let Err(reason) = Self::check_exclude_domain(pattern) {
                 log::warn!(
                     "rewrite.exclude_domains: entry `{pattern}` never matches a URL host ({reason})"
                 );
             }
+        }
+    }
+
+    /// Checks one normalized `exclude_domains` entry, returning why no fetched
+    /// URL can match it.
+    ///
+    /// Looser than the `include_domains` grammar on purpose: a trailing `.`, a
+    /// `_` and a wildcard IP address all still match a URL host, and a
+    /// trailing-dot entry is the only way to exclude `blocked.example.com.`.
+    fn check_exclude_domain(pattern: &str) -> Result<(), &'static str> {
+        let host = pattern.strip_prefix("*.").unwrap_or(pattern);
+        let labels = host.strip_suffix('.').unwrap_or(host);
+        if host.contains('*') {
+            Err("`*` other than a leading `*.`")
+        } else if labels.split('.').any(str::is_empty) {
+            Err("leading `.` or empty label")
+        } else {
+            check_host_round_trip(host)
         }
     }
 }
@@ -3584,7 +3602,7 @@ impl Settings {
 /// be:
 ///
 /// - a DNS name, optionally prefixed with `*.`: one or more `.`-separated,
-///   non-empty labels of ASCII `a-z`, `0-9` and `-`;
+///   non-empty labels of ASCII `a-z`, `0-9`, `-` and `_`;
 /// - an IPv4 address in dotted-quad form, such as `192.0.2.1`; or
 /// - an IPv6 address in brackets and compressed form, such as `[2001:db8::1]`.
 ///
@@ -3598,8 +3616,10 @@ fn validate_include_domains(patterns: &[String]) -> Result<(), ValidationError> 
             let mut err = ValidationError::new("non_ascii_rewrite_include_domain");
             err.add_param("value".into(), pattern);
             err.message = Some(
-                "rewrite.include_domains entries must be ASCII; write internationalized domain names in punycode (xn--) form"
-                    .into(),
+                format!(
+                    "rewrite.include_domains entry `{pattern}` is not ASCII; write internationalized domain names in punycode (xn--) form"
+                )
+                .into(),
             );
             return Err(err);
         }
@@ -3608,8 +3628,10 @@ fn validate_include_domains(patterns: &[String]) -> Result<(), ValidationError> 
             err.add_param("value".into(), pattern);
             err.add_param("reason".into(), &reason);
             err.message = Some(
-                "rewrite.include_domains entries must be a host name, an optional leading `*.`, a dotted-quad IPv4 address or a bracketed IPv6 address"
-                    .into(),
+                format!(
+                    "rewrite.include_domains entry `{pattern}` must be a host name with an optional leading `*.`, a dotted-quad IPv4 address or a bracketed IPv6 address ({reason})"
+                )
+                .into(),
             );
             return Err(err);
         }
@@ -3636,9 +3658,9 @@ fn check_include_domain(pattern: &str) -> Result<(), &'static str> {
         return Err("no host");
     }
     if !name.bytes().all(|byte| {
-        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.')
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.' | b'_')
     }) {
-        return Err("character outside a-z, 0-9, `-` and `.`");
+        return Err("character outside a-z, 0-9, `-`, `_` and `.`");
     }
     if name.split('.').any(str::is_empty) {
         return Err("leading or trailing `.` or empty label");
@@ -3647,8 +3669,7 @@ fn check_include_domain(pattern: &str) -> Result<(), &'static str> {
     // A URL host whose last label is numeric is parsed as an IPv4 address, so
     // such an entry only matches as an exact dotted-quad address.
     let last_label = name.rsplit('.').next().unwrap_or(name);
-    let numeric_last_label =
-        last_label.bytes().all(|byte| byte.is_ascii_digit()) || last_label.starts_with("0x");
+    let numeric_last_label = last_label.bytes().all(|byte| byte.is_ascii_digit());
     if numeric_last_label
         && (name.len() != pattern.len() || name.parse::<std::net::Ipv4Addr>().is_err())
     {
@@ -7120,6 +7141,48 @@ source_domain = "partner.example.com"
     }
 
     #[test]
+    fn rewrite_exclude_domains_flag_only_entries_that_never_match() {
+        for entry in [
+            "https://cdn.example.com",
+            "cdn.example.com:443",
+            "[2001:0db8::1]",
+            "cdn.*.example.com",
+            ".example.com",
+            "bücher.example",
+        ] {
+            assert!(
+                Rewrite::check_exclude_domain(entry).is_err(),
+                "should flag `{entry}`, which never matches a URL host"
+            );
+        }
+        for entry in [
+            "blocked.example.com.",
+            "ads_cdn.example.com",
+            "*.192.0.2.1",
+            "*.example.com",
+            "[::1]",
+        ] {
+            assert!(
+                Rewrite::check_exclude_domain(entry).is_ok(),
+                "should not flag `{entry}`, which matches a URL host"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_include_domains_report_the_bad_entry_and_reason() {
+        let err = validate_include_domains(&["cdn.example.com:443".to_owned()])
+            .expect_err("should reject an entry with a port");
+
+        let message = err.message.expect("should set a message").into_owned();
+        assert!(
+            message.contains("entry `cdn.example.com:443`")
+                && message.contains("character outside"),
+            "should name the bad entry and the reason: {message}"
+        );
+    }
+
+    #[test]
     fn rewrite_include_domains_are_normalized_from_toml() {
         let toml_str = crate_test_settings_str()
             + r#"
@@ -7156,7 +7219,7 @@ source_domain = "partner.example.com"
             "example.com.",
             "cdn..example.com",
             "cdn example.com",
-            "cdn_assets.example.com",
+            "0xc0000201",
             "::1",
             "[::1",
             "[2001:0db8::1]",
@@ -7195,6 +7258,10 @@ source_domain = "partner.example.com"
             "cdn.example.com",
             "*.example.com",
             "xn--bcher-kva.example",
+            "cdn_assets.example.com",
+            "0xproxy",
+            "*.0xproxy",
+            "a.0xcdn",
             "192.0.2.1",
             "[2001:db8::1]",
             "[::1]",
