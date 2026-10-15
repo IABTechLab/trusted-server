@@ -35,9 +35,19 @@ A Fastly config store entry holds at most 8,000 characters, so a longer settings
 
 **What changes for an operator.** Nothing. A long document reads as before, and one whose chunks disagree with the pointer is refused as before.
 
-### 2.2 Later rows
+### 2.2 The platform says whether it runs in a staging environment
 
-The staging variable, the request headers, the device selector and the conversion names follow in the same series, each with its own section here as it lands.
+Core named Fastly's `FASTLY_IS_STAGING` variable, and the DataDome module read it so that its test bypass works only on a staging version.
+
+**The interface.** An adapter declares whether its platform runs the service in a staging environment with `platform::declare_platform_staging`, and a module asks `platform::platform_is_staging`, which answers false until an adapter declares otherwise.
+
+**What each adapter declares.** The Fastly adapter declares staging when `FASTLY_IS_STAGING` is `1`. The Axum, Cloudflare and Spin adapters declare nothing.
+
+**What changes for an operator.** Nothing on Fastly. On the other adapters the DataDome bypass no longer follows a `FASTLY_IS_STAGING` variable.
+
+### 2.3 Later rows
+
+The request headers, the device selector and the conversion names follow in the same series, each with its own section here as it lands.
 
 ## 3. What is not in this change
 
@@ -48,6 +58,7 @@ The staging variable, the request headers, the device selector and the conversio
 ## 4. Tests
 
 - The Fastly store returns a document that fits, and other JSON at the key, as they are, reads a chunked document back whole, and refuses a pointer whose lengths disagree with the document and a chunk whose hash disagrees.
+- The DataDome test bypass applies while the platform declares staging and not otherwise.
 
 ## Review log
 

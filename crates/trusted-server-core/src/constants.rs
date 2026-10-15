@@ -55,9 +55,6 @@ pub const TS_GIT_VERSION: Option<&str> = match option_env!("TRUSTED_SERVER__GIT_
     _ => None,
 };
 
-// Fastly environment variables
-pub const ENV_FASTLY_IS_STAGING: &str = "FASTLY_IS_STAGING";
-
 // Common standard header names used across modules
 pub const HEADER_USER_AGENT: HeaderName = HeaderName::from_static("user-agent");
 pub const HEADER_ACCEPT: HeaderName = HeaderName::from_static("accept");

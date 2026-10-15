@@ -301,6 +301,14 @@ fn registered_integrations() -> &'static [IntegrationBuilder] {
 /// private.
 pub const FASTLY_SURROGATE_CONTROL_HEADER: &str = "fastly-surrogate-control";
 
+/// The variable Compute sets to `1` for a version on its staging network.
+const FASTLY_IS_STAGING: &str = "FASTLY_IS_STAGING";
+
+/// Whether Compute runs this version on its staging network.
+pub(crate) fn fastly_is_staging() -> bool {
+    std::env::var(FASTLY_IS_STAGING).is_ok_and(|value| value == "1")
+}
+
 pub(crate) fn build_state_with_registrations(
     settings: Settings,
     integrations: &[IntegrationBuilder],
@@ -308,6 +316,7 @@ pub(crate) fn build_state_with_registrations(
     trusted_server_core::platform::declare_platform_cache_headers(&[
         FASTLY_SURROGATE_CONTROL_HEADER,
     ]);
+    trusted_server_core::platform::declare_platform_staging(fastly_is_staging());
     warn_if_certificate_check_disabled(&settings);
 
     // The modules this adapter links come first and the deployment's own
@@ -1562,7 +1571,7 @@ fn fastly_platform_identity() -> PlatformIdentity {
         name: "fastly".to_owned(),
         service_id: read("FASTLY_SERVICE_ID"),
         service_version: read("FASTLY_SERVICE_VERSION"),
-        staging: std::env::var("FASTLY_IS_STAGING").is_ok_and(|value| value == "1"),
+        staging: fastly_is_staging(),
         pop: read("FASTLY_POP"),
     }
 }
