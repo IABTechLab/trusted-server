@@ -1621,7 +1621,9 @@ pub async fn handle_first_party_click(
 /// # Errors
 ///
 /// Returns an error if JSON parsing fails, the URL cannot be parsed, the URL uses an
-/// unsupported scheme, the URL lacks a host, or the host violates `proxy.allowed_domains`.
+/// unsupported scheme, the URL lacks a host, the host is declined by
+/// `rewrite.exclude_domains` or `rewrite.include_domains`, or the host violates
+/// `proxy.allowed_domains`.
 pub async fn handle_first_party_proxy_sign(
     settings: &Settings,
     _services: &RuntimeServices,
