@@ -2,7 +2,7 @@
 
 **Status:** Proposed, 2026-10-13. Raised as draft pull request jwrosewell/trusted-server#30, for Tech Lab review.
 **Author:** 51Degrees (contributed), for Tech Lab review
-**Related specs:** `2026-10-12-config-by-host-design.md`, `2026-10-12-middleware-prepare-design.md`, `2026-10-12-prefix-module-design.md`, `2026-08-27-integration-provider-seam-design.md` and `2026-10-15-cookies-by-path-design.md`, all in IABTechLab/trusted-server#1084, which holds every design document of the stack
+**Related specs:** `2026-10-12-config-by-host-design.md`, `2026-10-12-middleware-prepare-design.md`, `2026-10-12-prefix-module-design.md`, `2026-08-27-integration-provider-seam-design.md` and `2026-10-15-cookies-by-path-design.md`, all in IABTechLab/trusted-server#1342, which holds every design document of the stack
 **Related PRs:** jwrosewell/trusted-server#30
 **Issues:** IABTechLab/trusted-server#1328
 **Last updated:** 2026-10-15
@@ -112,7 +112,7 @@ Two paths have no test. No test drives `edgezero_main` with a hook registered th
 
 ## Review log
 
-1. **Round 1, 2026-10-15.** A review in a fresh session, against `split/35-request-addressing` at `0af81b181`. Issues found, two of them blocking. "Putting the removed path prefix back" left out that a page whose removed path prefix is put back is never stored and is sent `private, no-store`, and section 3 claimed publishers on one host could be kept apart in the browser when the consent cookies, the `sharedId` cookie and the forwarded Cookie header are shared. Both are fixed in this revision, with two of the three partly true claims, the coverage gaps and the advice the round gave. The third partly true claim concerned the copy of this page on `split/6-integration-seam`, which still lists the rules in full where this page points to the guide and the rustdoc, and that copy is brought up to date in the specs pull request IABTechLab/trusted-server#1084.
+1. **Round 1, 2026-10-15.** A review in a fresh session, against `split/35-request-addressing` at `0af81b181`. Issues found, two of them blocking. "Putting the removed path prefix back" left out that a page whose removed path prefix is put back is never stored and is sent `private, no-store`, and section 3 claimed publishers on one host could be kept apart in the browser when the consent cookies, the `sharedId` cookie and the forwarded Cookie header are shared. Both are fixed in this revision, with two of the three partly true claims, the coverage gaps and the advice the round gave. The third partly true claim concerned the copy of this page on `split/6-integration-seam`, which still lists the rules in full where this page points to the guide and the rustdoc, and that copy is brought up to date in the specs pull request IABTechLab/trusted-server#1342.
 2. **Round 2, 2026-10-15.** A lighter review in a fresh session, against this page at `d58b3f404`, of the round 1 fixes and the new text. No blocking issues. This revision corrects the claim that every page whose removed path prefix is put back is fetched from the origin for each reader, limits the rollout order to a Fastly service whose selector carries `{host}`, says in the round 1 entry that the copy of this page on `split/6-integration-seam` is brought up to date in the specs pull request, and writes "removed path prefix" wherever the text means it.
 
 ## Revision record
