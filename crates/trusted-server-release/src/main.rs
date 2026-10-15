@@ -4,6 +4,9 @@ mod documents;
 mod error;
 mod policy;
 mod preflight;
+// `expect` would be unfulfilled in the test build, where the tests use it.
+#[allow(dead_code, reason = "consumed by Task 7 boundary and preparation")]
+mod process;
 #[allow(dead_code)]
 mod source;
 

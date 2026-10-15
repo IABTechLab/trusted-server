@@ -18,6 +18,8 @@ pub(crate) enum ReleaseError {
     Unqualified,
     #[display("Release inputs are incomplete")]
     Incomplete,
+    #[display("Bounded release child process failed")]
+    Process,
 }
 
 impl core::error::Error for ReleaseError {}
