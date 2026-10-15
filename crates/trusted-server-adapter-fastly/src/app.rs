@@ -1704,9 +1704,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{
-        AppState, EidSyncSource, NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_LEGACY_PATH,
-        PAGE_BIDS_PATH, RuntimeStoreConfig, TrustedServerApp, build_per_request_services,
-        build_state_from_settings, startup_error_router,
+        AppState, EidSyncSource, IntegrationBuilder, NAMED_ROUTES, NamedRouteHandler,
+        PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, RuntimeStoreConfig, TrustedServerApp,
+        build_per_request_services, build_state_from_settings, module_builders_with,
+        shipped_module_builders, startup_error_router,
     };
     use bytes::Bytes;
     use edgezero_core::app::Hooks as _;
