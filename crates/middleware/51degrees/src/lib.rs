@@ -9,9 +9,9 @@
 //!
 //! No hint name is written down here. [`ClientHints`] asks the service,
 //! through the shared crate and its cache, which hints it wants from the
-//! request's browser as it filters a page request, leaves the names in the
-//! request's state, and writes them on every page a `[[serve]]` entry names
-//! it for, the first request included: the `Delegate-CH` tag in the head,
+//! request's browser as it filters a request for a page a `[[serve]]` entry
+//! names it for, leaves the names in the request's state, and writes them on
+//! that page, the first request included: the `Delegate-CH` tag in the head,
 //! and `Accept-CH`, `Critical-CH` and `Permissions-Policy` on the response,
 //! each keeping what the response already said. The tag's content follows
 //! 51Degrees' published example, lower case hint names, a space and the
@@ -338,6 +338,16 @@ fn asks_for_a_document(request: &http::Request<edgezero_core::body::Body>) -> bo
         || header("accept").to_ascii_lowercase().contains("text/html")
 }
 
+/// Whether a `[[serve]]` entry whose path covers `path` names this
+/// middleware, by the rule the headers step uses, so the service is asked
+/// only for a page whose response the middleware writes on.
+fn placed_for(settings: &Settings, path: &str) -> bool {
+    settings
+        .phase_entries(MiddlewarePhase::Serve)
+        .for_path(path)
+        .contains(&MODULE)
+}
+
 #[async_trait(?Send)]
 impl IntegrationRequestFilter for ClientHints {
     fn integration_id(&self) -> &'static str {
@@ -346,14 +356,17 @@ impl IntegrationRequestFilter for ClientHints {
 
     /// Asks the service, through the cache, which hints it wants from this
     /// browser, and leaves their names in the request's state for the
-    /// document. A request that is not a page navigation, and a service that
+    /// document. A request that is not a page navigation, one whose path no
+    /// `[[serve]]` entry naming this middleware covers, and a service that
     /// names nothing or does not answer, leave nothing, and the page gets no
     /// tag and no header.
     async fn filter_request(
         &self,
         input: RequestFilterInput<'_>,
     ) -> Result<RequestFilterDecision, Report<TrustedServerError>> {
-        if asks_for_a_document(input.request) {
+        if asks_for_a_document(input.request)
+            && placed_for(input.settings, input.request.uri().path())
+        {
             let client_ip = input
                 .services
                 .client_info()
@@ -996,16 +1009,31 @@ mod tests {
             .expect("should build the request")
     }
 
-    /// What the filter leaves in `request`'s state, asked as core asks it.
+    /// A `[[serve]]` entry naming the middleware on every HTML page.
+    const PLACED: &str =
+        "[[serve]]\nmedia_type = \"text/html\"\nmiddleware = [\"51degrees.client_hints\"]\n";
+
+    /// What the filter leaves in `request`'s state, asked as core asks it,
+    /// where an entry names the middleware on every page.
     async fn left_by_the_filter(
         middleware: &ClientHints,
         services: &RuntimeServices,
         request: &mut http::Request<Body>,
     ) -> Vec<String> {
-        let settings = settings_with("");
+        left_in(&settings_with(PLACED), middleware, services, request).await
+    }
+
+    /// What the filter leaves in `request`'s state for a deployment with
+    /// `settings`.
+    async fn left_in(
+        settings: &Settings,
+        middleware: &ClientHints,
+        services: &RuntimeServices,
+        request: &mut http::Request<Body>,
+    ) -> Vec<String> {
         let decision = middleware
             .filter_request(RequestFilterInput {
-                settings: &settings,
+                settings,
                 services,
                 request,
                 geo_info: None,
@@ -1034,6 +1062,61 @@ mod tests {
 
         assert!(names.is_empty());
         assert!(client.sent().is_empty());
+    }
+
+    /// A first page view of `path`.
+    fn first_view_of(path: &str) -> http::Request<Body> {
+        let mut request = first_view();
+        *request.uri_mut() = format!("https://www.example.com{path}")
+            .parse()
+            .expect("should build the address");
+        request
+    }
+
+    /// The table alone runs the filter, and with no entry naming the
+    /// middleware no page gets the headers, so no page asks the service.
+    #[tokio::test]
+    async fn a_table_with_no_entry_asks_the_service_nothing() {
+        let client = Arc::new(ScriptedHttpClient::new(&[DATA]));
+        let services = services_with(client.clone(), Arc::new(MemoryKvStore::default()));
+
+        let names = left_in(
+            &settings_with(""),
+            &middleware(CLOUD),
+            &services,
+            &mut first_view(),
+        )
+        .await;
+
+        assert!(names.is_empty());
+        assert!(client.sent().is_empty(), "no entry names the middleware");
+    }
+
+    /// An entry's `path` scopes the call as it scopes the headers, so a page
+    /// the entry covers asks the service and one it does not asks nothing.
+    #[tokio::test]
+    async fn an_entrys_path_scopes_the_call_to_the_service() {
+        let settings = settings_with(concat!(
+            "[[serve]]\n",
+            "media_type = \"text/html\"\n",
+            "path = \"/news/\"\n",
+            "middleware = [\"51degrees.client_hints\"]\n",
+        ));
+        for (path, covered) in [("/", false), ("/newsletter", false), ("/news/today", true)] {
+            let client = Arc::new(ScriptedHttpClient::new(&[DATA]));
+            let services = services_with(client.clone(), Arc::new(MemoryKvStore::default()));
+
+            let names = left_in(
+                &settings,
+                &middleware(CLOUD),
+                &services,
+                &mut first_view_of(path),
+            )
+            .await;
+
+            assert_eq!(client.sent().len(), usize::from(covered), "{path}");
+            assert_eq!(names.is_empty(), !covered, "{path}");
+        }
     }
 
     #[tokio::test]
