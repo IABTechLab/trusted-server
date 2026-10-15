@@ -58,8 +58,9 @@ cargo build --package trusted-server-adapter-fastly --release --target wasm32-wa
 # Run locally with Fastly simulator
 fastly compute serve
 
-# Deploy to Fastly
-fastly compute publish
+# Deploy to Fastly (managed path; links logical stores to the version)
+EDGEZERO_MANIFEST="<release-root>/edgezero.toml" \
+  ts deploy --adapter fastly --service-id <service-id> --application-release "<release-root>"
 
 # Run Axum dev server (native — no Viceroy)
 cargo run -p trusted-server-adapter-axum
@@ -362,7 +363,8 @@ Every PR must pass:
 7. Docs format (`cd docs && npm run format`)
 8. Markdown format outside `docs/` (requires `cd docs && npm ci` first): `docs/node_modules/.bin/prettier --config docs/.prettierrc --check "*.md" ".claude/**/*.md" ".github/**/*.md" "crates/**/*.md" "scripts/**/*.md" "tinybird/**/*.md"`; fix with `--write` in place of `--check`
 9. Native core build-digest test and lint (`cargo test -p trusted-server-core --test template_build_digest` and `cargo clippy -p trusted-server-core --test template_build_digest -- -D warnings`)
-10. Documentation proposal scripts: `shellcheck scripts/docs-proposal/*.sh && node --test scripts/docs-proposal/hunks.test.mjs && scripts/docs-proposal/test.sh`
+10. Wasm clock lint: `scripts/lint-wasm-clock.sh` (crates built into the Cloudflare Worker must use `web_time`, not the `std::time::{Instant,SystemTime}` `now`/`elapsed` methods, which panic there)
+11. Documentation proposal scripts: `shellcheck scripts/docs-proposal/*.sh && node --test scripts/docs-proposal/hunks.test.mjs && scripts/docs-proposal/test.sh`
 
 ---
 
