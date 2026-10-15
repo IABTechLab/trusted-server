@@ -19,13 +19,10 @@ fn secret_values_never_appear_in_debug_or_error_text() {
 
     assert!(
         command_text.contains("TOKEN"),
-        "should still name the secret variable: {command_text}"
+        "should still name the secret variable"
     );
     for text in [&command_text, &result_text, &report_text] {
-        assert!(
-            !text.contains(SECRET),
-            "should redact the secret value: {text}"
-        );
+        assert!(!text.contains(SECRET), "should redact the secret value");
     }
     assert!(
         report_text.contains("leak:[REDACTED]:"),
@@ -170,5 +167,5 @@ fn debug_redacts_program_and_working_directory() {
 
     let text = format!("{command:?}");
 
-    assert!(!text.contains(SECRET), "should redact paths: {text}");
+    assert!(!text.contains(SECRET), "should redact paths");
 }
