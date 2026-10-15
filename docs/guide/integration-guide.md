@@ -360,7 +360,8 @@ Opted-in HTML bypasses shared-template reads/reservations/stores and receives
 `Cache-Control: no-store, private`, including unchanged, failed and overflow-bypassed
 work. Raw-origin readthrough remains independent. Cacheable asynchronous output needs
 separate rules for output identity, external-data freshness, expiry, invalidation,
-failure caching and callback execution on hits.
+failure caching and callback execution on hits; this is tracked in
+[#1397](https://github.com/IABTechLab/trusted-server/issues/1397).
 
 When async factories are registered, HTML with 206 or any `Content-Range` bypasses
 rewriting and EOF I/O while preserving encoded bytes, framing, validators and origin

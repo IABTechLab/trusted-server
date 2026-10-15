@@ -453,6 +453,14 @@ requesting output retention delays initial delivery until EOF or overflow. Axum,
 Workers and Spin currently buffer publisher responses, so enabled EOF I/O can add to
 TTFB there even without stage retention. Enable only when accepting that delivery cost.
 
+::: warning Template caching is disabled
+Once an integration requiring async completion is enabled, processed HTML bypasses
+shared-template caching for every page, including pages where the stage leaves the
+output unchanged. Responses use `Cache-Control: no-store, private`. Caching
+document-deterministic async output is tracked in
+[#1397](https://github.com/IABTechLab/trusted-server/issues/1397).
+:::
+
 #### `html_finalization_timeout_ms`
 
 Shared budget for optional asynchronous processor EOF work in milliseconds. The default
