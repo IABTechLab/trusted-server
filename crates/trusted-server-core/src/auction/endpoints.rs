@@ -84,10 +84,14 @@ const MAX_AUCTION_BODY_SIZE: usize = 256 * 1024;
 /// ## Response
 ///
 /// Returns an `OpenRTB 2.x` response. Creative HTML is inlined in each bid's
-/// `adm` field after mandatory server-side sanitization. First-party resource
-/// and click URL rewriting plus creative TSJS injection are enabled by default;
-/// setting [`auction.rewrite_creatives`][`crate::auction_config_types::AuctionConfig::rewrite_creatives`]
-/// to `false` skips only that rewrite pass.
+/// `adm` field after optional sanitization
+/// ([`auction.sanitize_creatives`][`crate::auction_config_types::AuctionConfig::sanitize_creatives`]).
+/// First-party asset rewriting
+/// ([`auction.rewrite_creatives`][`crate::auction_config_types::AuctionConfig::rewrite_creatives`])
+/// and click wrapping
+/// ([`auction.rewrite_clicks`][`crate::auction_config_types::AuctionConfig::rewrite_clicks`])
+/// are enabled by default. Bidder `<base>` removal and creative TSJS injection
+/// run when either is on.
 ///
 /// ## Scroll, refresh, and SPA navigation
 ///
