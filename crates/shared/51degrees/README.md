@@ -12,8 +12,8 @@ one and on none of the others, and none of it is in core.
 - `client`: the one call to the cloud service for a request's evidence and
   the answer it gives, held in the loading cache so a question many requests
   ask at once is asked once.
-- `evidence`: the evidence a request gives the call, being the address, the
-  `User-Agent` and what the browser gathered into its `51D_` cookies.
+- `evidence`: the evidence a request gives the call, being the `User-Agent`
+  and the `Sec-CH-UA` hints alone.
 - `engine_cache`: the cache the answers are held in, `51degrees-answers`,
   selected and sized in `[cache.51degrees-answers]`.
 - `hints_engine`: the client hints question, which asks the service which
