@@ -1,7 +1,9 @@
+use std::cell::Cell;
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt as _, symlink};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tempfile::{TempDir, tempdir};
@@ -14,8 +16,91 @@ use crate::git_objects::checked_sha1;
 use crate::policy::ReleaseTarget;
 use crate::preflight::audit_environment;
 use crate::preflight::child::{ChildRequest, child_environment};
+use crate::process::Cancellation;
 
 const EPOCH: u64 = 1_700_000_000;
+
+#[test]
+fn fresh_source_attempt_controls_reject_cancelled_and_expired_work() {
+    let fixture = Fixture::new();
+    let approved = fixture.authenticate().expect("should authenticate source");
+    let cancellation = Cancellation::default();
+    cancellation.cancel();
+    assert!(
+        approved
+            .materialize(Instant::now() + Duration::from_secs(30), &cancellation)
+            .is_err(),
+        "should reject cancellation before copying"
+    );
+    assert!(
+        approved
+            .materialize(Instant::now(), &Cancellation::default())
+            .is_err(),
+        "should reject expired attempts before copying"
+    );
+    let cancellation = Cancellation::default();
+    let fresh = approved
+        .materialize(Instant::now() + Duration::from_secs(30), &cancellation)
+        .expect("should copy active source");
+    cancellation.cancel();
+    assert!(
+        fresh.verify_unchanged(&[]).is_err(),
+        "should retain attempt cancellation for handoff checks"
+    );
+}
+
+#[test]
+fn fresh_source_copy_and_source_scan_stop_at_the_first_cancelled_check() {
+    let fixture = Fixture::new();
+    let approved = fixture.authenticate().expect("should authenticate source");
+    let baseline = Cell::new(0);
+    super::worktree::compare_with_outputs_controlled(
+        &approved.snapshot.root,
+        &approved.snapshot.records,
+        &[],
+        &|| {
+            baseline.set(baseline.get() + 1);
+            Ok(())
+        },
+    )
+    .expect("should measure deterministic initial scan");
+    let calls = Cell::new(0);
+    let stop = baseline.get() + 12;
+    let result = approved.materialize_with_check(
+        Instant::now() + Duration::from_secs(30),
+        &Cancellation::default(),
+        &|| {
+            calls.set(calls.get() + 1);
+            if calls.get() >= stop {
+                return Err(source_error("cancelled during private copy"));
+            }
+            Ok(())
+        },
+    );
+    assert!(
+        result.is_err(),
+        "should stop copying instead of returning fresh source"
+    );
+    assert_eq!(calls.get(), stop, "should stop exactly at cancellation");
+    let scans = Cell::new(0);
+    let scanned = super::worktree::compare_with_outputs_controlled(
+        &approved.snapshot.root,
+        &approved.snapshot.records,
+        &[],
+        &|| {
+            scans.set(scans.get() + 1);
+            if scans.get() >= 3 {
+                return Err(source_error("cancelled during directory scan"));
+            }
+            Ok(())
+        },
+    );
+    assert!(
+        scanned.is_err(),
+        "should abort source enumeration when cancelled"
+    );
+    assert_eq!(scans.get(), 3, "should not enumerate after cancellation");
+}
 
 struct Fixture {
     parent: TempDir,
@@ -102,6 +187,18 @@ impl Fixture {
             "scripts/release/bootstrap.sh",
             b"#!/bin/sh\nexit 1\n",
         );
+        for script in [
+            "build-js.sh",
+            "build.sh",
+            "collect-js.mjs",
+            "observe-npm.mjs",
+        ] {
+            write(
+                &root,
+                &format!("scripts/release/{script}"),
+                b"// fictional driver\n",
+            );
+        }
         fs::set_permissions(
             root.join("scripts/release/bootstrap.sh"),
             fs::Permissions::from_mode(0o755),
@@ -192,3 +289,108 @@ mod layout;
 mod objects;
 mod process;
 mod worktree;
+
+#[test]
+fn fresh_source_copies_share_no_files_and_reject_changed_inputs() {
+    let fixture = Fixture::new();
+    let approved = fixture.authenticate().expect("should authenticate source");
+    let first = approved
+        .materialize(
+            Instant::now() + Duration::from_secs(30),
+            &Cancellation::default(),
+        )
+        .expect("should materialize first source");
+    let second = approved
+        .materialize(
+            Instant::now() + Duration::from_secs(30),
+            &Cancellation::default(),
+        )
+        .expect("should materialize second source");
+    assert_ne!(
+        first.root(),
+        second.root(),
+        "should own distinct source roots"
+    );
+    assert!(
+        !first.root().join(".git").exists(),
+        "should not inherit repository configuration"
+    );
+    first
+        .verify_unchanged(&[])
+        .expect("should verify pristine copy");
+    fs::write(first.root().join("AGENTS.md"), b"changed").expect("should modify private copy");
+    assert!(
+        first.verify_unchanged(&[]).is_err(),
+        "should reject changed copied source"
+    );
+    second
+        .verify_unchanged(&[])
+        .expect("should preserve independent copy");
+    approved
+        .snapshot()
+        .verify_unchanged()
+        .expect("should preserve original source");
+    fs::write(fixture.root.join("AGENTS.md"), b"changed").expect("should change original");
+    assert!(
+        approved
+            .materialize(
+                Instant::now() + Duration::from_secs(30),
+                &Cancellation::default()
+            )
+            .is_err(),
+        "should reject changed original before copying"
+    );
+}
+
+#[test]
+fn fresh_source_output_exclusions_cannot_hide_approved_files() {
+    let fixture = Fixture::new();
+    let approved = fixture.authenticate().expect("should authenticate source");
+    let fresh = approved
+        .materialize(
+            Instant::now() + Duration::from_secs(30),
+            &Cancellation::default(),
+        )
+        .expect("should copy source");
+    fs::create_dir(fresh.root().join("generated")).expect("should create generated root");
+    fs::write(fresh.root().join("generated/output"), b"output").expect("should write output");
+    assert!(
+        fresh.verify_unchanged(&[]).is_err(),
+        "should reject unapproved output root"
+    );
+    fresh
+        .verify_unchanged(&["generated"])
+        .expect("should allow disjoint generated root");
+    assert!(
+        fresh.verify_unchanged(&["crates"]).is_err(),
+        "should reject exclusion overlapping tracked source"
+    );
+    assert!(
+        fresh.verify_unchanged(&["../source"]).is_err(),
+        "should reject nonnormal exclusions"
+    );
+    fs::write(fresh.root().join("AGENTS.md"), b"changed").expect("should change tracked file");
+    assert!(
+        fresh.verify_unchanged(&["generated"]).is_err(),
+        "should still reject source changes outside generated root"
+    );
+}
+
+#[test]
+fn fresh_source_recheck_rejects_replaced_root_alias() {
+    let fixture = Fixture::new();
+    let approved = fixture.authenticate().expect("should authenticate source");
+    let fresh = approved
+        .materialize(
+            Instant::now() + Duration::from_secs(30),
+            &Cancellation::default(),
+        )
+        .expect("should create source copy");
+    let saved = fixture.parent.path().join("saved-copy");
+    fs::rename(fresh.root(), &saved).expect("should move owned source");
+    symlink(&saved, fresh.root()).expect("should alias identical source");
+    assert!(
+        fresh.verify_unchanged(&[]).is_err(),
+        "should reject source root substitution"
+    );
+}

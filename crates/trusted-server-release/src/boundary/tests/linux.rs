@@ -181,6 +181,22 @@ impl Fixture {
 }
 
 #[test]
+fn container_denies_process_memory_access() {
+    assert_eq!(
+        super::modes::process_memory_read(),
+        0,
+        "should permit the real self-memory operation outside confinement"
+    );
+    let fixture = Fixture::new();
+    let proof = fixture.prove();
+    assert_eq!(
+        fixture.run(&proof, "process-memory-read", &[]),
+        "denied errno=1",
+        "should deny the same process-memory syscall with real seccomp EPERM"
+    );
+}
+
+#[test]
 fn container_denial_proof_and_confined_execution() {
     let fixture = Fixture::new();
     let proof = fixture.prove();

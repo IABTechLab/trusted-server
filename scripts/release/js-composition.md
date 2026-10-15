@@ -102,21 +102,26 @@ fresh installation, network confinement, A/B comparison, signing or publication.
 
 ## Independent Rust preparation recipe
 
-Introduced Python release orchestration is removed; replacement Rust execution remains pending.
+The private Rust preparation and comparison recipe uses the retained Node collector.
 `build-js.sh` remains a thin POSIX adapter to the independently approved-source
 OS-native `trusted-server-release build-js` command. Until its authenticated Rust
-bootstrap, source-owned selections and real recipe are implemented, the wrapper
+bootstrap and qualified source-owned selections are implemented, the wrapper
 refuses before creating work directories. No public fixture bypass, unchecked
 interpreter or colocated self-authored SHA file establishes bootstrap authority.
 The host-only tool has no core/CLI/JS crate dependency; it retains this Node
 collector and composition pipeline. See the [migration addendum](../../docs/superpowers/specs/2026-10-14-release-tooling-rust-migration.md).
 
-Port the actual recipe into private `materials`, `process`, `boundary`,
-`preparation` and `javascript` modules. Each installation owns a fresh tracked
-source/object snapshot, sanitized private Git store, cache, node_modules, HOME,
-TMP, lifecycle observations and bundles. Original sources/object stores and shared
-authenticated archives/tools are read-only; sibling data/metadata, shared writes,
-network sockets and arbitrary Mach delegation are denied. Current installed-tool
+The recipe lives in private `materials`, `process`, `boundary`,
+`preparation` and `javascript` modules. Each installation owns a fresh copy of
+approved tracked source bytes, cache, node_modules, HOME, TMP, lifecycle observations
+and bundles. The parent authenticates the approved Git objects and derives the
+complete module set; it supplies that set and the source commit through a protected
+read-only source-context document. JS working copies contain no inherited `.git`,
+configuration or history. Git material snapshots for Cargo remain separate.
+Original sources/object stores and shared authenticated archives/tools are read-only;
+sibling data/metadata, shared writes and network sockets are denied. The shared JS
+execution path selects Linux containers with owned descendant cleanup; macOS native
+recipes require their own lifecycle containment and qualification. Current installed-tool
 rehashing is separate from independently reviewed all-cohort hosted evidence.
 Local macOS 26.6.2 diagnostics cannot qualify macOS 15 ARM/Intel or GNU.
 
@@ -176,6 +181,38 @@ through pinned npm's Arborist when installation changes the dependency tree. The
 results describe declarations only. They grant no execution authority and supply
 no starts, completions, failures or changed-file observations. Full installation
 tree mutation checks and actual lifecycle observations remain separate gates.
+
+`observe-npm.mjs` adapts the selected npm 11.6.2 lifecycle entry before npm loads
+its dependency graph. It records real starts, fulfilled/rejected execution,
+exit status and changed owned-file facts in memory. This includes hooks with no
+output and optional hook failures that npm would otherwise swallow. Root calls
+for absent scripts remain no-ops; root commands and unreviewed dependency hooks
+fail. Selected Node replaces the reviewed command's bare `node` and leads the
+child PATH after npm prepends package bins. Lifecycle children receive no parent
+stdin or additional inherited descriptors.
+
+The Linux supervisor loads the authenticated native non-dumpable-process guard
+before giving the observer its private request key. The guard and the process
+memory syscall denials prevent lifecycle children from reading or modifying the
+trusted npm process. Observations and the checked preparation document are sealed
+together with HMAC-SHA-256 over their exact original JSON bytes. The supervisor
+joins the nonce, source, workspace, cache, guard and native esbuild expectation,
+requires successful npm exit and complete successful events, and independently
+checks the retained outputs. A child's printed prefix or writable JSON file does
+not establish an observation. This adapter provides no macOS completion path and
+does not itself authenticate Node/npm distributions or qualify a hosted runner.
+
+The reviewed esbuild 0.27.3 postinstall can hard-link its selected native package
+binary to `node_modules/esbuild/bin/esbuild`. To retain the boundary's global
+single-link policy, the observer detaches only this exact pair after execution.
+Both paths must identify the same regular inode with exactly two links and match
+the parent-derived authenticated native archive's digest, size and expected mode.
+The observer copies the owned esbuild path into a fresh file and atomically
+replaces it, then verifies both files have one link and unchanged executable
+bytes. It records `esbuild-hardlink-copy-v1` separately in the sealed observations;
+the changed owned executable remains a lifecycle output. Other hard links,
+additional aliases, mismatched bytes/modes or unsafe paths fail. This
+normalization changes inode ownership of the bytes, not executable content.
 
 Run collector and unconditional full Vitest/type checks under that same native
 boundary, checking tracked source and unexpected files before/after each stage.

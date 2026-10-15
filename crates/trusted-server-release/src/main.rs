@@ -8,10 +8,14 @@ mod error;
 mod git_objects;
 #[allow(dead_code, reason = "consumed by Task 9 recipes")]
 mod inspect;
+#[allow(dead_code, reason = "production JS tool qualification remains closed")]
+mod javascript;
 #[allow(dead_code, reason = "consumed by Task 7 material preparation")]
 mod materials;
 mod policy;
 mod preflight;
+#[allow(dead_code, reason = "production JS tool qualification remains closed")]
+mod preparation;
 // `expect` would be unfulfilled in the test build, where the tests use it.
 #[allow(dead_code, reason = "consumed by Task 7 boundary and preparation")]
 mod process;

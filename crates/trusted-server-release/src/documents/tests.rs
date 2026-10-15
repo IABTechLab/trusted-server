@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::ffi::CString;
 use std::fs;
 use std::os::unix::ffi::OsStrExt as _;
@@ -8,6 +9,100 @@ use sha2::{Digest as _, Sha256};
 use tempfile::tempdir;
 
 use super::*;
+
+#[test]
+fn controlled_reads_cancel_before_and_between_bounded_chunks() {
+    let root = tempdir().expect("should create controlled input");
+    let path = root.path().join("input");
+    fs::write(&path, vec![7_u8; 4 * 64 * 1024]).expect("should write multiple chunks");
+    let calls = Cell::new(0);
+    let check = || {
+        calls.set(calls.get() + 1);
+        if calls.get() >= 6 {
+            return Err(invalid("cancelled fixture"));
+        }
+        Ok(())
+    };
+    assert!(
+        read_bounded_with_check(&path, Role::Executable, &check).is_err(),
+        "should cancel during bounded read"
+    );
+    assert_eq!(
+        calls.get(),
+        6,
+        "should stop between the first and second chunks"
+    );
+    let before = || Err(invalid("already cancelled fixture"));
+    assert!(
+        hash_bounded_with_check(&path, 1024 * 1024, &before).is_err(),
+        "should reject before hashing"
+    );
+}
+
+#[test]
+fn controlled_stream_hash_enforces_limit_and_exact_digest() {
+    let root = tempdir().expect("should create hash input");
+    let path = root.path().join("input");
+    let bytes = vec![9_u8; 3 * 64 * 1024];
+    fs::write(&path, &bytes).expect("should write hash input");
+    let measured = hash_bounded_with_check(&path, bytes.len() as u64, &|| Ok(()))
+        .expect("should stream exact bytes");
+    assert_eq!(
+        measured.sha256,
+        hex::encode(Sha256::digest(&bytes)),
+        "should hash all original bytes"
+    );
+    assert_eq!(
+        measured.size,
+        bytes.len() as u64,
+        "should retain original size"
+    );
+    assert_eq!(
+        measured.mode,
+        fs::metadata(&path)
+            .expect("should inspect measured mode")
+            .mode(),
+        "should retain mode from the same held input"
+    );
+    assert!(
+        hash_bounded_with_check(&path, bytes.len() as u64 - 1, &|| Ok(())).is_err(),
+        "should reject oversized files before reading"
+    );
+}
+
+#[test]
+fn controlled_stream_hash_detects_mutation_and_leaf_replacement() {
+    let root = tempdir().expect("should create changing input");
+    let path = root.path().join("input");
+    let bytes = vec![7_u8; 3 * 64 * 1024];
+    fs::write(&path, &bytes).expect("should write original input");
+    let calls = Cell::new(0);
+    let result = hash_bounded_with_check(&path, bytes.len() as u64, &|| {
+        calls.set(calls.get() + 1);
+        if calls.get() == 4 {
+            fs::write(&path, b"changed").expect("should mutate held input");
+        }
+        Ok(())
+    });
+    assert!(
+        result.is_err(),
+        "should reject mutations between hash chunks"
+    );
+    fs::write(&path, &bytes).expect("should restore input fixture");
+    let calls = Cell::new(0);
+    let result = hash_bounded_with_check(&path, bytes.len() as u64, &|| {
+        calls.set(calls.get() + 1);
+        if calls.get() == 4 {
+            fs::rename(&path, root.path().join("retained")).expect("should replace leaf name");
+            fs::write(&path, &bytes).expect("should write identical replacement bytes");
+        }
+        Ok(())
+    });
+    assert!(
+        result.is_err(),
+        "should reject changed path identity even with matching bytes"
+    );
+}
 
 fn parse(bytes: &[u8]) -> Result<Value, Report<ReleaseError>> {
     parse_json(bytes, Role::Metadata)

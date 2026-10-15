@@ -12,7 +12,7 @@ use sha2::{Digest as _, Sha256};
 use tempfile::TempDir;
 
 use super::{VerifiedOriginal, material_error};
-use crate::documents::{Role, read_bounded};
+use crate::documents::{Role, hash_bounded_with_check, read_bounded};
 use crate::error::ReleaseError;
 
 #[derive(Clone, Copy)]
@@ -41,9 +41,108 @@ pub(crate) struct ExtractedOriginal {
     root: PathBuf,
     files: BTreeMap<String, MemberFacts>,
     root_name: String,
+    directories: BTreeSet<String>,
 }
 
 impl ExtractedOriginal {
+    /// Returns a rechecked regular member's original digest, length and mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tree changed or the member was not recorded.
+    pub(super) fn member_facts(
+        &self,
+        relative: &str,
+    ) -> Result<(String, u64, u32), Report<ReleaseError>> {
+        self.verify_unchanged()?;
+        let facts = self
+            .files
+            .get(&format!("{}/{relative}", self.root_name))
+            .ok_or_else(|| {
+                material_error("required native tool is not an authenticated archive member")
+            })?;
+        Ok((facts.sha256.clone(), facts.size, facts.mode))
+    }
+    /// Rejoins the entire private extraction before it is consumed again.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a changed, missing or added member, unsafe type,
+    /// changed executable mode, or an expired attempt.
+    pub(crate) fn verify_unchanged(&self) -> Result<(), Report<ReleaseError>> {
+        self.original.check()?;
+        let mut remaining: BTreeSet<_> = self.files.keys().cloned().collect();
+        let mut remaining_directories = self.directories.clone();
+        let mut pending = vec![self.root_name.clone()];
+        while let Some(directory) = pending.pop() {
+            self.original.check()?;
+            let metadata = fs::symlink_metadata(self.directory.path().join(&directory))
+                .map_err(material_error)?;
+            if !metadata.is_dir() {
+                return Err(material_error(
+                    "extracted directory changed type or became an alias",
+                ));
+            }
+            remaining_directories.remove(&directory);
+            let entries =
+                fs::read_dir(self.directory.path().join(&directory)).map_err(material_error)?;
+            for entry in entries {
+                self.original.check()?;
+                let entry = entry.map_err(material_error)?;
+                let name = entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| material_error("extracted member is not UTF-8"))?;
+                let key = format!("{directory}/{name}");
+                let metadata = fs::symlink_metadata(entry.path()).map_err(material_error)?;
+                if metadata.is_dir() {
+                    if !self.directories.contains(&key) {
+                        return Err(material_error("unrecorded extracted directory appeared"));
+                    }
+                    pending.push(key);
+                } else {
+                    let expected = self
+                        .files
+                        .get(&key)
+                        .ok_or_else(|| material_error("unrecorded extracted member appeared"))?;
+                    if !metadata.is_file()
+                        || metadata.len() != expected.size
+                        || metadata.permissions().mode() & 0o7777 != 0o600 | (expected.mode & 0o111)
+                    {
+                        return Err(material_error(
+                            "extracted member type, size or permissions changed",
+                        ));
+                    }
+                    let raw = hash_bounded_with_check(&entry.path(), MEMBER_LIMIT, &|| {
+                        self.original.check()
+                    })?;
+                    if raw.sha256 != expected.sha256
+                        || raw.size != expected.size
+                        || raw.mode & 0o7777 != 0o600 | (expected.mode & 0o111)
+                    {
+                        return Err(material_error("extracted member bytes changed"));
+                    }
+                    remaining.remove(&key);
+                }
+            }
+        }
+        if !remaining.is_empty() || !remaining_directories.is_empty() {
+            return Err(material_error("recorded extracted member is missing"));
+        }
+        self.original.check()
+    }
+
+    /// Copies only the retained authenticated compressed original.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the retained original changed or the copy fails.
+    pub(super) fn copy_original(
+        &mut self,
+        destination: &mut impl io::Write,
+    ) -> Result<(), Report<ReleaseError>> {
+        self.original.copy_verified(destination)
+    }
     /// Returns the locked acquisition identity supplying this extracted tree.
     pub(super) fn identity(&self) -> &str {
         self.original.identity()
@@ -406,12 +505,20 @@ fn extract_bounded(
     if !root.is_dir() || state.files.is_empty() {
         return Err(material_error("archive has no package files"));
     }
+    for file in state.files.keys() {
+        let mut current = file.as_str();
+        while let Some((parent, _)) = current.rsplit_once('/') {
+            state.directories.insert(parent.to_owned());
+            current = parent;
+        }
+    }
     Ok(ExtractedOriginal {
         root_name: selection.root.to_owned(),
         original,
         root,
         directory: state.directory,
         files: state.files,
+        directories: state.directories,
     })
 }
 

@@ -509,3 +509,24 @@ fn sibling_lifetime_is_owned_by_the_parent_pipe() {
         "should exit successfully when the parent closes the pipe"
     );
 }
+
+#[test]
+fn confined_debug_does_not_expose_private_stdin() {
+    let private = b"fictional-private-parent-input";
+    let command = ConfinedCommand::new(
+        Path::new("/example/tool"),
+        Path::new("/example/work"),
+        limits(),
+    )
+    .expect("should describe command")
+    .stdin_bytes(private.to_vec());
+    let debug = format!("{command:?}");
+    assert!(
+        !debug.contains("fictional-private-parent-input"),
+        "should omit private stdin from diagnostics"
+    );
+    assert!(
+        !debug.contains("102, 105, 99, 116"),
+        "should not render private stdin as decimal bytes"
+    );
+}

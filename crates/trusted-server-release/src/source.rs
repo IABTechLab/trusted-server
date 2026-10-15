@@ -27,8 +27,11 @@ use worktree::compare_worktree;
 mod closure;
 mod config;
 mod git;
+mod materialize;
 mod tree;
 mod worktree;
+
+pub(crate) use materialize::FreshSource;
 
 /// Repository channels that rewrite history, objects or checkout attributes.
 const FORBIDDEN_GIT_PATHS: [&str; 7] = [

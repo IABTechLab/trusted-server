@@ -30,6 +30,7 @@ const COMPANION_SUFFIXES: [(&str, &str); 6] = [
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Role {
     Metadata,
+    Source,
     Companion,
     Bundle,
     Spdx,
@@ -40,6 +41,7 @@ impl Role {
     fn limit(self) -> u64 {
         match self {
             Self::Metadata => 1024 * 1024,
+            Self::Source => 64 * 1024 * 1024,
             Self::Companion | Self::Bundle => 32 * 1024 * 1024,
             Self::Spdx => 16 * 1024 * 1024,
             Self::Executable => 512 * 1024 * 1024,
@@ -71,15 +73,72 @@ pub(crate) struct RawBytes {
     pub(crate) sha256: String,
 }
 
+/// Exact bounded file bytes measured without retaining their body in memory.
+pub(crate) struct FileDigest {
+    pub(crate) sha256: String,
+    pub(crate) size: u64,
+    pub(crate) mode: u32,
+}
+
 /// Reads one unlinked regular file without following a leaf symlink.
 pub(crate) fn read_bounded(path: &Path, role: Role) -> Result<RawBytes, Report<ReleaseError>> {
-    let file = OpenOptions::new()
+    read_bounded_with_check(path, role, &|| Ok(()))
+}
+
+/// Reads bounded bytes while checking the owning attempt between 64 KiB chunks.
+///
+/// # Errors
+///
+/// Returns an error for cancellation, expired limits, unsafe files, changed
+/// metadata or paths, or bytes exceeding the role bound before allocation.
+pub(crate) fn read_bounded_with_check(
+    path: &Path,
+    role: Role,
+    check: &dyn Fn() -> Result<(), Report<ReleaseError>>,
+) -> Result<RawBytes, Report<ReleaseError>> {
+    check()?;
+    let file = open_input(path)?;
+    let before = file.metadata().map_err(invalid)?;
+    let raw = read_held_with_check(&file, &before, role, check)?;
+    verify_input_path(path, &before)?;
+    check()?;
+    Ok(raw)
+}
+
+/// Hashes a bounded held file with constant-sized buffers and attempt checks.
+///
+/// # Errors
+///
+/// Returns an error for unsafe files, changed metadata or paths, an exceeded
+/// byte limit, cancellation or an expired owning attempt.
+pub(crate) fn hash_bounded_with_check(
+    path: &Path,
+    limit: u64,
+    check: &dyn Fn() -> Result<(), Report<ReleaseError>>,
+) -> Result<FileDigest, Report<ReleaseError>> {
+    check()?;
+    let file = open_input(path)?;
+    let before = file.metadata().map_err(invalid)?;
+    let digest = consume_held(&file, &before, limit, check, &mut |_| Ok(()))?;
+    verify_input_path(path, &before)?;
+    check()?;
+    Ok(digest)
+}
+
+fn open_input(path: &Path) -> Result<File, Report<ReleaseError>> {
+    OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)
-        .map_err(invalid)?;
-    let before = file.metadata().map_err(invalid)?;
-    read_held(&file, &before, role)
+        .map_err(invalid)
+}
+
+fn verify_input_path(path: &Path, before: &std::fs::Metadata) -> Result<(), Report<ReleaseError>> {
+    let current = std::fs::symlink_metadata(path).map_err(invalid)?;
+    if !current.is_file() || stamp(before) != stamp(&current) {
+        return Err(invalid("input path changes while reading held descriptor"));
+    }
+    Ok(())
 }
 
 fn read_held(
@@ -87,28 +146,82 @@ fn read_held(
     before: &std::fs::Metadata,
     role: Role,
 ) -> Result<RawBytes, Report<ReleaseError>> {
+    read_held_with_check(file, before, role, &|| Ok(()))
+}
+
+fn read_held_with_check(
+    file: &File,
+    before: &std::fs::Metadata,
+    role: Role,
+    check: &dyn Fn() -> Result<(), Report<ReleaseError>>,
+) -> Result<RawBytes, Report<ReleaseError>> {
+    check()?;
+    validate_held(before, role.limit())?;
+    let capacity = usize::try_from(before.len()).map_err(invalid)?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(capacity).map_err(invalid)?;
+    let digest = consume_held(file, before, role.limit(), check, &mut |chunk| {
+        bytes.extend_from_slice(chunk);
+        Ok(())
+    })?;
+    Ok(RawBytes {
+        bytes,
+        sha256: digest.sha256,
+    })
+}
+
+fn validate_held(before: &std::fs::Metadata, limit: u64) -> Result<(), Report<ReleaseError>> {
     if !before.is_file() || before.nlink() != 1 {
         return Err(invalid("input must be a regular file with one hard link"));
     }
-    if before.len() > role.limit() {
+    if before.len() > limit {
         return Err(invalid("input exceeds role byte limit"));
     }
-    let mut bytes = Vec::new();
-    file.take(role.limit() + 1)
-        .read_to_end(&mut bytes)
-        .map_err(invalid)?;
-    let after = file.metadata().map_err(invalid)?;
-    if stamp(before) != stamp(&after) || bytes.len() as u64 != before.len() {
-        return Err(invalid("input changes while reading held descriptor"));
-    }
-    if bytes.len() as u64 > role.limit() {
-        return Err(invalid("input exceeds role byte limit"));
-    }
-    let sha256 = hex::encode(Sha256::digest(&bytes));
-    Ok(RawBytes { bytes, sha256 })
+    Ok(())
 }
 
-fn stamp(metadata: &std::fs::Metadata) -> (u64, u64, u64, u64, i64, i64, i64, i64) {
+fn consume_held(
+    file: &File,
+    before: &std::fs::Metadata,
+    limit: u64,
+    check: &dyn Fn() -> Result<(), Report<ReleaseError>>,
+    consume: &mut impl FnMut(&[u8]) -> Result<(), Report<ReleaseError>>,
+) -> Result<FileDigest, Report<ReleaseError>> {
+    check()?;
+    validate_held(before, limit)?;
+    let mut input = file;
+    let mut size = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut digest = Sha256::new();
+    loop {
+        check()?;
+        let count = input.read(&mut buffer).map_err(invalid)?;
+        check()?;
+        if count == 0 {
+            break;
+        }
+        size = size
+            .checked_add(count as u64)
+            .ok_or_else(|| invalid("input length overflows"))?;
+        if size > before.len() || size > limit {
+            return Err(invalid("input grows while reading held descriptor"));
+        }
+        digest.update(&buffer[..count]);
+        consume(&buffer[..count])?;
+    }
+    let after = file.metadata().map_err(invalid)?;
+    if stamp(before) != stamp(&after) || size != before.len() {
+        return Err(invalid("input changes while reading held descriptor"));
+    }
+    check()?;
+    Ok(FileDigest {
+        sha256: hex::encode(digest.finalize()),
+        size,
+        mode: before.permissions().mode(),
+    })
+}
+
+fn stamp(metadata: &std::fs::Metadata) -> (u64, u64, u64, u64, i64, i64, i64, i64, u32) {
     (
         metadata.dev(),
         metadata.ino(),
@@ -118,6 +231,7 @@ fn stamp(metadata: &std::fs::Metadata) -> (u64, u64, u64, u64, i64, i64, i64, i6
         metadata.mtime_nsec(),
         metadata.ctime(),
         metadata.ctime_nsec(),
+        metadata.permissions().mode(),
     )
 }
 

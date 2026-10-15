@@ -76,6 +76,18 @@ impl SourceFixture {
         write(&root, ".cargo/config.toml", b"[alias]\n");
         write(&root, ".tool-versions", b"rust 1.95.0\n");
         write(&root, BOOTSTRAP, b"#!/bin/sh\nexit 1\n");
+        for script in [
+            "build-js.sh",
+            "build.sh",
+            "collect-js.mjs",
+            "observe-npm.mjs",
+        ] {
+            write(
+                &root,
+                &format!("scripts/release/{script}"),
+                b"// fictional driver\n",
+            );
+        }
         write(
             &root,
             "crates/trusted-server-openrtb/Cargo.toml",

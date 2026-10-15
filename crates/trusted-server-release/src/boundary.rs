@@ -135,6 +135,39 @@ fn instance_fingerprint(platform: &[u8; 32]) -> Result<[u8; 32], Report<ReleaseE
 struct FixedFacts(Vec<TreeFacts>);
 
 impl Boundary {
+    /// Returns the current instance's measured roots, controls and nonce binding.
+    ///
+    /// This binds an executed candidate; it does not qualify that candidate.
+    pub(crate) fn execution_fingerprint(&self) -> [u8; 32] {
+        self.fingerprint
+    }
+    /// Requires exact mount roles and placement for an owning recipe.
+    pub(crate) fn matches_roots(&self, roots: &BoundaryRoots) -> bool {
+        self.roots == *roots
+    }
+
+    /// Reports whether container teardown owns every run descendant.
+    ///
+    /// The experimental macOS backend deliberately cannot satisfy this gate.
+    pub(crate) fn has_owned_descendant_cleanup(&self) -> bool {
+        matches!(self.platform, Platform::LinuxContainer(_))
+    }
+
+    /// Translates a selected host path into the command's execution namespace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path is not inside this boundary's roots.
+    pub(crate) fn execution_path(
+        &self,
+        path: &Path,
+    ) -> Result<std::path::PathBuf, Report<ReleaseError>> {
+        match &self.platform {
+            Platform::LinuxContainer(_) => docker::container_path(&self.roots, path),
+            Platform::MacSandbox(_) if self.roots.locate(path).is_some() => Ok(path.to_owned()),
+            _ => Err(boundary_error("execution path is outside boundary roots")),
+        }
+    }
     /// Configures the qualified macOS `sandbox-exec` boundary.
     ///
     /// # Errors

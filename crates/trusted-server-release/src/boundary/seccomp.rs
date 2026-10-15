@@ -4,7 +4,8 @@
 //! profile retained in `scripts/release/qualification/`. Its SHA-256 is
 //! checked before use. The effective profile preserves the baseline's default
 //! `SCMP_ACT_ERRNO`/`EPERM` action, native architectures and every other
-//! syscall rule. It empties every `subArchitectures` list, so non-native ABIs
+//! syscall rule except process-memory and descriptor-transfer allowances.
+//! It empties every `subArchitectures` list, so non-native ABIs
 //! (x86 and x32 on `x86_64`, where sockets go through `socketcall`; 32-bit
 //! ARM on `aarch64`) are not admitted by the filter at all and fail with the
 //! filter's bad-architecture action. It removes every `socket`, `socketpair`
@@ -27,6 +28,15 @@ pub(crate) const BASELINE_SHA256: &str =
     "536529b665dd0972c37bfb569f5d4ac8a53592e7b00752bc39ff063ca9864c74";
 /// Socket-creating syscalls whose baseline allowances are removed.
 const SOCKET_SYSCALLS: [&str; 3] = ["socket", "socketpair", "socketcall"];
+/// An install hook must not inspect or modify its trusted observer's memory.
+const PROCESS_ACCESS_SYSCALLS: [&str; 6] = [
+    "ptrace",
+    "process_vm_readv",
+    "process_vm_writev",
+    "pidfd_getfd",
+    "kcmp",
+    "process_madvise",
+];
 /// `AF_UNIX` on every Linux architecture.
 const AF_UNIX: u64 = 1;
 
@@ -61,8 +71,9 @@ fn strip_socket_names(rule: &mut Value) -> Result<bool, Report<ReleaseError>> {
         .and_then(Value::as_array_mut)
         .ok_or_else(|| seccomp_error("seccomp rule has no names array"))?;
     names.retain(|name| {
-        name.as_str()
-            .is_none_or(|name| !SOCKET_SYSCALLS.contains(&name))
+        name.as_str().is_none_or(|name| {
+            !SOCKET_SYSCALLS.contains(&name) && !PROCESS_ACCESS_SYSCALLS.contains(&name)
+        })
     });
     Ok(!names.is_empty())
 }

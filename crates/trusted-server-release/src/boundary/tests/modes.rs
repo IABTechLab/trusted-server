@@ -53,6 +53,8 @@ pub(super) fn run(mode: &str, arguments: &[String]) -> i32 {
         ),
         "signal" => signal(argument(0), argument(1)),
         "signal-own-child" => signal_own_child(),
+        #[cfg(target_os = "linux")]
+        "process-memory-read" => process_memory_read(),
         "wait-for-eof" => match std::io::copy(&mut std::io::stdin(), &mut std::io::sink()) {
             Ok(_) => 0,
             Err(_) => HELPER_SETUP_FAILED,
@@ -75,6 +77,31 @@ pub(super) fn run(mode: &str, arguments: &[String]) -> i32 {
         "unix-exchange" => unix_exchange(argument(0)),
         "socket" => socket(argument(0)),
         _ => HELPER_SETUP_FAILED,
+    }
+}
+
+/// Attempts a valid self-memory read, which the confined filter must deny.
+#[cfg(target_os = "linux")]
+pub(super) fn process_memory_read() -> i32 {
+    let remote = [0x5a_u8];
+    let mut local = [0_u8];
+    let local = libc::iovec {
+        iov_base: local.as_mut_ptr().cast(),
+        iov_len: 1,
+    };
+    let remote = libc::iovec {
+        iov_base: remote.as_ptr().cast_mut().cast(),
+        iov_len: 1,
+    };
+    // SAFETY: Both one-byte buffers remain live, and their iovecs describe
+    // valid memory in this process for the duration of the synchronous call.
+    let result = unsafe { libc::process_vm_readv(libc::getpid(), &local, 1, &remote, 1, 0) };
+    if result == 1 {
+        report("accessed", 0)
+    } else if result < 0 {
+        report_errno("accessed", std::io::Error::last_os_error().raw_os_error())
+    } else {
+        HELPER_SETUP_FAILED
     }
 }
 

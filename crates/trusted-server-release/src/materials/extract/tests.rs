@@ -457,3 +457,115 @@ fn enforces_decoded_byte_and_entry_budgets() {
         "should stop unbounded decoded expansion"
     );
 }
+
+#[test]
+fn extracted_tree_review_rejects_changed_or_added_members() {
+    let bytes = compressed(&tar_bytes(&[(
+        "package/index.js",
+        b'0',
+        0o644,
+        b"original",
+    )]));
+    let extracted = extract(
+        original(&bytes),
+        Selection {
+            root: "package",
+            index_alias: false,
+        },
+    )
+    .expect("should extract original");
+    extracted
+        .verify_unchanged()
+        .expect("should verify original tree");
+    fs::write(extracted.root().join("added.js"), b"added").expect("should add unrecorded file");
+    assert!(
+        extracted.verify_unchanged().is_err(),
+        "should reject unrecorded member"
+    );
+    fs::remove_file(extracted.root().join("added.js")).expect("should remove extra file");
+    fs::write(extracted.root().join("index.js"), b"changed").expect("should change recorded file");
+    assert!(
+        extracted.verify_unchanged().is_err(),
+        "should reject changed recorded member"
+    );
+}
+
+#[test]
+fn npm_bundle_rechecks_and_retains_originals_for_independent_caches() {
+    let manifest = serde_json::to_vec(&json!({"name":"fictional-package","version":"1.0.0"}))
+        .expect("should encode manifest");
+    let bytes = compressed(&tar_bytes(&[(
+        "package/package.json",
+        b'0',
+        0o644,
+        &manifest,
+    )]));
+    let catalog = catalog(&bytes);
+    let inputs = tempfile::tempdir().expect("should create input directory");
+    let name = format!("{}.tgz", hex::encode(Sha512::digest(&bytes)));
+    fs::write(inputs.path().join(&name), &bytes).expect("should write original");
+    let prepared = catalog
+        .prepare_npm_originals(
+            inputs.path(),
+            Instant::now() + Duration::from_secs(10),
+            &Cancellation::default(),
+        )
+        .expect("should authenticate complete original set");
+    assert_eq!(
+        prepared.archive_paths().len(),
+        1,
+        "should retain every locked original"
+    );
+    assert_eq!(
+        fs::read(&prepared.archive_paths()[0]).expect("should read retained original"),
+        bytes,
+        "should retain compressed identity rather than repacked bytes"
+    );
+    fs::write(inputs.path().join(name), b"changed").expect("should replace caller input");
+    prepared
+        .verify_unchanged()
+        .expect("should own originals independently of caller input");
+    assert!(
+        catalog
+            .prepare_npm_originals(
+                inputs.path(),
+                Instant::now() + Duration::from_secs(10),
+                &Cancellation::default()
+            )
+            .is_err(),
+        "should reject changed original on next preparation"
+    );
+}
+
+#[test]
+fn extraction_recheck_rejects_root_alias_and_missing_empty_directory() {
+    let bytes = compressed(&tar_bytes(&[
+        ("package/index.js", b'0', 0o644, b"original"),
+        ("package/empty", b'5', 0o755, b""),
+    ]));
+    let extracted = extract(
+        original(&bytes),
+        Selection {
+            root: "package",
+            index_alias: false,
+        },
+    )
+    .expect("should extract original");
+    extracted
+        .verify_unchanged()
+        .expect("should recheck explicit empty directory");
+    fs::remove_dir(extracted.root().join("empty")).expect("should remove empty directory");
+    assert!(
+        extracted.verify_unchanged().is_err(),
+        "should reject missing recorded empty directory"
+    );
+    fs::create_dir(extracted.root().join("empty")).expect("should restore directory");
+    let saved = extracted.directory.path().join("saved");
+    fs::rename(extracted.root(), &saved).expect("should move original root");
+    std::os::unix::fs::symlink("saved", extracted.root())
+        .expect("should substitute matching root alias");
+    assert!(
+        extracted.verify_unchanged().is_err(),
+        "should reject replaced extraction root even with identical members"
+    );
+}

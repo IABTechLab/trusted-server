@@ -6,8 +6,10 @@
 
 mod archive;
 mod extract;
+mod git;
 mod locked;
 mod manifest;
+mod npm_bundle;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -24,6 +26,7 @@ pub(crate) use archive::VerifiedOriginal;
 pub(crate) use extract::ExtractedOriginal;
 use locked::{CargoMaterials, NpmMaterial, parse_cargo, parse_npm};
 pub(crate) use manifest::{ReviewedNpmManifest, RootManifestReview};
+pub(crate) use npm_bundle::PreparedNpmOriginals;
 
 const NPM_LOCK: &str = "crates/trusted-server-js/lib/package-lock.json";
 
@@ -43,6 +46,21 @@ pub(crate) struct LockedMaterials {
 }
 
 impl LockedMaterials {
+    /// Starts one bounded collection of locked Git object snapshots.
+    ///
+    /// This selects a local executable; it does not qualify a release tool.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unsafe executable or expired collection.
+    pub(crate) fn git_collection(
+        &self,
+        program: &Path,
+        deadline: Instant,
+        cancellation: &Cancellation,
+    ) -> Result<git::GitCollection<'_>, Report<ReleaseError>> {
+        git::GitCollection::new(self, program, deadline, cancellation)
+    }
     /// Reviews approved root declarations without executing npm lifecycle hooks.
     ///
     /// # Errors

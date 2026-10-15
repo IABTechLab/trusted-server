@@ -6956,6 +6956,7 @@ dependencies = [
  "error-stack",
  "flate2",
  "hex",
+ "hmac",
  "jsonschema",
  "libc",
  "object",

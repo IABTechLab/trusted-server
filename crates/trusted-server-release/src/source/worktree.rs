@@ -3,16 +3,15 @@
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs::{self, Metadata};
-use std::io;
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 
 use error_stack::Report;
 use sha2::{Digest as _, Sha256};
 
 use super::{Mode, Records, source_error};
-use crate::documents::{Role, read_bounded};
+use crate::documents::hash_bounded_with_check;
 use crate::error::ReleaseError;
 
 const PROBLEMS_SHOWN: usize = 20;
@@ -25,6 +24,45 @@ pub(super) fn compare_worktree(
     root: &Path,
     expected: &Records,
 ) -> Result<(), Report<ReleaseError>> {
+    compare_with_outputs(root, expected, &[])
+}
+
+/// Checks source while allowing only explicitly disjoint generated roots.
+pub(super) fn compare_with_outputs(
+    root: &Path,
+    expected: &Records,
+    outputs: &[&str],
+) -> Result<(), Report<ReleaseError>> {
+    compare_with_outputs_controlled(root, expected, outputs, &|| Ok(()))
+}
+
+/// Checks the owning attempt between directory entries and held-file chunks.
+///
+/// # Errors
+///
+/// Returns an error for changed source, unsafe output exclusions, exceeded
+/// entry limits or failed attempt checks.
+pub(super) fn compare_with_outputs_controlled(
+    root: &Path,
+    expected: &Records,
+    outputs: &[&str],
+    check: &dyn Fn() -> Result<(), Report<ReleaseError>>,
+) -> Result<(), Report<ReleaseError>> {
+    check()?;
+    for output in outputs {
+        if output.is_empty()
+            || output
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == "..")
+            || expected
+                .keys()
+                .any(|path| path == output || path.starts_with(&format!("{output}/")))
+        {
+            return Err(source_error(
+                "generated root overlaps approved source or is not normal",
+            ));
+        }
+    }
     let mut scan = Scan {
         root,
         expected,
@@ -32,9 +70,12 @@ pub(super) fn compare_worktree(
         directories: vec![String::new()],
         problems: Vec::new(),
         seen: BTreeSet::new(),
+        outputs,
+        check,
     };
     while let Some(directory) = scan.directories.pop() {
-        for name in list_directory(root, &directory)? {
+        for name in list_directory(root, &directory, check)? {
+            check()?;
             scan.visit(&directory, &name);
         }
     }
@@ -44,6 +85,7 @@ pub(super) fn compare_worktree(
         .map(|path| format!("tracked path {path} is missing"))
         .collect();
     scan.problems.extend(missing);
+    check()?;
     report_problems(scan.problems)
 }
 
@@ -60,14 +102,26 @@ fn ancestor_directories(expected: &Records) -> BTreeSet<&str> {
     ancestors
 }
 
-fn list_directory(root: &Path, directory: &str) -> Result<Vec<OsString>, Report<ReleaseError>> {
-    let mut names = fs::read_dir(root.join(directory))
-        .and_then(|entries| {
-            entries
-                .map(|entry| entry.map(|entry| entry.file_name()))
-                .collect::<io::Result<Vec<OsString>>>()
-        })
+fn list_directory(
+    root: &Path,
+    directory: &str,
+    check: &dyn Fn() -> Result<(), Report<ReleaseError>>,
+) -> Result<Vec<OsString>, Report<ReleaseError>> {
+    check()?;
+    let entries = fs::read_dir(root.join(directory))
         .map_err(|error| source_error(format!("cannot list {directory:?}: {error}")))?;
+    let mut names = Vec::new();
+    for entry in entries {
+        check()?;
+        if names.len() >= 1_000_000 {
+            return Err(source_error("source directory exceeds tracked entry limit"));
+        }
+        names.push(
+            entry
+                .map_err(|error| source_error(error.to_string()))?
+                .file_name(),
+        );
+    }
     names.sort();
     Ok(names)
 }
@@ -91,6 +145,8 @@ struct Scan<'a> {
     directories: Vec<String>,
     problems: Vec<String>,
     seen: BTreeSet<String>,
+    outputs: &'a [&'a str],
+    check: &'a dyn Fn() -> Result<(), Report<ReleaseError>>,
 }
 
 impl Scan<'_> {
@@ -108,6 +164,9 @@ impl Scan<'_> {
             format!("{directory}/{name}")
         };
         if relative == ".git" {
+            return;
+        }
+        if self.outputs.contains(&relative.as_str()) {
             return;
         }
         self.observe(&relative);
@@ -134,7 +193,7 @@ impl Scan<'_> {
             }
             return;
         };
-        match observe_record(&path, &metadata) {
+        match observe_record(&path, &metadata, self.check) {
             Ok(observed) if observed == *record => {}
             Ok(_) => self.problems.push(format!(
                 "{relative} differs from the approved commit in mode, type or content"
@@ -145,7 +204,11 @@ impl Scan<'_> {
 }
 
 /// Observes the mode and content digest of one tracked worktree path.
-fn observe_record(path: &Path, metadata: &Metadata) -> Result<(Mode, String), String> {
+fn observe_record(
+    path: &Path,
+    metadata: &Metadata,
+    check: &dyn Fn() -> Result<(), Report<ReleaseError>>,
+) -> Result<(Mode, String), String> {
     if metadata.file_type().is_symlink() {
         let target = fs::read_link(path).map_err(|error| error.to_string())?;
         return Ok((
@@ -159,12 +222,14 @@ fn observe_record(path: &Path, metadata: &Metadata) -> Result<(Mode, String), St
     if metadata.nlink() != 1 {
         return Err(format!("has {} hard links", metadata.nlink()));
     }
-    let mode = if metadata.permissions().mode() & 0o100 == 0 {
-        Mode::Regular
-    } else {
-        Mode::Executable
-    };
-    read_bounded(path, Role::Executable)
-        .map(|raw| (mode, raw.sha256))
+    hash_bounded_with_check(path, 64 * 1024 * 1024, check)
+        .map(|raw| {
+            let mode = if raw.mode & 0o100 == 0 {
+                Mode::Regular
+            } else {
+                Mode::Executable
+            };
+            (mode, raw.sha256)
+        })
         .map_err(|report| format!("{report:?}"))
 }

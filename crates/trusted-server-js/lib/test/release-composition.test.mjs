@@ -646,17 +646,26 @@ describe('complete inventory producer', () => {
         })
       );
       // This is the fixture's source identity, not release approval.
-      const sourceCommit = execFileSync('git', ['rev-parse', 'HEAD'], {
-        cwd: repoRoot,
-        encoding: 'utf8',
-      }).trim();
+      const sourceContextPath = process.env.TRUSTED_SERVER__RELEASE_JS_SOURCE_CONTEXT;
+      const sourceCommit = sourceContextPath
+        ? JSON.parse(fs.readFileSync(sourceContextPath, 'utf8')).source_commit
+        : execFileSync('git', ['rev-parse', 'HEAD'], {
+            cwd: repoRoot,
+            encoding: 'utf8',
+          }).trim();
       vi.stubEnv('TRUSTED_SERVER__RELEASE_BUILD', '1');
       vi.stubEnv('TRUSTED_SERVER__GIT_VERSION', sourceCommit);
       vi.stubEnv('TSJS_SKIP_BUILD', undefined);
       try {
         const inventoryPath = path.join(root, 'inventory.json');
         const outDir = path.join(root, 'bundles');
-        const inventory = await collectJs({ repoRoot, outDir, inventoryPath, preparationPath });
+        const inventory = await collectJs({
+          repoRoot,
+          outDir,
+          inventoryPath,
+          preparationPath,
+          sourceContextPath,
+        });
         expect(Object.keys(inventory).sort()).toEqual([
           'materials',
           'modules',

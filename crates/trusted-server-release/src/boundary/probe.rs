@@ -111,6 +111,23 @@ pub(crate) struct ProbeProgram {
 }
 
 impl ProbeProgram {
+    /// Selects an ordinary CI copy of the source-built producer's fixed probe.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the staged executable cannot be resolved. This
+    /// test-only selector supplies no production tool authentication.
+    #[cfg(test)]
+    pub(crate) fn from_staged_release_binary(path: &Path) -> Result<Self, Report<ReleaseError>> {
+        let program =
+            std::fs::canonicalize(path).map_err(|error| boundary_error(error.to_string()))?;
+        Ok(Self {
+            program,
+            prefix: RELEASE_PROBE_ARGUMENTS.iter().map(OsString::from).collect(),
+            environment: Vec::new(),
+            output: ProbeOutput::Exact,
+        })
+    }
     /// Selects this release binary's documented `boundary-probe connect`
     /// subcommand.
     ///

@@ -76,6 +76,37 @@ pub(crate) struct ReviewedNpmManifest {
 }
 
 impl ReviewedNpmManifest {
+    /// Returns exact original member facts after rechecking retained extraction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a stale extraction or absent member.
+    pub(super) fn member_facts(
+        &self,
+        relative: &str,
+    ) -> Result<(String, u64, u32), Report<ReleaseError>> {
+        self.extracted.member_facts(relative)
+    }
+    /// Rechecks all archive members before preparation consumes this review.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the retained extraction changed or expired.
+    pub(crate) fn verify_unchanged(&self) -> Result<(), Report<ReleaseError>> {
+        self.extracted.verify_unchanged()
+    }
+
+    /// Copies the authenticated compressed original for a new private cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if retained original bytes changed or copying fails.
+    pub(super) fn copy_original(
+        &mut self,
+        destination: &mut impl std::io::Write,
+    ) -> Result<(), Report<ReleaseError>> {
+        self.extracted.copy_original(destination)
+    }
     /// Returns declarations only, without claiming any hook was executed.
     pub(crate) fn hooks(&self) -> &[DeclaredHook] {
         &self.hooks

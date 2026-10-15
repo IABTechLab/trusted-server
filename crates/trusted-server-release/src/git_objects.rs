@@ -29,7 +29,6 @@ impl ObjectReader {
     }
 
     /// Creates one Cargo collection policy: 32 MiB per object, 512 MiB total.
-    #[allow(dead_code, reason = "consumed by Task 7 Cargo acquisition")]
     pub(crate) fn cargo_materials() -> Self {
         Self {
             object_limit: 32 * 1024 * 1024,

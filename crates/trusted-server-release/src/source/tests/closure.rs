@@ -259,3 +259,34 @@ fn child_environment_takes_commit_and_epoch_from_approved_source() {
         "should inject the approved committer epoch"
     );
 }
+
+#[test]
+fn helper_closure_includes_the_actual_npm_observer() {
+    let mut fixture = Fixture::new();
+    write(
+        &fixture.root,
+        "scripts/release/observe-npm.mjs",
+        b"// first observer\n",
+    );
+    fixture.commit_all();
+    let first = fixture
+        .authenticate()
+        .expect("should authenticate observer source")
+        .closure_digest()
+        .to_owned();
+    write(
+        &fixture.root,
+        "scripts/release/observe-npm.mjs",
+        b"// changed observer\n",
+    );
+    fixture.commit_all();
+    let second = fixture
+        .authenticate()
+        .expect("should authenticate changed observer source")
+        .closure_digest()
+        .to_owned();
+    assert_ne!(
+        first, second,
+        "should invalidate helper selection when observer code changes"
+    );
+}

@@ -34,6 +34,10 @@ fn authenticates_clean_fixture_with_commit_epoch_and_closure() {
             "crates/trusted-server-release/src/main.rs",
             "rust-toolchain.toml",
             "scripts/release/bootstrap.sh",
+            "scripts/release/build-js.sh",
+            "scripts/release/build.sh",
+            "scripts/release/collect-js.mjs",
+            "scripts/release/observe-npm.mjs",
         ],
         "should record the complete helper-source closure"
     );

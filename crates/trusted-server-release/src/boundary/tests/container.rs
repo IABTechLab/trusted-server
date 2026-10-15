@@ -61,8 +61,8 @@ fn effective_seccomp_denies_inet_sockets_and_preserves_baseline() {
         .expect("should have syscalls");
     assert_eq!(
         rules.len(),
-        original_rules.len() - 3 + 1,
-        "should drop only the three socket-only rules and add one"
+        original_rules.len() - 5 + 1,
+        "should drop three socket-only and two process-memory rules, then add the Unix socket rule"
     );
     let mut allowing = original.clone();
     allowing["defaultAction"] = Value::from("SCMP_ACT_ALLOW");
@@ -475,5 +475,30 @@ fn effective_seccomp_admits_only_native_architectures() {
             serde_json::json!([]),
             "should admit no non-native ABI (x86/x32 socketcall)"
         );
+    }
+}
+
+#[test]
+fn effective_seccomp_has_no_process_memory_or_descriptor_transfer_allowance() {
+    let effective: Value = serde_json::from_slice(
+        &seccomp::effective(seccomp::baseline().expect("should authenticate baseline"))
+            .expect("should derive effective profile"),
+    )
+    .expect("should parse profile");
+    for rule in effective["syscalls"].as_array().expect("should list rules") {
+        for name in rule["names"].as_array().expect("should list syscall names") {
+            assert!(
+                ![
+                    "ptrace",
+                    "process_vm_readv",
+                    "process_vm_writev",
+                    "pidfd_getfd",
+                    "kcmp",
+                    "process_madvise"
+                ]
+                .contains(&name.as_str().expect("should have syscall name")),
+                "should remove process-memory and descriptor access from every allowance"
+            );
+        }
     }
 }

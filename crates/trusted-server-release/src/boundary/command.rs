@@ -1,6 +1,7 @@
 //! The command description a [`Boundary`](super::Boundary) runs confined.
 
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 
@@ -19,7 +20,6 @@ use crate::process::{BoundedCommand, Cancellation, ProcessLimits};
 /// Arguments are passed verbatim. Environment values are validated by the
 /// same rules as [`BoundedCommand::environment`]; secret values are not
 /// supported because Docker would carry them in argv.
-#[derive(Debug)]
 pub(crate) struct ConfinedCommand {
     pub(super) program: PathBuf,
     pub(super) arguments: Vec<OsString>,
@@ -28,6 +28,28 @@ pub(crate) struct ConfinedCommand {
     pub(super) stdin: Option<Vec<u8>>,
     pub(super) limits: ProcessLimits,
     pub(super) cancellation: Option<Cancellation>,
+}
+
+impl fmt::Debug for ConfinedCommand {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConfinedCommand")
+            .field("program", &self.program)
+            .field("arguments", &self.arguments)
+            .field("working_directory", &self.working_directory)
+            .field(
+                "environment_names",
+                &self
+                    .environment
+                    .iter()
+                    .map(|(name, _)| name)
+                    .collect::<Vec<_>>(),
+            )
+            .field("stdin_bytes", &self.stdin.as_ref().map(Vec::len))
+            .field("limits", &self.limits)
+            .field("cancellation", &self.cancellation)
+            .finish()
+    }
 }
 
 fn invalid_path(path: &Path) -> Report<ReleaseError> {

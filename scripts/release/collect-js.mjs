@@ -27,9 +27,36 @@ const defaultRoot = path.resolve(here, '../..')
 const MAX_BUNDLE = 32 * 1024 * 1024
 
 /** Discover modules from the selected source identity. */
-export function expectedModuleIds(repoRoot, sourceCommit) {
+export function expectedModuleIds(repoRoot, sourceCommit, sourceContextPath) {
   if (!/^[a-f0-9]{40}$/.test(sourceCommit ?? ''))
     throw new Error('Expected full source commit')
+  if (sourceContextPath) {
+    const file = fs.realpathSync(sourceContextPath)
+    if (file === repoRoot || file.startsWith(`${repoRoot}${path.sep}`))
+      throw new Error('Source context must be outside the writable checkout')
+    const context = strictJson(readBounded(file))
+    if (
+      !context ||
+      typeof context !== 'object' ||
+      Array.isArray(context) ||
+      Object.keys(context).sort().join(',') !==
+        'module_ids,schema_version,source_commit' ||
+      context.schema_version !== 1 ||
+      context.source_commit !== sourceCommit ||
+      !Array.isArray(context.module_ids) ||
+      !context.module_ids.includes('core') ||
+      context.module_ids.some(
+        (id) => typeof id !== 'string' || !/^[a-z][a-z0-9_-]*$/.test(id)
+      ) ||
+      context.module_ids.some(
+        (id, index) => index > 0 && context.module_ids[index - 1] >= id
+      )
+    )
+      throw new Error('Invalid parent-derived source context')
+    // The parent derives this list from authenticated objects and mounts it
+    // read-only. Parsing it alone does not establish source/build completion.
+    return context.module_ids
+  }
   const gitEnvironment = {
     PATH: process.env.PATH,
     TMPDIR: os.tmpdir(),
@@ -79,6 +106,7 @@ export async function collectJs({
   outDir,
   inventoryPath,
   preparationPath,
+  sourceContextPath,
 }) {
   if (!preparationPath)
     throw new Error('Checked preparation records are required')
@@ -128,7 +156,7 @@ export async function collectJs({
     inventoryPath.startsWith(`${outDir}${path.sep}`)
   )
     throw new Error('Inventory must be outside the bundle directory')
-  const expected = expectedModuleIds(repoRoot, sourceCommit)
+  const expected = expectedModuleIds(repoRoot, sourceCommit, sourceContextPath)
   const records = await buildAll({
     outDir,
     sourceDir: path.join(libDir, 'src'),
@@ -167,6 +195,7 @@ export async function collectJs({
     'tsconfig.json',
   ].map((file) => `crates/trusted-server-js/lib/${file}`)
   sources.push('scripts/release/collect-js.mjs')
+  sources.push('scripts/release/observe-npm.mjs')
   sources.push(
     'scripts/release/build-js.sh',
     'scripts/release/bootstrap.sh',
@@ -205,17 +234,19 @@ if (
 ) {
   const args = process.argv.slice(2)
   if (
-    args.length !== 6 ||
+    ![6, 8].includes(args.length) ||
     args[0] !== '--out-dir' ||
     args[2] !== '--inventory' ||
-    args[4] !== '--preparation'
+    args[4] !== '--preparation' ||
+    (args.length === 8 && args[6] !== '--source-context')
   )
     throw new Error(
-      'Usage: collect-js.mjs --out-dir <dir> --inventory <file> --preparation <file>'
+      'Usage: collect-js.mjs --out-dir <dir> --inventory <file> --preparation <file> [--source-context <file>]'
     )
   await collectJs({
     outDir: args[1],
     inventoryPath: args[3],
     preparationPath: args[5],
+    sourceContextPath: args[7],
   })
 }

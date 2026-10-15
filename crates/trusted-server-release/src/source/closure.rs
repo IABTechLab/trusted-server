@@ -11,13 +11,17 @@ use crate::error::ReleaseError;
 const RELEASE_CRATE_PREFIX: &str = "crates/trusted-server-release/";
 
 /// Root files always included in the helper-source closure.
-const CLOSURE_FILES: [&str; 6] = [
+const CLOSURE_FILES: [&str; 10] = [
     ".cargo/config.toml",
     ".tool-versions",
     "Cargo.lock",
     "Cargo.toml",
     "rust-toolchain.toml",
     "scripts/release/bootstrap.sh",
+    "scripts/release/build-js.sh",
+    "scripts/release/build.sh",
+    "scripts/release/collect-js.mjs",
+    "scripts/release/observe-npm.mjs",
 ];
 
 /// Path-dependency manifests that must be listed as workspace members.
@@ -43,7 +47,10 @@ pub(super) fn helper_closure(
     paths.extend(
         records
             .keys()
-            .filter(|path| path.starts_with(RELEASE_CRATE_PREFIX))
+            .filter(|path| {
+                path.starts_with(RELEASE_CRATE_PREFIX)
+                    || path.starts_with("crates/trusted-server-js/lib/")
+            })
             .cloned(),
     );
     let digest = digest_records(paths.iter().filter_map(|path| records.get_key_value(path)));
