@@ -292,6 +292,51 @@ jobs:
           cargo test --manifest-path crates/trusted-server-cli/Cargo.toml --target "$TARGET" \
             --test proxy_trust_linux -- --ignored
 
+  lint-domains:
+    # Server-side counterpart to the `ts dev install-hooks` pre-commit hook,
+    # which `--no-verify` skips and fresh clones never install: fail the PR
+    # when an added line introduces a non-allowlisted URL host. PR-only, so
+    # direct pushes to main are not linted.
+    name: ts dev lint domains (changed lines)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      # A PR checkout is GitHub's merge commit; depth 2 also fetches its
+      # parents, so `HEAD^1` is the exact base commit the PR merges into.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Retrieve Rust version
+        id: rust-version
+        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: ${{ steps.rust-version.outputs.rust-version }}
+          # Restore `test-cli`'s cache read-only. This job never runs on main,
+          # so a key of its own is only ever saved in PR scope, where no other
+          # PR can restore it.
+          cache-shared-key: cargo-cli-${{ runner.os }}
+          cache-save-if: false
+
+      # Building `ts` compiles trusted-server-core, whose trusted-server-js
+      # build script runs the TSJS build with the `npm` on PATH, so pin Node
+      # first (see #1204).
+      - name: Use Node.js for the TSJS build
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .tool-versions
+
+      # The `ts` CLI is host-target only; the workspace default is wasm32-wasip1.
+      - name: Lint URL hosts on lines added by this PR
+        run: |
+          cargo run --manifest-path crates/trusted-server-cli/Cargo.toml \
+            --target "$(rustc -vV | sed -n 's/host: //p')" --bin ts -- \
+            dev lint domains --changed-vs HEAD^1 --verbose
+
   test-typescript:
     name: vitest
     runs-on: ubuntu-latest
