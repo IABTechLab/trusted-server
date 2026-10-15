@@ -211,7 +211,7 @@ Core names no cookie here. The Prebid module, `crates/auction/prebid`, owns `ts-
 
 The `sharedId` cookie follows a similar path but is written directly by Prebid's SharedID module rather than by TSJS. The server reads it separately and maps it via the `sharedid.org` source domain.
 
-Returning-user persistence runs only on publisher document navigations, `POST /auction`, and admitted `GET /_ts/page-bids` SPA navigations. Static assets, analytics, integration requests, filter short circuits, and other subresources do not persist what the request carries. New EC creation remains eligible regardless of route because its backing row must include the request's initial IDs.
+Returning-user persistence runs only on publisher document navigations, `POST /auction`, and admitted `GET /_ts/page-bids` SPA navigations. Static assets, analytics, integration requests, filter short circuits, and other subresources do not persist what the request carries. Core still asks the identifier modules on these requests wherever it reads the Edge Cookie state with an Edge Cookie module selected, so the Prebid module decodes its cookie on them too. New EC creation remains eligible regardless of route because its backing row must include the request's initial IDs.
 
 Each eligible request attempts at most one conditional cookie update. If another writer wins, Trusted Server reads the row once and does not write again from that request. A matching value completes the sync; an absent or different value is deferred.
 
