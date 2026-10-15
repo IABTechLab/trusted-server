@@ -18,8 +18,14 @@ pub(crate) enum ReleaseError {
     Unqualified,
     #[display("Release inputs are incomplete")]
     Incomplete,
+    #[display("Final artifact inspection rejected the executable")]
+    Inspect,
+    #[display("Original release material is not verified")]
+    Material,
     #[display("Bounded release child process failed")]
     Process,
+    #[display("Release network-denial boundary rejected the execution")]
+    Boundary,
 }
 
 impl core::error::Error for ReleaseError {}

@@ -1,7 +1,14 @@
+// consumed by Task 7 preparation and Task 9 recipes
+#[allow(dead_code)]
+mod boundary;
 // Atomic output and schema helpers are consumed by later producer stages.
 #[allow(dead_code)]
 mod documents;
 mod error;
+#[allow(dead_code, reason = "consumed by Task 9 recipes")]
+mod inspect;
+#[allow(dead_code, reason = "consumed by Task 7 material preparation")]
+mod materials;
 mod policy;
 mod preflight;
 // `expect` would be unfulfilled in the test build, where the tests use it.
@@ -49,6 +56,19 @@ enum Command {
     },
     /// Diagnostic report of pending inputs; constructs no authorization.
     AuditInputs,
+    /// Network-denial socket probe used by the boundary controls.
+    BoundaryProbe {
+        #[command(subcommand)]
+        probe: ProbeCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProbeCommand {
+    /// Attempts one TCP connect to a literal loopback `IP:PORT`, prints
+    /// `connected` (exit 0) or `denied errno=<n>` (exit 3), and does nothing
+    /// else.
+    Connect { address: String },
 }
 
 /// Writes one human-readable diagnostic line to stderr.
@@ -92,7 +112,26 @@ fn run(
             Ok(ExitCode::SUCCESS)
         }
         Command::AuditInputs => audit_inputs(),
+        Command::BoundaryProbe {
+            probe: ProbeCommand::Connect { address },
+        } => boundary_probe(&address),
     }
+}
+
+/// Runs the single-connect probe and reports its real outcome.
+fn boundary_probe(address: &str) -> Result<ExitCode, Report<ReleaseError>> {
+    let address = boundary::parse_loopback(address)?;
+    let report = boundary::connect_probe(address)?;
+    std::io::stdout()
+        .write_all(format!("{report}\n").as_bytes())
+        .map_err(|error| {
+            Report::new(ReleaseError::Boundary)
+                .attach(format!("cannot write probe report: {error}"))
+        })?;
+    Ok(match report {
+        boundary::ProbeReport::Connected => ExitCode::SUCCESS,
+        boundary::ProbeReport::Denied { .. } => ExitCode::from(boundary::DENIED_STATUS),
+    })
 }
 
 fn audit_inputs() -> Result<ExitCode, Report<ReleaseError>> {

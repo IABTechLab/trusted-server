@@ -3,6 +3,77 @@
 use super::*;
 
 #[test]
+fn material_lockfiles_are_read_only_as_approved_tracked_bytes() {
+    let mut fixture = Fixture::new();
+    let original_bytes = b"fictional original registry distribution";
+    let checksum = hex::encode(Sha256::digest(original_bytes));
+    let registry_line = include_str!("../../../../../Cargo.lock")
+        .lines()
+        .find(|line| line.starts_with("source = \"registry+"))
+        .expect("should derive the reviewed registry identity from the source lock");
+    let lock = format!(
+        "version = 4\n[[package]]\nname = \"fictional\"\nversion = \"1.0.0\"\n{registry_line}\nchecksum = \"{checksum}\"\n"
+    );
+    write(&fixture.root, "Cargo.lock", lock.as_bytes());
+    write(
+        &fixture.root,
+        "crates/trusted-server-js/lib/package-lock.json",
+        br#"{"lockfileVersion":3,"packages":{}}"#,
+    );
+    fixture.commit_all();
+    let source = fixture
+        .authenticate()
+        .expect("should authenticate fixture source");
+    let materials = crate::materials::LockedMaterials::from_source(&source)
+        .expect("should read approved lockfiles");
+    let original = fixture.parent.path().join("fictional.crate");
+    fs::write(&original, original_bytes).expect("should create original outside source roots");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let cancellation = crate::process::Cancellation::default();
+    let retained = materials
+        .verify_registry("fictional", "1.0.0", &original, deadline, &cancellation)
+        .expect("should authenticate original from the approved lockfile");
+    assert_eq!(
+        retained.source_commit(),
+        fixture.commit,
+        "should bind the original to approved source"
+    );
+    assert_eq!(
+        retained.identity(),
+        "crate:fictional@1.0.0",
+        "should retain locked package identity"
+    );
+    assert_eq!(
+        retained.sha256(),
+        checksum,
+        "should retain exact original archive bytes"
+    );
+    assert!(
+        materials
+            .verify_registry("unknown", "1.0.0", &original, deadline, &cancellation)
+            .is_err(),
+        "should reject an archive absent from approved registry materials"
+    );
+    assert!(
+        materials
+            .verify_npm("node_modules/unknown", &original, deadline, &cancellation)
+            .is_err(),
+        "should reject an archive absent from approved npm locations"
+    );
+    assert!(
+        source
+            .read_tracked("../Cargo.lock", Role::Metadata)
+            .is_err(),
+        "should reject paths outside the approved tracked names"
+    );
+    write(&fixture.root, "Cargo.lock", b"version = 4\n");
+    assert!(
+        crate::materials::LockedMaterials::from_source(&source).is_err(),
+        "should reject lockfile changes after source authentication"
+    );
+}
+
+#[test]
 fn closure_requires_every_listed_member_manifest() {
     let mut fixture = Fixture::new();
     write(

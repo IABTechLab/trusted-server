@@ -3,20 +3,19 @@
 use std::cell::Cell;
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read, Write as _};
+use std::io::{self, BufRead, Cursor, Read as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::thread;
+use std::time::{Duration, Instant};
 
 use error_stack::Report;
 
 use super::{checked_sha1, source_error};
 use crate::error::ReleaseError;
 use crate::preflight::AuditedEnvironment;
+use crate::process::{BoundedCommand, ProcessLimits, ProcessResult};
 
 const STDERR_LIMIT: u64 = 64 * 1024;
-const STDERR_SHOWN: usize = 4 * 1024;
 /// Largest single object read; far above any tracked source file.
 const OBJECT_LIMIT: u64 = 64 * 1024 * 1024;
 /// Total bytes of all objects read in one authentication. The tracked tree is
@@ -33,6 +32,8 @@ pub(super) struct Git {
     home: tempfile::TempDir,
     /// Remaining bytes of the aggregate object budget.
     object_budget: Cell<u64>,
+    wall_limit: Duration,
+    attempt_deadline: Instant,
 }
 
 impl Git {
@@ -68,20 +69,38 @@ impl Git {
             root: root.to_path_buf(),
             home,
             object_budget: Cell::new(AGGREGATE_OBJECT_BUDGET),
+            wall_limit: Duration::from_secs(120),
+            attempt_deadline: Instant::now() + Duration::from_secs(900),
         })
     }
 
-    fn command(&self, args: &[&str]) -> Command {
+    #[cfg(test)]
+    pub(super) fn with_wall_limit(mut self, limit: Duration) -> Self {
+        self.wall_limit = limit;
+        self
+    }
+
+    fn command(
+        &self,
+        args: &[&str],
+        stdout_limit: u64,
+    ) -> Result<BoundedCommand, Report<ReleaseError>> {
         let mut git_dir = OsString::from("--git-dir=");
         git_dir.push(self.root.join(".git"));
         let mut work_tree = OsString::from("--work-tree=");
         work_tree.push(&self.root);
-        let mut command = Command::new(&self.program);
-        command
-            .arg(git_dir)
-            .arg(work_tree)
-            .arg("--no-replace-objects")
-            .args([
+        let remaining = self
+            .attempt_deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| source_error("Git authentication attempt exceeded its deadline"))?;
+        let limits = ProcessLimits {
+            wall: self.wall_limit.min(remaining),
+            stdout_max: stdout_limit,
+            stderr_max: STDERR_LIMIT,
+        };
+        let mut arguments = vec![git_dir, work_tree, OsString::from("--no-replace-objects")];
+        arguments.extend(
+            [
                 "-c",
                 "core.hooksPath=/dev/null",
                 "-c",
@@ -90,32 +109,42 @@ impl Git {
                 "core.untrackedCache=false",
                 "-c",
                 "protocol.allow=never",
-            ])
-            .args(args)
-            .current_dir(&self.root)
-            .env_clear()
-            .env("PATH", &self.child_path)
-            .env("HOME", self.home.path())
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_NO_REPLACE_OBJECTS", "1")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .env("LC_ALL", "C")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        command
+            ]
+            .into_iter()
+            .chain(args.iter().copied())
+            .map(OsString::from),
+        );
+        // HOME is fresh and private and XDG_CONFIG_HOME is absent. This
+        // disables user configuration without an arbitrary Git config path.
+        BoundedCommand::new(&self.program, &self.root, limits)?
+            .arguments(arguments)
+            .environment("PATH", &self.child_path)?
+            .environment("HOME", self.home.path())?
+            .environment("GIT_CONFIG_NOSYSTEM", "1")?
+            .environment("GIT_NO_REPLACE_OBJECTS", "1")?
+            .environment("GIT_TERMINAL_PROMPT", "0")?
+            .environment("GIT_OPTIONAL_LOCKS", "0")?
+            .environment("LC_ALL", "C")
     }
 
-    fn spawn(&self, args: &[&str], stdin: bool) -> Result<Child, Report<ReleaseError>> {
-        let mut command = self.command(args);
-        if stdin {
-            command.stdin(Stdio::piped());
+    fn execute(
+        &self,
+        args: &[&str],
+        stdin: Option<Vec<u8>>,
+        stdout_limit: u64,
+    ) -> Result<Vec<u8>, Report<ReleaseError>> {
+        let mut command = self.command(args, stdout_limit)?;
+        if let Some(bytes) = stdin {
+            command = command.stdin_bytes(bytes);
         }
         command
-            .spawn()
-            .map_err(|error| source_error(format!("cannot run git {}: {error}", args.join(" "))))
+            .run()
+            .and_then(ProcessResult::require_success)
+            .map_err(|report| {
+                report
+                    .change_context(ReleaseError::Source)
+                    .attach(format!("git {}", args.join(" ")))
+            })
     }
 
     /// Replaces the aggregate object budget so tests can exercise exhaustion.
@@ -131,26 +160,7 @@ impl Git {
         args: &[&str],
         stdout_limit: u64,
     ) -> Result<Vec<u8>, Report<ReleaseError>> {
-        let mut child = self.spawn(args, false)?;
-        let stderr = capture_stderr(&mut child);
-        let mut output = Vec::new();
-        let read = match child.stdout.take() {
-            Some(stdout) => stdout
-                .take(stdout_limit + 1)
-                .read_to_end(&mut output)
-                .map(|_| ())
-                .map_err(|error| source_error(format!("cannot read stdout: {error}"))),
-            None => Err(source_error("stdout is unavailable")),
-        };
-        let read = read.and_then(|()| {
-            if output.len() as u64 > stdout_limit {
-                Err(source_error("stdout exceeds its byte limit"))
-            } else {
-                Ok(())
-            }
-        });
-        finish(child, stderr, args, read)?;
-        Ok(output)
+        self.execute(args, None, stdout_limit)
     }
 
     /// Reads objects of one `kind` through `cat-file --batch`, rehashing each.
@@ -164,40 +174,69 @@ impl Git {
         oids: &[&str],
         mut visit: impl FnMut(usize, &[u8]) -> Result<(), Report<ReleaseError>>,
     ) -> Result<(), Report<ReleaseError>> {
-        let args = ["cat-file", "--batch"];
-        let mut child = self.spawn(&args, true)?;
-        let stderr = capture_stderr(&mut child);
-        let request: Vec<u8> = oids
-            .iter()
-            .flat_map(|oid| oid.bytes().chain(std::iter::once(b'\n')))
-            .collect();
-        let writer = child
-            .stdin
-            .take()
-            .map(|mut stdin| thread::spawn(move || stdin.write_all(&request)));
-        let read = match child.stdout.take() {
-            Some(stdout) => read_batch(
-                &mut BufReader::new(stdout),
+        let sizes = self.object_sizes(kind, oids)?;
+        let mut start = 0;
+        while start < oids.len() {
+            let mut end = start;
+            let mut limit = 0;
+            while end < oids.len() && limit + sizes[end] + 128 <= OBJECT_LIMIT + 128 {
+                limit += sizes[end] + 128;
+                end += 1;
+            }
+            let output = self.execute(
+                &["cat-file", "--batch"],
+                Some(request(&oids[start..end])),
+                limit,
+            )?;
+            let mut reader = Cursor::new(output.as_slice());
+            read_batch(
+                &mut reader,
                 &Batch {
                     kind,
-                    oids,
+                    oids: &oids[start..end],
                     budget: &self.object_budget,
                 },
-                &mut visit,
-            ),
-            None => Err(source_error("stdout is unavailable")),
-        };
-        if read.is_err() {
-            let _ = child.kill();
+                &mut |index, bytes| visit(start + index, bytes),
+            )?;
+            if reader.position() != output.len() as u64 {
+                return Err(source_error("unexpected trailing Git batch output"));
+            }
+            start = end;
         }
-        let written = match writer.map(thread::JoinHandle::join) {
-            Some(Ok(Ok(()))) => Ok(()),
-            Some(Ok(Err(error))) => Err(source_error(format!("cannot write stdin: {error}"))),
-            Some(Err(_)) => Err(source_error("stdin writer panicked")),
-            None => Err(source_error("stdin is unavailable")),
-        };
-        finish(child, stderr, &args, read.and(written))
+        Ok(())
     }
+
+    fn object_sizes(&self, kind: &str, oids: &[&str]) -> Result<Vec<u64>, Report<ReleaseError>> {
+        let limit = (oids.len() as u64)
+            .checked_mul(128)
+            .ok_or_else(|| source_error("object header budget overflow"))?;
+        let output = self.execute(&["cat-file", "--batch-check"], Some(request(oids)), limit)?;
+        let mut reader = Cursor::new(output.as_slice());
+        let mut total = 0_u64;
+        let mut sizes = Vec::with_capacity(oids.len());
+        for oid in oids {
+            let size = read_header(&mut reader, kind, oid)?;
+            total = total
+                .checked_add(size)
+                .ok_or_else(|| source_error("object byte budget overflow"))?;
+            if size > OBJECT_LIMIT || total > self.object_budget.get() {
+                return Err(source_error(
+                    "object exceeds the per-object or aggregate object byte budget",
+                ));
+            }
+            sizes.push(size);
+        }
+        if reader.position() != output.len() as u64 {
+            return Err(source_error("unexpected trailing Git object metadata"));
+        }
+        Ok(sizes)
+    }
+}
+
+fn request(oids: &[&str]) -> Vec<u8> {
+    oids.iter()
+        .flat_map(|oid| oid.bytes().chain(std::iter::once(b'\n')))
+        .collect()
 }
 
 /// Collision-checked Git SHA-1 object id of `bytes` stored as an object of `kind`.
@@ -269,57 +308,4 @@ fn read_header(
             "object {oid} is not a readable {kind}"
         ))),
     }
-}
-
-type StderrCapture = Option<thread::JoinHandle<Vec<u8>>>;
-
-fn capture_stderr(child: &mut Child) -> StderrCapture {
-    child.stderr.take().map(|stderr| {
-        thread::spawn(move || {
-            let mut captured = Vec::new();
-            let mut stderr = stderr;
-            let _ = (&mut stderr).take(STDERR_LIMIT).read_to_end(&mut captured);
-            let _ = io::copy(&mut stderr, &mut io::sink());
-            captured
-        })
-    })
-}
-
-/// Reaps the child and attaches its bounded stderr to any failure.
-fn finish(
-    mut child: Child,
-    stderr: StderrCapture,
-    args: &[&str],
-    read: Result<(), Report<ReleaseError>>,
-) -> Result<(), Report<ReleaseError>> {
-    if read.is_err() {
-        let _ = child.kill();
-    }
-    // Task 7 bounded process module replaces this unbounded wait.
-    let status = child
-        .wait()
-        .map_err(|error| source_error(format!("cannot wait for git: {error}")))?;
-    let detail = bounded_detail(stderr);
-    let context = format!("git {}; stderr: {detail}", args.join(" "));
-    read.map_err(|report| report.attach(context.clone()))?;
-    if !status.success() {
-        return Err(source_error(format!("{context}; exit {status}")));
-    }
-    Ok(())
-}
-
-fn bounded_detail(stderr: StderrCapture) -> String {
-    let detail = stderr
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_default();
-    let mut detail = String::from_utf8_lossy(&detail).trim().to_owned();
-    if detail.len() > STDERR_SHOWN {
-        let mut cut = STDERR_SHOWN;
-        while !detail.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        detail.truncate(cut);
-        detail.push_str(" [truncated]");
-    }
-    detail
 }

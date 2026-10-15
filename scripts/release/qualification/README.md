@@ -5,13 +5,20 @@ SDK, OCI image or recipe has become qualified. `release-tools.json` retains null
 measurement slots. A source checksum and a successful unit test cannot supply
 hosted execution or acquisition authenticity.
 
-The retained observation schema, source-owned candidate boundary design and inert
-hosted proposal guide replacement Rust semantic checks and native execution. It creates no repository, dispatches no job, registers no workflow,
+The retained observation schema, experimental source-owned boundaries and inert
+hosted proposal guide Rust semantic checks and native execution. This framework creates no repository, dispatches no job, registers no workflow,
 publishes no tag, signs no release and deploys no publisher service.
 
 ## Rust migration and Task 9 status
 
-Introduced Python qualification/recipe tooling and validator requirements are removed. Historical local socket/Cargo/tiny Mach-O probes are not replacement Rust boundary results or selected macOS 15/GNU qualification. The [Rust migration addendum](../../../docs/superpowers/specs/2026-10-14-release-tooling-rust-migration.md) and [primary plan](../../../docs/superpowers/plans/2026-10-13-attested-release-implementation.md#rust-migration-and-current-execution-boundary) define the host-only `crates/trusted-server-release` tool. Its document/schema utilities are implemented; source/preflight, complete helper closure and actual qualification remain pending.
+Introduced Python qualification/recipe tooling and validator requirements are removed. Historical local socket/Cargo/tiny Mach-O probes are not selected macOS 15/GNU qualification. The [Rust migration addendum](../../../docs/superpowers/specs/2026-10-14-release-tooling-rust-migration.md) and [primary plan](../../../docs/superpowers/plans/2026-10-13-attested-release-implementation.md#rust-migration-and-current-execution-boundary) define the host-only `crates/trusted-server-release` tool. Strict document/policy checks, local source authentication, helper-closure fingerprinting, bounded Git/process execution and final-artifact inspection are implemented. Authenticated bootstrap/acquisition and actual qualification remain pending.
+
+The experimental macOS sandbox denies network access but does not establish
+complete descendant cleanup: `posix_spawn` can escape the supervised group,
+and a child that scrubs its tracking environment can survive the run. Socket
+denial and successful utility tests do not qualify that lifecycle boundary.
+The production macOS and Linux selectors remain unconstructible until their
+required controls and independently authenticated inputs are established.
 
 Current wrappers fail closed until the independently approved native Rust
 bootstrap and source-owned authenticated selections are implemented. Neither

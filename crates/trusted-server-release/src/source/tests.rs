@@ -189,4 +189,5 @@ fn assert_rejects(fixture: &Fixture, needle: &str) {
 mod closure;
 mod layout;
 mod objects;
+mod process;
 mod worktree;

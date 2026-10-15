@@ -4369,6 +4369,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "object"
+version = "0.37.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff76201f031d8863c38aa7f905eca4f53abbfa15f609db4277d44cd8938f33fe"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "oid-registry"
 version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6931,18 +6940,21 @@ dependencies = [
 name = "trusted-server-release"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "clap",
  "derive_more",
  "error-stack",
  "hex",
  "jsonschema",
  "libc",
+ "object",
  "serde",
  "serde_json",
  "sha1-checked",
  "sha2 0.10.9",
  "tempfile",
  "toml",
+ "wasmparser",
 ]
 
 [[package]]

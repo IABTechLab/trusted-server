@@ -159,6 +159,29 @@ impl ApprovedSource {
             .get(path)
             .map(|(_, sha256)| sha256.as_str())
     }
+
+    /// Reads bounded tracked bytes and checks their approved object digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReleaseError::Source`] for an untracked name, changed bytes,
+    /// or an input rejected by the held-descriptor document reader.
+    pub(crate) fn read_tracked(
+        &self,
+        path: &str,
+        role: Role,
+    ) -> Result<Vec<u8>, Report<ReleaseError>> {
+        let expected = self
+            .tracked_sha256(path)
+            .ok_or_else(|| source_error("material input is not an approved tracked file"))?;
+        let raw = read_bounded(&self.snapshot.root.join(path), role)?;
+        if raw.sha256 != expected {
+            return Err(source_error(
+                "tracked material input differs from the approved source",
+            ));
+        }
+        Ok(raw.bytes)
+    }
 }
 
 /// Authenticates the checkout at `root` as exactly the approved commit.
