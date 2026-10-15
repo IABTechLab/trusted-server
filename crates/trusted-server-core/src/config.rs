@@ -496,12 +496,14 @@ fn validate_secret_key_references(
         }
     }
 
-    // An origin signer's secret settings are known through the builders that
-    // offer the signer, as they are when the settings load.
+    // An origin signer's secret settings, and the tables it can use, are
+    // known through the builders that offer the signer, as they are when the
+    // settings load.
     let builders: Vec<IntegrationBuilder> =
         crate::integrations::all_builders(extra_integrations).collect();
     let signers = crate::origin_auth::OriginSigners::offered_by(&builders)?;
     crate::origin_auth::check_key_references(settings, &signers)?;
+    crate::origin_auth::check_tables(settings, &signers)?;
 
     Ok(())
 }
@@ -956,21 +958,6 @@ formats = [{ width = 300, height = 250 }]
                 ("ec.partners[*].api_token".to_owned(), true),
                 ("ec.partners[*].ts_pull_token".to_owned(), true),
                 ("trusted_client_ip.shared_secret".to_owned(), false),
-                (
-                    "proxy.asset_routes[*].source.origin.auth.access_key_id".to_owned(),
-                    true
-                ),
-                (
-                    "proxy.asset_routes[*].source.origin.auth.secret_access_key".to_owned(),
-                    true,
-                ),
-                (
-                    "proxy.asset_routes[*].source.origin.auth.session_token".to_owned(),
-                    true
-                ),
-                ("source.origin.auth.access_key_id".to_owned(), true),
-                ("source.origin.auth.secret_access_key".to_owned(), true),
-                ("source.origin.auth.session_token".to_owned(), true),
             ],
             "should expose the native EdgeZero secret metadata contract"
         );
@@ -1279,6 +1266,35 @@ passphrase = "production-secret-key-32-bytes-min"
     fn deploy_validation_leaves_a_signer_s_settings_alone_without_its_builder() {
         validate_settings_for_deploy(&settings_signing_the_publisher_origin(" ", None))
             .expect("the key name is the signer's business, and no builder offers it here");
+    }
+
+    #[test]
+    fn deploy_validation_refuses_an_auth_table_its_signer_cannot_use() {
+        let mut publisher = valid_settings();
+        edit_origin(&mut publisher, |origin| {
+            origin.url = "https://storage.example.com/bucket/site".to_string();
+            origin.auth = Some(fixture::auth(" "));
+        });
+        let mut route =
+            crate::settings::ProxyAssetRoute::new("/assets/", "https://assets.example.com");
+        crate::test_support::tests::set_route_auth(&mut route, Some(fixture::auth(" ")));
+        let mut routed = valid_settings();
+        routed.proxy.asset_routes.push(route);
+
+        for (settings, table) in [
+            (publisher, "source.origin.auth"),
+            (routed, "proxy.asset_routes /assets/ source.origin.auth"),
+        ] {
+            let err = validate_settings_for_deploy_with(&settings, &[fixture::builder()])
+                .expect_err("should refuse a table the signer cannot use");
+            assert!(
+                format!("{err:?}").contains(&format!(
+                    "[{table}] {} realm must not be empty",
+                    fixture::SIGNER
+                )),
+                "should name `{table}`: {err:?}"
+            );
+        }
     }
 
     #[test]

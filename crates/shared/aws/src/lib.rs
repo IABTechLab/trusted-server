@@ -50,10 +50,9 @@ use http::{HeaderMap, Method};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use trusted_server_core::error::TrustedServerError;
-use trusted_server_core::integrations::{IntegrationBuilder, IntegrationRegistration};
+use trusted_server_core::integrations::IntegrationBuilder;
 use trusted_server_core::origin_auth::{OriginSigner, OriginSignerModule, SignerSecret};
 use trusted_server_core::redacted::Redacted;
-use trusted_server_core::settings::Settings;
 use url::Url;
 
 /// The id of this crate's builder, from the crate's folder.
@@ -87,41 +86,13 @@ pub static S3_SIGV4: OriginSignerModule = OriginSignerModule {
 };
 
 /// The builder a deployment hands to an adapter, which offers the signer
-/// whatever the settings say. A stock build lists it in
-/// `trusted-server-modules`.
+/// whatever the settings say. It supplies no page module, and core checks
+/// each `auth` table naming the signer when a deployment is validated. Each
+/// adapter lists it among the modules it links.
 #[must_use]
 pub fn builder() -> IntegrationBuilder {
-    IntegrationBuilder::new(MODULE, env!("CARGO_PKG_NAME"), no_registration, validate)
+    IntegrationBuilder::implementations(MODULE, env!("CARGO_PKG_NAME"))
         .with_origin_signer(&S3_SIGV4)
-}
-
-/// The builder registers no page integration, because no section selects it.
-fn no_registration(
-    _settings: &Settings,
-) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
-    Ok(None)
-}
-
-/// Checks every `auth` table naming the signer, for a deployment being
-/// validated, so a table the signer cannot use fails `ts config validate`
-/// and not the deployment's first start.
-fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
-    if let Some(auth) = settings.origin_source().and_then(|origin| origin.auth)
-        && auth.signer == SIGNER
-    {
-        S3SigV4Settings::read(&auth.settings, "source.origin.auth")?;
-    }
-    for route in &settings.proxy.asset_routes {
-        if let Some(auth) = route.origin_source().and_then(|origin| origin.auth)
-            && auth.signer == SIGNER
-        {
-            S3SigV4Settings::read(
-                &auth.settings,
-                &format!("{}.origin.auth", route.source_setting()),
-            )?;
-        }
-    }
-    Ok(false)
 }
 
 fn build_signer(

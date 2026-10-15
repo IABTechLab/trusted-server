@@ -9,8 +9,8 @@ core declares for that thing.
 - `crates/shared/aws` (`trusted-server-shared-aws`) offers the origin signer
   `s3_sigv4`, which a source's `auth` table names to sign a read from S3 with
   AWS Signature Version 4. Core's `origin_auth` module declares the signer
-  interface, the `OriginSigner` trait, and the stock build offers this signer
-  through `crates/trusted-server-modules`.
+  interface, the `OriginSigner` trait, and each adapter lists the crate's
+  builder among the modules it links.
 
 A vendor whose crates share settings, such as an endpoint and a license key,
 writes them in one `[shared.<vendor>]` table, which its builder reads with

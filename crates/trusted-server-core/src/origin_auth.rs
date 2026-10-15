@@ -469,6 +469,35 @@ pub(crate) fn check_key_references(
     }
 }
 
+/// Builds every `auth` table that names a signer `signers` offers, for a
+/// check that runs while the settings still hold key names, so a table the
+/// signer cannot use fails deploy validation and not the deployment's first
+/// start. A table naming a signer nothing offers is left to the build that
+/// offers it.
+///
+/// # Errors
+///
+/// The signer's refusal, naming the table as the settings load does.
+pub(crate) fn check_tables(
+    settings: &Settings,
+    signers: &OriginSigners,
+) -> Result<(), Report<TrustedServerError>> {
+    let publisher = settings
+        .origin_source()
+        .and_then(|origin| origin.auth)
+        .map(|auth| (auth, "source.origin.auth".to_owned()));
+    let routes = settings.proxy.asset_routes.iter().filter_map(|route| {
+        let auth = route.origin_source()?.auth?;
+        Some((auth, format!("{}.origin.auth", route.source_setting())))
+    });
+    for (auth, setting) in publisher.into_iter().chain(routes) {
+        if signers.get(&auth.signer).is_some() {
+            signers.build(&auth, &setting)?;
+        }
+    }
+    Ok(())
+}
+
 /// A signer for core's tests, which cannot link the crates that supply the
 /// real ones.
 ///
