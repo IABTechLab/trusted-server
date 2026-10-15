@@ -165,7 +165,6 @@ before checked cleanup; raw assertion messages and stacks are excluded.
 
 R-JS allows one shared Linux JS build for later Rust artifact jobs. Task 7
 does not qualify native Rust recipes or macOS lifecycle containment. The
-macOS hardlink and same-sandbox signal regression ports pass, but the known
-scrubbed process-group escape remains open for Tasks 8/9 and M2. Authenticated
+macOS regression ports passed afterwards on [macOS 15 CI](https://github.com/IABTechLab/trusted-server/actions/runs/38765937295/job/116529009924), including the formerly residual scrubbed process-group escape, which is now killed and rejected. That boundary remains unqualified. Authenticated
 bootstrap, selected hosted environments, actual Cargo recipes and official
 release publication remain separate incomplete gates.
