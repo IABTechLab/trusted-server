@@ -102,12 +102,12 @@ A module is named by its crate folder below `crates/permission-signal`, so
 also be written in full, as `permission-signal.gpp`. The `[consent]` table
 holds the settings the shipped modules read: the TCF module reads
 `check_expiration`, `max_consent_age_days` and `conflict_resolution`, the US
-Privacy module reads `us_privacy_defaults`, and every module reads `mode`,
-which says whether the strings are decoded or left as received. A module that
-gains settings of its own will take them in a `[permission-signal.<name>]`
-block named for it, and until one does `modules` is the only key the section
-accepts, with a block or any other key refused as an unknown field rather
-than ignored.
+Privacy module reads `us_privacy_defaults`, and the TCF, GPP and US Privacy
+modules read `mode`, which says whether the strings are decoded or left as
+received. A module that gains settings of its own will take them in a
+`[permission-signal.<name>]` block named for it, and until one does `modules`
+is the only key the section accepts, with a block or any other key refused as
+an unknown field rather than ignored.
 
 The default order asks the signal with no interface of its own first and the
 ones carrying a choice made through an interface after. Global Privacy
