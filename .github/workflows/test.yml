@@ -1,4 +1,4 @@
-name: 'Run Tests'
+name: "Run Tests"
 
 permissions:
   contents: read
@@ -267,7 +267,7 @@ jobs:
           TRUSTED_SERVER__PUBLISHER__ORIGIN_URL: http://127.0.0.1:8080
           TRUSTED_SERVER__PUBLISHER__PROXY_SECRET: integration-test-proxy-secret
           TRUSTED_SERVER__EC__PASSPHRASE: integration-test-ec-secret-padded-32
-          TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK: 'false'
+          TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK: "false"
         run: cargo build --package trusted-server-adapter-spin --target wasm32-wasip1 --features spin --release
 
       - name: Run Spin adapter tests (native host)
@@ -319,7 +319,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           toolchain: ${{ steps.rust-version.outputs.rust-version }}
-          components: 'clippy, rustfmt'
+          components: "clippy, rustfmt"
           cache-shared-key: cargo-cli-${{ runner.os }}
 
       - name: Read pinned Node.js version for CLI fixtures
@@ -393,7 +393,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
-          cache: 'npm'
+          cache: "npm"
           cache-dependency-path: crates/trusted-server-js/lib/package.json
 
       - name: Install dependencies

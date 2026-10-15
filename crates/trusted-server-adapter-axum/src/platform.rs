@@ -598,6 +598,11 @@ impl trusted_server_core::platform::PlatformTimer for AxumTimer {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use edgezero_core::body::Body as EdgeBody;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
     #[test]
     fn html_finalization_timer_is_request_scoped() {
         let request = edgezero_core::http::request_builder()
@@ -610,11 +615,6 @@ mod tests {
             "should install a cooperative timer without polling it"
         );
     }
-
-    use super::*;
-    use edgezero_core::body::Body as EdgeBody;
-    use std::time::Duration;
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     #[test]
     fn auction_http_capabilities_are_explicit() {
