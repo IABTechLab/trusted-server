@@ -312,23 +312,27 @@ fn rejects_hidden_data_bad_trailers_concatenation_and_truncation() {
     }
 }
 
-#[test]
-fn catalog_extraction_rejoins_source_and_locked_acquisition_identity() {
-    let bytes = compressed(&tar_bytes(&[("package/file", b'0', 0o644, b"x")]));
+fn catalog(bytes: &[u8]) -> LockedMaterials {
     let lock = serde_json::to_vec(&json!({"lockfileVersion":3, "packages": {
         "": {}, "node_modules/fictional-package": {
             "version":"1.0.0", "resolved":format!("{}fictional-package/-/fictional-package-1.0.0.tgz", locked::NPM_REGISTRY),
-            "integrity":format!("sha512-{}", STANDARD.encode(Sha512::digest(&bytes)))
+            "integrity":format!("sha512-{}", STANDARD.encode(Sha512::digest(bytes)))
         }
     }})).expect("should encode locked original identity");
-    let mut catalog = LockedMaterials {
+    LockedMaterials {
         source_commit: "a".repeat(40),
         cargo_lock_sha256: "0".repeat(64),
         npm_lock_sha256: "0".repeat(64),
         cargo: locked::parse_cargo(b"version = 4\npackage = []\n")
             .expect("should parse empty Cargo lock"),
         npm: locked::parse_npm(&lock).expect("should parse fixture npm lock"),
-    };
+    }
+}
+
+#[test]
+fn catalog_extraction_rejoins_source_and_locked_acquisition_identity() {
+    let bytes = compressed(&tar_bytes(&[("package/file", b'0', 0o644, b"x")]));
+    let mut catalog = catalog(&bytes);
     assert!(
         catalog
             .extract_npm("node_modules/fictional-package", original(&bytes))
@@ -354,6 +358,74 @@ fn catalog_extraction_rejoins_source_and_locked_acquisition_identity() {
             .is_err(),
         "should reject original bound to different approved source"
     );
+}
+
+#[test]
+fn manifest_review_uses_original_members_and_rejects_later_changes() {
+    let manifest = serde_json::to_vec(&json!({"name":"fictional-package","version":"1.0.0"}))
+        .expect("should encode fixture manifest");
+    for binding in [false, true] {
+        let mut entries = vec![("package/package.json", b'0', 0o644, manifest.as_slice())];
+        if binding {
+            entries.push((
+                "package/binding.gyp",
+                b'0',
+                0o644,
+                b"fictional binding".as_slice(),
+            ));
+        }
+        let bytes = compressed(&tar_bytes(&entries));
+        let catalog = catalog(&bytes);
+        let extract_package = || {
+            catalog
+                .extract_npm("node_modules/fictional-package", original(&bytes))
+                .expect("should extract original manifest")
+        };
+        let reviewed = catalog.review_npm("node_modules/fictional-package", extract_package());
+        if binding {
+            assert!(reviewed.is_err(), "should reject original implicit install");
+            let extracted = extract_package();
+            fs::remove_file(extracted.root().join("binding.gyp"))
+                .expect("should remove fixture binding");
+            assert!(
+                catalog
+                    .review_npm("node_modules/fictional-package", extracted)
+                    .is_err(),
+                "should reject removed original binding"
+            );
+        } else {
+            assert!(
+                reviewed
+                    .expect("should review hook-free original")
+                    .hooks()
+                    .is_empty(),
+                "should declare no execution"
+            );
+            let extracted = extract_package();
+            fs::write(extracted.root().join("binding.gyp"), b"added binding")
+                .expect("should add fixture binding");
+            assert!(
+                catalog
+                    .review_npm("node_modules/fictional-package", extracted)
+                    .is_err(),
+                "should reject unrecorded binding"
+            );
+        }
+        let extracted = extract_package();
+        fs::write(extracted.root().join("package.json"), b"{}").expect("should change manifest");
+        assert!(
+            catalog
+                .review_npm("node_modules/fictional-package", extracted)
+                .is_err(),
+            "should reject changed manifest bytes"
+        );
+        assert!(
+            catalog
+                .review_npm("node_modules/other", extract_package())
+                .is_err(),
+            "should reject another locked location"
+        );
+    }
 }
 
 #[test]

@@ -3,6 +3,74 @@
 use super::*;
 
 #[test]
+fn root_lifecycle_review_reads_only_the_approved_manifest() {
+    let mut fixture = Fixture::new();
+    let manifest = serde_json::to_vec(
+        &json!({"name":"fictional-project", "scripts":{"build":"node build.mjs"}}),
+    )
+    .expect("should encode root manifest");
+    write(&fixture.root, "Cargo.lock", b"version = 4\npackage = []\n");
+    write(
+        &fixture.root,
+        "crates/trusted-server-js/lib/package-lock.json",
+        &serde_json::to_vec(&json!({"lockfileVersion":3,"packages":{}}))
+            .expect("should encode empty lock"),
+    );
+    write(
+        &fixture.root,
+        "crates/trusted-server-js/lib/package.json",
+        &manifest,
+    );
+    fixture.commit_all();
+    let source = fixture
+        .authenticate()
+        .expect("should authenticate root source");
+    let materials = crate::materials::LockedMaterials::from_source(&source)
+        .expect("should read approved locks");
+    let review = materials
+        .review_root(&source)
+        .expect("should review hook-free approved root");
+    assert_eq!(
+        review.source_commit(),
+        fixture.commit,
+        "should bind declarations to approved source"
+    );
+    write(
+        &fixture.root,
+        "crates/trusted-server-js/lib/package.json",
+        b"{}",
+    );
+    assert!(
+        materials.review_root(&source).is_err(),
+        "should reject root manifest changed after approval"
+    );
+    write(
+        &fixture.root,
+        "crates/trusted-server-js/lib/package.json",
+        &manifest,
+    );
+    write(
+        &fixture.root,
+        "crates/trusted-server-js/lib/binding.gyp",
+        b"fictional implicit binding",
+    );
+    fixture.commit_all();
+    let source = fixture
+        .authenticate()
+        .expect("should authenticate changed source");
+    let current = crate::materials::LockedMaterials::from_source(&source)
+        .expect("should read current approved locks");
+    assert!(
+        current.review_root(&source).is_err(),
+        "should reject approved root implicit install"
+    );
+    assert!(
+        materials.review_root(&source).is_err(),
+        "should reject another approved source identity"
+    );
+}
+
+#[test]
 fn material_lockfiles_are_read_only_as_approved_tracked_bytes() {
     let mut fixture = Fixture::new();
     let original_bytes = b"fictional original registry distribution";

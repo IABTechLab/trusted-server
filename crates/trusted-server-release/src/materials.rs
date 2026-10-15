@@ -7,6 +7,7 @@
 mod archive;
 mod extract;
 mod locked;
+mod manifest;
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -22,6 +23,7 @@ use crate::source::ApprovedSource;
 pub(crate) use archive::VerifiedOriginal;
 pub(crate) use extract::ExtractedOriginal;
 use locked::{CargoMaterials, NpmMaterial, parse_cargo, parse_npm};
+pub(crate) use manifest::{ReviewedNpmManifest, RootManifestReview};
 
 const NPM_LOCK: &str = "crates/trusted-server-js/lib/package-lock.json";
 
@@ -41,6 +43,46 @@ pub(crate) struct LockedMaterials {
 }
 
 impl LockedMaterials {
+    /// Reviews approved root declarations without executing npm lifecycle hooks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for changed source, lifecycle hooks or an implicit install.
+    pub(crate) fn review_root(
+        &self,
+        source: &ApprovedSource,
+    ) -> Result<RootManifestReview, Report<ReleaseError>> {
+        if source.commit().as_str() != self.source_commit {
+            return Err(material_error(
+                "root manifest is bound to a different approved source",
+            ));
+        }
+        manifest::review_root(source)
+    }
+
+    /// Reviews a verified npm manifest against locked identity and hook policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a mismatched original, changed manifest or unreviewed hook.
+    pub(crate) fn review_npm(
+        &self,
+        location: &str,
+        extracted: ExtractedOriginal,
+    ) -> Result<ReviewedNpmManifest, Report<ReleaseError>> {
+        let locked = self
+            .npm
+            .get(location)
+            .ok_or_else(|| material_error("unknown npm location"))?;
+        if extracted.source_commit() != self.source_commit
+            || extracted.identity() != format!("npm:{location}")
+        {
+            return Err(material_error(
+                "extracted manifest is not bound to this locked acquisition",
+            ));
+        }
+        manifest::review_npm(extracted, &locked.name, &locked.version)
+    }
     /// Extracts a verified npm original into new private state.
     ///
     /// # Errors

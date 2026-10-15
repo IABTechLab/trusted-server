@@ -158,6 +158,25 @@ selected Node 24.12.0 despite package-bin shadowing. Missing prepared native
 Vite/esbuild tools MUST fail without fetching substitutes. Observed lifecycle
 records cannot be inferred from lockfile flags or successful npm exit alone.
 
+The source-owned declaration policy in the Rust material reviewer permits only
+these exact dependency install-hook tuples. It checks the name/version against
+the approved lock, the manifest bytes against the authenticated extraction, and
+the command bytes against this policy:
+
+| Package   | Version  | Event         | Exact command                                       |
+| --------- | -------- | ------------- | --------------------------------------------------- |
+| `core-js` | `3.48.0` | `postinstall` | `node -e "try{require('./postinstall')}catch(e){}"` |
+| `esbuild` | `0.27.3` | `postinstall` | `node install.js`                                   |
+
+Any added hook or command/version change requires a source policy review.
+Root review rejects all ten `npm ci` lifecycle hooks: `preinstall`, `install`,
+`postinstall`, `prepublish`, `preprepare`, `prepare`, `postprepare`,
+`predependencies`, `dependencies` and `postdependencies`. The last three also run
+through pinned npm's Arborist when installation changes the dependency tree. These
+results describe declarations only. They grant no execution authority and supply
+no starts, completions, failures or changed-file observations. Full installation
+tree mutation checks and actual lifecycle observations remain separate gates.
+
 Run collector and unconditional full Vitest/type checks under that same native
 boundary, checking tracked source and unexpected files before/after each stage.
 Preserve release Vitest's literal host and narrowly scoped native `node:` import

@@ -12,6 +12,7 @@ use sha2::{Digest as _, Sha256};
 use tempfile::TempDir;
 
 use super::{VerifiedOriginal, material_error};
+use crate::documents::{Role, read_bounded};
 use crate::error::ReleaseError;
 
 #[derive(Clone, Copy)]
@@ -39,9 +40,62 @@ pub(crate) struct ExtractedOriginal {
     directory: TempDir,
     root: PathBuf,
     files: BTreeMap<String, MemberFacts>,
+    root_name: String,
 }
 
 impl ExtractedOriginal {
+    /// Returns the locked acquisition identity supplying this extracted tree.
+    pub(super) fn identity(&self) -> &str {
+        self.original.identity()
+    }
+
+    /// Reads a bounded manifest input and rejoins its extraction-time digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unrecorded, changed, linked or oversized input,
+    /// or when the original's deadline/cancellation boundary has expired.
+    pub(super) fn read_member_checked(
+        &self,
+        relative: &str,
+    ) -> Result<Vec<u8>, Report<ReleaseError>> {
+        self.original.check()?;
+        let key = format!("{}/{relative}", self.root_name);
+        let expected = self
+            .files
+            .get(&key)
+            .ok_or_else(|| material_error("manifest input is not a recorded archive member"))?;
+        let raw = read_bounded(&self.root.join(relative), Role::Metadata)?;
+        if raw.sha256 != expected.sha256 || raw.bytes.len() as u64 != expected.size {
+            return Err(material_error("extracted manifest input changed"));
+        }
+        self.original.check()?;
+        Ok(raw.bytes)
+    }
+
+    /// Checks recorded manifest-input presence without allowing a later omission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the selected original input was removed or changed,
+    /// an unrecorded input appeared, or the attempt expired.
+    pub(super) fn contains_member_checked(
+        &self,
+        relative: &str,
+    ) -> Result<bool, Report<ReleaseError>> {
+        self.original.check()?;
+        let key = format!("{}/{relative}", self.root_name);
+        if self.files.contains_key(&key) {
+            self.read_member_checked(relative)?;
+            return Ok(true);
+        }
+        match fs::symlink_metadata(self.root.join(relative)) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            _ => Err(material_error(
+                "unrecorded or invalid manifest input appeared",
+            )),
+        }
+    }
     /// Returns the privately owned package root for later preparation checks.
     pub(crate) fn root(&self) -> &Path {
         &self.root
@@ -353,6 +407,7 @@ fn extract_bounded(
         return Err(material_error("archive has no package files"));
     }
     Ok(ExtractedOriginal {
+        root_name: selection.root.to_owned(),
         original,
         root,
         directory: state.directory,
