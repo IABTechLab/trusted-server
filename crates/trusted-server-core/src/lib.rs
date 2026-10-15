@@ -31,6 +31,7 @@
     )
 )]
 
+pub mod access_telemetry;
 pub(crate) mod asset_image_optimizer;
 pub mod auction;
 pub mod auction_config_types;
@@ -48,6 +49,7 @@ pub mod creative_opportunities;
 pub mod ec;
 pub(crate) mod edge_cookie;
 pub mod error;
+pub mod forwarder;
 pub mod geo;
 pub mod host_header;
 pub(crate) mod host_rewrite;
@@ -62,6 +64,8 @@ pub mod proxy;
 pub mod publisher;
 pub mod redacted;
 pub mod request_signing;
+pub mod request_timing;
+pub(crate) mod response_header_rewrite;
 pub mod response_privacy;
 pub mod rsc_flight;
 pub(crate) mod s3_sigv4;
@@ -72,6 +76,7 @@ pub mod streaming_processor;
 pub mod streaming_replacer;
 pub mod test_support;
 pub mod tester_cookie;
+pub mod trace;
 pub mod tsjs;
 pub mod version_header;
 

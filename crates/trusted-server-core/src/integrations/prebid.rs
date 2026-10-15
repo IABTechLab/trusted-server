@@ -36,7 +36,7 @@ use crate::auction::types::{AuctionContext, AuctionRequest, MediaType};
 use crate::auction::types::{AuctionResponse, Bid as AuctionBid};
 use crate::cache_policy::{CacheControlPolicy, EdgeCacheHeader};
 use crate::consent_config::ConsentForwardingMode;
-use crate::cookies::{CONSENT_COOKIE_NAMES, strip_cookies};
+use crate::cookies::auction_cookie_header;
 use crate::error::TrustedServerError;
 #[cfg(test)]
 use crate::http_util::RequestInfo;
@@ -2088,24 +2088,10 @@ fn apply_prebid_header_values(
     let Some(cookie_value) = cookie else {
         return;
     };
-    if !consent_forwarding.strips_consent_cookies() {
-        to.headers_mut()
-            .insert(header::COOKIE, cookie_value.clone());
-        return;
-    }
-    match cookie_value.to_str() {
-        Ok(value) => {
-            let stripped = strip_cookies(value, CONSENT_COOKIE_NAMES);
-            if !stripped.is_empty()
-                && let Ok(cookie_header) = HeaderValue::from_str(&stripped)
-            {
-                to.headers_mut().insert(header::COOKIE, cookie_header);
-            }
-        }
-        Err(_) => {
-            to.headers_mut()
-                .insert(header::COOKIE, cookie_value.clone());
-        }
+    if let Some(value) =
+        auction_cookie_header(cookie_value, consent_forwarding.strips_consent_cookies())
+    {
+        to.headers_mut().insert(header::COOKIE, value);
     }
 }
 
@@ -3964,6 +3950,7 @@ mod tests {
 
     fn make_request_info(context: &AuctionContext<'_>) -> RequestInfo {
         RequestInfo::from_request(context.request, context.services.client_info())
+            .expect("should extract valid test request info")
     }
 
     fn config_from_settings(
@@ -6864,6 +6851,9 @@ external_bundle_sri = "sha384-AAAA"
         let mut auction_request = create_test_auction_request();
         auction_request.user.eids = Some(vec![
             crate::openrtb::Eid {
+                inserter: None,
+                matcher: None,
+                mm: None,
                 source: "liveramp.com".to_owned(),
                 uids: vec![crate::openrtb::Uid {
                     id: "LR_xyz".to_owned(),
@@ -6872,6 +6862,9 @@ external_bundle_sri = "sha384-AAAA"
                 }],
             },
             crate::openrtb::Eid {
+                inserter: None,
+                matcher: None,
+                mm: None,
                 source: "id5-sync.com".to_owned(),
                 uids: vec![crate::openrtb::Uid {
                     id: "ID5_abc".to_owned(),
@@ -6880,6 +6873,9 @@ external_bundle_sri = "sha384-AAAA"
                 }],
             },
             crate::openrtb::Eid {
+                inserter: None,
+                matcher: None,
+                mm: None,
                 source: "google.com".to_owned(),
                 uids: vec![crate::openrtb::Uid {
                     id: "pair-id".to_owned(),
@@ -9729,6 +9725,68 @@ set = { networkId = 42 }
             bid.bid_id.is_none(),
             "should treat an empty OpenRTB bid id as absent"
         );
+    }
+
+    #[test]
+    fn planned_transport_never_forwards_authenticated_handoff_proof() {
+        let plan =
+            crate::auction::plan::AuctionPlan::compile(crate::auction::plan::AuctionPlanConfig {
+                timeout_ms: 321,
+                providers: std::collections::BTreeMap::new(),
+                bidders: std::collections::BTreeMap::new(),
+                mediator: None,
+                request_signing: None,
+            })
+            .expect("should compile empty plan");
+        for mode in [
+            ConsentForwardingMode::Both,
+            ConsentForwardingMode::CookiesOnly,
+            ConsentForwardingMode::OpenrtbOnly,
+        ] {
+            for cookie in [
+                HeaderValue::from_static("session=fictional; ts-eids-s=signed-proof; __gpp=signal"),
+                HeaderValue::from_bytes(b"session=\xff; ts-eids-s \t =signed-proof")
+                    .expect("should build opaque header"),
+            ] {
+                let inbound = http::Request::builder()
+                    .uri("https://publisher.example/auction")
+                    .header(header::COOKIE, cookie.clone())
+                    .body(EdgeBody::empty())
+                    .expect("should build inbound request");
+                let routed = crate::auction::routing::route_auction(
+                    canonical_parity_auction_request(),
+                    &inbound,
+                    &plan,
+                    None,
+                );
+                let mut outbound = http::Request::builder()
+                    .uri("https://pbs.example.test/openrtb2/auction")
+                    .body(EdgeBody::empty())
+                    .expect("should build outbound request");
+                apply_prebid_transport_headers(
+                    routed.prebid_transport_headers(),
+                    &mut outbound,
+                    mode,
+                    None,
+                );
+                if cookie.to_str().is_err() {
+                    assert!(
+                        !outbound.headers().contains_key(header::COOKIE),
+                        "should drop opaque headers carrying replay proof"
+                    );
+                } else {
+                    let forwarded = outbound.headers()[header::COOKIE]
+                        .to_str()
+                        .expect("should read forwarded cookies");
+                    assert!(
+                        !forwarded.contains("ts-eids-s"),
+                        "should never disclose the shared handoff to PBS"
+                    );
+                    assert!(forwarded.contains("session=fictional"));
+                    assert_eq!(forwarded.contains("__gpp"), !mode.strips_consent_cookies());
+                }
+            }
+        }
     }
 
     #[test]

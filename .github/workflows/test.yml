@@ -16,11 +16,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Retrieve Rust version
-        id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
-        shell: bash
-
       - name: Retrieve Viceroy version
         id: viceroy-version
         # `.tool-versions` is the single source of truth so this workflow and
@@ -34,11 +29,10 @@ jobs:
         shell: bash
 
       - name: Set up Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: ${{ steps.rust-version.outputs.rust-version }}
           target: wasm32-wasip1
-          cache-shared-key: cargo-${{ runner.os }}
+          cache-key: cargo-fastly
 
       - name: Cache Viceroy binary
         id: cache-viceroy
@@ -51,13 +45,20 @@ jobs:
         if: steps.cache-viceroy.outputs.cache-hit != 'true'
         run: cargo install viceroy --version "${{ steps.viceroy-version.outputs.viceroy-version }}" --locked --force
 
-      - name: Use Node.js for the served-seam contract
+      # trusted-server-core's dependency on trusted-server-js runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build and the served-seam contract
         uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
 
       - name: Run tests
         run: cargo test-fastly
+
+      - name: Run trace emitted-script regressions
+        run: |
+          cargo test -p trusted-server-core --target x86_64-unknown-linux-gnu --lib trace_document_skipped_emitted_script_leaves_ad_state_untouched -- --ignored
+          cargo test -p trusted-server-core --target x86_64-unknown-linux-gnu --lib trace_document_emitted_script_deep_freezes_owned_context_in_node -- --ignored
 
       - name: Run tests (reusable-sandbox feature)
         run: cargo test-fastly-reuse
@@ -77,26 +78,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Retrieve Rust version
-        id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
-        shell: bash
-
       - name: Set up Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: ${{ steps.rust-version.outputs.rust-version }}
           # wasm32-wasip1 is required by the "Verify Fastly WASM release
           # build" step below; the axum build and tests are native.
           target: wasm32-wasip1
-          cache-shared-key: cargo-${{ runner.os }}
+          cache-key: cargo-axum
 
-      - name: Read pinned Node.js version for CLI fixtures
+      - name: Read pinned Node.js version
         id: node-version
         shell: bash
         run: echo "version=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/setup-node@v4
+      # trusted-server-core's dependency on trusted-server-js runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build and the CLI fixtures
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.node-version.outputs.version }}
 
@@ -131,17 +129,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Retrieve Rust version
-        id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
-        shell: bash
-
       - name: Set up Rust toolchain (native + wasm32-unknown-unknown)
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: ${{ steps.rust-version.outputs.rust-version }}
           target: wasm32-unknown-unknown
-          cache-shared-key: cargo-${{ runner.os }}
+          cache-key: cargo-cloudflare
+
+      # trusted-server-core's dependency on trusted-server-js runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .tool-versions
+          cache: npm
+          cache-dependency-path: crates/trusted-server-js/lib/package-lock.json
 
       - name: Check Cloudflare adapter (native host)
         run: cargo check -p trusted-server-adapter-cloudflare
@@ -158,17 +159,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Retrieve Rust version
-        id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
-        shell: bash
-
       - name: Set up Rust toolchain (native + wasm32-wasip1)
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: ${{ steps.rust-version.outputs.rust-version }}
           target: wasm32-wasip1
-          cache-shared-key: cargo-${{ runner.os }}
+          cache-key: cargo-spin
+
+      # trusted-server-core's dependency on trusted-server-js runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .tool-versions
+          cache: npm
+          cache-dependency-path: crates/trusted-server-js/lib/package-lock.json
 
       - name: Check Spin adapter (native host)
         run: cargo check -p trusted-server-adapter-spin
@@ -197,17 +201,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Retrieve Rust version
-        id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
-        shell: bash
-
       - name: Set up Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: ${{ steps.rust-version.outputs.rust-version }}
           components: clippy, rustfmt
-          cache-shared-key: cargo-${{ runner.os }}
+          cache-key: cargo-parity
+
+      # trusted-server-core's dependency on trusted-server-js runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .tool-versions
+          cache: npm
+          cache-dependency-path: crates/trusted-server-js/lib/package-lock.json
 
       - name: Format check (parity test crate)
         run: cargo fmt --manifest-path crates/trusted-server-integration-tests/Cargo.toml -- --check
@@ -228,24 +235,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Retrieve Rust version
-        id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
-        shell: bash
-
       - name: Set up Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: ${{ steps.rust-version.outputs.rust-version }}
           components: "clippy, rustfmt"
-          cache-shared-key: cargo-cli-${{ runner.os }}
+          cache-key: cargo-cli
 
-      - name: Read pinned Node.js version for CLI fixtures
+      - name: Read pinned Node.js version
         id: node-version
         shell: bash
         run: echo "version=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/setup-node@v4
+      # trusted-server-core's dependency on trusted-server-js runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build and the CLI fixtures
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.node-version.outputs.version }}
 
@@ -291,6 +295,49 @@ jobs:
           fi
           cargo test --manifest-path crates/trusted-server-cli/Cargo.toml --target "$TARGET" \
             --test proxy_trust_linux -- --ignored
+
+  lint-domains:
+    # Server-side counterpart to the `ts dev install-hooks` pre-commit hook,
+    # which `--no-verify` skips and fresh clones never install: fail the PR
+    # when an added line introduces a non-allowlisted URL host. PR-only, so
+    # direct pushes to main are not linted.
+    name: ts dev lint domains (changed lines)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      # A PR checkout is GitHub's merge commit; depth 2 also fetches its
+      # parents, so `HEAD^1` is the exact base commit the PR merges into.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Set up Rust toolchain
+        uses: ./.github/actions/setup-rust
+        with:
+          # Restore `test-cli`'s cache read-only. This job never runs on main,
+          # so a key of its own is only ever saved in PR scope, where no other
+          # PR can restore it.
+          cache-key: cargo-cli
+          save-cache: "false"
+
+      - name: Read pinned Node.js version
+        id: node-version
+        shell: bash
+        run: echo "version=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+
+      # trusted-server-core's dependency on trusted-server-js runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.node-version.outputs.version }}
+
+      # The `ts` CLI is host-target only; the workspace default is wasm32-wasip1.
+      - name: Lint URL hosts on lines added by this PR
+        run: |
+          cargo run --manifest-path crates/trusted-server-cli/Cargo.toml \
+            --target "$(rustc -vV | sed -n 's/host: //p')" --bin ts -- \
+            dev lint domains --changed-vs HEAD^1
 
   test-typescript:
     name: vitest

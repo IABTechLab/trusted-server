@@ -213,6 +213,11 @@ type RequestBidsArg = Parameters<ReturnType<typeof installPrebidNpm>['requestBid
 
 /** The bid adapter spec object registered via `pbjs.registerBidAdapter`. */
 interface TestAdapterSpec {
+  onTimeout?: (bids: Array<Record<string, unknown>>) => void;
+  onBidderError?: (value: {
+    error: unknown;
+    bidderRequest: { bids: Array<Record<string, unknown>> };
+  }) => void;
   code: string;
   supportedMediaTypes: string[];
   isBidRequestValid: (bid: Record<string, unknown>) => boolean;
@@ -364,6 +369,9 @@ import type { TsjsApi } from '../../../src/core/types';
 import { GptDiagnosticsObserver } from '../../../src/integrations/gpt_diagnostics/observer';
 import { GptDiagnosticsStore } from '../../../src/integrations/gpt_diagnostics/store';
 import envelope from '../../fixtures/aps-renderer-v1.json';
+import { installTraceRuntime } from '../../../src/trace/runtime';
+import { gptTransport } from '../../trace/gpt-fixtures';
+import { SLOT_TOKEN } from '../../trace/fixtures';
 
 // installPrebidNpm is a per-page no-op once the sentinel is set (the module
 // self-init above already set it), so every test starts from a clean page.
@@ -2543,7 +2551,7 @@ describe('prebid/installPrebidNpm', () => {
       expect(logged.some((value) => JSON.stringify(value).includes(sentinel))).toBe(false);
     });
 
-    it('buildRequests clears stale ts-eids cookie when current Prebid EIDs are absent', () => {
+    it('buildRequests clears a stale ts-eids cookie when current Prebid EIDs are absent', () => {
       const spec = getAdapterSpec();
       document.cookie = 'ts-eids=stale-value';
       mockGetUserIdsAsEids.mockReturnValue([]);
@@ -2613,6 +2621,45 @@ describe('prebid/installPrebidNpm', () => {
           ],
         },
       ]);
+    });
+
+    it('buildRequests preserves supplied EID provenance including empty matcher and zero mm', () => {
+      const spec = getAdapterSpec();
+      mockGetUserIdsAsEids.mockReturnValue([
+        {
+          source: 'id5-sync.com',
+          inserter: 'Lockr-For-Publishers',
+          matcher: '',
+          mm: 0,
+          uids: [{ id: 'opaque-id', atype: 1, ext: { linkType: 1 } }],
+        },
+        {
+          source: 'other.example',
+          inserter: 1,
+          matcher: null,
+          mm: 1.5,
+          uids: [{ id: 'other-id' }],
+        },
+      ]);
+      const result = spec.buildRequests([
+        {
+          adUnitCode: 'slot',
+          bidder: 'trustedServer',
+          mediaTypes: { banner: { sizes: [[300, 250]] } },
+          params: {},
+        },
+      ]);
+      expect(JSON.parse(result.data).eids).toEqual([
+        {
+          source: 'id5-sync.com',
+          inserter: 'Lockr-For-Publishers',
+          matcher: '',
+          mm: 0,
+          uids: [{ id: 'opaque-id', atype: 1, ext: { linkType: 1 } }],
+        },
+        { source: 'other.example', uids: [{ id: 'other-id' }] },
+      ]);
+      expect(document.cookie).not.toMatch(/(?:^|; )ts-eids=/);
     });
 
     it('buildRequests uses custom endpoint when configured', () => {
@@ -3215,17 +3262,13 @@ describe('prebid/installPrebidNpm', () => {
       ]);
     });
 
-    it('trims an oversized ts-eids cookie deterministically and logs which sources were dropped', () => {
+    it('trims an oversized ts-eids cookie without trimming /auction body EIDs', () => {
       const debugSpy = vi.spyOn(log, 'debug').mockImplementation(() => {});
-      const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => {});
       mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
         opts?.bidsBackHandler?.();
       });
-      // A long uid value per source makes the encoded payload exceed
-      // MAX_EID_COOKIE_BYTES (3072) once several sources are present, the
-      // same way a real page with many ID modules would.
       const longUid = 'x'.repeat(400);
-      mockGetUserIdsAsEids.mockReturnValue([
+      const inputEids = [
         { source: 'id5-sync.com', uids: [{ id: longUid, atype: 1 }] },
         { source: 'liveramp.com', uids: [{ id: longUid, atype: 3 }] },
         { source: 'criteo.com', uids: [{ id: longUid, atype: 1 }] },
@@ -3233,9 +3276,21 @@ describe('prebid/installPrebidNpm', () => {
         { source: 'pubcid.org', uids: [{ id: longUid, atype: 1 }] },
         { source: 'sharedid.org', uids: [{ id: longUid, atype: 1 }] },
         { source: 'dropped.example', uids: [{ id: longUid, atype: 1 }] },
-      ]);
-
+      ];
+      mockGetUserIdsAsEids.mockReturnValue(inputEids);
       const pbjs = installPrebidNpm();
+      const spec = mockRegisterBidAdapter.mock.calls[0][2] as TestAdapterSpec;
+
+      const request = spec.buildRequests([
+        {
+          adUnitCode: 'slot',
+          bidder: 'trustedServer',
+          mediaTypes: { banner: { sizes: [[300, 250]] } },
+          params: {},
+        },
+      ]);
+      expect(JSON.parse(request.data).eids).toEqual(inputEids);
+
       pbjs.requestBids({
         adUnits: [{ bids: [{ bidder: 'appnexus', params: {} }] }],
       } as unknown as RequestBidsArg);
@@ -3243,99 +3298,20 @@ describe('prebid/installPrebidNpm', () => {
       const cookieValue = document.cookie.match(/(?:^|; )ts-eids=([^;]+)/)?.[1];
       expect(cookieValue).toBeDefined();
       expect(cookieValue!.length).toBeLessThanOrEqual(3072);
-
-      const persistedSources = (JSON.parse(atob(cookieValue!)) as Array<{ source: string }>).map(
-        (eid) => eid.source
-      );
-      expect(persistedSources).not.toContain('dropped.example');
-      expect(persistedSources).toContain('id5-sync.com');
-
+      const cookieEids = JSON.parse(atob(cookieValue!)) as Array<{ source: string }>;
+      expect(cookieEids.map((eid) => eid.source)).toEqual([
+        'id5-sync.com',
+        'liveramp.com',
+        'criteo.com',
+        'uidapi.com',
+        'pubcid.org',
+      ]);
       const loggedMessage = debugSpy.mock.calls
         .map((call) => call.at(-1))
         .find(
           (arg): arg is string => typeof arg === 'string' && arg.includes('ts-eids cookie exceeded')
         );
-      expect(loggedMessage).toBeDefined();
       expect(loggedMessage).toContain('dropped.example');
-      expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining('ts-eids cookie exceeded'));
-    });
-
-    it('logs a source whose UIDs were partially trimmed but retained', () => {
-      const debugSpy = vi.spyOn(log, 'debug').mockImplementation(() => {});
-      mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
-        opts?.bidsBackHandler?.();
-      });
-      // A single source with many UIDs is trimmed down to fit rather than
-      // dropped outright — it stays in the payload, but with fewer UIDs.
-      const longUid = 'x'.repeat(400);
-      mockGetUserIdsAsEids.mockReturnValue([
-        {
-          source: 'id5-sync.com',
-          uids: Array.from({ length: 10 }, (_, i) => ({ id: `${longUid}${i}`, atype: 1 })),
-        },
-      ]);
-
-      const pbjs = installPrebidNpm();
-      pbjs.requestBids({
-        adUnits: [{ bids: [{ bidder: 'appnexus', params: {} }] }],
-      } as unknown as RequestBidsArg);
-
-      const cookieValue = document.cookie.match(/(?:^|; )ts-eids=([^;]+)/)?.[1];
-      expect(cookieValue).toBeDefined();
-
-      const persisted = JSON.parse(atob(cookieValue!)) as Array<{
-        source: string;
-        uids: unknown[];
-      }>;
-      expect(persisted.map((eid) => eid.source)).toContain('id5-sync.com');
-      const persistedSource = persisted.find((eid) => eid.source === 'id5-sync.com');
-      expect(persistedSource!.uids.length).toBeLessThan(10);
-
-      const loggedMessage = debugSpy.mock.calls
-        .map((call) => call.at(-1))
-        .find(
-          (arg): arg is string => typeof arg === 'string' && arg.includes('ts-eids cookie exceeded')
-        );
-      expect(loggedMessage).toBeDefined();
-      expect(loggedMessage).toContain('trimmed uids from sources: id5-sync.com');
-    });
-
-    it('reports a source trimmed and then dropped only as dropped', () => {
-      const debugSpy = vi.spyOn(log, 'debug').mockImplementation(() => {});
-      mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
-        opts?.bidsBackHandler?.();
-      });
-      // The tail source has several UIDs that are each too large to fit: the
-      // trimmer first removes UIDs from it, then drops it entirely.
-      const hugeUid = 'y'.repeat(2500);
-      mockGetUserIdsAsEids.mockReturnValue([
-        { source: 'id5-sync.com', uids: [{ id: 'kept', atype: 1 }] },
-        {
-          source: 'dropped.example',
-          uids: Array.from({ length: 3 }, (_, i) => ({ id: `${hugeUid}${i}`, atype: 1 })),
-        },
-      ]);
-
-      const pbjs = installPrebidNpm();
-      pbjs.requestBids({
-        adUnits: [{ bids: [{ bidder: 'appnexus', params: {} }] }],
-      } as unknown as RequestBidsArg);
-
-      const cookieValue = document.cookie.match(/(?:^|; )ts-eids=([^;]+)/)?.[1];
-      expect(cookieValue).toBeDefined();
-      const persistedSources = (JSON.parse(atob(cookieValue!)) as Array<{ source: string }>).map(
-        (eid) => eid.source
-      );
-      expect(persistedSources).toEqual(['id5-sync.com']);
-
-      const loggedMessage = debugSpy.mock.calls
-        .map((call) => call.at(-1))
-        .find(
-          (arg): arg is string => typeof arg === 'string' && arg.includes('ts-eids cookie exceeded')
-        );
-      expect(loggedMessage).toBeDefined();
-      expect(loggedMessage).toContain('dropped sources: dropped.example');
-      expect(loggedMessage).not.toContain('trimmed uids from sources');
     });
 
     it('clears ts-eids cookie after bidsBackHandler when no current EIDs remain', () => {
@@ -4461,6 +4437,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     mockPbjs.requestBids = mockRequestBids;
     mockPbjs.removeAdUnit = mockRemoveAdUnit;
     delete (mockPbjs as unknown as Record<string, unknown>).__tsRemoveAdUnitWrapped;
+    delete (mockPbjs as unknown as Record<string, unknown>).__tsDiagnosticsBidWonInstalled;
     mockPbjs.adUnits = [];
     mockGetUserIdsAsEids.mockReset();
     mockGetUserIdsAsEids.mockReturnValue([]);
@@ -4481,6 +4458,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     testWindow.tsjs = undefined;
     delete testWindow.googletag;
     document.body.replaceChildren();
+    vi.restoreAllMocks();
   });
 
   function installGpt(slots: Array<Record<string, unknown>>) {
@@ -5747,6 +5725,136 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
       element.remove();
     }
   });
+
+  it('leaves Prebid auction identity and event listeners unchanged when diagnostics is inactive', () => {
+    const getTargeting = vi.fn(() => []);
+    const slot = {
+      getSlotElementId: () => 'example-inactive-slot',
+      getTargeting,
+      clearTargeting: vi.fn(),
+    };
+    const { pubads } = installGpt([slot]);
+    mockPbjs.setTargetingForGPTAsync = vi.fn();
+    mockRequestBids.mockImplementation((opts) => {
+      opts.bidsBackHandler?.({}, false, 'example-inactive-auction');
+    });
+
+    pubads.refresh([slot]);
+
+    const request = mockRequestBids.mock.calls[0][0];
+    expect(request).not.toHaveProperty('auctionId');
+    expect(mockOnEvent).not.toHaveBeenCalledWith('bidWon', expect.any(Function));
+    expect(getTargeting).not.toHaveBeenCalledWith('hb_bidder');
+    expect(getTargeting).not.toHaveBeenCalledWith('hb_pb');
+    expect(getTargeting).not.toHaveBeenCalledWith('hb_cur');
+  });
+
+  it('records completed client auction evidence only for the exact Prebid attempt', () => {
+    const getTargeting = vi.fn((key: string) =>
+      key === 'hb_bidder' ? ['example-client'] : key === 'hb_pb' ? ['2.40'] : []
+    );
+    const slot = {
+      getSlotElementId: () => 'example-client-slot',
+      getTargeting,
+      clearTargeting: vi.fn(),
+    };
+    const recordPrebidRefresh = vi.fn();
+    const recordPrebidAuction = vi.fn();
+    const recordPrebidWin = vi.fn();
+    testWindow.tsjs = {
+      gptDiagnosticsRecorder: {
+        recordPrebidRefresh,
+        recordPrebidAuction,
+        recordPrebidWin,
+      },
+    };
+    const { pubads } = installGpt([slot]);
+    mockPbjs.setTargetingForGPTAsync = vi.fn();
+    mockRequestBids.mockImplementation((opts) => {
+      opts.bidsBackHandler?.({}, false, 'example-client-auction');
+    });
+
+    pubads.refresh([slot]);
+
+    expect(mockRequestBids.mock.calls[0][0]).not.toHaveProperty('auctionId');
+    expect(mockOnEvent).toHaveBeenCalledWith('bidWon', expect.any(Function));
+    expect(recordPrebidRefresh).toHaveBeenCalledWith([slot]);
+    expect(recordPrebidAuction).toHaveBeenCalledWith(slot, 'example-client-auction', {
+      bidder: 'example-client',
+      priceBucket: '2.40',
+    });
+    expect(recordPrebidRefresh.mock.invocationCallOrder[0]).toBeLessThan(
+      recordPrebidAuction.mock.invocationCallOrder[0]
+    );
+    expect(getTargeting).not.toHaveBeenCalledWith('hb_cur');
+    const bidWon = mockOnEvent.mock.calls.find(([event]) => event === 'bidWon')?.[1];
+    expect(bidWon).toBeTypeOf('function');
+    bidWon?.({
+      auctionId: 'other-auction',
+      adUnitCode: 'example-client-slot',
+      adserverTargeting: { hb_bidder: 'wrong-client', hb_pb: '9.99' },
+    });
+    expect(recordPrebidWin).not.toHaveBeenCalled();
+    bidWon?.({
+      auctionId: 'example-client-auction',
+      latestTargetedAuctionId: 'later-client-auction',
+      adUnitCode: 'example-client-slot',
+      adserverTargeting: { hb_bidder: 'stale-client', hb_pb: '9.99' },
+    });
+    expect(recordPrebidWin).not.toHaveBeenCalled();
+    bidWon?.({
+      auctionId: 'example-client-auction',
+      latestTargetedAuctionId: 'example-client-auction',
+      adUnitCode: 'example-client-slot',
+      adserverTargeting: { hb_bidder: 'example-client', hb_pb: '2.40' },
+    });
+    expect(recordPrebidWin).toHaveBeenCalledWith(slot, 'example-client-auction', {
+      bidder: 'example-client',
+      priceBucket: '2.40',
+    });
+  });
+
+  it.each(['expiry', 'navigation change'] as const)(
+    'rejects a Prebid bidWon observation after %s',
+    (reason) => {
+      let now = 0;
+      vi.spyOn(performance, 'now').mockImplementation(() => now);
+      const adUnitCode = `example-${reason.replace(' ', '-')}`;
+      const slot = {
+        getSlotElementId: () => adUnitCode,
+        getTargeting: (key: string) =>
+          key === 'hb_bidder' ? ['example-client'] : key === 'hb_pb' ? ['2.40'] : [],
+        clearTargeting: vi.fn(),
+      };
+      const recordPrebidWin = vi.fn();
+      testWindow.tsjs = {
+        navGeneration: 1,
+        gptDiagnosticsRecorder: {
+          recordPrebidRefresh: vi.fn(),
+          recordPrebidAuction: vi.fn(),
+          recordPrebidWin,
+        },
+      };
+      const { pubads } = installGpt([slot]);
+      mockPbjs.setTargetingForGPTAsync = vi.fn();
+      mockRequestBids.mockImplementation((opts) => {
+        opts.bidsBackHandler?.({}, false, 'example-client-auction');
+      });
+
+      pubads.refresh([slot]);
+      const bidWon = mockOnEvent.mock.calls.find(([event]) => event === 'bidWon')?.[1];
+      expect(bidWon).toBeTypeOf('function');
+      if (reason === 'expiry') now = 30_001;
+      else testWindow.tsjs!.navGeneration = 2;
+      bidWon?.({
+        auctionId: 'example-client-auction',
+        adUnitCode,
+        adserverTargeting: { hb_bidder: 'example-client', hb_pb: '2.40' },
+      });
+
+      expect(recordPrebidWin).not.toHaveBeenCalled();
+    }
+  );
 
   it('records a publisher delivery refresh immediately before its GPT request', () => {
     const slot = {
@@ -7424,11 +7532,16 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     }
   });
 
-  it('completes a synthetic refresh when targeting throws', () => {
+  it('completes a synthetic refresh without recording auction evidence when targeting throws', () => {
     const slot = {
       getSlotElementId: () => 'example-throwing-targeting',
       getTargeting: () => [],
       clearTargeting: vi.fn(),
+    };
+    const recordPrebidRefresh = vi.fn();
+    const recordPrebidAuction = vi.fn();
+    testWindow.tsjs = {
+      gptDiagnosticsRecorder: { recordPrebidRefresh, recordPrebidAuction },
     };
     const { originalRefresh, pubads } = installGpt([slot]);
     mockPbjs.setTargetingForGPTAsync = vi.fn(() => {
@@ -7439,6 +7552,8 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
 
     pubads.refresh([slot]);
 
+    expect(recordPrebidRefresh).toHaveBeenCalledWith([slot]);
+    expect(recordPrebidAuction).not.toHaveBeenCalled();
     expect(originalRefresh).toHaveBeenCalledTimes(1);
     expect(originalRefresh).toHaveBeenCalledWith([slot], undefined);
   });
@@ -8088,4 +8203,363 @@ describe('prebid self-init user ID module timing', () => {
     window.dispatchEvent(new Event('load'));
     expect(userSyncCallCount()).toBe(1);
   });
+});
+
+describe('Prebid registered trace transport hooks', () => {
+  function setup(...flags: unknown[]) {
+    const flag = flags.length ? flags[0] : true;
+    window.tsjs = {} as TsjsApi;
+    window.__tsjs_trace_active = flag as boolean;
+    if (flag === true) installTraceRuntime(window.tsjs);
+    installPrebidNpm();
+    return mockRegisterBidAdapter.mock.calls[
+      mockRegisterBidAdapter.mock.calls.length - 1
+    ]![2] as TestAdapterSpec;
+  }
+  function original(id: string, code = 'example-unit', bidderRequestId = 'example-request') {
+    return {
+      bidId: id,
+      bidderRequestId,
+      adUnitCode: code,
+      bidder: 'trustedServer',
+      mediaTypes: { banner: { sizes: [[300, 250]] } },
+      params: {},
+    };
+  }
+  function result() {
+    return {
+      body: {
+        ext: {
+          trusted_server: {
+            trace_auction: {
+              ...gptTransport(),
+              evidence: { ...gptTransport().evidence!, source: 'auction_api' },
+            },
+          },
+        },
+      },
+    };
+  }
+  beforeEach(() => {
+    vi.useFakeTimers();
+    mockRegisterBidAdapter.mockClear();
+    mockGetConfig.mockReturnValue(3000);
+    vi.spyOn(window.crypto, 'randomUUID').mockReturnValue('12345678-1234-4abc-8def-123456789abc');
+  });
+  afterEach(() => {
+    window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: false }));
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    delete window.tsjs;
+    delete window.__tsjs_trace_active;
+  });
+  it.each([undefined, false, 'true', 1])(
+    'adds no hooks, listeners, tokens or timers for gate %s',
+    (flag) => {
+      const listen = vi.spyOn(window, 'addEventListener');
+      const uuid = window.crypto.randomUUID;
+      const spec = setup(flag);
+      expect(spec).not.toHaveProperty('onTimeout');
+      expect(spec).not.toHaveProperty('onBidderError');
+      const request = spec.buildRequests([original('first')]);
+      expect(JSON.parse(request.data as unknown as string).adUnits[0]).not.toHaveProperty('ext');
+      expect(uuid).not.toHaveBeenCalled();
+      expect(listen.mock.calls.filter(([name]) => name === 'pagehide')).toHaveLength(0);
+      expect(vi.getTimerCount()).toBe(0);
+    }
+  );
+  it('uses final grouped units and consumes API transport before ordinary bid parsing exactly once', () => {
+    const spec = setup();
+    const input = [original('first'), original('second')];
+    const request = spec.buildRequests(input);
+    const payload = JSON.parse(request.data as unknown as string);
+    expect(payload.adUnits).toHaveLength(1);
+    expect(payload.adUnits[0].ext.trusted_server.trace_slot_ref).toBe(SLOT_TOKEN);
+    expect(input[0]).not.toHaveProperty('ext');
+    const received = result();
+    Object.defineProperty(received.body, 'seatbid', {
+      get() {
+        expect(window.tsjs!.traceEvidence!.captureStatus()).toBe('complete');
+        return [];
+      },
+    });
+    expect(spec.interpretResponse(received, request)).toEqual([]);
+    spec.interpretResponse(received, request);
+    spec.onTimeout!([original('first')]);
+    spec.onBidderError!({ error: new Error('private'), bidderRequest: { bids: input } });
+    expect(window.tsjs!.traceEvidence!.snapshot().value?.serverAuctions).toHaveLength(1);
+    expect(window.tsjs!.traceEvidence!.snapshot().value?.slotCorrelations).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it('isolates concurrent request IDs and consumes timeout/error only once before callbacks', () => {
+    const spec = setup();
+    const first = spec.buildRequests([original('first')]);
+    const second = spec.buildRequests([original('second')]);
+    const collector = window.tsjs!.traceEvidence!;
+    expect(first).toBeDefined();
+    spec.onTimeout!([original('first')]);
+    spec.onBidderError!({
+      error: {
+        get message() {
+          throw Error('private');
+        },
+      },
+      bidderRequest: { bids: [original('first')] },
+    });
+    spec.interpretResponse(result(), second);
+    expect(collector.captureStatus()).toBe('partial');
+    expect(collector.snapshot().value?.serverAuctions).toHaveLength(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it('retains ordinary payload on throwing token generator and still observes independent evidence', () => {
+    const spec = setup();
+    vi.mocked(window.crypto.randomUUID).mockImplementation(() => {
+      throw Error('private');
+    });
+    const request = spec.buildRequests([original('first')]);
+    expect(JSON.parse(request.data as unknown as string).adUnits[0]).not.toHaveProperty('ext');
+    spec.interpretResponse(result(), request);
+    expect(window.tsjs!.traceEvidence!.captureStatus()).toBe('complete');
+  });
+  it('keeps missing optional evidence unobserved and malformed evidence bounded without changing bids', () => {
+    const spec = setup();
+    const absent = spec.buildRequests([original('first')]);
+    expect(spec.interpretResponse({ body: {} }, absent)).toEqual([]);
+    expect(window.tsjs!.traceEvidence!.captureStatus()).toBe('not_observed');
+    const malformed = spec.buildRequests([original('second')]);
+    expect(
+      spec.interpretResponse(
+        { body: { ext: { trusted_server: { trace_auction: null } } } },
+        malformed
+      )
+    ).toEqual([]);
+    expect(window.tsjs!.traceEvidence!.snapshot().value?.issues).toEqual([
+      'evidence_validation_failed',
+    ]);
+  });
+  it('clears BFCache markers, permits resumed requests, and destroys nonpersisted page timers', () => {
+    const spec = setup();
+    spec.buildRequests([original('first')]);
+    expect(vi.getTimerCount()).toBe(1);
+    window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true }));
+    expect(vi.getTimerCount()).toBe(0);
+    spec.onTimeout!([original('first')]);
+    expect(window.tsjs!.traceEvidence!.captureStatus()).toBe('not_observed');
+    const resumed = spec.buildRequests([original('second')]);
+    expect(vi.getTimerCount()).toBe(1);
+    window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: false }));
+    expect(vi.getTimerCount()).toBe(0);
+    spec.interpretResponse(result(), resumed);
+    spec.buildRequests([original('third')]);
+    expect(vi.getTimerCount()).toBe(0);
+    expect(window.tsjs!.traceEvidence!.captureStatus()).toBe('not_observed');
+  });
+  it('uses distinct final unit refs while retaining all original bid IDs for one request', () => {
+    const spec = setup();
+    vi.mocked(window.crypto.randomUUID)
+      .mockReturnValueOnce('12345678-1234-4abc-8def-123456789abc')
+      .mockReturnValueOnce('22345678-1234-4abc-8def-123456789abc');
+    const request = spec.buildRequests([
+      original('first', 'unit-a'),
+      original('second', 'unit-a'),
+      original('third', 'unit-b'),
+    ]);
+    const payload = JSON.parse(request.data as unknown as string);
+    expect(
+      payload.adUnits.map(
+        (unit: { ext: { trusted_server: { trace_slot_ref: string } } }) =>
+          unit.ext.trusted_server.trace_slot_ref
+      )
+    ).toEqual([SLOT_TOKEN, 'ts-slot-22345678-1234-4abc-8def-123456789abc']);
+    spec.onTimeout!([original('second')]);
+    expect(window.tsjs!.traceEvidence!.captureStatus()).toBe('unavailable');
+    spec.interpretResponse(result(), request);
+    expect(window.tsjs!.traceEvidence!.snapshot().value?.serverAuctions).toEqual([]);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it('swallows throwing diagnostic callbacks while returning ordinary auction bids unchanged', () => {
+    window.tsjs = {} as TsjsApi;
+    window.__tsjs_trace_active = true;
+    const collector = installTraceRuntime(window.tsjs)!;
+    window.tsjs.traceEvidence = {
+      ...collector,
+      recordTransport: () => {
+        throw Error('private-transport');
+      },
+      recordTransportFailure: () => {
+        throw Error('private-failure');
+      },
+    };
+    installPrebidNpm();
+    const spec = mockRegisterBidAdapter.mock.calls[
+      mockRegisterBidAdapter.mock.calls.length - 1
+    ]![2] as TestAdapterSpec;
+    const request = spec.buildRequests([original('first')]);
+    const received = result();
+    Object.assign(received.body, {
+      seatbid: [
+        {
+          seat: 'example-bidder',
+          bid: [
+            { impid: 'example-unit', adm: '<div>Example creative</div>', price: 1, w: 300, h: 250 },
+          ],
+        },
+      ],
+    });
+    expect(spec.interpretResponse(received, request)).toHaveLength(1);
+    spec.buildRequests([original('second')]);
+    expect(() => spec.onTimeout!([original('second')])).not.toThrow();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it('retires colliding live IDs while ordinary bid delivery and earlier capture remain intact', () => {
+    const spec = setup();
+    const collector = window.tsjs!.traceEvidence!;
+    collector.recordTransport(result().body.ext.trusted_server.trace_auction);
+    const first = spec.buildRequests([original('shared')]);
+    const collision = spec.buildRequests([original('shared')]);
+    expect(vi.getTimerCount()).toBe(2);
+    spec.onTimeout!([original('shared')]);
+    spec.onBidderError!({ error: Error('private'), bidderRequest: { bids: [original('shared')] } });
+    const received = result();
+    Object.assign(received.body, {
+      seatbid: [
+        {
+          seat: 'example-bidder',
+          bid: [{ impid: 'example-unit', adm: '<div>Example</div>', price: 1, w: 300, h: 250 }],
+        },
+      ],
+    });
+    expect(spec.interpretResponse(received, first)).toHaveLength(1);
+    expect(spec.interpretResponse(received, collision)).toHaveLength(1);
+    expect(collector.captureStatus()).toBe('complete');
+    expect(collector.snapshot().value?.serverAuctions).toHaveLength(3);
+  });
+  it('keeps ordinary bid parsing when the optional request trace handle getter throws', () => {
+    const spec = setup();
+    const request = spec.buildRequests([original('first')]);
+    Object.defineProperty(request, 'tracePending', {
+      get: () => {
+        throw Error('private-handle');
+      },
+    });
+    const received = result();
+    Object.assign(received.body, {
+      seatbid: [
+        {
+          seat: 'example-bidder',
+          bid: [{ impid: 'example-unit', adm: '<div>Example</div>', price: 1, w: 300, h: 250 }],
+        },
+      ],
+    });
+    expect(() => spec.interpretResponse(received, request)).not.toThrow();
+    expect(spec.interpretResponse(received, request)).toHaveLength(1);
+    expect(window.tsjs!.traceEvidence!.captureStatus()).toBe('not_observed');
+  });
+  it('declines trace setup if its lifecycle listener cannot install while registering the ordinary adapter', () => {
+    const listen = window.addEventListener.bind(window);
+    vi.spyOn(window, 'addEventListener').mockImplementation((type, listener, options) => {
+      if (type === 'pagehide') throw Error('private-listener');
+      listen(type, listener, options);
+    });
+    let spec!: TestAdapterSpec;
+    expect(() => {
+      spec = setup();
+    }).not.toThrow();
+    expect(spec).not.toHaveProperty('onTimeout');
+    expect(spec).not.toHaveProperty('onBidderError');
+    const request = spec.buildRequests([original('first')]);
+    expect(JSON.parse(request.data as unknown as string).adUnits[0]).not.toHaveProperty('ext');
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it('retains valid capped server evidence from a 65-unit request without changing ordinary bids', () => {
+    const spec = setup();
+    let generated = 0;
+    vi.mocked(window.crypto.randomUUID).mockImplementation(
+      () =>
+        `${(++generated).toString(16).padStart(8, '0')}-1234-4abc-8def-123456789abc` as ReturnType<
+          Crypto['randomUUID']
+        >
+    );
+    const requests = Array.from({ length: 65 }, (_, index) =>
+      original(`bid-${index}`, `unit-${index}`)
+    );
+    const request = spec.buildRequests(requests);
+    const payload = JSON.parse(request.data as unknown as string);
+    const envelope = gptTransport();
+    envelope.evidence.source = 'auction_api';
+    envelope.evidence.truncation.omitted_slots = 1;
+    envelope.evidence.slots = payload.adUnits
+      .slice(0, 64)
+      .map((unit: { ext: { trusted_server: { trace_slot_ref: string } } }, index: number) => ({
+        ...envelope.evidence.slots[0]!,
+        slot_number: index + 1,
+        slot_ref: unit.ext.trusted_server.trace_slot_ref,
+      }));
+    const received = {
+      body: {
+        ext: { trusted_server: { trace_auction: envelope } },
+        seatbid: [
+          {
+            seat: 'example-bidder',
+            bid: [{ impid: 'unit-64', adm: '<div>Example</div>', price: 1, w: 300, h: 250 }],
+          },
+        ],
+      },
+    };
+    expect(payload.adUnits).toHaveLength(65);
+    expect(spec.interpretResponse(received, request)).toHaveLength(1);
+    const capture = window.tsjs!.traceEvidence!.snapshot().value!;
+    expect(capture.serverAuctions).toHaveLength(1);
+    expect(capture.serverAuctions[0]!.slots).toHaveLength(64);
+    expect(capture.serverAuctions[0]!.truncation.omitted_slots).toBe(1);
+    expect(capture.slotCorrelations).toEqual([]);
+    expect(window.tsjs!.traceEvidence!.captureStatus()).toBe('complete');
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it('keeps over-cap exact response capture and never attributes unseen colliding timeout IDs', () => {
+    const spec = setup();
+    const first = spec.buildRequests([original('bid-2048')]);
+    const large = spec.buildRequests(
+      Array.from({ length: 2049 }, (_, index) => original(`bid-${index}`))
+    );
+    const later = spec.buildRequests([original('bid-2047')]);
+    spec.onTimeout!([original('bid-2048'), original('bid-2047')]);
+    spec.onBidderError!({
+      error: Error('private'),
+      bidderRequest: { bids: [original('bid-2048')] },
+    });
+    const collector = window.tsjs!.traceEvidence!;
+    expect(collector.captureStatus()).toBe('not_observed');
+    expect(collector.snapshot().value?.issues).toEqual(['correlation_unavailable']);
+    for (const request of [first, large, later])
+      expect(spec.interpretResponse(result(), request)).toEqual([]);
+    expect(collector.captureStatus()).toBe('complete');
+    expect(collector.snapshot().value?.serverAuctions).toHaveLength(3);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+  it('does not add a second lifecycle listener on repeated shim installation', () => {
+    const listen = vi.spyOn(window, 'addEventListener');
+    setup();
+    installPrebidNpm();
+    expect(listen.mock.calls.filter(([name]) => name === 'pagehide')).toHaveLength(1);
+  });
+  it.each(['timeout', 'error'])(
+    'ignores a retired %s hook when a newer request reuses the original bid ID',
+    (mode) => {
+      const spec = setup();
+      const old = original('reused', 'example-unit', 'request-old');
+      const first = spec.buildRequests([old]);
+      spec.interpretResponse(result(), first);
+      const next = spec.buildRequests([original('reused', 'example-unit', 'request-new')]);
+      if (mode === 'timeout') spec.onTimeout!([old]);
+      else spec.onBidderError!({ error: Error('private'), bidderRequest: { bids: [old] } });
+      expect(vi.getTimerCount()).toBe(1);
+      expect(window.tsjs!.traceEvidence!.snapshot().value?.issues).toEqual([
+        'correlation_unavailable',
+      ]);
+      spec.interpretResponse(result(), next);
+      expect(window.tsjs!.traceEvidence!.snapshot().value?.serverAuctions).toHaveLength(2);
+      expect(vi.getTimerCount()).toBe(0);
+    }
+  );
 });

@@ -55,7 +55,9 @@ publisher, trusted-client-IP, EC, handler, Tinybird, DataDome, and S3 fields:
 
 - `publisher.proxy_secret`
 - `trusted_client_ip.shared_secret`, when trusted client-IP forwarding is configured
+- `trusted_forwarder.shared_secret`, when public-origin forwarding is configured
 - `ec.passphrase`
+- `ec.identity_handoff.keys[*].secret`, for each provisioned handoff signing key
 - `ec.partners[*].api_token`, when inbound identify or batch sync is used
 - `ec.partners[*].ts_pull_token`, when pull sync is enabled
 - `handlers[*].password`
@@ -69,10 +71,8 @@ resolved only while an instance builds runtime settings. An adapter can map the
 logical ID to a different physical name. For example, Fastly commonly maps
 `trusted_server_secrets` to physical store `ts_secrets`.
 
-Two accepted secret-shaped fields are deliberately different:
+One accepted secret-shaped field is deliberately different:
 
-- `trusted_client_ip.shared_secret` is an inline value in the app-config blob;
-  it is redacted by debug formatting but is not resolved from a secret store.
 - `tinybird.access_token_secret` is deprecated input. It is accepted for
   migration, then discarded and omitted from serialized config; use
   `tinybird.auction_token_secret` as the store key name instead.
@@ -99,6 +99,7 @@ serialization, runtime, and secret axes for every exceptional field:
 | `DataDomeProtectionTestBypassConfig.credential_secret_name`  | canonical  | canonical                           | serialized    | active               | store resolved           |
 | `DataDomeProtectionTestBypassConfig.credential_secret_store` | deprecated | canonical                           | skipped       | normalized away      | none                     |
 | `Ec.passphrase`                                              | canonical  | canonical                           | serialized    | active               | store resolved           |
+| `IdentityHandoffKey.secret`                                  | canonical  | canonical                           | serialized    | active when provided | store resolved           |
 | `EcPartner.api_token`                                        | canonical  | canonical                           | serialized    | active               | store resolved           |
 | `EcPartner.ts_pull_token`                                    | canonical  | canonical                           | serialized    | active               | store resolved           |
 | `Handler.password`                                           | canonical  | canonical                           | serialized    | active               | store resolved           |
@@ -209,7 +210,9 @@ fail and the service will return its startup-error response.
 | `[response_headers]`       | Headers added to Trusted Server responses                               |
 | `[rewrite]`                | First-party URL rewrite exclusions                                      |
 | `[tester_cookie]`          | Optional tester-cookie endpoints                                        |
-| `[tinybird]`               | Direct Tinybird auction telemetry                                       |
+| `[tinybird]`               | Auction and access telemetry transport                                  |
+| `[observability]`          | Server-Timing header emission                                           |
+| `[trusted_forwarder]`      | Authenticated browser-facing host and scheme forwarding                 |
 | `[trusted_client_ip]`      | Authenticated front-door client-IP forwarding                           |
 
 ## Example: Production Setup
@@ -489,6 +492,53 @@ address instead of the immediate fronting edge node's address. Only the Fastly
 adapter honours this section; the Cloudflare, Spin, and Axum adapters validate
 it but keep using their own runtime client address.
 
+### `[trusted_forwarder]`
+
+Trusted Server can accept the browser-facing authority and scheme from an
+explicitly authenticated forwarder. This preserves the public origin when the
+upstream leg uses plain HTTP or sends a different Host. Leave the section absent
+for direct traffic. Unauthenticated forwarding headers never establish a public
+origin.
+
+```toml
+[trusted_forwarder]
+auth_header = "x-ts-forwarder-auth"
+shared_secret = "trusted_forwarder_shared_secret"
+```
+
+Both fields are required. `shared_secret` names a key in the logical
+`trusted_server_secrets` store. Generate a cryptographically random token, such
+as 32 random bytes encoded as hex; the stored value must contain at least 32
+ASCII graphic bytes. Length validation does not establish entropy. The
+credential is redacted in diagnostics; temporary fixed-size digests are compared
+in constant time and are never stored or exposed. Configure the forwarder to send
+the same actual value in the header named by `auth_header`. For `ts dev proxy`,
+use `auth_header = "x-ts-forwarder-auth"` and pass the local token file through
+`--forwarder-secret-file`; see its
+[authenticated forwarding setup](./ts-dev-proxy.md#authenticated-forwarding).
+
+The forwarder must replace client-supplied `X-Forwarded-Host` and
+`X-Forwarded-Proto` with the actual browser-facing authority and HTTP/HTTPS
+scheme. The authority includes a non-default browser port. Exactly one field of
+each kind and one matching authentication field are required. Lists, ambiguous
+or malformed values, and hosts outside `publisher.domain` or its subdomains
+cannot establish trust. Missing or invalid authentication falls back to the
+runtime transport origin. Hostname case and default ports canonicalize for
+comparison.
+
+The validated public origin supplies URL rewriting and trace Origin checks.
+The actual ingress URI, Host, TLS metadata, target provenance and cookie-header
+fidelity remain transport facts. Trace actions still require an exact browser
+Origin, same-origin Fetch Metadata, the action control, no query and an empty
+body; forwarding does not expand identify CORS or relax cookie policy.
+
+Forwarding credentials and raw forwarding fields are removed before routing,
+including trace preflight returns. Authentication names cannot overlap
+forwarding sources, internal controls or configured trusted-client-IP fields.
+Omitted configuration stays omitted from serialized blobs. Deploy a compatible
+server before enabling this section, and remove it before rolling back to an
+older server.
+
 ### `[trusted_client_ip]`
 
 | Field           | Type   | Required | Description                                                      |
@@ -646,6 +696,7 @@ be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
 | `pull_sync_concurrency`   | Integer        | No       | Maximum concurrent pull-sync requests per organic response              |
 | `cluster_trust_threshold` | Integer        | No       | Cluster size threshold for identity trust decisions                     |
 | `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps |
+| `identity_handoff`        | Table          | No       | Authenticated short-lived capture handoff, disabled by default          |
 | `partners`                | Array          | No       | Static partner registry entries                                         |
 
 ::: tip Partner keying
@@ -656,6 +707,29 @@ be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
 the partner calls the inbound identify or batch-sync APIs. A partner without
 `api_token` remains available for source-domain lookup, bidstream EIDs, and
 outbound pull sync, but cannot authenticate to those inbound APIs.
+
+Optional `identity_owner` selects one registered integration whose capture
+capability claims the source. Deploy validation, config push and startup reject
+missing or non-claiming owners and owned sources with legacy pull enabled.
+For owned sources, `api_token` still permits read-only `identify`; `batch-sync`
+returns 403 before accessing storage. Ownership also excludes the source from
+legacy pull dispatch, completeness and marker fingerprints. Disable capture
+without removing ownership when stopping acquisition. Changing owners requires
+an operator migration and old-invocation drain, not automatic fallback.
+
+Provider expiry, writer and opaque revision are optional schema-v1 KV fields.
+Known-expired IDs are omitted from auctions and `identify` without cleanup
+writes. Unowned legacy pull remains fill-missing-only even for expired records.
+Drain metadata-unaware readers and writers before enabling managed capture.
+`/auction` body EIDs and the browser-written `ts-eids` cookie enrich existing
+consenting rows conservatively. Body EIDs take precedence for auction forwarding;
+publisher and SPA auctions retain cookie fallback. EID diagnostic response headers
+and authenticated `/_ts/admin/eids` remain available. Their retirement is deferred
+to a separate PR; inbound diagnostic headers remain stripped. The optional
+`ts-eids-s` cookie is a separate authenticated server-capture handoff only and does
+not collect browser IDs. See the
+[Prebid identity transport](./integrations/prebid.md) and
+[Lockr capture gates](./integrations/lockr.md).
 
 **Example**:
 
@@ -671,6 +745,65 @@ bidstream_enabled = true
 # api_token = "partner_api_token"  # only for inbound identify or batch sync
 # ts_pull_token = "partner_ts_pull_token"  # required when pull sync is enabled
 ```
+
+### `[ec.identity_handoff]`
+
+The authenticated `ts-eids-s` capture handoff is an explicit publisher opt-in.
+It defaults off with no keys. Keep it off until capture, consent, source
+ownership, deployment compatibility, synthetic checks, and live acceptance have
+all passed for the publisher route.
+
+```toml
+[ec.identity_handoff]
+enabled = false
+active_key_id = "handoff-2026-10"
+
+[[ec.identity_handoff.keys]]
+id = "handoff-2026-10"
+secret = "identity_handoff_2026_10"
+```
+
+`secret` is a key name in `trusted_server_secrets`. Its resolved value must be
+URL-safe unpadded base64 for exactly 32 random bytes. Use a dedicated value, not
+`ec.passphrase` or another application credential. Key IDs must be unique,
+non-empty ASCII alphanumeric, `_`, or `-`, with at most 32 characters. Configure
+no more than four keys. When `enabled = true`, `active_key_id` must name one of
+them.
+
+Generate a value locally, then write it directly to the mapped secret store:
+
+```bash
+openssl rand 32 | openssl base64 -A | tr '+/' '-_' | tr -d '='
+```
+
+Trusted Server resolves every provided key at startup, even while handoff is
+disabled, and fails startup if a value is missing, malformed, or does not decode
+to exactly 32 bytes. This lets operators provision and check keys before opting
+in. Store changes are startup-scoped.
+
+For rotation, add the new key and secret while retaining the old key. Push and
+deploy that verification set first. After every instance can read both keys,
+change `active_key_id` to the new key and push again. Remove the old key only
+after old invocations have drained and at least the five-minute handoff lifetime
+has elapsed since all instances began issuing with the new key. The active key
+signs new envelopes; retained keys verify envelopes created before the switch.
+
+The cookie value has a fixed five-minute maximum lifetime and a 2,048-byte
+encoded-value limit. Provider expiry may shorten the lifetime. The handoff is
+eligible for an absent or known-expired registered source on an existing live,
+consenting EC root. Current consent, source ownership, bidstream policy, the
+integration's capture switch, and the shared handoff switch all still apply.
+Usable stored IDs win. A valid capture can supply an auction ID over an expired
+record without changing KV or renewing its handoff deadline. A matching
+known-expired UID requires a known refreshed provider expiry. Empty or invalidated
+records still block fallback.
+
+Persistence retry is best-effort. A later qualifying request may stage one
+bounded fill-absent attempt after the response is sent on Fastly. There is no
+durable queue, recursive retry, root creation, existing-source persistence
+refresh, or first-auction guarantee. Expired-source auction fallback never stages
+a replacement write; persistence replay remains absent-source-only. Keep rollout and live acceptance gated as described in
+the [Lockr integration guide](./integrations/lockr.md).
 
 **Environment Override**:
 
@@ -779,6 +912,75 @@ Edit TOML, validate, and push again for those changes.
 
 ::: warning Header Precedence
 Custom headers may be overwritten by application logic. Standard headers (`Content-Type`, `Content-Length`) are controlled by the application.
+:::
+
+### Origin URLs in proxied response headers
+
+Trusted Server rewrites publisher-origin URLs in page bodies to the serving
+host. It applies the same mapping to URL-bearing headers on every proxied
+publisher response, so the browser stays on the serving host. No configuration
+is required.
+
+| Header                                                               | Behavior                                                                                                                                     |
+| -------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Location`, `Content-Location`                                       | An absolute or protocol-relative URL on the origin is mapped to the serving host. Relative URLs, other hosts, and other ports are unchanged. |
+| `Refresh`                                                            | The URL after the delay (`0; url=...`) is mapped the same way.                                                                               |
+| `Link`                                                               | Each `<...>` target and quoted `imagesrcset` candidate on the origin is mapped; `rel`, `as`, and other parameters are kept.                  |
+| `Content-Security-Policy`, <br>`Content-Security-Policy-Report-Only` | Every source naming the origin gains a serving-host source beside it. Origin sources are kept; `report-uri` and `report-to` are unchanged.   |
+
+For example, with the origin `origin.example.com` served at `www.example.com`:
+
+```http
+Location: https://origin.example.com/landing.html
+Content-Security-Policy: img-src https://origin.example.com data:
+```
+
+is delivered as:
+
+```http
+Location: https://www.example.com/landing.html
+Content-Security-Policy: img-src https://origin.example.com https://www.example.com data:
+```
+
+Two exceptions prevent a redirect loop. Rewriting either target would send the
+browser back to the same URL, and the origin would redirect again:
+
+- When the origin redirects to the URL being requested but under a different
+  scheme from `publisher.origin_url` (for example, an `http://` origin forcing
+  HTTPS), the `Location` or `Refresh` target is left unchanged.
+- When the origin answers a `GET` or `HEAD` with a `Location` to the URL being
+  requested and sets no cookie, the target is left unchanged. The origin is
+  redirecting because of something Trusted Server sends unchanged on every
+  retry, such as the `Host` from `publisher.origin_host_header_override`.
+
+Other same-scheme redirects to the current URL, such as after a form POST or
+one that sets a cookie, are rewritten as usual, as is a `Refresh` reload.
+
+`Set-Cookie` headers are not rewritten. If the origin sets a cookie with a
+`Domain` attribute that does not cover the serving host (for example,
+`Domain=origin.example.com` served at `www.example.com`), the browser rejects
+it. A redirect to the current URL that relies on that cookie then repeats until
+the browser reports too many redirects. Have the origin set host-only cookies,
+or a `Domain` shared by both hosts.
+
+Each response keeps its own per-page values. A `[response_headers]` entry for
+the same header still replaces the rewritten value.
+
+Only response headers are covered. A `<meta http-equiv="refresh">` or
+`<meta http-equiv="Content-Security-Policy">` tag in the page body keeps its
+origin URLs, so the browser can still navigate to the origin or block rewritten
+resources. Deliver these as headers on proxied pages.
+
+::: warning CSP and injected scripts
+Host rewriting only adds serving-host sources. It does not authorize inline
+content Trusted Server inserts without a nonce, or the `/static/tsjs=` bundle
+when the policy allows neither `'self'` nor the serving host. Check
+`script-src` (or `default-src`) on pages with a restrictive policy.
+
+A serving-host source without a path also allows Trusted Server's own routes
+on that host, including `/first-party/proxy`, which serves any target that
+`/first-party/sign` signs. A policy that limited scripts to the origin now
+allows those too. Set `proxy.allowed_domains` to bound what the proxy serves.
 :::
 
 ## Request Signing
@@ -992,13 +1194,14 @@ before pushing the config.
 
 ## URL Rewrite Configuration
 
-Control which domains are excluded from first-party rewriting.
+Control which hosts first-party rewriting covers.
 
 ### `[rewrite]`
 
-| Field             | Type          | Required         | Description               |
-| ----------------- | ------------- | ---------------- | ------------------------- |
-| `exclude_domains` | Array[String] | No (default: []) | Domains to skip rewriting |
+| Field             | Type          | Required         | Description                                                                                         |
+| ----------------- | ------------- | ---------------- | --------------------------------------------------------------------------------------------------- |
+| `exclude_domains` | Array[String] | No (default: []) | Hosts never rewritten, for assets and click-through links                                           |
+| `include_domains` | Array[String] | No (default: []) | When non-empty, the only hosts whose asset URLs are proxied. Does not apply to click-through links. |
 
 **Example**:
 
@@ -1009,12 +1212,14 @@ exclude_domains = [
     "first-party.publisher.com",  # Exact match
     "localhost",                  # Development
 ]
+include_domains = ["assets.example.com", "*.img.example.com"]
 ```
 
 **Environment Override**:
 
-EdgeZero v0.0.4 cannot replace this array or address its elements by index. Edit
-`exclude_domains` in TOML, then validate and push the file again.
+EdgeZero v0.0.4 cannot replace these arrays or address their elements by index.
+Edit `exclude_domains` and `include_domains` in TOML, then validate and push the
+file again.
 
 ### Pattern Matching
 
@@ -1042,6 +1247,49 @@ Matches:
 - ✅ `api.example.com`
 - ❌ `www.api.example.com`
 - ❌ `api.example.com.evil.com`
+
+**Normalization and precedence**:
+
+- Both lists are trimmed and lowercased at load, so matching is case-insensitive.
+- `exclude_domains` wins when a host matches both lists.
+- Each `include_domains` entry must be able to equal a URL host. After
+  lowercasing, an entry must be one of:
+  - a host name of ASCII letters, digits, `-` and `.`, optionally prefixed with
+    `*.`, with no leading or trailing `.` and no empty label;
+  - an IPv4 address in dotted-quad form, such as `192.0.2.1`;
+  - an IPv6 address in brackets, written the way URL hosts render it, such as
+    `[2001:db8::1]` or `[::ffff:c000:201]` (not `[::ffff:192.0.2.1]`).
+- Settings load and `ts config validate` reject any other `include_domains`
+  entry: an empty entry, a bare `*`, a `*` other than a leading `*.`, a scheme
+  (`https://`), a port, a path, spaces, an unbracketed IPv6 address, or any
+  entry a URL parser would rewrite or reject, such as an invalid `xn--` label.
+  Non-ASCII (internationalized) names are rejected too; write them in punycode,
+  such as `xn--bcher-kva.example`.
+- Empty and bare `*` entries in `exclude_domains` are dropped with a warning,
+  because they never match a host. Other `exclude_domains` entries that can
+  never match a host (for example `https://cdn.example.com` or
+  `cdn.example.com:443`) are kept but logged with a warning at load; fix them,
+  or their hosts stay proxied.
+
+::: tip
+When both `include_domains` and `proxy.allowed_domains` are set, keep every
+`include_domains` host inside `proxy.allowed_domains`. Otherwise a listed asset
+is rewritten to a proxy URL that then fails with `403`.
+:::
+
+::: warning Upgrade sequencing and rollback for `include_domains`
+An empty `include_domains` is omitted from stored JSON. A non-empty list is
+serialized, and older binaries reject a blob that carries it because `[rewrite]`
+uses `deny_unknown_fields`.
+
+**Upgrading:** deploy the binary **first**, then add `include_domains` to
+`trusted-server.toml`, run `ts config validate`, and push.
+
+**Rolling back:** remove `include_domains` from the TOML, run
+`ts config validate`, push the resulting blob, and only then roll back the
+binary. Rolling back the binary also restores case-sensitive `exclude_domains`
+matching.
+:::
 
 ### Use Cases
 
@@ -1606,9 +1854,18 @@ See [GPT](/guide/integrations/gpt).
 
 **Section**: `[integrations.gpt_diagnostics]`
 
-The only field is `enabled`, a Boolean that defaults to `false`. When enabled,
-the standalone diagnostics tag is available, but individual browser sessions
-still require the activation flow in [GPT diagnostics](/guide/integrations/gpt-diagnostics).
+Both fields default to `false`:
+
+| Field                | Type    | Contract                                                         |
+| -------------------- | ------- | ---------------------------------------------------------------- |
+| `enabled`            | Boolean | Make the GPT diagnostics module available for activated sessions |
+| `trace_page_enabled` | Boolean | Enable the mobile trace endpoint; requires `enabled = true`      |
+
+Individual browser sessions still require the activation flow in
+[GPT diagnostics](/guide/integrations/gpt-diagnostics). The mobile endpoint does
+not activate tracing on a GET. Before enabling it, accept the documented
+same-origin visibility and privacy implications of cookie health, masked network
+facts and browser-carried auction evidence.
 
 ### JS Asset Proxy Integration
 
@@ -1936,15 +2193,16 @@ provider or bidder route.
 
 ### `[auction]`
 
-| Field                  | Type    | Default            | Description                                                    |
-| ---------------------- | ------- | ------------------ | -------------------------------------------------------------- |
-| `enabled`              | Boolean | `false`            | Enable the auction orchestrator                                |
-| `sanitize_creatives`   | Boolean | `false`            | Strip executable markup from winning-bid `adm` before delivery |
-| `rewrite_creatives`    | Boolean | `true`             | Rewrite winning-bid `adm` through first-party endpoints        |
-| `timeout_ms`           | Integer | `2000`             | Logical auction budget in milliseconds                         |
-| `mediator`             | String  | `None`             | Optional separate `adserver_mock` mediator                     |
-| `creative_store`       | String  | `"creative_store"` | Deprecated; creatives are delivered inline                     |
-| `allowed_context_keys` | Array   | `[]`               | Request context keys admitted into the auction                 |
+| Field                  | Type    | Default            | Description                                                                    |
+| ---------------------- | ------- | ------------------ | ------------------------------------------------------------------------------ |
+| `enabled`              | Boolean | `false`            | Enable the auction orchestrator                                                |
+| `sanitize_creatives`   | Boolean | `false`            | Strip executable markup from winning-bid `adm` before delivery                 |
+| `rewrite_creatives`    | Boolean | `true`             | Rewrite winning-bid asset URLs through first-party endpoints                   |
+| `rewrite_clicks`       | Boolean | unset              | Wrap creative links in `/first-party/click`; unset follows `rewrite_creatives` |
+| `timeout_ms`           | Integer | `2000`             | Logical auction budget in milliseconds                                         |
+| `mediator`             | String  | `None`             | Optional separate `adserver_mock` mediator                                     |
+| `creative_store`       | String  | `"creative_store"` | Deprecated; creatives are delivered inline                                     |
+| `allowed_context_keys` | Array   | `[]`               | Request context keys admitted into the auction                                 |
 
 Creative markup delivered by `POST /auction` and the publisher SSAT/page-bids
 path is processed by two independent passes. With `sanitize_creatives = true`
@@ -1952,23 +2210,29 @@ path is processed by two independent passes. With `sanitize_creatives = true`
 and event handlers) is stripped together with its inner content. This blanks
 script-based creatives, so enable it only when creatives render in a context
 that shares the publisher's origin. With `rewrite_creatives = true` (the
-default), eligible absolute or protocol-relative resource and click URLs not
-excluded by rewrite configuration are converted to signed first-party
-endpoints, and any bidder-supplied `<base>` element is removed. The
-`POST /auction` path emits root-relative endpoints and injects the creative TSJS
-runtime exactly once, whether or not the bidder supplied a `<body>`, since bare
+default), eligible absolute or protocol-relative asset URLs not excluded by
+rewrite configuration are converted to signed `/first-party/proxy` endpoints.
+`rewrite_clicks` controls click-through links (`<a href>`, `<area href>`)
+separately: when it is unset, it follows `rewrite_creatives`, so existing
+configs keep their current behavior. Whenever either setting is on, a bidder-supplied `<base>` element
+loses its `href`; it keeps a `target` and is removed when it has none. The `POST /auction` path emits
+root-relative endpoints and, when either setting is on, injects the creative
+TSJS runtime exactly once, whether or not the bidder supplied a `<body>`, since bare
 fragments are the common `adm` shape. The foreign-origin SSAT renderer emits
-absolute endpoints and does not inject that bundle. With both disabled, `adm`
-ships exactly as the bidder returned it, except that a creative larger than the
+absolute endpoints and does not inject that bundle. With all three disabled,
+`adm` ships exactly as the bidder returned it, except that a creative larger than the
 1 MiB per-creative cap is rejected in every mode and its `adm` is dropped.
-Accepted external URLs are not host allowlisted by the sanitizer. Neither
-setting affects HTML or CSS fetched through `/first-party/proxy`. See
+Accepted external URLs are not host allowlisted by the sanitizer.
+`rewrite_creatives` and `sanitize_creatives` do not affect HTML or CSS fetched
+through `/first-party/proxy`. An explicitly set `rewrite_clicks` does apply to
+links in proxied HTML; unset, proxied HTML keeps wrapping links. See
 [Creative Processing](/guide/creative-processing#auction-rewrite-control).
 
 ::: warning Existing configs, upgrade sequencing, and rollback
 Default values are omitted from stored JSON; non-default values
-(`sanitize_creatives = true`, `rewrite_creatives = false`) are serialized, and
-older `AuctionConfig` schemas reject unknown fields.
+(`sanitize_creatives = true`, `rewrite_creatives = false`, and any explicit
+`rewrite_clicks`) are serialized, and older `AuctionConfig` schemas reject
+unknown fields.
 
 **Upgrading:** binaries that predate `sanitize_creatives` reject a blob that
 carries it, so in a rolling deployment upgrade the binary **first**, then push
@@ -1982,14 +2246,20 @@ on new code, while an explicit `true` fails startup on old code.
 **Rolling back:** before reverting to a binary that does not know a field,
 remove that field's non-default value (and any environment override), run
 `ts config validate`, push the resulting default-compatible blob, and only then
-roll back the binary.
+roll back the binary. Older binaries tie click wrapping to `rewrite_creatives`
+in both directions: rolling back from `rewrite_creatives = true` with
+`rewrite_clicks = false` turns click wrapping back on, and rolling back from
+`rewrite_creatives = false` with `rewrite_clicks = true` turns it off.
 
 **Environment overlays:** The pinned EdgeZero loader cannot create missing TOML
 leaves. Existing configs must add **both** leaves under `[auction]`
 (`rewrite_creatives` and `sanitize_creatives`) before
 `TRUSTED_SERVER__AUCTION__REWRITE_CREATIVES` /
 `TRUSTED_SERVER__AUCTION__SANITIZE_CREATIVES` can take effect. An override for a
-missing leaf is silently ignored.
+missing leaf is silently ignored. `rewrite_clicks` is unset by default and so
+cannot appear as a TOML leaf until you set it; add `rewrite_clicks = true` or
+`false` under `[auction]` before relying on
+`TRUSTED_SERVER__AUCTION__REWRITE_CLICKS`.
 :::
 
 ### Provider map
@@ -2177,8 +2447,9 @@ finishes local decision and delivery. An auction can therefore exceed its
 configured wall-clock timeout.
 
 Creative sanitization is opt-in. `sanitize_creatives = true` strips executable
-markup before delivery. `rewrite_creatives = false` skips first-party URL
-rewriting and creative TSJS injection. See
+markup before delivery. `rewrite_creatives = false` leaves asset URLs
+direct; links still follow `rewrite_clicks`, and creative TSJS is still
+injected when `rewrite_clicks = true`. See
 [Creative Processing](/guide/creative-processing#auction-rewrite-control).
 
 **Environment overrides** replace map leaves that already exist in TOML:
@@ -2862,6 +3133,158 @@ contains their key references.
 Rollback to the legacy entry point is no longer controlled by runtime config
 keys. Use the normal deployment rollback path to restore a pre-cleanup service
 version if that is required.
+
+## Observability and Access Telemetry Configuration
+
+Settings for the `Server-Timing` response header and the sampled
+access-telemetry sink. Both are off by default and are independent switches:
+enabling one does not enable the other.
+
+### `[observability]`
+
+| Field                   | Type     | Required | Default | Description                                                                                               |
+| ----------------------- | -------- | -------- | ------- | --------------------------------------------------------------------------------------------------------- |
+| `server_timing_enabled` | Boolean  | No       | `false` | Append request-phase timings to the `Server-Timing` response header                                       |
+| `route_sections`        | String[] | No       | `[]`    | Section names kept as publisher route templates (`/{section}/*`) in access telemetry; empty collapses all |
+
+**Purpose**: Surfaces per-phase request timing (`ts-total` plus recorded
+phases such as `ts-appbuild`, `ts-filter`, `ts-geo`, `ts-kv`, `ts-origin`, and
+`ts-template-cache`) as a standard `Server-Timing` header, in milliseconds
+with one decimal place. An unrecorded phase is omitted from the header
+rather than rendered as zero.
+
+**Emission is conservative**: the header is appended only on responses that
+are conclusively private, meaning `Cache-Control` contains `private` or
+`no-store`. A response that is heuristically cacheable, carries a bare
+`max-age`, or has no cache header at all never receives the header, because a
+shared-cache object would otherwise replay one request's timings for its
+entire stored lifetime. The long-lived, shared-cacheable `tsjs` asset route is
+the concrete case this excludes. The header is appended, never inserted, so
+an origin-supplied `Server-Timing` value and any entries the fronting
+delivery layer adds are preserved alongside the TS entries.
+
+The Axum adapter applies the same private-response rule at its own terminal
+point before serializing the response, and emits the header only; it does not
+send access-telemetry rows.
+
+**Example**:
+
+```toml
+[observability]
+server_timing_enabled = true
+```
+
+::: tip The Axum dev server reads this flag once at startup
+Unlike the Fastly adapter, which reads settings per request, the Axum dev
+server bakes `server_timing_enabled` into its service when it starts.
+Flipping the flag there requires a restart to take effect.
+:::
+
+::: warning Client-visible latency disclosure
+The `Server-Timing` header is sent to every client on eligible responses,
+not only to operators: browsers expose the values to same-origin JavaScript
+via `PerformanceResourceTiming.serverTiming`, and any caller can read the
+raw header. Enabling it publishes measured per-phase server latency,
+including KV read timing on the public identity endpoints (`ts-kv`) and
+origin/cache behaviour on publisher pages (`ts-origin`,
+`ts-template-cache`). This is standard `Server-Timing` practice and the
+values are durations only, but treat the flag as a diagnostic aid to enable
+deliberately, not a general always-on toggle, unless disclosing those
+timings to all clients is acceptable for the deployment.
+:::
+
+**Environment Override**:
+
+```bash
+TRUSTED_SERVER__OBSERVABILITY__SERVER_TIMING_ENABLED=true
+```
+
+::: tip Present-but-false by default
+`server_timing_enabled` ships as `false` in the base operator config rather
+than being left out, even though `false` is also its default. The
+environment-variable overlay can only override a leaf that already exists in
+the parsed TOML; it cannot create a missing one. Keeping the leaf present lets
+`TRUSTED_SERVER__OBSERVABILITY__SERVER_TIMING_ENABLED` take effect without an
+extra edit to add the table first.
+:::
+
+### `[tinybird]` access telemetry keys
+
+`[tinybird]` configures a shared Events API transport (`enabled`, `api_host`,
+`secret_store`, and per-sink dataset and token fields) used by two
+independent emitters: auction telemetry (`auction_dataset`,
+`auction_token_secret`) and access telemetry. The keys below cover the
+access-telemetry sink and the shared enable flags.
+
+| Field                 | Type    | Required                             | Default                        | Description                                                                     |
+| --------------------- | ------- | ------------------------------------ | ------------------------------ | ------------------------------------------------------------------------------- |
+| `enabled`             | Boolean | Yes, when `access_enabled`           | `false`                        | Master switch for the shared Tinybird transport (host, store, credentials)      |
+| `auction_enabled`     | Boolean | No                                   | `true`                         | Independently gates auction telemetry emission, decoupled from access telemetry |
+| `access_enabled`      | Boolean | No                                   | `false`                        | Enables the sampled access-telemetry row sent after each response is delivered  |
+| `access_dataset`      | String  | Yes, when `access_enabled`           | `access_logs_raw`              | Access-log Events API datasource name                                           |
+| `access_token_secret` | String  | Yes, when `access_enabled`           | `tinybird_access_append_token` | Secret Store key holding the access APPEND token                                |
+| `max_body_bytes`      | Integer | No                                   | `1048576`                      | Maximum NDJSON request body size; must be at least 1024                         |
+| `access_sample_rate`  | Float   | Yes (`> 0.0`), when `access_enabled` | `0.0`                          | Fraction (`0.0`-`1.0`) of requests to emit an access-telemetry row for          |
+
+**Purpose**: `access_enabled` and `auction_enabled` gate the two Tinybird
+sinks separately so that turning on one does not silently turn on (or leave
+off) the other; a settings test locks this decoupling in both directions.
+Setting `access_enabled = true` with `access_sample_rate = 0.0` is rejected at
+config load as an armed-but-silent configuration; use `access_enabled` itself
+to turn the sink off, not the sample rate. Enabling `access_enabled` also
+requires the shared transport fields (`enabled`, non-empty `api_host`,
+`secret_store`, `access_dataset`, `access_token_secret`, and a
+`max_body_bytes` of at least 1024) to already be set.
+
+**Example**:
+
+```toml
+[tinybird]
+enabled = true
+api_host = "api.tinybird.example.com"
+secret_store = "ts_secrets"
+auction_enabled = true
+
+# Access-log telemetry, decoupled from auction emission.
+access_enabled = true
+access_dataset = "access_logs_raw"
+access_token_secret = "tinybird_access_append_token"
+access_sample_rate = 0.05
+max_body_bytes = 1048576
+```
+
+**Environment Override**:
+
+```bash
+TRUSTED_SERVER__TINYBIRD__ACCESS_ENABLED=true
+TRUSTED_SERVER__TINYBIRD__ACCESS_SAMPLE_RATE=0.05
+TRUSTED_SERVER__TINYBIRD__AUCTION_ENABLED=true
+```
+
+A sampled request emits one access-telemetry row to `access_dataset` after
+the response has already been delivered to the client, so ingest never delays
+the response the reader sees.
+
+### Deploy and rollback ordering
+
+::: warning Push a compatibility config before rolling back
+The compatibility boundary is uneven. The top-level `Settings` schema uses
+`deny_unknown_fields`, so an older binary rejects a config carrying the
+`[observability]` table. The nested `[tinybird]` table does not: an older
+binary accepts unknown keys there, rejects `access_enabled = true` through
+validation, ignores `auction_enabled` entirely, and reads `enabled = true`
+as "auction telemetry on".
+
+**Deploying**: upgrade the binary first, then push a config containing the
+new fields second. Never push a config with these fields while a
+pre-observability binary can still receive it.
+
+**Rolling back**: push a compatibility config first, then roll the binary
+back. The compatibility config removes the `[observability]` table, sets
+`access_enabled = false`, and, for a deployment that only used the access
+sink, sets `enabled = false` as well; otherwise the older binary would
+interpret the leftover `enabled = true` as enabling auction telemetry.
+:::
 
 ## Validation
 

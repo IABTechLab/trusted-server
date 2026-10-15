@@ -65,11 +65,20 @@ pub struct ConsentedProvidersSettings {
 }
 
 /// An Extended User ID entry from an identity provider.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Eid {
     /// Identity provider domain (e.g. `"id5-sync.com"`).
     pub source: String,
+    /// Entity that inserted this EID into the request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inserter: Option<String>,
+    /// Entity that matched this EID. An empty supplied string is preserved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matcher: Option<String>,
+    /// `OpenRTB` match method. Zero is a supplied value, not absence.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mm: Option<i32>,
     /// One or more user IDs from this provider.
     pub uids: Vec<Uid>,
 }
@@ -186,9 +195,22 @@ pub struct BidTrustedServerExt<'a> {
 #[derive(Debug, Serialize)]
 pub struct ResponseExt {
     pub orchestrator: OrchestratorExt,
+    /// Optional request-scoped trace transport under its own namespace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trusted_server: Option<TraceResponseExt>,
 }
 
 impl ToExt for ResponseExt {}
+
+/// Request-scoped trace data beside ordinary orchestration metadata.
+///
+/// The closed [`crate::trace::TraceAuctionTransportV1`] contains bounded evidence
+/// or its exclusive unavailable marker; provider payloads never use this type.
+#[derive(Debug, Serialize)]
+pub struct TraceResponseExt {
+    /// Checked evidence or its fixed projection-failure transport envelope.
+    pub trace_auction: crate::trace::TraceAuctionTransportV1,
+}
 
 #[cfg(test)]
 mod tests {
@@ -216,6 +238,7 @@ mod tests {
         };
 
         let ext = ResponseExt {
+            trusted_server: None,
             orchestrator: OrchestratorExt {
                 strategy: "parallel_only".to_owned(),
                 providers: 2,
@@ -394,6 +417,9 @@ mod tests {
     #[test]
     fn eid_serializes_correctly() {
         let eid = Eid {
+            inserter: None,
+            matcher: None,
+            mm: None,
             source: "id5-sync.com".to_owned(),
             uids: vec![Uid {
                 id: "ID5-abc123".to_owned(),
@@ -418,6 +444,9 @@ mod tests {
     #[test]
     fn eid_serializes_vendor_specific_atype() {
         let eid = Eid {
+            inserter: None,
+            matcher: None,
+            mm: None,
             source: "google.com".to_owned(),
             uids: vec![Uid {
                 id: "pair-id".to_owned(),

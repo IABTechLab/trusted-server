@@ -26,7 +26,9 @@ import { log } from '../../core/log';
 import { buildAdRequest, parseAuctionResponse } from '../../core/auction';
 import { registerApsPrebidRenderer, validateApsRenderer } from '../aps/render';
 import type { AuctionBid, AuctionEid } from '../../core/auction';
-import type { AuctionSlot, TsjsApi } from '../../core/types';
+import type { AuctionSlot, GptDiagnosticsAuctionWinner, TsjsApi } from '../../core/types';
+import { getActiveTraceCollector, prepareTraceAuctionRequest } from '../../trace/runtime';
+import { createTracePending, type TracePendingHandle } from '../../trace/pending';
 
 import {
   PREBID_USER_ID_MODULE_REGISTRY,
@@ -999,7 +1001,11 @@ type TrustedServerBidRequest = {
   adUnitCode?: string;
   code?: string;
   bidId?: string;
+  bidderRequestId?: string;
 };
+function traceHookBindings(bids: TrustedServerBidRequest[]) {
+  return bids.map((bid) => ({ bidId: bid.bidId ?? '', bidderRequestId: bid.bidderRequestId }));
+}
 type TrustedServerRequest = {
   method: 'POST';
   url: string;
@@ -1007,10 +1013,14 @@ type TrustedServerRequest = {
   options: { contentType: 'application/json' };
   bidRequests: TrustedServerBidRequest[];
   tsjsBidRequests: TrustedServerBidRequest[];
+  tracePending?: TracePendingHandle;
 };
 
 type PrebidUserIdEid = {
   source?: unknown;
+  inserter?: unknown;
+  matcher?: unknown;
+  mm?: unknown;
   uids?: Array<{ id?: unknown; atype?: unknown; ext?: unknown }>;
 };
 
@@ -1029,6 +1039,136 @@ function recordPrebidRefreshForDiagnostics(slots: RefreshGptSlot[]): void {
   } catch {
     // Diagnostics must not suppress the GAM request.
   }
+}
+
+const MAX_PREBID_DIAGNOSTIC_ATTEMPTS = 128;
+const PREBID_DIAGNOSTIC_WINDOW_MS = 30_000;
+
+interface PrebidDiagnosticAttempt {
+  slot: RefreshGptSlot;
+  generation: number;
+  expiresAtMs: number;
+}
+
+const prebidDiagnosticAttempts = new Map<string, PrebidDiagnosticAttempt>();
+
+function prebidDiagnosticKey(auctionId: string, adUnitCode: string): string {
+  return `${auctionId}\u0000${adUnitCode}`;
+}
+
+function boundedTargetingValue(
+  slot: RefreshGptSlot,
+  key: string,
+  maxBytes: number
+): string | undefined {
+  let values: string[] | undefined;
+  try {
+    values = slot.getTargeting?.(key);
+  } catch {
+    return undefined;
+  }
+  if (!Array.isArray(values) || values.length !== 1) return undefined;
+  const value = values[0]?.trim();
+  if (!value || new TextEncoder().encode(value).length > maxBytes) return undefined;
+  return value;
+}
+
+function targetingCandidate(slot: RefreshGptSlot): GptDiagnosticsAuctionWinner | undefined {
+  const bidder = boundedTargetingValue(slot, 'hb_bidder', 128);
+  const priceBucket = boundedTargetingValue(slot, 'hb_pb', 64);
+  if (!bidder || !priceBucket || !/^\d+(?:\.\d+)?$/.test(priceBucket)) return undefined;
+  return { bidder, priceBucket };
+}
+
+function recordCompletedPrebidAuction(
+  rawAuctionId: unknown,
+  auctionSlots: RefreshGptSlot[],
+  adUnitCodes: string[]
+): void {
+  const recorder = window.tsjs?.gptDiagnosticsRecorder;
+  if (!recorder || typeof rawAuctionId !== 'string') return;
+  const auctionId = rawAuctionId;
+  if (
+    !auctionId ||
+    auctionId !== auctionId.trim() ||
+    new TextEncoder().encode(auctionId).length > 256
+  )
+    return;
+  if (auctionSlots.length !== adUnitCodes.length) return;
+  installPrebidWinDiagnostics();
+  const counts = new Map<string, number>();
+  for (const code of adUnitCodes) counts.set(code, (counts.get(code) ?? 0) + 1);
+  const nowMs = performance.now();
+  for (const [key, attempt] of prebidDiagnosticAttempts) {
+    if (nowMs > attempt.expiresAtMs) prebidDiagnosticAttempts.delete(key);
+  }
+  const generation = window.tsjs?.navGeneration ?? 0;
+  for (let index = 0; index < auctionSlots.length; index += 1) {
+    const slot = auctionSlots[index];
+    const code = adUnitCodes[index];
+    if (!slot || !code || counts.get(code) !== 1) continue;
+    try {
+      recorder.recordPrebidAuction(slot, auctionId, targetingCandidate(slot));
+    } catch {
+      // Diagnostics must not suppress the GAM request.
+    }
+    const key = prebidDiagnosticKey(auctionId, code);
+    prebidDiagnosticAttempts.delete(key);
+    prebidDiagnosticAttempts.set(key, {
+      slot,
+      generation,
+      expiresAtMs: nowMs + PREBID_DIAGNOSTIC_WINDOW_MS,
+    });
+    while (prebidDiagnosticAttempts.size > MAX_PREBID_DIAGNOSTIC_ATTEMPTS) {
+      const oldest = prebidDiagnosticAttempts.keys().next().value;
+      if (oldest === undefined) break;
+      prebidDiagnosticAttempts.delete(oldest);
+    }
+  }
+}
+
+function installPrebidWinDiagnostics(): void {
+  const diagnosticPbjs = pbjs as PbjsGlobal & { __tsDiagnosticsBidWonInstalled?: boolean };
+  if (diagnosticPbjs.__tsDiagnosticsBidWonInstalled || typeof pbjs.onEvent !== 'function') return;
+  diagnosticPbjs.__tsDiagnosticsBidWonInstalled = true;
+  pbjs.onEvent('bidWon', (rawBid: unknown) => {
+    if (typeof rawBid !== 'object' || rawBid === null) return;
+    const bid = rawBid as Record<string, unknown>;
+    const auctionId = typeof bid.auctionId === 'string' ? bid.auctionId : undefined;
+    const adUnitCode = typeof bid.adUnitCode === 'string' ? bid.adUnitCode : undefined;
+    if (
+      !auctionId ||
+      !adUnitCode ||
+      (bid.latestTargetedAuctionId !== undefined && bid.latestTargetedAuctionId !== auctionId)
+    )
+      return;
+    const key = prebidDiagnosticKey(auctionId, adUnitCode);
+    const attempt = prebidDiagnosticAttempts.get(key);
+    prebidDiagnosticAttempts.delete(key);
+    if (
+      !attempt ||
+      performance.now() > attempt.expiresAtMs ||
+      (window.tsjs?.navGeneration ?? 0) !== attempt.generation
+    ) {
+      return;
+    }
+    const adserverTargeting =
+      typeof bid.adserverTargeting === 'object' && bid.adserverTargeting !== null
+        ? (bid.adserverTargeting as Record<string, unknown>)
+        : {};
+    const winner = targetingCandidate({
+      getTargeting: (targetingKey) => {
+        const value = adserverTargeting[targetingKey];
+        return typeof value === 'string' ? [value] : [];
+      },
+    });
+    if (!winner) return;
+    try {
+      window.tsjs?.gptDiagnosticsRecorder?.recordPrebidWin(attempt.slot, auctionId, winner);
+    } catch {
+      // Diagnostics must not alter delivery.
+    }
+  });
 }
 
 function dispatchPrebidRefresh<T>(
@@ -1907,7 +2047,18 @@ function collectAuctionEids(): AuctionEid[] | undefined {
       continue;
     }
 
-    eids.push({ source: eid.source, uids });
+    const sanitized: AuctionEid = { source: eid.source, uids };
+    if (typeof eid.inserter === 'string') sanitized.inserter = eid.inserter;
+    if (typeof eid.matcher === 'string') sanitized.matcher = eid.matcher;
+    if (
+      typeof eid.mm === 'number' &&
+      Number.isInteger(eid.mm) &&
+      eid.mm >= -2147483648 &&
+      eid.mm <= 2147483647
+    ) {
+      sanitized.mm = eid.mm;
+    }
+    eids.push(sanitized);
   }
 
   return eids.length > 0 ? eids : undefined;
@@ -2344,11 +2495,60 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     log.warn('[tsjs-prebid] Prebid bundle lacks markWinningBidAsUsed; APS renderer bids disabled');
   }
 
+  const traceCollector = getActiveTraceCollector();
+  let tracePending = traceCollector
+    ? createTracePending({
+        timeout: () => pbjs.getConfig('bidderTimeout'),
+      })
+    : undefined;
+  if (tracePending) {
+    const pending = tracePending;
+    const retireTracePending = (event: PageTransitionEvent): void => {
+      if (event.persisted) pending.clear();
+      else {
+        pending.destroy();
+        try {
+          window.removeEventListener('pagehide', retireTracePending);
+        } catch {
+          /* Already retired diagnostic state cannot affect page cleanup. */
+        }
+      }
+    };
+    try {
+      window.addEventListener('pagehide', retireTracePending);
+    } catch {
+      pending.destroy();
+      tracePending = undefined;
+    }
+  }
+
+  const activeTracePending = tracePending;
+
   // Register the trustedServer adapter using pbjs.registerBidAdapter(null, code, spec)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (pbjs as any).registerBidAdapter(undefined, ADAPTER_CODE, {
     code: ADAPTER_CODE,
     supportedMediaTypes: ['banner'],
+    ...(activeTracePending
+      ? {
+          onTimeout(timedOutBids: TrustedServerBidRequest[]) {
+            try {
+              if (timedOutBids.length <= 2048)
+                activeTracePending.failure(traceHookBindings(timedOutBids));
+            } catch {
+              /* Diagnostic hook input cannot interrupt Prebid callbacks. */
+            }
+          },
+          onBidderError(value: { bidderRequest?: { bids?: TrustedServerBidRequest[] } }) {
+            try {
+              const bids = value.bidderRequest?.bids ?? [];
+              if (bids.length <= 2048) activeTracePending.failure(traceHookBindings(bids));
+            } catch {
+              /* Error objects and response bodies are never inspected. */
+            }
+          },
+        }
+      : {}),
 
     isBidRequestValid(): boolean {
       return true; // All requests are valid — orchestrator handles filtering
@@ -2363,15 +2563,43 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
         clearPrebidEidsCookie();
       }
       const payload = buildAdRequest(validBidRequests, { eids: auctionEids });
+      const traceCarry = activeTracePending ? prepareTraceAuctionRequest(payload) : undefined;
+      let traceHandle: TracePendingHandle | undefined;
+      if (activeTracePending && traceCarry) {
+        try {
+          const refsByCode = new Map(
+            traceCarry.request.adUnits
+              .slice(0, 64)
+              .map((unit, index) => [unit.code, traceCarry.slotRefs[index]])
+          );
+          // Oversized ID collections keep exact readable-response capture, while
+          // declining unsupported hook association rather than guessing a prefix.
+          const bindings =
+            validBidRequests.length <= 2048
+              ? validBidRequests.map((bid) => ({
+                  bidId: bid.bidId ?? '',
+                  bidderRequestId: bid.bidderRequestId,
+                  slotRef: refsByCode.get(bid.adUnitCode ?? bid.code ?? ''),
+                }))
+              : undefined;
+          traceHandle = activeTracePending.add(bindings, {
+            collector: traceCarry.collector,
+            slotRefs: traceCarry.slotRefs,
+          });
+        } catch {
+          /* Retaining diagnostic state cannot change the ordinary request. */
+        }
+      }
       return {
         method: 'POST',
         url: auctionEndpoint,
-        data: JSON.stringify(payload),
+        data: JSON.stringify(traceCarry?.request ?? payload),
         options: { contentType: 'application/json' },
         // Keep bid requests on the request object so interpretResponse can
         // map bids without relying on shared mutable adapter state.
         bidRequests: requestScopedBidRequests,
         tsjsBidRequests: requestScopedBidRequests,
+        ...(traceHandle ? { tracePending: traceHandle } : {}),
       };
     },
 
@@ -2381,6 +2609,11 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       request?: Partial<TrustedServerRequest>
     ) {
       const body = serverResponse?.body;
+      try {
+        activeTracePending?.response(request?.tracePending, body);
+      } catch {
+        /* Optional diagnostic handles cannot interrupt ordinary bid parsing. */
+      }
       log.debug('[tsjs-prebid] interpretResponse', { hasSeatbid: !!body?.seatbid });
       const auctionBids = parseAuctionResponse(body);
       const bidRequests = request?.tsjsBidRequests ?? request?.bidRequests ?? [];
@@ -2793,11 +3026,10 @@ export function installRefreshHandler(timeoutMs = 1500): void {
       // slots, and a late callback cannot issue a second GAM request.
       let completed = false;
       let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
-      function completeRefresh(applyTargeting: boolean): void {
+      function completeRefresh(applyTargeting: boolean, completedAuctionId?: string): void {
         if (completed) return;
         completed = true;
         if (fallbackTimer !== undefined) clearTimeout(fallbackTimer);
-
         // The publisher refresh itself started before this asynchronous auction.
         // Reconcile its per-slot token only when the callback is ready to issue
         // GPT: TS may have won an already-overlapping first impression while the
@@ -2832,15 +3064,27 @@ export function installRefreshHandler(timeoutMs = 1500): void {
         const completedAdUnitCodes = refreshAdUnitCodes.filter(
           (_code, index) => !callbackFilteredSlots.has(auctionSlots[index])
         );
-        if (applyTargeting) {
+        const completedAuctionSlots = auctionSlots.filter(
+          (slot) => !callbackFilteredSlots.has(slot)
+        );
+        let targetingApplied = false;
+        if (applyTargeting && typeof pbjs.setTargetingForGPTAsync === 'function') {
           try {
-            pbjs.setTargetingForGPTAsync?.(completedAdUnitCodes);
+            pbjs.setTargetingForGPTAsync(completedAdUnitCodes);
+            targetingApplied = true;
           } catch (error) {
             log.error('[tsjs-prebid] refresh targeting failed', error);
           }
         }
         completedSlots.forEach(consumeGptPublisherRefreshSuppression);
         recordPrebidRefreshForDiagnostics(completedSlots);
+        if (targetingApplied) {
+          recordCompletedPrebidAuction(
+            completedAuctionId,
+            completedAuctionSlots,
+            completedAdUnitCodes
+          );
+        }
         // Preserve the publisher's original refresh form unless one losing
         // first-impression slot was filtered. A delayed bare call must also
         // become explicit so slots added after the auction snapshot cannot join.
@@ -2852,7 +3096,7 @@ export function installRefreshHandler(timeoutMs = 1500): void {
       try {
         pbjs.requestBids({
           adUnits,
-          bidsBackHandler: () => completeRefresh(true),
+          bidsBackHandler: (_bids, _timedOut, auctionId) => completeRefresh(true, auctionId),
           timeout: timeoutMs,
         });
         // A one-shot watchdog completes the GAM request even if Prebid never

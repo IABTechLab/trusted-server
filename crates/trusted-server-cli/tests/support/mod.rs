@@ -28,6 +28,9 @@ pub struct ProxiedResponse {
     pub seen_host: String,
     pub seen_orig_host: String,
     pub seen_forwarded_host: String,
+    pub seen_origin: String,
+    pub seen_forwarded_proto: String,
+    pub seen_forwarder_auth: String,
     pub path: String,
 }
 
@@ -237,6 +240,7 @@ fn upstream_identity() -> (Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)
 }
 
 fn upstream_tls_acceptor() -> TlsAcceptor {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let (chain, key) = upstream_identity();
     let mut config = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -290,6 +294,68 @@ pub async fn start_raw_echo_upstream() -> RawUpstream {
 /// always returns `200`. Serves keep-alive (many requests per connection).
 pub async fn start_echo_upstream() -> Upstream {
     start_upstream(false, Duration::ZERO, false, false).await
+}
+
+/// Starts an echo fixture over plaintext HTTP.
+pub async fn start_plaintext_echo_upstream() -> Upstream {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("should bind plaintext upstream");
+    let addr = listener.local_addr().expect("should read upstream address");
+    let counters = Arc::new(UpstreamCounters::default());
+    let task_counters = Arc::clone(&counters);
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            task_counters
+                .accepted_connections
+                .fetch_add(1, Ordering::Relaxed);
+            let counters = Arc::clone(&task_counters);
+            tokio::spawn(async move {
+                serve_upstream_connection(
+                    &mut stream,
+                    false,
+                    Duration::ZERO,
+                    false,
+                    false,
+                    &counters,
+                )
+                .await;
+            });
+        }
+    });
+    Upstream { addr, counters }
+}
+
+/// Fictional token shared by authenticated forwarding fixtures.
+pub const FORWARDER_TOKEN: &str = "example-forwarder-token-0123456789";
+
+/// Resolves a file-backed credential using the real CLI configuration path.
+pub fn test_config_authenticated(
+    addr: &SocketAddr,
+    plaintext: bool,
+    rewrite_host: bool,
+) -> config::ResolvedConfig {
+    let directory = tempfile::tempdir().expect("should create credential directory");
+    let path = directory.path().join("token");
+    std::fs::write(&path, FORWARDER_TOKEN).expect("should write test token");
+    let mapping = format!("{FROM_HOST}={addr}");
+    let mut args = vec![
+        "ts",
+        "--map",
+        &mapping,
+        "--listen",
+        "127.0.0.1:0",
+        "--insecure",
+        "--forwarder-secret-file",
+        path.to_str().expect("should encode credential path"),
+    ];
+    if plaintext {
+        args.push("--upstream-plaintext");
+    }
+    if rewrite_host {
+        args.push("--rewrite-host");
+    }
+    resolve(&args)
 }
 
 /// Starts the echo upstream with a fixed delay before every response.
@@ -390,6 +456,16 @@ pub async fn start_trailer_upstream() -> Upstream {
 /// Starts an origin that accepts a declared request trailer and returns a
 /// response trailer only when the proxy also forwards `TE: trailers`.
 pub async fn start_request_trailer_upstream() -> Upstream {
+    start_request_trailer_contract_upstream(None).await
+}
+
+/// Requires authentication removal from trailers while retaining the initial
+/// proxy credential and the benign checksum trailer.
+pub async fn start_forwarder_trailer_upstream(expected_auth: &'static str) -> Upstream {
+    start_request_trailer_contract_upstream(Some(expected_auth)).await
+}
+
+async fn start_request_trailer_contract_upstream(expected_auth: Option<&'static str>) -> Upstream {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("should bind request-trailer upstream");
@@ -446,7 +522,23 @@ pub async fn start_request_trailer_upstream() -> Upstream {
         let request_trailer_arrived = trailers
             .to_ascii_lowercase()
             .contains("x-request-checksum: verified");
-        let accepted = body == b"data"
+        let authentication_valid = expected_auth.is_none_or(|expected| {
+            let declaration_has_auth = head
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .filter(|(name, _)| name.eq_ignore_ascii_case("trailer"))
+                .flat_map(|(_, value)| value.split(','))
+                .any(|name| name.trim().eq_ignore_ascii_case("x-ts-forwarder-auth"));
+            let trailer_has_auth = trailers
+                .lines()
+                .filter_map(|line| line.split_once(':'))
+                .any(|(name, _)| name.eq_ignore_ascii_case("x-ts-forwarder-auth"));
+            !declaration_has_auth
+                && !trailer_has_auth
+                && header_value(&head, "x-ts-forwarder-auth").unwrap_or_default() == expected
+        });
+        let accepted = authentication_valid
+            && body == b"data"
             && trailer_declared
             && accepts_trailers
             && connection_declares_te
@@ -658,6 +750,18 @@ async fn serve_upstream_connection<S>(
         let host = header_value(&head, "host").unwrap_or_default();
         let orig_host = header_value(&head, "x-orig-host").unwrap_or_default();
         let fwd_host = header_value(&head, "x-forwarded-host").unwrap_or_default();
+        let origin = head
+            .lines()
+            .skip(1)
+            .filter_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.eq_ignore_ascii_case("origin")
+                    .then(|| value.trim().to_string())
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+        let proto = header_value(&head, "x-forwarded-proto").unwrap_or_default();
+        let auth = header_value(&head, "x-ts-forwarder-auth").unwrap_or_default();
         let has_auth = header_value(&head, "authorization").is_some();
 
         if fail_second_request && request_index == 2 {
@@ -667,7 +771,9 @@ async fn serve_upstream_connection<S>(
         let (status_line, body) = if gated && !has_auth {
             ("HTTP/1.1 401 Unauthorized", String::new())
         } else {
-            let body = format!("host={host};orig={orig_host};fwd={fwd_host};path={path}");
+            let body = format!(
+                "host={host};orig={orig_host};fwd={fwd_host};origin={origin};proto={proto};auth={auth};path={path}"
+            );
             ("HTTP/1.1 200 OK", body)
         };
         if !response_delay.is_zero() {
@@ -1003,6 +1109,7 @@ impl ServerCertVerifier for AcceptAny {
 }
 
 fn accept_any_connector() -> TlsConnector {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let mut config = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(AcceptAny))
@@ -1441,6 +1548,20 @@ pub async fn drive_request_trailer(proxy: SocketAddr) -> (Vec<u8>, String) {
         .expect("origin should return a chunked response with trailers")
 }
 
+/// Sends a benign trailer alongside duplicate hostile credential trailers.
+pub async fn drive_forwarder_auth_trailers(proxy: SocketAddr) -> (Vec<u8>, String) {
+    let mut tls = open_mitm_client(proxy).await;
+    let request = format!(
+        "POST /request-trailer HTTP/1.1\r\nHost: {FROM_HOST}\r\nX-Ts-Forwarder-Auth: hostile-header\r\nTransfer-Encoding: chunked\r\nTrailer: X-Ts-Forwarder-Auth, x-request-checksum\r\nTE: trailers\r\nConnection: TE\r\n\r\n4\r\ndata\r\n0\r\nX-Ts-Forwarder-Auth: hostile-trailer\r\nx-ts-forwarder-auth: second-hostile-trailer\r\nx-request-checksum: verified\r\n\r\n"
+    );
+    tls.write_all(request.as_bytes())
+        .await
+        .expect("should send credential trailer request");
+    read_chunked_response(&mut tls)
+        .await
+        .expect("should read trailer contract response")
+}
+
 /// Streams `body` through the proxy with chunked request framing and returns
 /// the decoded chunked response body.
 pub async fn drive_chunked_body(
@@ -1515,6 +1636,58 @@ pub async fn drive_request_with_host_header(
     read_http_response(&mut tls).await.status
 }
 
+/// CONNECTs to the mapped [`FROM_HOST`], then sends a single `POST` to `path`
+/// carrying `Host: FROM` and the given `Origin`, and returns what the upstream saw.
+pub async fn drive_request_with_origin(
+    cfg: config::ResolvedConfig,
+    ca: Arc<ca::CertAuthority>,
+    path: &str,
+    origin: &str,
+) -> ProxiedResponse {
+    let proxy = spawn_proxy(cfg, ca).await;
+    let authority = format!("{FROM_HOST}:443");
+    let tcp = proxy_connect(proxy, &authority).await;
+
+    let connector = accept_any_connector();
+    let server_name = ServerName::try_from(FROM_HOST.to_string()).expect("valid server name");
+    let mut tls = connector
+        .connect(server_name, tcp)
+        .await
+        .expect("client TLS handshake with proxy leaf");
+
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {FROM_HOST}\r\nOrigin: {origin}\r\nContent-Length: 0\r\n\r\n"
+    );
+    tls.write_all(request.as_bytes())
+        .await
+        .expect("should send request over tunnel");
+    tls.flush().await.expect("should flush request");
+    read_http_response(&mut tls).await
+}
+
+/// Sends raw decrypted requests sequentially over one mapped CONNECT tunnel.
+pub async fn drive_raw_mapped_requests(
+    proxy: SocketAddr,
+    requests: &[String],
+) -> Vec<ProxiedResponse> {
+    let tcp = proxy_connect(proxy, &format!("{FROM_HOST}:443")).await;
+    let server_name =
+        ServerName::try_from(FROM_HOST.to_string()).expect("should parse server name");
+    let mut tls = accept_any_connector()
+        .connect(server_name, tcp)
+        .await
+        .expect("should establish TLS tunnel");
+    let mut responses = Vec::new();
+    for request in requests {
+        tls.write_all(request.as_bytes())
+            .await
+            .expect("should send raw request");
+        tls.flush().await.expect("should flush raw request");
+        responses.push(read_http_response(&mut tls).await);
+    }
+    responses
+}
+
 /// Reads one HTTP/1.1 response (head + Content-Length body) and parses the echo.
 async fn read_http_response<S>(stream: &mut S) -> ProxiedResponse
 where
@@ -1552,34 +1725,52 @@ where
         body.extend_from_slice(&chunk[..n]);
     }
     let body = String::from_utf8_lossy(&body[..content_length.min(body.len())]).to_string();
-    let (seen_host, seen_orig_host, seen_forwarded_host, path) = parse_echo(&body);
+    let echo = parse_echo(&body);
     ProxiedResponse {
         status,
-        seen_host,
-        seen_orig_host,
-        seen_forwarded_host,
-        path,
+        seen_host: echo.host,
+        seen_orig_host: echo.orig,
+        seen_forwarded_host: echo.fwd,
+        seen_origin: echo.origin,
+        seen_forwarded_proto: echo.proto,
+        seen_forwarder_auth: echo.auth,
+        path: echo.path,
     }
 }
 
-/// Parses `host=..;orig=..;fwd=..;path=..` echoed by the upstream.
-fn parse_echo(body: &str) -> (String, String, String, String) {
-    let mut host = String::new();
-    let mut orig = String::new();
-    let mut fwd = String::new();
-    let mut path = String::new();
+/// Header values the echo upstream reported.
+#[derive(Default)]
+struct Echo {
+    host: String,
+    orig: String,
+    fwd: String,
+    origin: String,
+    proto: String,
+    auth: String,
+    path: String,
+}
+
+/// Parses `host=..;orig=..;fwd=..;origin=..;path=..` echoed by the upstream.
+fn parse_echo(body: &str) -> Echo {
+    let mut echo = Echo::default();
     for field in body.split(';') {
         if let Some(v) = field.strip_prefix("host=") {
-            host = v.to_string();
+            echo.host = v.to_string();
         } else if let Some(v) = field.strip_prefix("orig=") {
-            orig = v.to_string();
+            echo.orig = v.to_string();
         } else if let Some(v) = field.strip_prefix("fwd=") {
-            fwd = v.to_string();
+            echo.fwd = v.to_string();
+        } else if let Some(v) = field.strip_prefix("origin=") {
+            echo.origin = v.to_string();
+        } else if let Some(v) = field.strip_prefix("proto=") {
+            echo.proto = v.to_string();
+        } else if let Some(v) = field.strip_prefix("auth=") {
+            echo.auth = v.to_string();
         } else if let Some(v) = field.strip_prefix("path=") {
-            path = v.to_string();
+            echo.path = v.to_string();
         }
     }
-    (host, orig, fwd, path)
+    echo
 }
 
 /// CONNECTs through the proxy to an UNMATCHED authority, completes the TLS

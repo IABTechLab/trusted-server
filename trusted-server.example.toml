@@ -85,6 +85,18 @@ pull_sync_concurrency = 3
 # cluster_trust_threshold = 10    # entries with cluster_size <= this are individual users
 # cluster_recheck_secs = 3600     # re-evaluate cluster_size after this many seconds
 
+# Optional authenticated server-capture handoff. It defaults off. Keep it off
+# until capture, consent, ownership, key rotation, deployment compatibility, and
+# live acceptance gates pass. The resolved secret must be URL_SAFE_NO_PAD base64
+# for exactly 32 random bytes and must not reuse ec.passphrase.
+# [ec.identity_handoff]
+# enabled = false
+# active_key_id = "handoff-2026-10"
+#
+# [[ec.identity_handoff.keys]]
+# id = "handoff-2026-10"
+# secret = "identity_handoff_2026_10"  # Key in trusted_server_secrets
+
 # Example partner configuration. Provision referenced keys in
 # trusted_server_secrets before validating/pushing.
 # [[ec.partners]]
@@ -125,8 +137,13 @@ pull_sync_concurrency = 3
 
 # First-party HTML/CSS rewriting controls.
 # [rewrite]
-# Domains left as-is (not proxied/rewritten). Supports "*.example.com" wildcards.
+# Hosts never rewritten: assets stay direct and click-through links are not
+# wrapped. Supports "*.example.com" wildcards (matches the apex too).
 # exclude_domains = ["*.cdn.example.com"]
+# When non-empty, only asset URLs on these hosts are proxied; other assets load
+# directly. Click-through links are not affected. Set this in TOML; environment
+# overrides cannot replace arrays.
+# include_domains = ["assets.example.com", "*.img.example.com"]
 
 # Trust a fronting CDN's reader IP only when the same request also supplies
 # the matching shared secret. The front door must set both headers on requests
@@ -137,6 +154,15 @@ pull_sync_concurrency = 3
 # ip_header = "x-ts-client-ip"
 # auth_header = "x-ts-client-ip-auth"
 # shared_secret = "trusted_client_ip_shared_secret"
+
+# Opt-in browser-facing origin forwarding for a trusted development proxy.
+# Forwarded host/proto need a matching secret and stay publisher-domain bounded.
+# shared_secret is a key in trusted_server_secrets, not the credential itself.
+# Configure the forwarder to send the actual secret in auth_header.
+# With x-ts-forwarder-auth, use ts dev proxy --forwarder-secret-file.
+# [trusted_forwarder]
+# auth_header = "x-ts-forwarder-auth"
+# shared_secret = "trusted_forwarder_shared_secret"
 
 # Tester-cookie endpoints: GET /_ts/set-tester sets ts-tester=true and
 # GET /_ts/clear-tester clears it on publisher.cookie_domain.
@@ -263,18 +289,29 @@ proxy = "enabled"
 # Keep disabled until provider endpoints, routes, and profile values below are
 # replaced with deployment-specific settings.
 enabled = false
-# Rewrite winning-bid creative HTML to first-party endpoints (default true). Set
-# false to skip proxy/click-URL conversion and creative TSJS injection.
-# Sanitization is controlled separately by `sanitize_creatives` below. Restore
-# true before rolling back to an older binary that rejects unknown fields.
+# Rewrite winning-bid creative asset URLs (images, scripts, styles, media,
+# iframes, CSS url()) to first-party /first-party/proxy endpoints (default
+# true). Set false to leave asset URLs direct. Bidder <base> removal and
+# creative TSJS injection run when this or rewrite_clicks is on. Sanitization
+# is controlled separately by `sanitize_creatives` below. Restore true before
+# rolling back to an older binary that rejects unknown fields.
 rewrite_creatives = true
+# Wrap creative click-through links (<a href>, <area href>) in signed
+# /first-party/click redirects. Unset (the default) follows rewrite_creatives
+# for auction creatives and keeps wrapping links in HTML fetched through
+# /first-party/proxy; a set value applies to both. Leave it commented out to
+# keep that behavior: any explicit value is stored in the pushed config, and
+# binaries older than this setting reject it. Uncomment it before relying on
+# TRUSTED_SERVER__AUCTION__REWRITE_CLICKS, which cannot create a missing leaf.
+# rewrite_clicks = true
 # Strip executable markup (script/object/embed/form/...) from winning-bid adm,
 # removing those elements together with their inner content. Defaults to false
-# (executable markup preserved). Note that with `rewrite_creatives = true` the
-# adm is still not untouched: eligible URLs are rewritten, bidder `<base>`
-# elements are removed, and the creative TSJS runtime is injected. Enable it
-# whenever creatives can render in a context that shares the publisher origin
-# (its primary defence there); leave it off when creatives render in a
+# (executable markup preserved). Note that with `rewrite_creatives` or
+# `rewrite_clicks` on, the adm is still not untouched: eligible asset URLs
+# and/or links are rewritten, bidder `<base>` elements are removed, and the
+# creative TSJS runtime is injected. Enable it whenever creatives can render
+# in a context that shares the publisher origin (its primary defence there);
+# leave it off when creatives render in a
 # foreign-origin frame (e.g. the Prebid Universal Creative inside the ad
 # server's iframe), since it removes script-based creatives entirely and would
 # blank slots on a script-heavy demand stack.
@@ -320,6 +357,12 @@ provider = "pbs-main"
 # allow_script_creatives = false
 # inventory_domain = "publisher.example"
 # inventory_page_origin = "https://www.publisher.example"
+
+[observability]
+# Keep this leaf present so the environment override can apply; the overlay
+# cannot create a missing configuration leaf. The Server-Timing header stays
+# off until enabled.
+server_timing_enabled = false
 
 # Server-side ad slot templates + creative-opportunity auction. Kept active.
 [creative_opportunities]
@@ -439,8 +482,14 @@ auction_timeout_ms = 500
 # [tinybird]
 # enabled = true
 # api_host = "api.us-east.tinybird.example"   # required when enabled; host only
-# auction_dataset = "auction_events"          # Events API datasource name
+# auction_dataset = "auction_events_raw"      # auction Events API datasource
 # auction_token_secret = "tinybird_auction_append_token"  # Key in trusted_server_secrets
+# auction_enabled = true                       # emit auction telemetry
+# access_enabled = false                       # emit sampled access telemetry
+# access_dataset = "access_logs_raw"          # access Events API datasource
+# access_token_secret = "tinybird_access_append_token"  # Key in trusted_server_secrets
+# access_sample_rate = 0.0                     # fraction from 0.0 through 1.0
+# max_body_bytes = 1048576                     # maximum NDJSON request body
 
 # Debug endpoints (all default false — never enable in production).
 # [debug]
@@ -586,6 +635,13 @@ geo_query_parameters = false
 # sdk_url = "https://identity.example.com/trusted-server.js"
 # cache_ttl_seconds = 3600
 # rewrite_sdk = true
+# capture_identity = false                           # require provider approval and old-binary drain
+# capture_global_withdrawal = false                  # require confirmed global revoke semantics
+
+# The separate [ec.identity_handoff] opt-in stays off until its synthetic and
+# live acceptance gates pass. It supplies auction IDs for absent or expired
+# sources, expires within five minutes, and retries persistence only for absent
+# sources. The browser-written ts-eids cookie remains a separate legacy path.
 
 # DataDome bot protection. Proxies tags.js + signal-collection API first-party.
 # Kept active but disabled so `ts audit` can flip `enabled` when detected.
@@ -631,9 +687,11 @@ gam_attribution_enabled = false
 
 # GPT runtime diagnostics browser overlay. Optional and enabled manually (not
 # flipped by `ts audit`); serves a diagnostics module gated behind an activation
-# query param + session cookie.
+# query param + host-only cookie. Explicit activation lasts 30 minutes;
+# ordinary requests do not extend it. Mobile trace remains off by default.
 # [integrations.gpt_diagnostics]
 # enabled = true
+# trace_page_enabled = false
 
 # APS browser renderer ownership. Server-side APS behavior belongs under an
 # [auction.providers] entry with profile = "aps".

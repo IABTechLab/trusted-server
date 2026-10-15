@@ -8,17 +8,24 @@ import {
 } from '../../core/first_impression';
 import { log } from '../../core/log';
 import { resolveSlotElementByDivId } from '../../core/slot_element';
+import { getActiveTraceGptBridge } from '../../trace/runtime';
+import type { TraceGptOpportunity } from '../../trace/gpt';
 import type {
   AuctionSlot,
   AuctionBidData,
+  AuctionDiagnosticsData,
+  GptDiagnosticsAuctionFacts,
   GptDiagnosticsCreativeFailure,
   GptDiagnosticsTrustedServerOpportunity,
   GptSlotHandoff,
   TsjsApi,
 } from '../../core/types';
 import {
+  APS_NATIVE_RENDERER_TIMEOUT_MS,
+  APS_RENDER_FAILED_MESSAGE,
   APS_UNIVERSAL_CREATIVE_RENDERER,
   APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+  apsRenderFailureReason,
   apsRendererUrl,
   dispatchApsRendering,
   consumeApsPrebidRenderer,
@@ -72,6 +79,25 @@ function trustedServerOpportunity(bid: AuctionBidData): GptDiagnosticsTrustedSer
   const hasCache = isNonEmptyString(bid.hb_cache_host) && isNonEmptyString(bid.hb_cache_path);
 
   return hasAdId && (hasInline || hasCache) ? 'renderable_candidate' : 'unrenderable_candidate';
+}
+
+function diagnosticsAuctionFacts(
+  generation: number,
+  auctionDiagnostics: AuctionDiagnosticsData | undefined,
+  bid: AuctionBidData
+): GptDiagnosticsAuctionFacts | undefined {
+  const isSpaAuction = generation > 0;
+  const winner =
+    isNonEmptyString(bid.hb_bidder) && isNonEmptyString(bid.hb_pb)
+      ? { bidder: bid.hb_bidder, priceBucket: bid.hb_pb }
+      : undefined;
+  if (!winner && auctionDiagnostics === undefined) return undefined;
+
+  return {
+    auctionType: isSpaAuction ? 'trusted_server' : 'ssat',
+    ...(winner ? { winner } : {}),
+    ...(auctionDiagnostics ? { serverTimings: auctionDiagnostics } : {}),
+  };
 }
 
 // ------------------------------------------------------------------
@@ -799,17 +825,39 @@ function installInitialLoadDetector(ts: TsjsApi): void {
  * riding rAF keeps a single code path whose post-hydration-commit guarantee
  * holds whenever the request is actually issued.
  */
+function traceOpportunity(slot: AuctionSlot, auctionId: string | undefined): TraceGptOpportunity {
+  try {
+    return getActiveTraceGptBridge()?.opportunity(slot, auctionId) ?? { auctionId };
+  } catch {
+    return { auctionId };
+  }
+}
+
 function installScheduleInitialAdInit(ts: TsjsApi): void {
   ts.scheduleInitialAdInit = function (
     initialBids?: Record<string, AuctionBidData>,
-    initialSlots?: AuctionSlot[]
+    initialSlots?: AuctionSlot[],
+    initialAuctionDiagnostics?: AuctionDiagnosticsData,
+    traceAuctionTransport?: unknown
   ) {
     if ((ts.navGeneration ?? 0) !== 0 || ts.initialAdInitScheduled) return;
     ts.initialAdInitScheduled = true;
     if (initialSlots !== undefined) ts.adSlots = initialSlots;
     if (initialBids !== undefined) ts.bids = initialBids;
+    if (initialAuctionDiagnostics !== undefined) {
+      ts.auctionDiagnostics = initialAuctionDiagnostics;
+    }
     const runUnlessNavigated = (): void => {
       if ((ts.navGeneration ?? 0) !== 0) return;
+      try {
+        getActiveTraceGptBridge()?.observeTransport(
+          initialSlots ?? ts.adSlots,
+          traceAuctionTransport,
+          'initial_navigation_ssat'
+        );
+      } catch {
+        // A diagnostic bridge cannot block the ordinary initial ad pass.
+      }
       ts.adInit?.();
     };
     const afterHydrationFrames = (): void => {
@@ -1187,13 +1235,27 @@ function schedulePublisherFirstImpressionFallback(
       if (tsOwned) (ts.prevGptSlots ??= []).push(gptSlot);
 
       try {
-        ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
-          gptSlot,
-          slot.id,
-          trustedServerOpportunity(bid),
-          bid.hb_auction_id,
-          slot.formats
-        );
+        const trace = traceOpportunity(slot, bid.hb_auction_id);
+        const recorder = ts.gptDiagnosticsRecorder;
+        if (trace.identity) {
+          recorder?.recordTrustedServerOpportunity(
+            gptSlot,
+            slot.id,
+            trustedServerOpportunity(bid),
+            trace.auctionId,
+            slot.formats,
+            undefined,
+            trace.identity
+          );
+        } else {
+          recorder?.recordTrustedServerOpportunity(
+            gptSlot,
+            slot.id,
+            trustedServerOpportunity(bid),
+            trace.auctionId,
+            slot.formats
+          );
+        }
       } catch {
         // Diagnostics must not alter fallback delivery.
       }
@@ -1240,6 +1302,7 @@ export function installTsAdInit(): void {
     // first act and stands down rather than applying this invocation's
     // slots/bids to the newer route's DOM and double-requesting it.
     const generation = ts.navGeneration ?? 0;
+    const auctionDiagnostics = ts.auctionDiagnostics ? { ...ts.auctionDiagnostics } : undefined;
     const g = (window as GptWindow).googletag;
     if (!g) return;
     installFirstImpressionLifecycleObservers(ts, g);
@@ -1382,13 +1445,28 @@ export function installTsAdInit(): void {
         try {
           const requestedSlotSizes = ts.gptSlotHandoffs?.[slotDivId2]?.formats;
           const opportunity = trustedServerOpportunity(bid);
-          ts.gptDiagnosticsRecorder?.recordTrustedServerOpportunity(
-            gptSlot,
-            slot.id,
-            opportunity,
-            bid.hb_auction_id,
-            requestedSlotSizes
-          );
+          const auctionFacts = diagnosticsAuctionFacts(generation, auctionDiagnostics, bid);
+          const trace = traceOpportunity(slot, bid.hb_auction_id);
+          const recorder = ts.gptDiagnosticsRecorder;
+          if (auctionFacts || trace.identity) {
+            recorder?.recordTrustedServerOpportunity(
+              gptSlot,
+              slot.id,
+              opportunity,
+              trace.auctionId,
+              requestedSlotSizes,
+              auctionFacts,
+              ...(trace.identity ? ([trace.identity] as const) : [])
+            );
+          } else {
+            recorder?.recordTrustedServerOpportunity(
+              gptSlot,
+              slot.id,
+              opportunity,
+              trace.auctionId,
+              requestedSlotSizes
+            );
+          }
         } catch {
           // Diagnostics must not alter ad delivery.
         }
@@ -1490,6 +1568,8 @@ export function installTsAdInit(): void {
 interface PageBidsResponse {
   slots: AuctionSlot[];
   bids: Record<string, AuctionBidData>;
+  auctionDiagnostics?: AuctionDiagnosticsData;
+  trace_auction?: unknown;
 }
 
 /** Canonical SPA re-auction endpoint. Mirrors `PAGE_BIDS_PATH` in Rust. */
@@ -1698,6 +1778,9 @@ export function installSpaAuctionHook(): void {
     if (g) clearPreviousNavigationTargeting(ts, g);
     ts.navGeneration = (ts.navGeneration ?? 0) + 1;
     delete ts.firstImpression;
+    // Server timings belong to the route that produced them. Clear them before
+    // page-bids starts so failure or supersession cannot relabel stale offsets.
+    ts.auctionDiagnostics = undefined;
     // A route change invalidates hydration aliases before the new route's
     // publisher can define a same-prefix slot while page-bids is in flight.
     for (const [elementId, handoff] of Object.entries(ts.gptSlotHandoffs ?? {})) {
@@ -1724,6 +1807,12 @@ export function installSpaAuctionHook(): void {
       if (inflight !== controller) return;
       ts.adSlots = data.slots;
       ts.bids = data.bids;
+      ts.auctionDiagnostics = data.auctionDiagnostics;
+      try {
+        getActiveTraceGptBridge()?.observePageBids(data, data.slots);
+      } catch {
+        // A diagnostic bridge cannot block the accepted navigation.
+      }
       // This route is now the committed, loaded state — a later failed
       // navigation rolls back here, and a return trip no-ops correctly.
       lastAppliedPath = path;
@@ -1901,11 +1990,23 @@ function safelyRecordCreativeFailure(
   }
 }
 
+/**
+ * A consumed APS ad ID, retained as a security tombstone.
+ *
+ * `adUnitCode` is kept so a failure relayed later by the creative frame can be
+ * source-checked against the ad unit the capability was served to, rather than
+ * trusted because it names a live ad ID.
+ */
+interface ApsConsumedTombstone {
+  expiresAt: number;
+  adUnitCode: string;
+}
+
 /** Maximum number of consumed APS Prebid IDs retained as security tombstones. */
 const MAX_CONSUMED_PREBID_APS_IDS = 256;
 
 function pruneConsumedPrebidApsIds(
-  consumedIds: Map<string, { expiresAt: number }>,
+  consumedIds: Map<string, ApsConsumedTombstone>,
   now: number
 ): void {
   for (const [adId, consumed] of consumedIds) {
@@ -1914,7 +2015,7 @@ function pruneConsumedPrebidApsIds(
 }
 
 function hasConsumedPrebidApsIdCapacity(
-  consumedIds: Map<string, { expiresAt: number }>,
+  consumedIds: Map<string, ApsConsumedTombstone>,
   adId: string
 ): boolean {
   if (consumedIds.has(adId) || consumedIds.size < MAX_CONSUMED_PREBID_APS_IDS) return true;
@@ -1924,11 +2025,17 @@ function hasConsumedPrebidApsIdCapacity(
 }
 
 function recordConsumedPrebidApsId(
-  consumedIds: Map<string, { expiresAt: number }>,
+  consumedIds: Map<string, ApsConsumedTombstone>,
   adId: string,
-  expiresAt: number
+  expiresAt: number,
+  adUnitCode: string
 ): void {
-  consumedIds.set(adId, { expiresAt });
+  // A capability consumed with little TTL left would otherwise lose its
+  // tombstone before the renderer frame's timeout fires, dropping the relayed
+  // reason. Holding it for at least that long also keeps the ad ID blocked
+  // longer, which is the safer direction for a security tombstone.
+  const minimum = Date.now() + APS_NATIVE_RENDERER_TIMEOUT_MS;
+  consumedIds.set(adId, { expiresAt: Math.max(expiresAt, minimum), adUnitCode });
 }
 
 /**
@@ -1962,7 +2069,7 @@ export function installTsRenderBridge(): void {
   // is scoped to the slot, not the bare adId: hb_adid is not unique per bid, so
   // keying on it alone would let one slot block a distinct slot's render.
   const renderingKeys = new Set<string>();
-  const consumedPrebidApsIds = new Map<string, { expiresAt: number }>();
+  const consumedPrebidApsIds = new Map<string, ApsConsumedTombstone>();
   // One consumed APS ad ID per slot is sufficient: a newer bid replaces the
   // slot's old ad ID in `window.tsjs.bids`, so the ownership guard rejects it.
   const consumedServerApsBySlot = new Map<string, string>();
@@ -1975,6 +2082,43 @@ export function installTsRenderBridge(): void {
           ? (e.data as Record<string, unknown>)
           : (JSON.parse(e.data as string) as Record<string, unknown>);
     } catch {
+      return;
+    }
+
+    // Diagnostics relayed by the APS Universal Creative frame. The creative is
+    // cross-origin, so every field is untrusted: the reason resolves through the
+    // allowlist, and the sender must be a frame inside the ad unit the
+    // capability was served to. Recording only; it never answers the sender.
+    if (data['message'] === APS_RENDER_FAILED_MESSAGE) {
+      const failedAdId = data['adId'];
+      const reason = apsRenderFailureReason(data['reason']);
+      if (typeof failedAdId === 'string' && reason !== undefined) {
+        pruneConsumedPrebidApsIds(consumedPrebidApsIds, Date.now());
+        const tombstone = consumedPrebidApsIds.get(failedAdId);
+        let failedSlotId: string | undefined;
+        if (tombstone) {
+          // The Prebid path tombstones the publisher's ad unit code, which is a
+          // div id. The store keys associations by the configured Trusted Server
+          // slot id, so resolve it; a div Trusted Server never associated has no
+          // slot id and is left alone rather than recorded under the wrong key.
+          if (sourceFrameForAdUnit(e.source, tombstone.adUnitCode)) {
+            failedSlotId = window.tsjs?.divToSlotId?.[tombstone.adUnitCode];
+          }
+        } else {
+          // Server-side APS winners are served the same renderer and emit the
+          // same relay, but are tracked per slot. `hb_adid` is not unique per
+          // slot, so require the sender to sit in the slot that consumed it.
+          for (const [slotId, consumedAdId] of consumedServerApsBySlot) {
+            if (consumedAdId === failedAdId && sourceFrameForSlotId(e.source, slotId)) {
+              failedSlotId = slotId;
+              break;
+            }
+          }
+        }
+        if (failedSlotId !== undefined) {
+          safelyRecordCreativeFailure(safelyRecordCreativeRequest(failedSlotId), reason);
+        }
+      }
       return;
     }
 
@@ -2008,7 +2152,12 @@ export function installTsRenderBridge(): void {
       const renderer = validateApsRenderer(prebidRendererEntry.renderer);
       if (!renderer || !hasConsumedPrebidApsIdCapacity(consumedPrebidApsIds, adId)) return;
       if (!consumeApsPrebidRenderer(adId, prebidRendererEntry)) return;
-      recordConsumedPrebidApsId(consumedPrebidApsIds, adId, prebidRendererEntry.expiresAt);
+      recordConsumedPrebidApsId(
+        consumedPrebidApsIds,
+        adId,
+        prebidRendererEntry.expiresAt,
+        prebidRendererEntry.adUnitCode
+      );
 
       const markUsed = (): void => {
         try {

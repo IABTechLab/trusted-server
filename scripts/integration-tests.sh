@@ -22,6 +22,8 @@ ORIGIN_PORT="${INTEGRATION_ORIGIN_PORT:-8888}"
 NODE_VERSION="$(grep '^nodejs ' .tool-versions | awk '{print $2}')"
 TEST_ARGS=("$@")
 SKIP_DUPLICATE_HELPERS=true
+TRACE_RUNTIME_REQUESTED=false
+TRACE_SKIP_VALUE=false
 
 if [ -z "$NODE_VERSION" ]; then
     echo "Failed to detect Node.js version from .tool-versions" >&2
@@ -34,10 +36,27 @@ for arg in "$@"; do
             SKIP_DUPLICATE_HELPERS=false
             ;;
     esac
+    if [ "$TRACE_SKIP_VALUE" = true ]; then
+        TRACE_SKIP_VALUE=false
+        continue
+    fi
+    case "$arg" in
+        --skip)
+            TRACE_SKIP_VALUE=true
+            ;;
+        trace_browser_workflow*|trace_runtime_boundary*)
+            TRACE_RUNTIME_REQUESTED=true
+            ;;
+    esac
 done
 
 if [ "$SKIP_DUPLICATE_HELPERS" = true ]; then
-    TEST_ARGS=(--skip test_wordpress_fastly --skip test_nextjs_fastly "${TEST_ARGS[@]}")
+    TEST_ARGS=(--skip test_wordpress_fastly --skip test_nextjs_fastly "$@")
+fi
+
+# These opt-in probes require separately prepared browser and Spin artifacts.
+if [ "$TRACE_RUNTIME_REQUESTED" = false ]; then
+    TEST_ARGS=(--skip trace_browser_workflow --skip trace_runtime_boundary "${TEST_ARGS[@]}")
 fi
 
 # Detect native target from rustc (handles all OS + arch combinations correctly)

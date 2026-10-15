@@ -9,9 +9,8 @@
 
 GPT Runtime Diagnostics is an opt-in browser console for documented Google
 Publisher Tag (GPT) lifecycle callbacks and Trusted Server integration evidence.
-It groups observations into per-slot request cycles, shows timings and source-neutral
-GAM facts, binds slots to exact DOM elements, and downloads the same allowlisted data
-as versioned JSON.
+It groups observations into per-slot request cycles, shows auction and GPT timings,
+links each accessible page badge to the same stable `Ad #N` and `Request #M` in the side panel, binds slots to exact DOM elements, and downloads the same allowlisted data as versioned JSON. See the complete [label dictionary](./gpt-diagnostics-dictionary.md) for every operator-facing term.
 
 The console reports positive observations, not inferred ownership. A filled result
 means only that GPT emitted `slotRenderEnded` with `isEmpty === false`. A Trusted
@@ -45,8 +44,8 @@ and non-storeable.
 
 ### Auction correlation token
 
-Enabling the integration has one further server-side effect, beyond module
-availability, that does not depend on browser activation. For each server-side auction
+The existing `hb_auction_id` publication has one further server-side effect, beyond module
+availability, that does not depend on browser activation. With mobile tracing inactive, for each server-side auction
 that produced winning bids, Trusted Server mints a fresh correlation token and publishes
 it as `hb_auction_id` on each winning bid in `window.tsjs.bids`:
 
@@ -66,6 +65,11 @@ ts-auc-2f8c1d5a4b7e4c0f9a3d6b1e8c5f2a7d
 - It is published on every document whose auction produced winning bids, including
   documents with no active console session, because the console reads it from the same
   page bid state the GPT integration already consumes.
+
+Active mobile tracing instead mints its opaque identity before dispatch and reuses
+that token in deliverable auction evidence and GPT opportunity markers. Zero-bid,
+skipped and failed auctions can carry evidence independently of winning bids.
+Disabling mobile tracing retains the existing console-only publication behavior.
 
 ## Activate or Deactivate a Browser Session
 
@@ -94,13 +98,189 @@ An exact directive establishes or clears the host-only, `Secure`, `HttpOnly`,
 `SameSite=Lax` `__Host-ts-console` session cookie. The server removes every reserved
 `ts_console` pair before origin, cookie, or auction handling, and the response removes
 the directive from the visible URL while preserving the path, unrelated query pairs,
-and fragment. Activation applies to the same origin across tabs until the browser
-session ends or an exact deactivation directive clears it.
+and fragment. Explicit activation lasts 30 minutes; ordinary requests do not
+extend that lifetime. The host-only cookie is shared across tabs on that hostname
+and does not isolate different ports. An exact deactivation directive clears it.
 
 Duplicate directives, unrecognized values, and duplicate activation cookies fail
 closed for the current response. Active and directive-bearing HTML responses use
 `Cache-Control: private, no-store` and omit surrogate cache headers. The cookie is
 never forwarded to the publisher origin and is unrelated to `ts-tester`.
+
+## Mobile Trace Page
+
+The mobile report is a separate opt-in surface. Its deployment option defaults
+to `false` and requires the diagnostics integration:
+
+```toml
+[integrations.gpt_diagnostics]
+enabled = true
+trace_page_enabled = true
+```
+
+Before enabling it, the operator must accept that same-origin scripts can read
+the projected health of four owned cookies, opaque auction outcomes, a masked
+network identifier and available coarse network metadata. A masked identifier
+can still identify a network. The `HttpOnly` cookie value remains inaccessible
+to scripts; the report deliberately exposes only validated shape and observation
+categories. No cookie values, exact publisher path, provider identity, creative
+markup, bid price or external user identifier belongs in a trace report.
+
+Open `/_ts/trace` on the exact publisher hostname and in the same browser tab.
+The initial visit is read-only and describes its own **Setup request**, not an
+earlier ad failure. Tap **Enable tracing**. A successful POST requests the cookie
+change; a separate state request must observe a valid session before the page
+says tracing is on. Return to the affected page, explicitly reload it once,
+reproduce the issue, then tap **View trace results** in the TS Console. A history
+Back or restored page alone does not prove a new capture. If history is not useful,
+reopen the article on that same hostname in that tab and reload once.
+
+The publisher action validates one combined report and saves it before navigating
+in the same tab. If storage alone fails, it stays on the publisher page and offers
+an explicit download of that same valid report. A failed capture does not offer a
+GPT-only export as an equivalent fallback. The viewer keeps traced-document facts
+separate from its setup request. Server-auction and browser/GPT clocks remain
+separate; candidate selection or a filled slot does not establish an auction winner.
+
+Slot returned-bid counts include records returned by bidder and mediator calls,
+including mediator echoes. They are observations across stages, not unique bids;
+do not sum slot counts to infer a unique bid total.
+
+### Storage, export and cleanup
+
+One versioned `sessionStorage` key holds at most 512 KiB of compact UTF-8 data.
+A new explicit capture replaces it. Reports expire after 15 minutes, but tabs with
+an opener and browser session restoration may copy or retain the entry. Same-origin
+scripts and service workers can read or replace it. The viewer labels it
+**Browser-carried, unverified diagnostic data**; it is troubleshooting information,
+not cryptographic proof, identity evidence or security evidence.
+
+**Copy**, **Download** and file **Share** use the same validated public report JSON.
+The selected share app receives that file. The viewer does not upload a report or
+substitute URL sharing when file sharing is unavailable. Native download or share
+initiation does not prove that a recipient saved the file.
+
+**Delete local report** removes only this tab's owned report key. After confirmation,
+**Clear report and end tracing** attempts local deletion, the end POST and a separate
+state check independently. Offline requests cannot prevent local deletion. A failed
+deletion retains its own retry; unconfirmed server end retains a separate retry and
+may leave tracing active. An inactive state means no valid session was observed in
+that request; it does not prove that every cookie is absent. Exported files and
+copies in other tabs or apps are not removed by local cleanup.
+
+### Deployment and runtime boundary
+
+Use a suitable same-origin deployment where the browser accepts the unchanged
+`Secure`, `HttpOnly`, host-only `SameSite=Lax` cookie. Its explicit activation lifetime
+is 1800 seconds; ordinary requests do not refresh it. Do not weaken cookie attributes
+or infer HTTPS from an untrusted forwarding header to make a test pass.
+
+On deployed Fastly, Cloudflare and Spin staging services, verify HTTPS Enable returns a
+successful response, a separate state request observes the session, publisher
+reload captures evidence, and End followed by another state request observes
+inactivity. Local plain-HTTP runtime tests do not establish this HTTPS behavior.
+
+Enable and End require the browser's canonical Origin to agree with the
+effective public origin. By default that origin comes from the runtime's
+trusted transport metadata. A TLS-terminating proxy that forwards HTTPS as
+HTTP, or replaces the public authority with an internal host, can therefore
+cause an intentional `403`, including on Spin and Axum.
+
+For that arrangement, explicitly configure an
+[authenticated forwarder](../configuration.md#trusted-forwarder) and provision
+its shared secret in the secret store. The proxy must supply one authenticated
+`X-Forwarded-Host` and `X-Forwarded-Proto` pair bounded to the configured publisher
+domain or a subdomain. This supports an HTTPS browser using Axum's plain-HTTP
+listener without changing the received transport evidence. The request URI and
+Host must still agree with that evidence; forwarding cannot upgrade cookie or
+header fidelity. Unauthenticated `Forwarded` or `X-Forwarded-*` fields do not
+grant trust. Verify Enable, state and End through the actual proxy with the
+unchanged Secure cookie attributes before accepting the deployment.
+
+Publisher activation and context use injected inline scripts without an attached
+CSP nonce. A publisher nonce/hash policy that does not authorize those scripts
+can prevent diagnostics activation and capture. Check the literal activation gate
+and actual capture under the deployed publisher CSP; do not weaken that policy
+or the trace viewer's separate CSP to make the check pass.
+
+A pre-existing session cookie cannot be retroactively assigned this lifetime by
+the server. End tracing and explicitly enable it again to adopt the bounded cookie.
+Expiry or disabling the deployment flag does not unload an already-running page;
+reload documents after rollback. Subsequent gated server requests stop producing
+new evidence immediately when the deployment option is disabled.
+
+Ordered Basic-auth handlers remain first-match-wins. They match the literal path
+visible after runtime conversion, before trace feature flags or method checks.
+Protect the shell and its fixed assets consistently if operator authentication is
+required. Without a matching handler, this opt-in surface is available to users of
+that publisher deployment. The script and stylesheet are fixed same-origin versioned
+assets. Dynamic endpoints and evidence-bearing responses are `private, no-store`;
+successful assets are publicly immutable only when unprotected.
+
+The boundary distinguishes runtime rejection before invocation, adapter
+bootstrap/conversion failure, and successfully converted application-visible
+handling. Fastly, Cloudflare or Spin can normalize a path or change visible header
+representation before Trusted Server sees it. A path normalized outside the trace
+namespace follows ordinary health/routing behavior. A path normalized into a literal
+trace path receives full trace authentication and handling. Aliases still visible
+encoded after conversion are reserved and rejected under authentication for their literal visible path; decoding does not
+grant different authentication coverage. Original wire-target reconstruction is not
+a release prerequisite or a source of authentication decisions.
+
+The visible Cookie header is capped at 16384 bytes. Invalid visible text or size
+prevents health inspection. When runtime fidelity cannot guarantee preservation,
+replacement characters, or commas that border a Trusted Server cookie name and
+could be folded field boundaries, conservatively make all four cookie rows
+unavailable and suppress capture. Commas inside unrelated cookie values, such as
+JSON-valued sign-in or consent cookies, do not block tracing; marker-free headers
+with unknown fidelity can still activate tracing. This can produce false negatives rather than
+guessing a session. End remains available for ambiguous cookie observations.
+
+Locally handled authentication, routing and control failures use bounded
+400/401/403/404/405/413 responses. A runtime rejection has no fabricated local trace
+response. Adapters may buffer a request body before the hook runs; the hook supplies
+no wall-clock timeout, memory-allocation guarantee or earlier raw-header access.
+Unsupported metadata and request-relative server milestones display **Unavailable**.
+There is no historical recovery or server-side report store.
+
+### Release acceptance
+
+Keep `trace_page_enabled` off until the required automated checks in the
+[implementation plan](https://github.com/IABTechLab/trusted-server/blob/750ba8dc470aa37f3eb62512cc2b5a025bab8f9d/docs/superpowers/plans/2026-10-05-mobile-ad-render-trace-implementation-plan.md)
+pass. The browser checks must exercise the complete setup, real cookie observation,
+publisher reload, capture, viewer, export and end flow on each supported adapter.
+Real bidder transport and creative rendering require their separate live checks;
+an auction-disabled browser fixture does not establish those behaviors.
+
+Before production rollout, also complete the following checks on real iOS Safari
+and Android Chrome. Desktop Chromium emulation does not establish native mobile
+behavior:
+
+- Reproduce from the same hostname and tab using the displayed return/reload
+  instructions. Verify browser Back alone is not described as a fresh capture.
+- Check 320 CSS px layout, text zoom, safe-area placement, readable status messages
+  and usable primary controls without horizontal page scrolling.
+- Download and share the JSON through the native browser/app picker. Compare the
+  saved file with the copied report, and verify cancellation or rejection retains
+  the visible report and its other export actions.
+- Verify local deletion independently of an offline or failed end request, then
+  reconnect and use the separate end/state retry.
+- Check viewer reload, tab/opener copies, expiry and any browser session restoration
+  behavior being supported. Record session-restoration checks separately from
+  automated storage fixtures.
+
+The linked plan is the immutable implementation baseline. Record device/browser
+versions and new acceptance results in the current rollout evidence, referencing
+that baseline and the exact deployed revision.
+Until these checks are complete, physical mobile acceptance remains pending.
+
+### Maintaining versioned assets
+
+The committed trace asset manifest covers source, compiler dependency locks and
+build options. After changing those inputs, rebuild and review the JS/CSS and
+refresh the source digest. Unchanged bytes keep their existing asset URL and
+digest. Once an asset set is published, changed bytes require a new versioned
+URL; the current feature's v1 set remains unpublished until release acceptance.
 
 ## What the Console Shows
 
@@ -109,8 +289,12 @@ Visible, Filled, Empty, Pending/Incomplete, and Unbound/Ambiguous slots.
 
 Each request cycle can show:
 
+- The same stable `Ad #N` and `Request #M` used by the request's page badge.
 - The observed request path, request-intent ID, and direct Trusted Server opportunity.
+- Explicit auction classification: initial-page server, SPA server, completed client-side Prebid, multiple observed paths, or not observed.
 - Opaque Trusted Server auction-ID correlation and opportunity-to-request latency when available.
+- Source-scoped server-auction winner, Prebid targeting candidate, and documented Prebid win observations. None is presented as the final served creative.
+- Server-measured auction dispatch, resolution, commit, and wait timing when available.
 - Observed replacement of an earlier retained filled render, including GPT creative-ID transitions.
 - Requesting, Response received, Filled, Empty, or Rendered (fill unknown) GPT
   lifecycle state.
@@ -118,9 +302,11 @@ Each request cycle can show:
 - Safe, deduplicated creative-bridge failure categories.
 - Source-neutral GAM response class and identifiers reported by GPT.
 - GPT slot-onload, impression-viewable, and visibility observations.
-- Non-negative request-to-response, response-to-render, render-to-load, and
+- Non-negative GAM request-to-response, GAM response-to-render, render-to-load, and
   render-to-viewable durations.
-- GPT-reported rendered size, a separately labelled observed outer slot box when safely bound, backfill, and slot-content-change facts.
+- GPT-reported rendered size, a separately labelled `Size filled` outer-slot measurement
+  when safely bound, backfill, and slot-content-change facts. GPT's ubiquitous `1×1`
+  placeholder stays in the JSON evidence but is hidden from the panel and badge.
 - Current DOM binding status and viewport intersection.
 
 Elapsed time alone never changes a pending GPT request to Incomplete. Incomplete
@@ -128,6 +314,67 @@ sequence appears only when an observed callback proves a missing or invalid earl
 step. When `slotRenderEnded` omits `isEmpty`, the result stays Rendered (fill unknown),
 and `responseClass` remains absent. `unclassified_non_empty` requires an explicit
 `isEmpty === false` observation.
+
+## Auction Classification and Timing
+
+Auction labels describe the path observed for that GPT request cycle:
+
+| Label                             | Meaning                                                                                              |
+| --------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| SSAT: initial-page server auction | Explicit completed initial-document server-auction evidence populated the direct request.            |
+| TS auction: SPA server auction    | Explicit completed `/_ts/page-bids` server-auction evidence populated the direct request.            |
+| Client-side Prebid auction        | A completed Prebid attempt was joined by exact auction ID, ad-unit code, GPT slot, and next request. |
+| Multiple auction paths observed   | Server and completed client-side evidence were both observed. This does not prove a race or winner.  |
+| Auction not observed              | Explicit completed-auction evidence was absent or malformed. It never defaults to SSAT.              |
+
+Publisher refresh evidence does not by itself establish another auction. It remains
+visible in the request-path classification but does not turn an SSAT, TS auction, or
+client-side auction label into `Multiple auction paths observed`. Publisher-only refreshes and
+unattributed requests have no auction label because the available evidence does not
+establish an auction implementation.
+
+For synthetic refresh auctions, diagnostics correlates the auction ID supplied by
+Prebid's own `bidsBackHandler`; it does not provide or override Prebid auction IDs. The
+`bidWon` listener, targeting reads, and bounded correlation state are installed only
+when an active diagnostics recorder exists, so an inactive console does not change
+Prebid-visible behavior.
+
+Server auction timing and browser GPT timing use separate clocks and are never
+subtracted from each other. Both initial SSAT and SPA TS auction offsets use the
+adapter's server-request clock. Initial offsets belong to the document request, while
+SPA offsets belong to the later `/_ts/page-bids` request. Diagnostics retain that
+request origin separately from the aggregate auction classification, so a request marked
+`competing` still labels SPA offsets from the SPA page-bids request T0. Neither server
+clock is the browser's navigation clock. The server facts are:
+
+- `auctionDispatchedMs`: bid dispatch offset from that timing origin.
+- `auctionResolvedMs`: offset when auction collection completed, including timeout handling.
+- `auctionCommittedMs`: offset when winning bids were available to page state.
+- `auctionWaitMs`: actual time blocked in auction collection.
+- `auctionWaitPlacement`: whether that wait occurred before response headers or while
+  the document response was streaming.
+
+The SPA page-bids response includes these server timings only for an activated
+console session and a successfully dispatched auction. Failures before any provider
+dispatch do not emit timing evidence. The activation cookie is still removed before
+auction and publisher processing; the server retains only the request-scoped activation
+decision needed to gate this diagnostics field.
+
+Browser timings have different boundaries. **GAM request → response** starts at GPT's
+`slotRequested` callback and ends at `slotResponseReceived`. **GAM response → render**
+starts at `slotResponseReceived` and ends at `slotRenderEnded`. “Render” therefore
+means that GPT emitted its render-ended callback; it does not prove inner-iframe pixels
+executed or became visible.
+
+```mermaid
+flowchart TB
+    A[Server timing origin] --> B[Auction dispatched]
+    B --> C[Auction resolved]
+    C --> D[Bids committed to page state]
+    E[GPT slotRequested] --> F[GPT slotResponseReceived]
+    F --> G[GPT slotRenderEnded]
+    G --> H[GPT slotOnload / impressionViewable]
+```
 
 ## Request Paths
 
@@ -162,8 +409,10 @@ context even when the delegated refresh throws, and the Prebid wrapper restores 
 exact prior value. Diagnostics never suppresses or changes a GPT request.
 
 For a direct observation, the optional opaque auction ID is retained only after
-trimming to a non-empty value no longer than 256 UTF-8 bytes. No auction payload,
-targeting map, bid price, markup, network body, or stack trace is exported. The
+trimming to a non-empty value no longer than 256 UTF-8 bytes. Winning bidder names are
+limited to 128 UTF-8 bytes, and numeric price-bucket strings to 64 bytes. The console
+exports only those winning-bid fields and the bounded timing object—not a raw auction
+payload, targeting map, exact unbucketed CPM, markup, network body, or stack trace. The
 reported opportunity-to-request duration is browser-observed only and is omitted for
 invalid or negative timing.
 
@@ -181,8 +430,8 @@ For the direct path, `adInit` records one opportunity:
 | `unrenderable_candidate` | Bid targeting was applied, but the current bridge lacked the complete ID/render-source combination needed to serve markup. |
 | `no_candidate`           | `adInit` explicitly observed no direct Trusted Server bid targeting for that configured slot.                              |
 
-An absent opportunity is displayed as unknown. It must not be converted into a
-negative demand-source conclusion.
+An absent opportunity is displayed as `Not observed`. It must not be converted into
+a negative demand-source conclusion.
 
 ## Trusted Server Evidence Ladder
 
@@ -202,15 +451,15 @@ that acknowledgement is outside the zero-publisher-change design.
 
 The derived `delivery` value uses these evidence-safe meanings:
 
-| Delivery state                 | Panel wording                                                                                                                                               |
-| ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `trusted_server_response_sent` | Trusted Server selected; markup response sent to PUC                                                                                                        |
-| `trusted_server_selected`      | Trusted Server selected; no markup response confirmed                                                                                                       |
-| `candidate_unconfirmed`        | Trusted Server candidate unconfirmed — another GAM result or a creative/bridge failure is possible                                                          |
-| `no_candidate`                 | adInit observed no direct Trusted Server candidate for this request                                                                                         |
-| `unknown`                      | Delivery status unknown — required GPT or direct-candidate evidence was not observed                                                                        |
-| `pending`                      | Waiting for Trusted Server creative evidence                                                                                                                |
-| `not_applicable`               | No delivery conclusion is displayed before render or for an explicitly empty result, provided no Trusted Server creative evidence was stamped on the cycle. |
+| Delivery state                 | Panel wording                                                      |
+| ------------------------------ | ------------------------------------------------------------------ |
+| `trusted_server_response_sent` | Creative markup sent; execution not confirmed                      |
+| `trusted_server_selected`      | Server bid selected by the creative bridge; response not confirmed |
+| `candidate_unconfirmed`        | Server bid available; selection not confirmed                      |
+| `no_candidate`                 | No direct Trusted Server candidate                                 |
+| `unknown`                      | Delivery status unknown — required evidence was not observed       |
+| `pending`                      | Waiting for Trusted Server creative evidence                       |
+| `not_applicable`               | Delivery evidence: Not applicable                                  |
 
 For an explicit non-empty candidate, diagnostics wait five seconds from
 `slotRenderEnded` for positive creative evidence. If no matched PUC request arrives,
@@ -233,6 +482,32 @@ A matched creative attempt can report these safe, non-terminal categories:
 Failures are deduplicated and retain first-observed order. Detailed URLs, cache IDs,
 payloads, markup, and error objects remain only in existing operational logging and do
 not enter diagnostics.
+
+### APS render failures
+
+An APS bid that wins targeting is served as a 1x1 universal creative that resizes
+itself only once the creative draws, so Ad Manager reports a non-empty render whether
+or not anything was drawn. These categories name the guard that stopped the render, so
+a blank slot is distinguishable from a delivered one.
+
+They are relayed diagnostics rather than bridge failures: the sandboxed renderer
+document or the Universal Creative source observes the failure and reports it, the
+reason is validated against a fixed allowlist, and the sender is authenticated against
+the slot the capability was served to. A reason never carries creative or descriptor
+content.
+
+| Failure                      | Observed by               | Meaning                                                                                                                                                                              |
+| ---------------------------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `aps_bad_hash`               | Renderer document         | The frame loaded without a usable nonce fragment, so no descriptor was accepted.                                                                                                     |
+| `aps_nonce_mismatch`         | Renderer document         | A descriptor arrived bearing a nonce other than the one the frame was opened with.                                                                                                   |
+| `aps_descriptor_keys`        | Renderer document         | The descriptor's key set did not match either accepted shape.                                                                                                                        |
+| `aps_descriptor_fields`      | Renderer document         | A descriptor field was absent, the wrong type, or over its size limit.                                                                                                               |
+| `aps_descriptor_envelope`    | Renderer document         | The encoded bid envelope failed to decode or disagreed with the descriptor.                                                                                                          |
+| `aps_runner_script_error`    | Renderer document         | Amazon's `prebid-creative.js` failed to load, so the creative was never rendered.                                                                                                    |
+| `aps_frame_timeout`          | Universal Creative source | The renderer frame never acknowledged within its timeout. A missing or erroring renderer route also surfaces here, because an iframe does not raise a load error for an HTTP status. |
+| `aps_frame_load_error`       | Universal Creative source | The renderer frame raised a load error. Rare; see the timeout row.                                                                                                                   |
+| `aps_frame_reported_failure` | Universal Creative source | The frame reported a failure without naming a category.                                                                                                                              |
+| `aps_unknown`                | Universal Creative source | The render failed with no reason available.                                                                                                                                          |
 
 ### Source-neutral GAM facts
 
@@ -309,11 +584,12 @@ A concise viewport badge appears only when a slot:
 - Has a unique, connected exact binding.
 - Has a non-zero rectangle intersecting the viewport.
 
-A badge summarizes the slot's most recent request cycle: the GPT result (Filled, Empty,
-Rendered (fill unknown), or Pending), a short delivery label, a `Competing paths`
-marker when the request path is `competing`, the rendered size, and the request-to-
-response, response-to-render, and render-to-viewable durations that are available. It
-adds `Incomplete sequence` when a callback proved a missing or invalid earlier step.
+A badge starts with the slot's stable `Ad #N`, matching the side-panel heading. It then
+summarizes the most recent request cycle: the GPT result (Filled, Empty, Rendered (fill
+unknown), or Pending), auction type, a short delivery label, a `Competing paths` marker
+when the request path is `competing`, sizes, and the GAM request-to-response, GAM
+response-to-render, and render-to-viewable durations that are available. It adds
+`Incomplete sequence` when a callback proved a missing or invalid earlier step.
 
 Badge delivery labels are the same derived states the panel and export report, shortened
 to fit:
@@ -354,10 +630,11 @@ becomes unbound or ambiguous, the last successful sample remains as request-cycl
 evidence while the binding status reports the current DOM state. It is displayed
 separately from `size`, which remains the exact GPT-reported `slotRenderEnded.size`
 fill-size fact. The panel labels the three separate facts as requested slot sizes,
-GPT-reported fill size, and observed outer slot box; the badge abbreviates them as
-`Req`, `Fill`, and `Box`. The observed box may differ from GPT's reported size (for
-example, a flexible APS creative can report `1×1` while its allocated outer slot box
-is larger). The measurement describes publisher-page layout, not universal internal
+GPT-reported fill size, and `Size filled`; the badge abbreviates the first two as `Req`
+and `Fill` and uses `Size filled` for the observed outer box. The observed box may
+differ from GPT's reported size. A flexible APS creative, for example, can report GPT's
+uninformative `1×1` placeholder while its allocated outer slot box is larger; the UI
+suppresses that `1×1` text but the export retains the original `size: [1, 1]` evidence. The measurement describes publisher-page layout, not universal internal
 creative-pixel dimensions. A collapsed or hidden bound element can report `0×0`, which records the
 page layout state rather than an invalid measurement. Empty, unbound, missing, or
 ambiguous slots do not report an observed box; delayed measurements from an older cycle
@@ -368,14 +645,17 @@ content or altering the APS sandbox, so this field cannot prove the inner creati
 pixels.
 
 Badges and the panel live in a closed Shadow DOM. Diagnostics do not add attributes,
-classes, or inline styles to publisher slot elements.
+classes, or inline styles to publisher slot elements. Each badge is an interactive button
+positioned over the slot's top-left area. While diagnostics are active, the badge intercepts
+pointer input within its own bounds instead of passing that input to the creative.
 
 ## Presentation Lifecycle
 
 - **Collapse** reduces the panel while preserving capture.
 - **Close** dismisses the presentation for the current document.
 - External removal by hydration or DOM reconciliation triggers a debounced remount.
-- Live re-renders preserve open request-history disclosures and panel scroll position.
+- Live re-renders preserve open request-history, help, and technical disclosures plus panel scroll position.
+- Selecting an earlier request from a badge opens its history once. A later user collapse remains closed across live updates.
 - Explicit Close or `hide()` prevents remount until `show()` is called.
 - Capture continues while the panel is hidden.
 
@@ -410,17 +690,26 @@ unsubscribe()
 | `hide()`              | Dismisses presentation without stopping capture                                                      |
 | `show()`              | Clears dismissal and remounts presentation without resetting data                                    |
 
-## V1 Export, Storage, and Privacy
+## GPT-only V1 Export, Observation Memory, and Privacy
 
-The allowlisted export contains:
+The existing GPT-only `snapshot()` and `export()` model contains:
 
 - `version: 1` and an ISO `capturedAt` timestamp.
 - Current page origin and pathname, excluding query parameters and fragments.
 - Retained slots, binding facts, visibility, and request cycles.
 - `requestedSlotSizes` when Trusted Server supplied configured formats for that exact
   request, plus GPT-reported fill `size` and an optional observed outer `observedSlotSize`.
-- Request path, request intent ID, opportunity, creative-progress timestamps, and
-  safe failure enums.
+- Request path, auction type, request intent ID, opportunity, creative-progress
+  timestamps, and safe failure enums.
+- The bounded winning bidder and bucketed price plus server auction timing fields and
+  their `navigation` or `spa_auction` origin when direct auction evidence was observed.
+- Completed client-side Prebid evidence (`prebidAuction`): Prebid's opaque `auctionId`,
+  plus bounded bidder and bucketed price fields in `targetingCandidate` and `win`,
+  when a completed attempt and any documented `bidWon` observation were correlated
+  to that exact request. Neither candidate nor win evidence proves the final served bidder.
+- Optional `currency` on server winner, Prebid candidate, and Prebid win evidence,
+  when supplied through the internal recorder. Values are normalized to three uppercase
+  ASCII letters; first-party integrations do not populate this field.
 - The per-auction diagnostics token (`trustedServerAuctionId`) and the
   opportunity-to-request duration, when a direct opportunity was observed.
 - Replacement facts for a re-rendered slot: `replacedRequestNumber`,
@@ -431,9 +720,11 @@ The allowlisted export contains:
 - Separate callback issues, attribution issues, coverage counters, and retention
   counters.
 
-It does not contain raw targeting, bid IDs, bid prices, bidder identity, creative
-markup, cache URLs, cache payloads, cache or bridge error details, cookies, user
-identifiers, query strings, or URL fragments. The exported `trustedServerAuctionId`
+It does not contain raw targeting, bid IDs, exact unbucketed bid prices, losing bid
+lists, creative markup, cache URLs, cache payloads, cache or bridge error details,
+cookies, user identifiers, query strings, or URL fragments. It does contain the server
+winner and the Prebid candidate and win bidder names with their bucketed `hb_pb` values
+as described above, even when the final served bidder is unconfirmed. The exported `trustedServerAuctionId`
 is the `hb_auction_id` value described in
 [Auction correlation token](#auction-correlation-token): minted fresh for each
 server-side auction, not derived from the Edge Cookie ID or any other visitor
@@ -441,11 +732,21 @@ identifier, and never repeated across auctions, so it cannot be joined back to a
 visitor. Diagnostics retain it only after trimming to a non-empty value of at most
 256 UTF-8 bytes.
 
-Captured records are memory-only. Diagnostics do not add an upload, diagnostics
+The exported `prebidAuction.auctionId` is supplied by Prebid for auction correlation,
+not visitor identity. Diagnostics does not generate or replace it and retains only
+non-empty values of at most 256 UTF-8 bytes. Bidder names are limited to 128 UTF-8
+bytes and numeric price bucket strings to 64 bytes. These bounds limit retained data;
+they do not establish how a publisher's Prebid configuration generated its auction ID.
+
+The GPT-only observation store remains memory-only. Its capture and `export()` do not add an upload, diagnostics
 network request, `localStorage`, `sessionStorage`, IndexedDB, or other persistence.
 `export()` creates only the user-requested local JSON download; it sends nothing to a
 server. The `__Host-ts-console` session cookie contains only the activation bit and is
 inaccessible to JavaScript.
+
+The explicit mobile handoff separately writes the bounded combined trace report
+to `sessionStorage`. Its stricter GPT projection excludes the exact pathname,
+GAM identifiers and `previousCreativeId`, as described under [Mobile Trace Page](#mobile-trace-page).
 
 ## Timing and Retention Bounds
 
@@ -463,8 +764,9 @@ inaccessible to JavaScript.
 - Retained attribution issues: 128.
 
 The least-recently-active slot is evicted when the slot bound is exceeded. An evicted
-GPT slot can re-enter retention only after a future `slotRequested`; request numbers
-remain monotonic. The oldest request cycle or issue is removed at its own bound.
+GPT slot can re-enter retention only after a future `slotRequested`; its `Ad #N` identity
+and request numbers remain stable and monotonic for the console lifetime. The oldest
+request cycle or issue is removed at its own bound.
 Export metadata reports `evictedSlots`, `evictedRequestCycles`, `droppedCallbacks`,
 and `droppedAttributionIssues`.
 

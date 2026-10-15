@@ -1,6 +1,8 @@
 use core::future::Future;
 use std::sync::Arc;
 
+use edgezero_adapter_axum::context::AxumRequestContext;
+use edgezero_adapter_axum::service::EdgeZeroAxumService;
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
@@ -37,7 +39,8 @@ use trusted_server_core::settings_data::{
     default_config_key, default_config_store_name, get_settings_from_config_store,
 };
 
-use trusted_server_core::platform::RuntimeServices;
+use trusted_server_core::platform::{ClientInfo, RuntimeServices};
+use trusted_server_core::trace::{TraceMetadata, TracePreDispatchHook};
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, SanitizeRequestMiddleware};
 use crate::platform::{AxumPlatformConfigStore, AxumPlatformSecretStore, build_runtime_services};
@@ -616,15 +619,7 @@ impl Hooks for TrustedServerApp {
     }
 
     fn routes() -> RouterService {
-        let state = match build_state() {
-            Ok(s) => s,
-            Err(ref e) => {
-                log::error!("failed to build application state: {:?}", e);
-                return startup_error_router(e);
-            }
-        };
-
-        build_router(&state)
+        Self::routes_with_server_timing_flag().0
     }
 }
 
@@ -669,12 +664,55 @@ impl TrustedServerApp {
         let state = build_state_with_services(settings, Some(services))?;
         Ok(build_router(&state))
     }
+
+    /// The dev server's fully configured tower service: the application
+    /// router wrapped in the terminal timing layer
+    /// ([`crate::timing::TimingService`]), with `server_timing_enabled`
+    /// read from the same settings snapshot that built the router.
+    ///
+    /// This is the standard construction path for serving this adapter.
+    /// [`Hooks::routes`] satisfies the `Hooks` trait contract and returns
+    /// the bare router without the timing layer; callers who serve traffic
+    /// should use this instead so `server_timing_enabled` is never
+    /// silently discarded.
+    #[must_use]
+    pub fn dev_server_service() -> crate::timing::TimingService<EdgeZeroAxumService> {
+        let (router, server_timing_enabled) = Self::routes_with_server_timing_flag();
+        crate::timing::TimingService::new(EdgeZeroAxumService::new(router), server_timing_enabled)
+    }
+
+    /// Build the router alongside whether `Server-Timing` emission is
+    /// enabled, read from the same settings snapshot used to build the
+    /// router.
+    ///
+    /// The Axum dev server's terminal timing layer ([`crate::timing`]) needs
+    /// this flag once at startup: unlike the Fastly adapter, which rebuilds
+    /// `Settings` per request, the Axum dev server builds its application
+    /// state once and reuses the same [`RouterService`] for every request.
+    #[must_use]
+    fn routes_with_server_timing_flag() -> (RouterService, bool) {
+        let state = match build_state() {
+            Ok(s) => s,
+            Err(ref e) => {
+                log::error!("failed to build application state: {:?}", e);
+                return (startup_error_router(e), false);
+            }
+        };
+
+        let server_timing_enabled = state.settings.observability.server_timing_enabled;
+        (build_router(&state), server_timing_enabled)
+    }
 }
 
 fn build_router(state: &Arc<AppState>) -> RouterService {
     let fallback = fallback_handler(Arc::clone(state));
+    let trace_state = Arc::clone(state);
 
     let mut router = RouterService::builder()
+        .pre_dispatch_hook(Arc::new(TracePreDispatchHook::new(
+            Arc::clone(&state.settings),
+            Arc::new(move |request| trace_metadata(&trace_state, request)),
+        )))
         // Outermost middleware: strips the configured trusted-client-IP
         // headers before anything else sees the request. Must stay first —
         // any middleware registered ahead of it would observe the
@@ -714,4 +752,135 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
     }
 
     router.build()
+}
+
+fn trace_metadata(state: &AppState, request: &Request) -> TraceMetadata {
+    if let Some(services) = &state.services {
+        let client_info = services.client_info().clone();
+        let geo = client_info.client_ip.and_then(|client_ip| {
+            services.geo().lookup(Some(client_ip)).unwrap_or_else(|_| {
+                log::warn!("trace_geo_unavailable");
+                None
+            })
+        });
+        return TraceMetadata { client_info, geo };
+    }
+    TraceMetadata {
+        client_info: ClientInfo {
+            client_ip: AxumRequestContext::get(request)
+                .and_then(|context| context.remote_addr)
+                .map(|peer| peer.ip()),
+            ..ClientInfo::default()
+        },
+        geo: None,
+    }
+}
+#[cfg(test)]
+mod trace_dispatch_tests {
+    use super::*;
+    use futures::executor::block_on;
+    use trusted_server_core::trace::TraceTerminalResponse;
+
+    fn router(enabled: bool) -> RouterService {
+        let settings = Settings::from_toml(&format!(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "example-user"
+            password = "example-password"
+            [publisher]
+            domain = "publisher.example.com"
+            cookie_domain = ".publisher.example.com"
+            origin_url = "https://origin.example.com"
+            proxy_secret = "fictional-proxy-secret"
+            [ec]
+            passphrase = "fictional-passphrase-at-least-32-bytes"
+            [request_signing]
+            enabled = false
+            config_store_id = "fictional-config"
+            secret_store_id = "fictional-secrets"
+            [integrations.gpt_diagnostics]
+            enabled = true
+            trace_page_enabled = {enabled}
+        "#
+        ))
+        .expect("should parse trace settings");
+        TrustedServerApp::routes_with_settings(settings).expect("should build adapter routes")
+    }
+
+    #[tokio::test]
+    async fn trace_dispatch_reserves_all_methods_before_ordinary_lifecycle() {
+        let router = router(true);
+        for (method, path, status) in [
+            (Method::GET, "/_ts/trace/state", StatusCode::OK),
+            (Method::HEAD, "/_ts/trace", StatusCode::OK),
+            (Method::GET, "/_ts/trace/assets/v1.js", StatusCode::OK),
+            (Method::POST, "/_ts/trace/enable", StatusCode::FORBIDDEN),
+            (
+                Method::PATCH,
+                "/_ts/trace/state",
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+            (
+                Method::from_bytes(b"EXAMPLE-METHOD").expect("should parse extension method"),
+                "/_ts/trace",
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+            (Method::GET, "/_ts/trace/extra", StatusCode::NOT_FOUND),
+            (Method::GET, "/%5Fts/trace", StatusCode::BAD_REQUEST),
+        ] {
+            let head = method == Method::HEAD;
+            let request = edgezero_core::http::request_builder()
+                .method(method)
+                .uri(format!("https://publisher.example.com{path}"))
+                .body(edgezero_core::body::Body::empty())
+                .expect("should build trace request");
+            let response =
+                block_on(router.oneshot(request)).expect("should return local trace policy");
+            assert_eq!(response.status(), status, "should bypass ordinary dispatch");
+            assert!(
+                response
+                    .extensions()
+                    .get::<TraceTerminalResponse>()
+                    .is_some(),
+                "should mark terminal trace responses"
+            );
+            assert!(
+                !response.headers().contains_key(header::SET_COOKIE),
+                "should never manufacture a mutation"
+            );
+            if head {
+                assert_eq!(
+                    response
+                        .into_body()
+                        .into_bytes()
+                        .expect("should buffer HEAD")
+                        .len(),
+                    0,
+                    "should remove HEAD bodies"
+                );
+            }
+        }
+        let response = block_on(
+            self::router(false).oneshot(
+                edgezero_core::http::request_builder()
+                    .uri("/_ts/trace/state")
+                    .body(edgezero_core::body::Body::empty())
+                    .expect("should build disabled request"),
+            ),
+        )
+        .expect("should reserve disabled namespace");
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "should hide disabled feature"
+        );
+        assert!(
+            response
+                .extensions()
+                .get::<TraceTerminalResponse>()
+                .is_some(),
+            "should harden disabled feature"
+        );
+    }
 }
