@@ -48,9 +48,9 @@ The writers, each of which now writes `Path={public.cookie_path()}`, are these.
 | Pull-sync marker and its expiry         | `format_marker_cookie` in `ec/pull_sync_marker.rs`                  |
 | Tester cookie and its clearing          | `format_tester_cookie`, `format_clear_tester_cookie`                |
 
-The Edge Cookie context builds its prefix with `for_request` when it reads the request, so every cookie the finalize step writes takes the request's path. The resolve endpoint writes its cookies under that same prefix, read from the context and no longer from the runtime services. The tester routes take the request's prefix from their caller.
+The Edge Cookie context builds its prefix with `for_request` when it reads the request, so every cookie the finalize step writes takes the request's path. The resolve endpoint writes its cookies under that same prefix, read from the context and no longer from the runtime services. The tester routes write under the prefix their caller passes them.
 
-**A removed prefix must be a cookie path.** A prefix is written into a `Set-Cookie` header, so `RequestAddress::new` now refuses a removed prefix that does not start with `/` or that holds anything but visible ASCII other than `;`. Such a request is refused as an invalid address, which the adapters answer `421 Misdirected Request`, before any settings are read. `under_path` applies the same check and keeps `/` for a prefix that fails it, with a warning, so a prefix built some other way cannot add an attribute to a cookie.
+**A removed prefix must be a cookie path.** A prefix is written into a `Set-Cookie` header, so `RequestAddress::new` now refuses a removed prefix that does not start with `/` or that holds anything but visible ASCII other than `;`. An empty prefix removes nothing and is still accepted, and its cookies are written under `/`. Such a request is refused as an invalid address, which the adapters answer `421 Misdirected Request`, before any settings are read. `under_path` applies the same check and keeps `/` for a prefix that fails it, with a warning, so a prefix built some other way cannot add an attribute to a cookie.
 
 **Reading the cookie a publisher's path holds.** A browser that holds two cookies of one name, one under `/` and one under `/publisher-a.example`, sends both on a request under `/publisher-a.example/`. RFC 6265 section 5.4 step 2 lists the one with the longer path first.
 
@@ -68,7 +68,7 @@ Consent cookies are written by the publisher's consent tool in the browser, not 
 
 | Adapter    | Where the request gets its prefix                                  | Change in the adapter                     |
 | ---------- | ------------------------------------------------------------------ | ----------------------------------------- |
-| Fastly     | The entry point inserts `RemovedPathPrefix` after asking the hook  | The tester routes pass the request prefix |
+| Fastly     | The entry point inserts `RemovedPathPrefix` after asking the hook  | None, see section 3 for the tester routes |
 | Axum       | `addressed_router` in core                                          | None                                      |
 | Cloudflare | `addressed_router` in core                                          | None                                      |
 | Spin       | `addressed_router` in core                                          | None                                      |
@@ -83,17 +83,18 @@ Consent cookies are written by the publisher's consent tool in the browser, not 
 
 **Tests.** In `crates/trusted-server-core`:
 
-- `prefix.rs`: a prefix with no path gives `/`, `for_request` takes the removed prefix, and a prefix holding `;` or not starting with `/` keeps `/`.
+- `prefix.rs`: a prefix with no path or an empty one gives `/`, `for_request` takes the removed prefix, and a prefix holding `;`, a space or non-ASCII, or not starting with `/`, keeps `/`.
 - `ec/cookies.rs`: the Edge Cookie, its expiry and the resolved marker carry `Path=/publisher-a.example` under that prefix, and `Path=/` without it.
 - `ec/pull_sync_marker.rs` and `tester_cookie.rs`: the marker and the tester cookie carry the prefix path.
 - `cookies.rs`: on an addressed request the first of two pairs of one name is read, and with no prefix the last is read, as today.
 - `evidence.rs`: `RequestInfo::cookie` returns the first of two consent cookies of one name.
-- `addressing.rs`: `RequestAddress::new` refuses a removed prefix holding `;` or not starting with `/`.
+- `addressing.rs`: `RequestAddress::new` accepts an empty prefix or a cookie path, and refuses a removed prefix holding `;`, a space or non-ASCII, or not starting with `/`.
 
 ## 3. What is not in this change
 
 - **Cookies under `/`.** A cookie written under `/`, by an origin, by a tool not configured for the publisher's path, or by core before this change, is sent under every publisher's path and forwarded to every origin on the host. Core cannot tell which publisher wrote it. A deployment that needs an origin's cookies kept apart rewrites their `Path` with a middleware of its own, as it puts the prefix into links.
 - **The client script's endpoints and cookies.** The script calls root-relative endpoints, `/auction` in `crates/trusted-server-js/lib/src/core/request.ts`, `/_ts/api/v1/ec/resolve` in `integrations/ec_client_fixed`, `/_ts/page-bids` in `integrations/gpt`, and the auction endpoint default in `integrations/prebid`. Several integrations also write cookies with `Path=/` from the page, in `integrations/prebid`, `integrations/osano` and `integrations/sourcepoint`. On a host addressed by path these requests are addressed by host and those cookies are shared. The fix is for the server to tell the script the removed prefix in the page, as it tells it the public prefix with `data-ts-public-prefix`, and for the script to put the prefix before each endpoint and use it as each cookie's path. That change touches the script's core and four integrations and is left for a change of its own.
+- **The tester cookie on Fastly.** The Fastly adapter passes the runtime services' prefix to the tester routes, so on an addressed request the tester cookie is still written under `/`. Passing `services.public_prefix().for_request(&req)` there is a one-line change in the adapter, left out because this change builds and tests core alone.
 - **Expiring root cookies left from before.** Core expires a cookie under the path of the request it answers, so a root cookie written before this change stays until its `Max-Age` ends.
 - **Partitioning other first-party storage.** Local storage and other storage the page script keeps belong to the host, not the path.
 
