@@ -8,9 +8,6 @@ use error_stack::Report;
 use http::{Method, Request, Response};
 use matchit::Router;
 
-#[cfg(test)]
-use super::IntegrationHtmlFinalizerFactory;
-
 use crate::auction::AuctionPlan;
 use crate::constants::HEADER_X_TS_EC;
 use crate::ec::EcContext;
@@ -1166,23 +1163,6 @@ impl IntegrationRegistry {
             }
         }
         Ok(())
-    }
-
-    /// Construct an isolated processor registry for regression tests.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn from_html_finalizers(
-        factories: Vec<Arc<dyn IntegrationHtmlFinalizerFactory>>,
-    ) -> Self {
-        Self::from_html_stream_processors(
-            factories
-                .into_iter()
-                .map(|factory| {
-                    Arc::new(super::html_finalization::TestFinishFactory(factory))
-                        as Arc<dyn IntegrationHtmlStreamProcessorFactory>
-                })
-                .collect(),
-        )
     }
 
     /// Construct an isolated ordered processor registry for fixture controls.

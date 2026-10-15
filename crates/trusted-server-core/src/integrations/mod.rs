@@ -18,8 +18,6 @@ pub mod didomi;
 pub mod google_tag_manager;
 pub mod gpt;
 pub mod gpt_diagnostics;
-#[cfg(test)]
-mod html_finalization;
 pub mod js_asset_proxy;
 pub mod lockr;
 pub mod nextjs;
@@ -29,12 +27,6 @@ pub mod prebid;
 mod registry;
 pub mod sourcepoint;
 pub mod testlight;
-
-#[cfg(test)]
-pub(crate) use html_finalization::{
-    HtmlFinalization, HtmlFinalizationError, HtmlFinalizationInput, IntegrationHtmlFinalizer,
-    IntegrationHtmlFinalizerFactory,
-};
 
 pub use registry::{
     AttributeRewriteAction, AttributeRewriteOutcome, HeaderMutation, HeaderMutationMode,

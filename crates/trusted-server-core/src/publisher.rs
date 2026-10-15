@@ -18,8 +18,9 @@
 //! into any [`Write`] (a `Vec<u8>` for buffered routes, a streaming writer for
 //! the streaming route). It is not a content-rewriting concern.
 
-use std::borrow::Cow;
 mod html_finalization;
+
+use std::borrow::Cow;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10893,7 +10894,7 @@ mod tests {
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
             let services = services(Arc::clone(&stub), cache);
-            let registry = IntegrationRegistry::from_html_finalizers(vec![Arc::new(
+            let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
                 super::TerminalTestFactory,
             )]);
             let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
@@ -10985,9 +10986,10 @@ mod tests {
                         Arc::clone(&sink),
                     );
                     let calls = Arc::new(AtomicUsize::new(0));
-                    let registry = IntegrationRegistry::from_html_finalizers(vec![Arc::new(
-                        super::CountingTerminalFactory(Arc::clone(&calls)),
-                    )]);
+                    let registry =
+                        IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
+                            super::CountingTerminalFactory(Arc::clone(&calls)),
+                        )]);
                     let mut orchestrator = AuctionOrchestrator::new(settings.auction.clone());
                     orchestrator.register_provider(Arc::new(WinningBidProvider {
                         price: STUB_BID_CPM,
@@ -11176,7 +11178,7 @@ mod tests {
                 .client_info(ClientInfo::default())
                 .template_cache(template_cache.clone())
                 .build();
-            let registry = IntegrationRegistry::from_html_finalizers(vec![Arc::new(
+            let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
                 super::TerminalTestFactory,
             )]);
             let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
@@ -11277,7 +11279,7 @@ mod tests {
                 .expect("should lock stored keys")
                 .len();
             assert!(stores_before > 0, "should seed a warm shared template");
-            let registry = IntegrationRegistry::from_html_finalizers(vec![Arc::new(
+            let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
                 super::TerminalTestFactory,
             )]);
             let orchestrator = Arc::new(AuctionOrchestrator::new(settings.auction.clone()));
@@ -21669,7 +21671,7 @@ mod tests {
     fn html_finalization_applies_privacy_and_full_body_policy_without_an_auction() {
         let settings = crate::publisher::allow_eof_test_settings(create_test_settings());
         let registry =
-            IntegrationRegistry::from_html_finalizers(vec![Arc::new(TerminalTestFactory)]);
+            IntegrationRegistry::from_html_stream_processors(vec![Arc::new(TerminalTestFactory)]);
         let http = Arc::new(StubHttpClient::new());
         http.push_response_with_headers(
             404,
@@ -21748,33 +21750,47 @@ mod tests {
     struct CountingTerminalFactory(Arc<AtomicUsize>);
     struct CountingTerminalSession(Arc<AtomicUsize>);
 
-    impl crate::integrations::IntegrationHtmlFinalizerFactory for CountingTerminalFactory {
+    impl crate::integrations::IntegrationHtmlStreamProcessorFactory for CountingTerminalFactory {
         fn integration_id(&self) -> &'static str {
             "example_counter"
+        }
+        fn requires_async_finish(&self) -> bool {
+            true
+        }
+        fn buffer_output_until_eof(&self) -> bool {
+            true
         }
         fn create(
             &self,
             _: crate::integrations::IntegrationHtmlStreamContext,
-        ) -> Box<dyn crate::integrations::IntegrationHtmlFinalizer> {
+        ) -> Box<dyn StreamProcessor> {
             Box::new(CountingTerminalSession(Arc::clone(&self.0)))
         }
     }
-    impl crate::integrations::IntegrationHtmlFinalizer for CountingTerminalSession {
-        fn finalize<'a>(
+    impl StreamProcessor for CountingTerminalSession {
+        fn process_chunk(&mut self, chunk: &[u8], _: bool) -> std::io::Result<Vec<u8>> {
+            Ok(chunk.to_vec())
+        }
+        fn requires_async_finish(&self) -> bool {
+            true
+        }
+        fn async_finish<'a>(
             &'a mut self,
-            input: crate::integrations::HtmlFinalizationInput<'a>,
-        ) -> futures::future::LocalBoxFuture<
-            'a,
-            Result<
-                crate::integrations::HtmlFinalization,
-                Report<crate::integrations::HtmlFinalizationError>,
+            input: crate::streaming_processor::finish::StreamFinishInput<'a>,
+        ) -> Option<
+            futures::future::LocalBoxFuture<
+                'a,
+                Result<
+                    crate::streaming_processor::finish::StreamFinish,
+                    Report<crate::streaming_processor::finish::StreamFinishError>,
+                >,
             >,
         > {
-            Box::pin(async move {
+            Some(Box::pin(async move {
                 self.0.fetch_add(1, Ordering::SeqCst);
                 input.replacement.append(b"discarded candidate")?;
-                Ok(crate::integrations::HtmlFinalization::Unchanged)
-            })
+                Ok(crate::streaming_processor::finish::StreamFinish::Unchanged)
+            }))
         }
     }
 
@@ -21790,7 +21806,7 @@ mod tests {
                             ));
                             let calls = Arc::new(AtomicUsize::new(0));
                             let registry =
-                                IntegrationRegistry::from_html_finalizers(vec![Arc::new(
+                                IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
                                     CountingTerminalFactory(Arc::clone(&calls)),
                                 )]);
                             let raw = b"<p>Example range fragment</p>";
@@ -21926,7 +21942,7 @@ mod tests {
                     create_test_settings(),
                 ));
                 let calls = Arc::new(AtomicUsize::new(0));
-                let registry = IntegrationRegistry::from_html_finalizers(vec![Arc::new(
+                let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
                     CountingTerminalFactory(Arc::clone(&calls)),
                 )]);
                 let http = Arc::new(StubHttpClient::new());
@@ -21997,7 +22013,7 @@ mod tests {
         for streamed in [false, true] {
             let settings = crate::publisher::allow_eof_test_settings(create_test_settings());
             let calls = Arc::new(AtomicUsize::new(0));
-            let registry = IntegrationRegistry::from_html_finalizers(vec![Arc::new(
+            let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
                 CountingTerminalFactory(Arc::clone(&calls)),
             )]);
             let encoded = gzip_encode(b"<p>Example partial response</p>");
@@ -22068,7 +22084,7 @@ mod tests {
         }
         let settings = crate::publisher::allow_eof_test_settings(create_test_settings());
         let calls = Arc::new(AtomicUsize::new(0));
-        let registry = IntegrationRegistry::from_html_finalizers(vec![Arc::new(
+        let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
             CountingTerminalFactory(Arc::clone(&calls)),
         )]);
         let mut source = b"<html><head></head><body><p>".to_vec();
@@ -22163,7 +22179,7 @@ mod tests {
                 panic!("should dispatch a controlled pending auction");
             };
             let calls = Arc::new(AtomicUsize::new(0));
-            let registry = IntegrationRegistry::from_html_finalizers(vec![Arc::new(
+            let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
                 CountingTerminalFactory(Arc::clone(&calls)),
             )]);
             let mut source = b"<html><head></head><body>".to_vec();
@@ -22235,37 +22251,51 @@ mod tests {
     struct StatusTerminalFactory(Arc<Mutex<Vec<StatusCode>>>);
     struct StatusTerminalSession(Arc<Mutex<Vec<StatusCode>>>);
 
-    impl crate::integrations::IntegrationHtmlFinalizerFactory for StatusTerminalFactory {
+    impl crate::integrations::IntegrationHtmlStreamProcessorFactory for StatusTerminalFactory {
         fn integration_id(&self) -> &'static str {
             "example_status"
+        }
+        fn requires_async_finish(&self) -> bool {
+            true
+        }
+        fn buffer_output_until_eof(&self) -> bool {
+            true
         }
 
         fn create(
             &self,
             _: crate::integrations::IntegrationHtmlStreamContext,
-        ) -> Box<dyn crate::integrations::IntegrationHtmlFinalizer> {
+        ) -> Box<dyn StreamProcessor> {
             Box::new(StatusTerminalSession(Arc::clone(&self.0)))
         }
     }
 
-    impl crate::integrations::IntegrationHtmlFinalizer for StatusTerminalSession {
-        fn finalize<'a>(
+    impl StreamProcessor for StatusTerminalSession {
+        fn process_chunk(&mut self, chunk: &[u8], _: bool) -> std::io::Result<Vec<u8>> {
+            Ok(chunk.to_vec())
+        }
+        fn requires_async_finish(&self) -> bool {
+            true
+        }
+        fn async_finish<'a>(
             &'a mut self,
-            input: crate::integrations::HtmlFinalizationInput<'a>,
-        ) -> futures::future::LocalBoxFuture<
-            'a,
-            Result<
-                crate::integrations::HtmlFinalization,
-                Report<crate::integrations::HtmlFinalizationError>,
+            input: crate::streaming_processor::finish::StreamFinishInput<'a>,
+        ) -> Option<
+            futures::future::LocalBoxFuture<
+                'a,
+                Result<
+                    crate::streaming_processor::finish::StreamFinish,
+                    Report<crate::streaming_processor::finish::StreamFinishError>,
+                >,
             >,
         > {
-            Box::pin(async move {
+            Some(Box::pin(async move {
                 self.0
                     .lock()
                     .expect("should record the response status")
                     .push(input.response_status);
-                Ok(crate::integrations::HtmlFinalization::Unchanged)
-            })
+                Ok(crate::streaming_processor::finish::StreamFinish::Unchanged)
+            }))
         }
     }
 
@@ -22273,7 +22303,7 @@ mod tests {
     fn html_finalization_exposes_actual_success_and_error_status_on_both_sinks() {
         for buffered in [false, true] {
             let statuses = Arc::new(Mutex::new(Vec::new()));
-            let registry = IntegrationRegistry::from_html_finalizers(vec![Arc::new(
+            let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
                 StatusTerminalFactory(Arc::clone(&statuses)),
             )]);
             for status in [200, 404, 500] {
@@ -22366,7 +22396,7 @@ mod tests {
                 create_test_settings(),
             ));
             let calls = Arc::new(AtomicUsize::new(0));
-            let registry = IntegrationRegistry::from_html_finalizers(vec![Arc::new(
+            let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
                 CountingTerminalFactory(Arc::clone(&calls)),
             )]);
             let http = Arc::new(StubHttpClient::new());
@@ -22432,7 +22462,7 @@ mod tests {
         settings.publisher.max_buffered_body_bytes = 128;
         let settings = Arc::new(settings);
         let calls = Arc::new(AtomicUsize::new(0));
-        let registry = IntegrationRegistry::from_html_finalizers(vec![Arc::new(
+        let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
             CountingTerminalFactory(Arc::clone(&calls)),
         )]);
         let source = b"<html><head></head><body>Example</body></html>";
@@ -22527,7 +22557,7 @@ mod tests {
                     create_test_settings(),
                 ));
                 let calls = Arc::new(AtomicUsize::new(0));
-                let registry = IntegrationRegistry::from_html_finalizers(vec![Arc::new(
+                let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
                     CountingTerminalFactory(Arc::clone(&calls)),
                 )]);
                 let body = if streamed {
@@ -22609,37 +22639,51 @@ mod tests {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
     }
-    impl crate::integrations::IntegrationHtmlFinalizerFactory for HungTerminalFactory {
+    impl crate::integrations::IntegrationHtmlStreamProcessorFactory for HungTerminalFactory {
         fn integration_id(&self) -> &'static str {
             "example_hung"
+        }
+        fn requires_async_finish(&self) -> bool {
+            true
+        }
+        fn buffer_output_until_eof(&self) -> bool {
+            true
         }
         fn create(
             &self,
             _: crate::integrations::IntegrationHtmlStreamContext,
-        ) -> Box<dyn crate::integrations::IntegrationHtmlFinalizer> {
+        ) -> Box<dyn StreamProcessor> {
             Box::new(HungTerminalSession {
                 started: Arc::clone(&self.started),
                 dropped: Arc::clone(&self.dropped),
             })
         }
     }
-    impl crate::integrations::IntegrationHtmlFinalizer for HungTerminalSession {
-        fn finalize<'a>(
+    impl StreamProcessor for HungTerminalSession {
+        fn process_chunk(&mut self, chunk: &[u8], _: bool) -> std::io::Result<Vec<u8>> {
+            Ok(chunk.to_vec())
+        }
+        fn requires_async_finish(&self) -> bool {
+            true
+        }
+        fn async_finish<'a>(
             &'a mut self,
-            input: crate::integrations::HtmlFinalizationInput<'a>,
-        ) -> futures::future::LocalBoxFuture<
-            'a,
-            Result<
-                crate::integrations::HtmlFinalization,
-                Report<crate::integrations::HtmlFinalizationError>,
+            input: crate::streaming_processor::finish::StreamFinishInput<'a>,
+        ) -> Option<
+            futures::future::LocalBoxFuture<
+                'a,
+                Result<
+                    crate::streaming_processor::finish::StreamFinish,
+                    Report<crate::streaming_processor::finish::StreamFinishError>,
+                >,
             >,
         > {
-            Box::pin(async move {
+            Some(Box::pin(async move {
                 self.started.fetch_add(1, Ordering::SeqCst);
                 let _probe = TerminalDropProbe(Arc::clone(&self.dropped));
                 input.replacement.append(b"partial example candidate")?;
                 futures::future::pending().await
-            })
+            }))
         }
     }
 
@@ -22655,7 +22699,7 @@ mod tests {
         let started = Arc::new(AtomicUsize::new(0));
         let dropped = Arc::new(AtomicUsize::new(0));
         let registry =
-            IntegrationRegistry::from_html_finalizers(vec![Arc::new(HungTerminalFactory {
+            IntegrationRegistry::from_html_stream_processors(vec![Arc::new(HungTerminalFactory {
                 started: Arc::clone(&started),
                 dropped: Arc::clone(&dropped),
             })]);
@@ -22747,7 +22791,7 @@ mod tests {
         for failure in ["read", "decode", "write", "flush"] {
             let settings = crate::publisher::allow_eof_test_settings(create_test_settings());
             let calls = Arc::new(AtomicUsize::new(0));
-            let registry = IntegrationRegistry::from_html_finalizers(vec![Arc::new(
+            let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
                 CountingTerminalFactory(Arc::clone(&calls)),
             )]);
             let sink = Arc::new(RecordingTelemetrySink::default());
@@ -22905,30 +22949,44 @@ mod tests {
 
     struct TerminalTestSession;
 
-    impl crate::integrations::IntegrationHtmlFinalizerFactory for TerminalTestFactory {
+    impl crate::integrations::IntegrationHtmlStreamProcessorFactory for TerminalTestFactory {
         fn integration_id(&self) -> &'static str {
             "example_terminal"
+        }
+        fn requires_async_finish(&self) -> bool {
+            true
+        }
+        fn buffer_output_until_eof(&self) -> bool {
+            true
         }
         fn create(
             &self,
             _context: crate::integrations::IntegrationHtmlStreamContext,
-        ) -> Box<dyn crate::integrations::IntegrationHtmlFinalizer> {
+        ) -> Box<dyn StreamProcessor> {
             Box::new(TerminalTestSession)
         }
     }
 
-    impl crate::integrations::IntegrationHtmlFinalizer for TerminalTestSession {
-        fn finalize<'a>(
+    impl StreamProcessor for TerminalTestSession {
+        fn process_chunk(&mut self, chunk: &[u8], _: bool) -> std::io::Result<Vec<u8>> {
+            Ok(chunk.to_vec())
+        }
+        fn requires_async_finish(&self) -> bool {
+            true
+        }
+        fn async_finish<'a>(
             &'a mut self,
-            input: crate::integrations::HtmlFinalizationInput<'a>,
-        ) -> futures::future::LocalBoxFuture<
-            'a,
-            Result<
-                crate::integrations::HtmlFinalization,
-                Report<crate::integrations::HtmlFinalizationError>,
+            input: crate::streaming_processor::finish::StreamFinishInput<'a>,
+        ) -> Option<
+            futures::future::LocalBoxFuture<
+                'a,
+                Result<
+                    crate::streaming_processor::finish::StreamFinish,
+                    Report<crate::streaming_processor::finish::StreamFinishError>,
+                >,
             >,
         > {
-            Box::pin(async move {
+            Some(Box::pin(async move {
                 let mut yielded = false;
                 futures::future::poll_fn(|context| {
                     if yielded {
@@ -22940,10 +22998,10 @@ mod tests {
                     }
                 })
                 .await;
-                input.replacement.append(input.html)?;
+                input.replacement.append(input.output)?;
                 input.replacement.append(b"<!--example-finalized-->")?;
-                Ok(crate::integrations::HtmlFinalization::Replace)
-            })
+                Ok(crate::streaming_processor::finish::StreamFinish::Replace)
+            }))
         }
     }
 
@@ -22974,7 +23032,7 @@ mod tests {
                                 create_test_settings(),
                             ));
                             let registry =
-                                IntegrationRegistry::from_html_finalizers(vec![Arc::new(
+                                IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
                                     TerminalTestFactory,
                                 )]);
                             let orchestrator =
