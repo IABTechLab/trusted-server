@@ -280,6 +280,19 @@ fn registered_integrations() -> &'static [IntegrationBuilder] {
     REGISTERED_INTEGRATIONS.get().map_or(&[], Vec::as_slice)
 }
 
+/// The second header Compute reads a shared cache policy from, beside
+/// `Surrogate-Control`.
+pub const FASTLY_SURROGATE_CONTROL_HEADER: &str = "fastly-surrogate-control";
+
+/// The headers beyond the two core reads for every platform that carry a
+/// shared cache policy, Compute's own and Cloudflare's. Core strips each from
+/// every response it makes private, so a policy in either cannot let a shared
+/// cache in front of the service keep a personalized response.
+const SHARED_CACHE_HEADERS: &[&str] = &[
+    FASTLY_SURROGATE_CONTROL_HEADER,
+    "cloudflare-cdn-cache-control",
+];
+
 /// Build the application state from explicit settings, composing the modules
 /// this adapter links with the externally supplied builders in
 /// `integrations`.
@@ -296,18 +309,11 @@ fn registered_integrations() -> &'static [IntegrationBuilder] {
 /// adapter, or when the auction orchestrator or the integration registry fail
 /// to initialize, which includes two builders claiming the same integration
 /// id.
-/// The second header Compute reads a shared cache policy from, beside
-/// `Surrogate-Control`, which core strips from every response it makes
-/// private.
-pub const FASTLY_SURROGATE_CONTROL_HEADER: &str = "fastly-surrogate-control";
-
 pub(crate) fn build_state_with_registrations(
     settings: Settings,
     integrations: &[IntegrationBuilder],
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    trusted_server_core::platform::declare_platform_cache_headers(&[
-        FASTLY_SURROGATE_CONTROL_HEADER,
-    ]);
+    trusted_server_core::platform::declare_platform_cache_headers(SHARED_CACHE_HEADERS);
     warn_if_certificate_check_disabled(&settings);
 
     // The modules this adapter links come first and the deployment's own
@@ -1902,6 +1908,27 @@ mod tests {
             "ts.test-publisher.com"
         );
         assert_eq!(services.public_prefix().as_str(), "ts");
+    }
+
+    /// Once the state is built, a response core makes private loses the
+    /// shared cache headers of both platforms, not only the two core reads.
+    #[test]
+    fn a_private_response_loses_both_platforms_cache_headers() {
+        build_state_from_settings(test_settings()).expect("should build test state");
+        let mut response = edgezero_core::http::response_builder()
+            .header("fastly-surrogate-control", "max-age=600")
+            .header("cloudflare-cdn-cache-control", "max-age=600")
+            .body(Body::empty())
+            .expect("should build the response");
+
+        trusted_server_core::response_privacy::enforce_private_no_store(&mut response);
+
+        for name in ["fastly-surrogate-control", "cloudflare-cdn-cache-control"] {
+            assert!(
+                !response.headers().contains_key(name),
+                "should strip {name} from a response core makes private"
+            );
+        }
     }
 
     #[test]
