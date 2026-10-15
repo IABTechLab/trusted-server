@@ -1,28 +1,37 @@
 # Design Spec: Integration Response-Header Hook
 
-**Status:** Not implemented in the series. PR #1047 carries the
-documentation set only. The hook was removed from the earlier draft of that
-PR because it has no consumer, which is this spec's own §-rule for
-speculative surface. The spec is retained as the design bar for the hook
-when its first consumer arrives (an integration that must set response
-headers such as Accept-CH or detection results). Revised 2026-08-25, and
-on 2026-10-06 for the module wording.
+**Status:** Design only, and none of it is built at
+`split/5-response-hook-docs` (§1a). The pull request that carried the
+documentation set
+([#1047](https://github.com/IABTechLab/trusted-server/pull/1047)) was closed
+without merging on 2026-10-15, and draft pull request
+[#1347](https://github.com/IABTechLab/trusted-server/pull/1347) carries the
+same set at the same commit. This spec is held with every other design
+document of the stack in
+[#1342](https://github.com/IABTechLab/trusted-server/pull/1342). The hook was
+removed from the earlier draft of the documentation set because it has no
+consumer, which is this spec's own §-rule for speculative surface. The spec is
+retained as the design bar for the hook when its first consumer arrives (an
+integration that must set response headers such as Accept-CH or detection
+results). Revised 2026-08-25, on 2026-10-06 for the module wording, and on
+2026-10-15 after its round 1 review (Review log).
 **Author:** Engineering
 **Issue references:** #782
-**Related specs:** `2026-07-30-pluggable-providers-design.md` and the
-baseline DataDome design
-`2026-06-11-datadome-server-side-protection-design.md`
-**Last updated:** 2026-10-06
+**Related specs:** `2026-07-30-pluggable-providers-design.md`,
+`2026-07-30-permission-model-design.md`,
+`2026-07-30-provider-migration-rollout-design.md` and the baseline DataDome
+design `2026-06-11-datadome-server-side-protection-design.md`
+**Last updated:** 2026-10-15
 
 > **Context.** Issue #782 already specifies this feature well; its done-when
 > is the contract. PR #838 shipped the trait and registry wiring with **no
 > adapter call site**. `apply_response_headers` had zero production
-> callers, so the feature existed only in its own unit test. This short spec
+> callers, so the feature existed only in its own unit test. This spec
 > restates the contract plus the two details the issue left open (ordering
 > and collision policy), and adds the rule that prevents a repeat, which is
-> that the hook lands with a consumer or not at all. The implemented series
-> (PRs #1043-#1047) applied that rule to this spec itself, see the Status
-> above and §7.
+> that the hook lands with a consumer or not at all. The series (PRs
+> #1043-#1047, closed on 2026-10-15 and carried now by drafts #1343-#1347)
+> applied that rule to this spec itself, see the Status above and §7.
 
 ---
 
@@ -45,7 +54,154 @@ via its `IntegrationRegistration` builder, and every adapter applies all
 registered mutators to the outbound response for HTML document responses it
 processed.
 
+## 1a. What the code does today
+
+This section states the code at `split/5-response-hook-docs` (commit
+`61b1399c6`). A path that does not start with `crates/` is under
+`crates/trusted-server-core/src/`. Sections 2 to 4a are a design, and none of
+that design is built. A search of the code and the guides at that commit finds
+none of the names below, and the same search at
+`split/7-integration-seam-impl`, `split/31-caching-release` and
+`split/50-cookies-by-path` (the tip of the stack) finds none either. The names
+are `IntegrationResponseMutator`, `with_response_mutator`,
+`behavior_revision`, `HOOK_INVARIANT_REVISION`, the seven fields of the cache
+revision tuple in §3, `SecurityUse`, `DataDomeSecurityRequestFilter`,
+`RedactedRequestView`, `PartnerEgress` and `vary_digest_key_secret_name`.
+
+**Not built, and what each part waits for.**
+
+- **The hook and its apply point (§2).** A registration has no response
+  mutator and no revision number, and no adapter has an apply point.
+- **The cache revision tuple (§2, §3 and §3a).** Four of its seven fields
+  (`active_policy_digest`, `active_policy_ordinal`, `model_epoch` and
+  `activation_generation`) come from the permission model's policy
+  activation. Section 5.5 of `2026-07-30-permission-model-design.md` is headed
+  "Policy revision activation (deferred)" and begins "Not implemented", the
+  record in its section 11 says "None of it exists", and row 19 of §8 of
+  `2026-07-30-provider-migration-rollout-design.md` says "Not implemented".
+  Each build embeds `permissions.yaml`, so the deployed build is the policy.
+  The other three fields (`integration_registry_revision`,
+  `effective_config_revision` and `hook_invariant_revision`) have no code
+  either. The `pre_epic_v1` test in §4 item 8, the serve fence in §4a and the
+  effective-config digest in §4a.3 depend on the same activation.
+- **The keyed digest of `Vary` request values (§2).** The setting
+  `[cache] vary_digest_key_secret_name` does not exist. `CacheSettings` in
+  `settings.rs` holds `asset_rules` only and refuses an unknown key, and no
+  setting turns on the "response caching" that makes the key mandatory.
+- **The redacted request view and the egress type (§3 and §4a).**
+  `2026-07-30-pluggable-providers-design.md` lists `AuthorizedIdentity<Scope>`
+  and `RedactedRequestView` among draft positions and says "None of that is
+  implemented in these PRs". No spec defines `PartnerEgress` or lists what the
+  view strips.
+- **The security channel (§4a).** At this commit DataDome is core code, in
+  `integrations/datadome.rs` and the `integrations/datadome/` directory, and
+  its table is `[integrations.datadome]`. From `split/7-integration-seam-impl`
+  on, DataDome is the crate `crates/bot-protection/datadome` and its table is
+  `[bot-protection.datadome]`. None of the settings that §4a.3 adds exists in
+  the tree at either branch or at the tip of the stack.
+
+**What exists.**
+
+- **Three response-header steps.** Only the operator's `[response_headers]`
+  step is shared by every adapter.
+  - The Edge Cookie module's headers. `ec_finalize_response` (`ec/finalize.rs`)
+    appends them first, through `apply_module_response_headers` in
+    `ec/module.rs`. `reserved_response_effect` refuses the `x-ts-` prefix,
+    a `Set-Cookie` whose name starts with `ts-`, and the headers in
+    `FRAMING_OR_HOP_BY_HOP_HEADERS`, which are `cache-control`, `connection`,
+    `content-length`, `keep-alive`, `proxy-authenticate`,
+    `proxy-authorization`, `te`, `trailer`, `transfer-encoding` and `upgrade`.
+    A refused header makes the module's generation fail, and the response is
+    served without an Edge Cookie.
+  - The operator's `[response_headers]`.
+    `apply_response_headers_with_cache_privacy` (`response_privacy.rs`)
+    applies them, and each adapter's own `apply_finalize_headers`, in
+    `crates/trusted-server-adapter-<name>/src/middleware.rs`, calls that
+    function. The function receives the settings and the response only. It
+    runs the cookie rule, applies the operator's headers (skipping
+    `Cache-Control` and the edge cache fields once the response forbids shared
+    storage), and runs the cookie rule again.
+  - The request filters' response effects. `RequestFilterEffects`
+    (`integrations/registry.rs`) carries `response_headers`, a flat list of set
+    and append operations, and DataDome returns its response headers this way.
+    Only the Fastly adapter runs request filters (`run_pre_route_filters` in
+    `crates/trusted-server-adapter-fastly/src/app.rs`), and it applies the
+    effects in `apply_terminal_response_effects` (`main.rs` of that crate).
+    `apply_header_mutation_to_response` skips a single header named in
+    `is_forbidden_filter_header` (hop-by-hop and framing headers, `host` and
+    the `x-ts-` prefix) and applies everything else, `Set-Cookie` and
+    `Cache-Control` included.
+- **The order on each adapter.** On Fastly the order is `apply_finalize_headers`
+  (geo and version headers, then the shared function with the operator's
+  headers), the asset cache policy where one applies, `ec_finalize_response`
+  and then `apply_terminal_response_effects`. That last function applies the
+  request filter effects, calls `enforce_private_no_store` when the response
+  carries the `TerminalPrivateResponse` marker, and runs the cookie rule and
+  the uncacheable rule once more. Axum, Cloudflare and Spin call neither
+  `filter_request` nor `ec_finalize_response`, so on them
+  `apply_finalize_headers` is the only response-header step.
+- **The marker.** `enforce_terminal_private_cache_privacy` sets
+  `TerminalPrivateResponse` (`response_privacy.rs`) on a response whose
+  `no-store, private` policy belongs to Trusted Server, and only the Fastly
+  adapter reads the marker. A response without the marker is not restored, so
+  a late effect that replaces its `Cache-Control` stands unless the response
+  also carries `Set-Cookie`.
+- **The cookie rule.** `enforce_set_cookie_cache_privacy` does nothing on a
+  response without `Set-Cookie`. On a response with one it removes the edge
+  cache fields and writes `private, max-age=0`. It leaves a `Cache-Control`
+  that already forbids shared storage as it is, except for the
+  `private, max-age=60` policy that the code generates for inactive ad
+  templates, which it replaces.
+- **Processed HTML.** `publisher.rs` calls
+  `enforce_synthesized_html_cache_privacy`, which sets `no-store, private` and
+  drops the validators, `Expires`, `Age` and the edge cache fields, on an HTML
+  response or a `304` when the ad stack runs or the response was authorized for
+  the template cache, whatever cookies the response carries. It makes the same
+  call for HTML where the DataDome client tag was suppressed. That rule does
+  not apply to other processed HTML, which keeps the origin's policy unless
+  another rule in `publisher.rs` changes it, such as the browser cap on
+  structurally inactive ad templates.
+- **Edge cache fields.** `EDGE_CACHE_HEADER_NAMES` (`cache_policy.rs`) holds
+  `surrogate-control`, `fastly-surrogate-control`, `cdn-cache-control` and
+  `cloudflare-cdn-cache-control`. `remove_edge_cache_headers` and
+  `is_edge_cache_header_name` read it. The code has no `edge-control`.
+- **Integration ids.** The registry can hold fourteen ids, being `aps`,
+  `prebid`, `js_asset_proxy`, `testlight`, `nextjs`, `permutive`, `lockr`,
+  `didomi`, `sourcepoint`, `osano`, `google_tag_manager`, `datadome`, `gpt` and
+  `gpt_diagnostics`. Three of them hold an underscore, so
+  `[a-z0-9][a-z0-9-]{0,63}` refuses `google_tag_manager`, `js_asset_proxy` and
+  `gpt_diagnostics`. `IntegrationRegistry::with_plan` checks no id for a
+  duplicate. That function has a `debug_assert_eq!` that a builder's id equals
+  its registration's id, which runs in debug builds only, and
+  `registered_integrations` merges entries that share an id.
+- **Caches.** The module comment of `platform/template_cache.rs` names three
+  caches, being the origin readthrough cache, the template cache and an
+  assembled response, which "must never exist". The template cache keeps the
+  page after the HTML rewrite and before the per-reader assembly, is used only
+  when a deployment opts into a shared-template assembly mode, and is
+  configured in `[creative_opportunities]` (`assembly_mode`,
+  `template_cache_vary` and the keys beside them).
+  `TemplateCacheKey::to_cache_key` hashes the schema version, assembly mode,
+  scheme, host, path, origin identity, URL, `template_fingerprint`, the request
+  values of the headers in the configured `Vary` list (each value
+  length-prefixed, with absent kept apart from present) and the configured
+  cookie values. Storage is refused when the origin's `Vary` names a header
+  that list does not cover. A hit builds its headers again in
+  `build_cached_template_response`, replays only the origin headers in
+  `REPLAYABLE_POLICY_HEADERS`, and stamps `no-store, private`.
+- **Routes and conditional requests.** `classify_response_route`
+  (`publisher.rs`) processes a body whose type is `text/*`, JavaScript or JSON
+  and whose encoding is supported, whatever the status except `204` and `205`,
+  provided the request has a host. `strip_conditional_and_range_headers`
+  removes `If-None-Match`, `If-Modified-Since`, `Range` and `If-Range` from the
+  origin request, and only when the ad stack runs or the DataDome client tag is
+  suppressed on an HTML page. An origin `304` on the ad stack path is answered
+  with a `502`.
+
 ## 2. Contract
+
+Nothing in this section is built. The names `with_response_mutator`,
+`apply_response_headers` and `behavior_revision` are the design's own (§1a).
 
 - `IntegrationRegistration::builder(ID).with_response_mutator(...)` registers
   a mutator; `IntegrationRegistry::apply_response_headers(...)` applies all
@@ -53,7 +209,9 @@ processed.
 - Every registration carries a nonzero `behavior_revision: u32`, bumped for
   any change to its response decision, operation semantics, declared read set,
   or security field list. Integration IDs match
-  `[a-z0-9][a-z0-9-]{0,63}` and are unique. The registry revision hashes the
+  `[a-z0-9][a-z0-9-]{0,63}` and are unique. Three of the ids the code ships,
+  `google_tag_manager`, `js_asset_proxy` and `gpt_diagnostics`, hold an
+  underscore and fail this rule (§1a, §8). The registry revision hashes the
   ordered registration list. Order is behavior, so the array is never sorted.
 - **The mutator API is structured operations, not header-map access.** A
   mutator returns (or is handed a recorder for) typed operations,
@@ -66,24 +224,34 @@ processed.
   writes it never sees. An API that cannot express a violation beats one
   that promises to catch it.
 - **Every adapter calls the apply point** on its outbound-response path for
-  processed documents. The call site lives in shared response-finalization
-  code where one exists. Where adapters finalize independently, each adapter
-  gains the call and a test proving it.
+  processed documents. The only response-finalization code the adapters share
+  today is `apply_response_headers_with_cache_privacy`, which each adapter's own
+  `apply_finalize_headers` calls (§1a). Only the Fastly adapter runs request
+  filters and applies their late response effects, in
+  `apply_terminal_response_effects`, after `ec_finalize_response`. Which
+  function is the apply point on each adapter is an open question (§8). Each
+  adapter gains the call and a test proving it.
 - **Ordering is three stages, and the last one is inviolable:** core
-  response-header handling (EC Set-Cookie emission, EC header clearing,
-  privacy headers) → integration operations → **final cache/privacy
-  invariant enforcement**, which no integration operation can override.
-  Running the hook dead-last would be wrong, because current `main` deliberately
-  runs cookie-cache protection _after_ arbitrary header changes, stripping
-  surrogate caching and forcing private/no-store on any response that sets
-  a cookie, a hook applied after that recheck could combine an appended
-  `Set-Cookie` with a replaced public `Cache-Control` into a
-  **shared-cacheable cookie response**. The invariant pass therefore runs
+  response-header handling (the Edge Cookie module's response headers, EC
+  `Set-Cookie` emission and header clearing, the operator's
+  `[response_headers]`, and privacy headers) → integration operations →
+  **final cache/privacy invariant enforcement**, which no integration
+  operation can override. Running the hook dead-last would be wrong, because
+  the code deliberately runs the cookie cache rule _after_ arbitrary header
+  changes (`apply_response_headers_with_cache_privacy` runs
+  `enforce_set_cookie_cache_privacy` a second time after the operator's
+  headers). On a response that sets a cookie that rule removes the edge cache
+  fields and writes `private, max-age=0`, unless `Cache-Control` already
+  forbids shared storage (§1a gives the one exception). A hook applied after
+  that recheck could combine an appended `Set-Cookie` with a replaced public
+  `Cache-Control` into a **shared-cacheable cookie response**. The invariant
+  pass therefore runs
   after all mutations, unconditionally, and it enforces more than the
   cookie rule. Core **snapshots the complete pre-hook cache restriction
   state**, whether the restriction came from core's own classification
-  (processed auction HTML is marked private even when no cookie is
-  emitted, and today's final helper returns early without `Set-Cookie`) **or
+  (HTML that ran the ad stack or was authorized for the template cache is
+  made `no-store, private` whatever cookies it carries, and the cookie rule
+  returns early without `Set-Cookie`) **or
   from the origin** (an origin-supplied `private, no-store` that core
   merely passed through), and the post-hook response may only be
   **equal or stronger** on the privacy axis: integrations can tighten
@@ -116,16 +284,22 @@ processed.
   `must-revalidate`, or `s-maxage` from the origin), an integration may
   not introduce `public`, `must-revalidate`, or `s-maxage` (RFC 9111
   §3.5 makes those the very directives that unlock shared caching of
-  authenticated responses); the invariant pass forces `private,
-no-store` in that case regardless of the mutation; `max-age`/`s-maxage` may
+  authenticated responses); the invariant pass forces `private, no-store` in
+  that case regardless of the mutation, and where this rule meets the sticky
+  rule for `must-revalidate` this rule decides, so a `must-revalidate` that a
+  mutation introduces does not survive on such a request; `max-age`/`s-maxage`
+  may
   only shrink relative to the snapshot; `stale-while-revalidate`/
   `stale-if-error` may appear only if the snapshot had them **and their
   durations may only shrink** (present-at-1s must not become
   present-at-1y); CDN-specific cache fields are **reserved outright, by enumerated
-  name in the field registry**, `Surrogate-Control`,
-  `CDN-Cache-Control`, `Cloudflare-CDN-Cache-Control`, and
-  `Edge-Control`, each individually tested ("host equivalents" was not
-  a matching rule four adapters would implement identically).
+  name in the field registry**, being the names in `EDGE_CACHE_HEADER_NAMES`
+  (`cache_policy.rs`). At `split/5-response-hook-docs` they are
+  `Surrogate-Control`, `Fastly-Surrogate-Control`, `CDN-Cache-Control` and
+  `Cloudflare-CDN-Cache-Control`, each individually tested ("host equivalents"
+  was not a matching rule four adapters would implement identically). The code
+  has no `Edge-Control`, and whether the list gains it is an open question
+  (§8).
   Merging them per-directive on unrestricted responses was a hole (an
   unrestricted `CDN-Cache-Control: max-age=60` could become a year), and
   they are additionally stripped from any restricted response, and the
@@ -160,7 +334,7 @@ no-store` in that case regardless of the mutation; `max-age`/`s-maxage` may
   HMAC input below are always the normalized lowercase ASCII name, and a name
   is digested once even if it appeared repeatedly in `Vary`. In the known-answer
   normalization fixture, snapshot/mutation lines `Vary: X-Tenant ,
-  Accept-Encoding` and `Vary: accept-encoding` produce wire value
+Accept-Encoding` and `Vary: accept-encoding` produce wire value
   `accept-encoding, x-tenant` and descriptor value
   `["accept-encoding", "x-tenant"]`, then digest each nominated request
   field's original instances in their received order. Fixtures also cover
@@ -185,7 +359,7 @@ no-store` in that case regardless of the mutation; `max-age`/`s-maxage` may
   `[cache] vary_digest_key_secret_name` names a platform-secret-store
   entry containing one versioned keyring JSON object:
   `{ "schema_version": 1, "current_key_id": "<id>", "keys":
-  [{ "id": "<id>", "key_base64url": "<unpadded>" }] }`. `keys` is
+[{ "id": "<id>", "key_base64url": "<unpadded>" }] }`. `keys` is
   sorted by `id`, contains 1..4 unique entries, rejects unknown fields,
   and every value decodes to exactly 32 CSPRNG bytes. An id is derived,
   not operator-invented, and is the first 16 lowercase hex characters of
@@ -276,6 +450,13 @@ no-store` in that case regardless of the mutation; `max-age`/`s-maxage` may
   downgrade it applies.
 
 ## 3. Collision policy
+
+> **Not built, and not reconciled with the code.** The cache revision tuple in
+> this section has no code, and four of its fields come from the permission
+> model's policy activation, which is not built (§1a). The reserved lists in
+> this section are not the two lists the code has for response headers, which
+> are `FRAMING_OR_HOP_BY_HOP_HEADERS` in `ec/module.rs` and
+> `is_forbidden_filter_header` in `integrations/registry.rs` (§1a, §8).
 
 - Mutators may not touch **reserved surface**, which is defined at two
   granularities because `Set-Cookie` is multi-valued: (a) reserved header
@@ -405,14 +586,14 @@ no-store` in that case regardless of the mutation; `max-age`/`s-maxage` may
   `qualification-pending` cell fails startup when the depending feature is
   selected:
 
-  | Capability                                                                                         | Fastly                                                                                       | Axum (dev)                                          | Cloudflare                     | Spin                             |
-  | -------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- | --------------------------------------------------- | ------------------------------ | -------------------------------- |
-  | Runtime secret lookup for Vary-HMAC/DataDome                                                       | wired secret store, and qualify key-rotation behavior                                        | dev secret binding required                         | qualify Workers secret binding | qualify component secret binding |
-  | Persisted processed artifact + mutation IR/read sets                                               | qualification-pending                                                                        | in-process dev implementation required, non-durable | qualification-pending          | qualification-pending            |
-  | Atomic artifact/metadata entry commit                                                              | qualification-pending                                                                        | implementation required                             | qualification-pending          | qualification-pending            |
-  | `Vary` variant index + insert-new-then-index-update rekey                                          | qualification-pending                                                                        | implementation required                             | qualification-pending          | qualification-pending            |
-  | DataDome field-line order, trusted IP/port, fixed HTTPS backend/no-redirect, and exact form limits | qualification-pending                                                                        | qualification-pending                               | qualification-pending          | qualification-pending            |
-  | SecurityUse JA4 request evidence                                                                   | platform value available, with exact-field/payload qualification and sign-offs 23/28 pending | unavailable                                         | unavailable                    | unavailable                      |
+  | Capability                                                                                         | Fastly                                                                                                                | Axum (dev)                                          | Cloudflare                     | Spin                             |
+  | -------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------- | ------------------------------ | -------------------------------- |
+  | Runtime secret lookup for Vary-HMAC/DataDome                                                       | wired secret store, and qualify key-rotation behavior                                                                 | dev secret binding required                         | qualify Workers secret binding | qualify component secret binding |
+  | Persisted processed artifact + mutation IR/read sets                                               | qualification-pending                                                                                                 | in-process dev implementation required, non-durable | qualification-pending          | qualification-pending            |
+  | Atomic artifact/metadata entry commit                                                              | qualification-pending                                                                                                 | implementation required                             | qualification-pending          | qualification-pending            |
+  | `Vary` variant index + insert-new-then-index-update rekey                                          | qualification-pending                                                                                                 | implementation required                             | qualification-pending          | qualification-pending            |
+  | DataDome field-line order, trusted IP/port, fixed HTTPS backend/no-redirect, and exact form limits | qualification-pending                                                                                                 | qualification-pending                               | qualification-pending          | qualification-pending            |
+  | SecurityUse JA4 request evidence                                                                   | platform value available, with exact-field/payload qualification and sign-offs 23/28 of the rollout spec's §8 pending | unavailable                                         | unavailable                    | unavailable                      |
 
   The qualification commit records storage lifetime, maximum object size,
   concurrency semantics, torn-write behavior, and fault-injection evidence;
@@ -428,7 +609,7 @@ no-store` in that case regardless of the mutation; `max-age`/`s-maxage` may
   tidiness, because the hook runs after core queues the EC `Set-Cookie`, so an
   unredacted view would hand a mutator the raw EC to copy into
   `X-Vendor-Identity` or its own cookie, walking around
-  `AuthorizedIdentity<PartnerEgress>` entirely. The snapshot therefore
+  `AuthorizedIdentity<PartnerEgress>` entirely (§1a). The snapshot therefore
   **excludes every `Set-Cookie` value and every reserved identity,
   consent, and privacy header value** (names may be listed as present;
   values are withheld).
@@ -461,6 +642,14 @@ no-store` in that case regardless of the mutation; `max-age`/`s-maxage` may
 
 ## 3a. Response eligibility, normative
 
+The rows below for cache hits, `304` and `HEAD` describe a processed-document
+cache that is not built. The code ships the template cache instead, and this
+spec does not say which of the two the hook extends (§1a, §8). The recovery
+fetch below removes six request fields. The code removes four of them,
+`If-None-Match`, `If-Modified-Since`, `Range` and `If-Range`, and only when the
+ad stack runs or the DataDome client tag is suppressed on an HTML page. The
+code answers an origin `304` on the ad stack path with a `502`.
+
 Which responses the hook runs on, enumerated so two implementations cannot
 diverge silently:
 
@@ -487,28 +676,99 @@ transformed representation. Another bodyless origin 304 can never satisfy
 recovery.
 
 The 304 **safe-update set** is exactly `Cache-Control`, `Expires`, `Date`,
-`Age`, `Vary`, `Surrogate-Control`, `CDN-Cache-Control`,
-`Cloudflare-CDN-Cache-Control`, and `Edge-Control`. The phrase
+`Age`, `Vary`, and the reserved CDN cache fields (the names in
+`EDGE_CACHE_HEADER_NAMES`, §2). The phrase
 "registry-admitted mutable fields" in the matrix denotes an empty set in v1;
 adding any name requires a reviewed spec/registry revision and conformance
 fixture, never a runtime wildcard.
 
-| Response                                          | Hook runs?                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| ------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Processed HTML document (rewritten by TS)         | Yes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| Streamed processed document                       | Yes, operations apply to the header block before first byte                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| Pass-through proxy response (not processed)       | No, TS is a transparent proxy for it                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| Served-from-cache processed document              | Serves the **persisted post-hook finals** captured at cache fill (revision-versioned, mismatch = miss), mutators run at fill/processing time only, so a normal hit and a conditional hit return identical policy metadata **by construction**, with no purity or determinism assumption about mutators                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| Redirect (3xx)                                    | No                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| Error responses TS itself generates (4xx/5xx)     | No                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| `304 Not Modified` for a processed representation | **Persisted-metadata pass**: a cached processed 200 stores its final post-hook headers, accepted mutation-operation batches, and the union of every mutator's declared response-field read set (the persisted mutation IR), versioned by §3's complete cache revision tuple, including model epoch and logical activation generation. A local conditional hit re-emits persisted finals only when the complete tuple matches current active. An origin-revalidation 304 is staged and diffed against separately stored origin-side metadata. (a) Any byte-coupled field changed (`Content-Encoding`, `Content-Type`, validators, digests) → invalidate and fetch/process a full 200. (b) A changed metadata field that intersects any persisted mutator read set, or an artifact/mutator lacking a complete read-set declaration, is also unsafe → full 200 refetch and ordinary hook execution, because deterministic replay of old operations cannot stand in for re-evaluating a decision made from changed inputs. (c) If every changed field is outside every declared read set and belongs to the enumerated safe-update set (`Cache-Control`, reserved CDN cache fields, `Expires`, `Date`, `Age`, `Vary`, registry-admitted mutable fields), replay the persisted deterministic operations over updated origin metadata and rerun invariants. Updated origin metadata, finals, IR, read sets, and complete revision tuple publish in one atomic entry commit, and changed `Vary` uses insert-new-entry-then-index-update ordering. (d) No change → re-emit persisted finals. Artifact absence or any tuple mismatch triggers an unconditional recovery fetch so TS obtains bytes. For processed-document GET/HEAD routes, TS is explicitly the authoritative server for the transformed representation, and after processing the full 200 it evaluates RFC 9110 §13 preconditions against **processed** validators. This is not evaluation of origin validators by an intermediary cache. Other methods are never eligible for this recovery path. `Set-Cookie` and origin validators are never replayed. Absent metadata → cache miss |
-| `HEAD` of a processed document                    | **Serves the persisted GET artifact when one exists**, parity with GET/304 by construction, since RFC 9111 §4.3.5 lets HEAD metadata update a stored GET response and mutators are not required to be deterministic. With no persisted artifact, HEAD is processed like a GET (headers only) and its finals stored as a **distinct head-only artifact type that never satisfies a later GET**, when a stored GET artifact exists a HEAD may **update** it only when the comparison, made against the separately stored **origin-side** metadata, never the processed artifact's (origin and rewritten lengths differ by construction, so the processed length is never the comparand and HEAD metadata never touches processed-side headers), finds validators and origin `Content-Length` matching and no byte-coupled representation field changed (RFC 9111 §4.3.5); qualifying updates land origin-side under the same atomic-commit discipline as the 304 rules, and any mismatch **invalidates** the stored GET artifact rather than updating it                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
-| Informational `1xx`, `204`, `205`, `206`          | No, enumerated so adapters do not infer independently                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| Response                                                             | Hook runs?                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| -------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Processed HTML document (rewritten by TS)                            | Yes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| Streamed processed document                                          | Yes, operations apply to the header block before first byte                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| Pass-through proxy response (not processed)                          | No, TS is a transparent proxy for it                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| Served-from-cache processed document                                 | Serves the **persisted post-hook finals** captured at cache fill (revision-versioned, mismatch = miss), mutators run at fill/processing time only, so a normal hit and a conditional hit return identical policy metadata **by construction**, with no purity or determinism assumption about mutators                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| Redirect (3xx)                                                       | No                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| Error responses TS itself generates (4xx/5xx)                        | No                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| Origin response with a 3xx, 4xx or 5xx status and a processable body | Not decided. The code processes these bodies (§1a), and the matrix gains a result for them when the question in §8 is settled                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `304 Not Modified` for a processed representation                    | **Persisted-metadata pass**: a cached processed 200 stores its final post-hook headers, accepted mutation-operation batches, and the union of every mutator's declared response-field read set (the persisted mutation IR), versioned by §3's complete cache revision tuple, including model epoch and logical activation generation. A local conditional hit re-emits persisted finals only when the complete tuple matches current active. An origin-revalidation 304 is staged and diffed against separately stored origin-side metadata. (a) Any byte-coupled field changed (`Content-Encoding`, `Content-Type`, validators, digests) → invalidate and fetch/process a full 200. (b) A changed metadata field that intersects any persisted mutator read set, or an artifact/mutator lacking a complete read-set declaration, is also unsafe → full 200 refetch and ordinary hook execution, because deterministic replay of old operations cannot stand in for re-evaluating a decision made from changed inputs. (c) If every changed field is outside every declared read set and belongs to the enumerated safe-update set (`Cache-Control`, reserved CDN cache fields, `Expires`, `Date`, `Age`, `Vary`, registry-admitted mutable fields), replay the persisted deterministic operations over updated origin metadata and rerun invariants. Updated origin metadata, finals, IR, read sets, and complete revision tuple publish in one atomic entry commit, and changed `Vary` uses insert-new-entry-then-index-update ordering. (d) No change → re-emit persisted finals. Artifact absence or any tuple mismatch triggers an unconditional recovery fetch so TS obtains bytes. For processed-document GET/HEAD routes, TS is explicitly the authoritative server for the transformed representation, and after processing the full 200 it evaluates RFC 9110 §13 preconditions against **processed** validators. This is not evaluation of origin validators by an intermediary cache. Other methods are never eligible for this recovery path. `Set-Cookie` and origin validators are never replayed. Absent metadata → cache miss |
+| `HEAD` of a processed document                                       | **Serves the persisted GET artifact when one exists**, parity with GET/304 by construction, since RFC 9111 §4.3.5 lets HEAD metadata update a stored GET response and mutators are not required to be deterministic. With no persisted artifact, HEAD is processed like a GET (headers only) and its finals stored as a **distinct head-only artifact type that never satisfies a later GET**, when a stored GET artifact exists a HEAD may **update** it only when the comparison, made against the separately stored **origin-side** metadata, never the processed artifact's (origin and rewritten lengths differ by construction, so the processed length is never the comparand and HEAD metadata never touches processed-side headers), finds validators and origin `Content-Length` matching and no byte-coupled representation field changed (RFC 9111 §4.3.5); qualifying updates land origin-side under the same atomic-commit discipline as the 304 rules, and any mismatch **invalidates** the stored GET artifact rather than updating it                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| Informational `1xx`, `204`, `205`, `206`                             | No, enumerated so adapters do not infer independently                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 
 This deliberately narrows #782's general "outbound response" phrasing to
 processed documents (§6).
 
+## 4. Done-when (from #782, sharpened)
+
+1. Trait + builder + registry application, each public item documented.
+2. **The old generic `RequestFilterEffects.response_headers` channel is
+   removed.** DataDome uses the separate sealed, core-registered
+   `DataDomeSecurityRequestFilter` and typed `DataDomeSecurityEffects` defined
+   by §4a's PR-specific delta. Generic request filters
+   receive only `RedactedRequestView` and ordinary attributed effects and
+   cannot express the security view, owner overlay, cookie operation, or
+   reserved security header. The dedicated channel is necessary because
+   DataDome sets headers **and cookies** on 200, 301/302, 401, 403, and 429
+   responses, response classes (§3a) the ordinary response hook never runs
+   on, with cookie emission v1 reserves.
+3. **At least one real consumer ships in the same PR**, an existing
+   integration registering a mutator for a real need (or, failing a real
+   need, the feature waits, and scaffolding with only self-referential tests is
+   dead code and will be removed).
+4. Every adapter applies mutations on its outbound path, with a per-adapter
+   route test asserting an integration-set header appears in the response.
+5. A parity-suite case asserts identical mutation behavior across adapters.
+6. Reserved-surface, append/replace, operation-limit, duplicate-ID, and
+   erroring-mutator semantics covered by unit tests.
+7. **Every row of the §3a eligibility matrix has a test**, streaming,
+   cache-hit, pass-through, redirect, error, and 304 each proven to run or
+   not run the hook, not merely one positive header test per adapter. The row
+   for an origin 3xx, 4xx or 5xx page gains its test when its result is
+   decided (§8).
+8. Cache/privacy invariant tests, one per restriction source and shape:
+   a **core-owned** cookie already queued before the hook + an
+   integration's public `Cache-Control` replacement → private/no-store,
+   surrogate stripped; **core-private cookieless** processed HTML +
+   public replacement → restriction preserved; **origin-private cookieless** processed HTML that retained the
+   origin's cache restrictions + public replacement → restriction
+   preserved (pass-through responses never run the hook, §3a); a cache-hit serve re-applying mutations without
+   weakening the stored classification; a `Vary` mutation neither
+   dropping core-required values nor bypassing the snapshot; the §3
+   normalization fixture proves field-line grouping/case/order collapse to one
+   sorted lowercase descriptor, repeated names digest once, request value
+   instances retain octet/order boundaries, malformed/empty mutation members
+   reject, a malformed snapshot becomes `Vary: *` plus `no-store`, and `*`
+   writes no artifact; a `pre_epic_v1` artifact/index descriptor is a miss
+   immediately after the model-only `permissions_v2` activation CAS even when
+   config and policy digests are unchanged; each name in
+   `EDGE_CACHE_HEADER_NAMES` individually stripped; and a rejected
+   `Content-Encoding` mutation.
+
+The `pre_epic_v1` test and the other tests of the cache revision tuple cannot
+run until the permission model's policy activation exists (§1a). The work
+extends tests that exist at `split/5-response-hook-docs`. For the cookie and
+privacy rules these are the tests in `response_privacy.rs` (for example
+`downgrades_operator_configured_set_cookie_with_public_cache_headers`,
+`preserves_private_no_store_against_operator_cache_headers_without_cookie` and
+`terminal_private_stamp_removes_every_cache_and_validator_header`), the
+`apply_finalize_headers` tests in each adapter's `src/middleware.rs`, and the
+Fastly tests of `apply_terminal_response_effects` in
+`crates/trusted-server-adapter-fastly/src/main.rs`
+(`late_filter_effects_cannot_make_an_assembled_response_public`,
+`late_filter_effects_cannot_make_a_page_bids_response_public`,
+`late_filter_effects_cannot_make_an_active_diagnostics_response_public` and
+`terminal_response_preserves_unmarked_origin_private_policy`). For DataDome they
+are the tests in `integrations/datadome/protection.rs`, from
+`extract_header_mutations_appends_set_cookie_and_sets_other_headers` to
+`classify_ok_response_preserves_request_header_effects`.
+
 ## 4a. The security channel, normative closed boundary
+
+Nothing in this section is built (§1a). Sign-offs 23 and 28 are rows 23 and 28
+of the table in §8 of `2026-07-30-provider-migration-rollout-design.md`. Row 23
+permits a narrow `SecurityUse` authority for DataDome only, and row 28 requires
+product and written vendor conformance approval of the reduced DataDome
+surface. Both rows are open, and each says the hook is not shipped.
 
 The security channel (today: DataDome) runs under a distinct, typed
 `SecurityUse` authority rather than the advertising permissions P1/P4.
@@ -597,8 +857,8 @@ referrers are never in the security view. Every degree of freedom is closed:
   spec-pinned pointer allowlist starting at ClientID-only against
   DataDome's mandatory response-directed mapping set, that reduction
   needs explicit product **and vendor** acceptance under sign-off item 28. A
-  violating operation is rejected whole (the batch rule). **Both
-  sessionByHeader is startup-rejected in v1, one state, not three**:
+  violating operation is rejected whole (the batch rule). **`sessionByHeader`
+  is startup-rejected in v1, one state, not three**:
   TS never sends `X-DataDome-X-Set-Cookie: true`; a vendor
   `X-Set-Cookie` **invalidates the batch → Continue** (its matrix cell, since
   a session mode the fleet never requested must not half-apply); and an incoming
@@ -656,14 +916,16 @@ referrers are never in the security view. Every degree of freedom is closed:
   admission rather than extending the old scope. Fixtures cover origin
   collision, host-only vs explicit-domain set/delete, attempted domain change,
   and duplicate request cookies. The deletion claim therefore covers every
-  cookie this contract can create, not arbitrary pre-contract scopes.
+  cookie this contract can create, not arbitrary pre-contract scopes. The
+  fence, the register and the activation CAS named in this bullet belong to the
+  permission model's policy activation, which is not built (§1a).
 - **The incoming `X-DataDome-ClientID` request header is owner-only,
   like the cookie.** DataDome prioritizes the header over the cookie,
   so leaving it in the shared request would hand other integrations and
   upstream routing the same identifier the cookie boundary strips, so core
   **removes it from the shared request** before integrations and
   upstream routing run, it joins `RedactedRequestView`'s enumerated
-  strip set (providers spec), **and in v1 it is stripped for the
+  strip set (providers spec, §1a), **and in v1 it is stripped for the
   vendor too, because the Protection API request's ClientID derives only from
   the `datadome` cookie, never from the incoming header** (DataDome's
   contract requires `X-DataDome-X-Set-Cookie: true` whenever a
@@ -949,7 +1211,9 @@ byte-to-string replacement is forbidden:
   created rather than described, because nothing in the shipped code behaves
   that way. The protection path reads each mapped field through a single
   `headers().get()` in `header_value`
-  (`crates/trusted-server-core/src/integrations/datadome/protection.rs`) and
+  (`crates/trusted-server-core/src/integrations/datadome/protection.rs`, and
+  `crates/bot-protection/datadome/src/protection.rs` from
+  `split/7-integration-seam-impl`) and
   calls the Protection API regardless of how many lines arrived. The
   principle behind the rewrite is that core must not invent vendor-specific
   header normalization and must not decide on a vendor's behalf to skip a
@@ -958,14 +1222,17 @@ byte-to-string replacement is forbidden:
   logic, so it belongs to the vendor integration, which sees every received
   line in received order through `HeadersList` and the presented field
   lines.
-- **Where that logic belongs.** The DataDome integration is core code today,
-  in `crates/trusted-server-core/src/integrations/datadome.rs` and the
-  `crates/trusted-server-core/src/integrations/datadome/` directory. Vendor
-  detection logic of this kind belongs in the vendor's own module rather
-  than in core, and the integration module seam
-  (`2026-08-27-integration-provider-seam-design.md`) is where that move is
-  designed. This is a direction for that migration rather than a complaint
-  about the code as it stands.
+- **Where that logic belongs.** At `split/5-response-hook-docs` the DataDome
+  integration is core code, in
+  `crates/trusted-server-core/src/integrations/datadome.rs` and the
+  `crates/trusted-server-core/src/integrations/datadome/` directory. From
+  `split/7-integration-seam-impl` on it is the crate
+  `crates/bot-protection/datadome`, which holds `protection.rs` and
+  `protection_scope.rs`. Vendor detection logic of this kind belongs in the
+  vendor's own module rather than in core, and the integration module seam
+  (`2026-08-27-integration-provider-seam-design.md`) designs that move. This
+  is a direction for that migration rather than a complaint about the code as
+  it stands.
 - `content-length` is not a vendor decision. It is HTTP framing, parsed by
   the host HTTP layer beneath Trusted Server before any integration runs,
   and no integration reads it as a value. `PostParamLen` is always the byte
@@ -1129,6 +1396,16 @@ security/session fields rather than ignoring them as compatibility toggles,
 and the materialized values below participate in permission §5.5's complete
 effective-config digest.
 
+At `split/5-response-hook-docs` the pre-existing schema is the table
+`[integrations.datadome]` (`DataDomeConfig` in `integrations/datadome.rs`, and
+the "DataDome Integration" section of `docs/guide/configuration.md`), and the
+code has no `[bot-protection]` section. The delta below is written under
+`[bot-protection.datadome]`, the section name from
+`split/7-integration-seam-impl` on, where DataDome is the crate
+`crates/bot-protection/datadome`. None of the delta's settings exists in the
+tree, and the effective-config digest of permission §5.5 is not built either
+(§1a).
+
 ```toml
 [bot-protection.datadome]
 
@@ -1170,59 +1447,53 @@ that cannot preserve admitted request-header field-line order or enforce the
 request/body limits fails startup for protection rather than synthesizing
 different evidence.
 
-## 4. Done-when (from #782, sharpened)
+### 4a.4 Shipped DataDome behavior that §4a changes
 
-1. Trait + builder + registry application, each public item documented.
-2. **The old generic `RequestFilterEffects.response_headers` channel is
-   removed.** DataDome uses the separate sealed, core-registered
-   `DataDomeSecurityRequestFilter` and typed `DataDomeSecurityEffects` defined
-   by §4a's PR-specific delta. Generic request filters
-   receive only `RedactedRequestView` and ordinary attributed effects and
-   cannot express the security view, owner overlay, cookie operation, or
-   reserved security header. The dedicated channel is necessary because
-   DataDome sets headers **and cookies** on 200, 301/302, 401, 403, and 429
-   responses, response classes (§3a) the ordinary response hook never runs
-   on, with cookie emission v1 reserves.
-3. **At least one real consumer ships in the same PR**, an existing
-   integration registering a mutator for a real need (or, failing a real
-   need, the feature waits, and scaffolding with only self-referential tests is
-   dead code and will be removed).
-4. Every adapter applies mutations on its outbound path, with a per-adapter
-   route test asserting an integration-set header appears in the response.
-5. A parity-suite case asserts identical mutation behavior across adapters.
-6. Reserved-surface, append/replace, operation-limit, and erroring-mutator
-   semantics covered by unit tests.
-7. **Every row of the §3a eligibility matrix has a test**, streaming,
-   cache-hit, pass-through, redirect, error, and 304 each proven to run or
-   not run the hook, not merely one positive header test per adapter.
-8. Cache/privacy invariant tests, one per restriction source and shape:
-   a **core-owned** cookie already queued before the hook + an
-   integration's public `Cache-Control` replacement → private/no-store,
-   surrogate stripped; **core-private cookieless** processed HTML +
-   public replacement → restriction preserved; **origin-private cookieless** processed HTML that retained the
-   origin's cache restrictions + public replacement → restriction
-   preserved (pass-through responses never run the hook, §3a); a cache-hit serve re-applying mutations without
-   weakening the stored classification; a `Vary` mutation neither
-   dropping core-required values nor bypassing the snapshot; the §3
-   normalization fixture proves field-line grouping/case/order collapse to one
-   sorted lowercase descriptor, repeated names digest once, request value
-   instances retain octet/order boundaries, malformed/empty mutation members
-   reject, a malformed snapshot becomes `Vary: *` plus `no-store`, and `*`
-   writes no artifact; a `pre_epic_v1` artifact/index descriptor is a miss
-   immediately after the model-only `permissions_v2` activation CAS even when
-   config and policy digests are unchanged; each of the four enumerated CDN fields (`Surrogate-Control`,
-   `CDN-Cache-Control`, `Cloudflare-CDN-Cache-Control`, `Edge-Control`)
-   individually stripped; and a rejected `Content-Encoding` mutation.
+This spec has no rollout for a deployment that runs DataDome protection today,
+and §8 of the rollout spec has no row for these changes. Where §4a requires
+otherwise, the code at `split/5-response-hook-docs` behaves as follows. From
+`split/7-integration-seam-impl` on, the same behavior is in
+`crates/bot-protection/datadome`.
+
+- **Session identity.** `build_protection_payload` takes `ClientID` from the
+  `X-DataDome-ClientID` request header first and from the `datadome` cookie
+  second, and sends `X-DataDome-X-Set-Cookie: true` when the header supplied
+  the value. §4a takes `ClientID` from the cookie only, strips the header, and
+  refuses a session by header at startup.
+- **Fields sent.** The code sends `TrueClientIP`, `XForwardedForIP`,
+  `X-Real-IP`, `TlsCipher`, `H2Fingerprint` and `JA4` whenever the request or
+  the platform supplies a value. §4a.2.1 sends none of the first five, and
+  sends `JA4` only when `expose_host_fingerprints_to_vendor` is `true`.
+- **Request fields.** `Request` carries the path and the query, `Port` is the
+  literal `0`, `RequestModuleName` is `Trusted-Server-Rust`, `Origin` and
+  `Referer` carry the whole value, `PostParamLen` is the value of the
+  `content-length` header, and `HeadersList` names each distinct header once.
+  §4a.2.1 sends the path only, the TCP source port (and skips the call when it
+  is missing), the name `trusted-server`, the scheme, host and non-default port
+  of `Origin` and `Referer`, the byte length of the body core holds, and every
+  admitted received line in order.
+- **Response headers.** `extract_header_mutations` appends a vendor
+  `Set-Cookie` as the vendor sent it and sets every other pointed header, and
+  `is_forbidden_filter_header` refuses a few names when the effects are
+  applied. §4a turns `Set-Cookie` into the typed `datadome` cookie operation,
+  accepts only the names in the matrix of §4a.2.3, and treats any other name as
+  an invalid batch.
+- **Settings.** `protection_api_origin` is a setting with the default
+  `https://api-fastly.datadome.co`, and the code has no setting for a cookie
+  lifetime. §4a.3 makes `protection_api_origin` a startup error and makes
+  `security_cookie_max_age` required once `enable_protection` is `true`.
 
 ## 5. Size and sequencing
 
-The ordinary mutator API in §2 to §3 is a modest headers-only feature with no
-module or permission-model coupling. It lands only with the real consumer
-required by §4 item 3; without one, scaffolding does not ship. The separately
-typed security channel in §4a is already that consumer's PR-specific contract:
-it owns DataDome cookie operations and intentionally couples configuration
-activation to permission §5.5. Those capabilities never become part of the
-ordinary mutator API.
+The ordinary mutator API in §2 is a headers-only feature with no module
+coupling. Its cache rules in §3 and §3a are coupled to the permission model,
+because the revision tuple holds the policy activation fields, and that
+activation is not built (§1a). The API lands only with the real consumer
+required by §4 item 3, and without one scaffolding does not ship. The
+separately typed security channel in §4a is already that consumer's
+PR-specific contract, as it owns DataDome cookie operations and intentionally
+couples configuration activation to permission §5.5. Those capabilities never
+become part of the ordinary mutator API.
 
 ## 6. Divergences from issue #782
 
@@ -1264,3 +1535,83 @@ first consumer, §7) merges:
   because core cannot validate or attribute writes it never sees, so the
   structured, attributed operations API of §2 is the required shape and the
   `&mut HeaderMap` API must not return with the hook.
+
+## 8. Open questions
+
+Each of these waits for a decision and, for most, a code change. This revision
+changes no code and decides none of them.
+
+1. Which cache the hook extends. §2 and §3a describe a processed-document
+   cache with persisted finals, a variant index and a keyed digest. The code
+   ships the template cache (§1a), which keeps the page after the HTML rewrite
+   and builds its headers again on every hit. Is the processed-document cache
+   the template cache, or a second cache beside it? If it is the template
+   cache, the variant index, the keyed digest and the revision tuple have to
+   be restated against `TemplateCacheKey::to_cache_key`, `template_fingerprint`
+   and `VarySpec`. If it is a second cache, how does it fit the comment in
+   `platform/template_cache.rs` that an assembled response must never exist?
+2. What a stored entry is checked against until the permission model's policy
+   activation exists. The tuple in §3 names four fields from that activation
+   and none has code. The template cache checks `template_fingerprint`, which
+   hashes the build digest, the browser bundles and the whole typed settings.
+3. Whether `Edge-Control` joins `EDGE_CACHE_HEADER_NAMES`. The code strips four
+   names and has no `edge-control`. If it joins, `remove_edge_cache_headers`,
+   `is_edge_cache_header_name` and the tests of both change with it.
+4. Whether the integration id rule admits `_`, or `google_tag_manager`,
+   `js_asset_proxy` and `gpt_diagnostics` are renamed. A rename changes the
+   table name `[integrations.google_tag_manager]` that deployments already use.
+5. Which function is the apply point on each adapter, and how Done-when item 4
+   (every adapter applies the mutations and has a route test) fits the
+   capability cells in §3 that fail startup on Fastly, Cloudflare and Spin.
+   Axum, Cloudflare and Spin run no request filters, so the security channel
+   of §4a has no place to run on them today.
+6. Whether the three response-header steps share one reserved list and one
+   failure rule. The Edge Cookie module list refuses `cache-control` and fails
+   the module's generation. The request filter list skips one header and lets
+   `Cache-Control` and `Set-Cookie` through. §3 merges `Cache-Control` and
+   rejects a whole batch.
+7. How `TerminalPrivateResponse` relates to the snapshot in §2. The marker
+   restores `no-store, private` on Fastly only, for a policy of Trusted
+   Server's own, whereas the snapshot covers a restriction that came from core
+   or from the origin. Does the snapshot read the marker or replace it?
+8. Whether the hook runs on an origin response with a 3xx, 4xx or 5xx status,
+   and on a processed body that is not HTML. `classify_response_route`
+   processes a `text/*`, JavaScript or JSON body of a supported encoding
+   whatever its status except `204` and `205`. §3a says no for a redirect and
+   for an error that Trusted Server generates, and says nothing about these.
+9. What turns on the response caching that makes the keyring mandatory, and
+   where its secret is named. §2 puts `vary_digest_key_secret_name` in
+   `[cache]`, which holds only the asset rules today.
+10. Where `PartnerEgress` and the redacted request view are defined. The
+    providers spec names the view without defining it, and no spec defines
+    `PartnerEgress`.
+11. How a deployment that runs DataDome protection today moves to the behavior
+    in §4a.4. This spec has no rollout, rows 23 and 28 of the rollout spec's
+    §8 do not cover one, and a deployment with `enable_protection = true`
+    fails startup until it sets `security_cookie_max_age`.
+12. Whether §4a and the cache, `304` and `HEAD` rules move into specs of their
+    own, so that this spec covers the headers-only API alone.
+
+## Review log
+
+1. **Round 1, 2026-10-15.** A review in a fresh session, against
+   `split/5-response-hook-docs` at `61b1399c6`. Issues found, four of them
+   blocking. The four were a cache revision that needs a policy activation
+   nothing builds, a list of CDN cache fields that differs from the list in
+   the code, an id rule that refuses three ids that ship, and a
+   processed-document cache that never names the template cache already in
+   the code. This
+   revision states what the code does at that commit in a new section 1a and
+   in place, marks the parts that are not built or are built by a later row of
+   the stack, and puts the questions the code raises under Open questions, so
+   the hook, the cache fields, the id rule and the CDN field list wait for
+   those decisions and for code changes.
+
+## Revision record
+
+| Date       | Change                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 2026-08-25 | Disposition added (§7).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| 2026-09-01 | Repeated lines of an admitted request header pass through as received in §4a.2 (§7).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| 2026-10-06 | Module wording.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| 2026-10-15 | Fixes from review round 1. The status and the closed pull request, a new section 1a on what the code does today, the cookie rule, the shared finalization code and the DataDome section name stated as the code has them, the reserved CDN cache fields taken from `EDGE_CACHE_HEADER_NAMES`, the three ids the id rule refuses, the template cache and the cache revision tuple marked as unreconciled or not built, the changes to shipped DataDome behavior in section 4a.4, the order of sections 4 and 4a, the sign-off rows, `must-revalidate` precedence, the duplicate-ID test in the done-when, the existing tests, the open questions and the review log. |
