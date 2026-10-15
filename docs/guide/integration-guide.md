@@ -218,7 +218,15 @@ available before template lookup, so requested EOF work cannot be skipped by a
 processed cache hit. The factory and session share request-local
 `IntegrationDocumentState` with the existing parser hooks.
 
-A non-retaining session can make a KV lookup at EOF and append a fixed footer:
+A non-retaining session can make a KV lookup at EOF and append a fixed footer.
+
+::: warning Do not copy the KV lookup to Fastly
+The generic KV interface has no hard timeout, and Fastly installs no cooperative
+timer, so an unbounded KV call can hold the response indefinitely. The example
+skips the lookup when `input.deadline.has_cooperative_timer()` is false. On
+Fastly, use an HTTP lookup whose transport timeouts are capped with
+`input.deadline.remaining()` instead.
+:::
 
 <!-- documentation-snippet:html-eof:start -->
 
@@ -248,6 +256,9 @@ impl StreamProcessor for ExampleFooterProcessor {
         input: StreamFinishInput<'a>,
     ) -> Option<LocalBoxFuture<'a, Result<StreamFinish, Report<StreamFinishError>>>> {
         Some(Box::pin(async move {
+            if !input.deadline.has_cooperative_timer() {
+                return Ok(StreamFinish::Unchanged);
+            }
             let enabled = input
                 .services
                 .kv_store()
