@@ -4761,9 +4761,12 @@ impl Settings {
     where
         T: IntegrationConfig,
     {
-        let Some((section, written)) = self.module_selection(name) else {
+        let Some((section, selected)) = self.module_selection(name) else {
             return Ok(None);
         };
+        // The table is keyed by the name without its type folder, however the
+        // section's selector wrote it.
+        let written = crate::module_name::short_form(section, selected);
         let table = self
             .module_sections()
             .find(|(candidate, _)| *candidate == section)
