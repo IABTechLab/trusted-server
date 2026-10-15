@@ -424,6 +424,12 @@ The three script delivery choices are exclusive and the last call wins.
 
 Each of the last four takes the module's name, which is the path under
 `crates/` of the crate the module lives in, as `module_name!()` gives it.
+`[ec] module`, `[geo] module` and `[device] module` read a written name the
+way a section does, as written or with the type folder (`edgecookie`, `geo`
+or `device`) in front, so a geo module from `crates/geo/example` is selected
+with `[geo] module = "example"`. One registration can supply a module of each
+type, each under the name of its own crate, which is how a vendor makes one
+backend call serve all three.
 
 A geo module is a `GeoModule`, called with the request's module call as a
 device module is, so it sees the request's evidence, the settings and the
@@ -432,12 +438,6 @@ the same request can answer both from one call. A module that resolves from
 the client address alone implements `PlatformGeo` and is offered through
 `PlatformGeoModule::new(name, module)`, which hands the platform lookup the
 address the call carries, as the example above does.
-`[ec] module`, `[geo] module` and `[device] module` read a written name the
-way a section does, as written or with the type folder (`edgecookie`, `geo`
-or `device`) in front, so a geo module from `crates/geo/example` is selected
-with `[geo] module = "example"`. One registration can supply a module of each
-type, each under the name of its own crate, which is how a vendor makes one
-backend call serve all three.
 
 An Edge Cookie module is declared under the name its own `id` returns.
 Startup refuses a registration where the two differ, and two registrations
