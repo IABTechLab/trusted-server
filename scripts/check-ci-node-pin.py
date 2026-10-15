@@ -9,11 +9,12 @@ Node instead (see #1204).
 For each job in `.github/workflows/*.yml`, the check walks the steps in order,
 inlining local composite actions (`uses: ./...`). It fails when a step that
 compiles Rust comes before an unconditional `actions/setup-node` step pinned
-to `.tool-versions`. A step compiles Rust when it runs a `cargo` build, check,
-test, clippy, bench, run or doc command (including the `cargo <command>-<name>`
-aliases) or `worker-build`, directly or through a repository shell script.
-A compile step counts even when it has an `if:`, but a conditional setup-node
-step does not pin Node. A `node-version` taken from a step output counts as
+to `.tool-versions`. A step compiles Rust when it runs `worker-build` or any
+`cargo` subcommand except `fmt`, `metadata`, `tree` and a registry `install`
+(so aliases, toolchain overrides and unknown subcommands count), directly or
+through a repository shell script. A compile step counts even when it has an
+`if:`, but a conditional setup-node step does not pin Node, and a later
+setup-node step that does not pin Node undoes an earlier pin. A `node-version` taken from a step output counts as
 pinned, since the workflows read that output from `.tool-versions`.
 
 The check uses only the standard library and reads YAML by indentation, so it
@@ -27,11 +28,13 @@ import re
 import sys
 
 COMPILE = re.compile(
-    r"\bcargo\s+(?:build|check|test|clippy|bench|run|doc|rustc)(?:-[\w-]+)?\b"
+    r"\bcargo(?:[\s\\]+[+-]\S+)*[\s\\]+"
+    r"(?!(?:fmt|metadata|tree|install(?![^\n]*--path))(?:\s|$))\w"
     r"|\bworker-build\b"
 )
 SCRIPT = re.compile(r"(?<![\w/.-])(?:\./)?((?:scripts|crates|\.github)/[\w./-]+\.sh)\b")
 KEY = re.compile(r"^([\w.-]+):(?:\s+(.*))?$")
+TRAILING_COMMENT = re.compile(r"\s+#.*$")
 STEP_OUTPUT = re.compile(r"^\$\{\{\s*steps\.[\w-]+\.outputs\.[\w-]+\s*\}\}$")
 
 
@@ -56,6 +59,7 @@ class Step:
     path: Path
     line: int
     name: str
+    sets_node: bool
     pins_node: bool
     compiles: bool
 
@@ -97,7 +101,10 @@ def mapping(lines, start, end):
         if match is None:
             continue
         stop = heads[position + 1] if position + 1 < len(heads) else end
-        entries[match.group(1)] = Entry(head, (match.group(2) or "").strip(), head + 1, stop)
+        value = (match.group(2) or "").strip()
+        if not value.startswith(("'", '"')):
+            value = TRAILING_COMMENT.sub("", value)
+        entries[match.group(1)] = Entry(head, value, head + 1, stop)
     return entries
 
 
@@ -150,10 +157,12 @@ def pins_node(lines, step):
     if "with" not in step:
         return False
     options = mapping(lines, step["with"].start, step["with"].end)
-    if "node-version-file" in options:
-        return options["node-version-file"].value.strip("'\"") == ".tool-versions"
+    # setup-node uses `node-version` and ignores the file when both are set.
     if "node-version" in options:
         return STEP_OUTPUT.match(options["node-version"].value) is not None
+    if "node-version-file" in options:
+        value = options["node-version-file"].value.strip("'\"")
+        return value.removeprefix("./") == ".tool-versions"
     return False
 
 
@@ -170,6 +179,8 @@ def expand_steps(root, path, lines, start, end, conditional, active):
             action = root / uses / "action.yml"
             if not action.is_file():
                 action = root / uses / "action.yaml"
+            if not action.is_file():
+                raise ParseError(f"{path}:{item_start + 1}: no action.yml for `{uses}`")
             if action in active:
                 raise ParseError(f"{action}: composite action includes itself")
             yield from action_steps(root, action, step_conditional, active | {action})
@@ -179,6 +190,7 @@ def expand_steps(root, path, lines, start, end, conditional, active):
             path=path,
             line=item_start + 1,
             name=step["name"].value if "name" in step else uses or run.strip().partition("\n")[0],
+            sets_node=uses.startswith("actions/setup-node@"),
             pins_node=uses.startswith("actions/setup-node@")
             and not step_conditional
             and pins_node(item, step),
@@ -217,8 +229,8 @@ def check_workflow(root, path):
         for step in expand_steps(
             root, path, lines, keys["steps"].start, keys["steps"].end, False, frozenset()
         ):
-            if step.pins_node:
-                pinned = True
+            if step.sets_node:
+                pinned = step.pins_node
             elif step.compiles and not pinned:
                 violations.append(
                     f"{step.path.relative_to(root)}:{step.line}: job `{job_id}` in "
