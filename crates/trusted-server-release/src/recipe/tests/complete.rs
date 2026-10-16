@@ -7,6 +7,8 @@ use sha2::{Digest as _, Sha256};
 
 use super::fixture::*;
 use super::*;
+use crate::inspect::Violation;
+use crate::inspect::tests::builders::{ElfSpec, elf};
 
 const FINGERPRINT: [u8; 32] = [7; 32];
 
@@ -457,6 +459,62 @@ fn wasm_artifacts_must_keep_debug_sections() {
     assert!(
         built_text.finish(stdout).is_err(),
         "should reject bytes that are not a module"
+    );
+}
+
+/// Completes a Linux `ts` run whose executable holds `bytes`.
+fn finish_linux(bytes: &[u8]) -> Result<RecipeCompleted, Report<ReleaseError>> {
+    let mut built = built("ts-x86_64-unknown-linux-gnu", Role::Canonical, bytes);
+    let stdout = built.stdout(|_| {});
+    built.finish(stdout)
+}
+
+#[test]
+fn linux_executables_must_pass_elf_inspection_and_keep_debug_info() {
+    let completed = finish_linux(&elf(&ElfSpec::conforming()))
+        .expect("should accept a conforming executable with debug info");
+    assert_eq!(
+        completed.artifact().name(),
+        "ts-x86_64-unknown-linux-gnu",
+        "should publish under the asset name"
+    );
+    let cases: [(&str, ElfSpec, Violation); 3] = [
+        (
+            "stripped",
+            ElfSpec {
+                debug_sections: Vec::new(),
+                ..ElfSpec::conforming()
+            },
+            Violation::ElfDebugInfo,
+        ),
+        (
+            "above the glibc ceiling",
+            ElfSpec {
+                requirements: vec![("libc.so.6", vec!["GLIBC_2.35"])],
+                ..ElfSpec::conforming()
+            },
+            Violation::SymbolVersion,
+        ),
+        (
+            "runner path",
+            ElfSpec {
+                payload: b"panic at /home/runner/work/example/src/main.rs",
+                ..ElfSpec::conforming()
+            },
+            Violation::EmbeddedPath,
+        ),
+    ];
+    for (label, spec, expected) in cases {
+        let error = finish_linux(&elf(&spec)).expect_err("should reject the executable");
+        assert_eq!(
+            error.downcast_ref::<Violation>(),
+            Some(&expected),
+            "should reject the {label} executable by its rule: {error:?}"
+        );
+    }
+    assert!(
+        finish_linux(b"fictional text, not an executable").is_err(),
+        "should reject bytes that are not ELF"
     );
 }
 

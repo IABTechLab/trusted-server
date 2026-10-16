@@ -54,7 +54,7 @@
 //!   a boundary, not authenticated against an independent trust root.
 
 mod command;
-mod daemon;
+pub(crate) mod daemon;
 mod docker;
 mod host_inputs;
 mod macos;
@@ -92,7 +92,7 @@ fn boundary_error(message: impl std::fmt::Display) -> Report<ReleaseError> {
 }
 
 /// Returns `N` bytes from the kernel random source.
-fn random_bytes<const N: usize>() -> Result<[u8; N], Report<ReleaseError>> {
+pub(crate) fn random_bytes<const N: usize>() -> Result<[u8; N], Report<ReleaseError>> {
     let mut bytes = [0_u8; N];
     File::open("/dev/urandom")
         .and_then(|mut file| file.read_exact(&mut bytes))

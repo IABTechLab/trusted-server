@@ -43,11 +43,13 @@ mod compare;
 mod completed;
 mod execute;
 mod fresh;
+mod native;
 mod paths;
 mod plan;
 mod remap;
 mod runtime;
 mod sources;
+mod startup;
 mod tools;
 
 pub(crate) use ambient::{AmbientProfile, CheckedAmbient};

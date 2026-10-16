@@ -68,25 +68,26 @@ fn same_input<T: PartialEq + ?Sized>(
         return Ok(());
     }
     Err(recipe_error(format!(
-        "canonical and reproduction Fastly builds used different {label}"
+        "canonical and reproduction builds used different {label}"
     )))
 }
 
-/// Requires one canonical and one reproduction build of the Fastly asset over
+/// Requires one canonical and one reproduction build of `asset` over
 /// identical inputs.
-fn check_pair(
+pub(super) fn check_pair(
     canonical: &RecipeCompleted,
     reproduction: &RecipeCompleted,
+    asset: AssetId,
 ) -> Result<(), Report<ReleaseError>> {
     if canonical.role() != Role::Canonical || reproduction.role() != Role::Reproduction {
         return Err(recipe_error(
-            "Fastly equality needs a canonical then a reproduction build",
+            "a comparison needs a canonical then a reproduction build",
         ));
     }
-    let fastly = AssetId::parse(FASTLY_ASSET)?;
-    if canonical.asset() != fastly || reproduction.asset() != fastly {
+    if canonical.asset() != asset || reproduction.asset() != asset {
         return Err(recipe_error(format!(
-            "Fastly equality compares only {FASTLY_ASSET}"
+            "this comparison compares only {}",
+            asset.artifact().name
         )));
     }
     same_input("source commits", canonical.commit(), reproduction.commit())?;
@@ -160,7 +161,7 @@ pub(crate) fn check_fastly_equality(
     canonical: &RecipeCompleted,
     reproduction: &RecipeCompleted,
 ) -> Result<FastlyEqualityChecked, Report<ReleaseError>> {
-    check_pair(canonical, reproduction)?;
+    check_pair(canonical, reproduction, AssetId::parse(FASTLY_ASSET)?)?;
     let ambient = AmbientRecord::pair(
         canonical.ambient(),
         reproduction.ambient(),

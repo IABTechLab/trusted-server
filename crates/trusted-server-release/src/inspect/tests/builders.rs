@@ -6,19 +6,24 @@
 use object::elf as elf_format;
 use object::macho as macho_format;
 
+/// One non-loaded ELF section `(name, sh_type, payload)`.
+pub(crate) type ExtraSection = (&'static str, u32, &'static [u8]);
+
 /// Parameters of a synthetic `x86_64` ELF executable.
-pub(super) struct ElfSpec {
-    pub(super) machine: u16,
-    pub(super) interpreter: Option<&'static str>,
-    pub(super) needed: Vec<&'static str>,
-    pub(super) runpath: Option<&'static str>,
-    pub(super) requirements: Vec<(&'static str, Vec<&'static str>)>,
-    pub(super) payload: &'static [u8],
+pub(crate) struct ElfSpec {
+    pub(crate) machine: u16,
+    pub(crate) interpreter: Option<&'static str>,
+    pub(crate) needed: Vec<&'static str>,
+    pub(crate) runpath: Option<&'static str>,
+    pub(crate) requirements: Vec<(&'static str, Vec<&'static str>)>,
+    pub(crate) payload: &'static [u8],
+    /// Non-loaded sections after `.shstrtab`.
+    pub(crate) debug_sections: Vec<ExtraSection>,
 }
 
 impl ElfSpec {
     /// A conforming `ts`-like executable at the glibc 2.34 ceiling.
-    pub(super) fn conforming() -> Self {
+    pub(crate) fn conforming() -> Self {
         Self {
             machine: elf_format::EM_X86_64,
             interpreter: Some("/lib64/ld-linux-x86-64.so.2"),
@@ -29,6 +34,18 @@ impl ElfSpec {
                 ("libc.so.6", vec!["GLIBC_2.2.5", "GLIBC_2.34", "GLIBC_2.18"]),
             ],
             payload: b"fictional rodata /opt/example/src/main.rs",
+            debug_sections: vec![
+                (
+                    ".debug_info",
+                    elf_format::SHT_PROGBITS,
+                    b"fictional dwarf info",
+                ),
+                (
+                    ".debug_line",
+                    elf_format::SHT_PROGBITS,
+                    b"fictional dwarf lines",
+                ),
+            ],
         }
     }
 }
@@ -102,9 +119,11 @@ const ELF_HEADER_SIZE: u64 = 64;
 const PROGRAM_HEADER_SIZE: u64 = 56;
 /// Section index of `.dynstr`, linked from `.dynamic` and `.gnu.version_r`.
 const DYNSTR_INDEX: u32 = 1;
+/// Section index of `.shstrtab`, after the five loader sections.
+const SHSTRTAB_INDEX: u16 = 6;
 
 /// Builds a synthetic ELF64 executable from `spec`.
-pub(super) fn elf(spec: &ElfSpec) -> Vec<u8> {
+pub(crate) fn elf(spec: &ElfSpec) -> Vec<u8> {
     let mut dynstr = Strings::new();
     let mut dynamic = spec
         .needed
@@ -152,6 +171,11 @@ pub(super) fn elf(spec: &ElfSpec) -> Vec<u8> {
     dynamic.push((elf_format::DT_NULL, 0));
     let dynamic_range = body.append(&encode_dynamic(&dynamic));
     body.0.extend_from_slice(spec.payload);
+    let debug: Vec<(&str, u32, Range)> = spec
+        .debug_sections
+        .iter()
+        .map(|(name, kind, payload)| (*name, *kind, body.append(payload)))
+        .collect();
     let count = u32::try_from(spec.requirements.len()).expect("should fit");
     let table = section_table(
         &mut body,
@@ -163,6 +187,7 @@ pub(super) fn elf(spec: &ElfSpec) -> Vec<u8> {
             versions_range,
         ],
         count,
+        &debug,
     );
     let mut header = Writer::default();
     write_elf_header(&mut header, spec.machine, segments, body.offset(), &table);
@@ -193,9 +218,16 @@ fn encode_dynamic(entries: &[(u32, u64)]) -> Vec<u8> {
 }
 
 /// Appends `.shstrtab` to `body` and returns the non-null section headers
-/// for `[.dynstr, .dynamic, .gnu.version_r]` plus `.shstrtab`.
-fn section_table(body: &mut Writer, ranges: [Range; 5], requirements: u32) -> Vec<Section> {
+/// for `[.dynstr, .dynamic, .gnu.version_r, .dynsym, .gnu.version]`, then
+/// `.shstrtab` at [`SHSTRTAB_INDEX`], then the `debug` sections.
+fn section_table(
+    body: &mut Writer,
+    ranges: [Range; 5],
+    requirements: u32,
+    debug: &[(&str, u32, Range)],
+) -> Vec<Section> {
     let mut names = Strings::new();
+    let debug_names: Vec<u32> = debug.iter().map(|(name, _, _)| names.add(name)).collect();
     let [dynstr, dynamic, verneed, symbols, versions] = ranges;
     let mut table = vec![
         Section {
@@ -250,6 +282,16 @@ fn section_table(body: &mut Writer, ranges: [Range; 5], requirements: u32) -> Ve
         info: 0,
         entry_size: 0,
     });
+    for (name, (_, kind, range)) in debug_names.into_iter().zip(debug) {
+        table.push(Section {
+            name,
+            kind: *kind,
+            range: *range,
+            link: 0,
+            info: 0,
+            entry_size: 0,
+        });
+    }
     table
 }
 
@@ -307,7 +349,7 @@ fn write_elf_header(
     out.u16(u16::try_from(segments).expect("should fit"));
     out.u16(64);
     out.u16(u16::try_from(table.len() + 1).expect("should fit"));
-    out.u16(u16::try_from(table.len()).expect("should fit"));
+    out.u16(SHSTRTAB_INDEX);
 }
 
 fn program_header(out: &mut Writer, kind: u32, (offset, size): Range) {

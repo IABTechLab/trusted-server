@@ -10,13 +10,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use error_stack::Report;
 use sha2::{Digest as _, Sha256};
 
-use super::artifact::{EXECUTABLE_LIMIT, copy_artifact};
+use super::artifact::{CopiedArtifact, EXECUTABLE_LIMIT, copy_artifact};
 use super::cargo_output::{ExpectedBinary, locate_host_binary};
 use super::completed::SuccessFacts;
 use super::{Authority, ExecutionPaths, PreparedRecipe, RecipeCompleted, recipe_error};
 use crate::boundary::{Boundary, DenialProof};
 use crate::error::ReleaseError;
-use crate::inspect::inspect_wasm;
+use crate::inspect::{ElfPolicy, inspect_elf, inspect_wasm};
 use crate::policy::ReleaseTarget;
 use crate::process::ProcessLimits;
 use crate::tool_tree::tool_tree_digest;
@@ -193,15 +193,16 @@ impl PreparedRecipe {
     /// Turns one successful run into a [`RecipeCompleted`].
     ///
     /// Parses Cargo's stream, maps the executable back through a writable
-    /// root, copies it into the output directory and, for Wasm, requires the
-    /// debug sections a stripped module lacks.
+    /// root, copies it into the output directory and inspects the copy: a
+    /// Wasm module or Linux executable must pass its inspector and keep the
+    /// debug sections a stripped file lacks.
     ///
     /// # Errors
     ///
     /// Returns [`ReleaseError::Recipe`] when the tools or materials changed,
-    /// the stream is not exactly one fresh debug-info binary, the executable
-    /// cannot be copied, or a Wasm artifact is stripped, or
-    /// [`ReleaseError::Inspect`] when the Wasm module is rejected.
+    /// the stream is not exactly one fresh debug-info binary, or the
+    /// executable cannot be copied, or [`ReleaseError::Inspect`] when the
+    /// Wasm module or Linux executable is rejected or stripped.
     pub(super) fn complete(
         self,
         run: RunOutput,
@@ -240,15 +241,7 @@ impl PreparedRecipe {
             artifact.name,
             EXECUTABLE_LIMIT,
         )?;
-        if artifact.target == ReleaseTarget::Wasm32Wasip1 {
-            let bytes = std::fs::read(copied.path()).map_err(|error| {
-                recipe_error(format!("cannot read the copied artifact: {error}"))
-            })?;
-            if hex::encode(Sha256::digest(&bytes)) != copied.sha256() {
-                return Err(recipe_error("copied artifact changed before inspection"));
-            }
-            inspect_wasm(&bytes)?.require_debug_sections()?;
-        }
+        inspect_copied(artifact.target, &copied)?;
         if self.tools.authority() == Authority::Qualified
             && !self.materials.derived_manifest_digests().is_empty()
         {
@@ -277,6 +270,41 @@ impl PreparedRecipe {
             normalized_manifest_digests: self.materials.normalized_manifest_digests().clone(),
             derived_manifest_digests: self.materials.derived_manifest_digests().clone(),
         })
+    }
+}
+
+/// Inspects the copied final bytes of a Wasm or Linux artifact.
+///
+/// Wasm must be a core module that kept its debug sections. A Linux
+/// executable must pass the reviewed glibc 2.34 ELF policy (`x86_64`, the
+/// reviewed loader and libraries, no search path, no runner path) and keep
+/// its DWARF sections. macOS executables never reach a completed run while
+/// their boundary stays closed, and are inspected by their own gate.
+///
+/// # Errors
+///
+/// Returns [`ReleaseError::Recipe`] when the copy cannot be read or changed
+/// after it was hashed, or [`ReleaseError::Inspect`] when the bytes are
+/// rejected.
+fn inspect_copied(
+    target: ReleaseTarget,
+    copied: &CopiedArtifact,
+) -> Result<(), Report<ReleaseError>> {
+    if !matches!(
+        target,
+        ReleaseTarget::Wasm32Wasip1 | ReleaseTarget::X86_64UnknownLinuxGnu
+    ) {
+        return Ok(());
+    }
+    let bytes = std::fs::read(copied.path())
+        .map_err(|error| recipe_error(format!("cannot read the copied artifact: {error}")))?;
+    if hex::encode(Sha256::digest(&bytes)) != copied.sha256() {
+        return Err(recipe_error("copied artifact changed before inspection"));
+    }
+    if target == ReleaseTarget::Wasm32Wasip1 {
+        inspect_wasm(&bytes)?.require_debug_sections()
+    } else {
+        inspect_elf(&bytes, &ElfPolicy::linux_x86_64_gnu())?.require_debug_sections()
     }
 }
 

@@ -2,7 +2,7 @@
 
 use object::elf as elf_format;
 
-use super::builders::{ElfSpec, MachoSpec, elf, macho};
+use super::builders::{ElfSpec, ExtraSection, MachoSpec, elf, macho};
 use super::*;
 
 fn inspect(spec: &ElfSpec) -> Result<ElfFacts, Report<ReleaseError>> {
@@ -306,4 +306,61 @@ fn truncated_executables_are_rejected_without_panic() {
     assert_truncations_rejected(&elf(&ElfSpec::conforming()), |bytes| {
         inspect_elf(bytes, &policy)
     });
+}
+
+#[test]
+fn retained_debug_sections_are_recorded_and_required() {
+    let facts = inspect(&ElfSpec::conforming()).expect("should accept a conforming executable");
+
+    let recorded: Vec<(&str, usize)> = facts
+        .debug_sections()
+        .iter()
+        .map(|section| (section.name(), section.size()))
+        .collect();
+    assert_eq!(
+        recorded,
+        [(".debug_info", 20), (".debug_line", 21)],
+        "should record each required DWARF section with its file bytes"
+    );
+    facts
+        .require_debug_sections()
+        .expect("should accept an executable that kept its debug info");
+}
+
+#[test]
+fn stripped_or_empty_debug_sections_are_rejected() {
+    let cases: [(&str, Vec<ExtraSection>); 4] = [
+        ("stripped", Vec::new()),
+        (
+            "missing line table",
+            vec![(".debug_info", elf_format::SHT_PROGBITS, b"fictional dwarf")],
+        ),
+        (
+            "empty info",
+            vec![
+                (".debug_info", elf_format::SHT_PROGBITS, b""),
+                (".debug_line", elf_format::SHT_PROGBITS, b"fictional dwarf"),
+            ],
+        ),
+        (
+            "no file bytes",
+            vec![
+                (".debug_info", elf_format::SHT_PROGBITS, b"fictional dwarf"),
+                (".debug_line", elf_format::SHT_NOBITS, b"fictional dwarf"),
+            ],
+        ),
+    ];
+    for (label, debug_sections) in cases {
+        let spec = ElfSpec {
+            debug_sections,
+            ..ElfSpec::conforming()
+        };
+        let facts = inspect(&spec).expect("should record, not reject, missing debug info");
+
+        assert_eq!(
+            violation(facts.require_debug_sections()),
+            Violation::ElfDebugInfo,
+            "should reject the {label} executable"
+        );
+    }
 }

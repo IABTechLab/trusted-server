@@ -110,6 +110,10 @@ pub(crate) enum Violation {
     /// was stripped.
     #[display("WebAssembly module lacks a required nonempty debug section")]
     WasmDebugInfo,
+    /// A required DWARF section of an ELF executable is missing or holds no
+    /// file bytes, so the executable was stripped.
+    #[display("ELF executable lacks a required nonempty debug section")]
+    ElfDebugInfo,
     /// The module is not a Fastly Compute WASI command: `_start` or `memory`
     /// is missing or mistyped, or the downstream request ABI is not imported.
     #[display("WebAssembly module lacks the Fastly Compute entry ABI")]
@@ -253,6 +257,25 @@ pub(crate) struct VersionRequirement {
     name: String,
 }
 
+/// One section of an ELF executable named like a required DWARF section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ElfDebugSection {
+    name: String,
+    size: usize,
+}
+
+impl ElfDebugSection {
+    /// Section name, one of the required DWARF section names.
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// File bytes the section holds; zero for `SHT_NOBITS`.
+    pub(crate) fn size(&self) -> usize {
+        self.size
+    }
+}
+
 /// Facts observed in an accepted ELF executable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ElfFacts {
@@ -261,9 +284,41 @@ pub(crate) struct ElfFacts {
     needed: Vec<String>,
     version_requirements: Vec<VersionRequirement>,
     max_glibc: GlibcVersion,
+    debug_sections: Vec<ElfDebugSection>,
 }
 
 impl ElfFacts {
+    /// Sections named like a required DWARF section, in file order.
+    pub(crate) fn debug_sections(&self) -> &[ElfDebugSection] {
+        &self.debug_sections
+    }
+
+    /// Requires nonempty `.debug_info` and `.debug_line` sections.
+    ///
+    /// Release executables keep limited debug info (`debug = 1`) and are
+    /// never stripped, so a missing or empty section means the bytes are not
+    /// the profile's output.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Violation::ElfDebugInfo`] naming the first required section
+    /// that is absent or holds no file bytes in every occurrence.
+    pub(crate) fn require_debug_sections(&self) -> Result<(), Report<ReleaseError>> {
+        for required in REQUIRED_DEBUG_SECTIONS {
+            let present = self
+                .debug_sections
+                .iter()
+                .any(|section| section.name == required && section.size > 0);
+            if !present {
+                return Err(rejected(
+                    Violation::ElfDebugInfo,
+                    format!("missing or empty section {required}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Lowercase hex SHA-256 of the inspected bytes.
     pub(crate) fn sha256(&self) -> &str {
         &self.sha256
@@ -416,7 +471,8 @@ pub(crate) struct WasmFacts {
     exports: Vec<WasmExport>,
 }
 
-/// DWARF sections whose presence proves the module was not stripped.
+/// DWARF sections whose nonempty presence proves a Wasm module or ELF
+/// executable was not stripped.
 const REQUIRED_DEBUG_SECTIONS: [&str; 2] = [".debug_info", ".debug_line"];
 
 /// Hostcall modules a Fastly program must import to receive the downstream

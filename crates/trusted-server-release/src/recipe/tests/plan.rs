@@ -42,6 +42,26 @@ fn expected_remap(triple: &str) -> Vec<String> {
     ]
 }
 
+/// The exact C path remap a native asset's plan sets for the fixture layout.
+fn expected_c_prefix_map() -> String {
+    [
+        ("/boundary/immutable/0", "/trusted-server"),
+        ("/boundary/immutable/2/vendor", "/cargo-vendor"),
+        ("/boundary/writable/0/cargo-home", "/cargo-home"),
+        ("/boundary/tool/0", "/rust-tools"),
+        ("/boundary/writable/1", "/cargo-target"),
+    ]
+    .iter()
+    .flat_map(|(from, to)| {
+        [
+            format!("-ffile-prefix-map={from}={to}"),
+            format!("-fdebug-prefix-map={from}={to}"),
+        ]
+    })
+    .collect::<Vec<_>>()
+    .join(" ")
+}
+
 #[test]
 fn cargo_plan_has_fixed_release_frozen_json_flags_and_exact_source_replacement() {
     assert!(
@@ -143,6 +163,12 @@ fn assert_environment(actual: &BTreeMap<String, String>, fixture: &Fixture, targ
     );
     if target.is_darwin() {
         expected.insert("MACOSX_DEPLOYMENT_TARGET".to_owned(), "13.0".to_owned());
+    }
+    if target != ReleaseTarget::Wasm32Wasip1 {
+        expected.insert(
+            format!("CFLAGS_{}", target.triple().replace('-', "_")),
+            expected_c_prefix_map(),
+        );
     }
     assert_eq!(
         actual, &expected,

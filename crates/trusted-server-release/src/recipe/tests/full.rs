@@ -39,7 +39,7 @@ const DENIAL_EPOCH: u64 = 1_700_000_000;
 const ATTEMPTS: [&str; 3] = ["build-direct", "build-grandchild", "macro-attempt"];
 
 /// Reads the ordinary CI Cargo fixture named by `TS_RELEASE_CARGO_FIXTURE_ROOT`.
-fn cargo_fixture() -> CargoFixture {
+pub(super) fn cargo_fixture() -> CargoFixture {
     let root = std::env::var_os("TS_RELEASE_CARGO_FIXTURE_ROOT")
         .map(PathBuf::from)
         .expect("should explicitly supply the ordinary CI Cargo fixture root");
@@ -63,7 +63,14 @@ fn minimal_environment() -> AuditedEnvironment {
 /// are profile labels, while the child runs with the normalized `C` locale
 /// and `UTC` timezone either way. This is not an independent qualified
 /// observation, and the production reproduction build stays unqualified.
-fn ordinary_ci_ambient(role: Role, checkout: &Path) -> CheckedAmbient {
+pub(super) fn ordinary_ci_ambient(role: Role, checkout: &Path) -> CheckedAmbient {
+    try_ordinary_ci_ambient(role, checkout).expect("should match the role profile")
+}
+
+pub(super) fn try_ordinary_ci_ambient(
+    role: Role,
+    checkout: &Path,
+) -> Result<CheckedAmbient, Report<ReleaseError>> {
     let (profile, base) = match role {
         Role::Canonical => (AmbientProfile::CANONICAL, observed_canonical()),
         Role::Reproduction => (
@@ -75,7 +82,7 @@ fn ordinary_ci_ambient(role: Role, checkout: &Path) -> CheckedAmbient {
     let execution_uid = unsafe { libc::getuid() };
     let started_at_seconds = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .expect("should read a clock after the Unix epoch")
+        .map_err(|error| recipe_error(format!("cannot read ambient clock: {error}")))?
         .as_secs();
     CheckedAmbient::check(
         role,
@@ -87,53 +94,63 @@ fn ordinary_ci_ambient(role: Role, checkout: &Path) -> CheckedAmbient {
             ..base
         },
     )
-    .expect("should match the role profile")
 }
 
 /// A configured container boundary with its proof for this instance.
-struct Proven {
+pub(super) struct Proven {
     _state: tempfile::TempDir,
-    boundary: Boundary,
-    proof: DenialProof,
+    pub(super) boundary: Boundary,
+    pub(super) proof: DenialProof,
 }
 
-/// Configures the exact recipe boundary and proves its denial.
-fn proven_boundary(prepared: &PreparedRecipe, fixture: &CargoFixture) -> Proven {
-    let state = tempfile::tempdir().expect("should create disjoint boundary host state");
+/// Configures the exact recipe boundary in the image `image_id` and proves
+/// its denial.
+pub(super) fn proven_boundary(
+    prepared: &PreparedRecipe,
+    fixture: &CargoFixture,
+    image_id: &str,
+) -> Proven {
+    try_proven_boundary(prepared, fixture, image_id)
+        .expect("should prove the exact recipe boundary")
+}
+
+pub(super) fn try_proven_boundary(
+    prepared: &PreparedRecipe,
+    fixture: &CargoFixture,
+    image_id: &str,
+) -> Result<Proven, Report<ReleaseError>> {
+    let state = tempfile::tempdir()
+        .map_err(|error| recipe_error(format!("cannot create boundary state: {error}")))?;
+
     // These IDs only select the existing unprivileged CI worker account.
     let user = unsafe { (libc::getuid(), libc::getgid()) };
     let parallelism = std::thread::available_parallelism()
         .map_or(1, |count| u32::try_from(count.get()).unwrap_or(u32::MAX));
     let boundary = Boundary::linux_container(
-        prepared
-            .boundary_roots()
-            .expect("should derive the exact recipe roots"),
+        prepared.boundary_roots()?,
         cargo_docker_settings(user, parallelism),
         ImageSelection::Test {
-            id: fixture.image_id.clone(),
+            id: image_id.to_owned(),
         },
         state.path(),
-    )
-    .expect("should configure the owned PID/network container boundary");
-    let probe = ProbeProgram::from_staged_release_binary(&fixture.probe())
-        .expect("should select the staged producer probe");
+    )?;
+    let probe = ProbeProgram::from_staged_release_binary(&fixture.probe())?;
     let limits = ProcessLimits {
         wall: Duration::from_secs(60),
         stdout_max: 4096,
         stderr_max: 4096,
     };
-    let proof = boundary
-        .establish_denial(&probe, limits)
-        .expect("should establish real positive and denied socket controls");
-    assert!(
-        matches!(proof.denied_errno(), libc::EPERM | libc::EACCES),
-        "should prove denial by the seccomp profile, not by a missing route"
-    );
-    Proven {
+    let proof = boundary.establish_denial(&probe, limits)?;
+    if !matches!(proof.denied_errno(), libc::EPERM | libc::EACCES) {
+        return Err(recipe_error(
+            "denial proof does not establish seccomp denial",
+        ));
+    }
+    Ok(Proven {
         _state: state,
         boundary,
         proof,
-    }
+    })
 }
 
 /// Copies a tree of directories and regular files into a new directory.
@@ -227,7 +244,7 @@ fn cargo_children_inherit_denial() {
     let mut proof_errno = None;
     for case in ATTEMPTS {
         let bound = bind_denial_case(&fixture, case);
-        let proven = proven_boundary(&bound.prepared, &fixture);
+        let proven = proven_boundary(&bound.prepared, &fixture, &fixture.image_id);
         let errno = proven.proof.denied_errno();
         let error = bound
             .prepared
@@ -249,7 +266,7 @@ fn cargo_children_inherit_denial() {
         proof_errno = Some(errno);
     }
     let bound = bind_denial_case(&fixture, "control");
-    let proven = proven_boundary(&bound.prepared, &fixture);
+    let proven = proven_boundary(&bound.prepared, &fixture, &fixture.image_id);
     let control = bound
         .prepared
         .execute(&proven.boundary, &proven.proof)
@@ -278,25 +295,30 @@ fn cargo_children_inherit_denial() {
 /// The fixture's `cargo vendor` manifests only name which locked Git packages
 /// to supply closures for; the producer normalizes every inheriting manifest
 /// itself from the verified tree.
-fn prepare_vendor(
+pub(super) fn prepare_vendor(
     fixture: &CargoFixture,
     locked: &LockedMaterials,
     root: &Path,
     deadline: Instant,
     cancellation: &Cancellation,
 ) -> PreparedCargoMaterials {
-    let collection = locked
-        .git_collection(Path::new("/usr/bin/git"), deadline, cancellation)
-        .expect("should select the runner Git for object verification only");
+    try_prepare_vendor(fixture, locked, root, deadline, cancellation)
+        .expect("should vendor every locked original")
+}
+
+pub(super) fn try_prepare_vendor(
+    fixture: &CargoFixture,
+    locked: &LockedMaterials,
+    root: &Path,
+    deadline: Instant,
+    cancellation: &Cancellation,
+) -> Result<PreparedCargoMaterials, Report<ReleaseError>> {
+    let collection = locked.git_collection(Path::new("/usr/bin/git"), deadline, cancellation)?;
     let verified: Vec<_> = fixture
         .git
         .iter()
-        .map(|source| {
-            collection
-                .verify(&source.selector, &source.revision, &source.objects)
-                .expect("should verify the retained locked Git closure")
-        })
-        .collect();
+        .map(|source| collection.verify(&source.selector, &source.revision, &source.objects))
+        .collect::<Result<_, _>>()?;
     let inputs: Vec<GitVendorInput<'_>> = fixture
         .comparison_manifests
         .iter()
@@ -305,25 +327,23 @@ fn prepare_vendor(
                 .git
                 .iter()
                 .position(|source| source.selector == package.selector)
-                .expect("should name a retained Git source");
-            GitVendorInput {
+                .ok_or_else(|| recipe_error("comparison manifest names no retained Git source"))?;
+            Ok(GitVendorInput {
                 material: &verified[index],
                 name: &package.name,
                 version: &package.version,
-            }
+            })
         })
-        .collect();
-    locked
-        .prepare_cargo_vendor(
-            &VendorInputs {
-                registry_archives: &fixture.registry,
-                git: &inputs,
-            },
-            root,
-            deadline,
-            cancellation,
-        )
-        .expect("should vendor every locked original")
+        .collect::<Result<_, Report<ReleaseError>>>()?;
+    locked.prepare_cargo_vendor(
+        &VendorInputs {
+            registry_archives: &fixture.registry,
+            git: &inputs,
+        },
+        root,
+        deadline,
+        cancellation,
+    )
 }
 
 /// Compares every producer-normalized manifest with the one `cargo vendor`
@@ -392,7 +412,7 @@ struct FastlyBuild {
     differential: serde_json::Value,
 }
 
-fn path_text(path: &Path) -> String {
+pub(super) fn path_text(path: &Path) -> String {
     path.to_str().expect("should be a UTF-8 path").to_owned()
 }
 
@@ -459,7 +479,7 @@ fn build_fastly(
         request,
     )
     .expect("should bind the real source, handoff, tools and materials");
-    let proven = proven_boundary(&prepared, fixture);
+    let proven = proven_boundary(&prepared, fixture, &fixture.image_id);
     let execution_checkout = path_text(
         &proven
             .boundary

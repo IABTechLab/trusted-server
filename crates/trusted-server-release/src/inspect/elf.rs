@@ -14,8 +14,8 @@ use object::read::elf::{Dyn as _, FileHeader as _, ProgramHeader as _, SectionHe
 use object::read::{SectionIndex, StringTable};
 
 use super::{
-    ElfFacts, GlibcVersion, RUNNER_PATH_PREFIXES, VersionRequirement, Violation, malformed,
-    reject_denied_paths, rejected, sha256_hex, utf8,
+    ElfDebugSection, ElfFacts, GlibcVersion, REQUIRED_DEBUG_SECTIONS, RUNNER_PATH_PREFIXES,
+    VersionRequirement, Violation, malformed, reject_denied_paths, rejected, sha256_hex, utf8,
 };
 use crate::error::ReleaseError;
 
@@ -76,7 +76,9 @@ impl ElfPolicy {
 /// not a little-endian 64-bit `x86_64` executable, the interpreter differs,
 /// a `DT_NEEDED` entry is outside the allowlist, `DT_RPATH`/`DT_RUNPATH` (or
 /// a filter) is present, a version requirement is unparsable or above the
-/// glibc ceiling, or a runner-only path is embedded anywhere in the file.
+/// glibc ceiling, a section name or debug section is malformed, or a
+/// runner-only path is embedded anywhere in the file. Missing debug info is
+/// recorded, not rejected here; see [`ElfFacts::require_debug_sections`].
 pub(crate) fn inspect_elf(
     bytes: &[u8],
     policy: &ElfPolicy,
@@ -109,6 +111,7 @@ pub(crate) fn inspect_elf(
     }
     let version_requirements = version_requirements(endian, bytes, &sections)?;
     let max_glibc = check_versions(&version_requirements, &needed, policy.glibc_maximum)?;
+    let debug_sections = debug_sections(endian, bytes, &sections)?;
     reject_denied_paths(bytes, policy.denied_path_prefixes)?;
     Ok(ElfFacts {
         sha256: sha256_hex(bytes),
@@ -116,7 +119,44 @@ pub(crate) fn inspect_elf(
         needed,
         version_requirements,
         max_glibc,
+        debug_sections,
     })
+}
+
+/// Returns every section named like a required DWARF section, with the
+/// number of file bytes it holds (zero for `SHT_NOBITS`).
+///
+/// Recording is not acceptance: [`ElfFacts::require_debug_sections`] decides.
+fn debug_sections(
+    endian: Endianness,
+    bytes: &[u8],
+    sections: &Sections<'_>,
+) -> Result<Vec<ElfDebugSection>, Report<ReleaseError>> {
+    let mut found = Vec::new();
+    for section in sections.iter() {
+        let name = sections
+            .section_name(endian, section)
+            .map_err(|error| malformed("ELF section name", error))?;
+        let Some(required) = REQUIRED_DEBUG_SECTIONS
+            .iter()
+            .find(|required| required.as_bytes() == name)
+        else {
+            continue;
+        };
+        let size = if section.sh_type(endian) == format::SHT_NOBITS {
+            0
+        } else {
+            section
+                .data(endian, bytes)
+                .map_err(|error| malformed("ELF debug section", error))?
+                .len()
+        };
+        found.push(ElfDebugSection {
+            name: (*required).to_owned(),
+            size,
+        });
+    }
+    Ok(found)
 }
 
 /// Requires a little-endian `x86_64` `ET_EXEC`/`ET_DYN` file.

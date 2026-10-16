@@ -1,7 +1,7 @@
 use super::super::paths::PrefixPaths;
 use super::super::remap::{
-    REMAPPED_PREFIXES, RemapSources, check_cargo_config, check_no_extensionless_config,
-    remap_arguments, scan_remapped_bytes,
+    REMAPPED_PREFIXES, RemapSources, c_prefix_map_environment, check_cargo_config,
+    check_no_extensionless_config, remap_arguments, scan_remapped_bytes,
 };
 use super::fixture::*;
 use super::*;
@@ -268,6 +268,54 @@ fn remap_scan_requires_a_fixed_prefix_and_no_unremapped_path() {
         assert!(
             scan_remapped_bytes(clean, forbidden).is_err(),
             "should bound the forbidden prefixes"
+        );
+    }
+}
+
+#[test]
+fn native_c_code_gets_the_same_remap_and_wasm_gets_none() {
+    let roots = sources("/x/checkout", "/x/vendor");
+    assert_eq!(
+        c_prefix_map_environment(ReleaseTarget::Wasm32Wasip1, &roots)
+            .expect("should accept disjoint roots"),
+        None,
+        "should leave the Fastly plan without C flags"
+    );
+    let (name, value) = c_prefix_map_environment(ReleaseTarget::X86_64UnknownLinuxGnu, &roots)
+        .expect("should accept disjoint roots")
+        .expect("should remap C code of a native asset");
+    assert_eq!(
+        name, "CFLAGS_x86_64_unknown_linux_gnu",
+        "should use the target-scoped name cc reads first"
+    );
+    assert_eq!(
+        value,
+        [
+            "-ffile-prefix-map=/x/checkout=/trusted-server",
+            "-fdebug-prefix-map=/x/checkout=/trusted-server",
+            "-ffile-prefix-map=/x/vendor=/cargo-vendor",
+            "-fdebug-prefix-map=/x/vendor=/cargo-vendor",
+            "-ffile-prefix-map=/x/state/cargo-home=/cargo-home",
+            "-fdebug-prefix-map=/x/state/cargo-home=/cargo-home",
+            "-ffile-prefix-map=/x/tools=/rust-tools",
+            "-fdebug-prefix-map=/x/tools=/rust-tools",
+            "-ffile-prefix-map=/x/target=/cargo-target",
+            "-fdebug-prefix-map=/x/target=/cargo-target",
+        ]
+        .join(" "),
+        "should map every root to the same fixed prefix rustc uses"
+    );
+}
+
+#[test]
+fn native_c_remap_rejects_split_or_overlapping_roots() {
+    for (label, roots) in [
+        ("whitespace", sources("/x/check out", "/x/vendor")),
+        ("nested", sources("/x/checkout", "/x/checkout/vendor")),
+    ] {
+        assert!(
+            c_prefix_map_environment(ReleaseTarget::X86_64UnknownLinuxGnu, &roots).is_err(),
+            "should reject a {label} root"
         );
     }
 }

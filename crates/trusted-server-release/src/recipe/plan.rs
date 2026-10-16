@@ -16,7 +16,7 @@ use sha2::{Digest as _, Sha256};
 
 use super::ambient::CheckedAmbient;
 use super::paths::{ExecutionPaths, execution_text};
-use super::remap::{RemapSources, remap_arguments};
+use super::remap::{RemapSources, c_prefix_map_environment, remap_arguments};
 use super::sources::source_replacement_arguments;
 use super::tools::SelectedRustTools;
 use super::{AssetId, RecipeRequest, recipe_error};
@@ -162,15 +162,17 @@ pub(super) struct PlanInputs<'a> {
 /// Derives the exact Cargo invocation from the bound inputs.
 ///
 /// The arguments carry the source replacement and the deterministic target
-/// path remap of [`super::remap`], so both are bound by [`CargoPlan::digest`].
+/// path remap of [`super::remap`]; a native asset's environment also carries
+/// the same remap for C code. All of it is bound by [`CargoPlan::digest`].
 ///
 /// # Errors
 ///
 /// Returns [`ReleaseError::Recipe`] when the child environment's `HOME` or
 /// `CARGO_HOME` is not the request's private state, or any path variable,
 /// the tool directory, the vendor directory, the checkout root or the Rust
-/// tool root lies outside the boundary roots or is not plain text, or two
-/// remapped roots overlap in the execution namespace.
+/// tool root lies outside the boundary roots or is not plain text, two
+/// remapped roots overlap in the execution namespace, or a native asset's
+/// remapped root holds whitespace.
 pub(super) fn plan_for(inputs: &PlanInputs<'_>) -> Result<CargoPlan, Report<ReleaseError>> {
     let PlanInputs {
         request,
@@ -204,16 +206,21 @@ pub(super) fn plan_for(inputs: &PlanInputs<'_>) -> Result<CargoPlan, Report<Rele
     );
     let vendor = execution_text(*paths, "vendor directory", materials.vendor_dir())?;
     let mut configs = source_replacement_arguments(&vendor, materials.git_sources());
-    configs.extend(remap_arguments(
-        request.asset().artifact().target.triple(),
-        &RemapSources {
-            checkout: &execution_text(*paths, "checkout root", ambient.checkout_root())?,
-            vendor: &vendor,
-            cargo_home: &environment[CARGO_HOME_VARIABLE],
-            tools: &execution_text(*paths, "Rust tools root", tools.root())?,
-            target: &environment[TARGET_DIR_VARIABLE],
-        },
-    )?);
+    let target = request.asset().artifact().target;
+    let checkout = execution_text(*paths, "checkout root", ambient.checkout_root())?;
+    let tool_root = execution_text(*paths, "Rust tools root", tools.root())?;
+    let sources = RemapSources {
+        checkout: &checkout,
+        vendor: &vendor,
+        cargo_home: &environment[CARGO_HOME_VARIABLE],
+        tools: &tool_root,
+        target: &environment[TARGET_DIR_VARIABLE],
+    };
+    configs.extend(remap_arguments(target.triple(), &sources)?);
+    let c_prefix_map = c_prefix_map_environment(target, &sources)?;
+    if let Some((name, value)) = c_prefix_map {
+        environment.insert(name, value);
+    }
     Ok(CargoPlan {
         asset: request.asset(),
         program: tools.cargo(),

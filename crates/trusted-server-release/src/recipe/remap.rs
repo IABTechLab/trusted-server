@@ -38,6 +38,8 @@
 //!
 //! With an explicit `--target`, rustflags reach only target units, never
 //! build scripts or procedural macros: exactly the code in the artifact.
+//! C code those build scripts compile into a native artifact gets the same
+//! maps through [`c_prefix_map_environment`].
 
 use std::io;
 use std::path::Path;
@@ -47,6 +49,7 @@ use error_stack::Report;
 use super::fresh::disjoint;
 use super::recipe_error;
 use crate::error::ReleaseError;
+use crate::policy::ReleaseTarget;
 
 /// Tracked Cargo configuration Cargo reads from the checkout root.
 pub(super) const CARGO_CONFIG: &str = ".cargo/config.toml";
@@ -100,6 +103,20 @@ pub(super) fn remap_arguments(
     triple: &str,
     sources: &RemapSources<'_>,
 ) -> Result<Vec<String>, Report<ReleaseError>> {
+    let flags: Vec<String> = remapped_pairs(sources)?
+        .map(|(from, to)| format!("\"--remap-path-prefix={from}={to}\""))
+        .collect();
+    Ok(vec![
+        "--config".to_owned(),
+        format!("target.\"{triple}\".rustflags=[{}]", flags.join(",")),
+    ])
+}
+
+/// Pairs every source root with its fixed prefix after requiring the roots
+/// to be pairwise disjoint.
+fn remapped_pairs<'a>(
+    sources: &RemapSources<'a>,
+) -> Result<impl Iterator<Item = (&'a str, &'static str)>, Report<ReleaseError>> {
     let pairs = [
         ("remapped checkout", sources.checkout),
         ("remapped vendor directory", sources.vendor),
@@ -112,15 +129,52 @@ pub(super) fn remap_arguments(
         .map(|(label, from)| (*label, Path::new(*from)))
         .collect();
     disjoint(&labelled)?;
-    let flags: Vec<String> = pairs
-        .iter()
-        .zip(REMAPPED_PREFIXES)
-        .map(|((_, from), to)| format!("\"--remap-path-prefix={from}={to}\""))
-        .collect();
-    Ok(vec![
-        "--config".to_owned(),
-        format!("target.\"{triple}\".rustflags=[{}]", flags.join(",")),
-    ])
+    Ok(pairs
+        .into_iter()
+        .map(|(_, from)| from)
+        .zip(REMAPPED_PREFIXES))
+}
+
+/// Returns the target-scoped `CFLAGS` variable that applies the same remap to
+/// C code, or `None` for Wasm.
+///
+/// Native assets link C dependencies that `cc` compiles from build scripts
+/// (bundled `SQLite`, `ring`, `aws-lc-sys`). With the profile's debug info,
+/// Cargo tells those build scripts to emit DWARF, and `__FILE__` strings and
+/// DWARF directories then hold execution paths rustc's remap never sees.
+/// `-ffile-prefix-map` rewrites both in GCC 8+ and Clang 10+;
+/// `-fdebug-prefix-map` is repeated because the GCC driver forwards only that
+/// one to the assembler for `.S` sources. `cc` reads
+/// `CFLAGS_<triple with underscores>` first, the plan sets it (the audited
+/// environment rejects every inherited `CFLAGS` form), and it is bound by the
+/// plan digest. `cc` splits the value on whitespace, so a root containing any
+/// is refused instead of silently split.
+///
+/// # Errors
+///
+/// Returns [`ReleaseError::Recipe`] when two roots overlap or a root holds
+/// whitespace.
+pub(super) fn c_prefix_map_environment(
+    target: ReleaseTarget,
+    sources: &RemapSources<'_>,
+) -> Result<Option<(String, String)>, Report<ReleaseError>> {
+    if target == ReleaseTarget::Wasm32Wasip1 {
+        return Ok(None);
+    }
+    let mut flags = Vec::new();
+    for (from, to) in remapped_pairs(sources)? {
+        if from.chars().any(char::is_whitespace) {
+            return Err(recipe_error(
+                "a remapped root holds whitespace, which cc would split",
+            ));
+        }
+        flags.push(format!("-ffile-prefix-map={from}={to}"));
+        flags.push(format!("-fdebug-prefix-map={from}={to}"));
+    }
+    Ok(Some((
+        format!("CFLAGS_{}", target.triple().replace('-', "_")),
+        flags.join(" "),
+    )))
 }
 
 /// Requires the reviewed Cargo configuration not to set `build.rustflags`.
