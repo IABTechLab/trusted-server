@@ -2946,7 +2946,8 @@ pub const ROBOTS_TXT_CACHE: &str = "robots-txt";
 pub struct LoadingCacheConfig {
     /// The module whose loading cache holds this cache's copies, as its short
     /// name or in full, for example `51degrees` or `loading-cache.51degrees`.
-    /// Absent, no copy is kept and every call loads.
+    /// Absent, the one loading cache module the build links, and with none
+    /// linked, or several, no copy is kept and every call loads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub module: Option<String>,
     /// How long the brief copy in process memory is used, in seconds. Zero

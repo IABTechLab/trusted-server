@@ -631,8 +631,8 @@ impl IntegrationBuilder {
     ///
     /// The offer is not a selection. A cache is selected by naming the module
     /// in its own `[cache.<name>]` table, and an adapter resolves every table's
-    /// selection with [`loading_caches_from`] when it builds its state. A cache
-    /// whose table selects none asks each source itself.
+    /// selection with [`loading_caches_from`] when it builds its state. A table
+    /// naming no module takes the one loading cache module the build links.
     #[must_use]
     pub const fn with_loading_cache(mut self, factory: LoadingCacheFactory) -> Self {
         self.loading_cache = Some(factory);
@@ -786,8 +786,10 @@ pub(crate) fn all_builders(
 }
 
 /// The loading cache each `[cache.<name>]` table selects, from the caches the
-/// builders a deployment links offer. A table that names no module keeps no
-/// copy, and a module's cache is made once however many tables select it.
+/// builders a deployment links offer. A table that names no module takes the
+/// one loading cache module the build links, and keeps no copy when the build
+/// links none or several. A module's cache is made once however many tables
+/// select it.
 ///
 /// # Errors
 ///

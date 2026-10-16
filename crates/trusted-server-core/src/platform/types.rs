@@ -179,9 +179,10 @@ pub struct RuntimeServices {
     pub(crate) value_cache: Option<Arc<dyn super::PlatformValueCache>>,
     /// The loading cache each `[cache.<name>]` table selected, which loads a
     /// missing value once per key and keeps its copies in
-    /// [`value_cache`](Self::value_cache) or the key-value store. A cache whose
-    /// table selected none loads through [`super::NoLoadingCache`], which holds
-    /// nothing.
+    /// [`value_cache`](Self::value_cache) or the key-value store. A table
+    /// naming no module takes the one loading cache module the build links,
+    /// and with none linked, or several, its cache loads through
+    /// [`super::NoLoadingCache`], which holds nothing.
     pub(crate) loading_caches: Arc<super::LoadingCaches>,
     /// Shared transformed-template cache. Defaults to
     /// [`UnavailableTemplateCache`], so adapters without one degrade to transforming

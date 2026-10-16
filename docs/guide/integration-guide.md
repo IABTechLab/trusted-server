@@ -799,8 +799,9 @@ supplies nothing else starts from `IntegrationBuilder::implementations(...)`
 and is named by its id. An adapter takes the selections from the settings and
 the builders it is given with `loading_caches_from` when it builds its state,
 which refuses a name no builder offers a cache from, and hands them to every
-request's services as `LoadingCaches`. A feature that selects nothing loads
-through `NoLoadingCache`. The stock list carries
+request's services as `LoadingCaches`. A feature whose table names no module
+takes the one loading cache module the build links, and loads through
+`NoLoadingCache` when the build links none or several. The stock list carries
 `crates/loading-cache/51degrees`.
 
 ```rust

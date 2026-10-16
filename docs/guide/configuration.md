@@ -1712,12 +1712,12 @@ or several, making each answer every time it is asked for. A name that no
 linked crate offers a cache from is refused when the service starts, with
 the names that could be written.
 
-| Table                | Field                | Default            | Range         | Description                                                                     |
-| -------------------- | -------------------- | ------------------ | ------------- | ------------------------------------------------------------------------------- |
-| `[cache.robots-txt]` | `module`             | none               |               | The module whose loading cache holds each robots.txt module's answer.           |
-| `[cache.robots-txt]` | `memory_seconds`     | `60`               | 0 to 31536000 | How long the copy in memory is used. Zero keeps none.                           |
-| `[cache.robots-txt]` | `store_seconds`      | `604800`, a week   | 1 to 31536000 | The longest a module's answer is used. The module's own refresh ends it sooner. |
-| `[cache.robots-txt]` | `store_idle_seconds` | `2592000`, 30 days | 1 to 31536000 | How long an answer in the shared store lasts unused.                            |
+| Table                | Field                | Default                 | Range         | Description                                                                     |
+| -------------------- | -------------------- | ----------------------- | ------------- | ------------------------------------------------------------------------------- |
+| `[cache.robots-txt]` | `module`             | the one the build links |               | The module whose loading cache holds each robots.txt module's answer.           |
+| `[cache.robots-txt]` | `memory_seconds`     | `60`                    | 0 to 31536000 | How long the copy in memory is used. Zero keeps none.                           |
+| `[cache.robots-txt]` | `store_seconds`      | `604800`, a week        | 1 to 31536000 | The longest a module's answer is used. The module's own refresh ends it sooner. |
+| `[cache.robots-txt]` | `store_idle_seconds` | `2592000`, 30 days      | 1 to 31536000 | How long an answer in the shared store lasts unused.                            |
 
 ```toml
 [cache.robots-txt]

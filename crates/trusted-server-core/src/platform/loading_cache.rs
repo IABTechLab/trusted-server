@@ -240,8 +240,9 @@ impl PlatformLoadingCache for NoLoadingCache {
 }
 
 /// The loading cache each `[cache.<name>]` table selected, by the name a
-/// [`CacheSpec`] carries. A cache whose table selected none loads through
-/// [`NoLoadingCache`].
+/// [`CacheSpec`] carries. A cache with none, being one whose table names no
+/// module where the build links no loading cache module or several, loads
+/// through [`NoLoadingCache`].
 #[derive(Default)]
 pub struct LoadingCaches {
     by_feature: HashMap<&'static str, Arc<dyn PlatformLoadingCache>>,
