@@ -169,8 +169,9 @@ pub(crate) fn request_host(req: &Request<EdgeBody>) -> &str {
 ///
 /// Read from `Host`, or from the URI's host when there is no `Host` header,
 /// and never from `Forwarded` or `X-Forwarded-Host`, which a client can set to
-/// any host it likes. What is signed for a host, or held for everyone who
-/// asks it, is keyed on this, so one request cannot claim another host.
+/// any host it likes. What is signed for a host, or held for every request to
+/// it, is keyed on this, so a forwarded header cannot put another host in its
+/// place.
 pub(crate) fn addressed_host(req: &Request<EdgeBody>) -> String {
     let raw = req
         .headers()

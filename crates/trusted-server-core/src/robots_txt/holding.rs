@@ -49,8 +49,8 @@ struct Held {
     contribution: Contribution,
 }
 
-/// Who an answer is for and who gave it, which together name where it is
-/// held.
+/// Who an answer is for and who gave it, which with the host the contributor
+/// is asked for name where it is held.
 pub(crate) struct Holder<'a> {
     /// The publisher the file is for. One store may serve several, and one
     /// publisher's rules are never another's.
