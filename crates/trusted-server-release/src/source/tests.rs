@@ -129,7 +129,9 @@ fn host_path() -> OsString {
 }
 
 fn fixture_git(root: &Path, home: &Path, args: &[&str]) -> String {
+    // Keep the duplicated fixture setup free of detached maintenance writes.
     let output = Command::new("git")
+        .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
         .args(args)
         .current_dir(root)
         .env_clear()

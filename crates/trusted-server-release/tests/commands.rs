@@ -118,7 +118,9 @@ impl SourceFixture {
     fn git(&self, args: &[&str]) -> String {
         let home = self.parent.path().join("fixture-home");
         fs::create_dir_all(&home).expect("should create fixture home");
+        // Finish fixture writes synchronously before taking no-write snapshots.
         let output = Command::new("git")
+            .args(["-c", "maintenance.auto=false", "-c", "gc.auto=0"])
             .args(args)
             .current_dir(&self.root)
             .env_clear()
