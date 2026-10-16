@@ -7527,7 +7527,8 @@ fn permissions_json_or_empty(permissions_json: &str) -> Cow<'_, str> {
 /// Build the `tsjs.adSlots` `<script>` tag from matched slots.
 ///
 /// Property names match what the client-side TSJS bundle expects:
-/// `gam_unit_path`, `div_id`, `formats`, and `targeting`.
+/// `gam_unit_path`, `div_id`, `formats`, and `targeting`, with
+/// `viewport_sizes` added when a format names a viewport bound.
 pub(crate) fn build_ad_slots_script(
     matched_slots: &[crate::creative_opportunities::CreativeOpportunitySlot],
     co_config: &crate::creative_opportunities::CreativeOpportunitiesConfig,
