@@ -316,6 +316,107 @@ describe('installTsAdInit', () => {
     }
   });
 
+  it.each([
+    { name: 'a band with sizes', viewportWidth: 375, defines: true },
+    { name: 'a band with no size', viewportWidth: 700, defines: false },
+  ])(
+    'the claim-expiry fallback applies the viewport bands ($name)',
+    async ({ viewportWidth, defines }) => {
+      vi.useFakeTimers();
+      const originalInnerWidth = window.innerWidth;
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: viewportWidth });
+      try {
+        const builder = {
+          addSize: vi.fn().mockReturnThis(),
+          build: vi.fn().mockReturnValue('built mapping'),
+        };
+        const mockSlot = {
+          addService: vi.fn().mockReturnThis(),
+          setTargeting: vi.fn().mockReturnThis(),
+          clearTargeting: vi.fn().mockReturnThis(),
+          getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+          getTargeting: vi.fn().mockReturnValue([]),
+          defineSizeMapping: vi.fn().mockReturnThis(),
+        };
+        const mockPubads = {
+          enableSingleRequest: vi.fn(),
+          // The publisher never defined the slot, so the fallback defines it.
+          getSlots: vi.fn().mockReturnValue([]),
+          addEventListener: vi.fn(),
+          refresh: vi.fn(),
+        };
+        const defineSlot = vi.fn().mockReturnValue(mockSlot);
+        (window as TestWindow).googletag = {
+          cmd: { push: vi.fn((fn: () => void) => fn()) },
+          defineSlot,
+          display: vi.fn(),
+          pubads: vi.fn().mockReturnValue(mockPubads),
+          enableServices: vi.fn(),
+          sizeMapping: vi.fn().mockReturnValue(builder),
+        };
+        const bands: Array<[[number, number], Array<[number, number]>]> = [
+          [[1040, 0], [[970, 250]]],
+          [[600, 0], []],
+          [[0, 0], [[320, 50]]],
+        ];
+        (window as TestWindow).tsjs = {
+          adSlots: [
+            {
+              id: 'atf_sidebar_ad',
+              gam_unit_path: '/123/atf',
+              div_id: 'div-atf-sidebar',
+              formats: [
+                [970, 250],
+                [320, 50],
+              ],
+              viewport_sizes: bands,
+              targeting: {},
+            },
+          ],
+          bids: {
+            atf_sidebar_ad: {
+              hb_pb: '1.10',
+              hb_adid: 'example-fallback-ad',
+              adm: '<div>Fallback</div>',
+            },
+          },
+        };
+        const ts = (window as TestWindow).tsjs as TsjsApi;
+        registerPublisherFirstImpressionAuctions(ts, ['div-atf-sidebar']);
+        const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+        installTsAdInit();
+        ts.adInit!();
+        expect(defineSlot).not.toHaveBeenCalled();
+
+        // The publisher's claim lapses and the fallback defines the slot.
+        vi.advanceTimersByTime(5001);
+
+        if (defines) {
+          expect(defineSlot).toHaveBeenCalledWith(
+            '/123/atf',
+            [
+              [970, 250],
+              [320, 50],
+            ],
+            'div-atf-sidebar'
+          );
+          expect(builder.addSize.mock.calls).toEqual(bands);
+          expect(mockSlot.defineSizeMapping).toHaveBeenCalledWith('built mapping');
+          expect(ts.viewportMappedSlots?.has(mockSlot)).toBe(true);
+        } else {
+          expect(defineSlot).not.toHaveBeenCalled();
+          expect(ts.firstImpression?.slots['div-atf-sidebar']).toBeUndefined();
+        }
+      } finally {
+        vi.useRealTimers();
+        Object.defineProperty(window, 'innerWidth', {
+          configurable: true,
+          value: originalInnerWidth,
+        });
+      }
+    }
+  );
+
   it('does not clear targeting or request again after TS claims an existing slot', async () => {
     const recordTrustedServerOpportunity = vi.fn();
     const { mockPubads, mockSlot } = configureOpportunityDiagnostics(

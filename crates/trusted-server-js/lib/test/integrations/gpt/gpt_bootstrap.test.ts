@@ -453,6 +453,121 @@ describe('gpt_bootstrap.js fallback', () => {
     }
   });
 
+  it.each([
+    { name: 'a band with sizes', viewportWidth: 375, defines: true },
+    { name: 'a band with no size', viewportWidth: 700, defines: false },
+  ])(
+    'the claim-expiry fallback applies the viewport bands ($name)',
+    ({ viewportWidth, defines }) => {
+      vi.useFakeTimers();
+      vi.setSystemTime(100);
+      const originalInnerWidth = window.innerWidth;
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: viewportWidth });
+      try {
+        const builder = {
+          addSize: vi.fn().mockReturnThis(),
+          build: vi.fn().mockReturnValue('built mapping'),
+        };
+        const mockSlot = {
+          addService: vi.fn().mockReturnThis(),
+          setTargeting: vi.fn().mockReturnThis(),
+          getSlotElementId: vi.fn().mockReturnValue('banded-fallback'),
+          defineSizeMapping: vi.fn().mockReturnThis(),
+        };
+        const pubads = {
+          getSlots: vi.fn(() => []),
+          refresh: vi.fn(),
+          enableSingleRequest: vi.fn(),
+        };
+        const defineSlot = vi.fn(() => mockSlot);
+        (window as TestWindow).googletag = makeGoogleTag({
+          cmd: { push: (command) => command() },
+          defineSlot,
+          pubads: vi.fn(() => pubads),
+          sizeMapping: vi.fn(() => builder),
+        });
+        document.body.innerHTML = '<div id="banded-fallback"></div>';
+
+        runBootstrap();
+        const ts = (window as TestWindow).tsjs!;
+        const element = document.getElementById('banded-fallback')!;
+        const publisherClaim: FirstImpressionSlotClaim = {
+          generation: 0,
+          slotElementId: element.id,
+          element,
+          owner: 'publisher',
+          phase: 'auctioning',
+          expiresAt: 5_100,
+          publisherAuctions: {
+            original: {
+              token: 'original',
+              adUnitCode: element.id,
+              phase: 'auctioning',
+              expiresAt: 5_100,
+              adIds: [],
+              suppressDelivery: false,
+            },
+          },
+        };
+        ts.firstImpression = {
+          generation: 0,
+          nextToken: 1,
+          slots: { [element.id]: publisherClaim },
+          fallbackSlots: {},
+        };
+        const bands: Array<[[number, number], Array<[number, number]>]> = [
+          [[1040, 0], [[970, 250]]],
+          [[600, 0], []],
+          [[0, 0], [[320, 50]]],
+        ];
+        ts.adSlots = [
+          {
+            id: 'banded-fallback-ad',
+            gam_unit_path: '/123/banded-fallback',
+            div_id: element.id,
+            formats: [
+              [970, 250],
+              [320, 50],
+            ],
+            viewport_sizes: bands,
+            targeting: {},
+          },
+        ];
+        ts.bids = { 'banded-fallback-ad': { hb_pb: '1.00' } };
+
+        ts.adInit!();
+        expect(defineSlot).not.toHaveBeenCalled();
+
+        // The publisher's claim lapses and the fallback defines the slot.
+        vi.advanceTimersByTime(5_001);
+
+        if (defines) {
+          expect(defineSlot).toHaveBeenCalledWith(
+            '/123/banded-fallback',
+            [
+              [970, 250],
+              [320, 50],
+            ],
+            element.id
+          );
+          expect(builder.addSize.mock.calls).toEqual(bands);
+          expect(mockSlot.defineSizeMapping).toHaveBeenCalledWith('built mapping');
+          expect(ts.viewportMappedSlots?.has(mockSlot)).toBe(true);
+        } else {
+          expect(defineSlot).not.toHaveBeenCalled();
+          expect(ts.firstImpression.slots[element.id]).toBeUndefined();
+        }
+      } finally {
+        vi.clearAllTimers();
+        vi.useRealTimers();
+        Object.defineProperty(window, 'innerWidth', {
+          configurable: true,
+          value: originalInnerWidth,
+        });
+      }
+    }
+  );
+
   it.each([true, false])(
     'settles the persistent bootstrap listener on render (empty=%s)',
     (isEmpty) => {
