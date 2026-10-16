@@ -6577,6 +6577,7 @@ dependencies = [
  "async-trait",
  "edgezero-core",
  "error-stack",
+ "futures",
  "http",
  "log",
  "serde",
@@ -7206,6 +7207,7 @@ name = "trusted-server-tag-google-tag"
 version = "0.1.0"
 dependencies = [
  "error-stack",
+ "futures",
  "log",
  "regex",
  "serde",
