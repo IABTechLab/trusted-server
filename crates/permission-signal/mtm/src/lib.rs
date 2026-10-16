@@ -237,7 +237,7 @@ impl PermissionSignalModule for MtmModule {
     }
 
     /// The word, when one is present. There is nothing else to validate,
-    /// because a value that is not one of the two words is not an answer.
+    /// because a value that is not one of the three words is not an answer.
     fn valid_signal(&self, call: ModuleCall<'_>) -> Option<ValidSignal> {
         call.inject(self, Self::read_signal).ok().flatten()
     }
@@ -332,6 +332,21 @@ mod tests {
                 Preference::parse(value).map(Preference::as_str),
                 Some(*word),
                 "the module must accept what the platform writes: {set_cookie}",
+            );
+        }
+    }
+
+    /// Every string the platform writes names the cookie this module reads, so
+    /// a change to either name fails here rather than leaving every visitor's
+    /// answer unread.
+    #[test]
+    fn the_platforms_own_set_cookie_strings_name_the_cookie_the_module_reads() {
+        for (_, set_cookie) in PMP_SET_COOKIE {
+            let pair = set_cookie.split(';').next().unwrap_or_default().trim();
+            let (name, _) = pair.split_once('=').expect("a cookie is name=value");
+            assert_eq!(
+                name, COOKIE_MTM_PREF,
+                "the module must read the name the platform writes: {set_cookie}",
             );
         }
     }
