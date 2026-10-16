@@ -859,6 +859,25 @@ impl TrustedServerApp {
         let state = build_state_with_services(settings, Some(services))?;
         Ok(build_router(&state))
     }
+
+    /// Build the full router as
+    /// [`TrustedServerApp::routes_with_registrations`] does, with every
+    /// request handed a clone of `services`, as
+    /// [`TrustedServerApp::routes_with_settings_and_services`] hands them.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors [`TrustedServerApp::routes_with_registrations`]
+    /// returns.
+    pub fn routes_with_registrations_and_services(
+        settings: Settings,
+        integrations: &[IntegrationBuilder],
+        services: RuntimeServices,
+    ) -> Result<RouterService, Report<TrustedServerError>> {
+        let state =
+            build_state_with_registrations_and_services(settings, integrations, Some(services))?;
+        Ok(build_router(&state))
+    }
 }
 
 /// Answers the attestation pages without the request preparers, because

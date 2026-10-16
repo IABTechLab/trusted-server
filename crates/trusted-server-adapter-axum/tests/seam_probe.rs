@@ -381,6 +381,71 @@ fn robots_txt_selection_naming_a_module_that_is_not_running_fails_at_startup() {
     );
 }
 
+/// This adapter leaves `Forwarded` and `X-Forwarded-Host` in place, and the
+/// probe's robots.txt rule names the host it was asked for, so the file
+/// shows that a claimed host never reaches a contributor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forwarded_host_never_reaches_a_robots_txt_module() {
+    use trusted_server_core::platform::PlatformHttpClient;
+    use trusted_server_core::platform::test_support::{
+        StubHttpClient, build_services_with_http_client,
+    };
+
+    let settings = settings_with(&format!(
+        r#"
+            [robots-txt]
+            modules = ["{module}"]
+
+            [[fetch]]
+            media_type = "text/plain"
+            path = "/robots.txt"
+            middleware = ["robots_txt"]
+            {PROBE_BLOCK}
+        "#,
+        module = seam_probe::module_name(),
+    ));
+    let origin = Arc::new(StubHttpClient::new());
+    origin.push_response_with_headers(
+        404,
+        b"not found".to_vec(),
+        vec![("content-type", "text/html")],
+    );
+    let router = TrustedServerApp::routes_with_registrations_and_services(
+        settings,
+        &[seam_probe::builder()],
+        build_services_with_http_client(Arc::clone(&origin) as Arc<dyn PlatformHttpClient>),
+    )
+    .expect("should build the router with a stub origin");
+    let mut service = EdgeZeroAxumService::new(router);
+    let request = Request::builder()
+        .method("GET")
+        .uri("/robots.txt")
+        .header("host", "test-publisher.example.com")
+        .header("x-forwarded-host", "elsewhere.example")
+        .header("forwarded", "host=elsewhere.example")
+        .body(AxumBody::empty())
+        .expect("should build request");
+
+    let response = service
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(request)
+        .await
+        .expect("should respond");
+    assert_eq!(response.status().as_u16(), 200);
+    let file = body_text(response).await;
+
+    assert!(
+        file.contains("Disallow: /test-publisher.example.com/robots.txt?"),
+        "the probe should be asked for the host addressed: {file}"
+    );
+    assert!(
+        !file.contains("elsewhere.example"),
+        "a claimed host should never reach the file: {file}"
+    );
+}
+
 /// A request prepares exactly once whether it is served by a named route or by
 /// the fallback, so the invariant holds across the whole route table rather
 /// than only on the path the probe's own proxy route sits on.
