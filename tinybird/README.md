@@ -62,7 +62,9 @@ Publisher summary rows cover requests with matching renderable slots while creat
 opportunities are enabled. They include completed auctions **and skipped candidates**:
 bots, prefetches, consent-denied readers, and requests with auctions disabled can emit a
 `Skipped` summary when slots match. A page with no matching slot, a non-GET request, or
-traffic with creative opportunities disabled produces no publisher summary.
+traffic with creative opportunities disabled produces no publisher summary, and neither
+does a reader whose permissions do not include measuring ad performance, whatever the
+outcome.
 
 The query below therefore measures shareability among matching-slot candidates, including
 skipped summaries. It is neither an ad-serving-pageview rate nor a site-wide rate. The
