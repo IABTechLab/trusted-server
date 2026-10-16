@@ -27,6 +27,21 @@ fn expected_replacement() -> Vec<String> {
     .collect()
 }
 
+/// The exact target path remap for the fixture's mount layout.
+fn expected_remap(triple: &str) -> Vec<String> {
+    let flags = [
+        "\"--remap-path-prefix=/boundary/immutable/0=/trusted-server\"",
+        "\"--remap-path-prefix=/boundary/immutable/2/vendor=/cargo-vendor\"",
+        "\"--remap-path-prefix=/boundary/writable/0/cargo-home=/cargo-home\"",
+        "\"--remap-path-prefix=/boundary/tool/0=/rust-tools\"",
+        "\"--remap-path-prefix=/boundary/writable/1=/cargo-target\"",
+    ];
+    vec![
+        "--config".to_owned(),
+        format!("target.\"{triple}\".rustflags=[{}]", flags.join(",")),
+    ]
+}
+
 #[test]
 fn cargo_plan_has_fixed_release_frozen_json_flags_and_exact_source_replacement() {
     assert!(
@@ -58,6 +73,7 @@ fn cargo_plan_has_fixed_release_frozen_json_flags_and_exact_source_replacement()
         .map(str::to_owned)
         .collect();
         expected_arguments.extend(expected_replacement());
+        expected_arguments.extend(expected_remap(artifact.target.triple()));
         expected_arguments.extend(
             ["--message-format=json-render-diagnostics", "--jobs", jobs]
                 .into_iter()
@@ -139,7 +155,7 @@ fn assert_environment(actual: &BTreeMap<String, String>, fixture: &Fixture, targ
 /// One mapped location per path-carrying variable, so each can be omitted alone.
 fn granular(fixture: &Fixture, omit: &[&str]) -> PrefixPaths {
     let retained = fixture.retained();
-    let all: [(&str, PathBuf, &str, bool); 9] = [
+    let all: [(&str, PathBuf, &str, bool); 11] = [
         ("target", fixture.base.join("target"), "/c/target", true),
         (
             "cargo-home",
@@ -174,6 +190,13 @@ fn granular(fixture: &Fixture, omit: &[&str]) -> PrefixPaths {
             "/c/vendor",
             false,
         ),
+        (
+            "checkout",
+            fixture.base.join("checkout-a"),
+            "/c/checkout",
+            false,
+        ),
+        ("tools", fixture.base.join("tools"), "/c/tools", false),
     ];
     all.iter().filter(|(name, ..)| !omit.contains(name)).fold(
         PrefixPaths::new(),
@@ -190,15 +213,17 @@ fn path_variables_outside_every_root_are_rejected() {
     prepared
         .plan(&granular(&fixture, &[]))
         .expect("should derive the plan when every location is mapped");
-    let cases: [(&str, &[&str]); 8] = [
+    let cases: [(&str, &[&str]); 10] = [
         ("CARGO_TARGET_DIR", &["target"]),
         ("CARGO_HOME", &["cargo-home"]),
         ("HOME", &["home"]),
         ("TMPDIR", &["tmp"]),
         ("TSJS_PREBUILT_DIR", &["bundles"]),
         ("TRUSTED_SERVER__TSJS_PREBUILT_INVENTORY", &["inventory"]),
-        ("RUSTC", &["rustc", "bin"]),
+        ("RUSTC", &["rustc", "bin", "tools"]),
         ("vendor directory", &["vendor"]),
+        ("checkout root", &["checkout"]),
+        ("Rust tools root", &["tools"]),
     ];
     for (label, omit) in cases {
         let message = plan_error(&prepared, &granular(&fixture, omit));
@@ -207,7 +232,7 @@ fn path_variables_outside_every_root_are_rejected() {
             "should reject {label} outside the roots: {message}"
         );
     }
-    let message = plan_error(&prepared, &granular(&fixture, &["bin"]));
+    let message = plan_error(&prepared, &granular(&fixture, &["bin", "tools"]));
     assert!(
         message.contains("PATH") && message.contains("outside the boundary roots"),
         "should reject the tool directory in PATH outside the roots: {message}"
@@ -281,8 +306,15 @@ fn cargo_plan_rejects_inherited_rustflags_and_selectors() {
         .collect();
     assert_eq!(
         configs.len(),
-        expected_replacement().len() / 2,
-        "should carry only the exact source-replacement configs"
+        expected_replacement().len() / 2 + 1,
+        "should carry only the exact source-replacement configs and the path remap"
+    );
+    assert_eq!(
+        configs.last().map(|config| config.as_str()),
+        expected_remap("x86_64-unknown-linux-gnu")
+            .last()
+            .map(String::as_str),
+        "should remap paths only through target rustflags of the asset triple"
     );
     for argument in &plan.arguments {
         assert!(

@@ -11,6 +11,8 @@ use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 
+use super::super::ambient::Dimension;
+use super::super::compare::FastlyEqualityChecked;
 use super::*;
 use crate::boundary::DockerSettings;
 use crate::process::ProcessLimits;
@@ -292,6 +294,68 @@ pub(super) fn cargo_measurement(completed: &RecipeCompleted) -> Value {
         "stderr_sha256": completed.stderr_sha256(),
         "elapsed_seconds": completed.elapsed().as_secs(),
         "derived_manifest_digests": completed.derived_manifest_digests().len(),
+        "release_qualification": false,
+    })
+}
+
+/// The ambient conditions one build ran under, as the measurement states them.
+///
+/// Umask and jobs are the profile values the plan enforced on the child, and
+/// the host locale and timezone are profile labels: the child always ran
+/// with the normalized `C` locale and `UTC` timezone.
+fn ambient_measurement(completed: &RecipeCompleted) -> Value {
+    let ambient = completed.ambient();
+    let observed = ambient.observed();
+    json!({
+        "role": role_text(ambient.role()),
+        "umask": format!("{:03o}", observed.umask),
+        "jobs": observed.jobs,
+        "checkout_root": observed.checkout_root.to_string_lossy(),
+        "ambient_started_at_seconds": observed.started_at_seconds,
+        "run_started_at_seconds": completed.started_at_seconds(),
+        "execution_uid": observed.execution_uid,
+        "host_locale_label": observed.host_locale,
+        "host_timezone_label": observed.host_timezone,
+        "child_locale": observed.child_locale,
+        "child_timezone": observed.child_timezone,
+        "observation": "profile-enforced-not-independently-observed",
+    })
+}
+
+/// The ordinary CI measurement of the Fastly A/B final-byte comparison.
+pub(super) fn equality_measurement(
+    a: &RecipeCompleted,
+    b: &RecipeCompleted,
+    checked: &FastlyEqualityChecked,
+) -> Value {
+    let claim = checked.ambient().claim();
+    let names = |set: &BTreeSet<Dimension>| -> Vec<String> {
+        set.iter().map(ToString::to_string).collect()
+    };
+    let build = |completed: &RecipeCompleted| {
+        let mut value = cargo_measurement(completed);
+        value["ambient"] = ambient_measurement(completed);
+        value
+    };
+    json!({
+        "schema_version": SCHEMA_VERSION,
+        "kind": "ordinary-ci-fastly-ab-equality",
+        "asset": checked.asset().artifact().name,
+        "source_commit": a.commit().as_str(),
+        "equality": true,
+        "artifact": {
+            "sha256": checked.sha256(),
+            "size": checked.size(),
+        },
+        "builds": {
+            "A": build(a),
+            "B": build(b),
+        },
+        "ambient_claim": {
+            "varied": names(&claim.varied),
+            "normalized": names(&claim.normalized),
+            "unsupported": names(&claim.unsupported),
+        },
         "release_qualification": false,
     })
 }

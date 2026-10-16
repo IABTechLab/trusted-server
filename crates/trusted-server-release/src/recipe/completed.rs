@@ -232,4 +232,9 @@ impl RecipeCompleted {
     pub(crate) fn retained_stdout_path(&self) -> PathBuf {
         self.retained.path().join(STDOUT_FILE)
     }
+
+    /// Bound facts, for tests that forge one mismatched input.
+    pub(super) fn facts_mut_for_tests(&mut self) -> &mut SuccessFacts {
+        &mut self.facts
+    }
 }

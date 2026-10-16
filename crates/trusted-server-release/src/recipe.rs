@@ -39,11 +39,13 @@ use fresh::{
 mod ambient;
 mod artifact;
 mod cargo_output;
+mod compare;
 mod completed;
 mod execute;
 mod fresh;
 mod paths;
 mod plan;
+mod remap;
 mod sources;
 mod tools;
 
@@ -375,7 +377,10 @@ impl PreparedRecipe {
     ///
     /// Returns [`ReleaseError::Recipe`] when the fresh checkout is not the
     /// approved commit or not the ambient checkout root, the prepared
-    /// materials were derived from another `Cargo.lock`, or as [`Self::bind`].
+    /// materials were derived from another `Cargo.lock`, the tracked Cargo
+    /// configuration sets `build.rustflags`, which the path remap would
+    /// supersede, a legacy extensionless `.cargo/config` is tracked or on
+    /// disk at the checkout root, or as [`Self::bind`].
     #[allow(
         clippy::too_many_arguments,
         reason = "each argument is a distinct authority"
@@ -406,6 +411,14 @@ impl PreparedRecipe {
                 "prepared materials were derived from another Cargo.lock",
             ));
         }
+        let config = source
+            .read_tracked(remap::CARGO_CONFIG, DocumentRole::Metadata)
+            .map_err(|error| error.change_context(ReleaseError::Recipe))?;
+        remap::check_cargo_config(&config)?;
+        remap::check_no_extensionless_config(
+            fresh.root(),
+            source.tracked_sha256(remap::LEGACY_CARGO_CONFIG).is_some(),
+        )?;
         let child = child_environment(audited, source, &child_request(&request))?;
         Self::bind(BindInputs {
             commit: source.commit(),

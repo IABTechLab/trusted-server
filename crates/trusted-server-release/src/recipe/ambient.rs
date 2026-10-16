@@ -260,6 +260,11 @@ impl CheckedAmbient {
     pub(crate) fn checkout_root(&self) -> &Path {
         &self.observed.checkout_root
     }
+
+    /// Returns the observed conditions that matched the profile.
+    pub(crate) fn observed(&self) -> &ObservedAmbient {
+        &self.observed
+    }
 }
 
 /// Requires an observed value to equal the profile's value.

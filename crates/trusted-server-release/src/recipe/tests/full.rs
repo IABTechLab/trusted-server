@@ -11,8 +11,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::super::ambient::ObservedAmbient;
+use super::super::compare::{FASTLY_ASSET, check_fastly_equality};
+use super::super::remap::{RemapScan, scan_remapped_bytes};
 use super::candidate::{
-    CargoFixture, cargo_docker_settings, cargo_measurement, denial_measurement, reported_errno,
+    CargoFixture, cargo_docker_settings, cargo_measurement, denial_measurement,
+    equality_measurement, reported_errno,
 };
 use super::*;
 use crate::boundary::{Boundary, DenialProof, ImageSelection, ProbeProgram};
@@ -20,7 +23,7 @@ use crate::documents::{parse_json, read_bounded};
 use crate::materials::{GitVendorInput, LockedMaterials, NormalizedManifest, VendorInputs};
 use crate::preflight::child::build_child_for_tests;
 use crate::preflight::{AuditedEnvironment, audit_environment};
-use crate::preparation::tests::full::run_two_fresh_js_builds;
+use crate::preparation::tests::full::{JsFixtureRun, run_two_fresh_js_builds};
 use crate::process::{Cancellation, ProcessLimits};
 
 /// The committed denial fixture workspace.
@@ -48,11 +51,18 @@ fn minimal_environment() -> AuditedEnvironment {
         .expect("should audit the minimal environment")
 }
 
-/// Role A conditions of an ordinary CI build.
+/// Conditions of an ordinary CI build of `role`.
 ///
-/// The umask, jobs, locale and timezone are the profile values the plan
-/// enforces on the child; this is not an independent qualified observation.
-fn ordinary_ci_ambient(checkout: &Path) -> CheckedAmbient {
+/// The umask and jobs are the profile values the plan enforces on the child.
+/// Role B uses the test-only alternate profile: its host locale and timezone
+/// are profile labels, while the child runs with the normalized `C` locale
+/// and `UTC` timezone either way. This is not an independent qualified
+/// observation, and production role B stays unqualified.
+fn ordinary_ci_ambient(role: Role, checkout: &Path) -> CheckedAmbient {
+    let (profile, base) = match role {
+        Role::A => (AmbientProfile::A, observed_a()),
+        Role::B => (AmbientProfile::alternate_for_tests(), observed_b()),
+    };
     // Reading the real user ID has no preconditions.
     let execution_uid = unsafe { libc::getuid() };
     let started_at_seconds = std::time::SystemTime::now()
@@ -60,16 +70,16 @@ fn ordinary_ci_ambient(checkout: &Path) -> CheckedAmbient {
         .expect("should read a clock after the Unix epoch")
         .as_secs();
     CheckedAmbient::check(
-        Role::A,
-        &AmbientProfile::A,
+        role,
+        &profile,
         ObservedAmbient {
             execution_uid,
             checkout_root: checkout.to_owned(),
             started_at_seconds,
-            ..observed_a()
+            ..base
         },
     )
-    .expect("should match the role A profile")
+    .expect("should match the role profile")
 }
 
 /// A configured container boundary with its proof for this instance.
@@ -190,7 +200,7 @@ fn bind_denial_case(fixture: &CargoFixture, member: &str) -> DenialCase {
             .expect("should select the ordinary CI Rust tools"),
         materials: PreparedCargoMaterials::for_tests(&base.join("materials"), commit.as_str(), &[])
             .expect("should describe the empty vendor directory"),
-        ambient: ordinary_ci_ambient(&checkout),
+        ambient: ordinary_ci_ambient(Role::A, &checkout),
         request,
     })
     .expect("should bind the denial case");
@@ -315,36 +325,42 @@ fn prepare_vendor(
         .expect("should vendor every locked original")
 }
 
-#[test]
-#[ignore = "requires explicit JS and Cargo ordinary CI fixtures and Linux Docker; run separately in producer CI"]
-fn real_js_handoff_to_fastly_cargo_build() {
-    let fixture = cargo_fixture();
-    let js = run_two_fresh_js_builds();
-    assert_eq!(
-        js.source.commit().as_str(),
-        fixture.source_commit,
-        "should build the Cargo fixture's source commit"
-    );
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&js.measurement).expect("should encode the JS measurement")
-    );
-    let cancellation = Cancellation::default();
-    let deadline = Instant::now() + Duration::from_secs(40 * 60);
+/// One confined Fastly build with the private roots its output lives in.
+struct FastlyBuild {
+    _materials: tempfile::TempDir,
+    _work: tempfile::TempDir,
+    completed: RecipeCompleted,
+    /// Host roots of this build that must not appear in the final bytes.
+    host_roots: Vec<String>,
+    /// The checkout root as the confined build saw it.
+    execution_checkout: String,
+}
+
+fn path_text(path: &Path) -> String {
+    path.to_str().expect("should be a UTF-8 path").to_owned()
+}
+
+/// Builds the Fastly Wasm for `role` from the shared JS handoff.
+///
+/// Each role gets its own fresh source copy (a distinct checkout root), its
+/// own freshly prepared vendor tree, fresh state, output and target roots,
+/// and its own boundary with its own denial proof. The target directory and
+/// source copy are removed after the build; only the copied output remains.
+fn build_fastly(
+    js: &JsFixtureRun,
+    fixture: &CargoFixture,
+    role: Role,
+    deadline: Instant,
+    cancellation: &Cancellation,
+) -> FastlyBuild {
     let fresh = js
         .source
-        .materialize(deadline, &cancellation)
-        .expect("should materialize a third fresh tracked source");
+        .materialize(deadline, cancellation)
+        .expect("should materialize a fresh tracked source for this role");
     let materials_directory = tempfile::tempdir().expect("should create the materials root");
     let materials_root =
         fs::canonicalize(materials_directory.path()).expect("should resolve the materials root");
-    let materials = prepare_vendor(
-        &fixture,
-        &js.locked,
-        &materials_root,
-        deadline,
-        &cancellation,
-    );
+    let materials = prepare_vendor(fixture, &js.locked, &materials_root, deadline, cancellation);
     assert_eq!(
         materials.cargo_lock_sha256(),
         fixture.cargo_lock_sha256,
@@ -362,9 +378,12 @@ fn real_js_handoff_to_fastly_cargo_build() {
     )
     .expect("should resolve the retained root");
     let request = RecipeRequest::parse(&RecipeInput {
-        asset: "trusted-server-fastly.wasm",
+        asset: FASTLY_ASSET,
         variant: "default",
-        role: "A",
+        role: match role {
+            Role::A => "A",
+            Role::B => "B",
+        },
         commit: &fixture.source_commit,
         js_dir: &retained.join("bundles"),
         js_inventory: &retained.join("tsjs-inventory.json"),
@@ -382,14 +401,32 @@ fn real_js_handoff_to_fastly_cargo_build() {
         SelectedRustTools::for_tests(&fixture.tools(), ReleaseTarget::Wasm32Wasip1)
             .expect("should select the ordinary CI Rust tools"),
         materials,
-        ordinary_ci_ambient(fresh.root()),
+        ordinary_ci_ambient(role, fresh.root()),
         request,
     )
     .expect("should bind the real source, handoff, tools and materials");
-    let proven = proven_boundary(&prepared, &fixture);
+    let proven = proven_boundary(&prepared, fixture);
+    let execution_checkout = path_text(
+        &proven
+            .boundary
+            .execution_path(fresh.root())
+            .expect("should translate the checkout root"),
+    );
+    let host_roots = [
+        fresh.root(),
+        materials_root.as_path(),
+        base.as_path(),
+        retained.as_path(),
+    ]
+    .map(path_text)
+    .to_vec();
     let completed = prepared
         .execute(&proven.boundary, &proven.proof)
-        .expect("should build the Fastly Wasm through the confined recipe");
+        .unwrap_or_else(|error| {
+            panic!(
+                "should build the role {role:?} Fastly Wasm through the confined recipe: {error:?}"
+            )
+        });
     completed
         .rehash_for_handoff()
         .expect("should rehash the artifact before reporting it");
@@ -397,10 +434,81 @@ fn real_js_handoff_to_fastly_cargo_build() {
         !completed.derived_manifest_digests().is_empty(),
         "should mark the build as consuming derived Git manifests"
     );
-    let measurement = cargo_measurement(&completed);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&cargo_measurement(&completed))
+            .expect("should encode the build measurement")
+    );
+    fs::remove_dir_all(base.join("target")).expect("should remove the spent target directory");
+    fresh.close().expect("should remove the fresh source copy");
+    FastlyBuild {
+        _materials: materials_directory,
+        _work: work,
+        completed,
+        host_roots,
+        execution_checkout,
+    }
+}
+
+/// Scans the final bytes for every host root and the container prefix, and
+/// requires at least one fixed remapped prefix.
+fn scan_final_bytes(fixture: &CargoFixture, builds: [&FastlyBuild; 2]) -> RemapScan {
+    let mut forbidden: Vec<String> = builds
+        .iter()
+        .flat_map(|build| build.host_roots.iter().cloned())
+        .collect();
+    forbidden.push(path_text(&fixture.root));
+    if let Some(runner_temp) = std::env::var_os("RUNNER_TEMP") {
+        forbidden.push(
+            runner_temp
+                .into_string()
+                .expect("should name RUNNER_TEMP in UTF-8"),
+        );
+    }
+    let forbidden: Vec<&str> = forbidden.iter().map(String::as_str).collect();
+    let bytes = fs::read(builds[0].completed.artifact().path())
+        .expect("should read the compared final bytes");
+    scan_remapped_bytes(&bytes, &forbidden)
+        .unwrap_or_else(|error| panic!("should prove remapping in the final bytes: {error:?}"))
+}
+
+#[test]
+#[ignore = "requires explicit JS and Cargo ordinary CI fixtures and Linux Docker; run separately in producer CI"]
+fn fastly_role_a_and_b_builds_are_byte_identical() {
+    let fixture = cargo_fixture();
+    let js = run_two_fresh_js_builds();
+    assert_eq!(
+        js.source.commit().as_str(),
+        fixture.source_commit,
+        "should build the Cargo fixture's source commit"
+    );
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&js.measurement).expect("should encode the JS measurement")
+    );
+    let cancellation = Cancellation::default();
+    let deadline = Instant::now() + Duration::from_secs(40 * 60);
+    let a = build_fastly(&js, &fixture, Role::A, deadline, &cancellation);
+    let b = build_fastly(&js, &fixture, Role::B, deadline, &cancellation);
+    let checked = check_fastly_equality(&a.completed, &b.completed).unwrap_or_else(|error| {
+        panic!("should build byte-identical Fastly A/B outputs: {error:?}")
+    });
+    let scan = scan_final_bytes(&fixture, [&a, &b]);
+    let mut measurement = equality_measurement(&a.completed, &b.completed, &checked);
+    for (role, build) in [("A", &a), ("B", &b)] {
+        // Container paths are identical, so checkout variation is host-only on Linux.
+        measurement["builds"][role]["ambient"]["execution_checkout_root"] =
+            serde_json::json!(build.execution_checkout);
+    }
+    measurement["remap_scan"] = serde_json::json!({
+        "forbidden": ["/boundary/", "host build roots", "fixture root", "RUNNER_TEMP"],
+        "found": scan.found(),
+    });
     let text = serde_json::to_string_pretty(&measurement).expect("should encode the measurement");
     println!("{text}");
-    fs::write(fixture.root.join("cargo-execution-measurement.json"), text)
-        .expect("should retain the Cargo measurement");
-    fresh.close().expect("should remove the fresh source copy");
+    fs::write(
+        fixture.root.join("cargo-ab-equality-measurement.json"),
+        text,
+    )
+    .expect("should retain the A/B equality measurement");
 }

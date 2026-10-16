@@ -326,11 +326,13 @@ fn checked_b() -> CheckedAmbient {
 mod ambient;
 mod bind;
 mod candidate;
+mod compare;
 mod complete;
 mod fixture;
 #[cfg(target_os = "linux")]
 mod full;
 mod plan;
+mod remap;
 mod sources;
 mod tools;
 

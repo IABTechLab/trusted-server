@@ -16,6 +16,7 @@ use sha2::{Digest as _, Sha256};
 
 use super::ambient::CheckedAmbient;
 use super::paths::{ExecutionPaths, execution_text};
+use super::remap::{RemapSources, remap_arguments};
 use super::sources::source_replacement_arguments;
 use super::tools::SelectedRustTools;
 use super::{AssetId, RecipeRequest, recipe_error};
@@ -98,8 +99,9 @@ impl CargoPlan {
 
 /// Returns the fixed argument vector of the release Cargo build.
 ///
-/// The only `--config` entries are the exact source replacements.
-pub(super) fn cargo_arguments(asset: AssetId, jobs: u32, replacement: &[String]) -> Vec<String> {
+/// The only `--config` entries are `configs`: the exact source replacements
+/// followed by the target path remap.
+pub(super) fn cargo_arguments(asset: AssetId, jobs: u32, configs: &[String]) -> Vec<String> {
     let artifact = asset.artifact();
     [
         "build",
@@ -114,7 +116,7 @@ pub(super) fn cargo_arguments(asset: AssetId, jobs: u32, replacement: &[String])
     ]
     .into_iter()
     .map(str::to_owned)
-    .chain(replacement.iter().cloned())
+    .chain(configs.iter().cloned())
     .chain(
         ["--message-format=json-render-diagnostics", "--jobs"]
             .into_iter()
@@ -159,12 +161,16 @@ pub(super) struct PlanInputs<'a> {
 
 /// Derives the exact Cargo invocation from the bound inputs.
 ///
+/// The arguments carry the source replacement and the deterministic target
+/// path remap of [`super::remap`], so both are bound by [`CargoPlan::digest`].
+///
 /// # Errors
 ///
 /// Returns [`ReleaseError::Recipe`] when the child environment's `HOME` or
 /// `CARGO_HOME` is not the request's private state, or any path variable,
-/// the tool directory or the vendor directory lies outside the boundary roots
-/// or is not plain text.
+/// the tool directory, the vendor directory, the checkout root or the Rust
+/// tool root lies outside the boundary roots or is not plain text, or two
+/// remapped roots overlap in the execution namespace.
 pub(super) fn plan_for(inputs: &PlanInputs<'_>) -> Result<CargoPlan, Report<ReleaseError>> {
     let PlanInputs {
         request,
@@ -197,11 +203,21 @@ pub(super) fn plan_for(inputs: &PlanInputs<'_>) -> Result<CargoPlan, Report<Rele
         format!("{tool_bin}:/usr/bin:/bin"),
     );
     let vendor = execution_text(*paths, "vendor directory", materials.vendor_dir())?;
-    let replacement = source_replacement_arguments(&vendor, materials.git_sources());
+    let mut configs = source_replacement_arguments(&vendor, materials.git_sources());
+    configs.extend(remap_arguments(
+        request.asset().artifact().target.triple(),
+        &RemapSources {
+            checkout: &execution_text(*paths, "checkout root", ambient.checkout_root())?,
+            vendor: &vendor,
+            cargo_home: &environment[CARGO_HOME_VARIABLE],
+            tools: &execution_text(*paths, "Rust tools root", tools.root())?,
+            target: &environment[TARGET_DIR_VARIABLE],
+        },
+    )?);
     Ok(CargoPlan {
         asset: request.asset(),
         program: tools.cargo(),
-        arguments: cargo_arguments(request.asset(), ambient.jobs(), &replacement),
+        arguments: cargo_arguments(request.asset(), ambient.jobs(), &configs),
         environment,
         working_directory: ambient.checkout_root().to_owned(),
         umask: ambient.umask()?,

@@ -395,7 +395,10 @@ jobs:
   test-release-cargo-candidate:
     name: cargo test (confined release Cargo candidate, Linux)
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # Fixture preparation, two fresh JS builds (~12 min), then two confined
+    # Fastly builds each with its own vendoring (~3-4 min each) and the
+    # final-byte comparison: 45 minutes left too little headroom.
+    timeout-minutes: 60
     env:
       # Optimize repeated whole-input hashes with test safety checks retained.
       CARGO_PROFILE_TEST_OPT_LEVEL: '2'
@@ -464,17 +467,19 @@ jobs:
           cargo test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --nocapture
           cat "$TS_RELEASE_CARGO_FIXTURE_ROOT/cargo-denial-measurement.json"
 
-      - name: Build the Fastly Wasm from a real JS handoff through the confined recipe (Linux)
+      # Role A and role B build from the same JS handoff in separate fresh
+      # roots and boundaries; the final Fastly files must be byte-identical.
+      - name: Build Fastly roles A and B from one JS handoff and compare final bytes (Linux)
         shell: bash
         run: |
           set -euo pipefail
-          TEST_NAME=recipe::tests::full::real_js_handoff_to_fastly_cargo_build
+          TEST_NAME=recipe::tests::full::fastly_role_a_and_b_builds_are_byte_identical
           TEST_LIST="$(mktemp)"
           trap 'rm -f "$TEST_LIST"' EXIT
           cargo test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --list > "$TEST_LIST"
-          awk '/: test$/ { count++ } END { if (count != 1) { print "Expected exactly one confined Cargo build fixture"; exit 1 } }' "$TEST_LIST"
+          awk '/: test$/ { count++ } END { if (count != 1) { print "Expected exactly one Fastly A/B equality fixture"; exit 1 } }' "$TEST_LIST"
           cargo test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --nocapture
-          cat "$TS_RELEASE_CARGO_FIXTURE_ROOT/cargo-execution-measurement.json"
+          cat "$TS_RELEASE_CARGO_FIXTURE_ROOT/cargo-ab-equality-measurement.json"
 
   test-typescript:
     name: vitest

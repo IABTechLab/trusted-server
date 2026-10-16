@@ -10,7 +10,7 @@ use super::*;
 
 const FINGERPRINT: [u8; 32] = [7; 32];
 
-fn wasm_with(customs: &[(&str, &[u8])]) -> Vec<u8> {
+pub(super) fn wasm_with(customs: &[(&str, &[u8])]) -> Vec<u8> {
     let mut out = b"\0asm\x01\0\0\0".to_vec();
     for (name, data) in customs {
         let mut body = vec![u8::try_from(name.len()).expect("should fit")];
@@ -35,19 +35,19 @@ fn executable_name(asset: &str) -> String {
     }
 }
 
-struct Built {
+pub(super) struct Built {
     fixture: Fixture,
     prepared: Option<PreparedRecipe>,
     asset: &'static str,
     role: Role,
 }
 
-fn built(asset: &'static str, role: Role, bytes: &[u8]) -> Built {
+pub(super) fn built(asset: &'static str, role: Role, bytes: &[u8]) -> Built {
     built_with(asset, role, bytes, false)
 }
 
 /// Builds a bound recipe, optionally over materials with a derived manifest.
-fn built_with(asset: &'static str, role: Role, bytes: &[u8], derived: bool) -> Built {
+pub(super) fn built_with(asset: &'static str, role: Role, bytes: &[u8], derived: bool) -> Built {
     let fixture = Fixture::new(COMMIT);
     let prepared = if derived {
         let text = if role == Role::A { "A" } else { "B" };
@@ -86,7 +86,7 @@ impl Built {
             .expect("should hold the prepared recipe")
     }
 
-    fn stdout(&self, edit: impl FnOnce(&mut Value)) -> Vec<u8> {
+    pub(super) fn stdout(&self, edit: impl FnOnce(&mut Value)) -> Vec<u8> {
         let artifact = AssetId::parse(self.asset)
             .expect("should resolve asset")
             .artifact();
@@ -121,7 +121,10 @@ impl Built {
         }
     }
 
-    fn finish(&mut self, stdout: Vec<u8>) -> Result<RecipeCompleted, Report<ReleaseError>> {
+    pub(super) fn finish(
+        &mut self,
+        stdout: Vec<u8>,
+    ) -> Result<RecipeCompleted, Report<ReleaseError>> {
         let paths = self.fixture.paths(self.role);
         let run = self.run(stdout);
         self.prepared
