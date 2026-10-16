@@ -424,13 +424,23 @@ fn content_length_exceeds_limit(req: &Request<EdgeBody>, limit: usize) -> bool {
 mod tests {
     use super::*;
     use crate::consent::types::ConsentContext;
+    use crate::constants::COOKIE_TS_EC_RESOLVED;
+    use crate::ec::finalize::ec_finalize_response;
     use crate::ec::module::{
         CLIENT_FIXED_MODULE_KEY, EcModuleSelection, EdgeCookieModule, GeneratedEdgeCookie,
     };
+    use crate::ec::registry::PartnerRegistry;
     use crate::module_context::{ModuleCall, ModuleRequest};
-    use crate::platform::test_support::{noop_services, noop_services_with_ec_module};
+    use crate::permission_signal::{PermissionSignalModule, SignalInput};
+    use crate::permissions::{ConsentSignal, Permission};
+    use crate::platform::test_support::{
+        NoopBackend, NoopConfigStore, NoopGeo, NoopHttpClient, NoopSecretStore, noop_services,
+        noop_services_with_ec_module,
+    };
+    use crate::platform::{ClientInfo, RuntimeServices};
     use crate::test_support::tests::create_test_settings;
     use http::Method;
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     fn settings_with_client_fixed() -> Settings {
@@ -1353,6 +1363,244 @@ mod tests {
         assert!(
             response.headers().get(header::SET_COOKIE).is_none(),
             "a conflict must set no cookie"
+        );
+    }
+
+    /// A visitor's consent record, standing in for a signal module such as
+    /// the TCF one, which core does not link. `Grant` sets storage and
+    /// `Withdraw` refuses and withdraws it.
+    #[derive(Clone, Copy)]
+    enum StorageRecord {
+        Grant,
+        Withdraw,
+    }
+
+    impl PermissionSignalModule for StorageRecord {
+        fn id(&self) -> &'static str {
+            "storage-record"
+        }
+
+        fn signal(&self, permission: Permission, _input: &SignalInput<'_>) -> ConsentSignal {
+            if permission != Permission::StoreOnDevice {
+                return ConsentSignal::Neutral;
+            }
+            match self {
+                Self::Grant => ConsentSignal::Grant,
+                Self::Withdraw => ConsentSignal::Revoke,
+            }
+        }
+
+        fn withdraws(&self, permission: Permission, _input: &SignalInput<'_>) -> bool {
+            permission == Permission::StoreOnDevice && matches!(self, Self::Withdraw)
+        }
+    }
+
+    /// Services for a visitor whose record answers `record`, so the gate and
+    /// any withdrawal come from permission assembly, as in a deployment. No
+    /// location resolves, so the policy's top node applies, and storage there
+    /// needs a signal.
+    fn services_with_record(record: StorageRecord) -> RuntimeServices {
+        let modules: Vec<Arc<dyn PermissionSignalModule>> = vec![Arc::new(record)];
+        RuntimeServices::builder()
+            .config_store(Arc::new(NoopConfigStore))
+            .secret_store(Arc::new(NoopSecretStore))
+            .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+            .backend(Arc::new(NoopBackend))
+            .http_client(Arc::new(NoopHttpClient))
+            .geo(Arc::new(NoopGeo))
+            .client_info(ClientInfo::default())
+            .permission_signal_modules(modules.into())
+            .build()
+    }
+
+    /// The publisher cookies a browser holds, by name.
+    type Jar = BTreeMap<String, String>;
+
+    /// Stores a response's `Set-Cookie` headers in `jar` in order, as a
+    /// browser does, where `Max-Age=0` deletes the cookie.
+    fn store_cookies(jar: &mut Jar, response: &Response<EdgeBody>) {
+        for value in response.headers().get_all(header::SET_COOKIE) {
+            let line = value.to_str().expect("should render set-cookie as utf-8");
+            let (name, value) = line
+                .split(';')
+                .next()
+                .and_then(|pair| pair.split_once('='))
+                .expect("should start with a cookie name and value");
+            if line.contains("Max-Age=0") {
+                jar.remove(name);
+            } else {
+                jar.insert(name.to_owned(), value.to_owned());
+            }
+        }
+    }
+
+    /// Sends the cookies in `jar` with `req`, as a browser does.
+    fn send_cookies(req: &mut Request<EdgeBody>, jar: &Jar) {
+        if jar.is_empty() {
+            return;
+        }
+        let cookies = jar
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        req.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&cookies).expect("should be a valid cookie header"),
+        );
+    }
+
+    /// One page view as the publisher path handles it: the context is read,
+    /// organic generation runs, and the response is finalized before the
+    /// browser stores what it sets.
+    async fn view_page(
+        settings: &Settings,
+        services: &RuntimeServices,
+        graph: &KvIdentityGraph,
+        jar: &mut Jar,
+    ) -> EcContext {
+        let mut req = Request::builder()
+            .method(Method::GET)
+            .uri("https://test-publisher.com/")
+            .body(EdgeBody::empty())
+            .expect("should build page request");
+        send_cookies(&mut req, jar);
+        let mut ec =
+            EcContext::read_from_request(settings, &req, services).expect("should read EC context");
+        ec.generate_if_needed(settings, Some(graph), services)
+            .await
+            .expect("should run organic generation");
+        let mut response = Response::builder()
+            .status(StatusCode::OK)
+            .body(EdgeBody::empty())
+            .expect("should build page response");
+        ec_finalize_response(
+            settings,
+            &mut ec,
+            Some(graph),
+            &PartnerRegistry::empty(),
+            None,
+            &mut response,
+            services,
+        )
+        .await;
+        store_cookies(jar, &response);
+        ec
+    }
+
+    /// The demo page script's post as the adapter handles it: the context is
+    /// read from the post, the handler answers, and the response is
+    /// finalized before the browser stores what it sets.
+    async fn post_fixed_word(
+        settings: &Settings,
+        services: &RuntimeServices,
+        graph: &KvIdentityGraph,
+        jar: &mut Jar,
+    ) -> StatusCode {
+        let mut req = post(FIXED_WORD);
+        send_cookies(&mut req, jar);
+        let mut ec =
+            EcContext::read_from_request(settings, &req, services).expect("should read EC context");
+        let mut response = handle_ec_resolve(settings, req, &ec, Some(graph), services)
+            .await
+            .expect("should handle resolve");
+        ec_finalize_response(
+            settings,
+            &mut ec,
+            Some(graph),
+            &PartnerRegistry::empty(),
+            None,
+            &mut response,
+            services,
+        )
+        .await;
+        store_cookies(jar, &response);
+        response.status()
+    }
+
+    #[tokio::test]
+    async fn the_demo_identity_is_recognized_and_keeps_its_marker() {
+        let settings = settings_with_client_fixed();
+        let services = services_with_record(StorageRecord::Grant);
+        let graph = in_memory_graph();
+        let mut jar = Jar::new();
+
+        assert_eq!(
+            post_fixed_word(&settings, &services, &graph, &mut jar).await,
+            StatusCode::OK,
+            "the first post should create the identity"
+        );
+        assert_eq!(
+            jar.get(COOKIE_TS_EC_RESOLVED).map(String::as_str),
+            Some("1"),
+            "the resolve should set the marker"
+        );
+
+        let ec = view_page(&settings, &services, &graph, &mut jar).await;
+
+        assert_eq!(
+            ec.ec_value(),
+            Some("cfix~an-ec"),
+            "core should recognize the demo module's own identifier when it comes back"
+        );
+        assert_eq!(
+            jar.get(COOKIE_TS_EC_RESOLVED).map(String::as_str),
+            Some("1"),
+            "the next view should keep the marker once it is set, got {jar:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_demo_page_does_not_post_again_on_the_next_view() {
+        let settings = settings_with_client_fixed();
+        let services = services_with_record(StorageRecord::Grant);
+        let graph = in_memory_graph();
+        let mut jar = Jar::new();
+        let mut posts = 0;
+
+        for _view in 0..3 {
+            view_page(&settings, &services, &graph, &mut jar).await;
+            // The page script posts only when it finds no marker, which its
+            // own tests pin in `ec_client_fixed/index.test.ts`.
+            if !jar.contains_key(COOKIE_TS_EC_RESOLVED) {
+                posts += 1;
+                post_fixed_word(&settings, &services, &graph, &mut jar).await;
+            }
+        }
+
+        assert_eq!(posts, 1, "the page should post on the first view only");
+    }
+
+    #[tokio::test]
+    async fn a_withdrawal_tombstones_the_demo_identity() {
+        let settings = settings_with_client_fixed();
+        let graph = in_memory_graph();
+        let mut jar = Jar::new();
+        let granted = services_with_record(StorageRecord::Grant);
+        assert_eq!(
+            post_fixed_word(&settings, &granted, &graph, &mut jar).await,
+            StatusCode::OK,
+            "the first post should create the identity"
+        );
+
+        let withdrawn = services_with_record(StorageRecord::Withdraw);
+        let ec = view_page(&settings, &withdrawn, &graph, &mut jar).await;
+
+        assert!(
+            ec.storage_withdrawn(),
+            "the record should withdraw storage for this to test anything"
+        );
+        let (row, _) = graph
+            .get("cfix~an-ec")
+            .expect("should read the graph")
+            .expect("the row should remain as a tombstone");
+        assert!(
+            !row.consent.ok,
+            "a withdrawal should tombstone the demo identity's row"
+        );
+        assert!(
+            jar.is_empty(),
+            "a withdrawal should expire the Edge Cookie and the marker, got {jar:?}"
         );
     }
 }

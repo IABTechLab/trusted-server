@@ -12,9 +12,9 @@
 //! an answer is only ever given back to the same question, and the license
 //! key is never written into a store.
 //!
-//! An answer carrying a location is safe to hold because the visitor's address
-//! is in the evidence and therefore in the key, so an entry is only served
-//! back to a request from the same address.
+//! The evidence is the `User-Agent` and the `Sec-CH-UA` hints, with no address
+//! and no cookie, so one entry serves every reader whose browser sends the
+//! same values.
 //!
 //! The cache is [`CACHE`], which the 51Degrees builder declares, and a
 //! deployment selects the loading cache that holds it and sizes its copies in
@@ -33,11 +33,8 @@ use trusted_server_core::settings::{LoadingCacheConfig, Settings};
 /// `[cache.<name>]` table.
 pub const CACHE: &str = "51degrees-answers";
 
-/// How long an answer is held: an hour.
-///
-/// The answer says what the visitor's browser is and where the visitor is, and
-/// an address can be reassigned to another subscriber, which would describe a
-/// visitor by a browser they do not use.
+/// How long an answer is held, an hour, after which the service is asked
+/// again.
 pub(crate) const ANSWER_LIFETIME: Duration = Duration::from_secs(60 * 60);
 
 /// What a key's hash covers, so a change to it does not read old entries.
