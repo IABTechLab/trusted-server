@@ -1932,10 +1932,13 @@ See [Didomi](/guide/integrations/didomi) for the routed endpoint shapes.
 | `cmp_id`     | Number | `10`     | The IAB registered CMP identifier the GPP stub answers `ping` with while the prompt loads                   |
 
 The table refuses a field it does not read. Selecting the module with no
-`[[fetch]]` entry naming `cmp.inmobi` is refused, because the
+`[[fetch]]` or `[[serve]]` entry naming `cmp.inmobi` is refused, because the
 prompt would never be written, and the entry names it before any middleware
-that writes a vendor's tag. See [InMobi Choice](/guide/integrations/inmobi)
-for the tag's parts and what the module keeps to.
+that writes a vendor's tag. A `[[serve]]` entry naming it for a page whose
+`[[fetch]]` entry names another middleware is refused, because a serve
+middleware's head markup is written after every fetch middleware's. See
+[InMobi Choice](/guide/integrations/inmobi) for the tag's parts and what the
+module keeps to.
 
 ### Google Tag Manager Integration
 
