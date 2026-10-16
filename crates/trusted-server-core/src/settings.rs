@@ -320,6 +320,57 @@ impl TypeSections {
     }
 }
 
+/// Reads and validates a table as `T`, where `place` is the table's name as
+/// written, such as `shared.example`.
+///
+/// A message names the setting at fault and the rule it broke, and never
+/// quotes the setting's value, because at startup a table holds each of its
+/// secrets resolved from the secret store.
+fn read_table<T>(
+    place: &str,
+    table: serde_json::Map<String, JsonValue>,
+) -> Result<T, Report<TrustedServerError>>
+where
+    T: DeserializeOwned + Validate,
+{
+    let config: T =
+        serde_path_to_error::deserialize(JsonValue::Object(table)).map_err(|error| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "[{place}] could not be read: {}",
+                    read_error_summary(&error)
+                ),
+            })
+        })?;
+    config.validate().map_err(|errors| {
+        Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "[{place}] failed validation: {}",
+                validation_error_summary(&errors)
+            ),
+        })
+    })?;
+    Ok(config)
+}
+
+/// Why a table could not be read, by the path of the setting at fault.
+///
+/// `serde` quotes the value it could not read, so its message is kept only
+/// when it names keys alone: a key missing, unknown or written twice.
+fn read_error_summary(error: &serde_path_to_error::Error<serde_json::Error>) -> String {
+    let message = error.inner().to_string();
+    let names_keys_only = ["missing field `", "unknown field `", "duplicate field `"]
+        .iter()
+        .any(|start| message.starts_with(start));
+    let path = error.path().to_string();
+    match (path.as_str(), names_keys_only) {
+        (".", true) => message,
+        (".", false) => "a setting holds a value of the wrong type or form".to_owned(),
+        (path, true) => format!("{path}: {message}"),
+        (path, false) => format!("`{path}` holds a value of the wrong type or form"),
+    }
+}
+
 /// The settings type a module reads from its table, beneath the section that
 /// selects it.
 ///
@@ -2946,7 +2997,8 @@ pub const ROBOTS_TXT_CACHE: &str = "robots-txt";
 pub struct LoadingCacheConfig {
     /// The module whose loading cache holds this cache's copies, as its short
     /// name or in full, for example `51degrees` or `loading-cache.51degrees`.
-    /// Absent, no copy is kept and every call loads.
+    /// Absent, the one loading cache module the build links, and with none
+    /// linked, or several, no copy is kept and every call loads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub module: Option<String>,
     /// How long the brief copy in process memory is used, in seconds. Zero
@@ -4647,13 +4699,13 @@ impl Settings {
     /// A selected module with no table reads an empty one, so a module that
     /// takes no settings runs on its selection alone and one that requires a
     /// setting reports the setting it is missing. The parse and validation
-    /// messages carry the underlying error, because a report renders only its
-    /// outermost message in `ts config validate`.
+    /// messages name the setting at fault in the outermost message, because a
+    /// report renders only that in `ts config validate`.
     ///
     /// # Errors
     ///
     /// When the table cannot be read as `T` or fails its validation, naming the
-    /// table.
+    /// table and the setting at fault but never the setting's value.
     pub fn module_config<T>(&self, name: &str) -> Result<Option<T>, Report<TrustedServerError>>
     where
         T: IntegrationConfig,
@@ -4667,17 +4719,7 @@ impl Settings {
             .and_then(|(_, modules)| modules.settings_of(written))
             .cloned()
             .unwrap_or_default();
-        let config: T = serde_json::from_value(JsonValue::Object(table)).map_err(|error| {
-            Report::new(TrustedServerError::Configuration {
-                message: format!("[{section}.{written}] could not be read: {error}"),
-            })
-        })?;
-        config.validate().map_err(|error| {
-            Report::new(TrustedServerError::Configuration {
-                message: format!("[{section}.{written}] failed validation: {error}"),
-            })
-        })?;
-        Ok(Some(config))
+        read_table(&format!("{section}.{written}"), table).map(Some)
     }
 
     /// The modules `section` selects, to change, with the section created
@@ -9119,6 +9161,58 @@ source_domain = "partner.example.com"
             rendered.contains("[example.endpoint]") && rendered.contains("endpoint"),
             "should name the module's table and the missing setting: {rendered}"
         );
+    }
+
+    /// An example module's settings with a secret in them, as its table holds
+    /// them at startup, once the secret is resolved from the store.
+    #[derive(Debug, Deserialize, Validate)]
+    #[serde(deny_unknown_fields)]
+    struct SecretSetting {
+        #[validate(url)]
+        endpoint: String,
+        #[validate(range(max = 10))]
+        retries: Option<u32>,
+    }
+
+    impl IntegrationConfig for SecretSetting {}
+
+    #[test]
+    fn a_module_table_that_is_refused_names_the_setting_and_never_its_value() {
+        const SECRET: &str = "resolved-secret-value-4f7a";
+        for (table, setting) in [
+            // Fails a rule, whose parameters carry the value checked.
+            (serde_json::json!({ "endpoint": SECRET }), "endpoint"),
+            // Cannot be read, where `serde` quotes the value it found.
+            (
+                serde_json::json!({ "endpoint": "https://example.com", "retries": SECRET }),
+                "retries",
+            ),
+        ] {
+            let mut settings = create_test_settings();
+            settings
+                .insert_module_config(EXAMPLE_SECTION, ENDPOINT_MODULE, &table)
+                .expect("should insert the module's table");
+
+            let error = settings
+                .module_config::<SecretSetting>(ENDPOINT_MODULE)
+                .expect_err("the table breaks the module's rules");
+
+            let shown = format!("{error}\n{error:?}");
+            assert!(
+                !shown.contains(SECRET),
+                "printed a setting's value: {shown}"
+            );
+            // The module's name holds `endpoint` too, so the setting is looked
+            // for after the table's name.
+            let rendered = error.to_string();
+            let reason = rendered
+                .split_once("[example.endpoint]")
+                .map_or("", |(_, reason)| reason);
+            assert!(
+                reason.contains(setting),
+                "should name the table and the setting: {rendered}"
+            );
+        }
     }
 
     /// A table written for a module its section does not select is refused,

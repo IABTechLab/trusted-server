@@ -311,6 +311,7 @@ async fn key_administration_paths_are_answered_here_and_never_proxied() {
     for path in [
         "/_ts/admin/keys/rotate",
         "/_ts/admin/keys/deactivate",
+        "/_ts/admin/cache/purge",
         "/admin/keys/rotate",
         "/admin/keys/deactivate",
     ] {

@@ -135,6 +135,7 @@ async fn key_administration_paths_are_answered_here_and_never_proxied() {
     for path in [
         "/_ts/admin/keys/rotate",
         "/_ts/admin/keys/deactivate",
+        "/_ts/admin/cache/purge",
         "/admin/keys/rotate",
         "/admin/keys/deactivate",
     ] {
@@ -567,6 +568,99 @@ fn every_fixed_route_beneath_an_underscore_prefix_is_reserved() {
                 "{path} should be listed in attestation::RESERVED_PATHS"
             );
         }
+    }
+}
+
+/// The attestation pages are answered without the request preparers, so no
+/// preparer can change or refuse the request whose host and nonce are
+/// signed. The preparer here refuses every request, and the publisher
+/// fallback shows that it runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attestation_routes_skip_the_request_preparers() {
+    use error_stack::Report;
+    use trusted_server_core::error::TrustedServerError;
+    use trusted_server_core::integrations::{IntegrationBuilder, IntegrationRegistration};
+
+    fn refuse_every_request(
+        _settings: &Settings,
+        _request: &mut Request,
+    ) -> Result<(), Report<TrustedServerError>> {
+        Err(Report::new(TrustedServerError::Forbidden {
+            message: "refused by the route test's preparer".to_owned(),
+        }))
+    }
+
+    fn never_registers(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(None)
+    }
+
+    fn selects_nothing(_settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+        Ok(false)
+    }
+
+    let settings = Settings::from_toml(
+        r#"
+            [publisher]
+            domain = "test-publisher.example.com"
+            cookie_domain = ".test-publisher.example.com"
+            origin_url = "https://origin.test-publisher.example.com"
+            proxy_secret = "route-test-proxy-secret"
+
+            [ec]
+            module = "hmac"
+
+            [ec.hmac]
+            passphrase = "test-secret-key-32-bytes-minimum"
+
+            [geo]
+            assume_single_jurisdiction = true
+
+            [attestation]
+            endpoint = "/_ex/attestation"
+            operator = "Example Operator"
+            context = "example-attestation:v1"
+            verify_url = "https://verifier.example/verify?host=test-publisher.example.com"
+        "#,
+    )
+    .expect("should parse route test settings with an attestation section");
+    let refusing = IntegrationBuilder::new(
+        "refusing-preparer",
+        "routes-test",
+        never_registers,
+        selects_nothing,
+    )
+    .with_module_name("testing.refusing-preparer")
+    .with_request_preparer(refuse_every_request);
+    let router = TrustedServerApp::routes_with_registrations(settings, &[refusing])
+        .expect("should build router with the refusing preparer");
+    let get = |uri: &str| {
+        request_builder()
+            .method("GET")
+            .uri(uri)
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build request")
+    };
+
+    let page = route(router.clone(), get("/article")).await;
+    assert_eq!(
+        page.status(),
+        403,
+        "the preparer should refuse a request for the publisher's origin"
+    );
+
+    for (uri, status) in [
+        ("/_ex", 200),
+        ("/_ex/attestation.json", 503),
+        ("/_ts/attestation?nonce=abc123", 301),
+    ] {
+        let response = route(router.clone(), get(uri)).await;
+        assert_eq!(
+            response.status(),
+            status,
+            "{uri} should be answered without the preparers"
+        );
     }
 }
 

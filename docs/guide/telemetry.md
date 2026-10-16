@@ -2,7 +2,8 @@
 
 Trusted Server can emit bounded auction observations directly to Tinybird.
 Emission is currently wired only by the Fastly adapter. Other adapters use the
-core no-op sink even if they can parse the shared settings.
+core no-op sink even if they can parse the shared settings, and log a warning
+at startup when `[analytics]` selects a module.
 
 ## Data path
 
@@ -26,6 +27,11 @@ model includes coarse device classification, auction source and outcome,
 provider status and timing, slot dimensions, media type, seat, price,
 currency, win state, and selected creative identifiers. Tests reject the
 request's derived EC ID from serialized NDJSON.
+
+Every row also carries the reader's complete User-Agent, country, region and
+page path, so rows are built only when the reader's permissions include
+`analytics.ad_reporting.measure_ad_performance` (TCF Purpose 7). A reader
+without it gets no row, whatever the outcome, a skip for consent included.
 
 `browser_family` is a coarse User-Agent classification. Recognized values
 are `chrome`, `safari`, `firefox`, `edge`, and `opera`; unrecognized
