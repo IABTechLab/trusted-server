@@ -2878,9 +2878,13 @@ url = \"https://www.publisher.example:8443\""
             vec![(
                 "text/html".to_owned(),
                 false,
-                vec!["bot-protection.datadome.tag".to_owned()],
+                vec![
+                    "bot-protection.datadome.tag".to_owned(),
+                    "ad-tag.google.loader".to_owned(),
+                ],
             )],
-            "should run the one serve middleware the selected modules supply"
+            "should run the serve middleware the selected modules supply, in the order the \
+             stock modules register"
         );
         trusted_server_core::settings::Settings::from_toml(
             &draft
