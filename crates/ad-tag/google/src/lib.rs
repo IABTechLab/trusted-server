@@ -32,6 +32,12 @@
 //!    This is the sole mechanism that routes the GPT cascade through the proxy.
 //!    The shim also hooks into the `googletag` API for targeting injection.
 //!
+//! For a page that carries no loader of its own, `write_loader` asks for the
+//! loader tag, which a second middleware, [`LOADER_MIDDLEWARE`], writes in
+//! the serve phase and only for a reader whose permissions allow storage on
+//! the device, because GPT loaded from Google's standard address may use the
+//! device's storage at any time.
+//!
 //! The crate holds a second module, [`diagnostics`], which a deployment
 //! selects on its own as `ad-tag.google.diagnostics`.
 
@@ -49,6 +55,7 @@
 
 pub mod diagnostics;
 
+use std::any::Any;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -69,16 +76,25 @@ use trusted_server_core::integrations::{
 };
 use trusted_server_core::middleware::{
     AttributeRewrite, AttributeRewriteFn, Middleware, MiddlewareAction, MiddlewareContext,
-    MiddlewarePhase,
+    MiddlewarePhase, Preparation,
 };
+use trusted_server_core::module_context::ModuleCall;
+use trusted_server_core::permissions::{Permission, PermissionSet, PermissionState};
 use trusted_server_core::platform::RuntimeServices;
 use trusted_server_core::proxy::{ProxyRequestConfig, proxy_request};
 use trusted_server_core::settings::{IntegrationConfig, Settings};
 
 const GPT_INTEGRATION_ID: &str = "gpt";
 
-/// The name this module is selected by, in `[ad-tag]`.
+/// The name this module is selected by, in `[ad-tag]`, and the name of its
+/// fetch middleware, which writes the bootstrap and points the GPT script's
+/// address at the first-party path.
 pub const MODULE: &str = "ad-tag.google";
+
+/// The name of the module's serve middleware, which writes the loader tag,
+/// when `write_loader` is set, into the copy of each reader whose
+/// permissions allow storage on the device.
+pub const LOADER_MIDDLEWARE: &str = "ad-tag.google.loader";
 
 /// The builder a deployment hands to an adapter, which the registry runs when
 /// a section selects [`MODULE`].
@@ -98,6 +114,9 @@ const SECUREPUBADS_HOST: &str = "securepubads.g.doubleclick.net";
 
 /// Integration route prefix for all GPT proxy endpoints.
 const ROUTE_PREFIX: &str = "/integrations/gpt";
+
+/// The first-party path a page loads the GPT script from.
+const SCRIPT_PATH: &str = "/integrations/gpt/script";
 
 /// Configuration for the Google Publisher Tags integration.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
@@ -132,10 +151,12 @@ pub struct GptConfig {
     pub slim_prebid_url: Option<String>,
 
     /// Whether the loader tag is written into the head, for a page that
-    /// carries none of its own. The tag asks for the loader on this module's
-    /// own route, so it is served first party like the rest of the script
-    /// chain. Off by default, because a page that already carries the loader
-    /// would otherwise load it twice.
+    /// carries none of its own. The serve middleware [`LOADER_MIDDLEWARE`]
+    /// writes it, for a reader whose permissions allow storage on the device.
+    /// The tag asks for the loader on this module's own route, so it is
+    /// served first party like the rest of the script chain. Off by default,
+    /// because a page that already carries the loader would otherwise load it
+    /// twice.
     ///
     /// Override via env var: `TRUSTED_SERVER__AD-TAG__GOOGLE__WRITE_LOADER`
     #[serde(default)]
@@ -446,7 +467,8 @@ pub fn register(
 
     let mut registration = IntegrationRegistration::builder(GPT_INTEGRATION_ID)
         .with_proxy(integration.clone())
-        .with_middleware(Arc::new(PageChange(integration.clone())));
+        .with_middleware(Arc::new(PageChange::new(integration.clone())))
+        .with_middleware(Arc::new(Loader(integration.clone())));
     if let Some((name, value)) = integration.bundle_tag_attribute() {
         registration = registration.with_bundle_tag_attribute(name, value);
     }
@@ -504,7 +526,21 @@ impl IntegrationProxy for GptIntegration {
 /// for. It writes the `tsjs.adInit` bootstrap into the head and, when
 /// `rewrite_script` is set, points the GPT script's address at the
 /// first-party path.
-struct PageChange(Arc<GptIntegration>);
+struct PageChange {
+    integration: Arc<GptIntegration>,
+    /// The head scripts as written, then [`SCRIPT_PATH`].
+    template_key: String,
+}
+
+impl PageChange {
+    fn new(integration: Arc<GptIntegration>) -> Self {
+        let template_key = integration.head_markup().concat() + SCRIPT_PATH;
+        Self {
+            integration,
+            template_key,
+        }
+    }
+}
 
 impl Middleware for PageChange {
     fn middleware_id(&self) -> &'static str {
@@ -517,15 +553,94 @@ impl Middleware for PageChange {
 
     fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
         let mut action = MiddlewareAction {
-            head_inserts: self.0.head_markup(),
+            head_inserts: self.integration.head_markup(),
             ..MiddlewareAction::pass()
         };
-        if self.0.config.rewrite_script {
+        if self.integration.config.rewrite_script {
             let decide: Rc<AttributeRewriteFn> =
                 Rc::new(|matched| GptIntegration::rewrite_script_address(matched.value));
             action.element_handlers = AttributeRewrite::each(&["src", "href"], &decide);
         }
         action
+    }
+
+    /// The head scripts and the script path, because the bootstrap and the
+    /// path are compiled into this crate and no setting changes when they do.
+    fn template_key(&self) -> &str {
+        &self.template_key
+    }
+}
+
+/// What the loader tag needs from a reader, being storage on the device,
+/// because GPT loaded from Google's standard address may use the device's
+/// storage at any time. That is TCF Purpose 1, which core's server-side
+/// auction also requires where GDPR applies.
+const LOADER_REQUIRES: PermissionSet = PermissionSet::none().with(Permission::StoreOnDevice);
+
+/// Whether one reader's permissions allow the loader tag, as the
+/// middleware's preparation found them.
+struct LoaderAllowed(bool);
+
+/// Writes the loader tag into the head of the copy of each reader whose
+/// permissions allow storage on the device, on the pages a `[[serve]]` entry
+/// names [`LOADER_MIDDLEWARE`] for, when `write_loader` is set.
+///
+/// Serve and not fetch, because what a fetch middleware writes is stored and
+/// served to every reader, whatever their permissions.
+struct Loader(Arc<GptIntegration>);
+
+impl Loader {
+    /// Whether `permissions` set everything the loader tag needs.
+    fn loader_allowed(&self, permissions: &PermissionState) -> bool {
+        permissions.all_set(self.required_permissions())
+    }
+}
+
+impl Middleware for Loader {
+    fn middleware_id(&self) -> &'static str {
+        LOADER_MIDDLEWARE
+    }
+
+    fn phases(&self) -> &[MiddlewarePhase] {
+        &[MiddlewarePhase::Serve]
+    }
+
+    fn required_permissions(&self) -> PermissionSet {
+        LOADER_REQUIRES
+    }
+
+    /// Reads the reader's permissions, which core hands every serve
+    /// preparation, when `write_loader` is set. A preparation handed none
+    /// treats the reader as one whose permissions do not allow the loader.
+    fn prepare<'a>(
+        &'a self,
+        call: ModuleCall<'a>,
+        _context: &'a MiddlewareContext<'a>,
+    ) -> Option<Preparation<'a>> {
+        if !self.0.config.write_loader {
+            return None;
+        }
+        let allowed = matches!(call.inject(self, Self::loader_allowed), Ok(true));
+        Some(Box::pin(async move {
+            Ok(Box::new(LoaderAllowed(allowed)) as Box<dyn Any + Send>)
+        }))
+    }
+
+    fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction {
+        if !self.0.config.write_loader {
+            return MiddlewareAction::pass();
+        }
+        // A document nothing was prepared for gets no loader.
+        let allowed = context
+            .take_prepared::<LoaderAllowed>(LOADER_MIDDLEWARE)
+            .is_some_and(|prepared| prepared.0);
+        if !allowed {
+            return MiddlewareAction::pass();
+        }
+        MiddlewareAction {
+            head_inserts: vec![GptIntegration::loader_tag()],
+            ..MiddlewareAction::pass()
+        }
     }
 }
 
@@ -539,7 +654,7 @@ impl GptIntegration {
             // so on pages that set an external base URL these resolve against
             // that base rather than the address-bar origin — an accepted
             // tradeoff, matching GTM/Didomi/Testlight which are also relative.
-            AttributeRewriteAction::replace("/integrations/gpt/script".to_string())
+            AttributeRewriteAction::replace(SCRIPT_PATH.to_string())
         } else {
             AttributeRewriteAction::keep()
         }
@@ -589,15 +704,15 @@ impl GptIntegration {
             ));
         }
 
-        // Last, after the shim and the bootstrap it relies on, and fetched
-        // from this module's route so the whole chain stays first party.
-        if self.config.write_loader {
-            scripts.push(format!(
-                "<script async src=\"{ROUTE_PREFIX}/script\"></script>"
-            ));
-        }
-
         scripts
+    }
+
+    /// The loader tag, which asks for GPT on this module's own route so the
+    /// whole script chain stays first party. A serve middleware's head markup
+    /// goes after every fetch middleware's, so the tag follows the shim and
+    /// the bootstrap it relies on.
+    fn loader_tag() -> String {
+        format!("<script async src=\"{ROUTE_PREFIX}/script\"></script>")
     }
 
     /// The attribute on the script bundle's tag that lets the bundle apply
@@ -638,8 +753,22 @@ mod tests {
     use super::*;
     use http::Method;
     use trusted_server_core::constants::HEADER_X_FORWARDED_FOR;
-    use trusted_server_core::integrations::IntegrationDocumentState;
-    use trusted_server_core::test_support::tests::create_test_settings;
+    use trusted_server_core::html_processor::HtmlProcessorConfig;
+    use trusted_server_core::html_processor::test_support::{
+        ORIGIN_HOST, REQUEST_HOST, REQUEST_PATH, create_page_processor, place_on_every_page,
+    };
+    use trusted_server_core::integrations::{IntegrationDocumentState, IntegrationRegistry};
+    use trusted_server_core::middleware::test_support as middleware_test_support;
+    use trusted_server_core::middleware::{
+        HTML_MEDIA_TYPE, MiddlewareChain, MiddlewarePlan, Prepared,
+    };
+    use trusted_server_core::module_context::ModuleContext;
+    use trusted_server_core::module_context::test_support::request;
+    use trusted_server_core::permissions::{ConsentSignal, PermissionMaps};
+    use trusted_server_core::streaming_processor::StreamProcessor as _;
+    use trusted_server_core::test_support::tests::{
+        create_test_settings, storage_only_permissions,
+    };
 
     fn test_config() -> GptConfig {
         GptConfig {
@@ -659,7 +788,7 @@ mod tests {
             MiddlewarePhase::Fetch,
             &document_state,
         );
-        PageChange(integration).create(&context)
+        PageChange::new(integration).create(&context)
     }
 
     fn build_http_request(method: Method, uri: &str) -> http::Request<EdgeBody> {
@@ -1459,7 +1588,31 @@ mod tests {
     #[test]
     fn the_middleware_is_named_as_the_module() {
         let integration = GptIntegration::new(test_config());
-        assert_eq!(PageChange(integration).middleware_id(), MODULE);
+        assert_eq!(PageChange::new(integration).middleware_id(), MODULE);
+    }
+
+    /// The bootstrap and the script path are compiled into this crate and no
+    /// setting changes when they do, so they have to be in the text the
+    /// registered middleware keys a stored page by, or a page stored before a
+    /// change to either keeps the old one until it expires.
+    #[test]
+    fn the_bootstrap_is_in_what_keys_a_stored_page() {
+        let settings = trusted_server_core::html_processor::test_support::page_settings(
+            include_str!("fixtures/page-change.settings.toml"),
+        );
+        let registry = trusted_server_core::integrations::IntegrationRegistry::with_registrations(
+            &settings,
+            &[super::builder(), super::diagnostics::builder()],
+        )
+        .expect("should build the registry");
+
+        let keys = registry.middleware_template_keys();
+        let (_, key) = keys
+            .iter()
+            .find(|(name, _)| *name == MODULE)
+            .expect("the page change should be registered");
+        assert!(key.contains(GPT_BOOTSTRAP_JS), "{key}");
+        assert!(key.contains(SCRIPT_PATH), "{key}");
     }
 
     #[test]
@@ -1559,55 +1712,292 @@ mod tests {
         );
     }
 
+    /// The loader tag, as a page carries it.
+    const LOADER_TAG: &str = r#"<script async src="/integrations/gpt/script"></script>"#;
+
+    /// An invented publisher's page that carries no GPT loader of its own,
+    /// which is the page `write_loader` is for.
+    const PAGE_WITHOUT_A_LOADER: &str = concat!(
+        "<!doctype html><html><head><title>An article</title></head>",
+        "<body><div id=\"ad-slot-1\"></div></body></html>"
+    );
+
+    /// Settings selecting the module with `config` as its table.
+    fn settings_with_gpt(config: &serde_json::Value) -> Settings {
+        let mut settings = create_test_settings();
+        settings
+            .insert_module_config("ad-tag", MODULE, config)
+            .expect("should select GPT");
+        settings
+    }
+
+    /// Settings selecting the module with `write_loader` set.
+    fn settings_writing_the_loader() -> Settings {
+        settings_with_gpt(&serde_json::json!({ "write_loader": true }))
+    }
+
+    /// The loader middleware the module registers for `settings`.
+    fn loader_for(settings: &Settings) -> Arc<dyn Middleware> {
+        register(settings)
+            .expect("should register GPT")
+            .expect("should run GPT")
+            .middleware
+            .into_iter()
+            .find(|middleware| middleware.middleware_id() == LOADER_MIDDLEWARE)
+            .expect("the module should register its loader middleware")
+    }
+
+    /// What the loader middleware plans for one reader's copy, after the
+    /// serve phase's preparation has run with `module_context`, as core
+    /// prepares and plans every reader's copy.
+    fn loader_plan_with(settings: &Settings, module_context: &ModuleContext<'_>) -> MiddlewarePlan {
+        let chain = MiddlewareChain::new(
+            MiddlewarePhase::Serve,
+            HTML_MEDIA_TYPE,
+            vec![loader_for(settings)],
+        );
+        let document_state = IntegrationDocumentState::default();
+        let prepared = Prepared::default();
+        let context = MiddlewareContext {
+            prepared: &prepared,
+            ..middleware_test_support::context(MiddlewarePhase::Serve, &document_state)
+        };
+        futures::executor::block_on(chain.prepare(module_context, &context))
+            .expect("should prepare the middleware");
+        chain.plan(&context).expect("should plan the middleware")
+    }
+
+    /// What the loader middleware plans for a reader whose request resolved
+    /// to `permissions`.
+    fn loader_plan_for(settings: &Settings, permissions: &PermissionState) -> MiddlewarePlan {
+        loader_plan_with(
+            settings,
+            &ModuleContext::new(request(REQUEST_PATH)).with_permissions(permissions),
+        )
+    }
+
+    /// The page a reader whose request resolved to `permissions` receives of
+    /// `html`, with the module's fetch middleware named in a `[[fetch]]`
+    /// entry and its loader in a `[[serve]]` entry. Both phases are prepared
+    /// and then run on one pass, as core does for a page it does not store.
+    fn process_for(settings: &Settings, html: &str, permissions: &PermissionState) -> String {
+        let mut placed = settings.clone();
+        place_on_every_page(&mut placed, MiddlewarePhase::Fetch, &[MODULE]);
+        place_on_every_page(&mut placed, MiddlewarePhase::Serve, &[LOADER_MIDDLEWARE]);
+        let registry = IntegrationRegistry::with_registrations(&placed, &[builder()])
+            .expect("should build a registry with the module");
+
+        let prepared = Arc::new(Prepared::default());
+        let module_context = ModuleContext::new(request(REQUEST_PATH))
+            .with_settings(&placed)
+            .with_permissions(permissions);
+        for phase in MiddlewarePhase::ALL {
+            let chain = registry.middleware_chain(
+                placed.phase_entries(phase),
+                phase,
+                HTML_MEDIA_TYPE,
+                REQUEST_PATH,
+            );
+            let document_state = IntegrationDocumentState::default();
+            let context = MiddlewareContext {
+                prepared: &prepared,
+                ..middleware_test_support::context(phase, &document_state)
+            };
+            futures::executor::block_on(chain.prepare(&module_context, &context))
+                .expect("should prepare the page's middleware");
+        }
+
+        let config = HtmlProcessorConfig::from_settings(
+            &placed,
+            &registry,
+            ORIGIN_HOST,
+            REQUEST_HOST,
+            "https",
+        )
+        .with_prepared(prepared);
+        let page = create_page_processor(&placed, &registry, config)
+            .process_chunk(html.as_bytes(), true)
+            .expect("should process the page");
+        String::from_utf8(page).expect("should leave the page UTF-8")
+    }
+
     #[test]
-    fn head_inserts_write_the_loader_tag_when_asked() {
-        let integration = GptIntegration::new(GptConfig {
+    fn the_fetch_phase_writes_no_loader_tag_even_when_asked() {
+        // What the fetch phase writes is stored and served to every reader,
+        // so the loader tag, which depends on the reader's permissions, is
+        // never part of it.
+        let action = page_action(GptIntegration::new(GptConfig {
             write_loader: true,
             ..test_config()
-        });
-        let inserts = integration.head_markup();
+        }));
 
-        assert_eq!(
-            inserts.len(),
-            3,
-            "should add one head insert for the loader"
+        assert!(
+            action
+                .head_inserts
+                .iter()
+                .all(|insert| !insert.contains("/integrations/gpt/script")),
+            "the fetch phase should write no loader tag, got: {:?}",
+            action.head_inserts
         );
+    }
+
+    #[test]
+    fn a_reader_who_has_not_allowed_storage_gets_no_loader() {
+        // Arrange
+        // Every permission but storage on the device, which the loader needs.
+        let settings = settings_writing_the_loader();
+        let all_but_storage: PermissionSet = Permission::all()
+            .filter(|permission| *permission != Permission::StoreOnDevice)
+            .collect();
+
+        // Act
+        let plan = loader_plan_for(&settings, &PermissionState::new(all_but_storage));
+
+        // Assert
+        assert!(
+            plan.head_inserts.is_empty(),
+            "no loader tag should be written: {:?}",
+            plan.head_inserts
+        );
+    }
+
+    #[test]
+    fn a_reader_who_allows_storage_gets_the_loader() {
+        // Arrange
+        let settings = settings_writing_the_loader();
+
+        // Act
+        let plan = loader_plan_for(&settings, &storage_only_permissions());
+
+        // Assert
         assert_eq!(
-            inserts[2], r#"<script async src="/integrations/gpt/script"></script>"#,
+            plan.head_inserts,
+            vec![LOADER_TAG.to_owned()],
             "should ask for the loader on this module's own route"
         );
     }
 
     #[test]
-    fn head_inserts_write_the_loader_tag_last() {
-        let integration = GptIntegration::new(GptConfig {
-            slim_prebid_url: Some("https://cdn.example.com/tsjs-prebid.min.js".to_string()),
-            write_loader: true,
-            ..test_config()
-        });
-        let inserts = integration.head_markup();
+    fn no_loader_is_written_unless_asked() {
+        // Arrange
+        // A reader who allows storage on the device, and a table that leaves
+        // `write_loader` at its default.
+        let settings = settings_with_gpt(&serde_json::json!({}));
 
-        assert_eq!(
-            inserts.len(),
-            4,
-            "should add the loader after every other insert"
-        );
+        // Act
+        let plan = loader_plan_for(&settings, &storage_only_permissions());
+
+        // Assert
         assert!(
-            inserts[3].starts_with("<script async src="),
-            "should write the loader tag after the slim-Prebid address, got: {}",
-            inserts[3]
+            plan.head_inserts.is_empty(),
+            "no loader tag should be written unless asked: {:?}",
+            plan.head_inserts
         );
     }
 
     #[test]
-    fn head_inserts_write_no_loader_tag_by_default() {
-        let inserts = GptIntegration::new(test_config()).head_markup();
+    fn no_loader_is_written_where_no_permission_state_reached_the_middleware() {
+        // Arrange
+        // A preparation whose context carries no permission state, and a
+        // document nothing was prepared for.
+        let settings = settings_writing_the_loader();
+        let document_state = IntegrationDocumentState::default();
 
+        // Act
+        let unresolved = loader_plan_with(&settings, &ModuleContext::new(request(REQUEST_PATH)));
+        let context = middleware_test_support::context(MiddlewarePhase::Serve, &document_state);
+        let unprepared = loader_for(&settings).create(&context);
+
+        // Assert
         assert!(
-            inserts
-                .iter()
-                .all(|s| !s.contains("/integrations/gpt/script")),
-            "should write no loader tag unless asked, got: {inserts:?}"
+            unresolved.head_inserts.is_empty(),
+            "no permission state: no loader tag should be written: {:?}",
+            unresolved.head_inserts
+        );
+        assert!(
+            unprepared.head_inserts.is_empty(),
+            "nothing prepared: no loader tag should be written: {:?}",
+            unprepared.head_inserts
+        );
+    }
+
+    #[test]
+    fn a_page_for_a_reader_who_has_not_agreed_carries_no_gpt_loader() {
+        // Arrange
+        // Under the policy core ships, a reader in Germany whose request
+        // carries no signal is still waiting to allow storage on the device,
+        // and a reader in California who sends an opt-out, such as Global
+        // Privacy Control, has it revoked.
+        let settings = settings_writing_the_loader();
+        let policy = PermissionMaps::standard();
+        let readers = [
+            ("not yet agreed", policy.baseline(Some("DE"), None)),
+            (
+                "opted out",
+                policy.resolve_with(Some("US"), Some("CA"), |permission, _| {
+                    if policy.signals().opt_out_revokes(permission) {
+                        ConsentSignal::Revoke
+                    } else {
+                        ConsentSignal::Neutral
+                    }
+                }),
+            ),
+        ];
+
+        for (reader, permissions) in readers {
+            // Act
+            let processed = process_for(&settings, PAGE_WITHOUT_A_LOADER, &permissions);
+
+            // Assert
+            assert!(
+                processed.contains(GPT_BOOTSTRAP_JS),
+                "{reader}: the bootstrap should be written: {processed}"
+            );
+            assert!(
+                !processed.contains("/integrations/gpt/script"),
+                "{reader}: no loader tag should reach the page: {processed}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_page_for_a_reader_who_allows_storage_carries_the_loader_after_the_bootstrap() {
+        // Arrange
+        // Under the policy core ships, a reader in the United States who
+        // sends no opt-out allows storage on the device.
+        let settings = settings_writing_the_loader();
+        let permissions = PermissionMaps::standard().baseline(Some("US"), None);
+
+        // Act
+        let processed = process_for(&settings, PAGE_WITHOUT_A_LOADER, &permissions);
+
+        // Assert
+        assert_eq!(
+            processed.matches(LOADER_TAG).count(),
+            1,
+            "the loader tag should be written once: {processed}"
+        );
+        // The script that installs the shim comes before the bootstrap, so a
+        // tag after the bootstrap's end follows both.
+        let bootstrap_end = processed
+            .find(GPT_BOOTSTRAP_JS)
+            .map(|at| at + GPT_BOOTSTRAP_JS.len())
+            .expect("the bootstrap should be written");
+        let loader = processed
+            .find(LOADER_TAG)
+            .expect("the loader tag should be written");
+        assert!(
+            bootstrap_end <= loader,
+            "the loader tag should follow the shim and the bootstrap it relies on: {processed}"
+        );
+    }
+
+    #[test]
+    fn the_loader_middleware_is_named_after_the_module() {
+        assert_eq!(
+            LOADER_MIDDLEWARE,
+            trusted_server_core::module_name!("loader"),
+            "should be the module's name with a part of its own"
         );
     }
 

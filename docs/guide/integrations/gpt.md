@@ -72,6 +72,8 @@ write_loader = false
 | `rewrite_script`          | boolean | No       | `true`                                                 | Whether to rewrite GPT script URLs in HTML                        |
 | `write_loader`            | boolean | No       | `false`                                                | Write the loader tag into the head, for a page that carries none  |
 
+The serve middleware `ad-tag.google.loader` writes the loader tag, so a deployment that sets `write_loader` names that middleware in a `[[serve]]` entry. The middleware writes the tag only for a reader whose permissions allow storage on the device (`necessary.operations.storage`), because GPT loaded from Google's standard address may use the device's storage at any time.
+
 The environment override
 `TRUSTED_SERVER__AD-TAG__GOOGLE__GAM_ATTRIBUTION_ENABLED` works only when
 `gam_attribution_enabled` is already present under `[ad-tag.google]` in the

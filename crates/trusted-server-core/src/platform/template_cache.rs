@@ -213,9 +213,9 @@ impl TemplateCacheKey {
 
 /// Surrogate key for a reader-facing URL, as an operator would type it.
 ///
-/// A free function because both halves of the purge path need it and neither can build a
-/// whole [`TemplateCacheKey`]: the endpoint and the CLI have a URL, not an origin identity,
-/// a template fingerprint, or the origin's `Vary` values.
+/// A free function because the service tags a cached page with it and `ts cache purge
+/// --page` works the same key out from a URL alone, without the origin identity, template
+/// fingerprint or origin `Vary` values a whole [`TemplateCacheKey`] needs.
 ///
 /// # Canonicalization
 ///

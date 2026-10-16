@@ -1,11 +1,11 @@
 # Design Spec: A deployment may address a request by its path before its configuration is chosen
 
-**Status:** Proposed, 2026-10-13. Raised as draft pull request jwrosewell/trusted-server#30, for Tech Lab review.
+**Status:** Proposed, 2026-10-13. Raised as draft pull request IABTechLab/trusted-server#1376 (from jwrosewell/trusted-server#30, which is closed), for Tech Lab review.
 **Author:** 51Degrees (contributed), for Tech Lab review
 **Related specs:** `2026-10-12-config-by-host-design.md`, `2026-10-12-middleware-prepare-design.md`, `2026-10-12-prefix-module-design.md`, `2026-08-27-integration-provider-seam-design.md` and `2026-10-15-cookies-by-path-design.md`, all in IABTechLab/trusted-server#1342, which holds every design document of the stack
-**Related PRs:** jwrosewell/trusted-server#30
+**Related PRs:** IABTechLab/trusted-server#1376, jwrosewell/trusted-server#30 (closed)
 **Issues:** IABTechLab/trusted-server#1328
-**Last updated:** 2026-10-15
+**Last updated:** 2026-10-16
 
 > **Why this spec exists.** An adapter chooses the app-config blob that serves a request by the request's host alone, before any settings exist, so one host cannot serve several publishers under paths of their own.
 

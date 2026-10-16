@@ -3,9 +3,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
-use edgezero_core::http::{HeaderValue, Response};
+use edgezero_core::http::Response;
 use edgezero_core::middleware::{Middleware, Next};
-use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
 use trusted_server_core::http_util::{
     ROUTE_NAMESPACE, sanitize_trusted_client_ip_headers, strip_deployment_headers,
 };
@@ -53,9 +52,8 @@ impl Middleware for SanitizeRequestMiddleware {
 
 /// Response-finalization middleware: injects all standard TS response headers.
 ///
-/// Geo lookup is unavailable in the Axum dev server — `X-Geo-Info-Available: false`
-/// is always emitted. The Fastly adapter's `X-TS-ENV` is skipped because its
-/// env var is not set in a local dev context.
+/// The Fastly adapter's `X-TS-ENV` is skipped because its env var is not set
+/// in a local dev context.
 ///
 /// Registered directly inside [`SanitizeRequestMiddleware`], so that every
 /// outgoing response carries a consistent set of headers.
@@ -89,16 +87,10 @@ impl Middleware for FinalizeResponseMiddleware {
 
 /// Applies standard Trusted Server response headers to the given response.
 ///
-/// Unlike the Fastly variant, geo is always unavailable so `X-Geo-Info-Available: false`
-/// is unconditionally emitted. Fastly-specific headers are omitted.
-/// Operator-configured `settings.response_headers` are applied last (with the
-/// shared cookie cache-privacy hardening) and can override any managed header.
+/// Fastly-specific headers are omitted. Operator-configured
+/// `settings.response_headers` are applied with the shared cookie
+/// cache-privacy hardening and can override any header already written.
 pub(crate) fn apply_finalize_headers(settings: &Settings, response: &mut Response) {
-    response.headers_mut().insert(
-        HEADER_X_GEO_INFO_AVAILABLE,
-        HeaderValue::from_static("false"),
-    );
-
     // Cookie-bearing responses stay private to shared caches and operator
     // headers cannot re-enable caching for uncacheable per-user payloads.
     trusted_server_core::response_privacy::apply_response_headers_with_cache_privacy(
@@ -175,37 +167,21 @@ mod tests {
     }
 
     #[test]
-    fn sets_geo_unavailable_header() {
+    fn finalizing_writes_no_geo_header() {
         let settings = settings_with_response_headers(vec![]);
         let mut response = empty_response();
 
         apply_finalize_headers(&settings, &mut response);
 
-        assert_eq!(
-            response
-                .headers()
-                .get("x-geo-info-available")
-                .and_then(|v| v.to_str().ok()),
-            Some("false"),
-            "should set X-Geo-Info-Available: false"
-        );
-    }
-
-    #[test]
-    fn operator_response_headers_override_geo_header() {
-        let settings =
-            settings_with_response_headers(vec![("X-Geo-Info-Available", "operator-override")]);
-        let mut response = empty_response();
-
-        apply_finalize_headers(&settings, &mut response);
-
-        assert_eq!(
-            response
-                .headers()
-                .get("x-geo-info-available")
-                .and_then(|v| v.to_str().ok()),
-            Some("operator-override"),
-            "should override the managed geo header with the operator-configured value"
+        let geo_headers: Vec<&str> = response
+            .headers()
+            .keys()
+            .map(edgezero_core::http::HeaderName::as_str)
+            .filter(|name| name.starts_with("x-geo-"))
+            .collect();
+        assert!(
+            geo_headers.is_empty(),
+            "should write no x-geo-* header, which a serve middleware writes: {geo_headers:?}"
         );
     }
 

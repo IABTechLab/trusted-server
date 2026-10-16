@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use lol_html::{
     EndTagHandler, Settings as RewriterSettings, element, end,
-    html_content::{ContentType, EndTag, TextChunk},
+    html_content::{ContentType, EndTag, TextChunk, TextType},
     text,
 };
 
@@ -27,6 +27,10 @@ use crate::publisher::build_empty_bids_script;
 use crate::settings::Settings;
 use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
 use crate::tsjs;
+
+mod script_text;
+
+use script_text::ScriptTextGuard;
 
 struct HtmlWithStreamingProcessors {
     inner: Box<dyn StreamProcessor>,
@@ -407,7 +411,10 @@ type ContentHandler = (
 /// The handlers that carry out a plan's element and text handlers.
 ///
 /// The text handlers share `edits` with every text handler registered before
-/// them, so each is handed a chunk as the one before it left it.
+/// them, so each is handed a chunk as the one before it left it. A
+/// [`ScriptTextGuard`] registered after them writes what they left in a
+/// script, so that their text cannot end the script or keep its end tag from
+/// closing it.
 ///
 /// A selector that does not parse panics here, which
 /// [`MiddlewareChain::plan`] rules out by refusing to plan one.
@@ -444,6 +451,7 @@ fn middleware_content_handlers(
             Ok(())
         }));
     }
+    let guarded = !text_handlers.is_empty();
     for mut handler in text_handlers {
         let selector = handler.selector().to_owned();
         let edits = Rc::clone(edits);
@@ -453,6 +461,20 @@ fn middleware_content_handlers(
                 ScriptRewriteAction::Keep => {}
                 ScriptRewriteAction::Replace(rewritten) => edits.replace(text, &rewritten),
                 ScriptRewriteAction::RemoveNode => edits.remove(text),
+            }
+            Ok(())
+        }));
+    }
+    if guarded {
+        let edits = Rc::clone(edits);
+        let mut guard = ScriptTextGuard::default();
+        handlers.push(text!("script", move |text| {
+            if text.text_type() == TextType::ScriptData {
+                let written = edits.current(text);
+                if let Some(safe) = guard.write(&written, text.removed(), text.last_in_text_node())
+                {
+                    edits.replace(text, &safe);
+                }
             }
             Ok(())
         }));
@@ -525,6 +547,34 @@ fn build_serve_processor(plan: MiddlewarePlan) -> HtmlWithStreamingProcessors {
     }
 }
 
+/// `value` with each occurrence of a form's text replaced by that form's
+/// replacement, in one pass from the start, so no replacement is read again.
+///
+/// The earliest match is taken each time, and the longer of two that start at
+/// the same place. A form with empty text is ignored.
+fn replace_each_once(value: &str, forms: &[(String, String)]) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    loop {
+        let next = forms
+            .iter()
+            .filter(|(text, _)| !text.is_empty())
+            .filter_map(|(text, replacement)| {
+                rest.find(text.as_str())
+                    .map(|at| (at, text.len(), replacement))
+            })
+            .min_by(|a, b| a.0.cmp(&b.0).then_with(|| b.1.cmp(&a.1)));
+        let Some((at, len, replacement)) = next else {
+            break;
+        };
+        out.push_str(&rest[..at]);
+        out.push_str(replacement);
+        rest = &rest[at + len..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// The processor behind [`create_html_processor`] and
 /// [`create_html_processor_with_middleware`], carrying out `plan`.
 ///
@@ -549,32 +599,36 @@ fn build_html_processor(
         // refuses.
         response_headers: _,
     } = plan;
-    // Simplified URL patterns structure - stores only core data and generates variants on-demand
+    // The spellings of the origin's address in a URL attribute, each with its
+    // replacement, built once per document. They are replaced in one pass and a
+    // replacement is never read again, because a request host that begins with
+    // the origin host would otherwise match a later spelling inside an earlier
+    // spelling's replacement.
     struct UrlPatterns {
         origin_host: String,
         request_host: String,
-        request_scheme: String,
+        /// The `https://`, `http://` and protocol-relative spellings.
+        url_forms: Vec<(String, String)>,
+        /// The same and the bare host, which a `srcset` candidate may name.
+        srcset_forms: Vec<(String, String)>,
     }
 
     impl UrlPatterns {
-        fn https_origin(&self) -> String {
-            format!("https://{}", self.origin_host)
-        }
-
-        fn http_origin(&self) -> String {
-            format!("http://{}", self.origin_host)
-        }
-
-        fn protocol_relative_origin(&self) -> String {
-            format!("//{}", self.origin_host)
-        }
-
-        fn replacement_url(&self) -> String {
-            format!("{}://{}", self.request_scheme, self.request_host)
-        }
-
-        fn protocol_relative_replacement(&self) -> String {
-            format!("//{}", self.request_host)
+        fn new(origin_host: &str, request_host: &str, request_scheme: &str) -> Self {
+            let replacement_url = format!("{request_scheme}://{request_host}");
+            let url_forms = vec![
+                (format!("https://{origin_host}"), replacement_url.clone()),
+                (format!("http://{origin_host}"), replacement_url),
+                (format!("//{origin_host}"), format!("//{request_host}")),
+            ];
+            let mut srcset_forms = url_forms.clone();
+            srcset_forms.push((origin_host.to_owned(), request_host.to_owned()));
+            Self {
+                origin_host: origin_host.to_owned(),
+                request_host: request_host.to_owned(),
+                url_forms,
+                srcset_forms,
+            }
         }
 
         fn rewrite_url_value(&self, value: &str) -> Option<String> {
@@ -582,35 +636,32 @@ fn build_html_processor(
                 return None;
             }
 
-            let https_origin = self.https_origin();
-            let http_origin = self.http_origin();
-            let protocol_relative_origin = self.protocol_relative_origin();
-            let replacement_url = self.replacement_url();
-            let protocol_relative_replacement = self.protocol_relative_replacement();
-
-            let mut rewritten = value
-                .replace(&https_origin, &replacement_url)
-                .replace(&http_origin, &replacement_url)
-                .replace(&protocol_relative_origin, &protocol_relative_replacement);
-
-            if rewritten.starts_with(&self.origin_host) {
-                let suffix = &rewritten[self.origin_host.len()..];
-                let boundary_ok = suffix.is_empty()
-                    || matches!(suffix.as_bytes().first(), Some(b'/' | b'?' | b'#'));
-                if boundary_ok {
-                    rewritten = format!("{}{}", self.request_host, suffix);
+            // A value that begins with the bare host is moved when the host
+            // ends there, so `origin.example.com/news` moves and
+            // `origin.example.com.mirror.example` does not.
+            let rewritten = match value.strip_prefix(self.origin_host.as_str()) {
+                Some(rest)
+                    if rest.is_empty()
+                        || matches!(rest.as_bytes().first(), Some(b'/' | b'?' | b'#')) =>
+                {
+                    format!(
+                        "{}{}",
+                        self.request_host,
+                        replace_each_once(rest, &self.url_forms)
+                    )
                 }
-            }
+                _ => replace_each_once(value, &self.url_forms),
+            };
 
             (rewritten != value).then_some(rewritten)
         }
     }
 
-    let patterns = Rc::new(UrlPatterns {
-        origin_host: config.origin_host.clone(),
-        request_host: config.request_host.clone(),
-        request_scheme: config.request_scheme.clone(),
-    });
+    let patterns = Rc::new(UrlPatterns::new(
+        &config.origin_host,
+        &config.request_host,
+        &config.request_scheme,
+    ));
 
     let injected_tsjs = Rc::new(Cell::new(false));
     let injected_bids = Arc::new(AtomicBool::new(false));
@@ -804,14 +855,7 @@ fn build_html_processor(
             let patterns = patterns.clone();
             move |el| {
                 if let Some(srcset) = el.get_attribute("srcset") {
-                    let rewritten = srcset
-                        .replace(&patterns.https_origin(), &patterns.replacement_url())
-                        .replace(&patterns.http_origin(), &patterns.replacement_url())
-                        .replace(
-                            &patterns.protocol_relative_origin(),
-                            &patterns.protocol_relative_replacement(),
-                        )
-                        .replace(&patterns.origin_host, &patterns.request_host);
+                    let rewritten = replace_each_once(&srcset, &patterns.srcset_forms);
                     if rewritten != srcset {
                         el.set_attribute("srcset", &rewritten)?;
                     }
@@ -824,13 +868,7 @@ fn build_html_processor(
             let patterns = patterns.clone();
             move |el| {
                 if let Some(imagesrcset) = el.get_attribute("imagesrcset") {
-                    let rewritten = imagesrcset
-                        .replace(&patterns.https_origin(), &patterns.replacement_url())
-                        .replace(&patterns.http_origin(), &patterns.replacement_url())
-                        .replace(
-                            &patterns.protocol_relative_origin(),
-                            &patterns.protocol_relative_replacement(),
-                        );
+                    let rewritten = replace_each_once(&imagesrcset, &patterns.url_forms);
                     if rewritten != imagesrcset {
                         el.set_attribute("imagesrcset", &rewritten)?;
                     }
@@ -1470,6 +1508,115 @@ mod tests {
             processed.contains(r#"<img srcset="https://cdn.example.net/e.png 1x">"#),
             "should leave a srcset that names another host as it is: {processed}"
         );
+    }
+
+    /// A request host that begins with the origin host, as a local host named
+    /// after the publisher does, is written once in every address over either
+    /// scheme, rather than matched again inside its own replacement.
+    #[test]
+    fn a_request_host_that_begins_with_the_origin_host_is_written_once() {
+        for scheme in ["http", "https"] {
+            let mut config = create_test_config();
+            config.origin_host = "publisher.example".to_owned();
+            config.request_host = "publisher.example.localhost".to_owned();
+            config.request_scheme = scheme.to_owned();
+            let mut processor = create_html_processor(config);
+
+            let output = processor
+                .process_chunk(
+                    br#"<html><head><link rel="preload" as="image" imagesrcset="https://publisher.example/a.png 1x, //publisher.example/b.png 2x"></head><body><a href="https://publisher.example/news">n</a><a href="http://publisher.example/old">o</a><a href="publisher.example/bare">b</a><img src="//publisher.example/c.png" srcset="https://publisher.example/d.png 1x, publisher.example/e.png 2x"><form action="https://publisher.example/search"></form></body></html>"#,
+                    true,
+                )
+                .expect("should process the document");
+            let processed = String::from_utf8(output).expect("should stay UTF-8");
+
+            assert!(
+                !processed.contains(".localhost.localhost"),
+                "should write the request host once over {scheme}: {processed}"
+            );
+            for expected in [
+                format!(r#"href="{scheme}://publisher.example.localhost/news""#),
+                format!(r#"href="{scheme}://publisher.example.localhost/old""#),
+                r#"href="publisher.example.localhost/bare""#.to_owned(),
+                r#"src="//publisher.example.localhost/c.png""#.to_owned(),
+                format!(
+                    r#"srcset="{scheme}://publisher.example.localhost/d.png 1x, publisher.example.localhost/e.png 2x""#
+                ),
+                format!(r#"action="{scheme}://publisher.example.localhost/search""#),
+                format!(
+                    r#"imagesrcset="{scheme}://publisher.example.localhost/a.png 1x, //publisher.example.localhost/b.png 2x""#
+                ),
+            ] {
+                assert!(
+                    processed.contains(&expected),
+                    "should contain {expected} over {scheme}: {processed}"
+                );
+            }
+        }
+    }
+
+    /// Hosts that do not begin with the origin host are written as before,
+    /// both one with no part of the origin host in it and a `www.` host in
+    /// front of an apex origin, whose `srcset` must not become `www.www.`.
+    #[test]
+    fn a_request_host_that_does_not_begin_with_the_origin_host_is_written_as_before() {
+        for (origin, request) in [
+            ("publisher.example", "publisher-example.localhost"),
+            ("example.com", "www.example.com"),
+        ] {
+            let mut config = create_test_config();
+            config.origin_host = origin.to_owned();
+            config.request_host = request.to_owned();
+            config.request_scheme = "https".to_owned();
+            let mut processor = create_html_processor(config);
+
+            let input = format!(
+                r#"<html><head></head><body><a href="https://{origin}/a">a</a><a href="http://{origin}/b">b</a><img src="//{origin}/c.png" srcset="https://{origin}/d.png 1x, {origin}/e.png 2x"></body></html>"#
+            );
+            let output = processor
+                .process_chunk(input.as_bytes(), true)
+                .expect("should process the document");
+            let processed = String::from_utf8(output).expect("should stay UTF-8");
+
+            for expected in [
+                format!(r#"href="https://{request}/a""#),
+                format!(r#"href="https://{request}/b""#),
+                format!(r#"src="//{request}/c.png""#),
+                format!(r#"srcset="https://{request}/d.png 1x, {request}/e.png 2x""#),
+            ] {
+                assert!(
+                    processed.contains(&expected),
+                    "should contain {expected} for {origin} served as {request}: {processed}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn each_form_is_replaced_once_from_the_start() {
+        let forms = vec![
+            (
+                "https://a.example".to_owned(),
+                "http://a.example.localhost".to_owned(),
+            ),
+            (
+                "http://a.example".to_owned(),
+                "http://a.example.localhost".to_owned(),
+            ),
+            ("//a.example".to_owned(), "//a.example.localhost".to_owned()),
+            ("a.example".to_owned(), "a.example.localhost".to_owned()),
+            (String::new(), "never".to_owned()),
+        ];
+
+        assert_eq!(
+            replace_each_once(
+                "https://a.example/1 http://a.example/2 //a.example/3 a.example/4",
+                &forms
+            ),
+            "http://a.example.localhost/1 http://a.example.localhost/2 //a.example.localhost/3 a.example.localhost/4"
+        );
+        assert_eq!(replace_each_once("nothing here", &forms), "nothing here");
+        assert_eq!(replace_each_once("", &forms), "");
     }
 
     #[test]
