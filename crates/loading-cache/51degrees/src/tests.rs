@@ -674,9 +674,7 @@ fn a_memory_lifetime_of_zero_keeps_no_memory_copy_and_still_loads_once() {
     let mut no_memory = spec();
     no_memory.lifetimes.memory = Duration::ZERO;
 
-    let answers = ask_from_many_threads(&caches, &services, &no_memory, || {
-        counted(&runs, "value")
-    });
+    let answers = ask_from_many_threads(&caches, &services, &no_memory, || counted(&runs, "value"));
 
     assert_eq!(
         runs.load(Ordering::SeqCst),
@@ -695,7 +693,11 @@ fn a_memory_lifetime_of_zero_keeps_no_memory_copy_and_still_loads_once() {
         .block_on(caches.get_or_load(&services, &no_memory, &key("k"), never()))
         .expect("the store should answer");
     assert_eq!(again, "value");
-    assert_eq!(kv.reads(), reads + 1, "with no memory copy the store is read");
+    assert_eq!(
+        kv.reads(),
+        reads + 1,
+        "with no memory copy the store is read"
+    );
 }
 
 /// A caller whose load is dropped before it ends hands the load on, so a
