@@ -1746,6 +1746,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_page_with_no_head_gets_the_noscript_and_none_of_the_head_snippets() {
+        // Arrange
+        // Core writes the script bundle's tag at the start of the head, and
+        // the head snippets go straight before that tag, so a document with no
+        // head has nowhere to take them.
+        let settings = settings_with_google(&json!({
+            "analytics_tag_id": TEST_TAG_ID,
+            "container_id": TEST_CONTAINER_ID,
+        }));
+        let html = "<html><body><h1>Headline</h1></body></html>";
+
+        // Act
+        let processed = process(&settings, html);
+
+        // Assert
+        for snippet in ["gtag('consent'", "gtag/js", "gtm.js"] {
+            assert!(
+                !processed.contains(snippet),
+                "nothing naming `{snippet}` should be written without a head: {processed}"
+            );
+        }
+        assert_eq!(
+            processed.matches("ns.html?id=").count(),
+            1,
+            "the noscript iframe should still be written once: {processed}"
+        );
+        assert!(
+            processed.contains("<body><!-- Google Tag Manager (noscript) -->"),
+            "the noscript iframe should follow the opening body tag: {processed}"
+        );
+    }
+
     /// Settings naming all three ids, so every loader would be written.
     fn settings_with_every_id() -> Settings {
         settings_with_google(&json!({
