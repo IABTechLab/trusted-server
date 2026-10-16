@@ -601,7 +601,7 @@ fn serve_tsjs_static(
     );
     if request_version_hash(req).is_some_and(|hash| hash == expected_hash) {
         CachePolicy::public_immutable(Duration::from_secs(31_536_000))
-            .apply_to_headers(response.headers_mut(), edge_header);
+            .apply_to_response(&mut response, edge_header);
     }
     response
         .headers_mut()
@@ -2135,7 +2135,7 @@ fn apply_publisher_asset_cache_policy(
     }
 
     if let Some(policy) = settings.asset_cache_policy_for_path(path)? {
-        policy.apply_to_headers(response.headers_mut(), edge_header);
+        policy.apply_to_response(response, edge_header);
     }
 
     Ok(())
@@ -7747,11 +7747,13 @@ fn origin_response_may_be_kept(
     }
     // Core Cache has no HTTP semantics. The Surrogate-Control subset
     // `origin_shared_ttl` parses is read; a policy in any other shared cache
-    // header, the platform's own included, is a bypass rather than a guess
-    // at its grammar or precedence.
-    if crate::cache_policy::edge_cache_header_names()
-        .into_iter()
+    // header, the ones the platform's adapter declared included, is a bypass
+    // rather than a guess at its grammar or precedence.
+    if crate::cache_policy::EDGE_CACHE_HEADER_NAMES
+        .iter()
+        .copied()
         .filter(|name| *name != crate::cache_policy::HEADER_SURROGATE_CONTROL_NAME)
+        .chain(crate::platform::platform_cache_headers())
         .any(|name| headers.contains_key(name))
     {
         return Err(TemplateCacheBypassReason::OriginNotShareable);
@@ -18617,7 +18619,12 @@ mod tests {
 
         #[test]
         fn cdn_specific_cache_policy_cannot_be_overridden_by_public_cache_control() {
-            for name in crate::cache_policy::edge_cache_header_names() {
+            crate::platform::declare_platform_cache_headers(&["example-platform-cache-control"]);
+            for name in crate::cache_policy::EDGE_CACHE_HEADER_NAMES
+                .iter()
+                .copied()
+                .chain(["example-platform-cache-control"])
+            {
                 let mut split = shareable();
                 split.insert(
                     header::HeaderName::from_static(name),
@@ -18642,9 +18649,12 @@ mod tests {
 
         #[test]
         fn unsupported_vendor_freshness_does_not_authorize_template_cache() {
-            for name in crate::cache_policy::edge_cache_header_names()
-                .into_iter()
+            crate::platform::declare_platform_cache_headers(&["example-platform-cache-control"]);
+            for name in crate::cache_policy::EDGE_CACHE_HEADER_NAMES
+                .iter()
+                .copied()
                 .filter(|name| *name != "surrogate-control")
+                .chain(["example-platform-cache-control"])
             {
                 let mut split = shareable();
                 split.insert(
@@ -18663,7 +18673,7 @@ mod tests {
                         &nothing_covered(),
                     ),
                     Some(TemplateCacheBypassReason::OriginNotShareable),
-                    "the Fastly exception must not authorize the vendor policy {name}"
+                    "the Surrogate-Control exception must not authorize the policy in {name}"
                 );
             }
         }

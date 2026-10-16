@@ -1949,7 +1949,7 @@ On a configured Fastly asset-rehost route, a matching rule is authoritative
 over the third-party origin's cache defaults, including `no-store`, because
 Trusted Server owns the rehosted copy. A later Trusted Server or operator-applied
 `private` or `no-store` directive still vetoes public policy reapplication and
-removes shared-cache headers.
+removes the shared-cache headers Trusted Server writes.
 
 TS-owned validated hash URLs such as `/static/tsjs=...js?v=<hash>` use their
 built-in cache policy and do not require an asset rule. Shared-cache keys for
@@ -3227,8 +3227,8 @@ positive shared freshness. `private`, `no-store`, `no-cache`, exhausted or
 malformed freshness, `Set-Cookie`, `Vary: *`, `Vary: Cookie`, uncovered `Vary`
 names, response-bound CSP nonces, pass-through or ambiguous authorization,
 diagnostics sessions, range or conditional requests, positive or malformed
-request `max-age`, `min-fresh`, and unsupported CDN-specific cache policy fields
-all bypass the template cache. Fastly
+request `max-age`, `min-fresh`, and a policy in `CDN-Cache-Control` or in the
+running platform's own cache header all bypass the template cache. Fastly
 `Surrogate-Control` is the narrow exception: the template cache accepts exactly one positive
 `max-age` plus optional valid `stale-while-revalidate` and `stale-if-error`
 delta-seconds. Restrictive, duplicated, malformed, or unknown directives fail
