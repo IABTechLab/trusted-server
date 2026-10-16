@@ -971,9 +971,9 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_failure_gives_only_the_host_of_an_address_it_names() {
         let scripted = Arc::new(Scripted::new(vec![Err(
-            "GET https://user:secret-password@rules.example:8443/v1/secret-in-path/rules\
-             ?licence=secret-in-query#secret-in-fragment failed, and \"http://other.example/\
-             secret-in-quotes\" too"
+            "GET https://user:xyzzy-password@rules.example:8443/v1/xyzzy-in-path/rules\
+             ?licence=xyzzy-in-query#xyzzy-in-fragment failed, and \"http://other.example/\
+             xyzzy-in-quotes\" too"
                 .to_owned(),
         )]));
         let services = services_with(Arc::default(), Arc::default());
@@ -994,7 +994,9 @@ pub(crate) mod tests {
             "{logged}"
         );
         assert!(logged.contains("http://other.example"), "{logged}");
-        assert!(!logged.contains("secret"), "{logged}");
+        // A word no function name holds, because the report carries a
+        // backtrace when one is captured.
+        assert!(!logged.contains("xyzzy"), "{logged}");
     }
 
     /// A held copy that no longer reads is removed and the contributor asked
