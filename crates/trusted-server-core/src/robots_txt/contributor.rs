@@ -63,10 +63,11 @@ pub trait RobotsTxtContributor: Send + Sync + core::fmt::Debug {
     /// Core holds the answer for the publisher and serves it to every
     /// crawler. So the call carries the request the answer was asked for,
     /// being its method, path, host and scheme without its query, and the
-    /// request's services, and nothing about who asked. An implementation
-    /// hands its own function to [`ModuleCall::inject`], naming what it
-    /// needs. Its answer must be the same for every request the publisher
-    /// receives, because it is served for all of them.
+    /// services [without the reader](crate::platform::RuntimeServices::without_reader),
+    /// and nothing about who asked. An implementation hands its own function
+    /// to [`ModuleCall::inject`], naming what it needs. Its answer must be the
+    /// same for every request the publisher receives, because it is served
+    /// for all of them.
     ///
     /// A contribution with no groups is an answer, and is served as one. An
     /// error is a failure, and core serves this contributor's held copy

@@ -284,6 +284,10 @@ impl RuntimeServices {
     /// or from `load`, kept in this request's stores. See
     /// [`super::PlatformLoadingCache::get_or_load`].
     ///
+    /// The cache is handed these services [without the
+    /// reader](Self::without_reader), because one load serves every caller
+    /// waiting on it.
+    ///
     /// # Errors
     ///
     /// The error of the load this caller waited on.
@@ -294,7 +298,7 @@ impl RuntimeServices {
         load: super::Loader,
     ) -> Result<bytes::Bytes, super::LoadError> {
         self.loading_cache_for(spec.name)
-            .get_or_load(self, spec, key, load)
+            .get_or_load(&self.without_reader(), spec, key, load)
             .await
     }
 
@@ -443,6 +447,22 @@ impl RuntimeServices {
         Self {
             client_info,
             ..self
+        }
+    }
+
+    /// A clone of these services carrying nothing of the reader whose
+    /// request they were built for, being the client's connection details
+    /// and the host's signals about it. The stores, caches, backends, HTTP
+    /// client and modules stay.
+    ///
+    /// For work whose result serves other readers, such as a load a cache
+    /// shares, so one reader's details never shape what another is served.
+    #[must_use]
+    pub fn without_reader(&self) -> Self {
+        Self {
+            client_info: ClientInfo::default(),
+            host_signals: None,
+            ..self.clone()
         }
     }
 

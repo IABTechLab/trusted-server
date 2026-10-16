@@ -827,7 +827,9 @@ that started it, which only a load that never blocks its thread may. Its key
 is a `StoreKey`, which starts with the publisher's `ServerKeyPrefix` from the
 loaded settings, so two publishers sharing a store never share a copy. The
 `Loader` it hands over owns everything it uses, and answers a `LoadedValue`,
-with a lifetime of its own where the source gives one.
+with a lifetime of its own where the source gives one. Its value serves every
+reader, so any services it needs come from `services.without_reader()`, never
+the request's own, and `load_cached` hands the cache the same.
 
 ```rust
 let key = StoreKey::new(&ServerKeyPrefix::for_settings(settings), CACHE, digest);

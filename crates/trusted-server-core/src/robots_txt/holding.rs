@@ -82,13 +82,16 @@ pub(crate) async fn contribution_for(
     let key = StoreKey::new(&prefix, CACHE, held.clone());
     let kept = StoreKey::new(&prefix, KEPT, held);
     let spec = cache_spec(settings);
+    // The answer serves every reader, so the contributor is handed nothing
+    // of the reader whose request happens to ask first.
+    let shared = services.without_reader();
     let ask = || {
         load(
             Ask {
                 id,
                 contributor: Arc::clone(contributor),
                 request: request.clone(),
-                services: services.clone(),
+                services: shared.clone(),
             },
             kept.clone(),
         )
@@ -395,6 +398,96 @@ pub(crate) mod tests {
             .expect("should ask the contributor");
 
         assert_eq!(answer, rules(ECHOED));
+    }
+
+    /// Host signals about a reader, as a host that computes them gives each
+    /// request.
+    #[derive(Debug)]
+    struct ReaderSignals;
+
+    impl crate::evidence::HostSignals for ReaderSignals {
+        fn ja4(&self) -> Option<&str> {
+            Some("t13d1516h2_reader")
+        }
+
+        fn h2(&self) -> Option<&str> {
+            Some("1:65536|reader")
+        }
+    }
+
+    /// A contributor whose rules name what its services say about the
+    /// reader, so a test can see whether any of it arrived.
+    #[derive(Debug)]
+    struct ReaderEcho;
+
+    impl ReaderEcho {
+        fn rules(&self, services: Option<&RuntimeServices>) -> Contribution {
+            let client = services.map(RuntimeServices::client_info);
+            let ip = client
+                .and_then(|client| client.client_ip)
+                .map_or_else(|| "no-ip".to_owned(), |ip| ip.to_string());
+            let ja4 = client
+                .and_then(|client| client.tls_ja4.as_deref())
+                .unwrap_or("no-ja4");
+            let signals = if services.is_some_and(|services| services.host_signals().is_some()) {
+                "signals"
+            } else {
+                "no-signals"
+            };
+            rules(&format!(
+                "User-Agent: ReaderBot\nDisallow: /{ip}/{ja4}/{signals}"
+            ))
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl RobotsTxtContributor for ReaderEcho {
+        fn refresh(&self) -> Duration {
+            Duration::from_secs(60)
+        }
+
+        fn fingerprint(&self) -> String {
+            "reader".to_owned()
+        }
+
+        async fn contribute(
+            &self,
+            call: ModuleCall<'_>,
+        ) -> Result<Contribution, Report<TrustedServerError>> {
+            Ok(call.inject(self, Self::rules)?)
+        }
+    }
+
+    /// One load answers every crawler, so the contributor is handed nothing
+    /// of the reader whose request asks first, being the client's address,
+    /// its connection details and the host's signals about it.
+    #[tokio::test]
+    async fn the_contributor_is_handed_nothing_of_the_reader_who_asks_first() {
+        let reading: Arc<dyn RobotsTxtContributor> = Arc::new(ReaderEcho);
+        let services = crate::platform::RuntimeServices::builder()
+            .config_store(Arc::new(crate::platform::test_support::NoopConfigStore))
+            .secret_store(Arc::new(crate::platform::test_support::NoopSecretStore))
+            .kv_store(Arc::new(MemoryKvStore::default()))
+            .backend(Arc::new(crate::platform::test_support::NoopBackend))
+            .http_client(Arc::new(StubHttpClient::new()))
+            .geo(Arc::new(crate::platform::test_support::NoopGeo))
+            .client_info(crate::platform::ClientInfo {
+                client_ip: Some(std::net::IpAddr::from([203, 0, 113, 7])),
+                tls_ja4: Some("t13d1516h2_reader".to_owned()),
+                ..crate::platform::ClientInfo::default()
+            })
+            .host_signals(Arc::new(ReaderSignals))
+            .build()
+            .with_loading_cache(Arc::new(MemoryLoadingCache::default()));
+
+        let answer = contribution_for("reader", &reading, &request(), &services, &settings())
+            .await
+            .expect("should ask the contributor");
+
+        assert_eq!(
+            answer,
+            rules("User-Agent: ReaderBot\nDisallow: /no-ip/no-ja4/no-signals")
+        );
     }
 
     /// A store held in memory for the life of one test, so that what one
