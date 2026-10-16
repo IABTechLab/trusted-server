@@ -81,7 +81,7 @@ A module outside this repository moves the same way. It takes the `ModuleCall` w
 - On Axum, Cloudflare and Spin, every module route now reads the Edge Cookie state, as the publisher path does there and as Fastly does for every request. The route did none of the following before:
   - a geo lookup,
   - a parse of the `Cookie` header,
-  - the resolution of the selected Edge Cookie module, which Axum repeats on each request for a built-in module and Cloudflare and Spin do once at startup,
+  - the resolution of the selected Edge Cookie module, which Axum repeats on each request for a built-in module, and Cloudflare and Spin repeat on every request because they build their state for each one,
   - a decode of the consent signals, and
   - a run of every permission signal module over the permissions.
 
@@ -139,6 +139,7 @@ These are for the reviewer. This revision records what the code does and decides
 ## Review log
 
 1. **Round 1, 2026-10-15.** A review in a fresh session, against `split/8-module-context` at `bc28b3e7f`. Issues found, three of them blocking. The blocking issues were that section 3 said settings select the change when none does and left out what the Axum, Cloudflare and Spin adapters now do for every module route, that the costs left out the geo lookup and the other work each of those routes now does, and that nothing said what a route answers when a value is withheld or absent. This revision states what the code does for each, adds the adapter table, the answers for a missing value and the untested paths, corrects the partly true claims and the header, and leaves the code questions in section 6 and the missing tests in section 5 for code changes.
+2. **Round 2, 2026-10-16.** A lighter review in a fresh session, checking the round 1 fixes against `split/8-module-context` at `bc28b3e7f`. Approved, none blocking. This revision says Cloudflare and Spin resolve the selected Edge Cookie module on every request, as they build their state for each one, and the fork's check runs confirm 19 of 19 on both commits the spec names.
 
 ## Revision record
 
@@ -146,3 +147,4 @@ These are for the reviewer. This revision records what the code does and decides
 | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 2026-10-12 | First draft, from the pull request and its issue as they stand.                                                                                                                                                                                                                                                                                                                                                |
 | 2026-10-15 | Fixes from review round 1. The header, the failure path and the identifier on three adapters in place of the claim that settings select the change, the costs of a module route, the answers for a missing value, the gating defaults, what keeps its own parameter list, the move of a module outside this repository, the acceptance on the head, the untested paths, the open questions and the review log. |
+| 2026-10-16 | Review round 2, approved, with the module resolution on Cloudflare and Spin stated per request.                                                                                                                                                                                                                                                                                                                |
