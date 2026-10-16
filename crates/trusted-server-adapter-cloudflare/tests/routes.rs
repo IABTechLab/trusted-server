@@ -602,11 +602,6 @@ async fn attestation_routes_skip_the_request_preparers() {
 
     let settings = Settings::from_toml(
         r#"
-            [[handlers]]
-            path = "^/_ts/admin"
-            username = "admin"
-            password = "admin-pass"
-
             [publisher]
             domain = "test-publisher.example.com"
             cookie_domain = ".test-publisher.example.com"
