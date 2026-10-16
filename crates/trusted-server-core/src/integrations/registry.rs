@@ -2329,13 +2329,11 @@ impl IntegrationRegistry {
                 // The served `?v=` hash and its memo trust this value, so a
                 // stale literal is a startup error rather than a stale
                 // script. The cost is one SHA-256 of each carried module
-                // per registry build, and only the Axum dev server builds
-                // the registry once, because its `main` builds the router
-                // before serving. Fastly starts a fresh Wasm instance per
-                // request, and `edgezero_adapter_cloudflare::run_app` and
-                // `edgezero_adapter_spin::run_app` both call `build_app`
-                // inside the per-request entry point, so those three pay
-                // it on every request.
+                // per registry build. A native server builds the registry
+                // once, because its `main` builds the router before
+                // serving, while an adapter that starts a fresh instance
+                // per request, or builds the app inside its per-request
+                // entry point, pays it on every request.
                 let actual = hex::encode(Sha256::digest(module.source.as_bytes()));
                 if actual != module.sha256 {
                     return Err(Report::new(TrustedServerError::Configuration {

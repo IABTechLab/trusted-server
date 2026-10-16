@@ -22,7 +22,7 @@ pub fn config_key(env: &EnvConfig) -> String {
 
 /// Resolves the `EdgeZero` app-config store name from the process environment.
 ///
-/// Native adapters such as Axum use this wrapper. An adapter whose platform
+/// Native adapters use this wrapper. An adapter whose platform
 /// links each store to the deployment under its logical ID opens the store
 /// under that ID and reads no store name at runtime. Without an override,
 /// this wrapper also returns the manifest default logical store ID.
@@ -33,7 +33,7 @@ pub fn default_config_store_name() -> StoreName {
 
 /// Resolves the app-config blob key from the process environment.
 ///
-/// Native adapters such as Axum use this wrapper and honour a `__KEY`
+/// Native adapters use this wrapper and honour a `__KEY`
 /// override, which must match `ts config push --key`, because an ordinary
 /// push without that flag writes at the logical store ID. An adapter that
 /// chooses its key for each request resolves the key itself.

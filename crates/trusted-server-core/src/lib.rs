@@ -1,7 +1,7 @@
 //! Common functionality for the trusted server.
 //!
-//! This crate provides shared types, utilities, and abstractions used by both
-//! the Fastly edge implementation and local development/testing environments.
+//! This crate provides shared types, utilities, and abstractions used by every
+//! adapter, on edge platforms and in local development and testing.
 //!
 //! # Modules
 //!

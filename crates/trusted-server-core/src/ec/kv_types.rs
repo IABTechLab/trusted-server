@@ -1,6 +1,6 @@
 //! KV identity graph schema types.
 //!
-//! These types define the JSON schema stored in the Fastly KV Store for the
+//! These types define the JSON schema stored in the platform's KV store for the
 //! EC identity graph. Each EC ID (`{64hex}.{6alnum}`) maps to a [`KvEntry`]
 //! containing consent state, geo location, and accumulated partner IDs.
 //!

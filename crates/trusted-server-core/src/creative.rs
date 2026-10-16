@@ -785,7 +785,7 @@ pub fn rewrite_css_body(settings: &Settings, css: &str) -> Result<String, CssRew
 /// Maximum byte length of creative HTML accepted by [`sanitize_creative_html`].
 ///
 /// Inputs larger than this are rejected (empty string returned) to prevent unbounded
-/// allocations on the hot path. Fastly Compute enforces upstream request-body limits,
+/// allocations on the hot path. A platform may enforce upstream request-body limits,
 /// but this guard protects internal callers too.
 const MAX_CREATIVE_SIZE: usize = 1024 * 1024; // 1 MiB
 
@@ -1655,7 +1655,7 @@ mod tests {
 
     #[test]
     fn inline_rewrite_uses_http_localhost_origin_with_port() {
-        // Axum/Viceroy dev runs over HTTP on a port. The inline URLs must carry
+        // Local development runs over HTTP on a port. The inline URLs must carry
         // the actual request origin (scheme + host + port), not a hardcoded
         // https://<publisher.domain> that development traffic never reaches.
         let settings = crate::test_support::tests::create_test_settings();

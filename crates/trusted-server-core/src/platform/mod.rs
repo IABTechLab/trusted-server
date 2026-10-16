@@ -1,8 +1,7 @@
 //! Platform abstraction layer for `trusted-server-core`.
 //!
 //! This module defines platform-neutral service contracts and request-scoped
-//! runtime state. Concrete implementations live in adapter crates such as
-//! `trusted-server-adapter-fastly`.
+//! runtime state. Concrete implementations live in the adapter crates.
 //!
 //! ## Traits
 //!
@@ -22,7 +21,7 @@
 //! The following components were evaluated for platform-specific behavior
 //! (verified 2026-03-31; see `docs/superpowers/plans/2026-03-31-pr8-content-rewriting-verification.md`)
 //! and found to have a platform-agnostic rewriting pipeline. No
-//! platform trait is required; future adapters (Cloudflare Workers, Axum, Spin) need not provide
+//! platform trait is required, and no adapter needs to provide
 //! any content-rewriting implementation:
 //!
 //! - **Content rewriting** — `html_processor`, `streaming_processor`,

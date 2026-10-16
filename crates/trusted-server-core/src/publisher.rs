@@ -13,7 +13,7 @@
 //! **Note on platform coupling:** The handler boundaries use portable HTTP
 //! types: [`handle_publisher_request`] and [`stream_publisher_body`] take and
 //! return `http::Request`/`http::Response` over `EdgeBody`, and platform I/O is
-//! reached through `RuntimeServices` rather than `fastly::*` directly. The
+//! reached through `RuntimeServices` rather than a platform SDK directly. The
 //! streaming processor itself is generic: `process_response_streaming` writes
 //! into any [`Write`] (a `Vec<u8>` for buffered routes, a streaming writer for
 //! the streaming route). It is not a content-rewriting concern.
@@ -2347,7 +2347,7 @@ enum TemplateStoreOutcome {
 /// statuses (204, 304) carry no body but may advertise the `GET` representation's
 /// length, so they skip the buffer and length rewrite.
 ///
-/// Buffered adapters (Axum, Cloudflare, Spin, and non-streaming fallbacks) call
+/// Buffered adapters and non-streaming fallbacks call
 /// this: it drives
 /// [`stream_publisher_body_async`], which awaits
 /// [`AuctionOrchestrator::collect_dispatched_auction`], writes the winning bids
@@ -2608,9 +2608,10 @@ pub async fn buffer_publisher_response_async(
 
 /// Splices this visitor's slots and bids into the seam, if the mode assembles.
 ///
-/// Gives the platform assembler the already-buffered cold document. Fastly resolves a
-/// synthetic ESI include with the repaired parser; adapters without an assembler and
-/// documents the parser rejects use the same validated byte split as the warm path.
+/// Gives the platform assembler the already-buffered cold document. An adapter with an
+/// assembler resolves a synthetic ESI include with the repaired parser, while adapters
+/// without one, and documents the parser rejects, use the same validated byte split as
+/// the warm path.
 ///
 /// Called *after* [`store_template_if_authorized`], never before: what is stored must be
 /// the template every visitor shares.
@@ -3038,8 +3039,8 @@ async fn store_template_if_authorized(
 /// bodies where possible.
 ///
 /// Buffered adapters should keep using [`buffer_publisher_response_async`].
-/// Fastly uses this helper before the entry point commits headers, allowing the
-/// response body to be pulled lazily by `stream_to_client()`.
+/// A streaming adapter uses this helper before the entry point commits headers,
+/// allowing the response body to be pulled lazily by `stream_to_client()`.
 ///
 /// # Errors
 ///
@@ -3089,8 +3090,8 @@ pub async fn publisher_response_into_streaming_response(
 
     match publisher_response {
         PublisherResponse::Buffered(mut response) => {
-            // Fastly requests the origin body as a stream before the response is
-            // classified, so a buffered-unmodified response can still hold an
+            // A streaming adapter requests the origin body as a stream before
+            // classification, so a buffered-unmodified response can still hold an
             // `EdgeBody::Stream`. A bodiless response (HEAD, 204, 205, 304) must
             // stay bodiless — `send_edgezero_response` streams any
             // `EdgeBody::Stream` to the client — so drop the body and correct
@@ -4717,10 +4718,10 @@ async fn stream_html_with_auction_hold<W: Write, P: StreamProcessor>(
 /// so the two async hold paths cannot drift apart.
 ///
 /// No production caller reaches this today: it is only entered through
-/// [`buffer_publisher_response_async`], and the buffered adapters (Axum,
-/// Cloudflare, Spin) never produce `Body::Stream` because the publisher fetch
-/// is gated on `supports_streaming_responses()`. It is groundwork for those
-/// adapters' streaming cutover; Fastly uses the lazy stream instead.
+/// [`buffer_publisher_response_async`], and the buffered adapters never
+/// produce `Body::Stream` because the publisher fetch is gated on
+/// `supports_streaming_responses()`. It is groundwork for those adapters'
+/// streaming cutover, and a streaming adapter uses the lazy stream instead.
 #[allow(
     clippy::too_many_arguments,
     reason = "stream state remains explicit across the shared adapter driver"
@@ -4761,7 +4762,7 @@ async fn body_close_hold_loop_stream<W: Write, P: StreamProcessor>(
         .await?
         {
             // Write the ready prefix before collecting the auction, matching the
-            // lazy Fastly stream: only the held `</body>` tail waits on collection.
+            // lazy stream: only the held `</body>` tail waits on collection.
             for encoded in step.ready {
                 write_encoded_segment(writer, &encoded)?;
             }
@@ -4778,7 +4779,7 @@ async fn body_close_hold_loop_stream<W: Write, P: StreamProcessor>(
         }
 
         // Write the decoder-finalized prefix before collection, matching the lazy
-        // Fastly stream: only the held `</body>` tail waits on the auction.
+        // stream: only the held `</body>` tail waits on the auction.
         let final_step = hold_finish_ready_segments(
             processor,
             &mut decoder,
@@ -5343,7 +5344,7 @@ fn apply_origin_cache_intent(
         request.with_cache_bypass()
     } else if readthrough_applies {
         // The reader-facing key and the all-scope key that `ts cache purge` names.
-        // Fastly accepts multiple space-separated surrogate keys without changing TTL.
+        // Several space-separated surrogate keys tag one object without changing its TTL.
         request.with_shared_cache(format!(
             "{TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY} {}",
             reader_url_surrogate_key(reader_url),
@@ -8229,9 +8230,9 @@ fn normalize_page_bids_path(raw: &str) -> String {
 /// Called by the client-side SPA navigation hook after `pushState` / `popstate`.
 ///
 /// `kv` enriches the bid request with server-side EIDs from the EC identity
-/// graph. Only the Fastly adapter has a KV identity store, so Axum, Cloudflare,
-/// and Spin pass `None`; client cookie EIDs are still resolved and consent-gated
-/// on every adapter, so no adapter forwards unconsented EIDs.
+/// graph. An adapter with no KV identity store passes `None`, and client cookie
+/// EIDs are still resolved and consent-gated on every adapter, so no adapter
+/// forwards unconsented EIDs.
 ///
 /// # Errors
 ///
@@ -13410,8 +13411,8 @@ mod tests {
         /// test that exercised one of them proves nothing about the other.
         #[derive(Clone, Copy)]
         enum Finalizer {
-            /// Fastly's path: headers commit first and the seam is spliced inside the
-            /// body stream.
+            /// A streaming adapter's path: headers commit first and the seam is
+            /// spliced inside the body stream.
             Streaming,
             /// Every buffered adapter's path: the seam is spliced eagerly.
             Buffered,
@@ -14437,12 +14438,12 @@ mod tests {
             // trip.
             //
             // This asserts the *intent* recorded on the outbound request, not a cache
-            // hit, because a hit is not observable here. Measured under Viceroy 0.17 with
-            // the gate enabled, the request judged shareable, and an origin responding
-            // `Cache-Control: public, max-age=60` with no `Set-Cookie`: two identical
-            // navigations still produced two origin fetches. Viceroy does not implement
-            // the readthrough cache, so the saving this gate exists for cannot be
-            // demonstrated locally in any form — only the decision that enables it.
+            // hit, because a hit is not observable here. Measured under the local
+            // simulator with the gate enabled, the request judged shareable, and an origin
+            // responding `Cache-Control: public, max-age=60` with no `Set-Cookie`: two
+            // identical navigations still produced two origin fetches. The simulator does
+            // not implement the readthrough cache, so the saving this gate exists for
+            // cannot be demonstrated locally in any form, only the decision that enables it.
             let stub = Arc::new(StubHttpClient::new());
             let services = services_with_cache_and_telemetry(
                 Arc::clone(&stub),
@@ -23848,7 +23849,7 @@ mod tests {
 
     /// The answers to `GET /a.txt` through the publisher path, the origin
     /// answering `status` with `plain\n` as UTF-8 text and the headers given,
-    /// finalized as the adapters that buffer do and then as Fastly does.
+    /// finalized as the adapters that buffer do and then as a streaming adapter does.
     /// With `marked`, a module leaves state on the request.
     async fn text_answers_through_the_publisher(
         settings: Settings,
@@ -28794,10 +28795,11 @@ mod tests {
 
     #[test]
     fn publisher_response_streaming_finalize_normalizes_bodiless_framing() {
-        // Fastly requests the origin body as a stream before classification, so
-        // a buffered-unmodified response can hold an `EdgeBody::Stream`. The
-        // adapter streams any `EdgeBody::Stream` to the client, so bodiless
-        // responses must carry no body and correct framing per status.
+        // A streaming adapter requests the origin body as a stream before
+        // classification, so a buffered-unmodified response can hold an
+        // `EdgeBody::Stream`. The adapter streams any `EdgeBody::Stream` to the
+        // client, so bodiless responses must carry no body and correct framing
+        // per status.
         let settings = Arc::new(create_test_settings());
         let registry = Arc::new(
             IntegrationRegistry::with_plan(
@@ -28865,8 +28867,8 @@ mod tests {
 
     #[test]
     fn buffer_publisher_response_normalizes_bodiless_framing() {
-        // The buffered finalizer (Axum/Cloudflare/Spin) must correct bodiless
-        // framing identically to the streaming finalizer.
+        // The buffered finalizer must correct bodiless framing identically to
+        // the streaming finalizer.
         let settings = create_test_settings();
         let registry = IntegrationRegistry::with_plan(
             &settings,
@@ -29036,7 +29038,7 @@ mod tests {
             );
         }
 
-        // Streaming finalizer (Fastly).
+        // Streaming finalizer.
         let streaming_sink = Arc::new(RecordingTelemetrySink::default());
         let response = futures::executor::block_on(publisher_response_into_streaming_response(
             make_stream_response(),
@@ -29050,7 +29052,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
         assert_bodiless_abandoned(&streaming_sink);
 
-        // Buffered finalizer (Axum/Cloudflare/Spin).
+        // Buffered finalizer.
         let buffered_sink = Arc::new(RecordingTelemetrySink::default());
         let buffered_services = noop_services_with_telemetry_sink(Arc::clone(&buffered_sink) as _);
         let response = futures::executor::block_on(buffer_publisher_response_async(
@@ -29361,7 +29363,7 @@ mod tests {
     }
 
     /// Pass-through dispatch contract: the adapter treats `PublisherResponse::PassThrough`
-    /// by reattaching the origin body unchanged and letting Fastly emit it.
+    /// by reattaching the origin body unchanged and letting the platform emit it.
     /// Simulate that step and assert byte identity plus Content-Length
     /// preservation. Distinct from `pass_through_preserves_body_and_content_length`
     /// which only tests the header preservation; this one walks the full
