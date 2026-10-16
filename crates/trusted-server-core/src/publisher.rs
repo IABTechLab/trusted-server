@@ -2110,24 +2110,70 @@ pub(crate) fn classify_response_route(
     ResponseRoute::Stream
 }
 
-/// Whether the origin answered with a page where `entry` places core's
-/// robots.txt middleware, as a single-page application's catch-all does. A
-/// crawler reads a page there as no rules at all, so the file is made as it is
-/// where the origin has none.
-fn answers_robots_txt_with_a_page(
+/// The `[[fetch]]` entry whose middleware make the document at
+/// `request_path` on an empty one, in place of the origin's `response`, see
+/// [`PhaseEntries::making`](crate::middleware::PhaseEntries::making). That is
+/// where a middleware the entry names works on the path and the origin
+/// answers `404`, and where such a middleware writes the whole document and
+/// would not be handed the answer as a `200` of the entry's media type, so
+/// that no other answer of the origin's is served in place of the document.
+fn entry_making_the_document<'s>(
+    settings: &'s Settings,
+    integration_registry: &IntegrationRegistry,
+    request_path: &str,
+    request_host: &str,
     response: &Response<EdgeBody>,
-    entry: &crate::middleware::PhaseEntry,
+) -> Option<&'s crate::middleware::PhaseEntry> {
+    let entry = settings.fetch.making(request_path)?;
+    let chain = integration_registry.middleware_chain(
+        &settings.fetch,
+        MiddlewarePhase::Fetch,
+        &entry.media_type,
+        request_path,
+    );
+    if chain.is_empty() {
+        return None;
+    }
+    if response.status() == StatusCode::NOT_FOUND {
+        return Some(entry);
+    }
+    // Core runs no middleware for a request that names no host, so a document
+    // made for one would go out empty.
+    (chain.writes_whole_document()
+        && !request_host.is_empty()
+        && !is_handed_over_whole(response, &entry.media_type, request_host))
+    .then_some(entry)
+}
+
+/// Whether core hands a middleware for `media_type` the origin's `response`
+/// whole, being a `200` of that media type, in a charset and an encoding
+/// core reads, that core streams through the middleware.
+fn is_handed_over_whole(
+    response: &Response<EdgeBody>,
+    media_type: &str,
+    request_host: &str,
 ) -> bool {
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let content_encoding = response
+        .headers()
+        .get(header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
     response.status() == StatusCode::OK
-        && entry
-            .middleware
-            .iter()
-            .any(|name| name == crate::robots_txt::middleware::MODULE)
-        && response
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(is_html_content_type)
+        && media_type_of(content_type) == media_type
+        && crate::middleware::is_utf8_or_undeclared_charset(content_type)
+        && classify_response_route(
+            response.status(),
+            content_type,
+            &content_encoding,
+            request_host,
+        ) == ResponseRoute::Stream
 }
 
 /// An empty document of `media_type`, which the middleware a `[[fetch]]`
@@ -5322,10 +5368,13 @@ pub async fn handle_publisher_request(
     // a panic-prone invariant in the public request handler.
     let reader_compression = reader_compression.unwrap_or(Compression::None);
 
-    if should_run_ad_stack || personalization_requires_full_body {
-        // HTML document contexts whose output may be synthesized must not
-        // receive a cached 304 or partial 206. Non-document subresources contain
-        // no executable injected tag, so retain their validators and ranges.
+    let middleware_needs_whole_body =
+        integration_registry.middleware_needs_whole_body(settings, &request_path);
+    if should_run_ad_stack || personalization_requires_full_body || middleware_needs_whole_body {
+        // HTML document contexts whose output may be synthesized, and a
+        // middleware that needs the whole body, must not receive a cached 304
+        // or partial 206. Other non-document subresources contain no executable
+        // injected tag, so retain their validators and ranges.
         strip_conditional_and_range_headers(&mut req);
     }
 
@@ -5892,15 +5941,18 @@ pub async fn handle_publisher_request(
         response.headers().len()
     );
 
-    // A file the origin does not have is made, see `PhaseEntries::making`. An
-    // origin page where the robots.txt middleware is placed is no file either.
+    // A file the origin does not have is made, see `entry_making_the_document`.
     // Core runs no middleware for a request that names no host, so there the
     // made file would go out empty and the origin's answer stands instead.
     if (request_method == Method::GET || request_method == Method::HEAD)
         && !request_host.is_empty()
-        && let Some(entry) = settings.fetch.making(&request_path)
-        && (response.status() == StatusCode::NOT_FOUND
-            || answers_robots_txt_with_a_page(&response, entry))
+        && let Some(entry) = entry_making_the_document(
+            settings,
+            integration_registry,
+            &request_path,
+            request_host,
+            &response,
+        )
     {
         log::debug!(
             "Making {} for {request_path}, which the origin does not have, with {}",
@@ -22188,6 +22240,8 @@ mod tests {
         services: crate::platform::RuntimeServices,
         orchestrator: AuctionOrchestrator,
         response: PublisherResponse,
+        /// The origin, which keeps what it was asked.
+        origin: Arc<StubHttpClient>,
     }
 
     /// A request through the publisher path, the origin answering `status`.
@@ -22224,13 +22278,46 @@ mod tests {
         body: &[u8],
         content_type: &'static str,
     ) -> Proxied {
+        proxy_answered(
+            settings,
+            publisher_request(method, path, &[]),
+            status,
+            body,
+            vec![("content-type", content_type)],
+        )
+        .await
+    }
+
+    /// A request for `path` on the publisher's host, carrying `headers`.
+    fn publisher_request(
+        method: Method,
+        path: &str,
+        headers: &[(&'static str, &'static str)],
+    ) -> HttpRequest<EdgeBody> {
+        let mut builder = HttpRequest::builder()
+            .method(method)
+            .uri(format!("https://publisher.example{path}"))
+            .header(header::HOST, "publisher.example");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        builder
+            .body(EdgeBody::empty())
+            .expect("should build request")
+    }
+
+    /// `req` through the publisher path, the origin answering `status` with
+    /// `body` and `headers`.
+    async fn proxy_answered(
+        settings: Settings,
+        req: HttpRequest<EdgeBody>,
+        status: u16,
+        body: &[u8],
+        headers: Vec<(&'static str, &'static str)>,
+    ) -> Proxied {
         let registry = IntegrationRegistry::new(&settings).expect("should build a registry");
         let stub = Arc::new(StubHttpClient::new());
-        stub.push_response_with_headers(
-            status,
-            body.to_vec(),
-            vec![("content-type", content_type)],
-        );
+        stub.push_response_with_headers(status, body.to_vec(), headers);
         let services = build_services_with_http_client(
             Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
         );
@@ -22242,12 +22329,6 @@ mod tests {
         let orchestrator = AuctionOrchestrator::new(
             crate::auction::test_support::legacy_auction_config(&settings),
         );
-        let req = HttpRequest::builder()
-            .method(method)
-            .uri(format!("https://publisher.example{path}"))
-            .header(header::HOST, "publisher.example")
-            .body(EdgeBody::empty())
-            .expect("should build request");
         let response = handle_publisher_request(
             AppContext {
                 settings: &settings,
@@ -22272,6 +22353,7 @@ mod tests {
             services,
             orchestrator,
             response,
+            origin: stub,
         }
     }
 
@@ -22322,23 +22404,16 @@ mod tests {
         settings
     }
 
-    /// The file a proxied robots.txt request streams, with its status and
-    /// content type checked.
-    async fn streamed_robots_txt(proxied: Proxied) -> String {
+    /// The response a proxied request streams, and the body streamed.
+    async fn streamed(proxied: Proxied) -> (Response<EdgeBody>, String) {
         let PublisherResponse::Stream {
             response,
             body,
             params,
         } = proxied.response
         else {
-            panic!("the file should stream through the entry's middleware");
+            panic!("the answer should stream through the entries' middleware");
         };
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            content_type_of(&response),
-            Some("text/plain; charset=utf-8"),
-            "should be a document of the entry's media type"
-        );
         let mut params = *params;
         let mut output = Vec::new();
         stream_publisher_body_async(
@@ -22351,8 +22426,24 @@ mod tests {
             &proxied.services,
         )
         .await
-        .expect("should stream the file");
-        String::from_utf8(output).expect("the file is text")
+        .expect("should stream the body");
+        (
+            response,
+            String::from_utf8(output).expect("the body is text"),
+        )
+    }
+
+    /// The file a proxied robots.txt request streams, with its status and
+    /// content type checked.
+    async fn streamed_robots_txt(proxied: Proxied) -> String {
+        let (response, file) = streamed(proxied).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            content_type_of(&response),
+            Some("text/plain; charset=utf-8"),
+            "should be a document of the entry's media type"
+        );
+        file
     }
 
     /// The file the middleware makes replaces the origin's own.
@@ -22411,6 +22502,199 @@ mod tests {
             "User-agent: *\nAllow: /ads.txt\nDisallow: /\n",
             "the file is made"
         );
+    }
+
+    /// With `refuse_all` selected no other answer of the origin's takes the
+    /// place of the file. A crawler takes an error, a redirect or an empty
+    /// answer as permission, a `304` as leave to keep the copy it holds, and a
+    /// file core cannot replace as the origin's rules, so the refusal is made
+    /// in place of each, with status `200`.
+    #[tokio::test]
+    async fn robots_txt_is_made_in_place_of_any_answer_the_middleware_cannot_replace() {
+        let permissive: &[u8] = b"User-agent: *\nAllow: /\n";
+        let plain = ("content-type", "text/plain");
+        let answers: [(u16, &[u8], Vec<(&'static str, &'static str)>); 12] = [
+            (401, b"login", vec![("content-type", "text/html")]),
+            (403, permissive, vec![plain]),
+            (410, b"", vec![plain]),
+            (
+                301,
+                b"",
+                vec![("location", "https://elsewhere.example/robots.txt")],
+            ),
+            (302, b"", vec![("location", "/robots-staging.txt")]),
+            (500, b"down", vec![("content-type", "text/html")]),
+            (204, b"", Vec::new()),
+            (
+                200,
+                permissive,
+                vec![("content-type", "text/plain; charset=iso-8859-1")],
+            ),
+            (200, permissive, vec![plain, ("content-encoding", "zstd")]),
+            (
+                200,
+                permissive,
+                vec![("content-type", "application/octet-stream")],
+            ),
+            (
+                206,
+                b"User-agent: *\n",
+                vec![plain, ("content-range", "bytes 0-13/23")],
+            ),
+            (304, b"", vec![plain, ("etag", "\"origin-etag\"")]),
+        ];
+
+        for (status, body, headers) in answers {
+            let answer = format!("{status} {headers:?}");
+            let proxied = proxy_answered(
+                settings_refusing_every_crawler(),
+                publisher_request(Method::GET, crate::robots_txt::ROBOTS_TXT_PATH, &[]),
+                status,
+                body,
+                headers,
+            )
+            .await;
+
+            assert_eq!(
+                streamed_robots_txt(proxied).await,
+                "User-agent: *\nAllow: /ads.txt\nDisallow: /\n",
+                "the refusal should take the place of {answer}"
+            );
+        }
+    }
+
+    /// Core runs no middleware for a request that names no host, so the
+    /// origin's answer stands there rather than an empty file being made.
+    #[tokio::test]
+    async fn robots_txt_for_a_request_that_names_no_host_keeps_the_origins_answer() {
+        let req = HttpRequest::builder()
+            .method(Method::GET)
+            .uri(crate::robots_txt::ROBOTS_TXT_PATH)
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let proxied = proxy_answered(
+            settings_refusing_every_crawler(),
+            req,
+            403,
+            b"forbidden",
+            vec![("content-type", "text/plain")],
+        )
+        .await;
+
+        assert_eq!(
+            response_of(proxied.response).status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    /// An entry's `path` is a prefix, and the robots.txt middleware works on
+    /// the file's own path alone, so a longer path the entry covers keeps the
+    /// origin's answer, as it did when a route answered the file. A query is
+    /// no part of the path.
+    #[tokio::test]
+    async fn a_longer_path_the_robots_txt_entry_covers_keeps_the_origins_answer() {
+        for path in ["/robots.txt.bak", "/robots.txtx", "/robots.txt/rules"] {
+            let (response, body) = streamed(
+                proxy_origin(
+                    settings_refusing_every_crawler(),
+                    Method::GET,
+                    path,
+                    200,
+                    b"the origin's own text\n",
+                    "text/plain; charset=utf-8",
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(body, "the origin's own text\n", "{path} keeps its text");
+
+            for status in [404, 403] {
+                let proxied = proxy_origin(
+                    settings_refusing_every_crawler(),
+                    Method::GET,
+                    path,
+                    status,
+                    b"",
+                    "text/plain",
+                )
+                .await;
+                assert_eq!(
+                    response_of(proxied.response).status().as_u16(),
+                    status,
+                    "{path} keeps the origin's {status}"
+                );
+            }
+        }
+
+        let with_a_query = proxy_with(
+            settings_refusing_every_crawler(),
+            Method::GET,
+            "/robots.txt?crawler=one",
+            404,
+        )
+        .await;
+        assert_eq!(
+            streamed_robots_txt(with_a_query).await,
+            "User-agent: *\nAllow: /ads.txt\nDisallow: /\n",
+            "the file's path with a query is the file"
+        );
+    }
+
+    /// A reader's validators and range, as a crawler revalidating its copy
+    /// sends them.
+    const VALIDATORS_AND_RANGE: [(&str, &str); 4] = [
+        ("if-none-match", "\"origin-etag\""),
+        ("if-modified-since", "Wed, 21 Oct 2015 07:28:00 GMT"),
+        ("range", "bytes=0-9"),
+        ("if-range", "\"origin-etag\""),
+    ];
+
+    /// The names of the headers the origin is asked with, for a `GET` of
+    /// `path` carrying [`VALIDATORS_AND_RANGE`], under settings refusing every
+    /// crawler.
+    async fn headers_the_origin_is_asked_with(path: &str) -> Vec<String> {
+        let proxied = proxy_answered(
+            settings_refusing_every_crawler(),
+            publisher_request(Method::GET, path, &VALIDATORS_AND_RANGE),
+            200,
+            b"User-agent: *\nAllow: /\n",
+            vec![("content-type", "text/plain")],
+        )
+        .await;
+        proxied
+            .origin
+            .recorded_request_headers()
+            .concat()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    /// The robots.txt middleware needs the origin's whole file, so the origin
+    /// is asked for it without the reader's validators and range, as for a
+    /// page the ad stack answers. A path no such middleware works on, the
+    /// longer path the entry covers among them, keeps them.
+    #[tokio::test]
+    async fn the_origin_is_asked_for_the_whole_robots_txt() {
+        let asked = headers_the_origin_is_asked_with(crate::robots_txt::ROBOTS_TXT_PATH).await;
+        for (name, _) in VALIDATORS_AND_RANGE {
+            assert!(
+                !asked.iter().any(|header| header == name),
+                "{name} should not reach the origin: {asked:?}"
+            );
+        }
+
+        for path in ["/humans.txt", "/robots.txt.bak"] {
+            let asked = headers_the_origin_is_asked_with(path).await;
+            for (name, _) in VALIDATORS_AND_RANGE {
+                assert!(
+                    asked.iter().any(|header| header == name),
+                    "{name} should reach the origin for {path}: {asked:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

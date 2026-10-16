@@ -14,7 +14,9 @@
 //! contributor says.
 //!
 //! 1. A refusal cannot be loosened. With `refuse_all` selected the file is the
-//!    refusal and nothing else.
+//!    refusal and nothing else, and the origin cannot loosen it either,
+//!    because the file takes the place of whatever the origin answers to a
+//!    `GET` or `HEAD` that names its host.
 //! 2. A path in `always_allow` stays open to every crawler a contribution
 //!    refuses the whole site to, `*` included. A narrower rule is kept as
 //!    given, so `Disallow: /ads` still closes off `/ads.txt`.
@@ -160,7 +162,8 @@ impl RobotsTxtConfig {
     /// The configuration that refuses every crawler with no exception.
     ///
     /// The starting point for a publisher who wants the refusal with
-    /// allowances of their own. Needs no contributor, no key and no network.
+    /// allowances of their own. Needs no contributor and no key. The origin is
+    /// still asked, and the file takes the place of whatever it answers.
     #[must_use]
     pub fn refuse_all() -> Self {
         Self {

@@ -1933,8 +1933,9 @@ impl IntegrationRegistry {
     }
 
     /// The middleware the first entry covering a response selects, in the
-    /// order they run, for a response of `media_type` to a request for `path`.
-    /// A response no entry covers gives an empty chain.
+    /// order they run, for a response of `media_type` to a request for `path`,
+    /// leaving out any that does not work on `path`. A response no entry
+    /// covers gives an empty chain.
     #[must_use]
     pub fn middleware_chain(
         &self,
@@ -1947,8 +1948,27 @@ impl IntegrationRegistry {
             .for_response(media_type, path)
             .iter()
             .filter_map(|name| self.inner.middleware_named(name).map(Arc::clone))
+            .filter(|middleware| middleware.handles_path(path))
             .collect();
         MiddlewareChain::new(phase, media_type, middleware)
+    }
+
+    /// Whether a middleware that an entry of either phase names for a request
+    /// for `path`, under any media type, needs the origin's whole body, see
+    /// [`Middleware::needs_whole_body`]. Asked before the origin answers, so
+    /// before the media type of the response is known.
+    #[must_use]
+    pub fn middleware_needs_whole_body(&self, settings: &Settings, path: &str) -> bool {
+        MiddlewarePhase::ALL.iter().any(|phase| {
+            settings
+                .phase_entries(*phase)
+                .entries()
+                .iter()
+                .filter(|entry| entry.covers_path(path))
+                .flat_map(|entry| &entry.middleware)
+                .filter_map(|name| self.inner.middleware_named(name))
+                .any(|middleware| middleware.handles_path(path) && middleware.needs_whole_body())
+        })
     }
 
     /// Every integration id the registry was built from, named or not, in

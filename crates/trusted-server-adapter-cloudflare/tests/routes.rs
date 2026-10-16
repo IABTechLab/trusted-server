@@ -670,8 +670,8 @@ async fn attestation_routes_skip_the_request_preparers() {
 
 /// The route test settings with a `[robots-txt]` section that refuses every
 /// crawler and keeps one path open.
-fn router_refusing_every_crawler() -> RouterService {
-    let settings = Settings::from_toml(
+fn settings_refusing_every_crawler() -> Settings {
+    Settings::from_toml(
         r#"
             [publisher]
             domain = "test-publisher.example.com"
@@ -698,9 +698,11 @@ fn router_refusing_every_crawler() -> RouterService {
             middleware = ["robots_txt"]
         "#,
     )
-    .expect("should parse route test settings");
+    .expect("should parse route test settings")
+}
 
-    TrustedServerApp::routes_with_settings(settings)
+fn router_refusing_every_crawler() -> RouterService {
+    TrustedServerApp::routes_with_settings(settings_refusing_every_crawler())
         .expect("should build router from test settings")
 }
 
@@ -744,6 +746,84 @@ async fn refusing_every_crawler_tags_every_response_and_registers_no_route() {
         robots_tag(&other).as_deref(),
         Some("noindex, nofollow"),
         "no route may be the one page a crawler is allowed to index"
+    );
+}
+
+/// `/robots.txt` is the publisher path's, answered against an origin that
+/// answers each request in turn. A `GET` has the origin's file replaced by
+/// the refusal, a `HEAD` has the file made where the origin has none and
+/// gets no body, and a `POST` keeps the origin's `404`, because a file is
+/// made only for a `GET` or a `HEAD`. Each carries the refusal's
+/// `X-Robots-Tag`, the file's own answer included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn robots_txt_is_served_through_the_publisher_path_with_its_tag() {
+    use std::sync::Arc;
+
+    use trusted_server_core::platform::PlatformHttpClient;
+    use trusted_server_core::platform::test_support::{
+        StubHttpClient, build_services_with_http_client,
+    };
+
+    let origin = Arc::new(StubHttpClient::new());
+    origin.push_response_with_headers(
+        200,
+        b"User-agent: *\nAllow: /\n".to_vec(),
+        vec![("content-type", "text/plain")],
+    );
+    for _ in 0..2 {
+        origin.push_response_with_headers(
+            404,
+            b"<html><body>not found</body></html>".to_vec(),
+            vec![("content-type", "text/html")],
+        );
+    }
+    let router = TrustedServerApp::routes_with_settings_and_services(
+        settings_refusing_every_crawler(),
+        build_services_with_http_client(Arc::clone(&origin) as Arc<dyn PlatformHttpClient>),
+    )
+    .expect("should build router with a stub origin");
+    let robots_txt = |method: &str| {
+        request_builder()
+            .method(method)
+            .uri("https://test-publisher.example.com/robots.txt")
+            .header("host", "test-publisher.example.com")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build request")
+    };
+    let body = |response: Response| {
+        let bytes = response
+            .into_body()
+            .into_bytes()
+            .expect("should hold the answer in memory");
+        String::from_utf8(bytes.to_vec()).expect("the body is text")
+    };
+
+    let get = route(router.clone(), robots_txt("GET")).await;
+    assert_eq!(get.status(), 200);
+    assert_eq!(robots_tag(&get).as_deref(), Some("noindex, nofollow"));
+    assert_eq!(body(get), "User-agent: *\nAllow: /ads.txt\nDisallow: /\n");
+
+    let head = route(router.clone(), robots_txt("HEAD")).await;
+    assert_eq!(
+        head.status(),
+        200,
+        "the file is made where the origin has none"
+    );
+    assert_eq!(robots_tag(&head).as_deref(), Some("noindex, nofollow"));
+    assert_eq!(body(head), "", "a HEAD gets no body");
+
+    let post = route(router, robots_txt("POST")).await;
+    assert_eq!(
+        post.status(),
+        404,
+        "a file is made only for a GET or a HEAD"
+    );
+    assert_eq!(robots_tag(&post).as_deref(), Some("noindex, nofollow"));
+
+    assert_eq!(
+        origin.recorded_request_methods(),
+        ["GET", "HEAD", "POST"],
+        "each request reaches the origin"
     );
 }
 
