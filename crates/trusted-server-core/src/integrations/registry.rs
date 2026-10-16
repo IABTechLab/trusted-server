@@ -176,15 +176,17 @@ impl IntegrationDocumentState {
 ///
 /// A request preparer or a request filter leaves a value under its
 /// integration id with [`IntegrationRequestState::insert`]. Where the
-/// request's reader is served an HTML document, every value is copied into
-/// the [`IntegrationDocumentState`] the `[[serve]]` entry's middleware share,
+/// request's reader is served an HTML document, or another body a
+/// `[[serve]]` entry covers, every value is copied into the
+/// [`IntegrationDocumentState`] the `[[serve]]` entry's middleware share,
 /// so the module's serve middleware reads it there, and the same values are
 /// handed to the module's response finalizer.
 ///
 /// A request that carries any value keeps to the origin path. Its document is
 /// never read from a shared template and never stored as one, and an HTML
-/// response with a body is sent `private, no-store`. A fetch middleware is
-/// handed none of these values.
+/// response with a body, or another response a `[[serve]]` entry covers, is
+/// sent `private, no-store`. A fetch middleware is handed none of these
+/// values.
 #[derive(Clone, Default)]
 pub struct IntegrationRequestState {
     values: IntegrationDocumentStateMap,

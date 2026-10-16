@@ -204,9 +204,10 @@ A middleware works on `text/html` unless it says otherwise, with
 handle is refused when the registry is built. On a media type other than
 HTML an action may carry a stream processor alone, which is handed the body
 after core has moved the origin's addresses in it, chunk by chunk, with the
-last chunk marked. Head markup and the element and text handlers are
-decisions about HTML, and an action that makes one on another media type is
-refused by name when the chain is planned.
+last chunk marked, and only for a `200`, whose body is the whole file. Head
+markup and the element and text handlers are decisions about HTML, and an
+action that makes one on another media type is refused by name when the
+chain is planned.
 
 ```rust
 struct Sellers;

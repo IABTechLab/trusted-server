@@ -1762,7 +1762,8 @@ matched by the type and subtype of its `Content-Type`, without the
 parameters, so `text/plain; charset=utf-8` takes the entry for
 `text/plain`. Anything else, an image or a length prefixed stream among
 them, passes through untouched and no entry can cover it. So does a
-response that declares a charset other than UTF-8.
+response that declares a charset other than UTF-8 or whose status is not
+`200`, such as a partial `206` or an error page.
 
 A middleware says which media types it works on, HTML alone unless it says
 otherwise, and an entry naming one under a media type it does not handle is
@@ -1772,7 +1773,10 @@ after core has moved the origin's addresses in it, in the order the entry
 names them. Head markup and the element and text handlers are decisions
 about HTML, and a middleware that makes one there is refused by name. The
 template cache stores HTML alone, so the fetch entry's middleware and then
-the serve entry's run on each response as it is fetched.
+the serve entry's run on each response as it is fetched. A response an entry
+covers loses the origin's `ETag` and `Last-Modified`, because a middleware
+may change its body, and when a module left state on the request, one a
+`[[serve]]` entry covers is sent `private, no-store`, as a page is.
 
 ```toml
 [[fetch]]
