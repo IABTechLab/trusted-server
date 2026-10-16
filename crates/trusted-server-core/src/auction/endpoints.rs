@@ -2163,6 +2163,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auction_does_not_ask_the_device_module_when_consent_denies_the_auction() {
+        let module = Arc::new(DetectionServiceDevice::new(
+            selecting_basic_ads(),
+            Some(tablet()),
+        ));
+        // An unknown jurisdiction with no TCF signal fails the auction gate.
+        let ec_context = EcContext::new_for_test(None, ConsentContext::default())
+            .with_permissions_for_test(PermissionState::new(selecting_basic_ads()));
+
+        let captured = auction_with_device_module(ec_context, &module, noop_services()).await;
+
+        assert!(
+            captured
+                .lock()
+                .expect("should lock captured request")
+                .is_none(),
+            "a denied auction should dispatch nothing"
+        );
+        assert_eq!(
+            module.asked(),
+            0,
+            "a request on the consent-denied path should not reach the device module"
+        );
+    }
+
+    #[tokio::test]
     async fn auction_caps_the_transport_timers_of_the_device_modules_backend() {
         let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
         let services = build_services_with_backend_and_http_client(

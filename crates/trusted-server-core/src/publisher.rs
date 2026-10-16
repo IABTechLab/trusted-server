@@ -29069,6 +29069,26 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn initial_navigation_does_not_ask_the_device_module_when_consent_denies_the_auction()
+        {
+            let module = device_needing_basic_ads();
+            // An unknown jurisdiction with no TCF signal fails the auction gate.
+            let denied = EcContext::new_for_test(None, crate::consent::ConsentContext::default());
+
+            let request = navigation_with_device_module(selecting_basic_ads(denied), &module).await;
+
+            assert!(
+                request.is_none(),
+                "a denied auction should dispatch nothing"
+            );
+            assert_eq!(
+                module.asked(),
+                0,
+                "a request on the consent-denied path should not reach the device module"
+            );
+        }
+
+        #[tokio::test]
         async fn page_bids_asks_the_device_module_with_the_readers_permissions() {
             let module = device_needing_basic_ads();
 
@@ -29084,6 +29104,25 @@ mod tests {
                 request.device.and_then(|device| device.attributes),
                 Some(tablet()),
                 "a module whose permission the reader gave should describe the device to the bidder"
+            );
+        }
+
+        #[tokio::test]
+        async fn page_bids_does_not_ask_the_device_module_when_consent_denies_the_auction() {
+            let module = device_needing_basic_ads();
+            // An unknown jurisdiction with no TCF signal fails the auction gate.
+            let denied = EcContext::new_for_test(None, crate::consent::ConsentContext::default());
+
+            let request = page_bids_with_device_module(selecting_basic_ads(denied), &module).await;
+
+            assert!(
+                request.is_none(),
+                "a denied auction should dispatch nothing"
+            );
+            assert_eq!(
+                module.asked(),
+                0,
+                "a request on the consent-denied path should not reach the device module"
             );
         }
     }
