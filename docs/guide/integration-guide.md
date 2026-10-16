@@ -433,8 +433,9 @@ that names it refuses startup.
 | `MiddlewarePhase::Serve` | On each reader's copy, whether the page came from the store or from the origin     | What the module's request hooks left for it |
 
 A stored page is keyed by the settings and core's build, so a fetch
-middleware that writes markup compiled into its own crate returns that
-markup from `template_key`, and a change to it stores pages again.
+middleware that writes markup or an address compiled into its own crate
+returns that text from `template_key`, and a change to it stores pages
+again.
 
 A middleware is asked once for each document, by `create`, and what it
 answers is used for that document alone, so a handler may hold state between
