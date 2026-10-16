@@ -454,8 +454,9 @@ A middleware can rely on these rules.
   removed is not asked about again.
 - A script's text arrives in chunks. A handler that needs the whole script
   removes each chunk while keeping a copy, and writes back what it kept with
-  the last chunk. A replacement is written as it is, with no character
-  escaped.
+  the last chunk. A replacement is written as it is, except that a `<` that
+  would end the script, or begin `<script` after `<!--`, is written as
+  `\u003c`.
 - A fetch middleware is told nothing about the reader, because what it leaves
   is what a shared template stores. `MiddlewareContext::document_state` is
   shared by the middleware working on one document in one phase.

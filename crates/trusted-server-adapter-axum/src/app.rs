@@ -335,8 +335,9 @@ async fn build_ec_context(
 /// Dispatches the fallback routes: tsjs assets, integration proxy routes, and
 /// the publisher origin.
 ///
-/// The request arrives already prepared. Every route that reaches here is
-/// registered to [`fallback_handler`], which runs the request through
+/// The request arrives already prepared, and is not to a closed path. Every
+/// route that reaches here is registered to [`fallback_handler`], which
+/// answers a closed path itself and runs any other request through
 /// [`execute_handler`], and [`execute_handler`] calls
 /// `registry.prepare_request` before it calls this function, so there is
 /// nothing left to prepare here.
@@ -345,10 +346,6 @@ async fn dispatch_fallback(
     services: &RuntimeServices,
     req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
-    if let Some(response) = closed_path_response(&req) {
-        return Ok(response);
-    }
-
     let path = req.uri().path().to_string();
     let method = req.method().clone();
 
@@ -416,7 +413,12 @@ async fn dispatch_fallback(
 fn fallback_handler(
     state: Arc<AppState>,
 ) -> impl Fn(RequestContext) -> HandlerFuture + Clone + Send + Sync + 'static {
-    move |ctx: RequestContext| {
+    move |ctx: RequestContext| -> HandlerFuture {
+        // A closed path is answered before the modules' preparers run, as the
+        // other adapters answer it, so no preparer sees or answers it.
+        if let Some(response) = closed_path_response(ctx.request()) {
+            return Box::pin(async move { Ok::<_, EdgeError>(response) });
+        }
         let state = Arc::clone(&state);
         Box::pin(execute_handler(
             state,
