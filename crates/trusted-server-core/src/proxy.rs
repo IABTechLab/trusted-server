@@ -14,7 +14,7 @@ use web_time::{SystemTime, UNIX_EPOCH};
 use crate::cache_policy::{
     CachePolicy, EdgeCacheHeader, NO_STORE_PRIVATE_CACHE_CONTROL,
     apply_no_store_private_to_headers, cache_control_headers_are_private_or_no_store,
-    remove_edge_cache_headers,
+    remove_owned_cache_headers,
 };
 use crate::constants::{
     HEADER_ACCEPT, HEADER_ACCEPT_ENCODING, HEADER_ACCEPT_LANGUAGE, HEADER_REFERER,
@@ -148,9 +148,9 @@ impl AssetProxyCachePolicy {
             Self::NoStorePrivate => apply_no_store_cache_control(response),
             Self::Normalized(policy) => {
                 if cache_control_headers_are_private_or_no_store(response.headers()) {
-                    remove_edge_cache_headers(response.headers_mut());
+                    remove_owned_cache_headers(response);
                 } else {
-                    policy.apply_to_headers(response.headers_mut(), edge_header);
+                    policy.apply_to_response(response, edge_header);
                 }
             }
         }

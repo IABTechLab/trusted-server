@@ -555,6 +555,15 @@ pub trait Middleware: Send + Sync {
         let _ = (context, response);
         Vec::new()
     }
+
+    /// Text a stored page is keyed by, being what this middleware writes
+    /// that no setting decides, such as markup compiled into its crate. A
+    /// change to it stores pages again, where otherwise a page stored before
+    /// the change keeps the old markup until it expires. Empty when the
+    /// settings decide everything the middleware writes.
+    fn template_key(&self) -> &str {
+        ""
+    }
 }
 
 /// One entry of `[[fetch]]` or `[[serve]]`, being which responses it covers
