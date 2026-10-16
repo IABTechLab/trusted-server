@@ -388,15 +388,19 @@ describe('release collector boundaries', () => {
   it('rejects source symlink escape and unknown transform queries', async () => {
     const { installedOrigins } = await import('../release-composition.mjs');
     const root = fixture();
-    vi.stubEnv('TMPDIR', undefined);
-    const external = fs.mkdtempSync(path.join(os.tmpdir(), 'tsjs-outside-'));
-    temporary.push(external);
+    const source = path.join(root, 'source');
+    const external = path.join(root, 'external');
+    fs.mkdirSync(source);
+    fs.mkdirSync(external);
+    const sourceLock = path.join(source, 'package-lock.json');
+    fs.writeFileSync(sourceLock, JSON.stringify({ lockfileVersion: 3, packages: { '': {} } }));
     fs.writeFileSync(path.join(external, 'outside.ts'), 'export const example = 7;');
-    const link = path.join(root, 'alias.ts');
+    const link = path.join(source, 'alias.ts');
     fs.symlinkSync(path.join(external, 'outside.ts'), link);
-    const origins = installedOrigins({ repoRoot, lockFile });
+    expect(path.relative(fs.realpathSync(source), fs.realpathSync(link))).toMatch(/^\.\.[/\\]/);
+    const origins = installedOrigins({ repoRoot: source, lockFile: sourceLock });
     expect(() => origins.origin(link)).toThrow(/escape/i);
-    expect(() => origins.origin(path.join(root, 'entry.ts?unknown'))).toThrow(/query/i);
+    expect(() => origins.origin(path.join(source, 'entry.ts?unknown'))).toThrow(/query/i);
   });
   it('requires checked preparation records rather than inventing lifecycle observations', async () => {
     const collector = await import(path.join(repoRoot, 'scripts/release/collect-js.mjs'));
@@ -1052,7 +1056,6 @@ describe('approved source module discovery', () => {
         path.join(repoRoot, 'scripts/release/collect-js.mjs')
       );
       const root = fixture();
-      vi.stubEnv('TMPDIR', undefined);
       const git = (args) =>
         execFileSync(
           'git',

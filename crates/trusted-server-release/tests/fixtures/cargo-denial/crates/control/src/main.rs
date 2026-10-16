@@ -1,5 +1,4 @@
 //! Builds without any connection attempt.
 
-fn main() {
-    println!("control");
-}
+// The absolute include gives rustc a real source location to remap and retain.
+include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/control.rs"));
