@@ -17,13 +17,18 @@ mod url_guard;
 pub use run::{RunOutcome, run_from_env};
 
 // Every `ts` subcommand's implementation lives under `commands/<name>`. The
-// `ts dev` group is available on every host target; its only subcommand,
-// `ts dev proxy`, is macOS-only (CA trust via the login keychain, Safari
+// `ts dev` group is available on every host target; `ts dev lint` and
+// `ts dev install-hooks` are pure-Rust (gitoxide) and cross-host, while
+// `ts dev proxy` is macOS/Linux-only (CA trust via the login keychain, Safari
 // automation via `networksetup`, a native TLS / networking stack) and its
-// dependencies are scoped to macOS in `Cargo.toml`. `commands` is `pub` so the
-// macOS-gated `tests/proxy_e2e.rs` integration suite can exercise the proxy
-// internals.
+// dependencies are scoped to those targets in `Cargo.toml`. `commands` is
+// `pub` so the gated `tests/proxy_e2e.rs` integration suite can exercise the
+// shared proxy internals.
 #[cfg(not(target_arch = "wasm32"))]
 pub mod commands;
-#[cfg(target_os = "macos")]
+// Console output wrappers, cross-host: `ts dev lint` uses the `write_*`
+// helpers on every target, and `info` / `warn` are called by both the
+// macOS/Linux proxy and `ts dev sandbox-probe`, which builds on every host
+// target, so neither is gated.
+#[cfg(not(target_arch = "wasm32"))]
 mod output;

@@ -3,6 +3,10 @@
 **Date:** 2026-06-17
 **Status:** Implemented
 **Scope:** `ts prebid bundle` local external Prebid bundle generation
+
+> **Update (2026-09-16):** The command described here was later renamed to
+> `ts prebid client` when the `ts prebid server` namespace was introduced.
+
 **Related context:**
 
 - `docs/superpowers/specs/2026-05-28-external-prebid-first-party-proxy-design.md`
