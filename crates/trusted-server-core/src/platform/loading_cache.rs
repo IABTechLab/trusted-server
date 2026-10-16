@@ -96,9 +96,14 @@ pub type LoadFuture = Pin<Box<dyn Future<Output = Result<LoadedValue, LoadError>
 
 /// What a cache runs when no layer holds a key.
 ///
-/// It owns everything it uses, and is `Send`, so a host that can run work on
-/// its own can start it on another thread and keep it running after the
-/// caller that started it has gone.
+/// Its value serves every caller waiting on the load and every later reader
+/// of the copies kept, so it uses nothing of the reader whose request started
+/// it. Services it needs come from [`RuntimeServices::without_connection`],
+/// never the request's own.
+///
+/// It runs in the caller that leads the load. It owns everything it uses,
+/// and is `Send`, because a cache may keep it with the key it loads, in
+/// memory every thread of the process can reach.
 pub type Loader = Box<dyn FnOnce() -> LoadFuture + Send>;
 
 /// How long one cache's copies last.
@@ -113,8 +118,8 @@ pub struct CacheLifetimes {
     pub store_idle: Duration,
 }
 
-/// One cache: its name, the lifetimes its copies get, and how its loads may
-/// run.
+/// One cache: its name, the lifetimes its copies get, and how many values
+/// its memory copy holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CacheSpec {
     /// The cache's name, which is part of every key it writes.
@@ -123,10 +128,6 @@ pub struct CacheSpec {
     pub lifetimes: CacheLifetimes,
     /// The most values the brief copy in memory holds.
     pub memory_entries: usize,
-    /// Whether a load may run apart from the caller that started it, on a
-    /// host that can run work on its own. False for a load that blocks the
-    /// thread it runs on, which only the caller's own thread can afford.
-    pub detachable: bool,
 }
 
 /// A key in a shared store, being the publisher's prefix and the cache's name
@@ -181,7 +182,8 @@ pub trait PlatformLoadingCache: Send + Sync {
     ///
     /// `load` runs at most once per key at a time, and a caller arriving while
     /// it runs waits for it. The copies are kept in the stores `services`
-    /// supplies.
+    /// supplies. [`RuntimeServices::load_cached`] hands over services that
+    /// carry nothing of the reader, because the load serves every waiter.
     ///
     /// # Errors
     ///
@@ -238,8 +240,9 @@ impl PlatformLoadingCache for NoLoadingCache {
 }
 
 /// The loading cache each `[cache.<name>]` table selected, by the name a
-/// [`CacheSpec`] carries. A cache whose table selected none loads through
-/// [`NoLoadingCache`].
+/// [`CacheSpec`] carries. A cache with none, being one whose table names no
+/// module where the build links no loading cache module or several, loads
+/// through [`NoLoadingCache`].
 #[derive(Default)]
 pub struct LoadingCaches {
     by_feature: HashMap<&'static str, Arc<dyn PlatformLoadingCache>>,
@@ -317,10 +320,8 @@ mod tests {
         assert_eq!(key.to_string(), "ts.example.com/robots-txt/k1");
     }
 
-    #[test]
-    fn the_default_cache_runs_every_load() {
-        let services = super::super::test_support::noop_services();
-        let spec = CacheSpec {
+    fn spec() -> CacheSpec {
+        CacheSpec {
             name: "test",
             lifetimes: CacheLifetimes {
                 memory: Duration::from_secs(1),
@@ -328,15 +329,19 @@ mod tests {
                 store_idle: Duration::from_secs(1),
             },
             memory_entries: 1,
-            detachable: false,
-        };
+        }
+    }
+
+    #[test]
+    fn the_default_cache_runs_every_load() {
+        let services = super::super::test_support::noop_services();
         let key = StoreKey::new(&ServerKeyPrefix::new("ts", "example.com"), "test", "k");
         let runs = Arc::new(AtomicUsize::new(0));
         for _ in 0..2 {
             let counted = Arc::clone(&runs);
             let value = futures::executor::block_on(NoLoadingCache.get_or_load(
                 &services,
-                &spec,
+                &spec(),
                 &key,
                 Box::new(move || {
                     Box::pin(async move {
@@ -350,5 +355,57 @@ mod tests {
         }
 
         assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    /// A cache that records the client address in the services it is
+    /// handed.
+    #[derive(Default)]
+    struct Recording {
+        seen: std::sync::Mutex<Vec<Option<std::net::IpAddr>>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl PlatformLoadingCache for Recording {
+        async fn get_or_load(
+            &self,
+            services: &RuntimeServices,
+            _spec: &CacheSpec,
+            _key: &StoreKey,
+            load: Loader,
+        ) -> Result<Bytes, LoadError> {
+            self.seen
+                .lock()
+                .expect("should lock the record")
+                .push(services.client_info().client_ip);
+            load().await.map(|loaded| loaded.bytes)
+        }
+
+        async fn remove(&self, _services: &RuntimeServices, _spec: &CacheSpec, _key: &StoreKey) {}
+    }
+
+    /// One load serves every caller waiting on it, so the cache is handed
+    /// nothing of the reader whose request asked, while that request keeps
+    /// its own.
+    #[test]
+    fn a_cache_is_handed_nothing_of_the_reader_whose_request_loads() {
+        let reader = std::net::IpAddr::from([203, 0, 113, 7]);
+        let recording = Arc::new(Recording::default());
+        let services = super::super::test_support::noop_services_with_client_ip(reader)
+            .with_loading_cache(Arc::clone(&recording) as Arc<dyn PlatformLoadingCache>);
+        let key = StoreKey::new(&ServerKeyPrefix::new("ts", "example.com"), "test", "k");
+
+        futures::executor::block_on(services.load_cached(
+            &spec(),
+            &key,
+            Box::new(|| Box::pin(async { Ok(LoadedValue::new(Bytes::from_static(b"v"))) })),
+        ))
+        .expect("the load should succeed");
+
+        assert_eq!(
+            *recording.seen.lock().expect("should lock the record"),
+            vec![None],
+            "the cache should see no client address"
+        );
+        assert_eq!(services.client_info().client_ip, Some(reader));
     }
 }

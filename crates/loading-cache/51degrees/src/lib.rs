@@ -1,9 +1,10 @@
 //! The loading cache core declares, written with 51Degrees' `fiftyone-caching`.
 //!
 //! - **A brief copy in process memory.** A least recently used cache with a
-//!   short lifetime, shared by every request the process serves. It loads a
-//!   missing key once however many requests ask for it at the same moment, and
-//!   that one load covers the read of the shared store and the source together.
+//!   short lifetime, shared by every request an adapter serves with one
+//!   application state. It loads a missing key once however many of them ask
+//!   for it at the same moment, and that one load covers the read of the
+//!   shared store and the source together.
 //! - **The host's shared store.** The host's value cache where it has one,
 //!   which on Fastly makes every instance at a location wait for one load, and
 //!   its key-value store otherwise. It is read before the source, written
@@ -45,26 +46,18 @@ pub fn builder() -> IntegrationBuilder {
 /// Builds the loading cache a deployment uses, for
 /// [`IntegrationBuilder::with_loading_cache`].
 ///
-/// A new one for each application state everywhere but Cloudflare, where the
-/// state is built again for every request, so there one cache lives as long as
-/// the isolate and every request it serves shares it.
+/// A new one for each application state, so requests share a memory copy
+/// only where their adapter keeps one state for them. Cloudflare builds its
+/// state for every request, so no Worker request waits on another request's
+/// load, which `fiftyone-caching` says fails unless each request runs in the
+/// request scope it provides.
 #[must_use]
 pub fn factory() -> Arc<dyn PlatformLoadingCache> {
-    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-    {
-        static ISOLATE: std::sync::OnceLock<Arc<LoadingCaches>> = std::sync::OnceLock::new();
-        let caches: Arc<LoadingCaches> =
-            Arc::clone(ISOLATE.get_or_init(|| Arc::new(LoadingCaches::new())));
-        caches
-    }
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    {
-        Arc::new(LoadingCaches::new())
-    }
+    Arc::new(LoadingCaches::new())
 }
 
-/// Every cache a process uses, each a memory layer over the host's shared
-/// store. See the crate documentation.
+/// Every cache one application state uses, each a memory layer over the
+/// host's shared store. See the crate documentation.
 pub struct LoadingCaches {
     layers: Mutex<HashMap<LayerId, Arc<Layer>>>,
     clock: Arc<dyn Clock>,
