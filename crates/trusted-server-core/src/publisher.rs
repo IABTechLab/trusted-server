@@ -645,6 +645,8 @@ struct ProcessResponseParams<'a> {
     request_path: &'a str,
     settings: &'a Settings,
     content_type: &'a str,
+    /// See [`OwnedProcessResponseParams::status`].
+    status: StatusCode,
     integration_registry: &'a IntegrationRegistry,
     /// Head script carrying this request's permission state, or [`None`] under a
     /// shared-template mode. See [`template_permissions_script`].
@@ -675,6 +677,7 @@ struct PublisherBodyProcessor {
 struct TextResponse<'a> {
     /// The response's `Content-Type`, parameters and all.
     content_type: &'a str,
+    status: StatusCode,
     request_path: &'a str,
     request_host: &'a str,
     request_scheme: &'a str,
@@ -689,12 +692,11 @@ struct TextResponse<'a> {
 /// The stream processors the entries covering a response that is not HTML
 /// run on its body, the fetch entry's and then the serve entry's, with the
 /// headers the serve entry's middleware write on the response, or none
-/// when its media type is not one a middleware runs on, its charset is not
-/// UTF-8 or no entry covers it. Both phases run here because the template
-/// cache stores HTML alone. The pass also says whether a registered
-/// middleware moves the origin's address in a body of this media type
-/// itself, which holds whatever the charset and whether or not an entry
-/// names that middleware.
+/// when [`text_entry_media_type`] gives no media type or no entry covers
+/// it. Both phases run here because the template cache stores HTML alone.
+/// The pass also says whether a registered middleware moves the origin's
+/// address in a body of this media type itself, which holds whatever the
+/// charset and status and whether or not an entry names that middleware.
 ///
 /// # Errors
 ///
@@ -705,9 +707,7 @@ fn middleware_stream_processors(
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
 ) -> Result<TextPass, Report<TrustedServerError>> {
-    use crate::middleware::{
-        MiddlewareContext, is_dispatched_media_type, is_utf8_or_undeclared_charset,
-    };
+    use crate::middleware::{MiddlewareContext, is_dispatched_media_type};
 
     let media_type = media_type_of(response.content_type);
     if !is_dispatched_media_type(&media_type) {
@@ -715,7 +715,7 @@ fn middleware_stream_processors(
     }
     let addresses_left_to_middleware =
         integration_registry.middleware_moves_origin_address(&media_type);
-    if !is_utf8_or_undeclared_charset(response.content_type) {
+    if text_entry_media_type(response.content_type, response.status).is_none() {
         return Ok(TextPass {
             addresses_left_to_middleware,
             ..TextPass::default()
@@ -757,6 +757,60 @@ fn middleware_stream_processors(
         response_headers,
         addresses_left_to_middleware,
     })
+}
+
+/// The media type the entries match a response that is not HTML by, or
+/// `None` when no middleware runs on it: HTML, which has processors of its
+/// own, a type no entry may cover, a charset other than UTF-8, and a status
+/// other than `200`.
+/// Only a `200` carries the whole file, so a partial `206` or an error
+/// body is left as the origin sent it.
+fn text_entry_media_type(content_type: &str, status: StatusCode) -> Option<String> {
+    use crate::middleware::{is_dispatched_media_type, is_utf8_or_undeclared_charset};
+
+    let media_type = media_type_of(content_type);
+    let runs = status == StatusCode::OK
+        && !is_html_content_type(content_type)
+        && is_dispatched_media_type(&media_type)
+        && is_utf8_or_undeclared_charset(content_type);
+    runs.then_some(media_type)
+}
+
+/// Fits the headers of a response that is not HTML to the entries covering
+/// it. A body an entry covers loses the origin's `ETag` and `Last-Modified`,
+/// because its middleware may change it while the origin's file stays the
+/// same, so a conditional request carrying them would bring a `304` for the
+/// body as it was. A body a `[[serve]]` entry covers is also kept out of
+/// shared caches when a module left state on the request, because the
+/// entry's middleware are handed that state. Called once the serve
+/// middleware's headers are written, so none of them can undo it.
+fn apply_text_entry_cache_rules(
+    response: &mut Response<EdgeBody>,
+    params: &OwnedProcessResponseParams,
+    settings: &Settings,
+    integration_registry: &IntegrationRegistry,
+) {
+    let Some(media_type) = text_entry_media_type(&params.content_type, params.status) else {
+        return;
+    };
+    let covered = |phase: MiddlewarePhase| {
+        !integration_registry
+            .middleware_chain(
+                settings.phase_entries(phase),
+                phase,
+                &media_type,
+                &params.request_path,
+            )
+            .is_empty()
+    };
+    let served = covered(MiddlewarePhase::Serve);
+    if served && !params.request_state.is_empty() {
+        // Removes the validators too.
+        enforce_terminal_private_cache_privacy(response);
+    } else if served || covered(MiddlewarePhase::Fetch) {
+        response.headers_mut().remove(header::ETAG);
+        response.headers_mut().remove(header::LAST_MODIFIED);
+    }
 }
 
 /// What the entries covering a text response do to it: the processors over
@@ -854,42 +908,51 @@ async fn prepare_document(
     Ok(())
 }
 
+/// The request's services with nothing of the reader's connection, being
+/// what the fetch phase of a document that may be stored is prepared with.
+struct StoredDocumentServices(RuntimeServices);
+
+impl StoredDocumentServices {
+    fn of(services: &RuntimeServices) -> Self {
+        Self(services.clone().without_connection())
+    }
+}
+
 /// The context a phase's preparations of a document are called with. The
-/// fetch phase of a document that may be stored is handed the request's
-/// services and nothing of the reader, because what its preparations answer
-/// is stored with the document. Every other preparation, the serve phase's
-/// on every document included, is handed the reader's state.
+/// fetch phase of a document that may be stored is handed `stored` and
+/// nothing of the reader, because what its preparations answer is stored
+/// with the document. Every other preparation, the serve phase's on every
+/// document included, is handed the reader's state.
 fn preparation_context<'r>(
     request: ModuleRequest<'r>,
-    stored: bool,
+    stored: Option<&'r StoredDocumentServices>,
     settings: &'r Settings,
     ec_context: &'r EcContext,
     services: &'r RuntimeServices,
 ) -> ModuleContext<'r> {
     let context = ModuleContext::new(request).with_settings(settings);
-    if stored {
-        context.with_services(services)
-    } else {
-        context.with_request_state(ec_context, services)
+    match stored {
+        Some(StoredDocumentServices(stored)) => context.with_services(stored),
+        None => context.with_request_state(ec_context, services),
     }
 }
 
 /// The contexts the two phases of a fetched document are prepared with. The
-/// fetch phase's carries the services alone when the document may be stored,
+/// fetch phase's carries `stored` alone when the document may be stored,
 /// because what it answers is stored with the document, and the serve
 /// phase's carries the reader's state on every document, because what it
 /// answers is this reader's, so the reader a document is fetched for is
 /// prepared as every later reader of the stored copy is.
 fn preparation_contexts<'r>(
     request: impl Fn() -> ModuleRequest<'r>,
-    stored: bool,
+    stored: Option<&'r StoredDocumentServices>,
     settings: &'r Settings,
     ec_context: &'r EcContext,
     services: &'r RuntimeServices,
 ) -> (ModuleContext<'r>, ModuleContext<'r>) {
     (
         preparation_context(request(), stored, settings, ec_context, services),
-        preparation_context(request(), false, settings, ec_context, services),
+        preparation_context(request(), None, settings, ec_context, services),
     )
 }
 
@@ -987,6 +1050,7 @@ impl PublisherBodyProcessor {
             let (processor, headers) = middleware_stream_processors(
                 &TextResponse {
                     content_type: &params.content_type,
+                    status: params.status,
                     request_path: &params.request_path,
                     request_host: &params.request_host,
                     request_scheme: &params.request_scheme,
@@ -1094,6 +1158,7 @@ fn process_response_streaming<W: Write>(
         let (processor, headers) = middleware_stream_processors(
             &TextResponse {
                 content_type: params.content_type,
+                status: params.status,
                 request_path: params.request_path,
                 request_host: params.request_host,
                 request_scheme: params.request_scheme,
@@ -2069,24 +2134,70 @@ pub(crate) fn classify_response_route(
     ResponseRoute::Stream
 }
 
-/// Whether the origin answered with a page where `entry` places core's
-/// robots.txt middleware, as a single-page application's catch-all does. A
-/// crawler reads a page there as no rules at all, so the file is made as it is
-/// where the origin has none.
-fn answers_robots_txt_with_a_page(
+/// The `[[fetch]]` entry whose middleware make the document at
+/// `request_path` on an empty one, in place of the origin's `response`, see
+/// [`PhaseEntries::making`](crate::middleware::PhaseEntries::making). That is
+/// where a middleware the entry names works on the path and the origin
+/// answers `404`, and where such a middleware writes the whole document and
+/// would not be handed the answer as a `200` of the entry's media type, so
+/// that no other answer of the origin's is served in place of the document.
+fn entry_making_the_document<'s>(
+    settings: &'s Settings,
+    integration_registry: &IntegrationRegistry,
+    request_path: &str,
+    request_host: &str,
     response: &Response<EdgeBody>,
-    entry: &crate::middleware::PhaseEntry,
+) -> Option<&'s crate::middleware::PhaseEntry> {
+    let entry = settings.fetch.making(request_path)?;
+    let chain = integration_registry.middleware_chain(
+        &settings.fetch,
+        MiddlewarePhase::Fetch,
+        &entry.media_type,
+        request_path,
+    );
+    if chain.is_empty() {
+        return None;
+    }
+    if response.status() == StatusCode::NOT_FOUND {
+        return Some(entry);
+    }
+    // Core runs no middleware for a request that names no host, so a document
+    // made for one would go out empty.
+    (chain.writes_whole_document()
+        && !request_host.is_empty()
+        && !is_handed_over_whole(response, &entry.media_type, request_host))
+    .then_some(entry)
+}
+
+/// Whether core hands a middleware for `media_type` the origin's `response`
+/// whole, being a `200` of that media type, in a charset and an encoding
+/// core reads, that core streams through the middleware.
+fn is_handed_over_whole(
+    response: &Response<EdgeBody>,
+    media_type: &str,
+    request_host: &str,
 ) -> bool {
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let content_encoding = response
+        .headers()
+        .get(header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
     response.status() == StatusCode::OK
-        && entry
-            .middleware
-            .iter()
-            .any(|name| name == crate::robots_txt::middleware::MODULE)
-        && response
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(is_html_content_type)
+        && media_type_of(content_type) == media_type
+        && crate::middleware::is_utf8_or_undeclared_charset(content_type)
+        && classify_response_route(
+            response.status(),
+            content_type,
+            &content_encoding,
+            request_host,
+        ) == ResponseRoute::Stream
 }
 
 /// An empty document of `media_type`, which the middleware a `[[fetch]]`
@@ -2175,6 +2286,9 @@ pub struct OwnedProcessResponseParams {
     /// `[[serve]]` entries that cover the document.
     pub(crate) request_path: String,
     pub(crate) content_type: String,
+    /// The origin's status, which decides whether the entries' middleware
+    /// run on a body that is not HTML. See [`text_entry_media_type`].
+    pub(crate) status: StatusCode,
     pub(crate) ad_slots_script: Option<String>,
     pub(crate) ad_bids_state: AdBidsState,
     /// Observation context for the in-flight auction.
@@ -2307,6 +2421,7 @@ pub async fn buffer_publisher_response_async(
             )
             .await?;
             write_response_headers(&mut response, response_headers);
+            apply_text_entry_cache_rules(&mut response, &params, settings, integration_registry);
             // Authorized template cache transforms are emitted as identity by
             // `process_response_streaming_async`; inline transforms retain the origin
             // coding. This avoids recompressing and immediately decoding a full document.
@@ -2685,6 +2800,7 @@ fn build_template_assembly_params(
         // Set by the caller, with the rest of what belongs to the request.
         request_path: String::new(),
         content_type: entry.metadata.content_type.clone(),
+        status: StatusCode::OK,
         // The template already carries the head seam; re-injecting would duplicate it.
         permissions_json,
         ad_slots_script: None,
@@ -3149,6 +3265,7 @@ pub async fn publisher_response_into_streaming_response(
                     }
                 };
             write_response_headers(&mut response, processor.take_response_headers());
+            apply_text_entry_cache_rules(&mut response, &params, &settings, integration_registry);
             // The guard is created before the lazy stream so an auction whose
             // response body is dropped unpolled still logs the loss.
             let dispatched_auction = params.dispatched_auction.take().map(|dispatched| {
@@ -3481,6 +3598,7 @@ pub fn stream_publisher_body<W: Write>(
         request_path: &params.request_path,
         settings,
         content_type: &params.content_type,
+        status: params.status,
         integration_registry,
         permissions_script: permissions_script.as_deref(),
         ad_slots_script: params.ad_slots_script.as_deref(),
@@ -5224,7 +5342,7 @@ fn apply_origin_cache_intent(
     if bypass {
         request.with_cache_bypass()
     } else if readthrough_applies {
-        // The same reader-facing key and all-scope key used by the purge endpoint.
+        // The reader-facing key and the all-scope key that `ts cache purge` names.
         // Fastly accepts multiple space-separated surrogate keys without changing TTL.
         request.with_shared_cache(format!(
             "{TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY} {}",
@@ -5559,10 +5677,13 @@ pub async fn handle_publisher_request(
     // a panic-prone invariant in the public request handler.
     let reader_compression = reader_compression.unwrap_or(Compression::None);
 
-    if should_run_ad_stack || personalization_requires_full_body {
-        // HTML document contexts whose output may be synthesized must not
-        // receive a cached 304 or partial 206. Non-document subresources contain
-        // no executable injected tag, so retain their validators and ranges.
+    let middleware_needs_whole_body =
+        integration_registry.middleware_needs_whole_body(settings, &request_path);
+    if should_run_ad_stack || personalization_requires_full_body || middleware_needs_whole_body {
+        // HTML document contexts whose output may be synthesized, and a
+        // middleware that needs the whole body, must not receive a cached 304
+        // or partial 206. Other non-document subresources contain no executable
+        // injected tag, so retain their validators and ranges.
         strip_conditional_and_range_headers(&mut req);
     }
 
@@ -5855,8 +5976,10 @@ pub async fn handle_publisher_request(
             crate::auction::formats::attach_device_attributes(
                 &mut auction_request,
                 &auction_client_request,
+                ec_context.permissions(),
                 settings,
                 services,
+                auction_timeout_ms,
             )
             .await;
             let auction_context = AuctionContext {
@@ -6050,6 +6173,7 @@ pub async fn handle_publisher_request(
                     let stored_origin_host = location.host_header();
                     let document = TextResponse {
                         content_type: crate::middleware::HTML_MEDIA_TYPE,
+                        status: StatusCode::OK,
                         request_path: &request_path,
                         request_host,
                         request_scheme,
@@ -6209,12 +6333,18 @@ pub async fn handle_publisher_request(
         response.headers_mut().insert(header::LOCATION, value);
     }
 
-    // A file the origin does not have is made, see `PhaseEntries::making`. An
-    // origin page where the robots.txt middleware is placed is no file either.
+    // A file the origin does not have is made, see `entry_making_the_document`.
+    // Core runs no middleware for a request that names no host, so there the
+    // made file would go out empty and the origin's answer stands instead.
     if (request_method == Method::GET || request_method == Method::HEAD)
-        && let Some(entry) = settings.fetch.making(&request_path)
-        && (response.status() == StatusCode::NOT_FOUND
-            || answers_robots_txt_with_a_page(&response, entry))
+        && !request_host.is_empty()
+        && let Some(entry) = entry_making_the_document(
+            settings,
+            integration_registry,
+            &request_path,
+            request_host,
+            &response,
+        )
     {
         log::debug!(
             "Making {} for {request_path}, which the origin does not have, with {}",
@@ -6448,15 +6578,19 @@ pub async fn handle_publisher_request(
 
     let prepared = Arc::new(Prepared::default());
     if route == ResponseRoute::Stream {
+        let stored = template_cache_key
+            .is_some()
+            .then(|| StoredDocumentServices::of(services));
         let (fetch_context, serve_context) = preparation_contexts(
             || ModuleRequest::new(&request_method, request_host, request_scheme, &request_path),
-            template_cache_key.is_some(),
+            stored.as_ref(),
             settings,
             ec_context,
             services,
         );
         let document = TextResponse {
             content_type: &content_type,
+            status,
             request_path: &request_path,
             request_host,
             request_scheme,
@@ -6595,6 +6729,7 @@ pub async fn handle_publisher_request(
                     request_scheme: request_scheme.to_string(),
                     request_path: request_path.clone(),
                     content_type,
+                    status,
                     permissions_json,
                     ad_slots_script: ad_slots_script.clone(),
                     ad_bids_state: ad_bids_state.clone(),
@@ -6852,9 +6987,10 @@ pub(crate) fn build_bid_map_with_auction_id(
                         serde_json::Value::String(auction_id.to_owned()),
                     );
                 }
-                // Winning creative dimensions — the bridge sizes the inline
-                // render from these, falling back to the first configured slot
-                // format only when absent, which mis-sizes a multi-size slot.
+                // Winning creative dimensions. The bridge sizes the inline
+                // render from these. When they are absent it falls back to the
+                // first size of the slot's viewport band, then to the first
+                // configured format, which mis-sizes a multi-size slot.
                 // Omit a zero dimension (missing OpenRTB w/h parse to 0) so the
                 // bridge falls back rather than sizing the frame to 0.
                 if bid.width > 0 {
@@ -7926,7 +8062,8 @@ fn permissions_json_or_empty(permissions_json: &str) -> Cow<'_, str> {
 /// Build the `tsjs.adSlots` `<script>` tag from matched slots.
 ///
 /// Property names match what the client-side TSJS bundle expects:
-/// `gam_unit_path`, `div_id`, `formats`, and `targeting`.
+/// `gam_unit_path`, `div_id`, `formats`, and `targeting`, with
+/// `viewport_sizes` added when a format names a viewport bound.
 pub(crate) fn build_ad_slots_script(
     matched_slots: &[crate::creative_opportunities::CreativeOpportunitySlot],
     co_config: &crate::creative_opportunities::CreativeOpportunitiesConfig,
@@ -8323,17 +8460,19 @@ pub async fn handle_page_bids(
                 },
             );
 
+            let timeout_ms = co_config
+                .auction_timeout_ms
+                .unwrap_or(settings.auction.timeout_ms);
             // Fill the device object the bidder prices on.
             crate::auction::formats::attach_device_attributes(
                 &mut auction_request,
                 &req,
+                ec_context.permissions(),
                 settings,
                 services,
+                timeout_ms,
             )
             .await;
-            let timeout_ms = co_config
-                .auction_timeout_ms
-                .unwrap_or(settings.auction.timeout_ms);
             let auction_context = AuctionContext {
                 settings,
                 request: &req,
@@ -8507,7 +8646,6 @@ fn asset_cache(settings: &Settings) -> SourceCache {
         name,
         lifetimes,
         memory_entries,
-        detachable: false,
     };
     SourceCache {
         records: spec(crate::settings::ASSETS_VARY_CACHE, 256),
@@ -11224,6 +11362,7 @@ mod tests {
             request_scheme: "https".to_owned(),
             request_path: "/".to_owned(),
             content_type: "application/json".to_owned(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -13601,6 +13740,105 @@ mod tests {
                         1,
                         "should serve the {reader} {label} reader what the middleware wrote, \
                          once: {page}"
+                    );
+                }
+            }
+        }
+
+        /// The client IP of the reader [`services_for_a_reader`] carries.
+        const READER_IP: &str = "203.0.113.9";
+        /// The `User-Agent` that reader sends.
+        const READER_AGENT: &str = "Mozilla/5.0 ReaderAgent/1.0";
+        /// The TLS JA4 fingerprint of that reader's connection.
+        const READER_JA4: &str = "t13d1516h2_8daaf6152771_02713d6af862";
+
+        /// The host's client signals for that reader.
+        #[derive(Debug)]
+        struct ReaderSignals;
+
+        impl crate::evidence::HostSignals for ReaderSignals {
+            fn ja4(&self) -> Option<&str> {
+                Some(READER_JA4)
+            }
+
+            fn h2(&self) -> Option<&str> {
+                Some("1:65536;4:6291456|15663105|0|m,a,s,p")
+            }
+        }
+
+        /// [`services`], carrying the connection of one reader, being the
+        /// client IP, the TLS details and the host's client signals.
+        fn services_for_a_reader(
+            http_client: Arc<StubHttpClient>,
+            cache: Arc<MemoryTemplateCache>,
+        ) -> RuntimeServices {
+            RuntimeServices::builder()
+                .config_store(Arc::new(NoopConfigStore))
+                .secret_store(Arc::new(NoopSecretStore))
+                .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+                .backend(Arc::new(StubBackend))
+                .http_client(http_client)
+                .geo(Arc::new(crate::platform::PlatformGeoModule::new(
+                    "noop",
+                    Arc::new(NoopGeo),
+                )))
+                .client_info(ClientInfo {
+                    client_ip: Some(READER_IP.parse().expect("should parse the reader's IP")),
+                    tls_protocol: Some("TLSv1.3".to_owned()),
+                    tls_ja4: Some(READER_JA4.to_owned()),
+                    ..ClientInfo::default()
+                })
+                .host_signals(Arc::new(ReaderSignals))
+                .template_cache(cache)
+                .build()
+        }
+
+        #[tokio::test]
+        async fn a_fetch_preparation_of_a_stored_page_reads_nothing_of_the_reader() {
+            use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+            for (mode, stored) in [("esi", true), ("inline", false)] {
+                let stub = Arc::new(StubHttpClient::new());
+                let cache = Arc::new(MemoryTemplateCache::default());
+                let services = services_for_a_reader(Arc::clone(&stub), Arc::clone(&cache));
+                let settings = Arc::new(settings_with_fetch_entry(
+                    mode,
+                    "reader",
+                    None,
+                    &[fixture::PREPARING],
+                ));
+                let mut request = navigation_request();
+                request
+                    .headers_mut()
+                    .insert(header::USER_AGENT, HeaderValue::from_static(READER_AGENT));
+                queue_shareable_html(&stub);
+
+                let page = page_of(run(&settings, &services, request).await).await;
+
+                assert_eq!(
+                    stored_cache_keys(&cache).len(),
+                    usize::from(stored),
+                    "should store the {mode} page only where it may be stored"
+                );
+                if stored {
+                    assert!(
+                        page.contains(&fixture::prepared_reader_marker(
+                            fixture::NOTHING_OF_THE_READER
+                        )),
+                        "should prepare a page stored for every reader with nothing of the \
+                         reader whose request fetched it: {page}"
+                    );
+                    for value in [READER_IP, READER_AGENT, READER_JA4] {
+                        assert!(
+                            !page.contains(value),
+                            "should keep {value} out of the stored page: {page}"
+                        );
+                    }
+                } else {
+                    assert!(
+                        page.contains(&format!("client IP {READER_IP}")),
+                        "should prepare a page that is not stored with the reader, or the \
+                         stored page proves nothing: {page}"
                     );
                 }
             }
@@ -23265,6 +23503,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/a.txt".to_owned(),
             content_type: content_type.to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -23380,6 +23619,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/a.txt".to_owned(),
             content_type: fixture::FRAMED_MEDIA_TYPE.to_string(),
+            status: StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -23448,6 +23688,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/a.txt".to_owned(),
             content_type: "text/plain; charset=utf-8".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -23502,6 +23743,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/a.txt".to_owned(),
             content_type: content_type.to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -23604,6 +23846,183 @@ mod tests {
         assert_eq!(String::from_utf8(output).expect("text"), "plain\n");
     }
 
+    /// The answers to `GET /a.txt` through the publisher path, the origin
+    /// answering `status` with `plain\n` as UTF-8 text and the headers given,
+    /// finalized as the adapters that buffer do and then as Fastly does.
+    /// With `marked`, a module leaves state on the request.
+    async fn text_answers_through_the_publisher(
+        settings: Settings,
+        marked: bool,
+        status: u16,
+        origin_headers: &[(&str, &str)],
+    ) -> Vec<(Response<EdgeBody>, String)> {
+        let settings = Arc::new(settings);
+        let registry = IntegrationRegistry::new(&settings).expect("should build a registry");
+        let orchestrator = Arc::new(AuctionOrchestrator::new(
+            crate::auction::test_support::legacy_auction_config(&settings),
+        ));
+        let mut answers = Vec::new();
+        for streaming in [false, true] {
+            let stub = Arc::new(StubHttpClient::new());
+            let mut headers = vec![("content-type", "text/plain; charset=utf-8")];
+            headers.extend_from_slice(origin_headers);
+            stub.push_response_with_headers(status, b"plain\n".to_vec(), headers);
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let mut request = HttpRequest::builder()
+                .method(Method::GET)
+                .uri("https://publisher.example/a.txt")
+                .header(header::HOST, "publisher.example")
+                .body(EdgeBody::empty())
+                .expect("should build request");
+            if marked {
+                crate::integrations::registry_test_support::request_fixture::mark(&mut request);
+            }
+            let consent = crate::consent::ConsentContext {
+                jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                ..Default::default()
+            };
+            let mut ec_context = EcContext::new_for_test_with_ip(None, consent, None);
+            let proxied = handle_publisher_request(
+                AppContext {
+                    settings: &settings,
+                    integration_registry: &registry,
+                },
+                &services,
+                None,
+                &mut ec_context,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &[],
+                    registry: None,
+                },
+                request,
+                EdgeCacheHeader::SMaxageFallback,
+            )
+            .await
+            .expect("should proxy the request");
+            let response = if streaming {
+                publisher_response_into_streaming_response(
+                    proxied,
+                    &Method::GET,
+                    Arc::clone(&settings),
+                    &registry,
+                    Arc::clone(&orchestrator),
+                    services.clone(),
+                )
+                .await
+            } else {
+                buffer_publisher_response_async(
+                    proxied,
+                    &Method::GET,
+                    &settings,
+                    &registry,
+                    &orchestrator,
+                    &services,
+                )
+                .await
+            }
+            .expect("should finalize the response");
+            let (parts, body) = response.into_parts();
+            let body = match body {
+                EdgeBody::Stream(mut stream) => {
+                    let mut out = Vec::new();
+                    while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+                        out.extend_from_slice(&chunk.expect("should read a chunk"));
+                    }
+                    out
+                }
+                other => other.into_bytes().expect("should hold the bytes").to_vec(),
+            };
+            answers.push((
+                Response::from_parts(parts, EdgeBody::empty()),
+                String::from_utf8(body).expect("text"),
+            ));
+        }
+        answers
+    }
+
+    #[tokio::test]
+    async fn a_text_response_whose_serve_entry_is_handed_request_state_is_private() {
+        let origin = [("cache-control", "public, max-age=600"), ("etag", "\"v1\"")];
+        for (marked, cache_control) in [(true, "no-store, private"), (false, "public, max-age=600")]
+        {
+            let answers = text_answers_through_the_publisher(
+                settings_serving_the_text_header(),
+                marked,
+                200,
+                &origin,
+            )
+            .await;
+            for (response, _) in &answers {
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(header::CACHE_CONTROL)
+                        .and_then(|value| value.to_str().ok()),
+                    Some(cache_control),
+                    "should keep a text response shaped from one reader's state out of \
+                     shared caches, and no other"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_text_body_is_handed_to_a_middleware_only_when_the_status_is_200() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+        let settings = settings_running_the_middleware_fixture(vec![PhaseEntry {
+            media_type: fixture::TEXT_MEDIA_TYPE.to_owned(),
+            path: None,
+            middleware: vec![fixture::TEXT.to_owned()],
+        }]);
+        for (status, body) in [
+            (200, format!("plain\n{}", fixture::TEXT_LINE)),
+            (206, "plain\n".to_owned()),
+            (404, "plain\n".to_owned()),
+            (500, "plain\n".to_owned()),
+        ] {
+            let answers =
+                text_answers_through_the_publisher(settings.clone(), false, status, &[]).await;
+            for (response, text) in &answers {
+                assert_eq!(response.status().as_u16(), status);
+                assert_eq!(
+                    text, &body,
+                    "should change a whole file and leave a {status} as the origin sent it"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_text_body_a_middleware_changes_loses_the_origin_validators() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+        let origin = [
+            ("etag", "\"v1\""),
+            ("last-modified", "Wed, 21 Oct 2015 07:28:00 GMT"),
+        ];
+        for (path, keeps_validators) in [(None, false), (Some("/elsewhere/"), true)] {
+            let settings = settings_running_the_middleware_fixture(vec![PhaseEntry {
+                media_type: fixture::TEXT_MEDIA_TYPE.to_owned(),
+                path: path.map(str::to_owned),
+                middleware: vec![fixture::TEXT.to_owned()],
+            }]);
+            let answers = text_answers_through_the_publisher(settings, false, 200, &origin).await;
+            for (response, _) in &answers {
+                for name in [header::ETAG, header::LAST_MODIFIED] {
+                    assert_eq!(
+                        response.headers().contains_key(&name),
+                        keeps_validators,
+                        "{name} should stay on a body no middleware changes, and on no other"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_text_body_no_entry_covers_is_left_as_it_was() {
         use crate::integrations::registry_test_support::middleware_fixture as fixture;
@@ -23629,6 +24048,8 @@ mod tests {
         services: crate::platform::RuntimeServices,
         orchestrator: AuctionOrchestrator,
         response: PublisherResponse,
+        /// The origin, which keeps what it was asked.
+        origin: Arc<StubHttpClient>,
     }
 
     /// A request through the publisher path, the origin answering `status`.
@@ -23665,13 +24086,46 @@ mod tests {
         body: &[u8],
         content_type: &'static str,
     ) -> Proxied {
+        proxy_answered(
+            settings,
+            publisher_request(method, path, &[]),
+            status,
+            body,
+            vec![("content-type", content_type)],
+        )
+        .await
+    }
+
+    /// A request for `path` on the publisher's host, carrying `headers`.
+    fn publisher_request(
+        method: Method,
+        path: &str,
+        headers: &[(&'static str, &'static str)],
+    ) -> HttpRequest<EdgeBody> {
+        let mut builder = HttpRequest::builder()
+            .method(method)
+            .uri(format!("https://publisher.example{path}"))
+            .header(header::HOST, "publisher.example");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        builder
+            .body(EdgeBody::empty())
+            .expect("should build request")
+    }
+
+    /// `req` through the publisher path, the origin answering `status` with
+    /// `body` and `headers`.
+    async fn proxy_answered(
+        settings: Settings,
+        req: HttpRequest<EdgeBody>,
+        status: u16,
+        body: &[u8],
+        headers: Vec<(&'static str, &'static str)>,
+    ) -> Proxied {
         let registry = IntegrationRegistry::new(&settings).expect("should build a registry");
         let stub = Arc::new(StubHttpClient::new());
-        stub.push_response_with_headers(
-            status,
-            body.to_vec(),
-            vec![("content-type", content_type)],
-        );
+        stub.push_response_with_headers(status, body.to_vec(), headers);
         let services = build_services_with_http_client(
             Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
         );
@@ -23683,12 +24137,6 @@ mod tests {
         let orchestrator = AuctionOrchestrator::new(
             crate::auction::test_support::legacy_auction_config(&settings),
         );
-        let req = HttpRequest::builder()
-            .method(method)
-            .uri(format!("https://publisher.example{path}"))
-            .header(header::HOST, "publisher.example")
-            .body(EdgeBody::empty())
-            .expect("should build request");
         let response = handle_publisher_request(
             AppContext {
                 settings: &settings,
@@ -23713,6 +24161,7 @@ mod tests {
             services,
             orchestrator,
             response,
+            origin: stub,
         }
     }
 
@@ -23763,23 +24212,16 @@ mod tests {
         settings
     }
 
-    /// The file a proxied robots.txt request streams, with its status and
-    /// content type checked.
-    async fn streamed_robots_txt(proxied: Proxied) -> String {
+    /// The response a proxied request streams, and the body streamed.
+    async fn streamed(proxied: Proxied) -> (Response<EdgeBody>, String) {
         let PublisherResponse::Stream {
             response,
             body,
             params,
         } = proxied.response
         else {
-            panic!("the file should stream through the entry's middleware");
+            panic!("the answer should stream through the entries' middleware");
         };
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            content_type_of(&response),
-            Some("text/plain; charset=utf-8"),
-            "should be a document of the entry's media type"
-        );
         let mut params = *params;
         let mut output = Vec::new();
         stream_publisher_body_async(
@@ -23792,8 +24234,24 @@ mod tests {
             &proxied.services,
         )
         .await
-        .expect("should stream the file");
-        String::from_utf8(output).expect("the file is text")
+        .expect("should stream the body");
+        (
+            response,
+            String::from_utf8(output).expect("the body is text"),
+        )
+    }
+
+    /// The file a proxied robots.txt request streams, with its status and
+    /// content type checked.
+    async fn streamed_robots_txt(proxied: Proxied) -> String {
+        let (response, file) = streamed(proxied).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            content_type_of(&response),
+            Some("text/plain; charset=utf-8"),
+            "should be a document of the entry's media type"
+        );
+        file
     }
 
     /// The file the middleware makes replaces the origin's own.
@@ -23852,6 +24310,199 @@ mod tests {
             "User-agent: *\nAllow: /ads.txt\nDisallow: /\n",
             "the file is made"
         );
+    }
+
+    /// With `refuse_all` selected no other answer of the origin's takes the
+    /// place of the file. A crawler takes an error, a redirect or an empty
+    /// answer as permission, a `304` as leave to keep the copy it holds, and a
+    /// file core cannot replace as the origin's rules, so the refusal is made
+    /// in place of each, with status `200`.
+    #[tokio::test]
+    async fn robots_txt_is_made_in_place_of_any_answer_the_middleware_cannot_replace() {
+        let permissive: &[u8] = b"User-agent: *\nAllow: /\n";
+        let plain = ("content-type", "text/plain");
+        let answers: [(u16, &[u8], Vec<(&'static str, &'static str)>); 12] = [
+            (401, b"login", vec![("content-type", "text/html")]),
+            (403, permissive, vec![plain]),
+            (410, b"", vec![plain]),
+            (
+                301,
+                b"",
+                vec![("location", "https://elsewhere.example/robots.txt")],
+            ),
+            (302, b"", vec![("location", "/robots-staging.txt")]),
+            (500, b"down", vec![("content-type", "text/html")]),
+            (204, b"", Vec::new()),
+            (
+                200,
+                permissive,
+                vec![("content-type", "text/plain; charset=iso-8859-1")],
+            ),
+            (200, permissive, vec![plain, ("content-encoding", "zstd")]),
+            (
+                200,
+                permissive,
+                vec![("content-type", "application/octet-stream")],
+            ),
+            (
+                206,
+                b"User-agent: *\n",
+                vec![plain, ("content-range", "bytes 0-13/23")],
+            ),
+            (304, b"", vec![plain, ("etag", "\"origin-etag\"")]),
+        ];
+
+        for (status, body, headers) in answers {
+            let answer = format!("{status} {headers:?}");
+            let proxied = proxy_answered(
+                settings_refusing_every_crawler(),
+                publisher_request(Method::GET, crate::robots_txt::ROBOTS_TXT_PATH, &[]),
+                status,
+                body,
+                headers,
+            )
+            .await;
+
+            assert_eq!(
+                streamed_robots_txt(proxied).await,
+                "User-agent: *\nAllow: /ads.txt\nDisallow: /\n",
+                "the refusal should take the place of {answer}"
+            );
+        }
+    }
+
+    /// Core runs no middleware for a request that names no host, so the
+    /// origin's answer stands there rather than an empty file being made.
+    #[tokio::test]
+    async fn robots_txt_for_a_request_that_names_no_host_keeps_the_origins_answer() {
+        let req = HttpRequest::builder()
+            .method(Method::GET)
+            .uri(crate::robots_txt::ROBOTS_TXT_PATH)
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let proxied = proxy_answered(
+            settings_refusing_every_crawler(),
+            req,
+            403,
+            b"forbidden",
+            vec![("content-type", "text/plain")],
+        )
+        .await;
+
+        assert_eq!(
+            response_of(proxied.response).status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    /// An entry's `path` is a prefix, and the robots.txt middleware works on
+    /// the file's own path alone, so a longer path the entry covers keeps the
+    /// origin's answer, as it did when a route answered the file. A query is
+    /// no part of the path.
+    #[tokio::test]
+    async fn a_longer_path_the_robots_txt_entry_covers_keeps_the_origins_answer() {
+        for path in ["/robots.txt.bak", "/robots.txtx", "/robots.txt/rules"] {
+            let (response, body) = streamed(
+                proxy_origin(
+                    settings_refusing_every_crawler(),
+                    Method::GET,
+                    path,
+                    200,
+                    b"the origin's own text\n",
+                    "text/plain; charset=utf-8",
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(body, "the origin's own text\n", "{path} keeps its text");
+
+            for status in [404, 403] {
+                let proxied = proxy_origin(
+                    settings_refusing_every_crawler(),
+                    Method::GET,
+                    path,
+                    status,
+                    b"",
+                    "text/plain",
+                )
+                .await;
+                assert_eq!(
+                    response_of(proxied.response).status().as_u16(),
+                    status,
+                    "{path} keeps the origin's {status}"
+                );
+            }
+        }
+
+        let with_a_query = proxy_with(
+            settings_refusing_every_crawler(),
+            Method::GET,
+            "/robots.txt?crawler=one",
+            404,
+        )
+        .await;
+        assert_eq!(
+            streamed_robots_txt(with_a_query).await,
+            "User-agent: *\nAllow: /ads.txt\nDisallow: /\n",
+            "the file's path with a query is the file"
+        );
+    }
+
+    /// A reader's validators and range, as a crawler revalidating its copy
+    /// sends them.
+    const VALIDATORS_AND_RANGE: [(&str, &str); 4] = [
+        ("if-none-match", "\"origin-etag\""),
+        ("if-modified-since", "Wed, 21 Oct 2015 07:28:00 GMT"),
+        ("range", "bytes=0-9"),
+        ("if-range", "\"origin-etag\""),
+    ];
+
+    /// The names of the headers the origin is asked with, for a `GET` of
+    /// `path` carrying [`VALIDATORS_AND_RANGE`], under settings refusing every
+    /// crawler.
+    async fn headers_the_origin_is_asked_with(path: &str) -> Vec<String> {
+        let proxied = proxy_answered(
+            settings_refusing_every_crawler(),
+            publisher_request(Method::GET, path, &VALIDATORS_AND_RANGE),
+            200,
+            b"User-agent: *\nAllow: /\n",
+            vec![("content-type", "text/plain")],
+        )
+        .await;
+        proxied
+            .origin
+            .recorded_request_headers()
+            .concat()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    /// The robots.txt middleware needs the origin's whole file, so the origin
+    /// is asked for it without the reader's validators and range, as for a
+    /// page the ad stack answers. A path no such middleware works on, the
+    /// longer path the entry covers among them, keeps them.
+    #[tokio::test]
+    async fn the_origin_is_asked_for_the_whole_robots_txt() {
+        let asked = headers_the_origin_is_asked_with(crate::robots_txt::ROBOTS_TXT_PATH).await;
+        for (name, _) in VALIDATORS_AND_RANGE {
+            assert!(
+                !asked.iter().any(|header| header == name),
+                "{name} should not reach the origin: {asked:?}"
+            );
+        }
+
+        for path in ["/humans.txt", "/robots.txt.bak"] {
+            let asked = headers_the_origin_is_asked_with(path).await;
+            for (name, _) in VALIDATORS_AND_RANGE {
+                assert!(
+                    asked.iter().any(|header| header == name),
+                    "{name} should reach the origin for {path}: {asked:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -24019,6 +24670,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_missing_page_under_an_entry_path_keeps_the_origin_answer() {
+        for (entry_path, path) in [("/", "/missing-page"), ("/ads.txt", "/ads.txt.bak")] {
+            let proxied = proxy(text_entry_for(Some(entry_path)), Method::GET, path, 404).await;
+
+            assert_eq!(
+                response_of(proxied.response).status(),
+                StatusCode::NOT_FOUND,
+                "should keep the origin's answer for {path}, which the entry for {entry_path} \
+                 covers but does not name"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_entry_for_a_folder_makes_no_missing_page() {
+        for folder in ["/", "/feeds/"] {
+            let proxied = proxy(text_entry_for(Some(folder)), Method::GET, folder, 404).await;
+
+            assert_eq!(
+                response_of(proxied.response).status(),
+                StatusCode::NOT_FOUND,
+                "should keep the origin's answer for the folder {folder}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn a_missing_file_outside_the_entry_path_keeps_the_origin_answer() {
         let proxied = proxy(
             text_entry_for(Some("/ads.txt")),
@@ -24031,6 +24709,138 @@ mod tests {
         assert_eq!(
             response_of(proxied.response).status(),
             StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_that_names_no_host_keeps_the_origin_answer() {
+        let settings = settings_running_the_middleware_fixture(text_entry_for(Some("/ads.txt")));
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            404,
+            b"<html><body>the origin's page</body></html>".to_vec(),
+            vec![("content-type", "text/html; charset=utf-8")],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let request = build_request(Method::GET, "/ads.txt");
+
+        let response = run_publisher_proxy(&settings, &services, request).await;
+
+        assert_eq!(
+            response_of(response).status(),
+            StatusCode::NOT_FOUND,
+            "should keep the origin's answer, because core runs no middleware for a request \
+             that names no host and the made file would go out empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_method_other_than_get_or_head_keeps_the_origin_answer() {
+        for method in [
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ] {
+            let proxied = proxy(
+                text_entry_for(Some("/ads.txt")),
+                method.clone(),
+                "/ads.txt",
+                404,
+            )
+            .await;
+
+            assert_eq!(
+                response_of(proxied.response).status(),
+                StatusCode::NOT_FOUND,
+                "should keep the origin's answer to a {method}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_made_file_carries_none_of_the_headers_of_the_origin_s_404() {
+        let settings = settings_running_the_middleware_fixture(text_entry_for(Some("/ads.txt")));
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            404,
+            b"<html><body>the origin's page</body></html>".to_vec(),
+            vec![
+                ("content-type", "text/html; charset=utf-8"),
+                ("set-cookie", "session=origin; Path=/"),
+                ("cache-control", "public, max-age=600"),
+                ("etag", "\"origin-404\""),
+                ("x-origin", "not found"),
+            ],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let request = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/ads.txt")
+            .header(header::HOST, "publisher.example")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let response = response_of(run_publisher_proxy(&settings, &services, request).await);
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let names: Vec<&str> = response
+            .headers()
+            .keys()
+            .map(http::HeaderName::as_str)
+            .collect();
+        assert_eq!(
+            names,
+            [header::CONTENT_TYPE.as_str()],
+            "should carry the Content-Type the file is made with and nothing the origin sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_made_file_streams_through_the_finalizer_fastly_uses() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+        let proxied = proxy(
+            text_entry_for(Some("/ads.txt")),
+            Method::GET,
+            "/ads.txt",
+            404,
+        )
+        .await;
+        let response = publisher_response_into_streaming_response(
+            proxied.response,
+            &Method::GET,
+            Arc::new(proxied.settings),
+            &proxied.registry,
+            Arc::new(proxied.orchestrator),
+            proxied.services,
+        )
+        .await
+        .expect("should finalize the made file");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            content_type_of(&response),
+            Some("text/plain; charset=utf-8")
+        );
+        let mut body = Vec::new();
+        match response.into_body() {
+            EdgeBody::Stream(mut stream) => {
+                while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+                    body.extend_from_slice(&chunk.expect("should read the made file"));
+                }
+            }
+            other => body.extend_from_slice(&other.into_bytes().expect("should hold the file")),
+        }
+        assert_eq!(
+            String::from_utf8(body).expect("text"),
+            fixture::TEXT_LINE,
+            "should be what the middleware writes on an empty document"
         );
     }
 
@@ -24143,7 +24953,7 @@ mod tests {
         use crate::integrations::registry_test_support::middleware_fixture as fixture;
         use crate::middleware::HTML_MEDIA_TYPE;
 
-        let proxied = proxy(
+        let (proxied, logged) = crate::test_support::logs::logged_by(proxy(
             vec![PhaseEntry {
                 media_type: HTML_MEDIA_TYPE.to_owned(),
                 path: None,
@@ -24152,11 +24962,19 @@ mod tests {
             Method::GET,
             "/article",
             200,
-        )
+        ))
         .await;
         let PublisherResponse::Buffered(response) = proxied.response else {
             panic!("a refusal is answered whole, with no document to stream");
         };
+        let refusals: Vec<&String> = logged
+            .iter()
+            .filter(|line| line.contains(fixture::REFUSING))
+            .collect();
+        assert!(
+            refusals.len() == 1 && refusals[0].starts_with("WARN "),
+            "should warn of the refusal once, naming the middleware: {logged:?}"
+        );
         let header_value = |name: header::HeaderName| {
             response
                 .headers()
@@ -24235,10 +25053,17 @@ mod tests {
         .with_module_for_test(Arc::new(crate::ec::tests::CanonicalizingModule));
         let services = noop_services();
         let settings = settings_running_the_middleware_fixture(Vec::new());
+        let stored_services = StoredDocumentServices::of(&services);
         let method = Method::GET;
         let handed = |stored: bool| {
             let request = ModuleRequest::new(&method, "publisher.example", "https", "/article");
-            let context = preparation_context(request, stored, &settings, &ec_context, &services);
+            let context = preparation_context(
+                request,
+                stored.then_some(&stored_services),
+                &settings,
+                &ec_context,
+                &services,
+            );
             let call = context.call("testing.preparation", PermissionSet::none());
             (
                 <&PermissionState>::from_module_context(&call).is_ok(),
@@ -24254,7 +25079,8 @@ mod tests {
         assert_eq!(
             handed(true),
             (false, false),
-            "should hand a document that may be stored neither the reader's permissions nor              Edge Cookie"
+            "should hand a document that may be stored neither the reader's permissions nor \
+             Edge Cookie"
         );
     }
 
@@ -24269,6 +25095,7 @@ mod tests {
         .with_module_for_test(Arc::new(crate::ec::tests::CanonicalizingModule));
         let services = noop_services();
         let settings = settings_running_the_middleware_fixture(Vec::new());
+        let stored_services = StoredDocumentServices::of(&services);
         let method = Method::GET;
         let handed = |context: &ModuleContext<'_>| {
             let call = context.call("testing.preparation", PermissionSet::none());
@@ -24281,7 +25108,7 @@ mod tests {
         for stored in [true, false] {
             let (fetch, serve) = preparation_contexts(
                 || ModuleRequest::new(&method, "publisher.example", "https", "/article"),
-                stored,
+                stored.then_some(&stored_services),
                 &settings,
                 &ec_context,
                 &services,
@@ -25961,6 +26788,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/css".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -26026,6 +26854,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -26112,6 +26941,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/html; charset=utf-8".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -26207,6 +27037,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/html; charset=utf-8".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -26317,6 +27148,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -26368,6 +27200,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -26499,6 +27332,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -26568,6 +27402,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -26640,6 +27475,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -26712,6 +27548,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -26784,6 +27621,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -26836,6 +27674,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/css".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -27064,6 +27903,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/html; charset=utf-8".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: Some(
                     r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
@@ -27144,6 +27984,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/html; charset=utf-8".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: Some(
                     r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
@@ -27226,6 +28067,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -27302,6 +28144,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/css".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -27460,6 +28303,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: Some(
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
@@ -28138,6 +28982,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/html; charset=utf-8".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -28338,6 +29183,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: Some(
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
@@ -28422,6 +29268,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "Text/HTML; Charset=utf-8".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: Some(
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
@@ -28489,6 +29336,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/html".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -28611,6 +29459,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -28673,6 +29522,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/html".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -31528,7 +32378,9 @@ mod tests {
     /// The same capturing setup also covers how both paths key the identity
     /// graph. A module whose canonical form differs from the cookie value has
     /// its row read under the canonical key, so the partner ID stored there
-    /// reaches the dispatched auction request.
+    /// reaches the dispatched auction request. It also covers that neither
+    /// path sends a telemetry row about a reader the consent gate refuses and
+    /// who has not permitted ad performance measurement.
     mod navigation_publisher_domain_tests {
         use super::*;
         use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
@@ -31536,9 +32388,11 @@ mod tests {
         use crate::auction::types::AuctionRequest;
         use crate::auction::{AuctionContext, AuctionOrchestrator};
         use crate::creative_opportunities::{CreativeOpportunityFormat, CreativeOpportunitySlot};
+        use crate::ec::device::{DeviceAttributes, DeviceModule};
         use crate::ec::tests::{CANONICAL_COOKIE_VALUE, CANONICAL_KV_KEY, CanonicalizingModule};
+        use crate::permissions::{Permission, PermissionSet, PermissionState};
         use crate::platform::test_support::{
-            NoopConfigStore, NoopGeo, NoopSecretStore, StubBackend,
+            DetectionServiceDevice, NoopConfigStore, NoopGeo, NoopSecretStore, StubBackend,
         };
         use crate::platform::{ClientInfo, PlatformResponse};
         use crate::test_support::tests::crate_test_settings_str;
@@ -31687,6 +32541,26 @@ mod tests {
                 ..Default::default()
             };
             EcContext::new_for_test(None, consent)
+        }
+
+        /// [`EcContext`] in an unknown jurisdiction with no consent record,
+        /// which the server-side auction gate refuses, for a reader who has
+        /// set no permission, ad performance measurement included.
+        fn consent_denying_ec_context() -> EcContext {
+            EcContext::new_for_test_gated(None, crate::consent::ConsentContext::default(), false)
+        }
+
+        /// Asserts the sink received no telemetry row at all.
+        fn assert_no_telemetry(telemetry_sink: &RecordingTelemetrySink) {
+            let batches = telemetry_sink
+                .batches
+                .lock()
+                .expect("should lock telemetry batches");
+            assert!(
+                batches.is_empty(),
+                "should send no row about a reader who has not permitted ad measurement, got {:?}",
+                *batches
+            );
         }
 
         fn services_with(
@@ -31863,6 +32737,94 @@ mod tests {
             .expect("should return ok response");
 
             assert_configured_domain(&captured, &telemetry_sink);
+        }
+
+        #[tokio::test]
+        async fn navigation_sends_no_row_when_consent_denies_without_ad_measurement() {
+            let settings = settings_with_capturing_provider();
+            let captured = Arc::new(Mutex::new(None));
+            let orchestrator = orchestrator_capturing_request(&settings, &captured);
+            let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"<html><head></head><body>ok</body></html>".to_vec());
+            let services = services_with(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+                Arc::clone(&telemetry_sink),
+            );
+            let mut ec_context = consent_denying_ec_context();
+            let req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri(format!("https://{EDGE_HOST}/2024/01/my-article/"))
+                .header(header::HOST, EDGE_HOST)
+                .header(header::USER_AGENT, "FictionalBrowser/1.0 (FictionalOS)")
+                .header("sec-fetch-dest", "document")
+                .body(EdgeBody::empty())
+                .expect("should build test request");
+
+            let registry = test_registry(&settings);
+            let _ = handle_publisher_request(
+                AppContext {
+                    settings: &settings,
+                    integration_registry: &registry,
+                },
+                &services,
+                None,
+                &mut ec_context,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &article_slot(),
+                    registry: None,
+                },
+                req,
+                EdgeCacheHeader::SMaxageFallback,
+            )
+            .await
+            .expect("should proxy publisher request");
+
+            assert_no_telemetry(&telemetry_sink);
+        }
+
+        #[tokio::test]
+        async fn page_bids_sends_no_row_when_consent_denies_without_ad_measurement() {
+            let settings = settings_with_capturing_provider();
+            let captured = Arc::new(Mutex::new(None));
+            let orchestrator = orchestrator_capturing_request(&settings, &captured);
+            let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
+            let services = services_with(
+                Arc::new(crate::platform::test_support::NoopHttpClient),
+                Arc::clone(&telemetry_sink),
+            );
+            let mut ec_context = consent_denying_ec_context();
+            let mut req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "https://{EDGE_HOST}/_ts/page-bids?path=/2024/01/my-article/"
+                ))
+                .header(header::HOST, EDGE_HOST)
+                .header(header::USER_AGENT, "FictionalBrowser/1.0 (FictionalOS)")
+                .body(EdgeBody::empty())
+                .expect("should build test request");
+            req.headers_mut().insert(
+                header::HeaderName::from_static("sec-fetch-site"),
+                HeaderValue::from_static("same-origin"),
+            );
+
+            let _ = handle_page_bids(
+                &settings,
+                &services,
+                None,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &article_slot(),
+                    registry: None,
+                },
+                &mut ec_context,
+                req,
+            )
+            .await
+            .expect("should return ok response");
+
+            assert_no_telemetry(&telemetry_sink);
         }
 
         #[tokio::test]
@@ -32231,6 +33193,211 @@ mod tests {
             .expect("should return ok response");
 
             assert_auction_used_the_canonical_row(&captured, &ec_context);
+        }
+
+        fn tablet() -> DeviceAttributes {
+            DeviceAttributes {
+                device_type: Some(5),
+                make: Some("ExampleCorp".to_owned()),
+                ..DeviceAttributes::default()
+            }
+        }
+
+        /// A device module whose use needs limited-data ad selection.
+        fn device_needing_basic_ads() -> Arc<DetectionServiceDevice> {
+            Arc::new(DetectionServiceDevice::new(
+                PermissionSet::none().with(Permission::SelectBasicAds),
+                Some(tablet()),
+            ))
+        }
+
+        /// The same context, with the reader also giving limited-data ad
+        /// selection.
+        fn selecting_basic_ads(ec_context: EcContext) -> EcContext {
+            let set = ec_context
+                .permissions()
+                .permissions()
+                .with(Permission::SelectBasicAds);
+            ec_context.with_permissions_for_test(PermissionState::new(set))
+        }
+
+        /// Runs the initial navigation for `ec_context` with `module` selected,
+        /// and returns the auction request it dispatched, if it dispatched one.
+        async fn navigation_with_device_module(
+            mut ec_context: EcContext,
+            module: &Arc<DetectionServiceDevice>,
+        ) -> Option<AuctionRequest> {
+            let settings = settings_with_capturing_provider();
+            let captured = Arc::new(Mutex::new(None));
+            let orchestrator = orchestrator_capturing_request(&settings, &captured);
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"<html><head></head><body>ok</body></html>".to_vec());
+            let services = services_with(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+                Arc::new(RecordingTelemetrySink::default()),
+            )
+            .with_device_module(Arc::clone(module) as Arc<dyn DeviceModule>);
+            let req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri(format!("https://{EDGE_HOST}/2024/01/my-article/"))
+                .header(header::HOST, EDGE_HOST)
+                .header("sec-fetch-dest", "document")
+                .body(EdgeBody::empty())
+                .expect("should build test request");
+
+            let registry = test_registry(&settings);
+            let _ = handle_publisher_request(
+                AppContext {
+                    settings: &settings,
+                    integration_registry: &registry,
+                },
+                &services,
+                None,
+                &mut ec_context,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &article_slot(),
+                    registry: None,
+                },
+                req,
+                EdgeCacheHeader::SMaxageFallback,
+            )
+            .await
+            .expect("should proxy publisher request");
+
+            captured
+                .lock()
+                .expect("should lock captured request")
+                .clone()
+        }
+
+        /// Runs page-bids for `ec_context` with `module` selected, and returns
+        /// the auction request it dispatched, if it dispatched one.
+        async fn page_bids_with_device_module(
+            mut ec_context: EcContext,
+            module: &Arc<DetectionServiceDevice>,
+        ) -> Option<AuctionRequest> {
+            let settings = settings_with_capturing_provider();
+            let captured = Arc::new(Mutex::new(None));
+            let orchestrator = orchestrator_capturing_request(&settings, &captured);
+            let services = services_with(
+                Arc::new(crate::platform::test_support::NoopHttpClient),
+                Arc::new(RecordingTelemetrySink::default()),
+            )
+            .with_device_module(Arc::clone(module) as Arc<dyn DeviceModule>);
+            let mut req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "https://{EDGE_HOST}/_ts/page-bids?path=/2024/01/my-article/"
+                ))
+                .header(header::HOST, EDGE_HOST)
+                .body(EdgeBody::empty())
+                .expect("should build test request");
+            req.headers_mut().insert(
+                header::HeaderName::from_static("sec-fetch-site"),
+                HeaderValue::from_static("same-origin"),
+            );
+
+            let _ = handle_page_bids(
+                &settings,
+                &services,
+                None,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &article_slot(),
+                    registry: None,
+                },
+                &mut ec_context,
+                req,
+            )
+            .await
+            .expect("should return ok response");
+
+            captured
+                .lock()
+                .expect("should lock captured request")
+                .clone()
+        }
+
+        #[tokio::test]
+        async fn initial_navigation_asks_the_device_module_with_the_readers_permissions() {
+            let module = device_needing_basic_ads();
+
+            let request = navigation_with_device_module(
+                selecting_basic_ads(consent_allowing_ec_context()),
+                &module,
+            )
+            .await
+            .expect("should dispatch an auction request");
+
+            assert_eq!(
+                module.asked(),
+                1,
+                "the navigation should ask the device module"
+            );
+            assert_eq!(
+                request.device.and_then(|device| device.attributes),
+                Some(tablet()),
+                "a module whose permission the reader gave should describe the device to the bidder"
+            );
+        }
+
+        #[tokio::test]
+        async fn initial_navigation_does_not_ask_the_device_module_when_consent_denies_the_auction()
+        {
+            let module = device_needing_basic_ads();
+            // An unknown jurisdiction with no TCF signal fails the auction gate.
+            let denied = EcContext::new_for_test(None, crate::consent::ConsentContext::default());
+
+            let request = navigation_with_device_module(selecting_basic_ads(denied), &module).await;
+
+            assert!(
+                request.is_none(),
+                "a denied auction should dispatch nothing"
+            );
+            assert_eq!(
+                module.asked(),
+                0,
+                "a request on the consent-denied path should not reach the device module"
+            );
+        }
+
+        #[tokio::test]
+        async fn page_bids_asks_the_device_module_with_the_readers_permissions() {
+            let module = device_needing_basic_ads();
+
+            let request = page_bids_with_device_module(
+                selecting_basic_ads(consent_allowing_ec_context()),
+                &module,
+            )
+            .await
+            .expect("should dispatch an auction request");
+
+            assert_eq!(module.asked(), 1, "page-bids should ask the device module");
+            assert_eq!(
+                request.device.and_then(|device| device.attributes),
+                Some(tablet()),
+                "a module whose permission the reader gave should describe the device to the bidder"
+            );
+        }
+
+        #[tokio::test]
+        async fn page_bids_does_not_ask_the_device_module_when_consent_denies_the_auction() {
+            let module = device_needing_basic_ads();
+            // An unknown jurisdiction with no TCF signal fails the auction gate.
+            let denied = EcContext::new_for_test(None, crate::consent::ConsentContext::default());
+
+            let request = page_bids_with_device_module(selecting_basic_ads(denied), &module).await;
+
+            assert!(
+                request.is_none(),
+                "a denied auction should dispatch nothing"
+            );
+            assert_eq!(
+                module.asked(),
+                0,
+                "a request on the consent-denied path should not reach the device module"
+            );
         }
     }
 }

@@ -1,11 +1,11 @@
 # Design Spec: The consent decoders live in the crates named for their standards
 
-**Status:** Proposed, 2026-10-14. Implemented on a working branch of the fork, with no pull request raised yet.
+**Status:** Proposed, 2026-10-14. Raised as draft pull request IABTechLab/trusted-server#1383 (from jwrosewell/trusted-server#37), for Tech Lab review.
 **Author:** 51Degrees (contributed), for Tech Lab review
 **Related specs:** `2026-10-14-source-modules-design.md`, in IABTechLab/trusted-server#1342, which holds every design document of the stack
-**Related PRs:** none yet
+**Related PRs:** IABTechLab/trusted-server#1383, jwrosewell/trusted-server#37
 **Issues:** IABTechLab/trusted-server#1335, one of the removals listed in IABTechLab/trusted-server#777
-**Last updated:** 2026-10-15
+**Last updated:** 2026-10-16
 
 > **Why this spec exists.** Core decoded the TCF, GPP and US Privacy strings itself, in `crates/trusted-server-core/src/consent`, and the permission signal crates named for those standards read what core had decoded. A standard is a vendor's thing as much as a product is, so the decoding belongs in the crate for the standard, and core keeps only the interface every signal module fills.
 

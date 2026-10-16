@@ -300,6 +300,7 @@ endpoint = "https://house.example.com/openrtb2/auction"
 | --------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
 | `[integrations.<id>]` with `enabled = true`                                                   | the module in the section of its type, and `[<type>.<name>]` only for settings                     |
 | `[ec.providers.<name>]`                                                                       | `[ec.<name>]`                                                                                      |
+| `[device] module = "fastly"`                                                                  | `[device] module = "platform"`                                                                     |
 | `[permission_signal] sources`                                                                 | `[permission-signal] modules`                                                                      |
 | `host-signals`, `client-fixed`, `gpp-sale-opt-out`, `gpp_sale_opt_out`, `us_privacy`          | `host_signals`, `client_fixed`, `gpp`, `us-privacy`                                                |
 | `[auction.providers.<id>]` with `protocol`, `profile` and `profile_config`                    | `[demand] modules` and `[demand.<name>]`, with `implementation` and the settings flat in the table |
@@ -307,6 +308,8 @@ endpoint = "https://house.example.com/openrtb2/auction"
 | `profile = "prebid-server"` and `profile = "aps"`                                             | `implementation = "auction.prebid-server"` and `implementation = "auction.aps"`                    |
 | `[auction] mediator = "adserver_mock"` and `[integrations.adserver_mock]`                     | `[ad-server] module = "iabtl"` and `[ad-server.iabtl]`                                             |
 | `[ad-server] module = "mock"` and `[ad-server.mock]`, and `implementation = "ad-server.mock"` | `[ad-server] module = "iabtl"` and `[ad-server.iabtl]`, and `implementation = "ad-server.iabtl"`   |
+| `[ads-txt] modules = ["sellers"]`, `[ads-txt.sellers]` and `ads-txt.sellers` in `[[fetch]]`   | `[ads-txt] modules = ["iabtl"]`, `[ads-txt.iabtl]` and `ads-txt.iabtl` in `[[fetch]]`              |
+| `[tinybird]` with `enabled = true`                                                            | `[analytics] module = "tinybird"` and `[analytics.tinybird]`                                       |
 | `[integrations.aps] rendering_mode`                                                           | `rendering_mode` in the `[demand.<name>]` table of the `auction.aps` implementation                |
 | `[debug.auction_html_comment_options] include_mediator_response`                              | `include_adserver_response`                                                                        |
 

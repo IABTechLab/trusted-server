@@ -1,11 +1,11 @@
 # Design Spec: Each adapter names its own backends
 
-**Status:** Proposed, 2026-10-14. Raised as draft pull request jwrosewell/trusted-server#42, for Tech Lab review.
+**Status:** Proposed, 2026-10-14. Raised as draft pull request IABTechLab/trusted-server#1390 (from jwrosewell/trusted-server#42), for Tech Lab review.
 **Author:** 51Degrees (contributed), for Tech Lab review
 **Related specs:** `2026-08-10-config-first-auction-provider-architecture-design.md`, `2026-03-19-edgezero-migration-design.md`, `2026-10-14-last-names-in-core-design.md`
 **Related PRs:** jwrosewell/trusted-server#42, IABTechLab/trusted-server#1390
 **Issues:** IABTechLab/trusted-server#1339
-**Last updated:** 2026-10-15
+**Last updated:** 2026-10-16
 
 > **Why this spec exists.** Core held a backend naming and transport timer policy for each of the four adapters, so that startup validation and each adapter's registration predicted the same backend names before any was registered. The policies called no platform, and they still named every platform in core, where the rule is that core names none.
 

@@ -7,7 +7,8 @@ through core's no-op sink. The one module a stock build ships is Tinybird,
 `crates/analytics/tinybird`, which each adapter lists among the modules it
 links. Only the Fastly adapter hands that sink to the auction. The Axum,
 Cloudflare and Spin adapters link the module and check its settings, and use
-core's no-op sink, so they send nothing.
+core's no-op sink, so they send nothing, and log a warning at startup when
+`[analytics]` selects a module.
 
 ## Data path
 
@@ -31,6 +32,11 @@ model includes coarse device classification, auction source and outcome,
 provider status and timing, slot dimensions, media type, seat, price,
 currency, win state, and selected creative identifiers. Tests reject the
 request's derived EC ID from serialized NDJSON.
+
+Every row also carries the reader's complete User-Agent, country, region and
+page path, so rows are built only when the reader's permissions include
+`analytics.ad_reporting.measure_ad_performance` (TCF Purpose 7). A reader
+without it gets no row, whatever the outcome, a skip for consent included.
 
 `browser_family` is a coarse User-Agent classification. Recognized values
 are `chrome`, `safari`, `firefox`, `edge`, and `opera`; unrecognized

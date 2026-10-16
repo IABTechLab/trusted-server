@@ -12,6 +12,10 @@
 //! first-party path rather than Google's host, so the script the browser
 //! fetches is the one the publisher's own origin answers for.
 //!
+//! Every reader gets the consent mode defaults. The loaders and Tag Manager's
+//! noscript iframe reach only a reader whose permissions allow storage on the
+//! device, because each of them stores and reads Google's identifiers there.
+//!
 //! Everything emitted here is copied from Google's own documentation rather
 //! than paraphrased, so a reader can hold the two side by side:
 //!
@@ -26,6 +30,7 @@
 //! - The AdSense loader tag:
 //!   <https://support.google.com/adsense/answer/9190028>
 
+use std::any::Any;
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
 
@@ -38,8 +43,10 @@ use trusted_server_core::integrations::{
 };
 use trusted_server_core::middleware::{
     AttributeRewrite, AttributeRewriteFn, ElementHandler, HTML_MEDIA_TYPE, Middleware,
-    MiddlewareAction, MiddlewareContext, MiddlewarePhase,
+    MiddlewareAction, MiddlewareContext, MiddlewarePhase, Preparation,
 };
+use trusted_server_core::module_context::ModuleCall;
+use trusted_server_core::permissions::{Permission, PermissionSet, PermissionState};
 use trusted_server_core::settings::{IntegrationConfig, Settings};
 use trusted_server_tag_google_tag_manager as google_tag_manager;
 use validator::{Validate, ValidationError};
@@ -167,7 +174,7 @@ pub struct ConsentDefaults {
     pub wait_for_update: u32,
     /// The regions the defaults apply to, as ISO 3166-1 country codes or
     /// ISO 3166-2 region codes such as `GB` or `US-CA`. Empty applies them
-    /// everywhere.
+    /// everywhere. Where set, every other visitor gets all four denied.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub region: Vec<String>,
 }
@@ -325,30 +332,51 @@ fn validate_adsense_client_id(value: &str) -> Result<(), ValidationError> {
 /// before anything else, including before the tag snippet that would
 /// otherwise define them, and because it is written even when no tag is
 /// configured and AdSense alone reads it.
+///
+/// Where regions are set, the command for them is followed by one with no
+/// region, which the guide says sets the default for every visitor no
+/// regional command covers. That one denies all four types, because a grant
+/// in the settings holds only in the regions they list.
 fn consent_defaults_snippet(defaults: &ConsentDefaults) -> String {
-    // The regions are validated as codes, so the quotes cannot be escaped.
-    let region = if defaults.region.is_empty() {
-        String::new()
+    let commands = if defaults.region.is_empty() {
+        consent_default_command(defaults, "")
     } else {
+        // The regions are validated as codes, so the quotes cannot be escaped.
         let codes: Vec<String> = defaults
             .region
             .iter()
             .map(|code| format!("'{code}'"))
             .collect();
-        format!(",\n    'region': [{}]", codes.join(", "))
+        let region = format!(",\n    'region': [{}]", codes.join(", "));
+        let elsewhere = ConsentDefaults {
+            wait_for_update: defaults.wait_for_update,
+            ..ConsentDefaults::default()
+        };
+        let regional = consent_default_command(defaults, &region);
+        let rest = consent_default_command(&elsewhere, "");
+        format!("{regional}\n\n  {rest}")
     };
     format!(
         "<script>\n  \
          window.dataLayer = window.dataLayer || [];\n  \
          function gtag(){{dataLayer.push(arguments);}}\n\n  \
-         gtag('consent', 'default', {{\n    \
+         {commands}\n\
+         </script>"
+    )
+}
+
+/// One `gtag('consent', 'default', …)` command carrying `defaults`, with
+/// `region` after the wait, which is empty or the command's `region`
+/// parameter.
+fn consent_default_command(defaults: &ConsentDefaults, region: &str) -> String {
+    format!(
+        "gtag('consent', 'default', {{\n    \
          'ad_storage': '{ad_storage}',\n    \
          'ad_user_data': '{ad_user_data}',\n    \
          'ad_personalization': '{ad_personalization}',\n    \
          'analytics_storage': '{analytics_storage}',\n    \
          'wait_for_update': {wait_for_update}{region}\n  \
-         }});\n\
-         </script>",
+         }});",
         ad_storage = defaults.ad_storage.as_command_value(),
         ad_user_data = defaults.ad_user_data.as_command_value(),
         ad_personalization = defaults.ad_personalization.as_command_value(),
@@ -484,15 +512,21 @@ impl GoogleIntegration {
 }
 
 impl GoogleIntegration {
-    /// The snippets, in the order Google's own documentation requires.
+    /// The snippets for one reader, in the order Google's own documentation
+    /// requires.
     ///
     /// Consent defaults first, because the consent guide says the default
     /// command must come "before any commands that send measurement data
-    /// (such as `config` or `event`)". The container next, because Tag Manager
-    /// asks to be as high in the head as possible and it may carry tags of its
-    /// own that send data. Then the tag snippet, then the AdSense loader.
-    fn page_inserts(&self) -> Vec<String> {
+    /// (such as `config` or `event`)". They load nothing, so every reader gets
+    /// them. The container next, because Tag Manager asks to be as high in the
+    /// head as possible and it may carry tags of its own that send data. Then
+    /// the tag snippet, then the AdSense loader. Those three are loaders, so
+    /// they are written only where `loaders_allowed`.
+    fn page_inserts(&self, loaders_allowed: bool) -> Vec<String> {
         let mut inserts = vec![consent_defaults_snippet(&self.config.consent_defaults)];
+        if !loaders_allowed {
+            return inserts;
+        }
 
         if let (Some(container_id), Some(src)) = (
             self.config.container_id.as_deref(),
@@ -517,12 +551,16 @@ impl GoogleIntegration {
 }
 
 impl GoogleIntegration {
-    /// Tag Manager's `noscript` iframe, and nothing else.
+    /// Tag Manager's `noscript` iframe, and nothing else, where
+    /// `loaders_allowed`, because the iframe loads Google's page.
     ///
     /// Google's container install page puts this part immediately after the
     /// opening `<body>` tag, so it is the one piece of this integration's
     /// markup that does not belong in the head.
-    fn body_inserts(&self) -> Vec<String> {
+    fn body_inserts(&self, loaders_allowed: bool) -> Vec<String> {
+        if !loaders_allowed {
+            return Vec::new();
+        }
         self.config
             .container_id
             .as_deref()
@@ -533,13 +571,15 @@ impl GoogleIntegration {
 }
 
 impl GoogleIntegration {
-    /// Drops a second loader for the tag this module already wrote.
+    /// Drops the page's own loader for the configured tag, for every reader.
     ///
-    /// A page also carrying the loader for the same id would fetch the same
-    /// library twice, so the element is removed rather than rewritten. The
-    /// loader is recognised on its own host and on a first-party path, which is
-    /// how it arrives here once the fetch phase's rewrite has made it first
-    /// party.
+    /// Where this module writes its loader, a page also carrying the loader
+    /// for the same id would fetch the same library twice, and where the
+    /// reader's permissions keep this module's loader off the page, the
+    /// page's own would load it anyway, so the element is removed rather than
+    /// rewritten. The loader is recognised on its own host and on a
+    /// first-party path, which is how it arrives here once the fetch phase's
+    /// rewrite has made it first party.
     ///
     /// **An inline `gtag('config', …)` in the publisher's own page is left
     /// alone and will still send a second page view.** The module's guide
@@ -554,7 +594,7 @@ impl GoogleIntegration {
             // logged. The message says what happened and not which tag.
             log::debug!(
                 "Google: the page carries its own loader for the configured tag, \
-                 so the duplicate is dropped"
+                 so it is dropped"
             );
             return AttributeRewriteAction::RemoveElement;
         }
@@ -563,12 +603,30 @@ impl GoogleIntegration {
     }
 }
 
-/// Writes the module's markup onto the page for each reader, and removes the
-/// page's own loader for the configured tag so the library is fetched once.
+/// What Google's loaders and Tag Manager's noscript iframe need from a reader,
+/// being storage on the device, because each of them stores and reads
+/// Google's identifiers there.
+const LOADERS_REQUIRE: PermissionSet = PermissionSet::none().with(Permission::StoreOnDevice);
+
+/// Whether one reader's permissions allow the loaders, as the middleware's
+/// preparation found them.
+struct LoadersAllowed(bool);
+
+/// Writes the consent defaults onto every reader's copy, and the loaders and
+/// the noscript iframe onto the copy of a reader whose permissions allow
+/// storage on the device. Removes the page's own loader for the configured
+/// tag for every reader.
 ///
 /// Serve only, because it adds to the page, and the removal belongs with the
 /// addition it makes room for.
 struct PageTag(Arc<GoogleIntegration>);
+
+impl PageTag {
+    /// Whether `permissions` set everything the loaders need.
+    fn loaders_allowed(&self, permissions: &PermissionState) -> bool {
+        permissions.all_set(self.required_permissions())
+    }
+}
 
 impl Middleware for PageTag {
     fn middleware_id(&self) -> &'static str {
@@ -583,7 +641,29 @@ impl Middleware for PageTag {
         &[MiddlewarePhase::Serve]
     }
 
-    fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+    fn required_permissions(&self) -> PermissionSet {
+        LOADERS_REQUIRE
+    }
+
+    /// Reads the reader's permissions, which core hands every serve
+    /// preparation. A preparation handed none treats the reader as one whose
+    /// permissions do not allow the loaders.
+    fn prepare<'a>(
+        &'a self,
+        call: ModuleCall<'a>,
+        _context: &'a MiddlewareContext<'a>,
+    ) -> Option<Preparation<'a>> {
+        let allowed = matches!(call.inject(self, Self::loaders_allowed), Ok(true));
+        Some(Box::pin(async move {
+            Ok(Box::new(LoadersAllowed(allowed)) as Box<dyn Any + Send>)
+        }))
+    }
+
+    fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction {
+        // A document nothing was prepared for gets no loader.
+        let loaders_allowed = context
+            .take_prepared::<LoadersAllowed>(MODULE)
+            .is_some_and(|prepared| prepared.0);
         let mut element_handlers: Vec<Box<dyn ElementHandler>> = Vec::new();
         if self.0.config.analytics_tag_id.is_some() {
             let integration = Arc::clone(&self.0);
@@ -592,8 +672,8 @@ impl Middleware for PageTag {
             element_handlers.push(Box::new(AttributeRewrite::new("src", change)));
         }
         MiddlewareAction {
-            head_inserts: self.0.page_inserts(),
-            body_open_inserts: self.0.body_inserts(),
+            head_inserts: self.0.page_inserts(loaders_allowed),
+            body_open_inserts: self.0.body_inserts(loaders_allowed),
             element_handlers,
             ..MiddlewareAction::pass()
         }
@@ -657,7 +737,20 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use trusted_server_core::test_support::tests::create_test_settings;
+    use trusted_server_core::html_processor::HtmlProcessorConfig;
+    use trusted_server_core::html_processor::test_support::{
+        ORIGIN_HOST, REQUEST_HOST, REQUEST_PATH, create_page_processor, place_on_every_page,
+    };
+    use trusted_server_core::integrations::{IntegrationDocumentState, IntegrationRegistry};
+    use trusted_server_core::middleware::test_support as middleware_test_support;
+    use trusted_server_core::middleware::{MiddlewareChain, MiddlewarePlan, Prepared};
+    use trusted_server_core::module_context::ModuleContext;
+    use trusted_server_core::module_context::test_support::request;
+    use trusted_server_core::permissions::{ConsentSignal, PermissionMaps};
+    use trusted_server_core::streaming_processor::StreamProcessor as _;
+    use trusted_server_core::test_support::tests::{
+        create_test_settings, storage_only_permissions,
+    };
 
     /// An invented tag id of the shape Google's own pages use.
     const TEST_TAG_ID: &str = "G-XXXXXXXXXX";
@@ -754,30 +847,110 @@ mod tests {
         )
     }
 
-    /// The head snippets the middleware writes for `settings`.
-    fn head_inserts_for(settings: &Settings) -> Vec<String> {
-        let document_state = trusted_server_core::integrations::IntegrationDocumentState::default();
-        let context = trusted_server_core::middleware::test_support::context(
+    /// What the middleware plans for one reader's copy, after the serve
+    /// phase's preparation has run with `module_context`, as core prepares
+    /// and plans every reader's copy.
+    fn plan_with(settings: &Settings, module_context: &ModuleContext<'_>) -> MiddlewarePlan {
+        let chain = MiddlewareChain::new(
             MiddlewarePhase::Serve,
-            &document_state,
+            HTML_MEDIA_TYPE,
+            vec![page_tag_for(settings)],
         );
-        page_tag_for(settings).create(&context).head_inserts
+        let document_state = IntegrationDocumentState::default();
+        let prepared = Prepared::default();
+        let context = MiddlewareContext {
+            prepared: &prepared,
+            ..middleware_test_support::context(MiddlewarePhase::Serve, &document_state)
+        };
+        futures::executor::block_on(chain.prepare(module_context, &context))
+            .expect("should prepare the middleware");
+        chain.plan(&context).expect("should plan the middleware")
     }
 
-    /// `html` after the serve phase has run the middleware for `settings`, with
-    /// the Tag Manager module beside it where the settings select it.
+    /// What the middleware plans for a reader whose request resolved to
+    /// `permissions`.
+    fn plan_for(settings: &Settings, permissions: &PermissionState) -> MiddlewarePlan {
+        plan_with(
+            settings,
+            &ModuleContext::new(request(REQUEST_PATH)).with_permissions(permissions),
+        )
+    }
+
+    /// The head snippets the middleware writes for `settings`, for a reader
+    /// who allows storage on the device.
+    fn head_inserts_for(settings: &Settings) -> Vec<String> {
+        plan_for(settings, &storage_only_permissions()).head_inserts
+    }
+
+    /// `html` after the serve phase has run the middleware for `settings`,
+    /// for a reader who allows storage on the device.
     fn process(settings: &Settings, html: &str) -> String {
-        use trusted_server_core::html_processor::test_support::{
-            place_on_every_page, processed_page,
-        };
+        process_for(settings, html, &[], &storage_only_permissions())
+    }
+
+    /// The page a reader whose request resolved to `permissions` receives of
+    /// `html`, with this module's middleware named in a `[[serve]]` entry and
+    /// the middleware in `fetch` named in a `[[fetch]]` entry. Both phases are
+    /// prepared and then run on one pass, as core does for a page it does not
+    /// store.
+    fn process_for(
+        settings: &Settings,
+        html: &str,
+        fetch: &[&str],
+        permissions: &PermissionState,
+    ) -> String {
         let mut placed = settings.clone();
+        if !fetch.is_empty() {
+            place_on_every_page(&mut placed, MiddlewarePhase::Fetch, fetch);
+        }
         place_on_every_page(&mut placed, MiddlewarePhase::Serve, &[MODULE]);
-        let registry = trusted_server_core::integrations::IntegrationRegistry::with_registrations(
+        let registry = IntegrationRegistry::with_registrations(
             &placed,
             &[builder(), google_tag_manager::builder()],
         )
         .expect("should build a registry with the google modules");
-        processed_page(&placed, &registry, html, 8192)
+
+        let prepared = Arc::new(Prepared::default());
+        let module_context = ModuleContext::new(request(REQUEST_PATH))
+            .with_settings(&placed)
+            .with_permissions(permissions);
+        for phase in MiddlewarePhase::ALL {
+            let chain = registry.middleware_chain(
+                placed.phase_entries(phase),
+                phase,
+                HTML_MEDIA_TYPE,
+                REQUEST_PATH,
+            );
+            let document_state = IntegrationDocumentState::default();
+            let context = MiddlewareContext {
+                prepared: &prepared,
+                ..middleware_test_support::context(phase, &document_state)
+            };
+            futures::executor::block_on(chain.prepare(&module_context, &context))
+                .expect("should prepare the page's middleware");
+        }
+
+        let config = HtmlProcessorConfig::from_settings(
+            &placed,
+            &registry,
+            ORIGIN_HOST,
+            REQUEST_HOST,
+            "https",
+        )
+        .with_prepared(prepared);
+        let page = create_page_processor(&placed, &registry, config)
+            .process_chunk(html.as_bytes(), true)
+            .expect("should process the page");
+        String::from_utf8(page).expect("should leave the page UTF-8")
+    }
+
+    #[test]
+    fn module_constant_is_the_crate_folder() {
+        assert_eq!(
+            super::MODULE,
+            trusted_server_core::module_name!(),
+            "should be named by the folder this crate lives in"
+        );
     }
 
     #[test]
@@ -853,6 +1026,34 @@ mod tests {
             refusal.contains("analytics_tag") || refusal.contains("unknown field"),
             "the refusal should name the unknown setting: {refusal}"
         );
+    }
+
+    /// The value `trusted-server.example.toml` gives `setting` in its
+    /// `[tag.google-tag]` table.
+    fn example_value(setting: &str) -> String {
+        let prefix = format!("# {setting} = \"");
+        trusted_server_core::test_support::template::EXAMPLE_TEMPLATE
+            .lines()
+            .skip_while(|line| *line != "# [tag.google-tag]")
+            .take_while(|line| line.starts_with('#'))
+            .find_map(|line| line.strip_prefix(prefix.as_str())?.strip_suffix('"'))
+            .unwrap_or_else(|| panic!("the example should give `{setting}` a value"))
+            .to_owned()
+    }
+
+    #[test]
+    fn the_example_s_placeholder_ids_are_refused() {
+        // Arrange, Act, Assert
+        // A table uncommented with its placeholders left in should be refused,
+        // rather than write a tag or a container that is not the publisher's.
+        for setting in ["analytics_tag_id", "container_id"] {
+            let placeholder = example_value(setting);
+            let refusal = refusal_for(&settings_with_google(&json!({ setting: placeholder })));
+            assert!(
+                refusal.contains(setting),
+                "the example's `{placeholder}` should be refused for `{setting}`: {refusal}"
+            );
+        }
     }
 
     #[test]
@@ -954,6 +1155,61 @@ mod tests {
         assert!(
             written.contains("'region': ['GB', 'US-CA']"),
             "the defaults should name the regions as Google's command does: {written}"
+        );
+    }
+
+    #[test]
+    fn a_region_setting_leaves_every_other_visitor_with_all_four_denied() {
+        // Arrange
+        // A grant scoped to one region, which reaches visitors there and no
+        // one else.
+        let settings = settings_with_google(&json!({
+            "analytics_tag_id": TEST_TAG_ID,
+            "consent_defaults": {
+                "analytics_storage": "granted",
+                "wait_for_update": 2000,
+                "region": ["US"],
+            },
+        }));
+
+        // Act
+        let written = head_inserts_for(&settings).join("");
+
+        // Assert
+        // Google's guide gives the regional command first and then the one
+        // with no region, which covers every visitor the first does not.
+        let commands: Vec<&str> = written
+            .split("gtag('consent', 'default', {")
+            .skip(1)
+            .collect();
+        assert_eq!(
+            commands.len(),
+            2,
+            "should write two default commands: {written}"
+        );
+        assert!(
+            commands[0].contains("'region': ['US']")
+                && commands[0].contains("'analytics_storage': 'granted'"),
+            "the regional command should carry the grant: {written}"
+        );
+        assert!(
+            !commands[1].contains("'region'"),
+            "the second command should name no region: {written}"
+        );
+        for consent_type in [
+            "ad_storage",
+            "ad_user_data",
+            "ad_personalization",
+            "analytics_storage",
+        ] {
+            assert!(
+                commands[1].contains(&format!("'{consent_type}': 'denied'")),
+                "every other visitor should have {consent_type} denied: {written}"
+            );
+        }
+        assert!(
+            commands[1].contains("'wait_for_update': 2000"),
+            "every other visitor should wait as long: {written}"
         );
     }
 
@@ -1263,6 +1519,47 @@ mod tests {
     }
 
     #[test]
+    fn a_page_through_both_modules_ends_with_one_first_party_loader() {
+        // Arrange
+        // The Tag Manager module serves the configured tag, so its fetch
+        // middleware points the page's own loader at the first-party path, and
+        // this module's serve middleware then removes that loader and writes
+        // its own, which names the same path.
+        let settings = settings_with_google_and_tag_manager(
+            &json!({ "analytics_tag_id": TEST_TAG_ID }),
+            &json!({
+                "container_id": "GTM-ABCD1234",
+                "allowed_tag_ids": [TEST_TAG_ID],
+            }),
+        );
+
+        // Act
+        let processed = process_for(
+            &settings,
+            HEAD_WITH_ITS_OWN_TAG,
+            &[google_tag_manager::MODULE],
+            &storage_only_permissions(),
+        );
+
+        // Assert
+        assert_eq!(
+            processed.matches("gtag/js?id=").count(),
+            1,
+            "the page should end with one loader for the tag: {processed}"
+        );
+        assert!(
+            processed.contains(&format!(
+                "src=\"/integrations/google_tag_manager/gtag/js?id={TEST_TAG_ID}\""
+            )),
+            "the loader should name the first-party path: {processed}"
+        );
+        assert!(
+            !processed.contains("www.googletagmanager.com/gtag/js"),
+            "nothing should load the tag from Google's host: {processed}"
+        );
+    }
+
+    #[test]
     fn a_page_loading_another_tag_keeps_it() {
         // Arrange
         let settings = settings_with_google(&json!({ "analytics_tag_id": TEST_TAG_ID }));
@@ -1484,6 +1781,175 @@ mod tests {
             !processed.contains("noscript"),
             "nothing should be written at the body when no container is configured"
         );
+    }
+
+    #[test]
+    fn a_page_with_no_head_gets_the_noscript_and_none_of_the_head_snippets() {
+        // Arrange
+        // Core writes the script bundle's tag at the start of the head, and
+        // the head snippets go straight before that tag, so a document with no
+        // head has nowhere to take them.
+        let settings = settings_with_google(&json!({
+            "analytics_tag_id": TEST_TAG_ID,
+            "container_id": TEST_CONTAINER_ID,
+        }));
+        let html = "<html><body><h1>Headline</h1></body></html>";
+
+        // Act
+        let processed = process(&settings, html);
+
+        // Assert
+        for snippet in ["gtag('consent'", "gtag/js", "gtm.js"] {
+            assert!(
+                !processed.contains(snippet),
+                "nothing naming `{snippet}` should be written without a head: {processed}"
+            );
+        }
+        assert_eq!(
+            processed.matches("ns.html?id=").count(),
+            1,
+            "the noscript iframe should still be written once: {processed}"
+        );
+        assert!(
+            processed.contains("<body><!-- Google Tag Manager (noscript) -->"),
+            "the noscript iframe should follow the opening body tag: {processed}"
+        );
+    }
+
+    /// Settings naming all three ids, so every loader would be written.
+    fn settings_with_every_id() -> Settings {
+        settings_with_google(&json!({
+            "analytics_tag_id": TEST_TAG_ID,
+            "container_id": TEST_CONTAINER_ID,
+            "adsense_client_id": TEST_ADSENSE_CLIENT_ID,
+        }))
+    }
+
+    #[test]
+    fn a_reader_who_has_not_allowed_storage_gets_the_consent_defaults_alone() {
+        // Arrange
+        // Every permission but storage on the device, which each loader and
+        // the noscript iframe need.
+        let settings = settings_with_every_id();
+        let all_but_storage: PermissionSet = Permission::all()
+            .filter(|permission| *permission != Permission::StoreOnDevice)
+            .collect();
+
+        // Act
+        let plan = plan_for(&settings, &PermissionState::new(all_but_storage));
+
+        // Assert
+        assert_eq!(
+            plan.head_inserts,
+            vec![consent_defaults_snippet(&ConsentDefaults::default())],
+            "the consent defaults should be the only head snippet"
+        );
+        assert!(
+            plan.body_open_inserts.is_empty(),
+            "no noscript iframe should be written: {:?}",
+            plan.body_open_inserts
+        );
+    }
+
+    #[test]
+    fn a_reader_who_allows_storage_gets_every_configured_loader() {
+        // Arrange
+        let settings = settings_with_every_id();
+
+        // Act
+        let plan = plan_for(&settings, &storage_only_permissions());
+
+        // Assert
+        let head = plan.head_inserts.join("");
+        for loader in ["gtm.js", "gtag/js", "adsbygoogle.js"] {
+            assert!(
+                head.contains(loader),
+                "the head should name `{loader}`: {head}"
+            );
+        }
+        assert_eq!(
+            plan.body_open_inserts,
+            vec![container_noscript_snippet(TEST_CONTAINER_ID)],
+            "the noscript iframe should be written"
+        );
+    }
+
+    #[test]
+    fn no_loader_is_written_where_no_permission_state_reached_the_middleware() {
+        // Arrange
+        // A preparation whose context carries no permission state, and a
+        // document nothing was prepared for.
+        let settings = settings_with_every_id();
+        let document_state = IntegrationDocumentState::default();
+
+        // Act
+        let unresolved = plan_with(&settings, &ModuleContext::new(request(REQUEST_PATH)));
+        let context = middleware_test_support::context(MiddlewarePhase::Serve, &document_state);
+        let unprepared = page_tag_for(&settings).create(&context);
+
+        // Assert
+        for (case, head, body) in [
+            (
+                "no permission state",
+                unresolved.head_inserts,
+                unresolved.body_open_inserts,
+            ),
+            (
+                "nothing prepared",
+                unprepared.head_inserts,
+                unprepared.body_open_inserts,
+            ),
+        ] {
+            assert_eq!(
+                head,
+                vec![consent_defaults_snippet(&ConsentDefaults::default())],
+                "{case}: the consent defaults should be the only head snippet"
+            );
+            assert!(body.is_empty(), "{case}: no noscript iframe: {body:?}");
+        }
+    }
+
+    #[test]
+    fn a_page_for_a_reader_who_has_not_agreed_carries_no_google_loader() {
+        // Arrange
+        // Under the policy core ships, a reader in Germany whose request
+        // carries no signal is still waiting to allow storage on the device,
+        // and a reader in California who sends an opt-out, such as Global
+        // Privacy Control, has it revoked. The page carries its own loader for
+        // the configured tag as well.
+        let settings = settings_with_every_id();
+        let policy = PermissionMaps::standard();
+        let readers = [
+            ("not yet agreed", policy.baseline(Some("DE"), None)),
+            (
+                "opted out",
+                policy.resolve_with(Some("US"), Some("CA"), |permission, _| {
+                    if policy.signals().opt_out_revokes(permission) {
+                        ConsentSignal::Revoke
+                    } else {
+                        ConsentSignal::Neutral
+                    }
+                }),
+            ),
+        ];
+
+        for (reader, permissions) in readers {
+            // Act
+            let processed = process_for(&settings, HEAD_WITH_ITS_OWN_TAG, &[], &permissions);
+
+            // Assert
+            assert_eq!(
+                processed.matches("gtag('consent', 'default'").count(),
+                1,
+                "{reader}: the consent defaults should be written: {processed}"
+            );
+            for loader in ["gtag/js", "gtm.js", "adsbygoogle.js", "ns.html"] {
+                assert!(
+                    !processed.contains(loader),
+                    "{reader}: nothing naming `{loader}` should reach the page: {processed}"
+                );
+            }
+        }
     }
 
     /// The builder describes the middleware the registration supplies, so a
