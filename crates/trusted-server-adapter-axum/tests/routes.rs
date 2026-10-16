@@ -1028,6 +1028,7 @@ async fn robots_txt_is_served_through_the_publisher_path_with_its_tag() {
     };
 
     let get = router
+        .clone()
         .oneshot(robots_txt("GET"))
         .await
         .expect("should serve the GET");
@@ -1036,6 +1037,7 @@ async fn robots_txt_is_served_through_the_publisher_path_with_its_tag() {
     assert_eq!(body(get), "User-agent: *\nAllow: /ads.txt\nDisallow: /\n");
 
     let head = router
+        .clone()
         .oneshot(robots_txt("HEAD"))
         .await
         .expect("should serve the HEAD");
@@ -1048,6 +1050,7 @@ async fn robots_txt_is_served_through_the_publisher_path_with_its_tag() {
     assert_eq!(body(head), "", "a HEAD gets no body");
 
     let post = router
+        .clone()
         .oneshot(robots_txt("POST"))
         .await
         .expect("should serve the POST");
