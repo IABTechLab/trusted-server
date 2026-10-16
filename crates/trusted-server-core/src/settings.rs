@@ -494,13 +494,20 @@ impl SharedTables {
         self.0.contains_key(vendor)
     }
 
+    /// `[shared.<vendor>]` as written, for a check that reads a setting by its
+    /// path, such as that a secret setting names a key.
+    #[must_use]
+    pub(crate) fn table(&self, vendor: &str) -> Option<&serde_json::Map<String, JsonValue>> {
+        self.0.get(vendor)
+    }
+
     /// Reads and validates `[shared.<vendor>]` as `T`, or `None` when the table
     /// is absent.
     ///
     /// # Errors
     ///
     /// When the table cannot be read as `T` or fails its validation, naming
-    /// the table and the underlying error.
+    /// the table and the setting at fault but never the setting's value.
     pub fn get_typed<T>(&self, vendor: &str) -> Result<Option<T>, Report<TrustedServerError>>
     where
         T: DeserializeOwned + Validate,
@@ -508,18 +515,7 @@ impl SharedTables {
         let Some(table) = self.0.get(vendor) else {
             return Ok(None);
         };
-        let config: T =
-            serde_json::from_value(JsonValue::Object(table.clone())).map_err(|error| {
-                Report::new(TrustedServerError::Configuration {
-                    message: format!("[{SHARED_TYPE}.{vendor}] could not be read: {error}"),
-                })
-            })?;
-        config.validate().map_err(|error| {
-            Report::new(TrustedServerError::Configuration {
-                message: format!("[{SHARED_TYPE}.{vendor}] failed validation: {error}"),
-            })
-        })?;
-        Ok(Some(config))
+        read_table(&format!("{SHARED_TYPE}.{vendor}"), table.clone()).map(Some)
     }
 
     /// Refuses a table whose name is not a vendor's name, being lower case
@@ -542,6 +538,57 @@ impl SharedTables {
             })),
             None => Ok(()),
         }
+    }
+}
+
+/// Reads and validates a table as `T`, where `place` is the table's name as
+/// written, such as `shared.example`.
+///
+/// A message names the setting at fault and the rule it broke, and never
+/// quotes the setting's value, because at startup a table holds each of its
+/// secrets resolved from the secret store.
+fn read_table<T>(
+    place: &str,
+    table: serde_json::Map<String, JsonValue>,
+) -> Result<T, Report<TrustedServerError>>
+where
+    T: DeserializeOwned + Validate,
+{
+    let config: T =
+        serde_path_to_error::deserialize(JsonValue::Object(table)).map_err(|error| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "[{place}] could not be read: {}",
+                    read_error_summary(&error)
+                ),
+            })
+        })?;
+    config.validate().map_err(|errors| {
+        Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "[{place}] failed validation: {}",
+                validation_error_summary(&errors)
+            ),
+        })
+    })?;
+    Ok(config)
+}
+
+/// Why a table could not be read, by the path of the setting at fault.
+///
+/// `serde` quotes the value it could not read, so its message is kept only
+/// when it names keys alone: a key missing, unknown or written twice.
+fn read_error_summary(error: &serde_path_to_error::Error<serde_json::Error>) -> String {
+    let message = error.inner().to_string();
+    let names_keys_only = ["missing field `", "unknown field `", "duplicate field `"]
+        .iter()
+        .any(|start| message.starts_with(start));
+    let path = error.path().to_string();
+    match (path.as_str(), names_keys_only) {
+        (".", true) => message,
+        (".", false) => "a setting holds a value of the wrong type or form".to_owned(),
+        (path, true) => format!("{path}: {message}"),
+        (path, false) => format!("`{path}` holds a value of the wrong type or form"),
     }
 }
 
@@ -2942,7 +2989,7 @@ pub struct CacheSettings {
     )]
     pub robots_txt: LoadingCacheConfig,
     /// How long the copies of the assets the publisher's origin sends last,
-    /// `[cache.assets]`.
+    /// `[cache.assets]`. A `module` of [`ASSETS_CACHE_OFF`] keeps none.
     #[serde(default, skip_serializing_if = "LoadingCacheConfig::is_default")]
     pub assets: LoadingCacheConfig,
     /// The caches modules declare and load through, each in its own
@@ -2969,6 +3016,10 @@ pub const ASSETS_CACHE: &str = "assets";
 /// copies, so one line selects both.
 pub const ASSETS_VARY_CACHE: &str = "assets-vary";
 
+/// The `module` that turns both asset caches off in `[cache.assets]`, so
+/// every asset is fetched from its origin for each request.
+pub const ASSETS_CACHE_OFF: &str = "none";
+
 /// How long one loading cache's copies last, each field defaulting to the
 /// cache's own default when absent.
 ///
@@ -2980,7 +3031,8 @@ pub const ASSETS_VARY_CACHE: &str = "assets-vary";
 pub struct LoadingCacheConfig {
     /// The module whose loading cache holds this cache's copies, as its short
     /// name or in full, for example `51degrees` or `loading-cache.51degrees`.
-    /// Absent, no copy is kept and every call loads.
+    /// Absent, the one loading cache module the build links holds them, and
+    /// no copy is kept when it links none or several.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub module: Option<String>,
     /// How long the brief copy in process memory is used, in seconds. Zero
@@ -3087,6 +3139,7 @@ impl CacheSettings {
     /// invalid policy/matcher or cannot compile its regex/glob.
     pub fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
         self.robots_txt.check("cache.robots-txt")?;
+        self.assets.check("cache.assets")?;
         for (name, config) in &self.declared {
             config.check(&format!("cache.{name}"))?;
         }
@@ -4750,13 +4803,13 @@ impl Settings {
     /// A selected module with no table reads an empty one, so a module that
     /// takes no settings runs on its selection alone and one that requires a
     /// setting reports the setting it is missing. The parse and validation
-    /// messages carry the underlying error, because a report renders only its
-    /// outermost message in `ts config validate`.
+    /// messages name the setting at fault in the outermost message, because a
+    /// report renders only that in `ts config validate`.
     ///
     /// # Errors
     ///
     /// When the table cannot be read as `T` or fails its validation, naming the
-    /// table.
+    /// table and the setting at fault but never the setting's value.
     pub fn module_config<T>(&self, name: &str) -> Result<Option<T>, Report<TrustedServerError>>
     where
         T: IntegrationConfig,
@@ -4773,17 +4826,7 @@ impl Settings {
             .and_then(|(_, modules)| modules.settings_of(written))
             .cloned()
             .unwrap_or_default();
-        let config: T = serde_json::from_value(JsonValue::Object(table)).map_err(|error| {
-            Report::new(TrustedServerError::Configuration {
-                message: format!("[{section}.{written}] could not be read: {error}"),
-            })
-        })?;
-        config.validate().map_err(|error| {
-            Report::new(TrustedServerError::Configuration {
-                message: format!("[{section}.{written}] failed validation: {error}"),
-            })
-        })?;
-        Ok(Some(config))
+        read_table(&format!("{section}.{written}"), table).map(Some)
     }
 
     /// Reads `[shared.<vendor>]`, the settings every module of `vendor`
@@ -6709,28 +6752,30 @@ module = \"none\"",
 
     #[test]
     fn a_loading_cache_lifetime_out_of_range_is_refused_naming_it() {
-        for (field, value, least) in [
-            ("store_seconds", "0", 1),
-            ("store_idle_seconds", "0", 1),
-            ("memory_seconds", "31536001", 0),
-        ] {
-            let toml_str = format!(
-                "{}
+        for table in ["robots-txt", "assets"] {
+            for (field, value, least) in [
+                ("store_seconds", "0", 1),
+                ("store_idle_seconds", "0", 1),
+                ("memory_seconds", "31536001", 0),
+            ] {
+                let toml_str = format!(
+                    "{}
 
-[cache.robots-txt]
+[cache.{table}]
 {field} = {value}
 ",
-                crate_test_settings_str()
-            );
-            let error = Settings::from_toml(&toml_str)
-                .expect_err("a lifetime out of range should not load");
-            let message = format!("{error:?}");
-            assert!(
-                message.contains(&format!(
-                    "[cache.robots-txt] {field} is {value}, and must be from {least} to 31536000"
-                )),
-                "{field}: {message}"
-            );
+                    crate_test_settings_str()
+                );
+                let error = Settings::from_toml(&toml_str)
+                    .expect_err("a lifetime out of range should not load");
+                let message = format!("{error:?}");
+                assert!(
+                    message.contains(&format!(
+                        "[cache.{table}] {field} is {value}, and must be from {least} to 31536000"
+                    )),
+                    "{table} {field}: {message}"
+                );
+            }
         }
     }
 
@@ -9219,6 +9264,58 @@ source_domain = "partner.example.com"
         );
     }
 
+    /// An example module's settings with a secret in them, as its table holds
+    /// them at startup, once the secret is resolved from the store.
+    #[derive(Debug, Deserialize, Validate)]
+    #[serde(deny_unknown_fields)]
+    struct SecretSetting {
+        #[validate(url)]
+        endpoint: String,
+        #[validate(range(max = 10))]
+        retries: Option<u32>,
+    }
+
+    impl IntegrationConfig for SecretSetting {}
+
+    #[test]
+    fn a_module_table_that_is_refused_names_the_setting_and_never_its_value() {
+        const SECRET: &str = "resolved-secret-value-4f7a";
+        for (table, setting) in [
+            // Fails a rule, whose parameters carry the value checked.
+            (serde_json::json!({ "endpoint": SECRET }), "endpoint"),
+            // Cannot be read, where `serde` quotes the value it found.
+            (
+                serde_json::json!({ "endpoint": "https://example.com", "retries": SECRET }),
+                "retries",
+            ),
+        ] {
+            let mut settings = create_test_settings();
+            settings
+                .insert_module_config(EXAMPLE_SECTION, ENDPOINT_MODULE, &table)
+                .expect("should insert the module's table");
+
+            let error = settings
+                .module_config::<SecretSetting>(ENDPOINT_MODULE)
+                .expect_err("the table breaks the module's rules");
+
+            let shown = format!("{error}\n{error:?}");
+            assert!(
+                !shown.contains(SECRET),
+                "printed a setting's value: {shown}"
+            );
+            // The module's name holds `endpoint` too, so the setting is looked
+            // for after the table's name.
+            let rendered = error.to_string();
+            let reason = rendered
+                .split_once("[example.endpoint]")
+                .map_or("", |(_, reason)| reason);
+            assert!(
+                reason.contains(setting),
+                "should name the table and the setting: {rendered}"
+            );
+        }
+    }
+
     /// A table written for a module its section does not select is refused,
     /// rather than sitting in the configuration doing nothing.
     #[test]
@@ -11286,6 +11383,49 @@ mod permission_signal_config_tests {
                     .expect("an absent table reads as nothing")
                     .is_none()
             );
+        }
+
+        /// A vendor's settings with a secret in them, as the table holds them
+        /// at startup, once the secret is resolved from the store.
+        #[derive(Debug, Deserialize, Validate)]
+        #[serde(deny_unknown_fields)]
+        struct SecretShared {
+            #[validate(length(max = 8))]
+            license_key: String,
+            #[validate(range(max = 10))]
+            retries: Option<u32>,
+        }
+
+        const SECRET: &str = "resolved-secret-value-4f7a";
+
+        #[test]
+        fn a_shared_table_that_is_refused_names_the_setting_and_never_its_value() {
+            for (table, setting) in [
+                // Fails a rule, whose parameters carry the value checked.
+                (format!("license_key = '{SECRET}'"), "license_key"),
+                // Cannot be read, where `serde` quotes the value it found.
+                (
+                    format!("license_key = 'short'\nretries = '{SECRET}'"),
+                    "retries",
+                ),
+            ] {
+                let settings = with(&format!("[shared.example]\n{table}"))
+                    .expect("core reads none of the table, so it loads");
+
+                let refused = settings
+                    .shared_config::<SecretShared>("example")
+                    .expect_err("the table breaks the vendor's rules");
+
+                let shown = format!("{refused}\n{refused:?}");
+                assert!(
+                    !shown.contains(SECRET),
+                    "printed a setting's value: {shown}"
+                );
+                assert!(
+                    shown.contains("[shared.example]") && shown.contains(setting),
+                    "should name the table and the setting: {shown}"
+                );
+            }
         }
 
         #[test]
