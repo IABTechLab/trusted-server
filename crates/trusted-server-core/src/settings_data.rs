@@ -43,10 +43,10 @@ pub fn config_key(env: &EnvConfig) -> String {
 
 /// Resolves the `EdgeZero` app-config store name from the process environment.
 ///
-/// Native adapters such as Axum use this wrapper. Fastly opens the store under
-/// the logical ID that a managed deployment links to the selected physical
-/// store. Without an override, this wrapper also returns the manifest default
-/// logical store ID.
+/// Native adapters such as Axum use this wrapper. Fastly reads no selector at
+/// runtime: it opens the store under the logical ID that a managed deployment
+/// links to the selected physical store. Without an override, this wrapper
+/// also returns the manifest default logical store ID.
 #[must_use]
 pub fn default_config_store_name() -> StoreName {
     config_store_name(&EnvConfig::from_env())

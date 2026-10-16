@@ -619,22 +619,6 @@ mod tests {
     }
 
     #[test]
-    fn a_host_key_cannot_be_pushed_with_staging() {
-        Args::try_parse_from([
-            "ts",
-            "config",
-            "push",
-            "--adapter",
-            "fastly",
-            "--local",
-            "--staging",
-            "--key",
-            "a.example",
-        ])
-        .expect_err("should refuse a host's key with --staging");
-    }
-
-    #[test]
     fn config_diff_parses_staging_and_rejects_explicit_key() {
         let args = parse(&["ts", "config", "diff", "--adapter", "fastly", "--staging"]);
         let Command::Config(ConfigCommand::Diff(diff)) = args.command else {

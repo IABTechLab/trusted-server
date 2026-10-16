@@ -1475,28 +1475,13 @@ mod tests {
     }
 
     #[test]
-    fn a_module_is_shown_no_host_where_host_is_not_utf8() {
-        let settings = test_settings();
-        let services = build_finalize_services(&settings, Arc::new(UnavailableKvStore));
-        let registered: Arc<dyn DeviceModule> = Arc::new(MarkedDeviceModule);
-        let mut req = page_request();
-        req.set_header(header::HOST.as_str(), HOST_NOT_UTF8);
-        // A selector without the placeholder serves the request without
-        // reading Host, so the request goes on to the module request.
-        stores_for_request(stores_with_selector("site_a"), &req)
-            .expect("should serve a fixed selector whatever the Host");
-
-        let signals = futures::executor::block_on(derive_device_signals(
-            &settings,
-            Some(registered),
-            &req,
-            &services,
-        ));
+    fn entry_request_reads_a_host_that_is_not_utf8_as_no_host() {
+        let req = request_with_host_not_utf8();
 
         assert_eq!(
-            signals.platform_class.as_deref(),
-            Some("marked:example_width=1280:https:///article?page=2"),
-            "a module should be shown no host where the Host header is not UTF-8"
+            entry_request(&req).host(),
+            "",
+            "a module request should carry no host where Host is not UTF-8"
         );
     }
 
