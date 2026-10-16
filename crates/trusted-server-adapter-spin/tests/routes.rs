@@ -49,6 +49,28 @@ fn test_settings() -> Settings {
     .expect("should parse route test settings")
 }
 
+/// A router whose settings add one operator header, which only
+/// `FinalizeResponseMiddleware` writes, so a response carrying it passed
+/// through that middleware.
+fn router_writing_an_operator_header() -> RouterService {
+    let mut settings = test_settings();
+    settings
+        .response_headers
+        .insert("X-Finalized".to_owned(), "1".to_owned());
+    TrustedServerApp::routes_with_settings(settings)
+        .expect("should build router from test settings")
+}
+
+/// The `x-geo-*` headers on `response`, by name.
+fn geo_header_names(response: &Response) -> Vec<String> {
+    response
+        .headers()
+        .keys()
+        .map(|name| name.as_str().to_owned())
+        .filter(|name| name.starts_with("x-geo-"))
+        .collect()
+}
+
 async fn route(router: RouterService, req: Request) -> Response {
     router.oneshot(req).await.expect("should route request")
 }
@@ -168,10 +190,11 @@ async fn health_route_returns_ok() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn finalize_middleware_injects_geo_header() {
-    // The X-Geo-Info-Available header is injected by FinalizeResponseMiddleware.
-    // Its absence on any response means the middleware was not wired.
-    let router = test_router();
+async fn finalize_middleware_writes_the_operators_headers_and_no_geo_header() {
+    // The operator's header is written by FinalizeResponseMiddleware alone, so
+    // its absence on a response means the middleware was not wired. No
+    // x-geo-* header is written there, because a serve middleware writes them.
+    let router = router_writing_an_operator_header();
 
     let req = request_builder()
         .method("GET")
@@ -181,17 +204,25 @@ async fn finalize_middleware_injects_geo_header() {
 
     let resp = route(router, req).await;
 
+    assert_eq!(
+        resp.headers()
+            .get("x-finalized")
+            .and_then(|value| value.to_str().ok()),
+        Some("1"),
+        "FinalizeResponseMiddleware must write the operator's headers on every response"
+    );
     assert!(
-        resp.headers().contains_key("x-geo-info-available"),
-        "FinalizeResponseMiddleware must inject X-Geo-Info-Available on every response"
+        geo_header_names(&resp).is_empty(),
+        "no adapter writes an x-geo-* header: {:?}",
+        geo_header_names(&resp)
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_middleware_chain_runs_for_a_routed_request() {
-    // Asserts that the finalizing middleware ran (X-Geo-Info-Available present)
-    // and that the route is actually reached (status != 404).
-    let router = test_router();
+    // Asserts that the finalizing middleware ran (the operator's header
+    // present) and that the route is actually reached (status != 404).
+    let router = router_writing_an_operator_header();
 
     let req = request_builder()
         .method("POST")
@@ -203,8 +234,8 @@ async fn the_middleware_chain_runs_for_a_routed_request() {
     let resp = route(router, req).await;
 
     assert!(
-        resp.headers().contains_key("x-geo-info-available"),
-        "middleware chain must inject X-Geo-Info-Available"
+        resp.headers().contains_key("x-finalized"),
+        "middleware chain must write the operator's headers"
     );
     assert_ne!(
         resp.status().as_u16(),
@@ -318,6 +349,7 @@ async fn key_administration_paths_are_answered_here_and_never_proxied() {
     for path in [
         "/_ts/admin/keys/rotate",
         "/_ts/admin/keys/deactivate",
+        "/_ts/admin/cache/purge",
         "/admin/keys/rotate",
         "/admin/keys/deactivate",
     ] {
@@ -921,8 +953,8 @@ fn every_fixed_route_beneath_an_underscore_prefix_is_reserved() {
 
 /// The route test settings with a `[robots-txt]` section that refuses every
 /// crawler and keeps one path open.
-fn router_refusing_every_crawler() -> RouterService {
-    let settings = Settings::from_toml(
+fn settings_refusing_every_crawler() -> Settings {
+    Settings::from_toml(
         r#"
             [publisher]
             domain = "test-publisher.example.com"
@@ -949,9 +981,11 @@ fn router_refusing_every_crawler() -> RouterService {
             middleware = ["robots_txt"]
         "#,
     )
-    .expect("should parse route test settings");
+    .expect("should parse route test settings")
+}
 
-    TrustedServerApp::routes_with_settings(settings)
+fn router_refusing_every_crawler() -> RouterService {
+    TrustedServerApp::routes_with_settings(settings_refusing_every_crawler())
         .expect("should build router from test settings")
 }
 
@@ -995,6 +1029,84 @@ async fn refusing_every_crawler_tags_every_response_and_registers_no_route() {
         robots_tag(&other).as_deref(),
         Some("noindex, nofollow"),
         "no route may be the one page a crawler is allowed to index"
+    );
+}
+
+/// `/robots.txt` is the publisher path's, answered against an origin that
+/// answers each request in turn. A `GET` has the origin's file replaced by
+/// the refusal, a `HEAD` has the file made where the origin has none and
+/// gets no body, and a `POST` keeps the origin's `404`, because a file is
+/// made only for a `GET` or a `HEAD`. Each carries the refusal's
+/// `X-Robots-Tag`, the file's own answer included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn robots_txt_is_served_through_the_publisher_path_with_its_tag() {
+    use std::sync::Arc;
+
+    use trusted_server_core::platform::PlatformHttpClient;
+    use trusted_server_core::platform::test_support::{
+        StubHttpClient, build_services_with_http_client,
+    };
+
+    let origin = Arc::new(StubHttpClient::new());
+    origin.push_response_with_headers(
+        200,
+        b"User-agent: *\nAllow: /\n".to_vec(),
+        vec![("content-type", "text/plain")],
+    );
+    for _ in 0..2 {
+        origin.push_response_with_headers(
+            404,
+            b"<html><body>not found</body></html>".to_vec(),
+            vec![("content-type", "text/html")],
+        );
+    }
+    let router = TrustedServerApp::routes_with_settings_and_services(
+        settings_refusing_every_crawler(),
+        build_services_with_http_client(Arc::clone(&origin) as Arc<dyn PlatformHttpClient>),
+    )
+    .expect("should build router with a stub origin");
+    let robots_txt = |method: &str| {
+        request_builder()
+            .method(method)
+            .uri("https://test-publisher.example.com/robots.txt")
+            .header("host", "test-publisher.example.com")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build request")
+    };
+    let body = |response: Response| {
+        let bytes = response
+            .into_body()
+            .into_bytes()
+            .expect("should hold the answer in memory");
+        String::from_utf8(bytes.to_vec()).expect("the body is text")
+    };
+
+    let get = route(router.clone(), robots_txt("GET")).await;
+    assert_eq!(get.status(), 200);
+    assert_eq!(robots_tag(&get).as_deref(), Some("noindex, nofollow"));
+    assert_eq!(body(get), "User-agent: *\nAllow: /ads.txt\nDisallow: /\n");
+
+    let head = route(router.clone(), robots_txt("HEAD")).await;
+    assert_eq!(
+        head.status(),
+        200,
+        "the file is made where the origin has none"
+    );
+    assert_eq!(robots_tag(&head).as_deref(), Some("noindex, nofollow"));
+    assert_eq!(body(head), "", "a HEAD gets no body");
+
+    let post = route(router, robots_txt("POST")).await;
+    assert_eq!(
+        post.status(),
+        404,
+        "a file is made only for a GET or a HEAD"
+    );
+    assert_eq!(robots_tag(&post).as_deref(), Some("noindex, nofollow"));
+
+    assert_eq!(
+        origin.recorded_request_methods(),
+        ["GET", "HEAD", "POST"],
+        "each request reaches the origin"
     );
 }
 

@@ -42,6 +42,7 @@ pub fn builders() -> Vec<IntegrationBuilder> {
         trusted_server_ad_tag_google::builder(),
         trusted_server_ad_tag_google::diagnostics::builder(),
         trusted_server_ads_txt_sellers::builder(),
+        trusted_server_headers_geo::builder(),
         // Implementations `[demand]` and `[ad-server]` can name, which no
         // section selects.
         trusted_server_auction_protocol_openrtb::builder(),
@@ -114,6 +115,7 @@ pub fn middleware() -> Vec<StockMiddleware> {
     use trusted_server_core::robots_txt::middleware as robots_txt;
     use trusted_server_core::service_version;
     use trusted_server_framework_nextjs as nextjs;
+    use trusted_server_headers_geo as geo_headers;
     use trusted_server_identity_lockr as lockr;
     use trusted_server_tag_google_tag as google_tag;
     use trusted_server_tag_google_tag_manager as google_tag_manager;
@@ -145,6 +147,7 @@ pub fn middleware() -> Vec<StockMiddleware> {
         row(datadome::builder().id(), Fetch, datadome::MODULE),
         row(datadome::builder().id(), Serve, datadome::TAG_MIDDLEWARE),
         row(google::builder().id(), Fetch, google::MODULE),
+        row(google::builder().id(), Serve, google::LOADER_MIDDLEWARE),
         row(
             google::diagnostics::builder().id(),
             Serve,
@@ -156,6 +159,7 @@ pub fn middleware() -> Vec<StockMiddleware> {
             media_type: ads_txt_sellers::MEDIA_TYPE,
             name: ads_txt_sellers::MODULE,
         },
+        row(geo_headers::builder().id(), Serve, geo_headers::MODULE),
         // Core makes the file `[robots-txt]` describes under the module's
         // own name, on the file's path alone.
         StockMiddleware {
@@ -217,6 +221,7 @@ mod tests {
         include_str!("../../bot-protection/datadome/src/fixtures/page-change.settings.toml"),
         include_str!("../../ad-tag/google/src/fixtures/page-change.settings.toml"),
         include_str!("../../ads-txt/sellers/src/fixtures/sellers.settings.toml"),
+        include_str!("../../headers/geo/src/fixtures/geo-headers.settings.toml"),
     ];
 
     #[test]
@@ -499,6 +504,7 @@ middleware = [\"robots_txt\"]
                 "ad-tag.google",
                 "ad-tag.google.diagnostics",
                 "ads-txt.sellers",
+                "headers.geo",
                 "auction-protocol.openrtb",
                 "auction.prebid-server",
                 "auction.aps",
@@ -525,6 +531,55 @@ middleware = [\"robots_txt\"]
                 .for_feature(trusted_server_core::settings::ROBOTS_TXT_CACHE)
                 .keeps_values(),
             "the stock loading cache should keep what it loads"
+        );
+    }
+
+    /// A table naming no module takes the one loading cache module the build
+    /// links, so a stock build holds each answer only while this list links
+    /// exactly one. A second would leave the table holding nothing, with no
+    /// message.
+    #[test]
+    fn a_table_naming_no_module_holds_with_the_stock_loading_cache() {
+        let settings = trusted_server_core::test_support::tests::create_test_settings();
+        assert!(
+            settings.cache.robots_txt.module.is_none(),
+            "the test settings should name no module"
+        );
+
+        let caches = trusted_server_core::integrations::loading_caches_from(&settings, &builders())
+            .expect("a table naming no module is not an error");
+
+        assert!(
+            caches
+                .for_feature(trusted_server_core::settings::ROBOTS_TXT_CACHE)
+                .keeps_values(),
+            "a stock build should hold each robots.txt module's answer"
+        );
+    }
+
+    /// `ts config validate` validates against this list, so it accepts the
+    /// stock loading cache by name and refuses a misspelling, which the
+    /// service would otherwise refuse only as it starts.
+    #[test]
+    fn deploy_validation_knows_the_stock_loading_cache() {
+        use trusted_server_core::config::validate_settings_for_deploy_with;
+
+        let stock = builders();
+        let mut settings = trusted_server_core::test_support::tests::create_test_settings();
+
+        settings.cache.robots_txt.module = Some("51degrees".to_owned());
+        validate_settings_for_deploy_with(&settings, &stock)
+            .expect("the stock loading cache should pass deploy validation");
+
+        settings.cache.robots_txt.module = Some("51degreez".to_owned());
+        let error = validate_settings_for_deploy_with(&settings, &stock)
+            .expect_err("a module nothing offers should be refused");
+        assert!(
+            format!("{error:?}").contains(
+                "[cache.robots-txt] module names `51degreez`, which no linked crate offers a \
+                 loading cache from. The loading cache modules this build has are: 51degrees"
+            ),
+            "should name the table and the stock loading cache: {error:?}"
         );
     }
 

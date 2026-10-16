@@ -533,6 +533,12 @@ export interface TsjsApi {
   gptSlotHandoffs?: Record<string, GptSlotHandoff>;
   /** True only while TS calls a GPT function that the handoff wrappers observe. */
   gptSlotHandoffInternal?: boolean;
+  /**
+   * GPT slots TS defined with their viewport bands as a size mapping. Only
+   * these ask the ad server for a band's sizes, so the refresh auction offers
+   * only these the sizes of their band.
+   */
+  viewportMappedSlots?: WeakSet<object>;
   /** Per-navigation first-impression ownership shared by GPT and Prebid. */
   firstImpression?: FirstImpressionState;
   /** Guards the shared production GPT lifecycle listener installation. */
