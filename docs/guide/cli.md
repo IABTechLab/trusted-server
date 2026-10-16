@@ -351,9 +351,11 @@ Both print what they did as JSON. A `previous_kid` of `null` from `ts keys
 rotate` means the store held no current key. That is right for a new store and
 for no other, so check `--config-store-id` when it appears on a store in use.
 
-A command that cannot read the config store writes nothing. `ts keys deactivate
---delete` can be run again after a failure, because a key that is already gone
-from a store counts as deleted there. See [Key Rotation](./key-rotation.md).
+A command that cannot read the config store writes nothing, and `ts keys
+rotate` never replaces a secret already stored under the new key's id. `ts keys
+deactivate --delete` can be run again after a failure, because a key that is
+already gone from a store counts as deleted there. See
+[Key Rotation](./key-rotation.md).
 
 ## Cache purge
 
