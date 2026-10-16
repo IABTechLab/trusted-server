@@ -4619,7 +4619,7 @@ fn apply_origin_cache_intent(
     if bypass {
         request.with_cache_bypass()
     } else if readthrough_applies {
-        // The same reader-facing key and all-scope key used by the purge endpoint.
+        // The reader-facing key and the all-scope key that `ts cache purge` names.
         // Fastly accepts multiple space-separated surrogate keys without changing TTL.
         request.with_shared_cache(format!(
             "{TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY} {}",
