@@ -7,7 +7,7 @@
 **Issues:** IABTechLab/trusted-server#777 (its Fastly row)
 **Last updated:** 2026-10-16
 
-> **Why this spec exists.** After the series before this one, core still names one hosting platform, Fastly, in small pieces. They are the format of a long configuration document, a staging variable, three request headers, a device module selector and the names of two functions. Each is a place where a change by one platform is a change in core. One more Fastly header name, `x-compress-hint`, stays in core after this change (section 3).
+> **Why this spec exists.** After the series before this one, core's shipped code still names one hosting platform, Fastly, in small pieces. They are the format of a long configuration document, a staging variable, three request headers, a device module selector and the names of two functions. Each is a place where a change by one platform is a change in core. Core's comments, tests and README files name Fastly, Cloudflare, Spin, Fermyon, Viceroy and Axum as well, the attestation settings name Vercel, and three tests use a host under Fastly's `edgecompute.app` domain. After this change no line of core names a hosting platform, and a guard outside core keeps it so (section 2.6). One Fastly header, `x-compress-hint`, whose name does not name the platform, is still set by core after this change (section 3).
 
 ## 1. Problem
 
@@ -22,6 +22,8 @@ These names remain in core, each with the files that hold it:
 | Fastly in the names of the asset proxy's response conversions          | `proxy.rs`                                                                        |
 
 Each name is small. Each one means that another platform, or a change in how Fastly stores, flags or forwards something, is an edit to core rather than to the adapter beside it.
+
+Core's comments, doc comments, tests and README files named platforms too, and so did one shipped line, the `_vercel` entry among the prefixes an attestation endpoint may not take. Each told a reader that core knows which platform runs it or serves its origin. Section 2.6 counts them.
 
 ## 2. Design
 
@@ -108,11 +110,44 @@ The Spin adapter is the only adapter that calls `sanitize_forwarded_headers` (`n
 
 **What changes for an operator.** One error message changes with the names. The `Proxy` error for a streaming body in the buffered conversion (`proxy.rs`) now reads `streaming platform response body is not supported by buffered response conversion`, where it named a Fastly response conversion. A `Proxy` error answers 502 with `An internal error occurred`, so the message reaches the log and not the response. Both functions are internal to core.
 
+### 2.6 Core names no hosting platform
+
+Core is built on EdgeZero and names no hosting platform in any line, whether code, comment, test, document or file name. EdgeZero's own names stay, because EdgeZero is the platform layer core is built on. An adapter may name its own platform.
+
+**What changes.**
+
+- Comments and doc comments say what they meant without the platform's name, for example a streaming adapter, an adapter whose platform has a shared cache, or a platform whose `send_async` runs each request eagerly. Where one cited a platform SDK's source, the adapter that maps core's type onto that SDK already documents it (`apply_fastly_cache_intent` in the Fastly adapter's `platform.rs`).
+- The `Surrogate-Control` tests in `publisher.rs` test the standard header core reads for every platform, so their names and assertion messages say `Surrogate-Control`, or edge freshness, where they said Fastly. The wildcard exclusion test in `creative.rs` excludes `*.cdn.example.com` where it excluded a platform's domain. A registry test name, a publisher test name and a stub's assertion message drop the platform they named.
+- The test that the largest `KvMetadata` serializes within 2048 bytes moves to the tests of the Fastly adapter's store (`ec_kv.rs`), because the limit is the Fastly KV Store's.
+- The test that core's code never uses the Fastly SDK moves from core's `migration_guards.rs` to the Fastly adapter's `core_sdk_guard.rs`. A build script in the adapter embeds every Rust source under core's `src` by path, so a file added to core is checked with no edit to the test. Core's build script no longer lists its own sources.
+- Core's README and the auction README show the command that runs core's tests on the host and point at `TESTING.md` for the adapter aliases, where they listed each alias by its platform.
+- `_vercel` leaves `ORIGIN_ASSET_PREFIXES`, the prefixes a web framework serves its assets from and an attestation endpoint may not take, because it is a hosting platform's prefix and not a framework's. The attestation guide names it instead, as a prefix the origin serves that the operator has to avoid, which the guide already says of every prefix the list does not hold. Three HTML processor tests use `test-publisher-ts.edge.example` as the request host, where they used a host under `edgecompute.app`.
+- `scripts/lint-core-platform-names.py` fails on any line or path under `crates/trusted-server-core` that names a hosting platform, a tool named for one, or a domain a platform serves deployments from. It splits text into words at every character that is not a letter and at each change from lower to upper case, so `FASTLY_IS_STAGING` and `edgezero_adapter_cloudflare` each name a platform. Six names, among them `spin`, `axum` and `aws`, count only as words of their own, because ordinary words such as `spinner` and `withdraws` contain them. Eighteen, among them `fastly`, `cloudflare`, `akamai`, `vercel` and `netlify`, also count at the start of a word, so `akamaized` counts. Sixteen domains, among them `edgecompute.app`, `workers.dev` and `fermyon.app`, count where they are not part of a longer host name. It runs its matcher on every name and domain and on known non-names before it reads core, and stops with exit 2 when the matcher is wrong. The Run Format workflow runs it as a job of its own, and `AGENTS.md` lists it among the CI gates.
+
+**The count.** Lines of `crates/trusted-server-core` that name each platform on this branch before and after this change, counted as a whole word with `git grep -i -w`, and with the guard, which also counts a name inside an identifier such as `FASTLY_IS_STAGING` or `_vercel`.
+
+| Name                       | `git grep -i -w` before (files) | Guard before | After, either count |
+| -------------------------- | ------------------------------- | ------------ | ------------------- |
+| Fastly                     | 100 (32)                        | 110          | 0                   |
+| Cloudflare                 | 26 (14)                         | 28           | 0                   |
+| Axum                       | 27 (14)                         | 27           | 0                   |
+| Spin                       | 21 (10)                         | 23           | 0                   |
+| `edgecompute.app`          | 5 (1)                           | 5            | 0                   |
+| Viceroy                    | 4 (3)                           | 4            | 0                   |
+| Fermyon                    | 1 (1)                           | 1            | 0                   |
+| Vercel                     | 0                               | 1            | 0                   |
+| Every other name or domain | 0                               | 0            | 0                   |
+
+The guard found 173 lines before this change, some of them naming two platforms, and none after. One of them, the `_vercel` entry, was shipped code, and the rest were comments, documents or test code.
+
+**What changes for an operator.** An attestation endpoint beneath `/_vercel` is accepted where it was refused, so an operator whose origin is hosted on Vercel has to avoid that prefix, as the attestation guide says. Nothing else that core does when it runs changes.
+
+**For crates outside core.** `ORIGIN_ASSET_PREFIXES` no longer holds `_vercel`, and nothing else in core's API changes. A change that adds a hosting platform's name to core, in a comment or a test as much as in code, fails the guard. The Fastly adapter gains a build script and a `regex` dev-dependency for the test of core's sources.
+
 ## 3. What is not in this change
 
-- The `x-compress-hint` header, a Fastly compression hint. Core sets it to `on` on the script bundle responses it serves (`HEADER_X_COMPRESS_HINT` in `constants.rs`, used in `publisher.rs`) and lists it among the headers never passed to a third party (`constants.rs`).
+- The `x-compress-hint` header, a Fastly compression hint. Core sets it to `on` on the script bundle responses it serves (`HEADER_X_COMPRESS_HINT` in `constants.rs`, used in `publisher.rs`) and lists it among the headers never passed to a third party (`constants.rs`). The header's name does not name the platform, so the guard of 2.6 passes it.
 - The comment at the top of `platform/request_headers.rs`, which says a TLS or spoofable header is removed at entry, without the precondition in 2.3 that the adapter calls `sanitize_forwarded_headers`. It is a code comment and stays for a later change.
-- Comments that mention Fastly, in 29 of core's `.rs` files, and the names and assertion messages of some tests, the publisher's surrogate cache tests among them. None is a shipped line of core.
 - The Axum, Cloudflare and Spin adapters' comments comparing their behavior with the Fastly adapter's, and their two errors that suggest the Fastly adapter for parallel bidder fan-out.
 - The `ts` development proxy's removal of `fastly-ssl`.
 
@@ -123,6 +158,8 @@ The Spin adapter is the only adapter that calls `sanitize_forwarded_headers` (`n
 - A declared TLS header sets the scheme and an undeclared one does not, the declared TLS and spoofable headers are stripped with the standard ones, the auction sees the client's declared TLS header where the origin request does not, a declared internal header is refused in the `auth_header` slot of `[trusted_client_ip]`, and a bare `client-ip` is refused where `example-client-ip` is accepted.
 - The `platform` device selector builds the module the adapter's factory supplies, and no selector builds the built-in one.
 - The asset proxy's tests pass unchanged through the renamed conversions.
+- The guard of 2.6 passes on core after this change and fails on core before it. Each of its 40 names and domains, planted once on a line of its own in a file git does not yet track, fails it on that line, and so do `_vercel` and the `edgecompute.app` test host put back where they were. It passes `spinner`, `SpinyAI`, `steadfastly`, `denominator`, `withdraws`, `EdgeZero`, `notworkers.dev` and `butterfly.io`. With its word pattern or its domain pattern broken to match nothing, it stops with exit 2 before it reads core.
+- The Fastly adapter checks that core's code never uses the Fastly SDK, that the list of core's sources it embeds covers core, and that the largest `KvMetadata` fits the Fastly KV Store's 2048-byte metadata limit.
 
 Not tested:
 
@@ -131,6 +168,8 @@ Not tested:
 - A declared internal header in the `ip_header` slot. The one test uses the `auth_header` slot, and one loop checks both slots.
 - Any change on the Axum, Cloudflare and Spin adapters listed in 2.1 to 2.4. No adapter test sends a client's `fastly-ssl`, `fastly-client-ip` or `x-debug-fastly-pop` to those adapters, or selects `module = "platform"` on them.
 - The strip at entry of a declared header through an adapter. Core's test declares example headers and calls `sanitize_forwarded_headers` directly, and the one adapter that calls the function declares none.
+- The guard's job in the Run Format workflow, which only a pull request's checks run.
+- That the guard's list of names is complete. It holds the platforms the stack has adapters or tools for and other common edge, CDN and hosting platforms, so a platform outside the list has to be added to it.
 
 ## Review log
 
@@ -144,3 +183,4 @@ Not tested:
 | 2026-10-15 | First draft.                                                                                                                                                                                                                                                                                                          |
 | 2026-10-15 | Fixes from review round 1. The readers of each declared list and the open questions on them, `x-debug-fastly-pop`, the scheme change, the effects on the other adapters, where each refusal happens, the rollout, the narrowed constants, `x-compress-hint`, the file count, the untested paths and the review log.   |
 | 2026-10-15 | Corrections from review round 2. The Fastly sentence of 2.3 and the changelog on the `x-debug-fastly-pop` refusal, the changelog on the spoofable strip and the scheme change, when the Axum, Cloudflare and Spin adapters strip `fastly-client-ip`, and the comment in `request_headers.rs` left for a later change. |
+| 2026-10-16 | Core names no hosting platform or platform domain in any line. Section 2.6 with the counts, the `_vercel` prefix and the test host, the guard and the tests that moved to the Fastly adapter, and section 3 no longer leaves core's comments and tests for later.                                                     |
