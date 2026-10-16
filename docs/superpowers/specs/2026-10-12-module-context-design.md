@@ -5,7 +5,7 @@
 **Related specs:** `2026-08-27-integration-provider-seam-design.md`
 **Related PRs:** IABTechLab/trusted-server#1349, which builds on the integration seam in [IABTechLab/trusted-server#1348](https://github.com/IABTechLab/trusted-server/pull/1348) and was reviewed on [jwrosewell/trusted-server#3](https://github.com/jwrosewell/trusted-server/pull/3) (closed)
 **Issues:** IABTechLab/trusted-server#1267
-**Last updated:** 2026-10-15
+**Last updated:** 2026-10-16
 
 > **Why this spec exists.** Each kind of module is called with its own parameter list.
 

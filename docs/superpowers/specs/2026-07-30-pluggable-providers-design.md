@@ -4,7 +4,7 @@
 IABTechLab/trusted-server#1343 (row 2 of the stack, the Edge Cookie module
 seam) and IABTechLab/trusted-server#1344 (row 3, device and geo selection),
 neither of which is merged to main. Both were reviewed earlier, as pull
-requests #1043 and #1044.
+requests #1043 and #1044, which are closed.
 **Author:** Engineering
 **Issue references:** #777, #778, #780, #781
 **Related specs:** `2026-07-30-permission-model-design.md`,

@@ -1,11 +1,11 @@
 # Design Spec: The last Fastly names leave core
 
-**Status:** Proposed, 2026-10-15. Implemented on a working branch of the fork, with no pull request raised yet.
+**Status:** Proposed, 2026-10-15. Raised as draft pull request IABTechLab/trusted-server#1399 (from jwrosewell/trusted-server#44), for Tech Lab review.
 **Author:** 51Degrees (contributed), for Tech Lab review
 **Related specs:** `2026-10-14-last-names-in-core-design.md`, `2026-10-14-backend-naming-design.md`
-**Related PRs:** none yet
+**Related PRs:** IABTechLab/trusted-server#1399, jwrosewell/trusted-server#44
 **Issues:** IABTechLab/trusted-server#777 (its Fastly row)
-**Last updated:** 2026-10-15
+**Last updated:** 2026-10-16
 
 > **Why this spec exists.** After the series before this one, core still names one hosting platform, Fastly, in small pieces. They are the format of a long configuration document, a staging variable, three request headers, a device module selector and the names of two functions. Each is a place where a change by one platform is a change in core. One more Fastly header name, `x-compress-hint`, stays in core after this change (section 3).
 

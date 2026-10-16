@@ -3,9 +3,9 @@
 **Status:** Proposed, 2026-10-15. Written after the code, for draft pull request IABTechLab/trusted-server#1373. Every design document of the stack is in IABTechLab/trusted-server#1342.
 **Author:** 51Degrees (contributed), for Tech Lab review
 **Related specs:** `2026-10-12-loading-cache-design.md`, `2026-10-12-robots-txt-from-modules-design.md`, `2026-08-27-integration-provider-seam-design.md`
-**Related PRs:** IABTechLab/trusted-server#1373, reviewed on jwrosewell/trusted-server#27
+**Related PRs:** IABTechLab/trusted-server#1373, reviewed on jwrosewell/trusted-server#27 (closed)
 **Issues:** IABTechLab/trusted-server#1320
-**Last updated:** 2026-10-15
+**Last updated:** 2026-10-16
 
 > **Why this spec exists.** A module that holds its own answers asks core for the cache of the name it chose, finds no `[cache.<name>]` table for that name, and gets the cache that holds nothing, so every request loads the answer again.
 

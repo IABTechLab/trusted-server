@@ -1,19 +1,19 @@
 # Design Spec: The Integration Seam
 
-**Status:** Proposed, 2026-08-27, revised 2026-08-28, 2026-10-06, 2026-10-07, 2026-10-08, 2026-10-12 and 2026-10-15. This PR adds design
-documents only and targets `main` directly. Following the review of #1043
-(27 August) the seam it defines is a precondition for the module series
-rather than a follow-up to it, so the order is now this spec, then its
-implementation in a seventh PR against `main` (51Degrees), then PRs #1043
-to #1047 reworked onto it. It reads alongside the series' specs, which this
-PR now carries too, so the whole normative set is reviewable before any of
-the code lands.
+**Status:** Proposed, 2026-08-27, revised 2026-08-28, 2026-10-06, 2026-10-07, 2026-10-08, 2026-10-12, 2026-10-15 and 2026-10-16. Draft
+PR #1342, row 1 of the stack in #777, carries this spec with every design
+document of the stack and the URL host linter's allowlist for the modules the
+stack ships, and targets `main` directly, so the whole normative set is
+reviewable before any of the code lands. The module series follows it in
+PRs #1343 to #1347 (rows 2 to 6), then the seam's implementation in PR #1348
+(row 7), each PR based on the one before it.
 **Author:** 51Degrees (contributed), for Tech Lab review
 **Related specs:** `2026-07-30-pluggable-providers-design.md`,
 `2026-07-30-provider-migration-rollout-design.md`,
 `provider-code-registry.md`
-**Related PRs:** #986, #1043, #1044, #1045, #1046, #1047, #1054
-**Last updated:** 2026-10-15
+**Related PRs:** #1342 (row 1), #1343 to #1347 (rows 2 to 6), #1348 (row 7), #986 (closed), #1043 to #1047 (closed), #1054 (merged)
+**Issues:** #777 (row 1), #784 and #1100 (row 7)
+**Last updated:** 2026-10-16
 
 > **Why this spec exists.** PRs #1043 to #1047 open the identity, device and
 > geo seams, so a vendor can ship an Edge Cookie module in its own crate

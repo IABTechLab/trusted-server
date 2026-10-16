@@ -3,9 +3,9 @@
 **Status:** Proposed, 2026-10-15. Written after the code, for draft pull request IABTechLab/trusted-server#1374
 **Author:** 51Degrees (contributed), for Tech Lab review
 **Related specs:** `2026-10-12-module-context-design.md`, `2026-10-12-device-signals-design.md`, `2026-08-27-integration-provider-seam-design.md`, `2026-09-07-didomi-geo-design.md`. Every design document of the stack is in IABTechLab/trusted-server#1342.
-**Related PRs:** IABTechLab/trusted-server#1374, reviewed on jwrosewell/trusted-server#28
+**Related PRs:** IABTechLab/trusted-server#1374, reviewed on jwrosewell/trusted-server#28 (closed)
 **Issues:** IABTechLab/trusted-server#1321
-**Last updated:** 2026-10-15
+**Last updated:** 2026-10-16
 
 > **Why this spec exists.** A geo module was handed the client address and nothing else of the request, so a vendor whose one service answers location and device from the same request could not answer both from one call.
 

@@ -6,7 +6,7 @@ documentation set
 ([#1047](https://github.com/IABTechLab/trusted-server/pull/1047)) was closed
 without merging on 2026-10-15, and draft pull request
 [#1347](https://github.com/IABTechLab/trusted-server/pull/1347) carries the
-same set at the same commit. This spec is held with every other design
+same set. This spec is held with every other design
 document of the stack in
 [#1342](https://github.com/IABTechLab/trusted-server/pull/1342). The hook was
 removed from the earlier draft of the documentation set because it has no

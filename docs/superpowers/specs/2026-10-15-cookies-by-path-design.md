@@ -1,10 +1,11 @@
 # Design Spec: Core keeps a publisher's cookies under that publisher's path when one host serves several
 
-**Status:** Proposed, 2026-10-15
+**Status:** Proposed, 2026-10-15. Raised as draft pull request IABTechLab/trusted-server#1400 (from jwrosewell/trusted-server#45), for Tech Lab review.
 **Author:** 51Degrees (contributed), for Tech Lab review
 **Related specs:** `2026-10-13-request-addressing-design.md`, `2026-10-12-prefix-module-design.md`
+**Related PRs:** IABTechLab/trusted-server#1400, jwrosewell/trusted-server#45
 **Issues:** IABTechLab/trusted-server#1328
-**Last updated:** 2026-10-15
+**Last updated:** 2026-10-16
 
 > **Why this spec exists.** On a host that serves several publishers by path, every cookie core writes has `Path=/`, so the browser sends each publisher's cookies to every other publisher's pages and origin. This change writes the cookies core owns under each publisher's path. Cookies written under `/` by an origin, a module or the page script stay shared, and section 3 lists them.
 

@@ -20,7 +20,7 @@ page against the code at `split/3-permissions` (see the Review log), so that
 **Issue references:** #779
 **Related specs:** `2026-07-30-pluggable-providers-design.md`,
 `2026-07-30-provider-migration-rollout-design.md`
-**Last updated:** 2026-10-15
+**Last updated:** 2026-10-16
 
 > **Context.** PR #838 proposed a permission model whose review surfaced two
 > classes of defect this spec exists to prevent. The first was silent

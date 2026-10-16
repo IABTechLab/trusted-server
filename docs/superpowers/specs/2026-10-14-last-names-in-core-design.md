@@ -1,11 +1,11 @@
 # Design Spec: Small vendor, standard and platform names leave core
 
-**Status:** Proposed, 2026-10-14. Implemented on a working branch of the fork, with no pull request raised yet.
+**Status:** Proposed, 2026-10-14. Raised as draft pull request IABTechLab/trusted-server#1389 (from jwrosewell/trusted-server#41), for Tech Lab review.
 **Author:** 51Degrees (contributed), for Tech Lab review
 **Related specs:** `2026-10-14-source-modules-design.md`, `2026-10-14-no-modules-crate-design.md` and `2026-10-13-request-addressing-design.md`
-**Related PRs:** none yet
+**Related PRs:** IABTechLab/trusted-server#1389, jwrosewell/trusted-server#41
 **Issues:** IABTechLab/trusted-server#1341
-**Last updated:** 2026-10-15
+**Last updated:** 2026-10-16
 
 > **Why this spec exists.** Core is the interfaces, the routing, the origin fetch, the caches and their tests. After the series before this one it still names, in small pieces, a telemetry vendor, two hosting platforms' cache headers and stores, a TLS fingerprint format and a published key format. Each is a place where a change by one vendor or one platform is a change in core.
 

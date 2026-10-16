@@ -1,8 +1,9 @@
 # Design Spec: Module and Permission Model, Migration and Rollout
 
-**Status:** Proposed. The implementation is carried by the series PRs #1043 to
-#1047, none of which is yet merged to main, and this document was revised
-against that series on 2026-08-25. The §8 sign-off rows remain the series'
+**Status:** Proposed. The implementation is carried by the series' draft PRs
+#1343 to #1347 (rows 2 to 6 of the stack in #777), none of which is yet merged
+to main, and this document was revised against that series on 2026-08-25. The
+§8 sign-off rows remain the series'
 decision ledger, and rows the implementation now satisfies are marked with
 their PR so the task force can ratify rather than re-litigate. Updated on
 2026-09-01, where `[geo] default_country` is retired and the fallback baseline
@@ -19,7 +20,7 @@ selectors (pluggable spec §2.1).
 `2026-07-30-permission-model-design.md`,
 `2026-07-30-integration-response-header-hook-design.md` (not implemented in
 the series, see its status)
-**Last updated:** 2026-10-06
+**Last updated:** 2026-10-16
 
 > **Context.** The module/permission epic is a breaking change to a live
 > identity system. PR #838's review showed that the riskiest part of such a

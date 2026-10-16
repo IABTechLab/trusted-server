@@ -3,7 +3,7 @@
 **Status:** Proposed, 2026-10-15. Written after the code, for draft pull request IABTechLab/trusted-server#1375
 **Author:** 51Degrees (contributed), for Tech Lab review
 **Related specs:** `2026-10-12-loading-cache-design.md`, `2026-09-15-852-template-and-origin-caching-design.md`, `2026-04-28-multi-backend-asset-proxy-design.md`, `2026-05-19-asset-s3-auth-fastly-io-design.md`, `2026-09-08-1138-per-cookie-template-cache-policy-design.md`
-**Related PRs:** IABTechLab/trusted-server#1375, reviewed on jwrosewell/trusted-server#29
+**Related PRs:** IABTechLab/trusted-server#1375, reviewed on jwrosewell/trusted-server#29 (closed)
 **Issues:** IABTechLab/trusted-server#1324
 **Last updated:** 2026-10-16
 
