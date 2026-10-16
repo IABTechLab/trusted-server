@@ -165,7 +165,7 @@ pub struct ConsentDefaults {
     pub wait_for_update: u32,
     /// The regions the defaults apply to, as ISO 3166-1 country codes or
     /// ISO 3166-2 region codes such as `GB` or `US-CA`. Empty applies them
-    /// everywhere.
+    /// everywhere. Where set, every other visitor gets all four denied.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub region: Vec<String>,
 }
@@ -323,30 +323,51 @@ fn validate_adsense_client_id(value: &str) -> Result<(), ValidationError> {
 /// before anything else, including before the tag snippet that would
 /// otherwise define them, and because it is written even when no tag is
 /// configured and AdSense alone reads it.
+///
+/// Where regions are set, the command for them is followed by one with no
+/// region, which the guide says sets the default for every visitor no
+/// regional command covers. That one denies all four types, because a grant
+/// in the settings holds only in the regions they list.
 fn consent_defaults_snippet(defaults: &ConsentDefaults) -> String {
-    // The regions are validated as codes, so the quotes cannot be escaped.
-    let region = if defaults.region.is_empty() {
-        String::new()
+    let commands = if defaults.region.is_empty() {
+        consent_default_command(defaults, "")
     } else {
+        // The regions are validated as codes, so the quotes cannot be escaped.
         let codes: Vec<String> = defaults
             .region
             .iter()
             .map(|code| format!("'{code}'"))
             .collect();
-        format!(",\n    'region': [{}]", codes.join(", "))
+        let region = format!(",\n    'region': [{}]", codes.join(", "));
+        let elsewhere = ConsentDefaults {
+            wait_for_update: defaults.wait_for_update,
+            ..ConsentDefaults::default()
+        };
+        let regional = consent_default_command(defaults, &region);
+        let rest = consent_default_command(&elsewhere, "");
+        format!("{regional}\n\n  {rest}")
     };
     format!(
         "<script>\n  \
          window.dataLayer = window.dataLayer || [];\n  \
          function gtag(){{dataLayer.push(arguments);}}\n\n  \
-         gtag('consent', 'default', {{\n    \
+         {commands}\n\
+         </script>"
+    )
+}
+
+/// One `gtag('consent', 'default', …)` command carrying `defaults`, with
+/// `region` after the wait, which is empty or the command's `region`
+/// parameter.
+fn consent_default_command(defaults: &ConsentDefaults, region: &str) -> String {
+    format!(
+        "gtag('consent', 'default', {{\n    \
          'ad_storage': '{ad_storage}',\n    \
          'ad_user_data': '{ad_user_data}',\n    \
          'ad_personalization': '{ad_personalization}',\n    \
          'analytics_storage': '{analytics_storage}',\n    \
          'wait_for_update': {wait_for_update}{region}\n  \
-         }});\n\
-         </script>",
+         }});",
         ad_storage = defaults.ad_storage.as_command_value(),
         ad_user_data = defaults.ad_user_data.as_command_value(),
         ad_personalization = defaults.ad_personalization.as_command_value(),
@@ -1088,6 +1109,61 @@ mod tests {
         assert!(
             written.contains("'region': ['GB', 'US-CA']"),
             "the defaults should name the regions as Google's command does: {written}"
+        );
+    }
+
+    #[test]
+    fn a_region_setting_leaves_every_other_visitor_with_all_four_denied() {
+        // Arrange
+        // A grant scoped to one region, which reaches visitors there and no
+        // one else.
+        let settings = settings_with_google(&json!({
+            "analytics_tag_id": TEST_TAG_ID,
+            "consent_defaults": {
+                "analytics_storage": "granted",
+                "wait_for_update": 2000,
+                "region": ["US"],
+            },
+        }));
+
+        // Act
+        let written = head_inserts_for(&settings).join("");
+
+        // Assert
+        // Google's guide gives the regional command first and then the one
+        // with no region, which covers every visitor the first does not.
+        let commands: Vec<&str> = written
+            .split("gtag('consent', 'default', {")
+            .skip(1)
+            .collect();
+        assert_eq!(
+            commands.len(),
+            2,
+            "should write two default commands: {written}"
+        );
+        assert!(
+            commands[0].contains("'region': ['US']")
+                && commands[0].contains("'analytics_storage': 'granted'"),
+            "the regional command should carry the grant: {written}"
+        );
+        assert!(
+            !commands[1].contains("'region'"),
+            "the second command should name no region: {written}"
+        );
+        for consent_type in [
+            "ad_storage",
+            "ad_user_data",
+            "ad_personalization",
+            "analytics_storage",
+        ] {
+            assert!(
+                commands[1].contains(&format!("'{consent_type}': 'denied'")),
+                "every other visitor should have {consent_type} denied: {written}"
+            );
+        }
+        assert!(
+            commands[1].contains("'wait_for_update': 2000"),
+            "every other visitor should wait as long: {written}"
         );
     }
 
