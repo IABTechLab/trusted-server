@@ -21663,6 +21663,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_missing_page_under_an_entry_path_keeps_the_origin_answer() {
+        for (entry_path, path) in [("/", "/missing-page"), ("/ads.txt", "/ads.txt.bak")] {
+            let proxied = proxy(text_entry_for(Some(entry_path)), Method::GET, path, 404).await;
+
+            assert_eq!(
+                response_of(proxied.response).status(),
+                StatusCode::NOT_FOUND,
+                "should keep the origin's answer for {path}, which the entry for {entry_path} \
+                 covers but does not name"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_entry_for_a_folder_makes_no_missing_page() {
+        for folder in ["/", "/feeds/"] {
+            let proxied = proxy(text_entry_for(Some(folder)), Method::GET, folder, 404).await;
+
+            assert_eq!(
+                response_of(proxied.response).status(),
+                StatusCode::NOT_FOUND,
+                "should keep the origin's answer for the folder {folder}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn a_missing_file_outside_the_entry_path_keeps_the_origin_answer() {
         let proxied = proxy(
             text_entry_for(Some("/ads.txt")),
