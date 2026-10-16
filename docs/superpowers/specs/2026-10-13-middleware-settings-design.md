@@ -1,11 +1,11 @@
 # Design Spec: A middleware reads its settings from a table of its own
 
-**Status:** Proposed, 2026-10-15. Raised as draft pull request jwrosewell/trusted-server#33, for Tech Lab review.
+**Status:** Proposed, 2026-10-15. Raised as draft pull request IABTechLab/trusted-server#1379 (from jwrosewell/trusted-server#33), for Tech Lab review.
 **Author:** 51Degrees (contributed), for Tech Lab review
 **Related specs:** `2026-08-27-integration-provider-seam-design.md`, `2026-10-12-page-middleware-design.md`, `2026-10-12-shared-vendor-tables-design.md`, `2026-10-14-51degrees-client-hints-design.md`
 **Related PRs:** jwrosewell/trusted-server#33, IABTechLab/trusted-server#1379, IABTechLab/trusted-server#1342
 **Issues:** IABTechLab/trusted-server#1331
-**Last updated:** 2026-10-15
+**Last updated:** 2026-10-16
 
 > **Why this spec exists.** A middleware has no table of its own for its settings, so the options of one page change share a table with the module's other settings or, for a vendor, sit beside the endpoint and license key that every module of the vendor shares.
 

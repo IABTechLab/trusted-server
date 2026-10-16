@@ -48,6 +48,7 @@ trusted-server-cmp-osano = { workspace = true }
 trusted-server-cmp-sourcepoint = { workspace = true }
 trusted-server-core = { workspace = true }
 trusted-server-framework-nextjs = { workspace = true }
+trusted-server-headers-geo = { workspace = true }
 trusted-server-identity-lockr = { workspace = true }
 trusted-server-loading-cache-51degrees = { workspace = true }
 trusted-server-permission-signal-gpc = { workspace = true }

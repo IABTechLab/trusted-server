@@ -1,6 +1,7 @@
 use core::future::Future;
 use core::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
@@ -11,6 +12,7 @@ use error_stack::Report;
 use trusted_server_core::addressing::{RequestAddressing, addressed_router};
 use trusted_server_core::attestation::{PlatformIdentity, handle_prefix, prefix_routes};
 use trusted_server_core::auction::endpoints::handle_auction;
+use trusted_server_core::auction::telemetry::warn_once_when_analytics_is_unsent;
 use trusted_server_core::auction::{
     AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan_with,
 };
@@ -324,6 +326,14 @@ fn build_state_with_registrations_and_services(
         )?;
     let loading_caches =
         trusted_server_core::integrations::loading_caches_from(&settings, integrations)?;
+    // This adapter builds no telemetry sink, so a module `[analytics]` selects
+    // sends nothing unless the caller's services carry a sink.
+    warn_once_when_analytics_is_unsent(
+        &settings,
+        services.as_ref(),
+        "Cloudflare",
+        &UNSENT_ANALYTICS_LOGGED,
+    );
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
@@ -335,6 +345,11 @@ fn build_state_with_registrations_and_services(
         loading_caches,
     }))
 }
+
+/// Set once startup has logged that this adapter sends no auction telemetry.
+/// The state is built for every request, so the flag keeps the warning to
+/// one for each instance.
+static UNSENT_ANALYTICS_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// The permission signal modules this adapter links, in the order they run
 /// when configuration names none. Global Privacy Control is first because it
@@ -383,6 +398,7 @@ pub fn shipped_module_builders() -> Vec<IntegrationBuilder> {
         trusted_server_ad_tag_google::builder(),
         trusted_server_ad_tag_google::diagnostics::builder(),
         trusted_server_ads_txt_iabtl::builder(),
+        trusted_server_headers_geo::builder(),
         // Run by `[shared.51degrees]` rather than selected by a section.
         trusted_server_middleware_51degrees::builder(),
         // The analytics module `[analytics]` selects, which changes no page.
@@ -518,6 +534,23 @@ where
                 return Ok(http_error(&error));
             }
             Ok(f(s, services, req).await.unwrap_or_else(|e| http_error(&e)))
+        })
+    }
+}
+
+/// Answers the attestation pages without the request preparers, so no
+/// preparer can change or refuse the request whose host and nonce are signed.
+fn attestation_route_handler(
+    state: Arc<AppState>,
+) -> impl Fn(RequestContext) -> BoxedHandlerFuture + Clone + 'static {
+    move |ctx: RequestContext| {
+        let state = Arc::clone(&state);
+        Box::pin(async move {
+            Ok(handle_prefix(
+                &state.settings,
+                state.registry.platform(),
+                &ctx.into_request(),
+            ))
         })
     }
 }
@@ -970,9 +1003,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         // Routes chosen by the settings, so not in the fixed table.
         let routes = prefix_routes(&state.settings);
         if !routes.is_empty() {
-            let attestation = make_handler(Arc::clone(&state), |s, _services, req| async move {
-                Ok(handle_prefix(&s.settings, s.registry.platform(), &req))
-            });
+            let attestation = attestation_route_handler(Arc::clone(&state));
             for route in &routes {
                 for method in publisher_fallback_methods() {
                     if matches!(method, Method::GET | Method::HEAD) || route.every_method {
@@ -1354,6 +1385,25 @@ mod tests {
         );
     }
 
+    /// `[analytics]` selecting a module still loads on this adapter, which
+    /// sends no auction telemetry, and startup says so.
+    #[test]
+    fn startup_logs_that_this_adapter_sends_no_auction_telemetry() {
+        let settings = Settings::from_toml(&format!(
+            "{}\n{}",
+            trusted_server_core::test_support::tests::crate_test_settings_str(),
+            trusted_server_core::test_support::template::documented_block("[analytics]")
+        ))
+        .expect("should load settings selecting the documented analytics module");
+
+        build_state_with_settings(settings).expect("should accept a selected analytics module");
+
+        assert!(
+            UNSENT_ANALYTICS_LOGGED.load(std::sync::atomic::Ordering::Relaxed),
+            "startup should log that this adapter sends no auction telemetry"
+        );
+    }
+
     /// A response core makes private loses the policy core wrote in the
     /// Workers header and carries the private policy, and keeps that header
     /// where the origin sent it, which is a fetch middleware's to remove. The
@@ -1454,6 +1504,7 @@ mod tests {
                 "ad-tag.google",
                 "ad-tag.google.diagnostics",
                 "ads-txt.iabtl",
+                "headers.geo",
                 "51degrees",
                 "analytics.tinybird",
                 "auction-protocol.openrtb",
