@@ -3289,7 +3289,7 @@ mod tests {
                 .body(Body::empty())
                 .expect("should build request");
             let mut response = block_on(super::dispatch_fallback(&state, &services, request));
-            crate::middleware::apply_finalize_headers(&state.settings, None, &mut response);
+            crate::middleware::apply_finalize_headers(&state.settings, &mut response);
             response
         };
         let tag = |response: &Response| {
