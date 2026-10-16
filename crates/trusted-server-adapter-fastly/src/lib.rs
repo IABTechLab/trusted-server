@@ -90,8 +90,8 @@ fn open_trusted_server_config_store(store_name: &str) -> Result<ConfigStoreHandl
 /// Chooses the app-config blob that serves this request.
 ///
 /// A `__KEY` selector that carries the host placeholder names a blob for each
-/// host, so the key is the selector with this request's host in it. Any
-/// other selector is the key as it stands.
+/// host, so the key is the selector with this request's host in it, and only
+/// then is `Host` read. Any other selector is the key as it stands.
 ///
 /// # Errors
 ///
@@ -101,7 +101,11 @@ fn stores_for_request(
     stores: RuntimeStoreConfig,
     req: &FastlyRequest,
 ) -> Result<RuntimeStoreConfig, config_selection::Refusal> {
-    let host = req.get_header_str(header::HOST.as_str());
+    let host = if stores.config_key.contains(config_selection::HOST_PLACEHOLDER) {
+        request_host(req)
+    } else {
+        None
+    };
     let resolved = config_selection::resolve_key(&stores.config_key, host, |key| {
         config_selection::blob_exists(stores.config_store_name.as_ref(), key)
     });
@@ -111,7 +115,9 @@ fn stores_for_request(
             ..stores
         }),
         Err(refusal) => {
-            let named = host.unwrap_or_default();
+            let named = req
+                .get_header_str_lossy(header::HOST.as_str())
+                .unwrap_or_default();
             match &refusal {
                 config_selection::Refusal::NoConfigForHost => log::warn!(
                     "no app-config blob for host {named:?} under key selector `{}`",
@@ -126,6 +132,16 @@ fn stores_for_request(
             Err(refusal)
         }
     }
+}
+
+/// The request's `Host` header as text, or `None` when it is absent or its
+/// bytes are not valid UTF-8.
+///
+/// Read with `get_header`, because `get_header_str` panics on a value that is
+/// not UTF-8 and a client chooses the bytes of `Host`.
+fn request_host(req: &FastlyRequest) -> Option<&str> {
+    req.get_header(header::HOST.as_str())
+        .and_then(|value| core::str::from_utf8(value.as_bytes()).ok())
 }
 
 /// The answer to a request no app-config blob serves.
@@ -1082,7 +1098,8 @@ pub(crate) async fn derive_device_signals(
 /// it is converted.
 ///
 /// The scheme is `https` when the entry point marked the request as arriving
-/// over TLS, which it does from Fastly's own TLS metadata.
+/// over TLS, which it does from Fastly's own TLS metadata. A `Host` that is
+/// not UTF-8 is shown as no host.
 fn entry_request(req: &FastlyRequest) -> ModuleRequest<'_> {
     let scheme = if req.get_header_str("fastly-ssl").is_some() {
         "https"
@@ -1091,8 +1108,7 @@ fn entry_request(req: &FastlyRequest) -> ModuleRequest<'_> {
     };
     ModuleRequest::new(
         req.get_method(),
-        req.get_header_str(header::HOST.as_str())
-            .unwrap_or_default(),
+        request_host(req).unwrap_or_default(),
         scheme,
         req.get_path(),
     )
@@ -1376,6 +1392,76 @@ mod tests {
             response.get_status(),
             fastly::http::StatusCode::INTERNAL_SERVER_ERROR,
             "should not answer 421 while the host's blob is unknown"
+        );
+    }
+
+    /// A `Host` header whose bytes are not valid UTF-8.
+    const HOST_NOT_UTF8: &[u8] = b"\xffa.example";
+
+    /// A request whose `Host` header is [`HOST_NOT_UTF8`].
+    fn request_with_host_not_utf8() -> FastlyRequest {
+        let mut req = request_for_host(None);
+        req.set_header(header::HOST.as_str(), HOST_NOT_UTF8);
+        req
+    }
+
+    #[test]
+    fn a_host_that_is_not_utf8_is_refused_without_a_panic() {
+        let refusal = stores_for_request(
+            stores_with_selector("{host}"),
+            &request_with_host_not_utf8(),
+        )
+        .expect_err("should refuse a Host that is not UTF-8");
+
+        assert_eq!(
+            refusal,
+            config_selection::Refusal::NoConfigForHost,
+            "should take a Host that is not UTF-8 as no host"
+        );
+        assert_eq!(
+            refusal_response(&refusal).get_status(),
+            fastly::http::StatusCode::MISDIRECTED_REQUEST,
+            "should answer 421"
+        );
+    }
+
+    #[test]
+    fn a_fixed_selector_does_not_read_the_host() {
+        let resolved = stores_for_request(
+            stores_with_selector("site_a"),
+            &request_with_host_not_utf8(),
+        )
+        .expect("should serve a fixed selector whatever the Host");
+
+        assert_eq!(
+            resolved.config_key, "site_a",
+            "a service that reads one blob should read it without reading Host"
+        );
+    }
+
+    #[test]
+    fn a_module_is_shown_no_host_where_host_is_not_utf8() {
+        let settings = test_settings();
+        let services = build_finalize_services(&settings, Arc::new(UnavailableKvStore));
+        let registered: Arc<dyn DeviceModule> = Arc::new(MarkedDeviceModule);
+        let mut req = page_request();
+        req.set_header(header::HOST.as_str(), HOST_NOT_UTF8);
+        // A selector without the placeholder serves the request without
+        // reading Host, so the request goes on to the module request.
+        stores_for_request(stores_with_selector("site_a"), &req)
+            .expect("should serve a fixed selector whatever the Host");
+
+        let signals = futures::executor::block_on(derive_device_signals(
+            &settings,
+            Some(registered),
+            &req,
+            &services,
+        ));
+
+        assert_eq!(
+            signals.platform_class.as_deref(),
+            Some("marked:example_width=1280:https:///article?page=2"),
+            "a module should be shown no host where the Host header is not UTF-8"
         );
     }
 
