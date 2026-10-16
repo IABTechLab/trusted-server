@@ -2,7 +2,8 @@
 //! the build script writes.
 //!
 //! A module of the build script and of the tests in `src/attestation.rs`,
-//! which check what a schedule may hold.
+//! which check what a schedule may hold. Both also hold `signing_key.rs` as
+//! `signing_key`, which reads each key the way the signer does.
 
 /// The source of the `ATTESTATION_KEYS` constant for the text of a key
 /// schedule, or of an empty schedule for `None`.
@@ -14,13 +15,14 @@
 /// A key id and a key may hold only letters, digits and `-_.:+/=`. Each is
 /// written into Rust source as a string, so nothing a schedule holds can end
 /// the string it is written in. No two lines share a key id or a start, so
-/// one key is in force at any second and a key id names one key.
+/// one key is in force at any second and a key id names one key. Each key
+/// must be one the signer can read, however late it starts.
 ///
 /// # Errors
 ///
-/// Returns the number of the first line of any other shape, or of the first
-/// that repeats an earlier line's key id or start, and what is wrong with it.
-/// The line itself is never repeated, because it holds a private key.
+/// Returns the number of the first line of any other shape, of the first
+/// that repeats an earlier line's key id or start, or of the first whose key
+/// cannot sign, and what is wrong with it. The key itself is never repeated.
 pub(crate) fn constant_source(schedule: Option<&str>) -> Result<String, String> {
     let mut source = String::from("const ATTESTATION_KEYS: &[(&str, i64, &str)] = &[");
     let mut seen: Vec<(usize, &str, i64)> = Vec::new();
@@ -52,6 +54,11 @@ pub(crate) fn constant_source(schedule: Option<&str>) -> Result<String, String> 
         if let Some((earlier, _, _)) = seen.iter().find(|(_, _, start)| *start == starts_at) {
             return Err(format!(
                 "line {number} should not start at the same second as line {earlier}"
+            ));
+        }
+        if let Err(reason) = super::signing_key::read(private_key) {
+            return Err(format!(
+                "line {number} holds key `{key_id}`, which cannot sign, as {reason}"
             ));
         }
         seen.push((number, *key_id, starts_at));

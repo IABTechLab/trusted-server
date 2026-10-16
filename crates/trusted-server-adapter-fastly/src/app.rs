@@ -2135,6 +2135,7 @@ mod tests {
         for path in [
             "/_ts/admin/keys/rotate",
             "/_ts/admin/keys/deactivate",
+            "/_ts/admin/cache/purge",
             "/admin/keys/rotate",
             "/admin/keys/deactivate",
         ] {
@@ -2183,6 +2184,10 @@ mod tests {
             "/admin/keys/rotate/extra".to_owned(),
             "/admin/keys%2Frotate".to_owned(),
             "/admin%2fkeys/rotate".to_owned(),
+            // Multi-encoded separators survive a single decode, so the reservation
+            // decodes to a fixed point before the publisher fallback runs.
+            "/admin%252Fkeys/rotate".to_owned(),
+            "/_ts%252Fadmin/ec".to_owned(),
         ] {
             for method in [Method::GET, Method::POST] {
                 let request = request_builder()
@@ -3226,6 +3231,118 @@ mod tests {
         assert!(
             !response.headers().contains_key(header::CONTENT_LENGTH),
             "processed streaming publisher responses must not carry a stale Content-Length"
+        );
+    }
+
+    /// `/robots.txt` is the publisher path's, streamed against an origin that
+    /// answers each request in turn. A `GET` has the origin's file replaced
+    /// by the refusal, a `HEAD` has the file made where the origin has none
+    /// and gets no body, and a `POST` keeps the origin's `404`, because a
+    /// file is made only for a `GET` or a `HEAD`. Finalizing gives each the
+    /// refusal's `X-Robots-Tag`, the file's own answer included.
+    #[test]
+    fn robots_txt_is_served_through_the_publisher_path_with_its_tag() {
+        use trusted_server_core::platform::test_support::{
+            StubHttpClient, build_services_with_http_client,
+        };
+
+        let settings = Settings::from_toml(
+            r#"
+            [publisher]
+            domain = "test-publisher.com"
+            cookie_domain = ".test-publisher.com"
+            origin_url = "https://origin.test-publisher.com"
+            proxy_secret = "unit-test-proxy-secret"
+
+            [ec]
+            module = "hmac"
+
+            [ec.hmac]
+            passphrase = "test-secret-key-32-bytes-minimum"
+
+            [geo]
+            assume_single_jurisdiction = true
+
+            [request_signing]
+            enabled = false
+
+            [robots-txt]
+            modules = "refuse_all"
+            always_allow = ["/ads.txt"]
+
+            [[fetch]]
+            media_type = "text/plain"
+            path = "/robots.txt"
+            middleware = ["robots_txt"]
+            "#,
+        )
+        .expect("should parse robots.txt test settings");
+        let state = build_state_from_settings(settings).expect("should build state");
+        let origin = Arc::new(StubHttpClient::new());
+        origin.push_response_with_headers(
+            200,
+            b"User-agent: *\nAllow: /\n".to_vec(),
+            vec![("content-type", "text/plain")],
+        );
+        for _ in 0..2 {
+            origin.push_response_with_headers(
+                404,
+                b"<html><body>not found</body></html>".to_vec(),
+                vec![("content-type", "text/html")],
+            );
+        }
+        let services =
+            build_services_with_http_client(Arc::clone(&origin) as Arc<dyn PlatformHttpClient>);
+        let served = |method: Method| {
+            let request = request_builder()
+                .method(method)
+                .uri("https://test-publisher.com/robots.txt")
+                .header(header::HOST, "test-publisher.com")
+                .body(Body::empty())
+                .expect("should build request");
+            let mut response = block_on(super::dispatch_fallback(&state, &services, request));
+            crate::middleware::apply_finalize_headers(&state.settings, None, &mut response);
+            response
+        };
+        let tag = |response: &Response| {
+            response
+                .headers()
+                .get("x-robots-tag")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+        let body = |response: Response| {
+            let bytes = block_on(response.into_body().into_bytes_bounded(1024 * 1024))
+                .expect("should read the body");
+            String::from_utf8(bytes.to_vec()).expect("the body is text")
+        };
+
+        let get = served(Method::GET);
+        assert_eq!(get.status(), StatusCode::OK);
+        assert_eq!(tag(&get).as_deref(), Some("noindex, nofollow"));
+        assert_eq!(body(get), "User-agent: *\nAllow: /ads.txt\nDisallow: /\n");
+
+        let head = served(Method::HEAD);
+        assert_eq!(
+            head.status(),
+            StatusCode::OK,
+            "the file is made where the origin has none"
+        );
+        assert_eq!(tag(&head).as_deref(), Some("noindex, nofollow"));
+        assert_eq!(body(head), "", "a HEAD gets no body");
+
+        let post = served(Method::POST);
+        assert_eq!(
+            post.status(),
+            StatusCode::NOT_FOUND,
+            "a file is made only for a GET or a HEAD"
+        );
+        assert_eq!(tag(&post).as_deref(), Some("noindex, nofollow"));
+
+        assert_eq!(
+            origin.recorded_request_methods(),
+            ["GET", "HEAD", "POST"],
+            "each request reaches the origin"
         );
     }
 
