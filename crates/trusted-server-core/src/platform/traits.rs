@@ -202,9 +202,7 @@ pub trait PlatformGeo: Send + Sync {
 ///
 /// Core builds the call in one place, `locate_request` on `dyn GeoModule`,
 /// so every path that asks for a location hands the module the same
-/// evidence. The Fastly adapter's finalize paths are the exception: no
-/// headers survive to them, and they call the host's own lookup through
-/// `PlatformGeoModule`, never a module from the registry.
+/// evidence. No path asks again when a response is finished.
 ///
 /// Uses `#[async_trait(?Send)]` for the same reason as [`PlatformGeo`].
 #[async_trait::async_trait(?Send)]

@@ -445,7 +445,6 @@ mod tests {
                 store_idle: Duration::from_secs(60),
             },
             memory_entries: 8,
-            detachable: false,
         }
     }
 

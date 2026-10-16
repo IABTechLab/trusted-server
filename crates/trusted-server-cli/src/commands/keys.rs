@@ -26,10 +26,8 @@ use trusted_server_core::request_signing::{kid_is_creatable, kid_is_well_formed}
 use crate::fastly_cli::{FastlyProcess, FastlyRunner};
 
 /// How the `fastly` CLI begins its report that the API found nothing at the
-/// address it was asked for.
-///
-/// Only the test fake is known to produce this wording. No recorded run of the
-/// `fastly` CLI has, and the live check saw `401` alone.
+/// address it was asked for. Versions 15.1.0 and 16.1.0 print it for a missing
+/// config store, config store entry, secret store and secret store entry.
 const API_NOT_FOUND: &str = "the Fastly API returned 404";
 
 /// The entries of the config store that are not keys. A key named as one of
@@ -483,8 +481,28 @@ mod tests {
             .find_map(|arg| arg.strip_prefix(name)?.strip_prefix('='))
     }
 
+    /// What `fastly` 15.1.0 and 16.1.0 print on standard error when the API
+    /// finds no config store or entry, and no secret store or secret.
+    const RECORDED_CONFIG_404: &str = "ERROR: the Fastly API returned 404 Not Found: Record \
+                                       not found.\n\nIf you believe this error is the result \
+                                       of a bug, please file an issue: \
+                                       https://github.com/fastly/cli/issues/new?labels=bug&\
+                                       template=bug_report.md";
+    const RECORDED_SECRET_404: &str = "ERROR: the Fastly API returned 404 Not Found: Not \
+                                       Found (not found).\n\nIf you believe this error is the \
+                                       result of a bug, please file an issue: \
+                                       https://github.com/fastly/cli/issues/new?labels=bug&\
+                                       template=bug_report.md";
+
+    /// The failure the runner reports for a recorded 404, `what` saying
+    /// which store was asked.
     fn not_found(what: &str) -> String {
-        format!("`fastly` failed: ERROR: the Fastly API returned 404 Not Found: {what}")
+        let recorded = if what.contains("secret") {
+            RECORDED_SECRET_404
+        } else {
+            RECORDED_CONFIG_404
+        };
+        format!("`fastly` failed: {recorded}")
     }
 
     impl FastlyRunner for FakeFastly {
@@ -530,11 +548,18 @@ mod tests {
                         .ok_or_else(|| not_found("no such entry"))
                 }
                 ("secret-store-entry", "create") => {
+                    // The API refuses to create a secret under a name the
+                    // store holds, and replaces one only when asked to with
+                    // `--recreate` or `--recreate-allow`.
                     let name = flag(args, "--name").unwrap_or_default();
-                    self.secrets
-                        .lock()
-                        .expect("should lock")
-                        .insert(name.to_owned(), stdin.unwrap_or_default().to_owned());
+                    let mut secrets = self.secrets.lock().expect("should lock");
+                    let replace = args
+                        .iter()
+                        .any(|arg| arg == "--recreate" || arg == "--recreate-allow");
+                    if secrets.contains_key(name) && !replace {
+                        return Err(format!("`fastly` failed: ERROR: secret `{name}` exists"));
+                    }
+                    secrets.insert(name.to_owned(), stdin.unwrap_or_default().to_owned());
                     Ok(String::new())
                 }
                 ("secret-store-entry", "delete") => {
@@ -713,6 +738,61 @@ mod tests {
 
         assert!(error.contains("already exists"), "{error}");
         assert_eq!(fake.config("current-kid").as_deref(), Some("ts-old"));
+    }
+
+    /// A secret stored under the new key's id with no public key beside it,
+    /// as a half finished rotation can leave one, is never replaced. The
+    /// command asks only to create, the create is refused, and nothing is
+    /// written to the config store.
+    #[test]
+    fn rotate_never_replaces_a_secret_stored_under_the_new_kid() {
+        let fake = two_keys();
+        fake.add_secret("ts-orphan");
+
+        rotate(&fake, Some("ts-orphan")).expect_err("should refuse to replace the secret");
+
+        assert_eq!(
+            fake.secrets
+                .lock()
+                .expect("should lock")
+                .get("ts-orphan")
+                .map(String::as_str),
+            Some("private"),
+            "the stored secret must be left as it was"
+        );
+        let writes = fake.writes();
+        assert!(
+            writes
+                .iter()
+                .all(|call| call.args[0] == "secret-store-entry"),
+            "nothing may be written to the config store: {writes:?}"
+        );
+        assert!(
+            writes
+                .iter()
+                .flat_map(|call| &call.args)
+                .all(|arg| arg != "--recreate" && arg != "--recreate-allow"),
+            "the command must never ask fastly to replace a secret: {writes:?}"
+        );
+        assert_eq!(fake.config("current-kid").as_deref(), Some("ts-new"));
+    }
+
+    /// The wording the stores read a missing entry from is what the real CLI
+    /// prints, for the config store and for the secret store.
+    #[test]
+    fn the_recorded_404_of_the_real_cli_reads_as_not_found() {
+        for recorded in [RECORDED_CONFIG_404, RECORDED_SECRET_404] {
+            assert!(recorded.contains(API_NOT_FOUND), "{recorded}");
+        }
+    }
+
+    /// The value is read from the fields `fastly config-store-entry describe
+    /// --json` prints in 15.1.0 and 16.1.0, here with made up values.
+    #[test]
+    fn the_value_is_read_from_the_fields_the_real_cli_prints() {
+        let answer = r#"{"created_at":"2026-01-01T00:00:00Z","deleted_at":null,"item_key":"current-kid","item_value":"ts-new","store_id":"examplestoreid","updated_at":"2026-01-01T00:00:00Z"}"#;
+
+        assert_eq!(item_value(answer, "current-kid"), Ok("ts-new".to_owned()));
     }
 
     #[test]

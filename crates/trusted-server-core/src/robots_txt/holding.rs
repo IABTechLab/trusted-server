@@ -1,9 +1,10 @@
 //! Each contributor's answer, held between requests by the loading cache.
 //!
 //! A contributor's answer is loaded through
-//! [`RuntimeServices::load_cached`], so the contributor is asked once however
-//! many requests want its rules at the same moment, and the copy in the host's
-//! shared store answers every instance until the contributor's refresh is due.
+//! [`RuntimeServices::load_cached`], so requests that share the cache's memory
+//! copy and want its rules at the same moment ask the contributor once, and
+//! the copy in the host's shared store answers every instance until the
+//! contributor's refresh is due.
 //!
 //! The last answer a contributor gave is also kept apart from the cache, for
 //! far longer than any refresh, and read only when the contributor fails. It is
@@ -14,6 +15,10 @@
 //! A value cache may drop it sooner, so on such a host a copy past its age is
 //! likely to be there rather than certain, and a key-value store that cannot
 //! give an entry a lifetime keeps it until it is deleted there.
+//!
+//! An answer is held for the host the contributor was asked for, as well as
+//! for the publisher and the contributor's settings, so one host's answer is
+//! never served for another.
 
 use core::time::Duration;
 use std::sync::Arc;
@@ -49,15 +54,11 @@ const DEFAULT_LIFETIMES: CacheLifetimes = CacheLifetimes {
 
 /// The cache contributors' answers are held in, with the lifetimes
 /// `[cache.robots-txt]` sets.
-///
-/// Its loads run in the caller, because a contributor may block the thread it
-/// runs on while it asks its service.
 pub(crate) fn cache_spec(settings: &Settings) -> CacheSpec {
     CacheSpec {
         name: CACHE,
         lifetimes: settings.cache.robots_txt.lifetimes(DEFAULT_LIFETIMES),
         memory_entries: 64,
-        detachable: false,
     }
 }
 
@@ -77,17 +78,20 @@ pub(crate) async fn contribution_for(
     settings: &Settings,
 ) -> Result<Contribution, Report<TrustedServerError>> {
     let prefix = services.server_key_prefix();
-    let held = held_key(id, &contributor.fingerprint());
+    let held = held_key(id, request.view().host(), &contributor.fingerprint());
     let key = StoreKey::new(prefix, CACHE, held.clone());
     let kept = StoreKey::new(prefix, KEPT, held);
     let spec = cache_spec(settings);
+    // The answer is served to every crawler, so the contributor's services
+    // carry nothing of the connection that asked.
+    let services_handed = services.clone().without_connection();
     let ask = || {
         load(
             Ask {
                 id,
                 contributor: Arc::clone(contributor),
                 request: request.clone(),
-                services: services.clone(),
+                services: services_handed.clone(),
             },
             kept.clone(),
         )
@@ -153,8 +157,8 @@ async fn held_answer(
     })
 }
 
-/// What a load owns to ask one contributor, because it may outlive the
-/// request that started it.
+/// What a load owns to ask one contributor, because the cache keeps the load
+/// with its key rather than borrowing the request.
 struct Ask {
     /// The name the contributor was declared under.
     id: &'static str,
@@ -178,7 +182,9 @@ fn load(ask: Ask, kept: StoreKey) -> Loader {
             let contribution = contributor
                 .contribute(context.call(id, contributor.required_permissions()))
                 .await
-                .map_err(|report| LoadError::new(format!("{report:?}")))?;
+                .map_err(|report| {
+                    LoadError::new(addresses_cut_to_their_host(&format!("{report:?}")))
+                })?;
             let bytes = serde_json::to_vec(&contribution)
                 .map_err(|error| LoadError::new(format!("the answer cannot be held: {error}")))?;
             keep_answer(&services, &kept, &bytes).await;
@@ -187,13 +193,45 @@ fn load(ask: Ask, kept: StoreKey) -> Loader {
     })
 }
 
-/// The key one contributor's answer for one fingerprint is held under, a hash
-/// so the fingerprint's contents, whatever they are, never appear in a store.
-fn held_key(id: &str, fingerprint: &str) -> String {
+/// `text` with every address in it cut to its scheme and host, because what
+/// a contributor reports is written to the log, and the path, query or user
+/// part of an address it names may carry a key.
+fn addresses_cut_to_their_host(text: &str) -> String {
+    let mut cut = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("://") {
+        let (before, address) = rest.split_at(at + "://".len());
+        cut.push_str(before);
+        // An address ends where white space or a quote does, so whatever
+        // else follows the host is dropped with it.
+        let end = address
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '`' | '\\'))
+            .unwrap_or(address.len());
+        let authority = address[..end]
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or_default();
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        cut.push_str(host);
+        rest = &address[end..];
+    }
+    cut.push_str(rest);
+    cut
+}
+
+/// The key one contributor's answer for one host and one fingerprint is held
+/// under, a hash so the fingerprint's contents, whatever they are, never
+/// appear in a store. The publisher is the key's prefix.
+fn held_key(id: &str, host: &str, fingerprint: &str) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(id.as_bytes());
-    hasher.update(b"\n");
-    hasher.update(fingerprint.as_bytes());
+    for part in [host, id, fingerprint] {
+        // Each part with its length, so that no two different sets of parts
+        // run together into the same bytes.
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
     let mut key = String::with_capacity(64);
     for byte in hasher.finalize() {
         key.push_str(&format!("{byte:02x}"));
@@ -397,6 +435,99 @@ pub(crate) mod tests {
         assert_eq!(answer, rules(ECHOED));
     }
 
+    /// Host signals about a reader, as a host that computes them gives each
+    /// request.
+    #[derive(Debug)]
+    struct ReaderSignals;
+
+    impl crate::evidence::HostSignals for ReaderSignals {
+        fn ja4(&self) -> Option<&str> {
+            Some("t13d1516h2_reader")
+        }
+
+        fn h2(&self) -> Option<&str> {
+            Some("1:65536|reader")
+        }
+    }
+
+    /// A contributor whose rules name what its services say about the
+    /// reader, so a test can see whether any of it arrived.
+    #[derive(Debug)]
+    struct ReaderEcho;
+
+    impl ReaderEcho {
+        fn rules(&self, services: Option<&RuntimeServices>) -> Contribution {
+            let client = services.map(RuntimeServices::client_info);
+            let ip = client
+                .and_then(|client| client.client_ip)
+                .map_or_else(|| "no-ip".to_owned(), |ip| ip.to_string());
+            let ja4 = client
+                .and_then(|client| client.tls_ja4.as_deref())
+                .unwrap_or("no-ja4");
+            let signals = if services.is_some_and(|services| services.host_signals().is_some()) {
+                "signals"
+            } else {
+                "no-signals"
+            };
+            rules(&format!(
+                "User-Agent: ReaderBot\nDisallow: /{ip}/{ja4}/{signals}"
+            ))
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl RobotsTxtContributor for ReaderEcho {
+        fn refresh(&self) -> Duration {
+            Duration::from_secs(60)
+        }
+
+        fn fingerprint(&self) -> String {
+            "reader".to_owned()
+        }
+
+        async fn contribute(
+            &self,
+            call: ModuleCall<'_>,
+        ) -> Result<Contribution, Report<TrustedServerError>> {
+            Ok(call.inject(self, Self::rules)?)
+        }
+    }
+
+    /// One load answers every crawler, so the contributor is handed nothing
+    /// of the reader whose request asks first, being the client's address,
+    /// its connection details and the host's signals about it.
+    #[tokio::test]
+    async fn the_contributor_is_handed_nothing_of_the_reader_who_asks_first() {
+        let reading: Arc<dyn RobotsTxtContributor> = Arc::new(ReaderEcho);
+        let services = crate::platform::RuntimeServices::builder()
+            .config_store(Arc::new(crate::platform::test_support::NoopConfigStore))
+            .secret_store(Arc::new(crate::platform::test_support::NoopSecretStore))
+            .kv_store(Arc::new(MemoryKvStore::default()))
+            .backend(Arc::new(crate::platform::test_support::NoopBackend))
+            .http_client(Arc::new(StubHttpClient::new()))
+            .geo(Arc::new(crate::platform::PlatformGeoModule::new(
+                "noop",
+                Arc::new(crate::platform::test_support::NoopGeo),
+            )))
+            .client_info(crate::platform::ClientInfo {
+                client_ip: Some(std::net::IpAddr::from([203, 0, 113, 7])),
+                tls_ja4: Some("t13d1516h2_reader".to_owned()),
+                ..crate::platform::ClientInfo::default()
+            })
+            .host_signals(Arc::new(ReaderSignals))
+            .build()
+            .with_loading_cache(Arc::new(MemoryLoadingCache::default()));
+
+        let answer = contribution_for("reader", &reading, &request(), &services, &settings())
+            .await
+            .expect("should ask the contributor");
+
+        assert_eq!(
+            answer,
+            rules("User-Agent: ReaderBot\nDisallow: /no-ip/no-ja4/no-signals")
+        );
+    }
+
     /// A store held in memory for the life of one test, so that what one
     /// instance wrote is what the next one reads.
     #[derive(Debug, Default)]
@@ -486,9 +617,12 @@ pub(crate) mod tests {
         .with_prefixes(trusted_server_for("www.publisher.example"))
     }
 
+    /// The publisher the tests hold answers for.
+    pub(crate) const PUBLISHER: &str = "www.publisher.example";
+
     pub(crate) fn settings() -> Settings {
         let mut settings = crate::test_support::tests::create_test_settings();
-        settings.publisher.domain = "www.publisher.example".to_owned();
+        settings.publisher.domain = PUBLISHER.to_owned();
         settings
     }
 
@@ -599,6 +733,44 @@ pub(crate) mod tests {
         };
 
         assert_keys_follow_the_publisher(keys_for);
+    }
+
+    /// One deployment may serve several hosts, and each is answered for
+    /// itself.
+    #[tokio::test]
+    async fn an_answer_is_held_for_the_host_it_was_asked_for() {
+        let scripted = Arc::new(Scripted::new(vec![
+            Ok(rules("User-Agent: OneBot\nDisallow: /")),
+            Ok(rules("User-Agent: TwoBot\nDisallow: /")),
+        ]));
+        let services = services_with(Arc::default(), Arc::default());
+        let other_host = http::Request::builder()
+            .uri("/robots.txt")
+            .header(http::header::HOST, "other.publisher.example")
+            .body(EdgeBody::empty())
+            .expect("should build the request");
+
+        contribution_for(
+            "a",
+            &contributor(&scripted),
+            &request(),
+            &services,
+            &settings(),
+        )
+        .await
+        .expect("should ask the contributor");
+        let for_other_host = contribution_for(
+            "a",
+            &contributor(&scripted),
+            &ResolvedRequest::of(&other_host, &crate::platform::ClientInfo::default()),
+            &services,
+            &settings(),
+        )
+        .await
+        .expect("should ask for the other host");
+
+        assert_eq!(for_other_host, rules("User-Agent: TwoBot\nDisallow: /"));
+        assert_eq!(scripted.times_asked(), 2, "each host is asked for");
     }
 
     #[tokio::test]
@@ -796,6 +968,38 @@ pub(crate) mod tests {
         assert_eq!(scripted.times_asked(), 2);
     }
 
+    /// What a contributor reports when it fails is written to the log, so an
+    /// address it names keeps only its scheme and host, and a key in the
+    /// path, the query or the user part is not written.
+    #[tokio::test]
+    async fn a_failure_gives_only_the_host_of_an_address_it_names() {
+        let scripted = Arc::new(Scripted::new(vec![Err(
+            "GET https://user:secret-password@rules.example:8443/v1/secret-in-path/rules\
+             ?licence=secret-in-query#secret-in-fragment failed, and \"http://other.example/\
+             secret-in-quotes\" too"
+                .to_owned(),
+        )]));
+        let services = services_with(Arc::default(), Arc::default());
+
+        let error = contribution_for(
+            "a",
+            &contributor(&scripted),
+            &request(),
+            &services,
+            &settings(),
+        )
+        .await
+        .expect_err("with nothing kept the failure is an error");
+        let logged = format!("{error:?}");
+
+        assert!(
+            logged.contains("GET https://rules.example:8443 failed, and"),
+            "{logged}"
+        );
+        assert!(logged.contains("http://other.example"), "{logged}");
+        assert!(!logged.contains("secret"), "{logged}");
+    }
+
     /// A held copy that no longer reads is removed and the contributor asked
     /// again, rather than every request failing until the copy ends.
     #[tokio::test]
@@ -809,7 +1013,7 @@ pub(crate) mod tests {
         let key = StoreKey::new(
             services.server_key_prefix(),
             CACHE,
-            held_key("a", &scripted.fingerprint()),
+            held_key("a", PUBLISHER, &scripted.fingerprint()),
         );
         services
             .load_cached(
@@ -937,10 +1141,22 @@ pub(crate) mod tests {
 
     #[test]
     fn the_key_carries_nothing_of_the_fingerprint() {
-        let key = held_key("a", "license=secret-value");
+        let key = held_key("a", "crawled.example", "license=secret-value");
 
         assert_eq!(key.len(), 64);
-        assert!(!key.contains("secret"), "{key}");
-        assert_ne!(key, held_key("b", "license=secret-value"));
+        for part in ["crawled.example", "secret"] {
+            assert!(!key.contains(part), "{key} should not hold {part}");
+        }
+        assert_ne!(
+            key,
+            held_key("b", "crawled.example", "license=secret-value")
+        );
+    }
+
+    #[test]
+    fn parts_that_run_together_do_not_share_a_key() {
+        assert_ne!(held_key("c", "ab", "d"), held_key("bc", "a", "d"));
+        assert_ne!(held_key("ab", "h", "c"), held_key("a", "h", "bc"));
+        assert_ne!(held_key("c", "h", "d"), held_key("c", "other.example", "d"));
     }
 }
