@@ -338,7 +338,7 @@ fn escape_attribute(value: &str) -> String {
 mod tests {
     use super::*;
     use trusted_server_core::html_processor::test_support::{
-        assert_page_is_recorded, page_settings, processed_page,
+        assert_page_is_recorded, page_settings, place_on_every_page, processed_page,
     };
     use trusted_server_core::integrations::{IntegrationDocumentState, IntegrationRegistry};
     use trusted_server_core::middleware::test_support::context;
@@ -967,6 +967,32 @@ mod tests {
                 env!("CARGO_MANIFEST_DIR"),
                 "/src/fixtures/page-change.recorded.html"
             ),
+        );
+    }
+
+    /// Named in `[[serve]]` in place of `[[fetch]]`, the prompt passes the
+    /// registry's check and gives a reader the recorded page, because a page
+    /// with no other middleware gets it in the same place from either phase.
+    #[test]
+    fn placed_in_serve_the_prompt_gives_a_reader_the_recorded_page() {
+        let mut settings = page_settings(include_str!("fixtures/page-change.settings.toml"));
+        settings.fetch = PhaseEntries::default();
+        place_on_every_page(&mut settings, MiddlewarePhase::Serve, &[MODULE]);
+        let registry = IntegrationRegistry::with_registrations(&settings, &[super::builder()])
+            .expect("the registry should accept the prompt in a serve entry");
+
+        let page = processed_page(
+            &settings,
+            &registry,
+            include_str!("fixtures/page-change.input.html"),
+            8192,
+        );
+
+        assert_eq!(page.matches(&loader()).count(), 1, "{page}");
+        assert_eq!(
+            page,
+            include_str!("fixtures/page-change.recorded.html"),
+            "a serve entry should give the reader the page a fetch entry does"
         );
     }
 }
