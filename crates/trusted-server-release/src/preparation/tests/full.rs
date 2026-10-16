@@ -3,7 +3,8 @@
 use super::*;
 use crate::boundary::{DockerSettings, ImageSelection, ProbeProgram};
 use crate::documents::read_bounded;
-use crate::preflight::audit_environment;
+use crate::javascript::JsBuildCompleted;
+use crate::preflight::{AuditedEnvironment, audit_environment};
 use crate::source::{CommitId, authenticate};
 
 fn host_limits() -> ProcessLimits {
@@ -14,9 +15,33 @@ fn host_limits() -> ProcessLimits {
     }
 }
 
-#[test]
-#[ignore = "requires explicit original-only fixture and Linux Docker; run separately in producer CI"]
-fn real_two_fresh_js_builds() {
+/// One real two-build JS fixture run and the authenticated source it built.
+///
+/// Ordinary CI evidence only: the tools, image and fixture acquisition are
+/// unqualified, so nothing here is release qualification.
+pub(crate) struct JsFixtureRun {
+    /// The explicitly supplied fixture root.
+    pub(crate) fixture: PathBuf,
+    /// The audited minimal environment the source was authenticated under.
+    pub(crate) audited: AuditedEnvironment,
+    /// The locally authenticated fixture source.
+    pub(crate) source: ApprovedSource,
+    /// The locked materials derived from that source.
+    pub(crate) locked: LockedMaterials,
+    /// The completed JS handoff of build A.
+    pub(crate) completed: JsBuildCompleted,
+    /// The ordinary CI measurement of both JS builds.
+    pub(crate) measurement: Value,
+}
+
+/// Runs two fresh offline JS builds from the fixture named by
+/// `TS_RELEASE_JS_FIXTURE_ROOT` and returns the retained A handoff.
+///
+/// # Panics
+///
+/// Panics when the fixture is missing or any preparation, boundary or build
+/// step fails; this is an explicit CI fixture, not a production path.
+pub(crate) fn run_two_fresh_js_builds() -> JsFixtureRun {
     let fixture = std::env::var_os("TS_RELEASE_JS_FIXTURE_ROOT")
         .map(PathBuf::from)
         .expect("should explicitly supply original-only fixture root");
@@ -30,13 +55,30 @@ fn real_two_fresh_js_builds() {
             .expect("should retain source identity"),
     )
     .expect("should parse independently selected source identity");
-    let environment =
-        audit_environment(&[(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))])
-            .expect("should audit minimal source environment");
-    let source = authenticate(&fixture.join("source"), &commit, &environment)
+    let audited = audit_environment(&[(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))])
+        .expect("should audit minimal source environment");
+    let source = authenticate(&fixture.join("source"), &commit, &audited)
         .expect("should authenticate fixture tracked source");
     let locked =
         LockedMaterials::from_source(&source).expect("should derive approved locked npm materials");
+    let (completed, measurement) = two_fresh_js_builds(&fixture, &context, &source, &locked);
+    JsFixtureRun {
+        fixture,
+        audited,
+        source,
+        locked,
+        completed,
+        measurement,
+    }
+}
+
+/// Prepares, proves and runs both JS builds, returning the handoff and measurement.
+fn two_fresh_js_builds(
+    fixture: &Path,
+    context: &Value,
+    source: &ApprovedSource,
+    locked: &LockedMaterials,
+) -> (JsBuildCompleted, Value) {
     let cancellation = Cancellation::default();
     let deadline = Instant::now() + Duration::from_secs(3600);
     let originals = locked
@@ -45,8 +87,8 @@ fn real_two_fresh_js_builds() {
     let tools = SelectedJsTools::for_tests(&fixture.join("tools"))
         .expect("should measure ordinary CI candidate tools");
     let prepared = PreparedJsBuild::new(
-        &source,
-        &locked,
+        source,
+        locked,
         &originals,
         tools,
         JsAttempt::new(deadline, cancellation),
@@ -149,7 +191,7 @@ fn real_two_fresh_js_builds() {
     );
     assert_eq!(
         completed.source_commit(),
-        commit.as_str(),
+        source.commit().as_str(),
         "should bind actual approved source"
     );
     assert!(
@@ -186,9 +228,16 @@ fn real_two_fresh_js_builds() {
         "private_roots_removed": owned_roots.len(),
         "release_qualification": false,
     });
+    (completed, measurement)
+}
+
+#[test]
+#[ignore = "requires explicit original-only fixture and Linux Docker; run separately in producer CI"]
+fn real_two_fresh_js_builds() {
+    let run = run_two_fresh_js_builds();
     fs::write(
-        fixture.join("js-execution-measurement.json"),
-        serde_json::to_vec_pretty(&measurement).expect("should encode actual CI measurement"),
+        run.fixture.join("js-execution-measurement.json"),
+        serde_json::to_vec_pretty(&run.measurement).expect("should encode actual CI measurement"),
     )
     .expect("should retain actual CI measurement after successful handoff");
 }

@@ -146,6 +146,7 @@ impl LockedMaterials {
                 index_alias,
                 node_tar_timestamps,
                 local_pax: locked.name == "gulp-wrap" && locked.version == "0.15.0",
+                cargo_package: false,
             },
         )
     }
@@ -176,6 +177,7 @@ impl LockedMaterials {
                 index_alias: false,
                 node_tar_timestamps: false,
                 local_pax: false,
+                cargo_package: true,
             },
         )
     }

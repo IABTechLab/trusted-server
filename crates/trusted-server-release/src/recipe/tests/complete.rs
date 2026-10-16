@@ -476,3 +476,61 @@ fn derived_manifest_digests_are_carried_into_the_completion() {
         "should carry the derived manifest digest so the build stays marked unqualified"
     );
 }
+
+#[test]
+fn candidate_measurements_report_no_release_qualification() {
+    let asset = "trusted-server-fastly.wasm";
+    let kept = wasm_with(&[(".debug_info", b"i"), (".debug_line", b"l")]);
+    let mut built = built_with(asset, Role::A, &kept, true);
+    let stdout = built.stdout(|_| {});
+    let completed = built.finish(stdout).expect("should complete the run");
+
+    let measurement = super::candidate::cargo_measurement(&completed);
+    assert_eq!(
+        measurement["kind"], "ordinary-ci-confined-cargo-build",
+        "should name the candidate kind"
+    );
+    assert_eq!(
+        measurement["release_qualification"], false,
+        "should never claim release qualification"
+    );
+    assert_eq!(measurement["asset"], asset, "should name the asset");
+    assert_eq!(measurement["role"], "A", "should name the role");
+    assert_eq!(
+        measurement["source_commit"], COMMIT,
+        "should bind the commit"
+    );
+    assert_eq!(
+        measurement["artifact"]["sha256"],
+        hex::encode(Sha256::digest(&kept)),
+        "should report the copied artifact digest"
+    );
+    assert_eq!(
+        measurement["artifact"]["size"],
+        kept.len(),
+        "should report the copied artifact size"
+    );
+    assert_eq!(
+        measurement["derived_manifest_digests"], 1,
+        "should count the derived manifests that keep the build unqualified"
+    );
+    for field in ["rust_tools_digest", "materials_digest", "plan_digest"] {
+        assert_eq!(
+            measurement[field].as_str().map(str::len),
+            Some(64),
+            "should report the {field}"
+        );
+    }
+
+    let observed = std::collections::BTreeMap::from([("build-direct".to_owned(), libc::EPERM)]);
+    let denial = super::candidate::denial_measurement(libc::EPERM, &observed, &completed);
+    assert_eq!(
+        denial["attempts"]["build-direct"]["errno"],
+        libc::EPERM,
+        "should report each observed errno"
+    );
+    assert_eq!(
+        denial["release_qualification"], false,
+        "should never claim release qualification"
+    );
+}

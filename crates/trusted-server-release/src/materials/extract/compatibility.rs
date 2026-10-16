@@ -1,4 +1,5 @@
-//! Closed compatibility for authenticated, exact-version npm originals.
+//! Closed compatibility for authenticated, exact-version npm originals and
+//! for the encodings `cargo package` writes into registry crates.
 use super::{field, material_error};
 use crate::error::ReleaseError;
 use error_stack::Report;
@@ -150,4 +151,69 @@ pub(super) fn parse_pax(mut bytes: &[u8]) -> Result<LocalPax, Report<ReleaseErro
         path,
         size: size.parse().map_err(material_error)?,
     })
+}
+
+/// Name field width of a TAR header.
+const HEADER_NAME_WIDTH: usize = 100;
+/// Name `cargo package` gives every GNU long-name record.
+const LONG_NAME_RECORD: &str = "././@LongLink";
+/// File-type bits of a mode field.
+const TYPE_BITS: u32 = 0o170_000;
+
+/// Reads one GNU long-name record as `cargo package` writes it: named
+/// `././@LongLink`, with a plain regular-file mode and no link target, holding
+/// at most `limit` path bytes followed by exactly one NUL.
+pub(super) fn read_long_name<R: std::io::Read>(
+    entry: &mut tar::Entry<'_, R>,
+    limit: usize,
+) -> Result<String, Report<ReleaseError>> {
+    let header = entry.header();
+    let mode = strip_member_type(header.mode().map_err(material_error)?, false)?;
+    if field(&header.as_old().name)? != LONG_NAME_RECORD
+        || !field(&header.as_old().linkname)?.is_empty()
+        || mode & !0o777 != 0
+    {
+        return Err(material_error("unreviewed GNU long-name record header"));
+    }
+    let size = entry.size();
+    if size < 2 || size > limit as u64 + 1 {
+        return Err(material_error("GNU long-name record has an invalid size"));
+    }
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(entry, &mut bytes).map_err(material_error)?;
+    let name = bytes
+        .strip_suffix(b"\0")
+        .filter(|name| bytes.len() as u64 == size && !name.contains(&0))
+        .ok_or_else(|| material_error("GNU long name is not one NUL-terminated path"))?;
+    String::from_utf8(name.to_vec()).map_err(material_error)
+}
+
+/// Joins a long name with the member header it describes.
+///
+/// The header must hold exactly the first 100 bytes of the long name, so a
+/// record can only lengthen the member it precedes, never rename it.
+pub(super) fn join_long_name(
+    long: String,
+    header_name: &str,
+) -> Result<String, Report<ReleaseError>> {
+    let consistent = long.len() > HEADER_NAME_WIDTH
+        && header_name.len() == HEADER_NAME_WIDTH
+        && long.as_bytes().starts_with(header_name.as_bytes());
+    if !consistent {
+        return Err(material_error(
+            "GNU long name does not extend its member's header name",
+        ));
+    }
+    Ok(long)
+}
+
+/// Removes the regular-file or directory type bits older `cargo package`
+/// releases left in the mode field; any other type is rejected.
+pub(super) fn strip_member_type(mode: u32, directory: bool) -> Result<u32, Report<ReleaseError>> {
+    let expected = if directory { 0o040_000 } else { 0o100_000 };
+    match mode & TYPE_BITS {
+        0 => Ok(mode),
+        kind if kind == expected => Ok(mode & !TYPE_BITS),
+        _ => Err(material_error("TAR member mode names another file type")),
+    }
 }

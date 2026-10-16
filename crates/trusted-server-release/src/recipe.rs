@@ -1,10 +1,11 @@
 //! Closed recipe layer for one reproducible Cargo build.
 //!
 //! The recipe validates and binds every input a Cargo execution needs, derives
-//! the exact plan in the build's own path namespace, and parses and copies the
-//! result of a successful run. The execute gate stays closed: it checks the
-//! boundary and plan, then reports the unqualified selection. The real
-//! confined run is wired by a later slice.
+//! the exact plan in the build's own path namespace, runs it confined, and
+//! parses and copies the result of a successful run. Only the test-only
+//! ordinary CI tool selection reaches the run, so every completed build is
+//! unqualified candidate evidence; production execution stays closed until a
+//! toolchain, boundary and image are qualified.
 //!
 //! # Roots
 //!
@@ -15,21 +16,20 @@
 //! copies the executable into it after the run.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use error_stack::Report;
 use sha2::{Digest as _, Sha256};
 
-use crate::boundary::{Boundary, BoundaryRoots, DenialProof};
+use crate::boundary::BoundaryRoots;
 use crate::documents::Role as DocumentRole;
 use crate::error::ReleaseError;
-use crate::inspect::inspect_wasm;
 use crate::javascript::JsBuildCompleted;
 use crate::materials::PreparedCargoMaterials;
-use crate::policy::{FIXED_ARTIFACTS, FixedArtifact, ReleaseTarget};
+#[cfg(test)]
+use crate::policy::ReleaseTarget;
+use crate::policy::{FIXED_ARTIFACTS, FixedArtifact};
 use crate::preflight::AuditedEnvironment;
 use crate::preflight::child::{ChildEnvironment, ChildRequest, child_environment};
-use crate::process::ProcessLimits;
 use crate::source::{ApprovedSource, CommitId, FreshSource};
 use fresh::{
     absent_in_real_parent, disjoint, empty_directory, normal_absolute, prepared_materials,
@@ -40,6 +40,7 @@ mod ambient;
 mod artifact;
 mod cargo_output;
 mod completed;
+mod execute;
 mod fresh;
 mod paths;
 mod plan;
@@ -56,18 +57,13 @@ pub(crate) use plan::CargoPlan;
 )]
 pub(crate) use tools::{Authority, QualifiedRustTools, SelectedRustTools, ToolSelection};
 
-use artifact::{EXECUTABLE_LIMIT, copy_artifact};
-use cargo_output::{ExpectedBinary, locate_host_binary};
-use completed::SuccessFacts;
+#[cfg(test)]
+use execute::RunOutput;
+use execute::retained_tree_digest;
 use plan::{PlanInputs, check_child_state, plan_for};
 
 /// The only released feature variant of every asset.
 const DEFAULT_VARIANT: &str = "default";
-
-/// Wall limit of one Cargo build.
-const BUILD_WALL: Duration = Duration::from_secs(3600);
-/// Captured output limit of each Cargo stream.
-const BUILD_STREAM_MAX: u64 = 64 * 1024 * 1024;
 
 /// Builds a recipe error carrying `message`.
 pub(crate) fn recipe_error(message: impl std::fmt::Display) -> Report<ReleaseError> {
@@ -114,6 +110,20 @@ impl AssetId {
     /// Returns the fixed table row; JSON can never supply its fields.
     pub(crate) fn artifact(&self) -> &'static FixedArtifact {
         self.artifact
+    }
+
+    /// Resolves a Cargo denial fixture member by package name, for tests only.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReleaseError::Recipe`] for any package not in the test rows.
+    #[cfg(test)]
+    pub(crate) fn denial_fixture(package: &str) -> Result<Self, Report<ReleaseError>> {
+        crate::policy::DENIAL_FIXTURE_ARTIFACTS
+            .iter()
+            .find(|artifact| artifact.package == package)
+            .map(|artifact| Self { artifact })
+            .ok_or_else(|| recipe_error(format!("unknown denial fixture member {package:?}")))
     }
 }
 
@@ -245,6 +255,26 @@ impl RecipeRequest {
     pub(crate) fn parse(input: &RecipeInput<'_>) -> Result<Self, Report<ReleaseError>> {
         check_variant(input.variant)?;
         let asset = AssetId::parse(input.asset)?;
+        Self::with_asset(asset, input)
+    }
+
+    /// Parses a request for an already resolved test-only asset; the asset
+    /// text of `input` is ignored.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::parse`], except for the asset name.
+    #[cfg(test)]
+    pub(crate) fn parse_for_asset(
+        asset: AssetId,
+        input: &RecipeInput<'_>,
+    ) -> Result<Self, Report<ReleaseError>> {
+        check_variant(input.variant)?;
+        Self::with_asset(asset, input)
+    }
+
+    /// Validates every field but the asset, which the caller resolved.
+    fn with_asset(asset: AssetId, input: &RecipeInput<'_>) -> Result<Self, Report<ReleaseError>> {
         let role = Role::parse(input.role)?;
         let commit = CommitId::parse(input.commit)?;
         check_roots(input)?;
@@ -331,15 +361,8 @@ pub(crate) struct PreparedRecipe {
     ambient: CheckedAmbient,
     child: ChildEnvironment,
     retained_root: PathBuf,
+    retained_digest: String,
     js: JsFacts,
-}
-
-/// What a successful confined run produced, as the run path reports it.
-struct RunOutput {
-    stdout: Vec<u8>,
-    stderr_sha256: String,
-    started_at_seconds: u64,
-    elapsed: Duration,
 }
 
 impl PreparedRecipe {
@@ -420,6 +443,7 @@ impl PreparedRecipe {
         let retained_root = resolve_js_handoff(completed, &request)?;
         check_fresh_and_disjoint(&request, &ambient, &tools, &materials, &retained_root)?;
         let tools_digest = tools.digest()?;
+        let retained_digest = retained_tree_digest(&retained_root)?;
         create_private_roots(&request)?;
         Ok(Self {
             js: JsFacts {
@@ -434,6 +458,7 @@ impl PreparedRecipe {
             ambient,
             child,
             retained_root,
+            retained_digest,
         })
     }
 
@@ -479,171 +504,6 @@ impl PreparedRecipe {
                 self.request.target_dir.clone(),
             ],
         )
-    }
-
-    /// Requires the tools to be the tree measured at binding.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ReleaseError::Recipe`] when anything under the tool root was
-    /// edited, linked, added or removed.
-    fn check_tools(&self) -> Result<(), Report<ReleaseError>> {
-        if self.tools.digest()? != self.tools_digest {
-            return Err(recipe_error("Rust tools changed after binding"));
-        }
-        Ok(())
-    }
-
-    /// Requires the prepared materials to be unchanged.
-    fn check_materials(&self) -> Result<(), Report<ReleaseError>> {
-        self.materials.rehash().map_err(|error| {
-            error
-                .change_context(ReleaseError::Recipe)
-                .attach("prepared materials changed after binding")
-        })
-    }
-
-    /// Requires unchanged inputs, a derivable plan, the exact planned roots
-    /// and owned descendant cleanup.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ReleaseError::Recipe`] when the tools or materials changed,
-    /// the plan cannot be derived in the boundary's namespace, the boundary
-    /// roots differ from [`Self::boundary_roots`], or the boundary does not
-    /// own descendant cleanup.
-    fn check_boundary(&self, boundary: &Boundary) -> Result<(), Report<ReleaseError>> {
-        self.check_tools()?;
-        self.check_materials()?;
-        self.plan(boundary)?;
-        if !boundary.matches_roots(&self.boundary_roots()?) {
-            return Err(recipe_error(
-                "boundary roots differ from the exact recipe roots",
-            ));
-        }
-        if !boundary.has_owned_descendant_cleanup() {
-            return Err(recipe_error(
-                "boundary does not own descendant cleanup for Cargo build scripts",
-            ));
-        }
-        Ok(())
-    }
-
-    /// Checks every gate, then reports the closed selection.
-    ///
-    /// The confined command is described but never started: the real run is
-    /// wired by a later slice, and no tool selection is qualified.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ReleaseError::Recipe`] when an input, plan, roots or
-    /// descendant cleanup gate fails, then always [`ReleaseError::Unqualified`].
-    pub(crate) fn execute(
-        self,
-        boundary: &Boundary,
-        _proof: &DenialProof,
-    ) -> Result<(), Report<ReleaseError>> {
-        self.check_boundary(boundary)?;
-        self.plan(boundary)?.confined_command(ProcessLimits {
-            wall: BUILD_WALL,
-            stdout_max: BUILD_STREAM_MAX,
-            stderr_max: BUILD_STREAM_MAX,
-        })?;
-        let reason = match self.tools.authority() {
-            Authority::Qualified => "the confined Cargo run is not wired yet",
-            Authority::Unqualified => {
-                "Cargo execution is closed until Rust tools and boundary are qualified"
-            }
-        };
-        Err(Report::new(ReleaseError::Unqualified).attach(reason))
-    }
-
-    /// Turns one successful run into a [`RecipeCompleted`].
-    ///
-    /// Parses Cargo's stream, maps the executable back through a writable
-    /// root, copies it into the output directory and, for Wasm, requires the
-    /// debug sections a stripped module lacks.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ReleaseError::Recipe`] when the tools or materials changed,
-    /// the stream is not exactly one fresh debug-info binary, the executable
-    /// cannot be copied, or a Wasm artifact is stripped, or
-    /// [`ReleaseError::Inspect`] when the Wasm module is rejected.
-    fn complete(
-        self,
-        run: RunOutput,
-        boundary_fingerprint: [u8; 32],
-        paths: &dyn ExecutionPaths,
-    ) -> Result<RecipeCompleted, Report<ReleaseError>> {
-        self.check_tools()?;
-        self.check_materials()?;
-        let plan_digest = self.plan(paths)?.digest()?;
-        let artifact = self.request.asset.artifact();
-        let manifest = paths.execution_path(
-            &self
-                .ambient
-                .checkout_root()
-                .join("crates")
-                .join(artifact.package)
-                .join("Cargo.toml"),
-        )?;
-        let release_dir = paths
-            .execution_path(&self.request.target_dir)?
-            .join(artifact.target.triple())
-            .join("release");
-        let located = locate_host_binary(
-            &run.stdout,
-            &ExpectedBinary {
-                bin: artifact.bin,
-                manifest: &manifest,
-                release_dir: &release_dir,
-            },
-            paths,
-        )?;
-        let copied = copy_artifact(
-            &located.host,
-            &self.request.target_dir,
-            &self.request.output,
-            artifact.name,
-            EXECUTABLE_LIMIT,
-        )?;
-        if artifact.target == ReleaseTarget::Wasm32Wasip1 {
-            let bytes = std::fs::read(copied.path()).map_err(|error| {
-                recipe_error(format!("cannot read the copied artifact: {error}"))
-            })?;
-            if hex::encode(Sha256::digest(&bytes)) != copied.sha256() {
-                return Err(recipe_error("copied artifact changed before inspection"));
-            }
-            inspect_wasm(&bytes)?.require_debug_sections()?;
-        }
-        if self.tools.authority() == Authority::Qualified
-            && !self.materials.derived_manifest_digests().is_empty()
-        {
-            return Err(Report::new(ReleaseError::Unqualified)
-                .attach("a build from derived manifests cannot carry qualified authority"));
-        }
-        RecipeCompleted::record_success(SuccessFacts {
-            asset: self.request.asset,
-            role: self.request.role,
-            commit: self.request.commit.clone(),
-            cargo_lock_sha256: self.materials.cargo_lock_sha256().to_owned(),
-            materials_digest: self.materials.digest().to_owned(),
-            js_inventory_sha256: self.js.inventory_sha256.clone(),
-            js_settings_sha256: self.js.settings_sha256.clone(),
-            js_tools_sha256: self.js.tools_sha256.clone(),
-            rust_tools_digest: self.tools_digest.clone(),
-            boundary_fingerprint,
-            plan_digest,
-            ambient: self.ambient.clone(),
-            started_at_seconds: run.started_at_seconds,
-            elapsed: run.elapsed,
-            stdout: run.stdout,
-            stderr_sha256: run.stderr_sha256,
-            artifact: copied,
-            output_dir: self.request.output.clone(),
-            derived_manifest_digests: self.materials.derived_manifest_digests().clone(),
-        })
     }
 }
 

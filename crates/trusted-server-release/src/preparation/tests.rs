@@ -102,7 +102,7 @@ fn hook_start_does_not_substitute_for_successful_terminal_execution() {
 }
 
 #[cfg(target_os = "linux")]
-mod full;
+pub(crate) mod full;
 
 #[test]
 fn normalization_receipt_cannot_assert_another_native_tool_identity() {

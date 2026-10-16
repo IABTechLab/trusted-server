@@ -54,6 +54,18 @@ pub(crate) struct RecipeCompleted {
     retained: tempfile::TempDir,
 }
 
+impl std::fmt::Debug for RecipeCompleted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RecipeCompleted")
+            .field("asset", &self.facts.asset)
+            .field("role", &self.facts.role)
+            .field("artifact", &self.facts.artifact)
+            .field("plan_digest", &self.facts.plan_digest)
+            .finish_non_exhaustive()
+    }
+}
+
 impl RecipeCompleted {
     /// Records one successful run and retains its Cargo message stream.
     ///

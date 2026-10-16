@@ -2,10 +2,11 @@
 //!
 //! Registry crates come from archives already authenticated against the
 //! approved `Cargo.lock` checksum and extracted under the archive policy.
-//! Git packages come from a verified object closure. Each package becomes
-//! `vendor/<name>-<version>/` with a producer-written `.cargo-checksum.json`
-//! (see [`writer`]). The result is a [`PreparedCargoMaterials`] token whose
-//! digest covers the whole vendor tree.
+//! Git packages come from a verified object closure. Each registry crate
+//! becomes `vendor/<name>-<version>/` and each Git package `vendor/<name>/`
+//! (so sibling paths inside its own workspace still resolve), with a
+//! producer-written `.cargo-checksum.json` (see [`writer`]). The result is a
+//! [`PreparedCargoMaterials`] token whose digest covers the whole vendor tree.
 //!
 //! # Normalized Git manifests
 //!
@@ -208,18 +209,35 @@ fn attempt_check(
 }
 
 /// Requires a vendor directory name that cannot escape or hide.
-fn directory_name(name: &str, version: &str) -> Result<String, Report<ReleaseError>> {
-    let joined = format!("{name}-{version}");
-    let plain = !joined.starts_with('.')
-        && joined
+fn plain_directory(directory: String) -> Result<String, Report<ReleaseError>> {
+    let plain = !directory.is_empty()
+        && !directory.starts_with('.')
+        && directory
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'+'));
     if !plain {
         return Err(material_error(format!(
-            "package identity {joined:?} is not a safe vendor directory name"
+            "package identity {directory:?} is not a safe vendor directory name"
         )));
     }
-    Ok(joined)
+    Ok(directory)
+}
+
+/// Names a registry crate's vendor directory `<name>-<version>`.
+fn directory_name(name: &str, version: &str) -> Result<String, Report<ReleaseError>> {
+    plain_directory(format!("{name}-{version}"))
+}
+
+/// Names a Git package's vendor directory after the package alone.
+///
+/// This is the layout `cargo vendor` gives a unique name, and it keeps paths
+/// between sibling members of the package's own workspace resolving: a
+/// package that reads `../<sibling>/...` from its manifest directory, as a
+/// checkout allows, finds that sibling in the vendor directory too. A
+/// registry crate or second Git package with the same directory name still
+/// fails closed, because every vendor directory is created exclusively.
+fn git_directory_name(name: &str) -> Result<String, Report<ReleaseError>> {
+    plain_directory(name.to_owned())
 }
 
 /// Requires a real, empty directory that no symlink aliases.
@@ -417,7 +435,7 @@ impl LockedMaterials {
             attempt_check(deadline, cancellation)?;
             let input = self.matching_git_input(package, inputs)?;
             if let Some(digest) = vendor_git(package, input, &vendor)? {
-                derived.insert(directory_name(&package.name, &package.version)?, digest);
+                derived.insert(git_directory_name(&package.name)?, digest);
             }
         }
         attempt_check(deadline, cancellation)?;
@@ -467,7 +485,7 @@ fn vendor_git(
     input: &GitVendorInput<'_>,
     vendor: &Path,
 ) -> Result<Option<String>, Report<ReleaseError>> {
-    let directory = directory_name(&package.name, &package.version)?;
+    let directory = git_directory_name(&package.name)?;
     let store = Store::new(input.material.object_store());
     let root = find_package(&store, input.material.root_tree(), &package.name)?;
     let committed = store.read("blob", &root.manifest, MANIFEST_LIMIT)?;

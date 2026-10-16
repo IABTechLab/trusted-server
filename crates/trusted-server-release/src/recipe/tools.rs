@@ -48,6 +48,19 @@ impl ToolSelection {
             Self::OrdinaryCi => Authority::Unqualified,
         }
     }
+
+    /// Reports whether this selection may start an unqualified candidate run.
+    ///
+    /// Only the test-only ordinary CI selection may, so a candidate run is
+    /// evidence for CI and never release qualification. A production build
+    /// can name no selection at all, so its execute gate stays closed.
+    pub(crate) fn permits_candidate_run(&self) -> bool {
+        match self {
+            Self::Qualified(qualification) => match *qualification {},
+            #[cfg(test)]
+            Self::OrdinaryCi => true,
+        }
+    }
 }
 
 /// Fixed `bin/cargo`, `bin/rustc` and target standard-library layout, retained
@@ -128,6 +141,11 @@ impl SelectedRustTools {
     /// The authority of this selection.
     pub(crate) fn authority(&self) -> Authority {
         self.selection.authority()
+    }
+
+    /// Whether this selection may start an unqualified candidate run.
+    pub(crate) fn permits_candidate_run(&self) -> bool {
+        self.selection.permits_candidate_run()
     }
 
     /// Host path of the selected Cargo.

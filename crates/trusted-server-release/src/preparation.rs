@@ -686,4 +686,4 @@ fn authenticate_observation(
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

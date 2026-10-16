@@ -201,3 +201,66 @@ fn tools_edited_after_binding_are_rejected_at_the_execute_gate() {
         "should name the changed materials"
     );
 }
+
+#[test]
+fn handoff_edits_and_cargo_home_caches_are_rejected_around_the_run() {
+    let fixture = Fixture::new(COMMIT);
+    let retained = fixture.retained();
+    let prepared = fixture
+        .bind("ts-aarch64-apple-darwin", Role::A)
+        .expect("should bind the recipe");
+    prepared
+        .check_inputs()
+        .expect("should accept the untouched handoff, tools and materials");
+    fs::write(retained.join("bundles/tsjs-core.js"), b"tampered")
+        .expect("should edit a retained module");
+    assert!(
+        format!(
+            "{:?}",
+            prepared
+                .check_inputs()
+                .expect_err("should reject the edited handoff")
+        )
+        .contains("retained JS handoff changed"),
+        "should name the changed handoff"
+    );
+    fs::write(retained.join("bundles/tsjs-core.js"), b"fictional module")
+        .expect("should restore the retained module");
+    prepared
+        .check_inputs()
+        .expect("should accept the restored handoff");
+
+    prepared
+        .check_no_fetched_sources()
+        .expect("should accept a Cargo home without caches");
+    for cache in ["registry", "git"] {
+        let path = fixture.base.join("cargo-state/cargo-home").join(cache);
+        fs::create_dir(&path).expect("should create a Cargo cache");
+        assert!(
+            format!(
+                "{:?}",
+                prepared
+                    .check_no_fetched_sources()
+                    .expect_err("should reject a Cargo cache")
+            )
+            .contains(&format!("holds a {cache} cache")),
+            "should name the {cache} cache"
+        );
+        fs::remove_dir(&path).expect("should remove the Cargo cache");
+    }
+}
+
+#[test]
+fn only_the_ordinary_ci_selection_permits_a_candidate_run() {
+    let fixture = Fixture::new(COMMIT);
+    let tools = fixture.tools_for(ReleaseTarget::Wasm32Wasip1);
+    assert!(
+        tools.permits_candidate_run(),
+        "should let the ordinary CI selection start a candidate run"
+    );
+    assert_eq!(
+        tools.authority(),
+        Authority::Unqualified,
+        "should still carry no release authority"
+    );
+}

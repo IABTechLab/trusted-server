@@ -116,7 +116,7 @@ fn plain_manifest_package_is_vendored_without_derivation() {
     let material = built.objects.material(SELECTOR, REVISION, &built.root_tree);
     let result = run(&locked_core(), &material, None);
     let materials = result.outcome.expect("should vendor the plain package");
-    let package = result.root.join("vendor/example-core-0.4.0");
+    let package = result.root.join("vendor/example-core");
     assert_eq!(
         fs::read(package.join("Cargo.toml")).expect("should read manifest"),
         PLAIN.as_bytes(),
@@ -193,7 +193,7 @@ fn workspace_inheritance_requires_a_matching_normalized_manifest() {
         normalized(NORMALIZED, INHERITING),
     );
     let materials = accepted.outcome.expect("should accept the normalized pair");
-    let package = accepted.root.join("vendor/example-core-0.4.0");
+    let package = accepted.root.join("vendor/example-core");
     assert_eq!(
         fs::read(package.join("Cargo.toml")).expect("should read manifest"),
         NORMALIZED.as_bytes(),
@@ -206,9 +206,7 @@ fn workspace_inheritance_requires_a_matching_normalized_manifest() {
     );
     let digest = hex::encode(Sha256::digest(NORMALIZED.as_bytes()));
     assert_eq!(
-        materials
-            .derived_manifest_digests()
-            .get("example-core-0.4.0"),
+        materials.derived_manifest_digests().get("example-core"),
         Some(&digest),
         "should record the normalized manifest digest as derived"
     );
@@ -460,5 +458,89 @@ fn store_objects_are_rehashed_before_use() {
     assert!(
         rejection(run(&locked_core(), &missing_root, None)).contains("cannot be opened"),
         "should reject a root tree absent from the store"
+    );
+}
+
+#[test]
+fn git_package_directory_is_its_bare_name_and_never_shared() {
+    let built = workspace(PLAIN, &[]);
+    let material = built.objects.material(SELECTOR, REVISION, &built.root_tree);
+    let accepted = run(&locked_core(), &material, None);
+    accepted.outcome.expect("should vendor the Git package");
+    assert!(
+        accepted
+            .root
+            .join("vendor/example-core/Cargo.toml")
+            .is_file()
+            && !accepted.root.join("vendor/example-core-0.4.0").exists(),
+        "should name the Git package directory after the package alone"
+    );
+
+    let registry_crate = plain_crate("example", "core");
+    let locked = locked(
+        &[("example", "core", &registry_crate)],
+        vec![git_package("example-core", "0.4.0")],
+    );
+    let archive_directory = temporary();
+    let registry = archives(
+        archive_directory.path(),
+        &[("example", "core", &registry_crate)],
+    );
+    let output = temporary();
+    let inputs = [GitVendorInput {
+        material: &material,
+        name: "example-core",
+        version: "0.4.0",
+        normalized: None,
+    }];
+    let error = locked
+        .prepare_cargo_vendor(
+            &VendorInputs {
+                registry_archives: &registry,
+                git: &inputs,
+            },
+            output.path(),
+            deadline(),
+            &cancellation(),
+        )
+        .expect_err("should refuse a Git directory that a registry crate already holds");
+    assert!(
+        format!("{error:?}").contains("cannot be created exclusively"),
+        "should fail closed on the shared directory: {error:?}"
+    );
+}
+
+#[test]
+fn git_packages_sharing_a_name_fail_closed() {
+    let built = workspace(INHERITING, &[]);
+    let material = built.objects.material(SELECTOR, REVISION, &built.root_tree);
+    let locked = locked(
+        &[],
+        vec![
+            git_package("example-core", "0.4.0"),
+            git_package("example-core", "0.5.0"),
+        ],
+    );
+    let inputs = ["0.4.0", "0.5.0"].map(|version| GitVendorInput {
+        material: &material,
+        name: "example-core",
+        version,
+        normalized: normalized(&NORMALIZED.replace("0.4.0", version), INHERITING),
+    });
+    let output = temporary();
+    let error = locked
+        .prepare_cargo_vendor(
+            &VendorInputs {
+                registry_archives: &Default::default(),
+                git: &inputs,
+            },
+            output.path(),
+            deadline(),
+            &cancellation(),
+        )
+        .expect_err("should refuse a second Git package in the same bare-name directory");
+    assert!(
+        format!("{error:?}").contains("cannot be created exclusively"),
+        "should fail closed on the shared directory: {error:?}"
     );
 }

@@ -21,6 +21,11 @@ pub(super) struct Selection<'a> {
     pub(super) index_alias: bool,
     pub(super) node_tar_timestamps: bool,
     pub(super) local_pax: bool,
+    /// Accepts the two encodings `cargo package` itself writes into `.crate`
+    /// archives: a GNU long-name record before a member whose path exceeds
+    /// the 100-byte header field, and (in older Cargo releases) the regular
+    /// file or directory type bits inside the mode field.
+    pub(super) cargo_package: bool,
 }
 
 mod compatibility;
@@ -339,6 +344,7 @@ impl State {
         &mut self,
         mut entry: tar::Entry<'_, R>,
         selection: &Selection<'_>,
+        long_name: Option<String>,
     ) -> Result<(), Report<ReleaseError>> {
         let header = entry.header();
         let directory = header.entry_type().is_dir();
@@ -347,13 +353,21 @@ impl State {
                 "TAR member is not a regular file or directory",
             ));
         }
-        let raw = raw_name(header, selection)?;
+        let raw = match long_name {
+            Some(long) => compatibility::join_long_name(long, &raw_name(header, selection)?)?,
+            None => raw_name(header, selection)?,
+        };
         let name = member_name(&raw, directory, selection)?;
         if !self.spellings.insert(raw.clone()) {
             return Err(material_error("TAR repeats a member spelling"));
         }
         self.portable_name(&name)?;
         let mode = header.mode().map_err(material_error)?;
+        let mode = if selection.cargo_package {
+            compatibility::strip_member_type(mode, directory)?
+        } else {
+            mode
+        };
         let size = entry.size();
         if mode & !0o777 != 0 || (directory && size != 0) {
             return Err(material_error(format!(
@@ -478,6 +492,7 @@ fn extract_bounded(
         directories: BTreeSet::new(),
     };
     let mut pending_pax: Option<compatibility::LocalPax> = None;
+    let mut pending_long: Option<String> = None;
     for (index, entry) in archive
         .entries()
         .map_err(material_error)?
@@ -488,7 +503,21 @@ fn extract_bounded(
             return Err(material_error("TAR exceeds entry count limit"));
         }
         let mut entry = entry.map_err(material_error)?;
+        if entry.header().entry_type().is_gnu_longname() {
+            if !selection.cargo_package || pending_long.is_some() || pending_pax.is_some() {
+                return Err(material_error(
+                    "unreviewed, consecutive or mixed GNU long-name record",
+                ));
+            }
+            pending_long = Some(compatibility::read_long_name(&mut entry, PATH_LIMIT)?);
+            continue;
+        }
         if entry.header().entry_type().as_byte() == b'x' {
+            if pending_long.is_some() {
+                return Err(material_error(
+                    "GNU long-name record must immediately precede its member",
+                ));
+            }
             if !selection.local_pax || pending_pax.is_some() || entry.size() > 64 * 1024 {
                 return Err(material_error(
                     "unreviewed, consecutive or oversized local PAX header",
@@ -517,10 +546,13 @@ fn extract_bounded(
                 entry.header().size().map_err(material_error)?,
             )?;
         }
-        state.entry(entry, &selection)?;
+        state.entry(entry, &selection, pending_long.take())?;
     }
     if pending_pax.is_some() {
         return Err(material_error("dangling local PAX header"));
+    }
+    if pending_long.is_some() {
+        return Err(material_error("dangling GNU long-name record"));
     }
     if state.spellings.contains("package/./dist/index.js")
         && !state.spellings.contains("package/dist/index.js")

@@ -173,6 +173,37 @@ pub(crate) const FIXED_ARTIFACTS: [FixedArtifact; 4] = [
     },
 ];
 
+/// Test-only rows naming the members of the Cargo denial fixture workspace.
+///
+/// They are never part of [`FIXED_ARTIFACTS`] or the cohort, so no request
+/// text can select them; only test code reaches them by package name.
+#[cfg(test)]
+pub(crate) const DENIAL_FIXTURE_ARTIFACTS: [FixedArtifact; 4] = [
+    denial_fixture_row("denial-build-direct.wasm", "build-direct"),
+    denial_fixture_row("denial-build-grandchild.wasm", "build-grandchild"),
+    denial_fixture_row("denial-macro-attempt.wasm", "macro-attempt"),
+    denial_fixture_row("denial-control.wasm", "control"),
+];
+
+/// One Wasm denial fixture row whose binary is named after its package.
+#[cfg(test)]
+const fn denial_fixture_row(name: &'static str, package: &'static str) -> FixedArtifact {
+    FixedArtifact {
+        name,
+        package,
+        bin: package,
+        target: ReleaseTarget::Wasm32Wasip1,
+        kind: "denial-fixture",
+        role: "test-fixture",
+        assurance_profile: "none",
+        capability: "none",
+        architecture: "wasm32",
+        minimum_version: "wasip1",
+        runtime: "none",
+        recipe_environment: "ordinary-ci",
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CohortDocument {
