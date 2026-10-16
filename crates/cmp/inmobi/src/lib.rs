@@ -706,11 +706,15 @@ mod tests {
     /// a message naming the setting.
     #[test]
     fn a_cmp_id_outside_1_to_4095_is_refused_naming_the_setting() {
+        // The test settings name the template's placeholder origin, which the
+        // load refuses before any module's own check, so a real one stands in.
         let with_cmp_id = |value: &str| {
-            settings_with_rest(&format!(
+            let mut settings = settings_with_rest(&format!(
                 "cmp_id = {value}\n{}",
                 html_entry(None, &[MODULE])
-            ))
+            ));
+            settings.publisher.origin_url = "https://origin.publisher.example".to_owned();
+            settings
         };
         let load = |settings: &Settings| {
             trusted_server_core::config::validate_settings_for_runtime_with(
