@@ -134,15 +134,15 @@ cp "$REPO_ROOT/fastly.toml" "$WORK/fastly.toml"
 ln -s "$REPO_ROOT/crates" "$WORK/crates"
 cat >> "$WORK/fastly.toml" <<'SECRETSEOF'
 
-[[local_server.secret_stores.ts_secrets]]
+[[local_server.secret_stores.trusted_server_secrets]]
 key = "publisher_proxy_secret"
 data = "fictional-local-proxy-secret-for-this-harness"
 
-[[local_server.secret_stores.ts_secrets]]
+[[local_server.secret_stores.trusted_server_secrets]]
 key = "ec_passphrase"
 data = "fictional-local-ec-passphrase-secret-value"
 
-[[local_server.secret_stores.ts_secrets]]
+[[local_server.secret_stores.trusted_server_secrets]]
 key = "handler_password"
 data = "fictional-local-handler-password-secret-value"
 SECRETSEOF
