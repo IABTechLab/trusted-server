@@ -1177,10 +1177,7 @@ impl EntryRequest {
     fn of(req: &FastlyRequest) -> Self {
         Self {
             method: req.get_method().clone(),
-            host: req
-                .get_header_str(header::HOST.as_str())
-                .unwrap_or_default()
-                .to_owned(),
+            host: request_host(req).unwrap_or_default().to_owned(),
             scheme: entry_scheme(req),
             path: req.get_path().to_owned(),
             query: req.get_query_str().unwrap_or_default().to_owned(),
@@ -1519,6 +1516,21 @@ mod tests {
             entry_request(&req).host(),
             "",
             "a module request should carry no host where Host is not UTF-8"
+        );
+    }
+
+    #[test]
+    fn a_kept_entry_request_reads_a_host_that_is_not_utf8_as_no_host() {
+        let kept = EntryRequest::of(&request_with_host_not_utf8());
+
+        assert_eq!(
+            kept.host, "",
+            "a kept request should carry no host where Host is not UTF-8"
+        );
+        assert_eq!(
+            kept.module_request().host(),
+            "",
+            "the module request a kept request makes should hand on no host"
         );
     }
 
