@@ -169,9 +169,10 @@ use crate::platform::{
 
 /// The stores a service reads and the key of its app-config blob.
 ///
-/// [`Self::logical`] gives the logical stores and key. A selector that names a
-/// blob for each host is resolved for the request before anything is built,
-/// by `stores_for_request` in the entry point.
+/// [`Self::logical`] gives the logical stores and key. The entry point puts
+/// the selector the config store holds in place of the key and resolves it
+/// for the request before anything is built, with
+/// `stores_with_stored_selector` and `stores_for_request`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RuntimeStoreConfig {
     pub(crate) config_store_name: StoreName,
@@ -182,12 +183,11 @@ pub(crate) struct RuntimeStoreConfig {
 impl RuntimeStoreConfig {
     /// Store bindings for the Fastly runtime.
     ///
-    /// Store selection is a deploy-time input; no store selector reaches the
-    /// Fastly runtime. `EdgeZero` links each selected physical store to the
-    /// service version under its logical ID, so the runtime opens stores by
-    /// logical ID and reads the config entry under that same ID for every
-    /// publication target. Staging isolation comes from linking a different
-    /// physical store, never from a different key.
+    /// A deployment chooses each physical store, and `EdgeZero` links it to
+    /// the service version under its logical ID, so the runtime opens every
+    /// store by logical ID. The config key is the logical store ID until the
+    /// entry point puts the store's selector in its place. A staging version
+    /// is kept apart by the physical store it links.
     pub(crate) fn logical() -> Self {
         Self {
             config_store_name: StoreName::from(DEFAULT_CONFIG_STORE_ID),

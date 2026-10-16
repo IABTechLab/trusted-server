@@ -87,11 +87,40 @@ fn open_trusted_server_config_store(store_name: &str) -> Result<ConfigStoreHandl
     Ok(ConfigStoreHandle::new(Arc::new(store)))
 }
 
+/// The stores with the service's selector as their key.
+///
+/// The selector is read on every request, so a changed selector serves the
+/// next request.
+///
+/// # Errors
+///
+/// Returns why the request is not served, which [`refusal_response`] turns
+/// into the answer.
+fn stores_with_stored_selector(
+    stores: RuntimeStoreConfig,
+) -> Result<RuntimeStoreConfig, config_selection::Refusal> {
+    match config_selection::selector_in_store(stores.config_store_name.as_ref(), &stores.config_key)
+    {
+        Ok(config_key) => Ok(RuntimeStoreConfig {
+            config_key,
+            ..stores
+        }),
+        Err(refusal) => {
+            if let config_selection::Refusal::StoreUnavailable(reason)
+            | config_selection::Refusal::MalformedSelector(reason) = &refusal
+            {
+                log::error!("cannot read the app-config selector: {reason}");
+            }
+            Err(refusal)
+        }
+    }
+}
+
 /// Chooses the app-config blob that serves this request.
 ///
-/// A `__KEY` selector that carries the host placeholder names a blob for each
-/// host, so the key is the selector with this request's host in it, and only
-/// then is `Host` read. Any other selector is the key as it stands.
+/// A selector that carries the host placeholder names a blob for each host,
+/// so the key is the selector with this request's host in it, and only then
+/// is `Host` read. Any other selector is the key as it stands.
 ///
 /// # Errors
 ///
@@ -101,7 +130,10 @@ fn stores_for_request(
     stores: RuntimeStoreConfig,
     req: &FastlyRequest,
 ) -> Result<RuntimeStoreConfig, config_selection::Refusal> {
-    let host = if stores.config_key.contains(config_selection::HOST_PLACEHOLDER) {
+    let host = if stores
+        .config_key
+        .contains(config_selection::HOST_PLACEHOLDER)
+    {
         request_host(req)
     } else {
         None
@@ -120,13 +152,12 @@ fn stores_for_request(
                 .unwrap_or_default();
             match &refusal {
                 config_selection::Refusal::NoConfigForHost => log::warn!(
-                    "no app-config blob for host {named:?} under key selector `{}`",
+                    "no app-config blob for host {named:?} under selector `{}`",
                     stores.config_key
                 ),
-                config_selection::Refusal::StoreUnavailable(reason) => {
-                    log::error!(
-                        "cannot tell whether host {named:?} has an app-config blob: {reason}"
-                    );
+                config_selection::Refusal::StoreUnavailable(reason)
+                | config_selection::Refusal::MalformedSelector(reason) => {
+                    log::error!("cannot choose the app-config blob for host {named:?}: {reason}");
                 }
             }
             Err(refusal)
@@ -148,7 +179,8 @@ fn request_host(req: &FastlyRequest) -> Option<&str> {
 ///
 /// A host with no blob is answered `421 Misdirected Request`. The answer is
 /// not to be stored, so a host is served as soon as its blob is pushed. A
-/// store that could not say whether the host has a blob is answered `500`.
+/// store that could not say whether the host has a blob, or whose selector
+/// cannot be read or is malformed, is answered `500`.
 fn refusal_response(refusal: &config_selection::Refusal) -> FastlyResponse {
     match refusal {
         config_selection::Refusal::NoConfigForHost => {
@@ -156,7 +188,8 @@ fn refusal_response(refusal: &config_selection::Refusal) -> FastlyResponse {
                 .with_header("cache-control", "private, no-store")
                 .with_body_text_plain("Misdirected Request")
         }
-        config_selection::Refusal::StoreUnavailable(_) => {
+        config_selection::Refusal::StoreUnavailable(_)
+        | config_selection::Refusal::MalformedSelector(_) => {
             FastlyResponse::from_status(fastly::http::StatusCode::INTERNAL_SERVER_ERROR)
                 .with_body_text_plain("Internal Server Error")
         }
@@ -442,7 +475,9 @@ fn heap_mib() -> String {
 fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, request_id: &str) {
     // Settled before anything reads settings, so every path below reads the
     // blob of the publisher this request is for.
-    let runtime_stores = match stores_for_request(RuntimeStoreConfig::logical(), &req) {
+    let runtime_stores = match stores_with_stored_selector(RuntimeStoreConfig::logical())
+        .and_then(|stores| stores_for_request(stores, &req))
+    {
         Ok(stores) => stores,
         Err(refusal) => {
             refusal_response(&refusal).send_to_client();
@@ -1462,6 +1497,43 @@ mod tests {
             signals.platform_class.as_deref(),
             Some("marked:example_width=1280:https:///article?page=2"),
             "a module should be shown no host where the Host header is not UTF-8"
+        );
+    }
+
+    #[test]
+    fn a_malformed_selector_is_answered_500() {
+        let response = refusal_response(&config_selection::Refusal::MalformedSelector(
+            "selector \"{Host}\" carries a brace".to_owned(),
+        ));
+
+        assert_eq!(
+            response.get_status(),
+            fastly::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "a selector the operator wrote wrongly should not answer 421"
+        );
+    }
+
+    #[test]
+    fn the_root_store_holds_no_selector() {
+        let stores = stores_with_stored_selector(RuntimeStoreConfig::logical())
+            .expect("should read the root fastly.toml's config store");
+
+        assert_eq!(
+            stores,
+            RuntimeStoreConfig::logical(),
+            "a store with no selector entry should read the logical key"
+        );
+    }
+
+    #[test]
+    fn a_store_that_is_not_linked_is_store_unavailable() {
+        let refusal =
+            config_selection::selector_in_store("not_a_linked_store", "trusted_server_config")
+                .expect_err("should not read a selector from a store that is not linked");
+
+        assert!(
+            matches!(refusal, config_selection::Refusal::StoreUnavailable(_)),
+            "should refuse rather than read the logical key, got {refusal:?}"
         );
     }
 
