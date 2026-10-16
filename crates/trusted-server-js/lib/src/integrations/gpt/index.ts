@@ -862,7 +862,8 @@ function displayTargetElementId(target: GoogleTagDisplayTarget): string | undefi
  *
  * Defines nothing where the band at the current viewport width asks for no
  * size, as no ad can serve there and GPT would otherwise size or collapse the
- * slot's container after the page has painted.
+ * slot's container after the page has painted. A mapping that throws leaves the
+ * slot defined with every format, so the caller still adds it to the service.
  */
 function defineWithViewportSizes<
   S extends object & { defineSizeMapping?(mapping: unknown): unknown },
@@ -882,12 +883,16 @@ function defineWithViewportSizes<
   const definedSlot = api.defineSlot?.(slot.gam_unit_path, slot.formats, elementId);
   const bands = slot.viewport_sizes;
   if (definedSlot && bands?.length && api.sizeMapping && definedSlot.defineSizeMapping) {
-    const builder = api.sizeMapping();
-    for (const [viewport, sizes] of bands) {
-      builder.addSize(viewport, sizes);
+    try {
+      const builder = api.sizeMapping();
+      for (const [viewport, sizes] of bands) {
+        builder.addSize(viewport, sizes);
+      }
+      definedSlot.defineSizeMapping(builder.build());
+      (ts.viewportMappedSlots ??= new WeakSet()).add(definedSlot);
+    } catch (error) {
+      log.warn('GPT size mapping failed; slot keeps every format', { divId: slot.div_id, error });
     }
-    definedSlot.defineSizeMapping(builder.build());
-    (ts.viewportMappedSlots ??= new WeakSet()).add(definedSlot);
   }
   return definedSlot;
 }

@@ -949,6 +949,72 @@ describe('installTsAdInit', () => {
     }
   });
 
+  it('keeps every format when the size mapping throws', async () => {
+    const mockSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+      defineSizeMapping: vi.fn(() => {
+        throw new Error('mapping refused');
+      }),
+      getTargeting: vi.fn().mockReturnValue([]),
+    };
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([]),
+      addEventListener: vi.fn(),
+      refresh: vi.fn(),
+    };
+    const displayMock = vi.fn();
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn().mockReturnValue(mockSlot),
+      display: displayMock,
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+      sizeMapping: vi.fn().mockReturnValue({
+        addSize: vi.fn().mockReturnThis(),
+        build: vi.fn().mockReturnValue('built mapping'),
+      }),
+    };
+    (window as TestWindow).tsjs = {
+      adSlots: [
+        {
+          id: 'atf_sidebar_ad',
+          gam_unit_path: '/123/atf',
+          div_id: 'div-atf-sidebar',
+          formats: [
+            [300, 600],
+            [300, 250],
+          ],
+          viewport_sizes: [
+            [
+              [1040, 0],
+              [
+                [300, 600],
+                [300, 250],
+              ],
+            ],
+            [[0, 0], [[300, 250]]],
+          ],
+          targeting: {},
+        },
+      ],
+      bids: {},
+    };
+
+    const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+    installTsAdInit();
+    const ts = (window as TestWindow).tsjs!;
+    expect(() => ts.adInit!()).not.toThrow();
+
+    // The slot is still added to the ad service and displayed, asking for
+    // every format, and the refresh auction does not narrow it.
+    expect(mockSlot.addService).toHaveBeenCalledWith(mockPubads);
+    expect(displayMock).toHaveBeenCalledWith('div-atf-sidebar');
+    expect(ts.viewportMappedSlots?.has(mockSlot) ?? false).toBe(false);
+  });
+
   it('hands a late publisher definition the TS inner-div slot without a second request', async () => {
     type FakeSlot = {
       addService(service: unknown): FakeSlot;

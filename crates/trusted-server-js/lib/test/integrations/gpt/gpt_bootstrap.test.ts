@@ -481,7 +481,7 @@ describe('gpt_bootstrap.js fallback', () => {
         };
         const defineSlot = vi.fn(() => mockSlot);
         (window as TestWindow).googletag = makeGoogleTag({
-          cmd: { push: (command) => command() },
+          cmd: { push: (command: () => void) => command() },
           defineSlot,
           pubads: vi.fn(() => pubads),
           sizeMapping: vi.fn(() => builder),
@@ -1087,6 +1087,69 @@ describe('gpt_bootstrap.js fallback', () => {
         value: originalInnerWidth,
       });
     }
+  });
+
+  it('fallback adInit keeps every format when the size mapping throws', () => {
+    const mockSlot = {
+      addService: vi.fn().mockReturnThis(),
+      setTargeting: vi.fn().mockReturnThis(),
+      getSlotElementId: vi.fn().mockReturnValue('div-atf-sidebar'),
+      defineSizeMapping: vi.fn(() => {
+        throw new Error('mapping refused');
+      }),
+    };
+    const mockPubads = {
+      enableSingleRequest: vi.fn(),
+      getSlots: vi.fn().mockReturnValue([]),
+      refresh: vi.fn(),
+    };
+    const display = vi.fn();
+    (window as TestWindow).googletag = {
+      cmd: { push: vi.fn((fn: () => void) => fn()) },
+      defineSlot: vi.fn().mockReturnValue(mockSlot),
+      pubads: vi.fn().mockReturnValue(mockPubads),
+      enableServices: vi.fn(),
+      display,
+      sizeMapping: vi.fn().mockReturnValue({
+        addSize: vi.fn().mockReturnThis(),
+        build: vi.fn().mockReturnValue('built mapping'),
+      }),
+    };
+    document.body.innerHTML =
+      '<div id="div-atf-sidebar-container"><div id="div-atf-sidebar"></div></div>';
+    runBootstrap();
+    const ts = (window as TestWindow).tsjs!;
+    ts.adSlots = [
+      {
+        id: 'atf_sidebar_ad',
+        gam_unit_path: '/123/atf',
+        div_id: 'div-atf-sidebar',
+        formats: [
+          [300, 600],
+          [300, 250],
+        ],
+        viewport_sizes: [
+          [
+            [1040, 0],
+            [
+              [300, 600],
+              [300, 250],
+            ],
+          ],
+          [[0, 0], [[300, 250]]],
+        ],
+        targeting: {},
+      },
+    ];
+    ts.bids = { atf_sidebar_ad: { hb_pb: '1.00' } };
+
+    expect(() => ts.adInit!()).not.toThrow();
+
+    // The slot is still added to the ad service and displayed, asking for
+    // every format, and the refresh auction does not narrow it.
+    expect(mockSlot.addService).toHaveBeenCalledWith(mockPubads);
+    expect(display).toHaveBeenCalledWith('div-atf-sidebar');
+    expect(ts.viewportMappedSlots?.has(mockSlot) ?? false).toBe(false);
   });
 
   it('fallback adInit leaves a publisher-rendered slot untouched', () => {

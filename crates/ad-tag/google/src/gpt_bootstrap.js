@@ -375,7 +375,8 @@
   // the slot in ts.viewportMappedSlots once the mapping is applied. Defines
   // nothing where the band at the current viewport width asks for no size, as
   // no ad can serve there and GPT would otherwise size or collapse the slot's
-  // container after the page has painted.
+  // container after the page has painted. A mapping that throws leaves the slot
+  // defined with every format, so the caller still adds it to the ad service.
   function defineWithViewportSizes(api, slot, elementId) {
     var bandSizes = viewportBandSizes(slot);
     if (bandSizes && !bandSizes.length) {
@@ -399,13 +400,22 @@
       api.sizeMapping &&
       definedSlot.defineSizeMapping
     ) {
-      var builder = api.sizeMapping();
-      bands.forEach(function (band) {
-        builder.addSize(band[0], band[1]);
-      });
-      definedSlot.defineSizeMapping(builder.build());
-      ts.viewportMappedSlots = ts.viewportMappedSlots || new WeakSet();
-      ts.viewportMappedSlots.add(definedSlot);
+      try {
+        var builder = api.sizeMapping();
+        bands.forEach(function (band) {
+          builder.addSize(band[0], band[1]);
+        });
+        definedSlot.defineSizeMapping(builder.build());
+        ts.viewportMappedSlots = ts.viewportMappedSlots || new WeakSet();
+        ts.viewportMappedSlots.add(definedSlot);
+      } catch (err) {
+        if (ts.log && typeof ts.log.warn === "function") {
+          ts.log.warn("GPT size mapping failed; slot keeps every format", {
+            divId: slot.div_id,
+            error: err,
+          });
+        }
+      }
     }
     return definedSlot;
   }
