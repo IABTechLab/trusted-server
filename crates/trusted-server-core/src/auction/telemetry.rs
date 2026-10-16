@@ -5,6 +5,7 @@
 //! a reader who permits measuring ad performance.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::Utc;
 use error_stack::Report;
@@ -18,6 +19,7 @@ use crate::ec::EcContext;
 use crate::error::TrustedServerError;
 use crate::permissions::Permission;
 use crate::platform::RuntimeServices;
+use crate::settings::Settings;
 
 const MAX_PAGE_PATH_BYTES: usize = 256;
 const DYNAMIC_SEGMENT_REPLACEMENT: &str = ":id";
@@ -521,6 +523,32 @@ impl AuctionTelemetrySink for NoopAuctionTelemetrySink {
     ) -> Result<(), Report<TrustedServerError>> {
         Ok(())
     }
+}
+
+/// Logs once, at warning level, that `adapter` sends no auction telemetry
+/// when `[analytics]` selects a module.
+///
+/// An adapter that builds no sink of its own calls this as it builds its
+/// state, so the selection is not ignored without a word. `supplied` is the
+/// services a caller handed the adapter, whose sink its requests use, and
+/// nothing is logged when that sink sends. `logged` is the adapter's own flag,
+/// so the line is written once however often the state is built.
+pub fn warn_once_when_analytics_is_unsent(
+    settings: &Settings,
+    supplied: Option<&RuntimeServices>,
+    adapter: &str,
+    logged: &AtomicBool,
+) {
+    if settings.analytics_module().is_none()
+        || supplied.is_some_and(|services| services.auction_telemetry_sink().is_enabled())
+        || logged.swap(true, Ordering::Relaxed)
+    {
+        return;
+    }
+    log::warn!(
+        "[analytics] selects a module, but the {adapter} adapter sends no auction \
+         telemetry, so nothing is sent"
+    );
 }
 
 /// Emit a telemetry batch without letting errors affect customer traffic.
@@ -1236,6 +1264,116 @@ mod tests {
             1,
             "the permission alone should let the summary row through"
         );
+    }
+
+    thread_local! {
+        /// The lines logged on this thread while a test is capturing them.
+        static CAPTURED_LOG: std::cell::RefCell<Option<Vec<(log::Level, String)>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// A logger that keeps the lines logged on a thread that asked for them,
+    /// so a test reads its own lines and none of another test's.
+    struct ThreadLog;
+
+    impl log::Log for ThreadLog {
+        fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            CAPTURED_LOG.with(|captured| {
+                if let Some(lines) = captured.borrow_mut().as_mut() {
+                    lines.push((record.level(), record.args().to_string()));
+                }
+            });
+        }
+
+        fn flush(&self) {}
+    }
+
+    /// The lines at warning level or above that `run` logs on this thread.
+    fn warnings_logged_by(run: impl FnOnce()) -> Vec<(log::Level, String)> {
+        static LOGGER: ThreadLog = ThreadLog;
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            log::set_logger(&LOGGER).expect("no other test should install a logger");
+            log::set_max_level(log::LevelFilter::Warn);
+        });
+        CAPTURED_LOG.with(|captured| *captured.borrow_mut() = Some(Vec::new()));
+        run();
+        CAPTURED_LOG.with(|captured| captured.borrow_mut().take().unwrap_or_default())
+    }
+
+    /// Settings whose `[analytics]` selects the module the example documents.
+    fn settings_selecting_analytics() -> Settings {
+        Settings::from_toml(&format!(
+            "{}\n{}",
+            crate::test_support::tests::crate_test_settings_str(),
+            crate::test_support::template::documented_block("[analytics]")
+        ))
+        .expect("should load settings selecting the documented analytics module")
+    }
+
+    /// A sink that sends, standing in for one a caller supplies.
+    struct SendingSink;
+
+    #[async_trait::async_trait(?Send)]
+    impl AuctionTelemetrySink for SendingSink {
+        async fn emit_auction_events(
+            &self,
+            _services: &RuntimeServices,
+            _batch: AuctionEventBatch,
+        ) -> Result<(), Report<TrustedServerError>> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn an_adapter_that_sends_nothing_warns_once_when_analytics_selects_a_module() {
+        let settings = settings_selecting_analytics();
+        let logged = AtomicBool::new(false);
+
+        let lines = warnings_logged_by(|| {
+            warn_once_when_analytics_is_unsent(&settings, None, "Example", &logged);
+            warn_once_when_analytics_is_unsent(&settings, None, "Example", &logged);
+        });
+
+        assert_eq!(lines.len(), 1, "should log one line, got {lines:?}");
+        assert_eq!(lines[0].0, log::Level::Warn, "should log a warning");
+        assert!(
+            lines[0]
+                .1
+                .contains("the Example adapter sends no auction telemetry"),
+            "should name the adapter, got {:?}",
+            lines[0].1
+        );
+    }
+
+    #[test]
+    fn no_warning_when_analytics_selects_nothing_or_a_supplied_sink_sends() {
+        let selecting_nothing = crate::test_support::tests::create_test_settings();
+        let selecting = settings_selecting_analytics();
+        let sending = crate::platform::test_support::noop_services_with_telemetry_sink(
+            std::sync::Arc::new(SendingSink),
+        );
+
+        let lines = warnings_logged_by(|| {
+            warn_once_when_analytics_is_unsent(
+                &selecting_nothing,
+                None,
+                "Example",
+                &AtomicBool::new(false),
+            );
+            warn_once_when_analytics_is_unsent(
+                &selecting,
+                Some(&sending),
+                "Example",
+                &AtomicBool::new(false),
+            );
+        });
+
+        assert!(lines.is_empty(), "should log nothing, got {lines:?}");
     }
 
     #[test]
