@@ -1675,7 +1675,7 @@ mod tests {
         assert_eq!(
             result.remaining[0].backend_name(),
             None,
-            "should strip backend name from remaining (matches Fastly production behavior)"
+            "should strip backend name from remaining (matches production select behavior)"
         );
 
         let names = stub.recorded_backend_names();

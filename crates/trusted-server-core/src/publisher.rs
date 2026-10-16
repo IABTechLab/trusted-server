@@ -15205,15 +15205,16 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn fastly_surrogate_control_still_allows_a_cold_fill_and_warm_hit() {
+        async fn surrogate_control_still_allows_a_cold_fill_and_warm_hit() {
             let stub = Arc::new(StubHttpClient::new());
             let cache = Arc::new(MemoryTemplateCache::default());
             let settings = Arc::new(settings_with_mode_and_template_cache_max_age("esi", 1_200));
             let services = services(Arc::clone(&stub), Arc::clone(&cache));
 
-            // This is the policy observed on the publisher that exposed the bug. Fastly
-            // gives the surrogate lifetime edge precedence; the configured safety
-            // ceiling allows the origin's twenty-minute edge freshness.
+            // This is the policy observed on the publisher that exposed the bug.
+            // `Surrogate-Control` gives the edge lifetime precedence, and the
+            // configured safety ceiling allows the origin's twenty-minute edge
+            // freshness.
             stub.push_response_with_headers(
                 200,
                 b"<html><head></head><body>origin</body></html>".to_vec(),
@@ -18919,7 +18920,7 @@ mod tests {
         }
 
         #[test]
-        fn observed_fastly_surrogate_policy_uses_edge_freshness_capped_by_configuration() {
+        fn observed_surrogate_policy_uses_edge_freshness_capped_by_configuration() {
             let publisher_headers = headers(&[
                 (header::CACHE_CONTROL, "public, max-age=60"),
                 (
@@ -18939,13 +18940,13 @@ mod tests {
                     &TemplateCachePolicy::for_test(&nothing_covered(), Duration::from_secs(300),),
                 ),
                 Ok(Duration::from_secs(300)),
-                "Fastly's edge freshness should take precedence over the shorter browser \
+                "the edge freshness should take precedence over the shorter browser \
                  lifetime, while the configured safety ceiling remains authoritative"
             );
         }
 
         #[test]
-        fn fastly_surrogate_freshness_takes_precedence_over_standard_freshness() {
+        fn surrogate_freshness_takes_precedence_over_standard_freshness() {
             for (cache_control, surrogate_control, expected) in [
                 ("public, max-age=300", "max-age=30", 30),
                 ("public, max-age=30", "max-age=300", 300),
@@ -19106,7 +19107,7 @@ mod tests {
         }
 
         #[test]
-        fn surrogate_control_can_authorize_fastly_edge_freshness_without_browser_freshness() {
+        fn surrogate_control_can_authorize_edge_freshness_without_browser_freshness() {
             let publisher_headers = headers(&[(
                 header::HeaderName::from_static("surrogate-control"),
                 "max-age=1200",
@@ -19123,7 +19124,7 @@ mod tests {
                     &TemplateCachePolicy::for_test(&nothing_covered(), Duration::from_secs(300),),
                 ),
                 Ok(Duration::from_secs(300)),
-                "Fastly edge freshness should not require browser freshness"
+                "Surrogate-Control edge freshness should not require browser freshness"
             );
         }
 
@@ -24806,7 +24807,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_made_file_streams_through_the_finalizer_fastly_uses() {
+    async fn a_made_file_streams_through_the_streaming_finalizer() {
         use crate::integrations::registry_test_support::middleware_fixture as fixture;
 
         let proxied = proxy(

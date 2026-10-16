@@ -4698,7 +4698,7 @@ mod tests {
     }
 
     #[test]
-    fn handle_proxy_passes_http_request_without_fastly_round_trip() {
+    fn handle_proxy_passes_http_request_without_a_platform_round_trip() {
         let settings = create_test_settings();
         let registry = IntegrationRegistry::from_routes(vec![(
             http::Method::GET,

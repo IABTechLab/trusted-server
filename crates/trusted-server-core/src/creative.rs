@@ -3474,31 +3474,31 @@ b{background:url(\"https://cdn.example/c.png\")}";
     #[test]
     fn to_abs_respects_wildcard_domains() {
         let mut settings = crate::test_support::tests::create_test_settings();
-        settings.rewrite.exclude_domains = vec!["*.cloudflare.com".to_owned()];
+        settings.rewrite.exclude_domains = vec!["*.cdn.example.com".to_owned()];
 
         // Should exclude base domain
-        assert_eq!(to_abs(&settings, "https://cloudflare.com/cdn.js"), None);
+        assert_eq!(to_abs(&settings, "https://cdn.example.com/cdn.js"), None);
 
         // Should exclude subdomain
         assert_eq!(
-            to_abs(&settings, "https://cdnjs.cloudflare.com/lib.js"),
+            to_abs(&settings, "https://assets.cdn.example.com/lib.js"),
             None
         );
         assert_eq!(
-            to_abs(&settings, "//cloudflare.com/cdn.js"),
+            to_abs(&settings, "//cdn.example.com/cdn.js"),
             None,
             "should exclude a protocol-relative wildcard base domain"
         );
         assert_eq!(
-            to_abs(&settings, "//cdnjs.cloudflare.com/lib.js"),
+            to_abs(&settings, "//assets.cdn.example.com/lib.js"),
             None,
             "should exclude a protocol-relative wildcard subdomain"
         );
 
         // Should not exclude different domain
         assert_eq!(
-            to_abs(&settings, "https://notcloudflare.com/lib.js"),
-            Some("https://notcloudflare.com/lib.js".to_owned())
+            to_abs(&settings, "https://notcdn.example.com/lib.js"),
+            Some("https://notcdn.example.com/lib.js".to_owned())
         );
     }
 
