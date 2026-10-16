@@ -142,7 +142,8 @@ impl PublicPrefix {
     ///
     /// A browser sends a cookie only on requests under its `Path`, so a
     /// cookie written under one publisher's path is not sent on another
-    /// publisher's requests. A cookie written under `/` is sent on them all.
+    /// publisher's requests, unless that publisher's path lies under it. A
+    /// cookie written under `/` is sent on them all.
     #[must_use]
     pub fn for_request<B>(&self, request: &http::Request<B>) -> Self {
         self.clone().under_path(
