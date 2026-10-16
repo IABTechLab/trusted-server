@@ -91,8 +91,10 @@ fn remove_at(table: &mut Map<String, Value>, path: &[&str]) {
 /// configuration whose secrets have not been looked up yet.
 ///
 /// A setting is in use when its section selects the module and the module's
-/// rule for the setting says its table uses it. A table the section does not
-/// select is refused once the settings are deserialized, and clearing its
+/// rule for the setting says its table uses it. The table is the one at the
+/// name without the section's type folder, however the selection wrote the
+/// name, because that is the table the module reads. A table the section does
+/// not select is refused once the settings are deserialized, and clearing its
 /// references first means that refusal is what an operator sees, rather than
 /// a secret lookup failing.
 pub(crate) fn clear_unused(data: &mut Value, builders: &[IntegrationBuilder]) {
@@ -110,11 +112,12 @@ pub(crate) fn clear_unused(data: &mut Value, builders: &[IntegrationBuilder]) {
             Some(vendor) => Some(vendor),
             None => selected_as(data, section, &forms),
         };
+        let read = selected.map(|written| short_form(section, written));
         for form in &forms {
             let Some(table) = table_mut(data, section, form) else {
                 continue;
             };
-            let runs = selected == Some(*form);
+            let runs = read == Some(*form);
             let unused = secrets
                 .iter()
                 .filter(|secret| !(runs && (secret.in_use)(table)))
@@ -292,7 +295,7 @@ mod tests {
     }
 
     #[test]
-    fn a_module_selected_by_its_full_name_keeps_the_settings_in_the_table_at_that_name() {
+    fn a_module_selected_by_its_full_name_keeps_the_settings_in_the_table_it_reads() {
         let mut data = json!({
             "testing": {
                 "module": "testing.probe",
@@ -304,18 +307,19 @@ mod tests {
         clear_unused(&mut data, &[builder()]);
 
         assert_eq!(
-            data.pointer("/testing/testing/probe/key_name"),
+            data.pointer("/testing/probe/key_name"),
             Some(&json!("main-key")),
-            "should keep the settings of the table the selection names"
+            "should keep the settings of the table at the name without its type folder"
         );
         assert_eq!(
-            data.pointer("/testing/testing/probe/spare/key_name"),
+            data.pointer("/testing/probe/spare/key_name"),
             Some(&json!("spare-key"))
         );
         assert_eq!(
-            data.pointer("/testing/probe/key_name"),
+            data.pointer("/testing/testing/probe/key_name"),
             None,
-            "should clear the settings of a table under the name not selected"
+            "should clear the settings of the table at the full name's parts, which the \
+             module never reads"
         );
     }
 

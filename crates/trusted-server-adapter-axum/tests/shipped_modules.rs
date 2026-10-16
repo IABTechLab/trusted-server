@@ -162,7 +162,9 @@ fn documented_module_tables_validate_when_uncommented_and_selected() {
 
 /// Every linked page module refuses a setting it does not know, so a
 /// misspelt key in its table fails deploy validation naming the table and
-/// the key, where it would otherwise be ignored.
+/// the key, where it would otherwise be ignored. The planted table names a
+/// key for each secret setting the module declares, so the unknown setting
+/// is its only fault.
 #[test]
 fn every_linked_module_rejects_a_setting_it_does_not_know() {
     use serde_json::json;
@@ -176,11 +178,21 @@ fn every_linked_module_rejects_a_setting_it_does_not_know() {
         .iter()
         .filter(|builder| builder.supplies_integration())
     {
+        let mut planted = json!({ "no_such_setting": true });
+        for secret in builder.secret_settings() {
+            if let Some((last, parents)) = secret.path.split_last() {
+                let mut at = &mut planted;
+                for parent in parents {
+                    at = &mut at[*parent];
+                }
+                at[*last] = json!("example-secret-name");
+            }
+        }
+
         let mut settings = create_test_settings();
         let (name, table) = if let Some(vendor) = builder.shared_settings() {
-            settings.shared =
-                serde_json::from_value(json!({ vendor: { "no_such_setting": true } }))
-                    .expect("should plant the shared table");
+            settings.shared = serde_json::from_value(json!({ vendor: planted }))
+                .expect("should plant the shared table");
             (builder.id(), format!("[{SHARED_TYPE}.{vendor}]"))
         } else {
             let name = builder
@@ -189,18 +201,8 @@ fn every_linked_module_rejects_a_setting_it_does_not_know() {
             let section = builder
                 .section()
                 .expect("every linked page module has a section");
-            let mut table = json!({ "no_such_setting": true });
-            for secret in builder.secret_settings() {
-                if let Some((last, parents)) = secret.path.split_last() {
-                    let mut at = &mut table;
-                    for parent in parents {
-                        at = &mut at[*parent];
-                    }
-                    at[*last] = json!("example-secret-name");
-                }
-            }
             settings
-                .insert_module_config(section, name, &table)
+                .insert_module_config(section, name, &planted)
                 .expect("should insert the planted table");
             (name, format!("[{section}.{}]", short_form(section, name)))
         };
