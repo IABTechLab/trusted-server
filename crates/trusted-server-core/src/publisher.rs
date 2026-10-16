@@ -55,7 +55,7 @@ use crate::auction::types::{
 use crate::cache_policy::{
     CachePolicy, EdgeCacheHeader, cache_control_headers_are_private_or_no_store,
 };
-use crate::consent::{gate_eids_by_permissions, permissions_allow_server_side_auction};
+use crate::consent::gate_eids_by_permissions;
 use crate::constants::{COOKIE_SHAREDID, HEADER_X_COMPRESS_HINT};
 use crate::cookies::handle_request_cookies;
 use crate::cookies::template_cache_policy::{TemplateCookieDecision, evaluate_cookie_policy};
@@ -5421,10 +5421,10 @@ pub async fn handle_publisher_request(
         Vec::new()
     };
 
-    // Fail closed where the resolved permissions do not set basic ad
-    // selection, which under a baseline that requires a signal means no
-    // module granted it.
-    let consent_allows_auction = permissions_allow_server_side_auction(ec_context.permissions());
+    // Fail closed for GDPR or unknown jurisdictions, and where a consent
+    // record says its regulation applies, unless a record that applies
+    // consents to storage. Known jurisdictions outside GDPR are free.
+    let consent_allows_auction = ec_context.server_side_auction_allowed();
 
     let should_run_ad_stack = evaluate_ad_stack_gate(AdStackGateInput {
         method_get: is_get,
@@ -8200,8 +8200,9 @@ pub async fn handle_page_bids(
     let consent_context = ec_context.consent().clone();
     let geo = ec_context.geo_info().cloned();
 
-    // Same fail-closed permission gate the publisher navigation path uses.
-    let consent_allows_auction = permissions_allow_server_side_auction(ec_context.permissions());
+    // Same fail-closed jurisdiction-aware gate the publisher navigation path
+    // uses, which relies on the adapter's geo-aware EC context.
+    let consent_allows_auction = ec_context.server_side_auction_allowed();
 
     // Same bot / prefetch guards the publisher path uses — without them this
     // endpoint would fire real SSP auctions on Sec-Purpose=prefetch warm-up
@@ -30382,8 +30383,9 @@ mod tests {
                 .expect("should be json")
         }
 
-        /// Builds an [`EcContext`] whose permissions permit the server-side
-        /// auction (a jurisdiction whose baseline grants basic ad selection).
+        /// Builds an [`EcContext`] whose consent context permits the server-side
+        /// auction (a known jurisdiction outside GDPR, with no record saying a
+        /// regulation applies).
         fn consent_allowing_ec_context() -> EcContext {
             let consent = crate::consent::ConsentContext {
                 jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
