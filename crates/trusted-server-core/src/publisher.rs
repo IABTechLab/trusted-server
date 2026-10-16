@@ -642,6 +642,8 @@ struct ProcessResponseParams<'a> {
     request_path: &'a str,
     settings: &'a Settings,
     content_type: &'a str,
+    /// See [`OwnedProcessResponseParams::status`].
+    status: StatusCode,
     integration_registry: &'a IntegrationRegistry,
     /// Head script carrying this request's permission state, or [`None`] under a
     /// shared-template mode. See [`template_permissions_script`].
@@ -668,6 +670,7 @@ struct PublisherBodyProcessor {
 struct TextResponse<'a> {
     /// The response's `Content-Type`, parameters and all.
     content_type: &'a str,
+    status: StatusCode,
     request_path: &'a str,
     request_host: &'a str,
     request_scheme: &'a str,
@@ -679,9 +682,8 @@ struct TextResponse<'a> {
 /// The stream processors the entries covering a response that is not HTML
 /// run on its body, the fetch entry's and then the serve entry's, with the
 /// headers the serve entry's middleware write on the response, or none
-/// when its media type is not one a middleware runs on, its charset is not
-/// UTF-8 or no entry covers it. Both phases run here because the template
-/// cache stores HTML alone.
+/// when [`text_entry_media_type`] gives no media type or no entry covers
+/// it. Both phases run here because the template cache stores HTML alone.
 ///
 /// # Errors
 ///
@@ -694,7 +696,7 @@ fn middleware_stream_processors(
 ) -> Result<TextPass, Report<TrustedServerError>> {
     use crate::middleware::MiddlewareContext;
 
-    let Some(media_type) = text_entry_media_type(response.content_type) else {
+    let Some(media_type) = text_entry_media_type(response.content_type, response.status) else {
         return Ok(TextPass::default());
     };
     let mut processors = Vec::new();
@@ -736,12 +738,15 @@ fn middleware_stream_processors(
 /// The media type the entries match a response that is not HTML by, or
 /// `None` when no middleware runs on it: HTML and the React Server
 /// Components stream, which have processors of their own, a type no entry
-/// may cover, and a charset other than UTF-8.
-fn text_entry_media_type(content_type: &str) -> Option<String> {
+/// may cover, a charset other than UTF-8, and a status other than `200`.
+/// Only a `200` carries the whole file, so a partial `206` or an error
+/// body is left as the origin sent it.
+fn text_entry_media_type(content_type: &str, status: StatusCode) -> Option<String> {
     use crate::middleware::{is_dispatched_media_type, is_utf8_or_undeclared_charset};
 
     let media_type = media_type_of(content_type);
-    let runs = !is_html_content_type(content_type)
+    let runs = status == StatusCode::OK
+        && !is_html_content_type(content_type)
         && !content_type_contains_ascii_case_insensitive(content_type, "text/x-component")
         && is_dispatched_media_type(&media_type)
         && is_utf8_or_undeclared_charset(content_type);
@@ -758,7 +763,7 @@ fn apply_text_entry_cache_rules(
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
 ) {
-    let Some(media_type) = text_entry_media_type(&params.content_type) else {
+    let Some(media_type) = text_entry_media_type(&params.content_type, params.status) else {
         return;
     };
     let serve = MiddlewarePhase::Serve;
@@ -860,6 +865,7 @@ impl PublisherBodyProcessor {
             let pass = middleware_stream_processors(
                 &TextResponse {
                     content_type: &params.content_type,
+                    status: params.status,
                     request_path: &params.request_path,
                     request_host: &params.request_host,
                     request_scheme: &params.request_scheme,
@@ -983,6 +989,7 @@ fn process_response_streaming<W: Write>(
         let pass = middleware_stream_processors(
             &TextResponse {
                 content_type: params.content_type,
+                status: params.status,
                 request_path: params.request_path,
                 request_host: params.request_host,
                 request_scheme: params.request_scheme,
@@ -2023,6 +2030,9 @@ pub struct OwnedProcessResponseParams {
     /// `[[serve]]` entries that cover the document.
     pub(crate) request_path: String,
     pub(crate) content_type: String,
+    /// The origin's status, which decides whether the entries' middleware
+    /// run on a body that is not HTML. See [`text_entry_media_type`].
+    pub(crate) status: StatusCode,
     pub(crate) ad_slots_script: Option<String>,
     pub(crate) ad_bids_state: AdBidsState,
     /// Observation context for the in-flight auction.
@@ -2504,6 +2514,7 @@ fn build_template_assembly_params(
         // Set by the caller, with the rest of what belongs to the request.
         request_path: String::new(),
         content_type: entry.metadata.content_type.clone(),
+        status: StatusCode::OK,
         // The template already carries the head seam; re-injecting would duplicate it.
         permissions_json,
         ad_slots_script: None,
@@ -3299,6 +3310,7 @@ pub fn stream_publisher_body<W: Write>(
         request_path: &params.request_path,
         settings,
         content_type: &params.content_type,
+        status: params.status,
         integration_registry,
         permissions_script: permissions_script.as_deref(),
         ad_slots_script: params.ad_slots_script.as_deref(),
@@ -5920,6 +5932,7 @@ pub async fn handle_publisher_request(
                     request_scheme: request_scheme.to_string(),
                     request_path: request_path.clone(),
                     content_type,
+                    status,
                     permissions_json,
                     ad_slots_script: ad_slots_script.clone(),
                     ad_bids_state: ad_bids_state.clone(),
@@ -9564,6 +9577,7 @@ mod tests {
             request_scheme: "https".to_owned(),
             request_path: "/".to_owned(),
             content_type: "application/json".to_owned(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -21194,6 +21208,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/a.txt".to_owned(),
             content_type: content_type.to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -21267,6 +21282,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/a.txt".to_owned(),
             content_type: "text/plain; charset=utf-8".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -21319,6 +21335,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/a.txt".to_owned(),
             content_type: content_type.to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -21539,6 +21556,33 @@ mod tests {
                     Some(cache_control),
                     "should keep a text response shaped from one reader's state out of \
                      shared caches, and no other"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_text_body_is_handed_to_a_middleware_only_when_the_status_is_200() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+        let settings = settings_running_the_middleware_fixture(vec![PhaseEntry {
+            media_type: fixture::TEXT_MEDIA_TYPE.to_owned(),
+            path: None,
+            middleware: vec![fixture::TEXT.to_owned()],
+        }]);
+        for (status, body) in [
+            (200, format!("plain\n{}", fixture::TEXT_LINE)),
+            (206, "plain\n".to_owned()),
+            (404, "plain\n".to_owned()),
+            (500, "plain\n".to_owned()),
+        ] {
+            let answers =
+                text_answers_through_the_publisher(settings.clone(), false, status, &[]).await;
+            for (response, text) in &answers {
+                assert_eq!(response.status().as_u16(), status);
+                assert_eq!(
+                    text, &body,
+                    "should change a whole file and leave a {status} as the origin sent it"
                 );
             }
         }
@@ -21768,6 +21812,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/css".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -21831,6 +21876,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -21915,6 +21961,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/html; charset=utf-8".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -22008,6 +22055,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/html; charset=utf-8".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -22116,6 +22164,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -22165,6 +22214,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -22294,6 +22344,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -22361,6 +22412,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -22431,6 +22483,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -22501,6 +22554,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -22571,6 +22625,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -22621,6 +22676,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/css".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -22847,6 +22903,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/html; charset=utf-8".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: Some(
                     r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
@@ -22925,6 +22982,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/html; charset=utf-8".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: Some(
                     r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
@@ -23005,6 +23063,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -23079,6 +23138,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/css".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -23235,6 +23295,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: Some(
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
@@ -23911,6 +23972,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/html; charset=utf-8".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -24109,6 +24171,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: Some(
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
@@ -24191,6 +24254,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "Text/HTML; Charset=utf-8".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: Some(
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
@@ -24256,6 +24320,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/html".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -24376,6 +24441,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -24436,6 +24502,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/html".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
