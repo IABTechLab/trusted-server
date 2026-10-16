@@ -71,7 +71,7 @@ pub struct Publisher {
     /// exceeding it fails the response rather than allocating past the cap.
     /// Defaults to 16 MiB — a conservative cap that prevents Wasm-heap OOM.
     ///
-    /// Fastly origin bodies are preserved as streams on the publisher path, so
+    /// Streaming adapters keep origin bodies as streams on the publisher path, so
     /// this setting also caps the streaming pipeline twice over: cumulative
     /// raw (still compressed) bytes pulled from origin, and cumulative decoded
     /// bytes emitted by the decompressor — the latter so a decompression bomb
@@ -819,7 +819,7 @@ pub struct Ec {
     #[serde(default)]
     pub resolve_allowed_origins: Vec<String>,
 
-    /// Fastly KV store name for the EC identity graph.
+    /// KV store name for the EC identity graph.
     #[serde(default, serialize_with = "crate::redacted::sensitive")]
     pub ec_store: Option<String>,
 
@@ -1903,9 +1903,9 @@ pub struct AssetImageOptimizerConfig {
     pub profile_set: String,
     /// Query-string handling policy for the origin request.
     ///
-    /// `preserve` is rejected while Image Optimizer is enabled because Fastly `IO`
-    /// can interpret arbitrary request query parameters as transformation
-    /// inputs outside the configured profile table.
+    /// `preserve` is rejected while Image Optimizer is enabled because the
+    /// platform's image optimizer can interpret arbitrary request query
+    /// parameters as transformation inputs outside the configured profile table.
     #[serde(default)]
     pub origin_query: Option<OriginQueryPolicy>,
 }
@@ -2191,7 +2191,7 @@ impl ImageOptimizerAspectRatioConfig {
 #[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MissingCropOffsetMode {
-    /// Append Fastly `IO` `smart` crop mode.
+    /// Append the image optimizer's `smart` crop mode.
     #[default]
     Smart,
     /// Leave the crop as-is.
@@ -3516,8 +3516,9 @@ pub struct DebugConfig {
     /// Expose the JA4/TLS probabilistic identifier debug endpoint at `GET /_ts/debug/ja4`.
     ///
     /// When `false` (the default), the endpoint returns 404. Enable only for
-    /// intentional Fastly/browser TLS investigation. The endpoint reflects
-    /// Fastly-observed TLS details that browser JS cannot normally read.
+    /// an intentional comparison of the TLS details the edge and the browser
+    /// see. The endpoint reflects TLS details observed at the edge that
+    /// browser JS cannot normally read.
     #[serde(default)]
     pub ja4_endpoint_enabled: bool,
 

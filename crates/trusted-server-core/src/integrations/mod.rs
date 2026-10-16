@@ -226,7 +226,7 @@ pub async fn collect_body_bounded(
                     }));
                 }
                 // Size check runs after chunk is materialized — effective bound is
-                // ≤ max_bytes + one_chunk (Fastly H2/H3 chunks are ≤ 16 KiB in practice).
+                // ≤ max_bytes + one_chunk (H2/H3 chunks are ≤ 16 KiB in practice).
                 body_bytes.extend_from_slice(&chunk);
             }
             Ok(body_bytes)
@@ -244,8 +244,8 @@ pub async fn collect_body_bounded(
 /// [`TrustedServerError::RequestTooLarge`] (413).
 ///
 /// Note: the effective bound for streaming bodies is ≤ `max_bytes` + `one_chunk`
-/// because the size check runs after each chunk is materialized. Fastly
-/// H2/H3 chunks are ≤ 16 KiB in practice, making the overshoot negligible.
+/// because the size check runs after each chunk is materialized. H2/H3
+/// chunks are ≤ 16 KiB in practice, making the overshoot negligible.
 ///
 /// Public because an integration crate outside this one reads upstream
 /// responses too, and an unbounded read of a misbehaving upstream is not a
@@ -284,7 +284,7 @@ pub async fn collect_response_bounded(
                     })
                 })?;
                 // Size check runs after chunk is materialized — effective bound is
-                // ≤ max_bytes + one_chunk (Fastly H2/H3 chunks are ≤ 16 KiB in practice).
+                // ≤ max_bytes + one_chunk (H2/H3 chunks are ≤ 16 KiB in practice).
                 if body_bytes.len() + chunk.len() > max_bytes {
                     return Err(Report::new(TrustedServerError::Integration {
                         integration: integration.to_string(),

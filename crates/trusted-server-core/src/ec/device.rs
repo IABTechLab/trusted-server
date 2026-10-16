@@ -527,7 +527,7 @@ fn compute_h2_fp_hash(raw_h2_fp: &str) -> String {
 /// `h2_fp_prefix` is the raw H2 SETTINGS string (not the hash) — we
 /// compare against the hash computed from it.
 ///
-/// Empirically derived from Fastly Compute production responses (2026-04-03).
+/// Empirically derived from production traffic at the edge (2026-04-03).
 const KNOWN_BROWSERS: &[(&str, &str, bool)] = &[
     // Chrome/Mac v146
     ("t13d1516h2", "1:65536;2:0;4:6291456;6:262144", true),

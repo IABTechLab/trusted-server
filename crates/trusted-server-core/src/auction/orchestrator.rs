@@ -29,7 +29,7 @@ use crate::request_signing::RequestSigner;
 /// Created by [`AuctionOrchestrator::dispatch_auction`] and consumed by
 /// [`AuctionOrchestrator::collect_dispatched_auction`]. Carrying this handle
 /// across `pending_origin.wait()` lets origin response and SSP HTTP requests
-/// race in Fastly's native layer, enabling TTFB ≈ origin latency rather than
+/// race in the host's native layer, enabling TTFB ≈ origin latency rather than
 /// TTFB ≈ auction timeout.
 pub struct DispatchedAuction {
     pending_requests: Vec<PlatformPendingRequest>,
@@ -1139,7 +1139,7 @@ impl AuctionOrchestrator {
         }
 
         // Reject multi-provider fan-out before any request launches when the
-        // platform executes `send_async` eagerly (e.g. Cloudflare Workers):
+        // platform executes `send_async` eagerly:
         // sequential execution would accrue the sum of provider latencies and
         // blow the auction budget before a later `select` could reject it.
         if provider_names.len() > 1 && !context.services.http_client().supports_concurrent_fanout()
@@ -1850,8 +1850,8 @@ impl AuctionOrchestrator {
     /// Dispatch SSP bid requests without blocking WASM.
     ///
     /// Calls each enabled provider's [`AuctionProvider::request_bids`] (which
-    /// internally calls Fastly's `send_async`), then returns immediately with a
-    /// [`DispatchedAuction`] token. The Fastly host begins the SSP round-trips
+    /// internally calls the platform's `send_async`), then returns immediately with a
+    /// [`DispatchedAuction`] token. The host begins the SSP round-trips
     /// while WASM continues to `pending_origin.wait()`.
     ///
     /// Returns [`DispatchAuctionOutcome::NotStarted`] when no providers are configured or
@@ -1883,10 +1883,9 @@ impl AuctionOrchestrator {
         }
 
         // Mirror run_providers_parallel: reject multi-provider fan-out before
-        // any request launches when the platform executes `send_async` eagerly
-        // (e.g. Cloudflare Workers, Spin). Sequential execution would accrue
-        // the sum of provider latencies before the origin fetch and then fail
-        // collection with empty bids.
+        // any request launches when the platform executes `send_async` eagerly.
+        // Sequential execution would accrue the sum of provider latencies
+        // before the origin fetch and then fail collection with empty bids.
         #[cfg(test)]
         if provider_names.len() > 1 && !context.services.http_client().supports_concurrent_fanout()
         {

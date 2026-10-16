@@ -46,6 +46,8 @@ mod backend;
 mod compat;
 mod config_chunks;
 mod config_selection;
+#[cfg(test)]
+mod core_sdk_guard;
 mod ec_kv;
 mod esi_assembly;
 mod logging;

@@ -50,8 +50,8 @@ pub(crate) fn normalize_ip(ip: IpAddr) -> String {
 
 /// Generates a random alphanumeric string of the specified length.
 ///
-/// Fastly Compute's `wasm32-wasip1` runtime supplies OS randomness through
-/// WASI for `rand::thread_rng`; the CI wasm release build verifies that this
+/// On `wasm32-wasip1` the runtime supplies OS randomness through WASI for
+/// `rand::thread_rng`, and the CI wasm release build verifies that this
 /// entropy path remains available for the EC suffix contract.
 fn generate_random_suffix(length: usize) -> String {
     let mut rng = rand::thread_rng();
