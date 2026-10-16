@@ -22667,9 +22667,12 @@ mod tests {
     /// in place of each, with status `200`.
     #[tokio::test]
     async fn robots_txt_is_made_in_place_of_any_answer_the_middleware_cannot_replace() {
+        // The status, body and headers of one answer of the origin's.
+        type OriginAnswer = (u16, &'static [u8], Vec<(&'static str, &'static str)>);
+
         let permissive: &[u8] = b"User-agent: *\nAllow: /\n";
         let plain = ("content-type", "text/plain");
-        let answers: [(u16, &[u8], Vec<(&'static str, &'static str)>); 12] = [
+        let answers: [OriginAnswer; 12] = [
             (401, b"login", vec![("content-type", "text/html")]),
             (403, permissive, vec![plain]),
             (410, b"", vec![plain]),
