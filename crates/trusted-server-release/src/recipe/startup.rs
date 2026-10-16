@@ -27,11 +27,11 @@ use sha2::{Digest as _, Sha256};
 use super::artifact::EXECUTABLE_LIMIT;
 use super::compare::read_artifact;
 use super::{RecipeCompleted, recipe_error};
-use crate::boundary::daemon::{DockerClient, host_arguments};
+use crate::boundary::daemon::{ContainerId, DockerClient, host_arguments};
 use crate::documents::hash_bounded_with_check;
 use crate::error::ReleaseError;
 use crate::policy::ReleaseTarget;
-use crate::process::{ProcessLimits, ProcessOutcome};
+use crate::process::{ProcessLimits, ProcessOutcome, ProcessResult};
 use crate::source::CommitId;
 
 /// The only asset the Linux startup gate accepts.
@@ -42,7 +42,7 @@ const STARTUP_USER: &str = "65534:65534";
 const MOUNT_POINT: &str = "/opt/ts";
 /// File name of the private copy.
 const EXECUTABLE_NAME: &str = "ts";
-/// Wall limit of one startup container, image start included.
+/// Wall limit of attached execution; stopped-container creation is separately bounded.
 const STARTUP_WALL: Duration = Duration::from_secs(120);
 /// Captured stdout limit; the version line is short.
 const STARTUP_STDOUT_MAX: u64 = 4096;
@@ -183,12 +183,54 @@ impl StartupClient {
         })
     }
 
+    /// Requires creation acknowledgement before any attached start request.
+    fn execute_created(
+        &self,
+        name: &str,
+        create_arguments: Vec<OsString>,
+        limits: ProcessLimits,
+        before_start: impl FnOnce() -> Result<(), Report<ReleaseError>>,
+        accept: impl FnOnce(&ProcessResult) -> Result<(), Report<ReleaseError>>,
+    ) -> Result<ProcessResult, Report<ReleaseError>> {
+        lifecycle::run_created(
+            || {
+                self.client.create(
+                    create_arguments,
+                    ProcessLimits {
+                        wall: Duration::from_secs(15),
+                        stdout_max: 4096,
+                        stderr_max: STARTUP_STDERR_MAX,
+                    },
+                )
+            },
+            |identity| {
+                before_start()?;
+                let result = self
+                    .client
+                    .command(
+                        startup_attach_arguments(self.client.inputs().config(), identity),
+                        limits,
+                    )?
+                    .run()?;
+                accept(&result)?;
+                Ok(result)
+            },
+            |identity, step| self.cleanup(identity, name, step),
+        )
+    }
+
     /// Stops and removes only the uniquely named container owned by this run.
-    fn cleanup(&self, name: &str, step: &str) -> Result<bool, Report<ReleaseError>> {
-        let filter = format!("name=^/{name}$");
+    fn cleanup(
+        &self,
+        identity: Option<&ContainerId>,
+        name: &str,
+        step: &str,
+    ) -> Result<bool, Report<ReleaseError>> {
+        let target = identity.map_or(name, ContainerId::as_str);
+        let filter = cleanup_filter(identity, name);
         let arguments: &[&str] = match step {
-            "stop" => &["stop", "--time", "2", name],
-            "rm" => &["rm", "--force", name],
+            "stop" => &["stop", "--time", "2", target],
+            "rm" => &["rm", "--force", target],
             "ps" => &["ps", "--all", "--quiet", "--filter", &filter],
             _ => return Err(recipe_error("unknown startup cleanup step")),
         };
@@ -206,6 +248,14 @@ impl StartupClient {
                 && (step != "ps" || result.stdout().is_empty())
         }))
     }
+}
+
+/// Selects the acknowledged immutable identity, or an unacknowledged owned name.
+fn cleanup_filter(identity: Option<&ContainerId>, name: &str) -> String {
+    identity.map_or_else(
+        || format!("name=^/{name}$"),
+        |id| format!("id={}", id.as_str()),
+    )
 }
 
 /// Returns the exact `--version` output of the owning build facts.
@@ -229,8 +279,7 @@ pub(crate) fn startup_arguments(
 ) -> Vec<OsString> {
     let mut arguments = host_arguments(config);
     arguments.extend([
-        "run".into(),
-        "--rm".into(),
+        "create".into(),
         "--init".into(),
         format!("--name={name}").into(),
         "--pull=never".into(),
@@ -252,6 +301,13 @@ pub(crate) fn startup_arguments(
     arguments.push(format!("--entrypoint={MOUNT_POINT}/{EXECUTABLE_NAME}").into());
     arguments.push(image.id.clone().into());
     arguments.push("--version".into());
+    arguments
+}
+
+/// Returns attached-start arguments for one acknowledged immutable identity.
+pub(crate) fn startup_attach_arguments(config: &Path, identity: &ContainerId) -> Vec<OsString> {
+    let mut arguments = host_arguments(config);
+    arguments.extend(["start".into(), "--attach".into(), identity.as_str().into()]);
     arguments
 }
 
@@ -413,21 +469,18 @@ impl StartupCopy {
             "ts-release-startup-{}",
             hex::encode(crate::boundary::random_bytes::<12>()?)
         );
-        let result = lifecycle::run_owned(
-            || {
-                self.verify()?;
-                let result = client
-                    .client
-                    .command(
-                        startup_arguments(
-                            client.client.inputs().config(),
-                            image,
-                            &self.directory,
-                            &name,
-                        ),
-                        limits,
-                    )?
-                    .run()?;
+        self.verify()?;
+        let result = client.execute_created(
+            &name,
+            startup_arguments(
+                client.client.inputs().config(),
+                image,
+                &self.directory,
+                &name,
+            ),
+            limits,
+            || self.verify(),
+            |result| {
                 check_startup_output(
                     image.distribution,
                     result.outcome(),
@@ -441,10 +494,8 @@ impl StartupCopy {
                         "docker stderr tail: {}",
                         String::from_utf8_lossy(tail)
                     ))
-                })?;
-                Ok(result)
+                })
             },
-            |step| client.cleanup(&name, step),
         );
         let after = self.verify();
         let result = lifecycle::combine(result, after)?;
@@ -522,6 +573,39 @@ mod tests {
         );
     }
 
+    #[test]
+    fn acknowledged_container_is_attached_and_checked_by_immutable_id() {
+        let text = "a".repeat(64);
+        let identity = ContainerId::parse(text.as_bytes()).expect("should parse a full ID");
+        let arguments = startup_attach_arguments(Path::new("/example/config"), &identity);
+        let expected: Vec<OsString> = [
+            "--config",
+            "/example/config",
+            "--host",
+            "unix:///var/run/docker.sock",
+            "start",
+            "--attach",
+            &text,
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        assert_eq!(
+            arguments, expected,
+            "should attach only to the acknowledged identity"
+        );
+        assert_eq!(
+            cleanup_filter(Some(&identity), "ts-release-startup-example"),
+            format!("id={text}"),
+            "should confirm ID absence using the ID filter rather than a name filter"
+        );
+        assert_eq!(
+            cleanup_filter(None, "ts-release-startup-example"),
+            "name=^/ts-release-startup-example$",
+            "should restrict unresolved creation cleanup to its owned name"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires explicit ordinary CI CLI fixture and Linux Docker; starts only its own named container"]
@@ -555,8 +639,7 @@ mod tests {
         let mut arguments = host_arguments(client.client.inputs().config());
         arguments.extend(
             [
-                "run",
-                "--rm",
+                "create",
                 "--init",
                 "--pull=never",
                 "--network=none",
@@ -576,23 +659,19 @@ mod tests {
             image.id().into(),
             "60".into(),
         ]);
-        let result = lifecycle::run_owned(
-            || {
-                client
-                    .client
-                    .command(
-                        arguments,
-                        ProcessLimits {
-                            wall: Duration::from_millis(500),
-                            stdout_max: 4096,
-                            stderr_max: STARTUP_STDERR_MAX,
-                        },
-                    )?
-                    .run()
-            },
-            |step| client.cleanup(&name, step),
-        )
-        .expect("should clean up after the bounded client timeout");
+        let result = client
+            .execute_created(
+                &name,
+                arguments,
+                ProcessLimits {
+                    wall: Duration::from_millis(500),
+                    stdout_max: 4096,
+                    stderr_max: STARTUP_STDERR_MAX,
+                },
+                || Ok(()),
+                |_| Ok(()),
+            )
+            .expect("should clean up after the bounded client timeout");
         assert_eq!(
             result.outcome(),
             ProcessOutcome::TimedOut,
@@ -600,7 +679,7 @@ mod tests {
         );
         assert!(
             client
-                .cleanup(&name, "ps")
+                .cleanup(None, &name, "ps")
                 .expect("should independently confirm absence"),
             "should leave no owned container"
         );

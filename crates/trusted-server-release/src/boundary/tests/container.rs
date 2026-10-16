@@ -13,10 +13,11 @@ use std::time::Duration;
 use serde_json::Value;
 use tempfile::TempDir;
 
-use super::super::daemon::DockerClient;
 use super::super::daemon::check_daemon_socket;
+use super::super::daemon::{ContainerId, DockerClient};
 use super::super::docker::{
-    DockerSettings, RunPlan, container_path, mounts, run_arguments, validate_image_id,
+    DockerSettings, RunPlan, cleanup_target, complete_created, container_path, create_arguments,
+    mounts, start_arguments, validate_image_id,
 };
 use super::super::host_inputs::HostInputs;
 use super::super::seccomp;
@@ -87,7 +88,7 @@ fn docker_settings(client: &Path) -> DockerSettings {
 }
 
 #[test]
-fn docker_run_arguments_are_exact() {
+fn docker_create_arguments_are_exact() {
     let (_directory, base) = canonical_tempdir();
     let roots = sample_roots(&base);
     let mounts = mounts(&roots).expect("should build mounts");
@@ -97,7 +98,7 @@ fn docker_run_arguments_are_exact() {
         OsString::from("/boundary/writable/0"),
     )];
     let arguments = [OsString::from("--flag")];
-    let plan = RunPlan {
+    let mut plan = RunPlan {
         config: Path::new("/host/config"),
         seccomp: Path::new("/host/seccomp.json"),
         name: "ts-release-boundary-fixture",
@@ -110,14 +111,15 @@ fn docker_run_arguments_are_exact() {
         interactive: false,
         umask: None,
     };
-    let actual: Vec<String> = run_arguments(&docker_settings(Path::new("/usr/bin/docker")), &plan)
-        .iter()
-        .map(|part| part.to_string_lossy().into_owned())
-        .collect();
+    let actual: Vec<String> =
+        create_arguments(&docker_settings(Path::new("/usr/bin/docker")), &plan)
+            .iter()
+            .map(|part| part.to_string_lossy().into_owned())
+            .collect();
     let root = base.to_str().expect("should be UTF-8");
     assert_eq!(
         actual,
-        expected_run_arguments(root, &image),
+        expected_create_arguments(root, &image),
         "should build the exact fixed argv"
     );
     assert!(
@@ -127,19 +129,28 @@ fn docker_run_arguments_are_exact() {
             || part == "--tty"),
         "should never pass --pid or a TTY"
     );
+    plan.interactive = true;
+    let interactive = create_arguments(&docker_settings(Path::new("/usr/bin/docker")), &plan);
+    assert!(
+        interactive.contains(&OsString::from("--interactive")),
+        "should keep created stdin open for later attached input"
+    );
+    assert!(
+        !interactive.contains(&OsString::from("--rm")),
+        "should retain the acknowledged container until explicit cleanup"
+    );
 }
 
 /// The exact argv expected for the fixture plan rooted at `root`.
 /// Fixed argv prefix expected before the mounts.
-const EXPECTED_PREFIX: [&str; 33] = [
+const EXPECTED_PREFIX: [&str; 32] = [
     "--config",
     "/host/config",
     "--host",
     "unix:///var/run/docker.sock",
-    "run",
+    "create",
     "--name",
     "ts-release-boundary-fixture",
-    "--rm",
     "--init",
     "--pull",
     "never",
@@ -167,7 +178,7 @@ const EXPECTED_PREFIX: [&str; 33] = [
     "--mount",
 ];
 
-fn expected_run_arguments(root: &str, image: &str) -> Vec<String> {
+fn expected_create_arguments(root: &str, image: &str) -> Vec<String> {
     EXPECTED_PREFIX
     .iter()
     .map(|part| (*part).to_owned())
@@ -524,7 +535,7 @@ fn argv_after_image(umask: Option<Umask>, program: &str, arguments: &[&str]) -> 
         interactive: false,
         umask,
     };
-    let argv: Vec<String> = run_arguments(&docker_settings(Path::new("/usr/bin/docker")), &plan)
+    let argv: Vec<String> = create_arguments(&docker_settings(Path::new("/usr/bin/docker")), &plan)
         .iter()
         .map(|part| part.to_string_lossy().into_owned())
         .collect();
@@ -620,5 +631,97 @@ fn docker_argv_keeps_shell_metacharacters_positional() {
         tail[5..],
         hostile,
         "should pass every hostile argument verbatim as its own word"
+    );
+}
+
+#[test]
+fn start_attaches_only_to_the_confirmed_full_container_id() {
+    let id = ContainerId::parse("a".repeat(64).as_bytes()).expect("should accept full ID");
+    for interactive in [false, true] {
+        let actual = start_arguments(Path::new("/host/config"), &id, interactive);
+        let mut expected: Vec<OsString> = [
+            "--config",
+            "/host/config",
+            "--host",
+            "unix:///var/run/docker.sock",
+            "start",
+            "--attach",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        if interactive {
+            expected.push(OsString::from("--interactive"));
+        }
+        expected.push(OsString::from(id.as_str()));
+        assert_eq!(
+            actual, expected,
+            "should attach by exact ID and preserve requested stdin"
+        );
+    }
+}
+
+#[test]
+fn unresolved_create_never_starts_even_when_name_cleanup_observes_absence() {
+    let mut cleanup_attempted = false;
+    let result = complete_created::<()>(
+        Err(boundary_error("unresolved creation")),
+        |_| panic!("should never start an unacknowledged container"),
+        |id| {
+            assert!(id.is_none(), "should clean up only the unresolved name");
+            cleanup_attempted = true;
+            Ok(())
+        },
+    );
+    assert!(
+        cleanup_attempted,
+        "should attempt cleanup after failed creation"
+    );
+    assert!(
+        result.is_err(),
+        "should retain unresolved creation despite current absence"
+    );
+}
+
+#[test]
+fn acknowledged_start_failure_cleans_up_the_same_id() {
+    let id = ContainerId::parse("b".repeat(64).as_bytes()).expect("should accept full ID");
+    let expected = id.as_str().to_owned();
+    let mut cleanup_attempted = false;
+    let result = complete_created::<()>(
+        Ok(id),
+        |id| {
+            assert_eq!(id.as_str(), expected, "should start the acknowledged ID");
+            Err(boundary_error("attached start failed"))
+        },
+        |id| {
+            assert_eq!(
+                id.expect("should clean a confirmed ID").as_str(),
+                expected,
+                "should remove the exact acknowledged ID"
+            );
+            cleanup_attempted = true;
+            Ok(())
+        },
+    );
+    assert!(
+        cleanup_attempted,
+        "should attempt cleanup after start failure"
+    );
+    assert!(result.is_err(), "should retain attached start failure");
+}
+
+#[test]
+fn confirmed_cleanup_filters_by_id_and_unresolved_cleanup_filters_by_name() {
+    let id = ContainerId::parse("c".repeat(64).as_bytes()).expect("should accept full ID");
+    assert_eq!(
+        cleanup_target("fixture-name", Some(&id)),
+        (id.as_str(), format!("id={}", id.as_str())),
+        "should never mistake an ID for a container name in absence confirmation"
+    );
+    assert_eq!(
+        cleanup_target("fixture-name", None),
+        ("fixture-name", "name=^/fixture-name$".to_owned()),
+        "should restrict unresolved best-effort cleanup to the owned name"
     );
 }

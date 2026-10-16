@@ -240,13 +240,22 @@ fn startup_container_is_offline_read_only_unprivileged_and_bounded() {
             .any(|argument| argument.starts_with("--name=")),
         "should own a named container for cleanup"
     );
+    assert!(
+        arguments.iter().any(|argument| argument == "create"),
+        "should acknowledge creation before starting guest code"
+    );
+    assert!(
+        !arguments
+            .iter()
+            .any(|argument| argument == "run" || argument == "--rm"),
+        "should retain the created identity through explicit cleanup"
+    );
     let expected: Vec<String> = [
         "--config",
         "/example/docker-config",
         "--host",
         "unix:///var/run/docker.sock",
-        "run",
-        "--rm",
+        "create",
         "--init",
         "--name=ts-release-startup-example",
         "--pull=never",

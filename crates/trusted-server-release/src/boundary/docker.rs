@@ -15,9 +15,12 @@
 //! read-only and recursively read-only (`bind-recursive=readonly`), writable
 //! roots read-write, at fixed `/boundary/<role>/<index>` targets.
 //!
-//! Every run is followed, on success and failure alike, by bounded
+//! Creation must acknowledge a full container ID before a separate attached
+//! start can execute the guest. A failed creation remains unresolved and fatal;
+//! a later name lookup cannot exclude a delayed daemon-side creation.
+//! Every acknowledged start is followed, on success and failure alike, by bounded
 //! `docker stop --time <n>`, `docker rm --force` and a listing that must show
-//! the named container gone. Each step is attempted even when an earlier one
+//! the acknowledged container ID gone. Each step is attempted even when an earlier one
 //! failed, and every failure is reported. If the pinned host inputs fail
 //! their integrity check during cleanup, cleanup still proceeds through the
 //! pinned client path (a left-running container is the worse outcome) and the
@@ -29,7 +32,9 @@ use std::path::{Path, PathBuf};
 use error_stack::Report;
 use sha2::{Digest as _, Sha256};
 
-use super::daemon::{DOCKER_SOCKET, DockerClient, check_daemon_socket, host_arguments};
+use super::daemon::{
+    ContainerId, DOCKER_SOCKET, DockerClient, check_daemon_socket, host_arguments,
+};
 use super::roots::{BoundaryRoots, RootRole, validate_path_text};
 use super::{ConfinedCommand, Umask};
 use crate::error::ReleaseError;
@@ -38,7 +43,7 @@ use crate::process::{ProcessLimits, ProcessOutcome, ProcessResult};
 /// Container-namespace prefix for every mount target.
 const MOUNT_PREFIX: &str = "/boundary";
 /// Configuration fingerprint domain.
-const FINGERPRINT_DOMAIN: &[u8] = b"trusted-server-boundary-docker-v1\n";
+const FINGERPRINT_DOMAIN: &[u8] = b"trusted-server-boundary-docker-confirmed-create-v2\n";
 /// Fixed absolute shell of the selected image that applies a requested umask.
 const SHELL: &str = "/bin/sh";
 /// Fixed `argv[0]` of [`SHELL`]; the program and its arguments follow it.
@@ -111,7 +116,7 @@ pub(crate) struct DockerSettings {
     pub(crate) user: (u32, u32),
     /// `docker stop -t` grace in seconds.
     pub(crate) stop_timeout_seconds: u32,
-    /// Limits for every Docker host command other than `run`.
+    /// Limits for Docker creation and host cleanup commands.
     pub(crate) host_limits: ProcessLimits,
 }
 
@@ -320,8 +325,7 @@ fn mount_argument(mount: &Mount) -> OsString {
 
 /// Fixed isolation flags; deliberately no `--pid` (the default namespace is
 /// already private) and no `--tty`.
-const ISOLATION_ARGUMENTS: [&str; 13] = [
-    "--rm",
+const ISOLATION_ARGUMENTS: [&str; 12] = [
     "--init",
     "--pull",
     "never",
@@ -371,11 +375,11 @@ fn umask_prefix(umask: Option<Umask>) -> Vec<OsString> {
         .unwrap_or_default()
 }
 
-/// Returns the complete fixed `docker` argument vector for `plan`.
+/// Returns the complete fixed `docker create` argument vector for `plan`.
 #[must_use]
-pub(crate) fn run_arguments(settings: &DockerSettings, plan: &RunPlan<'_>) -> Vec<OsString> {
+pub(crate) fn create_arguments(settings: &DockerSettings, plan: &RunPlan<'_>) -> Vec<OsString> {
     let mut arguments = host_arguments(plan.config);
-    arguments.extend(["run", "--name", plan.name].iter().map(OsString::from));
+    arguments.extend(["create", "--name", plan.name].iter().map(OsString::from));
     arguments.extend(ISOLATION_ARGUMENTS.iter().map(OsString::from));
     let mut seccomp = OsString::from("seccomp=");
     seccomp.push(plan.seccomp);
@@ -483,7 +487,7 @@ impl DockerBoundary {
         let mut hasher = Sha256::new();
         hasher.update(FINGERPRINT_DOMAIN);
         let digests = self.client.inputs().digests();
-        let parts = run_arguments(&self.settings, &plan)
+        let parts = create_arguments(&self.settings, &plan)
             .into_iter()
             .chain(digests.iter().map(OsString::from));
         for part in parts {
@@ -522,37 +526,37 @@ impl DockerBoundary {
             interactive: command.stdin.is_some(),
             umask: command.umask,
         };
-        let arguments = run_arguments(&self.settings, &plan);
-        let outcome = self
-            .client
-            .command(arguments, command.limits)
-            .and_then(|bounded| command.finish(bounded).run());
-        let cleanup = self.cleanup(&name);
-        match (outcome, cleanup) {
-            (Ok(result), Ok(())) => Ok(result),
-            (Ok(_), Err(cleanup)) => Err(cleanup),
-            (Err(run), Ok(())) => Err(run),
-            (Err(run), Err(cleanup)) => {
-                Err(run.attach(format!("cleanup also failed: {cleanup:?}")))
-            }
-        }
+        let arguments = create_arguments(&self.settings, &plan);
+        complete_created(
+            self.client.create(arguments, self.settings.host_limits),
+            |id| {
+                self.client
+                    .command(
+                        start_arguments(self.client.inputs().config(), id, command.stdin.is_some()),
+                        command.limits,
+                    )
+                    .and_then(|bounded| command.finish(bounded).run())
+            },
+            |id| self.cleanup(&name, id),
+        )
     }
 
     /// Attempts bounded stop, remove and a confirming listing independently,
     /// and aggregates every failure, including a host-input integrity
     /// failure observed during cleanup.
-    fn cleanup(&self, name: &str) -> Result<(), Report<ReleaseError>> {
+    fn cleanup(&self, name: &str, id: Option<&ContainerId>) -> Result<(), Report<ReleaseError>> {
         let grace = self.settings.stop_timeout_seconds.to_string();
-        let filter = format!("name=^/{name}$");
+        let (reference, filter) = cleanup_target(name, id);
         let mut failures = Vec::new();
-        // A container already removed by `--rm` makes stop and rm fail; only
-        // the final listing decides whether the container is gone.
+        // A stopped or already removed container can make stop or rm fail;
+        // the final listing confirms absence of the exact acknowledged ID.
+        // After failed creation, name absence never resolves the creation error.
         let _ = self
             .client
-            .cleanup_host(&["stop", "--time", &grace, name], &mut failures);
+            .cleanup_host(&["stop", "--time", &grace, reference], &mut failures);
         let _ = self
             .client
-            .cleanup_host(&["rm", "--force", name], &mut failures);
+            .cleanup_host(&["rm", "--force", reference], &mut failures);
         let listing = self.client.cleanup_host(
             &["ps", "--all", "--quiet", "--filter", &filter],
             &mut failures,
@@ -562,7 +566,7 @@ impl DockerBoundary {
         });
         if !gone {
             failures.push(docker_error(format!(
-                "container {name} was not confirmed removed"
+                "container {reference} was not confirmed removed"
             )));
         }
         aggregate(failures)
@@ -571,3 +575,48 @@ impl DockerBoundary {
 
 #[cfg(test)]
 mod host_path_tests;
+
+/// Attaches to a confirmed container, preserving its configured stdin behavior.
+#[must_use]
+pub(crate) fn start_arguments(config: &Path, id: &ContainerId, interactive: bool) -> Vec<OsString> {
+    let mut arguments = host_arguments(config);
+    arguments.extend([OsString::from("start"), OsString::from("--attach")]);
+    if interactive {
+        arguments.push(OsString::from("--interactive"));
+    }
+    arguments.push(OsString::from(id.as_str()));
+    arguments
+}
+
+/// Starts only acknowledged creations and always attempts the matching cleanup.
+///
+/// # Errors
+///
+/// Returns the creation or start failure together with any cleanup failure.
+/// Observing absence after failed creation never clears the creation error.
+pub(crate) fn complete_created<T>(
+    created: Result<ContainerId, Report<ReleaseError>>,
+    start: impl FnOnce(&ContainerId) -> Result<T, Report<ReleaseError>>,
+    cleanup: impl FnOnce(Option<&ContainerId>) -> Result<(), Report<ReleaseError>>,
+) -> Result<T, Report<ReleaseError>> {
+    let (outcome, cleanup) = match created {
+        Ok(id) => (start(&id), cleanup(Some(&id))),
+        Err(error) => (Err(error), cleanup(None)),
+    };
+    match (outcome, cleanup) {
+        (Ok(result), Ok(())) => Ok(result),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(error), Ok(())) => Err(error),
+        (Err(error), Err(cleanup)) => {
+            Err(error.attach(format!("cleanup also failed: {cleanup:?}")))
+        }
+    }
+}
+
+/// Selects ID-based cleanup after acknowledgment, or name lookup for unresolved creation.
+pub(crate) fn cleanup_target<'a>(name: &'a str, id: Option<&'a ContainerId>) -> (&'a str, String) {
+    match id {
+        Some(id) => (id.as_str(), format!("id={}", id.as_str())),
+        None => (name, format!("name=^/{name}$")),
+    }
+}

@@ -156,6 +156,31 @@ impl DockerClient {
         full
     }
 
+    /// Creates a stopped container and requires its acknowledged full identity.
+    ///
+    /// Callers must supply fixed `create` arguments and must not issue a start
+    /// request before this returns successfully. Killing a create client cannot
+    /// cancel its daemon RPC, so an error leaves creation explicitly unresolved.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for changed host inputs, failed creation or an invalid
+    /// ID. A late stopped container remains possible after any failure; name
+    /// cleanup and an absence observation cannot turn that failure into success.
+    pub(crate) fn create(
+        &self,
+        arguments: Vec<OsString>,
+        limits: ProcessLimits,
+    ) -> Result<ContainerId, Report<ReleaseError>> {
+        self.command(arguments, limits)
+            .and_then(|command| command.run())
+            .and_then(ProcessResult::require_success)
+            .and_then(|stdout| ContainerId::parse(&stdout))
+            .map_err(|error| error.attach(
+                "container creation is unresolved; a late stopped container may remain; no start is authorized"
+            ))
+    }
+
     /// Runs one host command (`docker --config … --host … <arguments>`).
     ///
     /// # Errors
@@ -191,6 +216,70 @@ impl DockerClient {
                 failures.push(error);
                 None
             }
+        }
+    }
+}
+
+/// Full immutable identity acknowledged by a successful Docker create command.
+#[derive(Debug)]
+pub(crate) struct ContainerId(String);
+
+impl ContainerId {
+    /// Parses exactly one full lowercase hexadecimal container ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for abbreviated IDs, names, extra output or invalid bytes.
+    pub(crate) fn parse(stdout: &[u8]) -> Result<Self, Report<ReleaseError>> {
+        let bytes = stdout.strip_suffix(b"\n").unwrap_or(stdout);
+        if bytes.len() != 64
+            || !bytes
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+        {
+            return Err(daemon_error(
+                "container creation returned no unambiguous full identity",
+            ));
+        }
+        let id = std::str::from_utf8(bytes)
+            .map_err(|error| daemon_error(format!("container identity is not UTF-8: {error}")))?;
+        Ok(Self(id.to_owned()))
+    }
+
+    /// Returns the full daemon-owned container identity.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+mod create_tests {
+    use super::*;
+
+    #[test]
+    fn created_container_identity_is_full_and_unambiguous() {
+        let id = "a".repeat(64);
+        for bytes in [id.clone(), format!("{id}\n")] {
+            assert_eq!(
+                ContainerId::parse(bytes.as_bytes())
+                    .expect("should accept one full ID")
+                    .as_str(),
+                id
+            );
+        }
+        for invalid in [
+            String::new(),
+            "a".repeat(12),
+            "A".repeat(64),
+            format!("sha256:{id}"),
+            format!("{id}\nextra"),
+            format!(" {id}"),
+            format!("{id}\n\n"),
+        ] {
+            assert!(
+                ContainerId::parse(invalid.as_bytes()).is_err(),
+                "should reject ambiguous container identity {invalid:?}"
+            );
         }
     }
 }
