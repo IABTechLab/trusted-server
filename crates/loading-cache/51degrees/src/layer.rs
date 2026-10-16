@@ -1,8 +1,9 @@
-//! The memory layer, the brief copy every request in a process shares.
+//! The memory layer, the brief copy every request served with one application
+//! state shares.
 //!
 //! Its key is a [`Call`], which carries the caller's own way of loading the
 //! value through the shared store, because what loads a value belongs to the
-//! request asking for it while the layer belongs to the process. The key is
+//! request asking for it while the layer belongs to the state. The key is
 //! compared by its text alone, so every caller for one key joins one load, and
 //! the load of whichever caller leads is the one that runs.
 

@@ -47,7 +47,7 @@ pub fn closed_path_response(req: &Request<EdgeBody>) -> Option<Response<EdgeBody
 /// A separator encoded twice, as in `/admin%252Fkeys/rotate`, survives one
 /// decode as `/admin%2Fkeys/rotate`, so the check is repeated to a fixed point
 /// rather than applied once.
-fn is_closed(path: &str) -> bool {
+pub(crate) fn is_closed(path: &str) -> bool {
     matches_any_decoding(path, is_closed_as_written)
 }
 

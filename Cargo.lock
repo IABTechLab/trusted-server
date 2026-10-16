@@ -6580,6 +6580,7 @@ dependencies = [
  "async-trait",
  "edgezero-core",
  "error-stack",
+ "futures",
  "http",
  "log",
  "serde",
@@ -6622,6 +6623,7 @@ dependencies = [
  "trusted-server-cmp-sourcepoint",
  "trusted-server-core",
  "trusted-server-framework-nextjs",
+ "trusted-server-headers-geo",
  "trusted-server-identity-lockr",
  "trusted-server-loading-cache-51degrees",
  "trusted-server-middleware-51degrees",
@@ -6668,6 +6670,7 @@ dependencies = [
  "trusted-server-cmp-sourcepoint",
  "trusted-server-core",
  "trusted-server-framework-nextjs",
+ "trusted-server-headers-geo",
  "trusted-server-identity-lockr",
  "trusted-server-js",
  "trusted-server-loading-cache-51degrees",
@@ -6720,6 +6723,7 @@ dependencies = [
  "trusted-server-device-fastly",
  "trusted-server-framework-nextjs",
  "trusted-server-geo-fastly",
+ "trusted-server-headers-geo",
  "trusted-server-identity-lockr",
  "trusted-server-loading-cache-51degrees",
  "trusted-server-middleware-51degrees",
@@ -6769,6 +6773,7 @@ dependencies = [
  "trusted-server-cmp-sourcepoint",
  "trusted-server-core",
  "trusted-server-framework-nextjs",
+ "trusted-server-headers-geo",
  "trusted-server-identity-lockr",
  "trusted-server-js",
  "trusted-server-loading-cache-51degrees",
@@ -6975,6 +6980,7 @@ dependencies = [
  "trusted-server-cmp-sourcepoint",
  "trusted-server-core",
  "trusted-server-framework-nextjs",
+ "trusted-server-headers-geo",
  "trusted-server-identity-lockr",
  "trusted-server-loading-cache-51degrees",
  "trusted-server-middleware-51degrees",
@@ -7130,6 +7136,21 @@ dependencies = [
  "error-stack",
  "fastly",
  "trusted-server-core",
+]
+
+[[package]]
+name = "trusted-server-headers-geo"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "edgezero-core",
+ "error-stack",
+ "futures",
+ "http",
+ "log",
+ "serde",
+ "trusted-server-core",
+ "validator",
 ]
 
 [[package]]
@@ -7319,6 +7340,7 @@ name = "trusted-server-tag-google-tag"
 version = "0.1.0"
 dependencies = [
  "error-stack",
+ "futures",
  "log",
  "regex",
  "serde",
