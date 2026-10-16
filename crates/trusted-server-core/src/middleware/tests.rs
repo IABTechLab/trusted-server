@@ -418,6 +418,31 @@ fn an_entry_for_the_same_pages_as_an_earlier_one_is_told_to_share_its_list() {
 }
 
 #[test]
+fn a_path_of_slash_covers_the_same_pages_as_no_path() {
+    // The path of a request for a page begins with `/`, so whichever of the
+    // two entries comes second is never reached.
+    let cases = [
+        vec![
+            entry(Some("/"), &["example.a"]),
+            entry(None, &["example.b"]),
+        ],
+        vec![
+            entry(None, &["example.a"]),
+            entry(Some("/"), &["example.b"]),
+        ],
+    ];
+
+    for entries in cases {
+        let message = refusal(entries);
+        assert!(
+            message.contains("[[fetch]] entry 2 covers the same pages as [[fetch]] entry 1")
+                && message.contains("Name every middleware for those pages in one entry's list"),
+            "should refuse the entry that is never reached: {message}"
+        );
+    }
+}
+
+#[test]
 fn entries_are_read_from_a_list_and_written_back_as_they_were() {
     let written = json!([
         { "media_type": "text/html", "path": "/news/", "middleware": ["example.a", "example.b"] },
@@ -1392,6 +1417,28 @@ fn settings_with_a_misshapen_entry_are_refused() {
             "should say `{expected}`: {message}"
         );
     }
+}
+
+#[test]
+fn settings_with_an_entry_after_one_for_the_path_slash_are_refused() {
+    let message = settings_with_document(
+        r#"
+[[fetch]]
+media_type = "text/html"
+path = "/"
+middleware = ["example.root"]
+
+[[fetch]]
+media_type = "text/html"
+middleware = ["example.all"]
+"#,
+    )
+    .expect_err("should refuse settings with an entry that is never reached");
+
+    assert!(
+        message.contains("[[fetch]] entry 2 covers the same pages as [[fetch]] entry 1"),
+        "should name the entry that is never reached: {message}"
+    );
 }
 
 #[test]
