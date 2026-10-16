@@ -13,12 +13,11 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use base64::Engine as _;
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use edgezero_core::body::Body as EdgeBody;
 use http::{HeaderValue, Method, Request, Response, StatusCode, header};
+use p256::ecdsa::Signature;
 use p256::ecdsa::signature::Signer as _;
-use p256::ecdsa::{Signature, SigningKey};
-use p256::pkcs8::DecodePrivateKey as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use validator::{Validate, ValidationError};
@@ -32,6 +31,11 @@ use crate::settings::Settings;
 
 // `ATTESTATION_KEYS`, written by build.rs from the schedule the build names.
 include!(concat!(env!("OUT_DIR"), "/attestation_keys.rs"));
+
+/// The reading of a signing key, shared with the build script, which refuses
+/// a schedule key that cannot sign.
+#[path = "../signing_key.rs"]
+mod signing_key;
 
 /// The build script's reading of a key schedule, compiled here so a test can
 /// call it.
@@ -334,16 +338,19 @@ pub fn handle_attestation(
         platform,
         req,
         ATTESTATION_KEYS,
-        crate::ec::current_timestamp(),
+        crate::ec::checked_current_timestamp(),
     )
 }
 
+/// Answers from `schedule` at `now`, which is `None` when the clock cannot be
+/// read. Nothing is signed then, because the evidence would carry a time that
+/// never happened.
 fn answer(
     settings: &Settings,
     platform: &PlatformIdentity,
     req: &Request<EdgeBody>,
     schedule: &[ScheduledKey<'_>],
-    now: u64,
+    now: Option<u64>,
 ) -> Response<EdgeBody> {
     let Some(config) = settings.attestation.as_ref() else {
         return error_response(
@@ -354,6 +361,12 @@ fn answer(
     let nonce = match nonce_from_query(req.uri().query()) {
         Ok(nonce) => nonce,
         Err(message) => return error_response(StatusCode::BAD_REQUEST, message),
+    };
+    let Some(now) = now else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The clock could not be read, so no evidence can be signed.",
+        );
     };
     let Some(&(key_id, _, private_key)) = key_in_force(schedule, now) else {
         log::error!("attestation has no signing key in force at {now}");
@@ -485,13 +498,7 @@ pub fn signed_bytes(context: &str, payload: &[u8]) -> Vec<u8> {
 /// Signs `payload` under `context` with a key held as base64 DER text,
 /// returning the raw 64 byte `r` and `s` pair.
 fn sign(context: &str, payload: &[u8], key_text: &str) -> Result<Vec<u8>, &'static str> {
-    let der = STANDARD
-        .decode(key_text.trim())
-        .map_err(|_| "the key is not base64")?;
-    let secret = p256::SecretKey::from_sec1_der(&der)
-        .or_else(|_| p256::SecretKey::from_pkcs8_der(&der))
-        .map_err(|_| "the key is not a P-256 private key in SEC1 or PKCS #8 DER")?;
-    let signature: Signature = SigningKey::from(secret).sign(&signed_bytes(context, payload));
+    let signature: Signature = signing_key::read(key_text)?.sign(&signed_bytes(context, payload));
     Ok(signature.to_bytes().to_vec())
 }
 
@@ -764,6 +771,7 @@ fn validate_https_url(value: &str) -> Result<(), ValidationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::STANDARD;
     use p256::ecdsa::VerifyingKey;
     use p256::ecdsa::signature::Verifier as _;
     use p256::pkcs8::{DecodePublicKey as _, EncodePublicKey as _};
@@ -823,7 +831,7 @@ mod tests {
             ("example-first", FIRST_STARTS, first.as_str()),
             ("example-second", SECOND_STARTS, second.as_str()),
         ];
-        answer(settings, &platform(), &request(uri), &schedule, now)
+        answer(settings, &platform(), &request(uri), &schedule, Some(now))
     }
 
     fn body_bytes(response: Response<EdgeBody>) -> Vec<u8> {
@@ -975,6 +983,40 @@ mod tests {
         }
     }
 
+    /// A key that cannot sign stops the build however late it starts, so no
+    /// built binary carries one. The message names the key's line and id and
+    /// never the key.
+    #[test]
+    fn a_schedule_key_that_cannot_sign_is_refused_without_showing_it() {
+        let first = key_text(&FIRST);
+        let latest = i64::MAX;
+        let ed25519_seed = STANDARD.encode([0x33u8; 32]);
+        for (case, key, reason) in [
+            (
+                "a key that is not base64",
+                "not-base64-at-all",
+                "the key is not base64",
+            ),
+            (
+                "a key that is not a P-256 private key",
+                ed25519_seed.as_str(),
+                "the key is not a P-256 private key in SEC1 or PKCS #8 DER",
+            ),
+        ] {
+            let schedule =
+                format!("example-first\t1000\t{first}\nexample-later\t{latest}\t{key}\n");
+            let refused = key_schedule::constant_source(Some(&schedule))
+                .expect_err("should refuse the schedule");
+
+            assert_eq!(
+                refused,
+                format!("line 2 holds key `example-later`, which cannot sign, as {reason}"),
+                "{case} should be refused"
+            );
+            assert!(!refused.contains(key), "{case} should never show the key");
+        }
+    }
+
     /// A verifier with only the public key, in the `SubjectPublicKeyInfo` DER
     /// form a key schedule publishes, accepts the signature over exactly the
     /// context, one line feed, then the payload. Without the context, without
@@ -1103,7 +1145,7 @@ mod tests {
                 &platform(),
                 &request("/_ex/attestation.json"),
                 &schedule,
-                now,
+                Some(now),
             );
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{case}");
             let body = json_body(response);
@@ -1112,6 +1154,30 @@ mod tests {
                     .as_str()
                     .is_some_and(|error| error.starts_with(says)),
                 "{case}: {body}"
+            );
+        }
+    }
+
+    /// A clock that cannot be read signs nothing, even with a key in force
+    /// from the epoch, because the evidence would carry a time that never
+    /// happened.
+    #[test]
+    fn a_clock_that_cannot_be_read_signs_nothing() {
+        let first = key_text(&FIRST);
+        let schedule = [("example-first", 0, first.as_str())];
+        for uri in ["/_ex/attestation.json", "/_ex/attestation"] {
+            let response = answer(
+                &settings_with_attestation(),
+                &platform(),
+                &request(uri),
+                &schedule,
+                None,
+            );
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+            assert_eq!(
+                json_body(response),
+                json!({ "error": "The clock could not be read, so no evidence can be signed." }),
+                "{uri} should sign nothing"
             );
         }
     }
@@ -1184,7 +1250,7 @@ mod tests {
             &platform(),
             &request("/_ex/attestation.json"),
             &schedule,
-            1_500,
+            Some(1_500),
         );
         assert_eq!(response.status(), StatusCode::OK);
     }
@@ -1773,7 +1839,7 @@ mod tests {
             &platform(),
             &req,
             &schedule,
-            1_500,
+            Some(1_500),
         ));
         let (payload, _) = payload_and_signature(&envelope);
         serde_json::from_slice(&payload).expect("JSON payload")
@@ -1985,7 +2051,7 @@ mod tests {
             &staged,
             &request("/_ex/attestation.json"),
             &schedule,
-            1_500,
+            Some(1_500),
         ));
         assert_eq!(from_staging["evidence"]["platform"]["staging"], true);
     }
