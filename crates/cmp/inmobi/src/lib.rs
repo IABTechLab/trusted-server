@@ -303,6 +303,12 @@ impl Middleware for Choice {
             ..MiddlewareAction::pass()
         }
     }
+
+    /// The whole tag, because the stubs are compiled into this crate and no
+    /// setting changes when they do.
+    fn template_key(&self) -> &str {
+        &self.tag
+    }
 }
 
 /// Escapes a value for an HTML double quoted attribute.
@@ -324,7 +330,7 @@ mod tests {
     use trusted_server_core::html_processor::test_support::{
         assert_page_is_recorded, page_settings,
     };
-    use trusted_server_core::integrations::IntegrationDocumentState;
+    use trusted_server_core::integrations::{IntegrationDocumentState, IntegrationRegistry};
     use trusted_server_core::middleware::test_support::context;
     use trusted_server_core::middleware::{MiddlewareChain, PhaseEntries};
 
@@ -804,6 +810,25 @@ mod tests {
             position(&tcf) < position(&gpp) && position(&gpp) < position("cmp.inmobi.com"),
             "the order is TCF stub, GPP stub, loader: {tag}"
         );
+    }
+
+    /// The stubs are compiled into this crate and no setting changes when
+    /// they do, so they have to be in the text the registered middleware
+    /// keys a stored page by, or a page stored before a change to a stub
+    /// keeps the old stub until it expires.
+    #[test]
+    fn the_stubs_are_in_what_keys_a_stored_page() {
+        let settings = settings_with(REAL);
+        let registry = IntegrationRegistry::with_registrations(&settings, &[super::builder()])
+            .expect("should build the registry");
+
+        let keys = registry.middleware_template_keys();
+        let (_, key) = keys
+            .iter()
+            .find(|(name, _)| *name == MODULE)
+            .expect("the prompt's middleware should be registered");
+        assert!(key.contains(&tcf_stub()), "{key}");
+        assert!(key.contains(&gpp_stub(CMP_ID)), "{key}");
     }
 
     #[test]
