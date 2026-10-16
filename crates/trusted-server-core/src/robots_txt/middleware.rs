@@ -47,9 +47,11 @@ impl RobotsTxt {
     }
 
     /// The file for the request, which is the refusal alone or every selected
-    /// contributor's held answer assembled.
+    /// contributor's held answer assembled, each asked for `addressed_host`.
+    /// With no addressed host only the refusal can be made.
     async fn file(
         &self,
+        addressed_host: Option<&str>,
         request: ModuleRequest<'_>,
         settings: &Settings,
         services: &RuntimeServices,
@@ -57,10 +59,21 @@ impl RobotsTxt {
         if self.config.refuses_all() {
             return Ok(document::refusal(&self.config.always_allow));
         }
-        // The answers are held and served to every crawler, so the
-        // contributors are handed the request with nothing one crawler put in
-        // the address.
-        let request = ResolvedRequest::from_view(&request).without_query();
+        // The answers are held for the host and served to every crawler of
+        // it, so the contributors are handed the request with nothing one
+        // crawler put in the address, for the host it was addressed to and
+        // never one a forwarded header names. The host is part of the key an
+        // answer is held under.
+        let Some(host) = addressed_host else {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: "robots.txt cannot be made without the host the request was \
+                          addressed to"
+                    .to_owned(),
+            }));
+        };
+        let request = ResolvedRequest::from_view(&request)
+            .without_query()
+            .with_host(host);
         file_for(&self.config, &self.selected, &request, services, settings).await
     }
 }
@@ -103,7 +116,7 @@ impl Middleware for RobotsTxt {
         _context: &'a MiddlewareContext<'a>,
     ) -> Option<Preparation<'a>> {
         Some(Box::pin(async move {
-            let file = match call.inject(self, Self::file) {
+            let file = match call.inject_with(self, call.addressed_host(), Self::file) {
                 Ok(file) => file.await,
                 Err(withheld) => Err(Report::new(TrustedServerError::Configuration {
                     message: format!("robots.txt cannot be made for this request: {withheld:?}"),
