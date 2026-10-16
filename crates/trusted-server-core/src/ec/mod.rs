@@ -2614,6 +2614,46 @@ pub(crate) mod tests {
         }
     }
 
+    /// A returning visitor whose one Edge Cookie is under `/`, where every
+    /// Edge Cookie was before core wrote under the removed prefix, withdraws
+    /// on a request addressed by path. The cookie and its resolved marker are
+    /// expired under the prefix and under `/`, and the row is tombstoned.
+    #[tokio::test]
+    async fn a_withdrawal_reaches_a_returning_visitors_root_edge_cookie() {
+        let settings = create_test_settings();
+        let ec_id = valid_ec_id("c", "RtCk01");
+        let req = addressed_test_request(&[("cookie", &format!("ts-ec={ec_id}"))]);
+        let mut ec = EcContext::read_from_request(&settings, &req, &noop_services())
+            .expect("should read EC context")
+            .with_storage_withdrawn_for_test(true);
+        assert!(ec.ec_was_present(), "the visitor should be a returning one");
+        assert!(!ec.ec_allowed(), "the gate should be closed");
+        let kv_key = ec
+            .kv_key_for(&ec_id)
+            .expect("the module should own the identifier");
+        let graph = KvIdentityGraph::in_memory("test-ec-store");
+        graph
+            .create(&kv_key, &KvEntry::minimal("ssp.example.com", "uid", 1))
+            .expect("should seed the visitor's row");
+
+        let cookies = finalized_set_cookies(&settings, &mut ec, &graph).await;
+
+        assert_eq!(
+            names_and_paths(&cookies),
+            [
+                ("ts-ec", "/publisher-a.example"),
+                ("ts-ecr", "/publisher-a.example"),
+                ("ts-ec", "/"),
+                ("ts-ecr", "/"),
+            ]
+        );
+        let (entry, _) = graph
+            .get(&kv_key)
+            .expect("should read the row")
+            .expect("should keep the row");
+        assert!(!entry.consent.ok, "the withdrawal should tombstone the row");
+    }
+
     /// A cookie a module may set for itself, used to check which module
     /// responses keep their headers.
     const MODULE_EVIDENCE_COOKIE: &str = "acme-evidence=abc123; Path=/; Secure";
