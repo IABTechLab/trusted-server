@@ -10,6 +10,7 @@
 
 use std::ffi::OsString;
 use std::fs;
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -262,7 +263,7 @@ fn start_everywhere(
 fn linux_cli_candidate_builds_inspects_and_starts_cleanly() {
     let fixture = cargo_fixture();
     let (cli_root, cli) = cli_fixture();
-    preflight_cli_builder(&fixture, &cli)
+    preflight_cli_builder(&fixture, &cli, &cli_root)
         .expect("should load the staged probe and Rust tools on glibc 2.34 before JS builds");
     let js = run_two_fresh_js_builds();
     assert_eq!(
@@ -344,12 +345,26 @@ fn linux_cli_candidate_builds_inspects_and_starts_cleanly() {
 fn preflight_cli_builder(
     fixture: &CargoFixture,
     cli: &CliFixture,
+    evidence_root: &Path,
 ) -> Result<(), Report<ReleaseError>> {
     let work = tempfile::tempdir().map_err(fixture_io)?;
     let state = tempfile::tempdir().map_err(fixture_io)?;
+    let scripts = tempfile::tempdir().map_err(fixture_io)?;
     let root = fs::canonicalize(work.path()).map_err(fixture_io)?;
     let result = (|| {
-        let roots = BoundaryRoots::new(&[], &[fixture.tools()], std::slice::from_ref(&root))?;
+        let script_root = fs::canonicalize(scripts.path()).map_err(fixture_io)?;
+        let script = script_root.join("filesystem-controls.sh");
+        fs::write(&script, FILESYSTEM_CONTROLS).map_err(fixture_io)?;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o555)).map_err(fixture_io)?;
+        for directory in ["home", "tmp", "cargo-home"] {
+            fs::create_dir(root.join(directory)).map_err(fixture_io)?;
+        }
+        let roots = BoundaryRoots::new(
+            &[script_root],
+            &[fixture.tools()],
+            std::slice::from_ref(&root),
+        )?;
+
         // These IDs select the existing unprivileged ordinary CI worker.
         let user = unsafe { (libc::getuid(), libc::getgid()) };
         let boundary = Boundary::linux_container(
@@ -367,6 +382,46 @@ fn preflight_cli_builder(
         };
         let probe = ProbeProgram::from_staged_release_binary(&fixture.probe())?;
         let proof = boundary.establish_denial(&probe, limits)?;
+        let controls = ConfinedCommand::new(&script, &root, limits)?
+            .environment("HOME", boundary.execution_path(&root.join("home"))?)?
+            .environment("TMPDIR", boundary.execution_path(&root.join("tmp"))?)?
+            .environment(
+                "CARGO_HOME",
+                boundary.execution_path(&root.join("cargo-home"))?,
+            )?
+            .environment("LC_ALL", "C")?;
+        let observed = boundary.run_confined(&controls, &proof)?;
+        let evidence = serde_json::json!({
+            "kind": "ordinary-ci-builder-filesystem-controls",
+            "builder_image_id": cli.builder_image_id,
+            "stdout": String::from_utf8_lossy(observed.stdout()),
+            "stderr": String::from_utf8_lossy(observed.stderr()),
+            "outcome": format!("{:?}", observed.outcome()),
+            "release_qualification": false,
+        });
+        let evidence = serde_json::to_vec_pretty(&evidence)
+            .map_err(|error| recipe_error(format!("cannot encode filesystem controls: {error}")))?;
+        fs::write(
+            evidence_root.join("builder-filesystem-controls.json"),
+            evidence,
+        )
+        .map_err(fixture_io)?;
+
+        let stdout = observed.require_success()?;
+        if stdout != FILESYSTEM_CONTROL_OUTPUT.as_bytes() {
+            return Err(recipe_error(
+                "filesystem controls did not report every denied root and bound TMPDIR success",
+            ));
+        }
+        if root
+            .join("tmp/ts-release-filesystem-control")
+            .try_exists()
+            .map_err(fixture_io)?
+        {
+            return Err(recipe_error(
+                "filesystem controls left the bound temporary file behind",
+            ));
+        }
         for tool in ["rustc", "cargo"] {
             let command =
                 ConfinedCommand::new(&fixture.tools().join("bin").join(tool), &root, limits)?
@@ -376,6 +431,38 @@ fn preflight_cli_builder(
         }
         Ok(())
     })();
+    let result = finish_cleanup(result, scripts.close().map_err(fixture_io));
     let result = finish_cleanup(result, state.close().map_err(fixture_io));
     finish_cleanup(result, work.close().map_err(fixture_io))
 }
+
+/// Fixed ordinary CI controls: redirections test permissions without external helpers.
+const FILESYSTEM_CONTROLS: &str = r#"#!/bin/sh
+set -eu
+for directory in /tmp /dev/shm /dev; do
+    if ( : > "$directory/ts-release-filesystem-control" ); then
+        printf 'unexpected writable root %s\n' "$directory" >&2
+        exit 1
+    fi
+    printf 'denied %s\n' "$directory"
+done
+for file in /etc/hosts /etc/hostname /etc/resolv.conf; do
+    [ -f "$file" ]
+    if ( : >> "$file" ); then
+        printf 'unexpected writable daemon file %s\n' "$file" >&2
+        exit 1
+    fi
+    printf 'denied %s\n' "$file"
+done
+path=$TMPDIR/ts-release-filesystem-control
+
+printf 'bound temporary root\n' > "$path"
+IFS= read -r observed < "$path"
+[ "$observed" = 'bound temporary root' ]
+/usr/bin/rm -- "$path"
+[ ! -e "$path" ]
+printf 'bound TMPDIR write read cleanup accepted\n'
+"#;
+
+/// Every expected control must report success, in the fixed script's order.
+const FILESYSTEM_CONTROL_OUTPUT: &str = "denied /tmp\ndenied /dev/shm\ndenied /dev\ndenied /etc/hosts\ndenied /etc/hostname\ndenied /etc/resolv.conf\nbound TMPDIR write read cleanup accepted\n";

@@ -42,6 +42,7 @@ mod cargo_output;
 mod compare;
 mod completed;
 mod execute;
+mod final_paths;
 mod fresh;
 mod native;
 mod paths;

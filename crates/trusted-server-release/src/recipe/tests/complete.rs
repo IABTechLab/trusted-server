@@ -14,7 +14,11 @@ const FINGERPRINT: [u8; 32] = [7; 32];
 
 pub(super) fn wasm_with(customs: &[(&str, &[u8])]) -> Vec<u8> {
     let mut out = b"\0asm\x01\0\0\0".to_vec();
-    for (name, data) in customs {
+    for (name, data) in customs
+        .iter()
+        .copied()
+        .chain([("remapped-source", b"/trusted-server/src/main.rs".as_slice())])
+    {
         let mut body = vec![u8::try_from(name.len()).expect("should fit")];
         body.extend_from_slice(name.as_bytes());
         body.extend_from_slice(data);
@@ -168,7 +172,7 @@ fn rejection(result: Result<RecipeCompleted, Report<ReleaseError>>) -> String {
 
 #[test]
 fn successful_run_binds_every_input_and_copies_the_artifact() {
-    let bytes = b"fictional native executable";
+    let bytes = b"fictional native executable /trusted-server/src/main.rs";
     let mut built = built("ts-aarch64-apple-darwin", Role::Canonical, bytes);
     let stdout = built.stdout(|_| {});
     let expected_plan = built
@@ -313,7 +317,7 @@ fn rehash_rejects_changed_output_and_retained_stream() {
             fs::remove_file(&path).expect("should remove");
             fs::write(
                 output.join("..").join("elsewhere"),
-                b"fictional native executable",
+                b"fictional native executable /trusted-server/src/main.rs",
             )
             .expect("should write target");
             symlink(output.join("..").join("elsewhere"), path).expect("should swap in a symlink");
@@ -326,7 +330,7 @@ fn rehash_rejects_changed_output_and_retained_stream() {
         let mut built = built(
             "ts-aarch64-apple-darwin",
             Role::Canonical,
-            b"fictional native executable",
+            b"fictional native executable /trusted-server/src/main.rs",
         );
         let stdout = built.stdout(|_| {});
         let output = built.fixture.base.join("output");
@@ -360,7 +364,7 @@ fn malformed_streams_complete_nothing_and_copy_nothing() {
         let mut built = built(
             "ts-aarch64-apple-darwin",
             Role::Canonical,
-            b"fictional native executable",
+            b"fictional native executable /trusted-server/src/main.rs",
         );
         let stdout = built.stdout(edit);
         let output = built.fixture.base.join("output");
@@ -381,7 +385,7 @@ fn changed_tools_or_materials_or_existing_output_reject_completion() {
     let mut built_tools = built(
         "ts-aarch64-apple-darwin",
         Role::Canonical,
-        b"fictional native executable",
+        b"fictional native executable /trusted-server/src/main.rs",
     );
     let stdout = built_tools.stdout(|_| {});
     fs::write(built_tools.fixture.base.join("tools/bin/cargo"), b"swapped")
@@ -394,7 +398,7 @@ fn changed_tools_or_materials_or_existing_output_reject_completion() {
     let mut built_materials = built(
         "ts-aarch64-apple-darwin",
         Role::Canonical,
-        b"fictional native executable",
+        b"fictional native executable /trusted-server/src/main.rs",
     );
     let stdout = built_materials.stdout(|_| {});
     fs::write(
@@ -413,7 +417,7 @@ fn changed_tools_or_materials_or_existing_output_reject_completion() {
     let mut built_output = built(
         "ts-aarch64-apple-darwin",
         Role::Canonical,
-        b"fictional native executable",
+        b"fictional native executable /trusted-server/src/main.rs",
     );
     let stdout = built_output.stdout(|_| {});
     fs::write(
@@ -471,8 +475,11 @@ fn finish_linux(bytes: &[u8]) -> Result<RecipeCompleted, Report<ReleaseError>> {
 
 #[test]
 fn linux_executables_must_pass_elf_inspection_and_keep_debug_info() {
-    let completed = finish_linux(&elf(&ElfSpec::conforming()))
-        .expect("should accept a conforming executable with debug info");
+    let completed = finish_linux(&elf(&ElfSpec {
+        payload: b"/trusted-server/src/main.rs",
+        ..ElfSpec::conforming()
+    }))
+    .expect("should accept a conforming executable with debug info");
     assert_eq!(
         completed.artifact().name(),
         "ts-x86_64-unknown-linux-gnu",
@@ -523,7 +530,7 @@ fn execute_stays_closed_for_an_ordinary_ci_selection() {
     let built = built(
         "ts-aarch64-apple-darwin",
         Role::Canonical,
-        b"fictional native executable",
+        b"fictional native executable /trusted-server/src/main.rs",
     );
     assert_eq!(
         built.prepared().tools.authority(),
@@ -538,7 +545,7 @@ fn manifest_digests_are_carried_into_the_completion() {
         let mut built = built_with(
             "ts-aarch64-apple-darwin",
             Role::Canonical,
-            b"fictional native executable",
+            b"fictional native executable /trusted-server/src/main.rs",
             marks,
         );
         let stdout = built.stdout(|_| {});
@@ -636,4 +643,142 @@ fn candidate_measurements_report_no_release_qualification() {
         denial["release_qualification"], false,
         "should never claim release qualification"
     );
+}
+
+/// Maps the bound roots into an innocuous namespace without `/boundary/`.
+fn innocuous_paths(built: &Built) -> super::super::paths::PrefixPaths {
+    let prepared = built.prepared();
+    super::super::paths::PrefixPaths::new()
+        .with(prepared.ambient.checkout_root(), "/work/source", false)
+        .with(&prepared.retained_root, "/work/scripts", false)
+        .with(&prepared.request.materials, "/work/dependencies", false)
+        .with(prepared.tools.root(), "/work/compiler", false)
+        .with(&prepared.request.cargo_state, "/work/state", true)
+        .with(&prepared.request.target_dir, "/work/products", true)
+}
+
+#[test]
+fn completion_rejects_every_bound_host_and_execution_root() {
+    for index in 0..13 {
+        let mut build = built(
+            "ts-aarch64-apple-darwin",
+            Role::Canonical,
+            b"/trusted-server/src/main.rs",
+        );
+        let paths = innocuous_paths(&build);
+        let prepared = build.prepared();
+        let host = [
+            prepared.ambient.checkout_root().to_owned(),
+            prepared.retained_root.clone(),
+            prepared.request.materials.clone(),
+            prepared.tools.root().to_owned(),
+            prepared.request.cargo_state.clone(),
+            prepared.request.target_dir.clone(),
+        ];
+        let mut denied = host.to_vec();
+        denied.extend(host.iter().map(|root| {
+            paths
+                .execution_path(root)
+                .expect("should translate a bound root")
+        }));
+        denied.push(prepared.request.output.clone());
+        let leaked = denied[index].join("generated/source.rs");
+        let payload = format!(
+            "/trusted-server/src/main.rs env!(CARGO_MANIFEST_DIR)={}",
+            leaked.display()
+        );
+        let target = prepared
+            .request
+            .target_dir
+            .join("aarch64-apple-darwin/release/ts");
+        fs::write(&target, payload).expect("should plant the literal in the executable");
+        let stdout = build.stdout(|message| {
+            message["manifest_path"] = json!("/work/source/crates/trusted-server-cli/Cargo.toml");
+            message["executable"] = json!("/work/products/aarch64-apple-darwin/release/ts");
+        });
+        let run = build.run(stdout);
+        let result = build
+            .prepared
+            .take()
+            .expect("should retain the prepared recipe")
+            .complete(run, FINGERPRINT, &paths);
+        let error = rejection(result);
+        assert!(
+            error.contains("unremapped path prefix"),
+            "should reject bound root {} by final-path gate: {error}",
+            denied[index].display()
+        );
+    }
+}
+
+#[test]
+fn completion_rejects_cargo_state_home_and_temporary_literals() {
+    for child in ["home", "tmp", "cargo-home"] {
+        let mut build = built(
+            "ts-aarch64-apple-darwin",
+            Role::Canonical,
+            b"/trusted-server/src/main.rs",
+        );
+        let paths = innocuous_paths(&build);
+        let payload =
+            format!("/trusted-server/src/main.rs env!(OUT_DIR)=/work/state/{child}/generated.rs");
+        fs::write(
+            build
+                .prepared()
+                .request
+                .target_dir
+                .join("aarch64-apple-darwin/release/ts"),
+            payload,
+        )
+        .expect("should plant cargo-state descendant");
+        let stdout = build.stdout(|message| {
+            message["manifest_path"] = json!("/work/source/crates/trusted-server-cli/Cargo.toml");
+            message["executable"] = json!("/work/products/aarch64-apple-darwin/release/ts");
+        });
+        let run = build.run(stdout);
+        let result = build
+            .prepared
+            .take()
+            .expect("should retain the prepared recipe")
+            .complete(run, FINGERPRINT, &paths);
+        assert!(
+            rejection(result).contains("unremapped path prefix"),
+            "should reject {child} outside remapped Cargo home too"
+        );
+    }
+}
+
+#[test]
+fn completion_requires_a_fixed_remapped_prefix() {
+    let mut build = built(
+        "ts-aarch64-apple-darwin",
+        Role::Canonical,
+        b"fictional executable with no remap",
+    );
+    let stdout = build.stdout(|_| {});
+    assert!(
+        rejection(build.finish(stdout)).contains("no remapped path prefix"),
+        "should require proof of remapping before recording completion"
+    );
+}
+
+#[test]
+fn completion_accepts_fixed_prefixes_in_an_innocuous_execution_namespace() {
+    let mut build = built(
+        "ts-aarch64-apple-darwin",
+        Role::Canonical,
+        b"/trusted-server/src/main.rs /cargo-target/generated/file.rs",
+    );
+    let paths = innocuous_paths(&build);
+    let stdout = build.stdout(|message| {
+        message["manifest_path"] = json!("/work/source/crates/trusted-server-cli/Cargo.toml");
+        message["executable"] = json!("/work/products/aarch64-apple-darwin/release/ts");
+    });
+    let run = build.run(stdout);
+    build
+        .prepared
+        .take()
+        .expect("should retain prepared recipe")
+        .complete(run, FINGERPRINT, &paths)
+        .expect("should complete only remapped final bytes without requiring Linux mount names");
 }

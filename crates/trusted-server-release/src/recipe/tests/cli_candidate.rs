@@ -417,6 +417,7 @@ fn description() -> Value {
 #[test]
 fn optional_reproduction_setup_failure_preserves_canonical_evidence() {
     let bytes = elf(&ElfSpec {
+        payload: b"/trusted-server/src/main.rs",
         debug_sections: vec![
             (
                 ".debug_info",

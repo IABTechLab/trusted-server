@@ -14,9 +14,8 @@ use object::read::elf::{Dyn as _, FileHeader as _, ProgramHeader as _, SectionHe
 use object::read::{SectionIndex, StringTable};
 
 use super::{
-    ElfDebugSection, ElfFacts, GlibcVersion, REQUIRED_DEBUG_SECTIONS, RUNNER_PATH_PREFIXES,
-    VersionRequirement, Violation, malformed, reject_denied_paths_with_sections, rejected,
-    sha256_hex, utf8,
+    ElfDebugSection, ElfFacts, GlibcVersion, REQUIRED_DEBUG_SECTIONS, VersionRequirement,
+    Violation, malformed, reject_denied_paths_with_sections, rejected, sha256_hex, utf8,
 };
 use crate::error::ReleaseError;
 
@@ -42,6 +41,26 @@ const LINUX_X86_64_NEEDED: &[&str] = &[
     "libm.so.6",
 ];
 
+/// GNU-specific runner path prefixes, excluding the generic runtime `/tmp/`.
+///
+/// The Linux CLI includes a dependency's browser lookup under `/tmp/`; that
+/// runtime string is not a build path. Complete GNU recipe acceptance also
+/// requires read-only unbound scratch, IPC without writable shared memory,
+/// no image-declared volumes, and the bound host/execution-root scan in
+/// [`crate::recipe::PreparedRecipe`]. This list alone cannot establish build
+/// path provenance. The default macOS list retains `/tmp/` until its own
+/// filesystem boundary is qualified.
+const LINUX_X86_64_DENIED_PATH_PREFIXES: &[&str] = &[
+    "/home/",
+    "/Users/",
+    "/root/",
+    "/private/var/",
+    "/private/tmp/",
+    "/var/folders/",
+    "/github/workspace/",
+    "/__w/",
+];
+
 /// Version-name prefixes accepted per library, besides `GLIBC_`.
 ///
 /// `libgcc_s` versions its unwinder as `GCC_x.y[.z]`; those carry no glibc
@@ -64,7 +83,7 @@ impl ElfPolicy {
             interpreter: LINUX_X86_64_INTERPRETER,
             allowed_needed: LINUX_X86_64_NEEDED,
             glibc_maximum: GlibcVersion::new(2, 34),
-            denied_path_prefixes: RUNNER_PATH_PREFIXES,
+            denied_path_prefixes: LINUX_X86_64_DENIED_PATH_PREFIXES,
         }
     }
 }
@@ -80,6 +99,11 @@ impl ElfPolicy {
 /// glibc ceiling, a section name or debug section is malformed, or a
 /// runner-only path is embedded anywhere in the file. Missing debug info is
 /// recorded, not rejected here; see [`ElfFacts::require_debug_sections`].
+///
+/// Structural inspection records final-file facts, not complete build-path
+/// provenance. The GNU policy permits runtime `/tmp/` constants; its owning
+/// recipe must additionally enforce the filesystem restrictions and scan its
+/// actual bound host and execution roots before accepting the artifact.
 pub(crate) fn inspect_elf(
     bytes: &[u8],
     policy: &ElfPolicy,

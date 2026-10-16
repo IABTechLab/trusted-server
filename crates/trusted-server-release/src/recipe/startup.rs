@@ -465,6 +465,7 @@ impl StartupCopy {
             stderr_max: STARTUP_STDERR_MAX,
         };
         self.verify()?;
+        client.client.require_no_image_volumes(image.id())?;
         let name = format!(
             "ts-release-startup-{}",
             hex::encode(crate::boundary::random_bytes::<12>()?)

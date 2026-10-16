@@ -20,6 +20,7 @@ use std::path::Path;
 use error_stack::Report;
 
 use super::host_inputs::HostInputs;
+use crate::documents::{Role as DocumentRole, parse_json};
 use crate::error::ReleaseError;
 use crate::process::{BoundedCommand, ProcessLimits, ProcessResult};
 
@@ -156,6 +157,23 @@ impl DockerClient {
         full
     }
 
+    /// Requires the selected image not to declare anonymous writable volumes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when image inspection fails or its volume declaration
+    /// is malformed or nonempty. Inspection uses the pinned host client.
+    pub(crate) fn require_no_image_volumes(&self, image: &str) -> Result<(), Report<ReleaseError>> {
+        let result = self.host(&[
+            "image",
+            "inspect",
+            "--format",
+            "{{json .Config.Volumes}}",
+            image,
+        ])?;
+        validate_image_volumes(&result.require_success()?)
+    }
+
     /// Creates a stopped container and requires its acknowledged full identity.
     ///
     /// Callers must supply fixed `create` arguments and must not issue a start
@@ -282,4 +300,43 @@ mod create_tests {
             );
         }
     }
+}
+
+#[cfg(test)]
+mod volume_tests {
+    use super::*;
+
+    #[test]
+    fn image_volumes_must_be_absent_or_an_empty_object() {
+        for accepted in [b"null".as_slice(), b"{}\n"] {
+            validate_image_volumes(accepted)
+                .expect("should accept an image without declared volumes");
+        }
+        for rejected in [
+            b"{\"/scratch\":{}}".as_slice(),
+            b"[]",
+            b"\"null\"",
+            b"true",
+            b"",
+            b"{} trailing",
+            b"{\"x\":{},\"x\":{}}",
+        ] {
+            assert!(
+                validate_image_volumes(rejected).is_err(),
+                "should reject malformed or writable image volumes: {rejected:?}"
+            );
+        }
+    }
+}
+
+/// Accepts only the Docker image volume JSON values that declare no mounts.
+fn validate_image_volumes(stdout: &[u8]) -> Result<(), Report<ReleaseError>> {
+    let value = parse_json(stdout, DocumentRole::Metadata)
+        .map_err(|error| error.change_context(ReleaseError::Boundary))?;
+    if value.is_null() || value.as_object().is_some_and(serde_json::Map::is_empty) {
+        return Ok(());
+    }
+    Err(daemon_error(
+        "selected image declares writable volumes or malformed volume metadata",
+    ))
 }

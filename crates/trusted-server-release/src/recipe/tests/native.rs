@@ -44,6 +44,7 @@ fn native_build(asset: &'static str, role: Role, bytes: &[u8]) -> NativeBuild {
 /// A conforming Linux executable whose `.debug_info` holds `info`.
 fn linux_executable(info: &'static [u8]) -> Vec<u8> {
     elf(&ElfSpec {
+        payload: b"/trusted-server/src/main.rs",
         debug_sections: vec![
             (".debug_info", elf_format::SHT_PROGBITS, info),
             (
@@ -121,7 +122,7 @@ fn native_measurement_rejects_fastly_and_mismatched_pairs() {
     let other = native_build(
         "ts-aarch64-apple-darwin",
         Role::Reproduction,
-        b"fictional executable",
+        b"fictional executable /trusted-server/src/main.rs",
     );
     assert!(
         measure_native_repeatability(&canonical.completed, &other.completed).is_err(),
@@ -367,7 +368,7 @@ fn startup_copy_is_read_only_rehashed_and_linux_only() {
     let other = native_build(
         "ts-aarch64-apple-darwin",
         Role::Canonical,
-        b"fictional executable",
+        b"fictional executable /trusted-server/src/main.rs",
     );
     assert!(
         StartupCopy::create(&other.completed, &base.join("other-copy")).is_err(),

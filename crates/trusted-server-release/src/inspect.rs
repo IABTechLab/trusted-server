@@ -38,12 +38,13 @@ pub(crate) use self::{
     wasm::inspect_wasm,
 };
 
-/// Absolute path prefixes that only exist on a build host or runner.
+/// Default build-host or runner path prefixes, retained by macOS inspection.
 ///
 /// A final executable embedding any of them leaks the build environment
 /// (unremapped source, home, temporary or workspace paths). The scan is
 /// deliberately conservative: it matches anywhere in the file, not only in
-/// loader strings, and a reviewed exception requires changing this list.
+/// loader strings. GNU ELF inspection uses its own reviewed list; this default
+/// retains generic temporary paths for macOS.
 ///
 /// Matches are substrings, not path starts: Rust panic locations sit in
 /// unterminated rodata, so the byte before a path is arbitrary. Entries are

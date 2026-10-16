@@ -577,13 +577,24 @@ jobs:
           # These cached downloads remain unauthenticated candidate inputs.
           BOOTSTRAP_ROOT="$(mktemp -d "$RUNNER_TEMP/cli-producer.XXXXXX")"
           BOOTSTRAP_NAME="ts-cli-producer-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          BOOTSTRAP_ID=
+          BOOTSTRAP_CREATE_STARTED=false
           mkdir "$BOOTSTRAP_ROOT/cargo-home" "$BOOTSTRAP_ROOT/target" "$BOOTSTRAP_ROOT/docker-config"
           cleanup_cli_bootstrap() {
             local build_status=$?
             trap - EXIT
-            timeout --kill-after=5s 30s docker --config "$BOOTSTRAP_ROOT/docker-config" --host unix:///var/run/docker.sock rm --force "$BOOTSTRAP_NAME" >/dev/null 2>&1 || true
+            local reference="$BOOTSTRAP_NAME" filter="name=^/$BOOTSTRAP_NAME$"
+            if [[ -n "$BOOTSTRAP_ID" ]]; then
+              reference="$BOOTSTRAP_ID"
+              filter="id=$BOOTSTRAP_ID"
+            elif [[ "$BOOTSTRAP_CREATE_STARTED" == true ]]; then
+              printf '%s\n' 'Bootstrap creation was not acknowledged; no start was issued.' >&2
+              [[ "$build_status" -ne 0 ]] || build_status=1
+            fi
+            timeout --kill-after=5s 30s docker --config "$BOOTSTRAP_ROOT/docker-config" --host unix:///var/run/docker.sock stop --time 2 "$reference" >/dev/null 2>&1 || true
+            timeout --kill-after=5s 30s docker --config "$BOOTSTRAP_ROOT/docker-config" --host unix:///var/run/docker.sock rm --force "$reference" >/dev/null 2>&1 || true
             local survivors
-            survivors="$(timeout --kill-after=5s 30s docker --config "$BOOTSTRAP_ROOT/docker-config" --host unix:///var/run/docker.sock ps --all --quiet --filter "name=^/$BOOTSTRAP_NAME$")" || exit 1
+            survivors="$(timeout --kill-after=5s 30s docker --config "$BOOTSTRAP_ROOT/docker-config" --host unix:///var/run/docker.sock ps --all --quiet --filter "$filter")" || exit 1
             [[ -z "$survivors" ]] || exit 1
             exit "$build_status"
           }
@@ -594,8 +605,9 @@ jobs:
           fi
           BUILDER_IMAGE="$(node -p 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).builder_image_id' "$CLI_FIXTURE_ROOT/cli-fixture.json")"
           TOOLCHAIN_ROOT="$(rustc --print sysroot)"
-          timeout --kill-after=10s 15m docker --config "$BOOTSTRAP_ROOT/docker-config" --host unix:///var/run/docker.sock run \
-            --rm --init --name "$BOOTSTRAP_NAME" --pull=never --network=none --read-only \
+          BOOTSTRAP_CREATE_STARTED=true
+          BOOTSTRAP_CREATED="$(timeout --kill-after=5s 60s docker --config "$BOOTSTRAP_ROOT/docker-config" --host unix:///var/run/docker.sock create \
+            --init --name "$BOOTSTRAP_NAME" --pull=never --network=none --read-only \
             --user "$(id -u):$(id -g)" --cap-drop=ALL --security-opt=no-new-privileges \
             --pids-limit=256 --memory=4g --cpus=2 --tmpfs /tmp:rw,nosuid,nodev,size=256m \
             --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/source,readonly" \
@@ -606,7 +618,10 @@ jobs:
             --env CARGO_HOME=/cargo-home --env CARGO_TARGET_DIR=/target --env RUSTC=/tools/bin/rustc \
             --env GIT_CONFIG_NOSYSTEM=1 --env GIT_CONFIG_GLOBAL=/dev/null \
             --entrypoint /tools/bin/cargo "$BUILDER_IMAGE" \
-            build -p trusted-server-release --target "$HOST_TARGET" --locked --offline
+            build -p trusted-server-release --target "$HOST_TARGET" --locked --offline)"
+          [[ "$BOOTSTRAP_CREATED" =~ ^[a-f0-9]{64}$ ]]
+          BOOTSTRAP_ID="$BOOTSTRAP_CREATED"
+          timeout --kill-after=10s 15m docker --config "$BOOTSTRAP_ROOT/docker-config" --host unix:///var/run/docker.sock start --attach "$BOOTSTRAP_ID"
           PRODUCER="$BOOTSTRAP_ROOT/target/$HOST_TARGET/debug/trusted-server-release"
           node scripts/release/tests/prepare-js-fixture.mjs "$JS_FIXTURE_ROOT" "$PRODUCER"
           node scripts/release/tests/prepare-cargo-fixture.mjs "$CARGO_FIXTURE_ROOT" "$PRODUCER"
@@ -646,12 +661,16 @@ jobs:
           cat "$TS_RELEASE_CLI_FIXTURE_ROOT/linux-cli-candidate-measurement.json"
           df -h "$RUNNER_TEMP"
 
-      - name: Preserve available CLI candidate measurement in the job log
+      - name: Preserve available CLI candidate measurements in the job log
         if: always()
         shell: bash
         run: |
-          if [[ -n "${TS_RELEASE_CLI_FIXTURE_ROOT:-}" && -f "$TS_RELEASE_CLI_FIXTURE_ROOT/linux-cli-candidate-measurement.json" ]]; then
-            cat "$TS_RELEASE_CLI_FIXTURE_ROOT/linux-cli-candidate-measurement.json"
+          if [[ -n "${TS_RELEASE_CLI_FIXTURE_ROOT:-}" ]]; then
+            for report in builder-filesystem-controls.json linux-cli-candidate-measurement.json; do
+              if [[ -f "$TS_RELEASE_CLI_FIXTURE_ROOT/$report" ]]; then
+                cat "$TS_RELEASE_CLI_FIXTURE_ROOT/$report"
+              fi
+            done
           fi
 
   test-typescript:

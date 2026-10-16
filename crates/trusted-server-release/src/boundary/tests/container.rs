@@ -157,7 +157,7 @@ const EXPECTED_PREFIX: [&str; 32] = [
     "--network",
     "none",
     "--ipc",
-    "private",
+    "none",
     "--read-only",
     "--cap-drop",
     "ALL",
@@ -174,7 +174,7 @@ const EXPECTED_PREFIX: [&str; 32] = [
     "--user",
     "1001:1001",
     "--tmpfs",
-    "/tmp:rw,noexec,nosuid,nodev,size=16777216",
+    "/tmp:ro,noexec,nosuid,nodev,size=16777216",
     "--mount",
 ];
 

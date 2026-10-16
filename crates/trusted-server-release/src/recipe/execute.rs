@@ -10,11 +10,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use error_stack::Report;
 use sha2::{Digest as _, Sha256};
 
-use super::artifact::{CopiedArtifact, EXECUTABLE_LIMIT, copy_artifact};
+use super::artifact::{EXECUTABLE_LIMIT, copy_artifact};
 use super::cargo_output::{ExpectedBinary, locate_host_binary};
 use super::completed::SuccessFacts;
 use super::{Authority, ExecutionPaths, PreparedRecipe, RecipeCompleted, recipe_error};
 use crate::boundary::{Boundary, DenialProof};
+use crate::documents::{Role as DocumentRole, read_bounded};
 use crate::error::ReleaseError;
 use crate::inspect::{ElfPolicy, inspect_elf, inspect_wasm};
 use crate::policy::ReleaseTarget;
@@ -195,13 +196,15 @@ impl PreparedRecipe {
     /// Parses Cargo's stream, maps the executable back through a writable
     /// root, copies it into the output directory and inspects the copy: a
     /// Wasm module or Linux executable must pass its inspector and keep the
-    /// debug sections a stripped file lacks.
+    /// debug sections a stripped file lacks. Every target must also exclude
+    /// all bound host and execution roots and contain a fixed remapped prefix.
     ///
     /// # Errors
     ///
     /// Returns [`ReleaseError::Recipe`] when the tools or materials changed,
     /// the stream is not exactly one fresh debug-info binary, or the
-    /// executable cannot be copied, or [`ReleaseError::Inspect`] when the
+    /// executable cannot be copied or rehashed, a bound path remains, no fixed
+    /// remapped prefix exists, or [`ReleaseError::Inspect`] when the
     /// Wasm module or Linux executable is rejected or stripped.
     pub(super) fn complete(
         self,
@@ -241,7 +244,16 @@ impl PreparedRecipe {
             artifact.name,
             EXECUTABLE_LIMIT,
         )?;
-        inspect_copied(artifact.target, &copied)?;
+        let raw = read_bounded(copied.path(), DocumentRole::Executable)
+            .map_err(|error| error.change_context(ReleaseError::Recipe))?;
+        if raw.sha256 != copied.sha256() || raw.bytes.len() as u64 != copied.size() {
+            return Err(recipe_error(
+                "copied artifact changed before final-byte checks",
+            ));
+        }
+        inspect_copied(artifact.target, &raw.bytes)?;
+        self.check_final_paths(&raw.bytes, paths)?;
+
         if self.tools.authority() == Authority::Qualified
             && !self.materials.derived_manifest_digests().is_empty()
         {
@@ -283,28 +295,18 @@ impl PreparedRecipe {
 ///
 /// # Errors
 ///
-/// Returns [`ReleaseError::Recipe`] when the copy cannot be read or changed
-/// after it was hashed, or [`ReleaseError::Inspect`] when the bytes are
-/// rejected.
-fn inspect_copied(
-    target: ReleaseTarget,
-    copied: &CopiedArtifact,
-) -> Result<(), Report<ReleaseError>> {
+/// Returns [`ReleaseError::Inspect`] when the final bytes are rejected.
+fn inspect_copied(target: ReleaseTarget, bytes: &[u8]) -> Result<(), Report<ReleaseError>> {
     if !matches!(
         target,
         ReleaseTarget::Wasm32Wasip1 | ReleaseTarget::X86_64UnknownLinuxGnu
     ) {
         return Ok(());
     }
-    let bytes = std::fs::read(copied.path())
-        .map_err(|error| recipe_error(format!("cannot read the copied artifact: {error}")))?;
-    if hex::encode(Sha256::digest(&bytes)) != copied.sha256() {
-        return Err(recipe_error("copied artifact changed before inspection"));
-    }
     if target == ReleaseTarget::Wasm32Wasip1 {
-        inspect_wasm(&bytes)?.require_debug_sections()
+        inspect_wasm(bytes)?.require_debug_sections()
     } else {
-        inspect_elf(&bytes, &ElfPolicy::linux_x86_64_gnu())?.require_debug_sections()
+        inspect_elf(bytes, &ElfPolicy::linux_x86_64_gnu())?.require_debug_sections()
     }
 }
 

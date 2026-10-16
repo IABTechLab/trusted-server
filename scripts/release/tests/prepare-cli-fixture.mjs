@@ -62,6 +62,19 @@ const imageId = (text, label) => {
     throw new Error(`Expected a local image ID for ${label}`)
   return text
 }
+const requireNoVolumes = (id) => {
+  const volumes = JSON.parse(
+    docker(['image', 'inspect', '--format', '{{json .Config.Volumes}}', id])
+  )
+  if (
+    volumes !== null &&
+    (!volumes ||
+      typeof volumes !== 'object' ||
+      Array.isArray(volumes) ||
+      Object.keys(volumes).length !== 0)
+  )
+    throw new Error(`Fixture image declares implicit writable volumes: ${id}`)
+}
 
 // 1. The tracked builder Dockerfile, unmodified from HEAD.
 run('git', ['diff', '--quiet', 'HEAD', '--', DOCKERFILE])
@@ -79,6 +92,7 @@ const builderImage = imageId(
   fs.readFileSync(imageFile, 'utf8').trim(),
   'the builder'
 )
+requireNoVolumes(builderImage)
 const glibc = docker([
   'run',
   '--rm',
@@ -94,7 +108,9 @@ if (!/ 2\.34$/m.test(glibc.split('\n')[0] ?? ''))
 const startupImages = STARTUP_IMAGES.map(([distribution, reference]) => {
   docker(['pull', '--quiet', reference])
   const id = docker(['image', 'inspect', '--format', '{{.Id}}', reference])
-  return { distribution, reference, image_id: imageId(id, reference) }
+  const selected = imageId(id, reference)
+  requireNoVolumes(selected)
+  return { distribution, reference, image_id: selected }
 })
 
 fs.rmSync(dockerConfig, { recursive: true, force: true })

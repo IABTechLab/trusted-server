@@ -366,16 +366,16 @@ fn stripped_or_empty_debug_sections_are_rejected() {
 }
 
 #[test]
-fn runtime_lookup_candidate_remains_rejected_with_final_elf_diagnostics() {
+fn runner_path_rejection_includes_final_elf_diagnostics() {
     let mut spec = ElfSpec::conforming();
     spec.debug_sections.push((
         ".rodata",
         elf_format::SHT_PROGBITS,
-        b"before /tmp/aws/lib\n\x1bafter",
+        b"before /home/runner/example\n\x1bafter",
     ));
     let bytes = elf(&spec);
     let report = inspect_elf(&bytes, &ElfPolicy::linux_x86_64_gnu())
-        .expect_err("should retain rejection of the runtime lookup candidate");
+        .expect_err("should retain rejection of a runner-only path");
     assert_eq!(
         report.downcast_ref::<Violation>(),
         Some(&Violation::EmbeddedPath),
@@ -395,7 +395,35 @@ fn runtime_lookup_candidate_remains_rejected_with_final_elf_diagnostics() {
         "should identify the containing ELF section: {diagnostic}"
     );
     assert!(
-        diagnostic.contains("/tmp/aws/lib\\n\\x1bafter"),
+        diagnostic.contains("/home/runner/example\\n\\x1bafter"),
         "should escape controls in a bounded context: {diagnostic}"
     );
+}
+
+#[test]
+fn linux_runtime_browser_lookup_path_is_structurally_accepted() {
+    let mut spec = ElfSpec::conforming();
+    spec.debug_sections.push((
+        ".rodata",
+        elf_format::SHT_PROGBITS,
+        b"/opt/google/chrome/tmp/aws/libCHROME",
+    ));
+    inspect(&spec).expect("should permit a Linux runtime temporary-directory lookup constant");
+}
+
+#[test]
+fn linux_keeps_every_other_runner_path_prefix_rejected() {
+    for prefix in RUNNER_PATH_PREFIXES
+        .iter()
+        .copied()
+        .filter(|prefix| *prefix != "/tmp/")
+    {
+        let mut spec = ElfSpec::conforming();
+        spec.payload = prefix.as_bytes();
+        assert_eq!(
+            violation(inspect(&spec)),
+            Violation::EmbeddedPath,
+            "should keep rejecting runner-only prefix {prefix}"
+        );
+    }
 }

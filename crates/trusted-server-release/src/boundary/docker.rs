@@ -4,7 +4,8 @@
 //! namespace (never the invalid `--pid=private`), `--network none`, the
 //! effective seccomp profile (every non-Unix socket denied with `EPERM`), a read-only
 //! root filesystem, all capabilities dropped, `no-new-privileges`, private
-//! IPC, a non-root user and CPU, memory and process limits that fit the
+//! IPC without a `/dev/shm` mount, an empty read-only `/tmp`, a non-root user
+//! and CPU, memory and process limits that fit the
 //! actual host. The client is a fixed absolute executable invoked with an
 //! explicit empty `--config` and the fixed Unix daemon socket, a cleared
 //! environment (no `DOCKER_HOST`, `DOCKER_CONTEXT` or `DOCKER_CONFIG`), no TTY
@@ -110,7 +111,7 @@ pub(crate) struct DockerSettings {
     pub(crate) memory_bytes: u64,
     /// Maximum container processes.
     pub(crate) pids_limit: u32,
-    /// Size of the private `/tmp` tmpfs in bytes.
+    /// Size bound of the empty read-only `/tmp` tmpfs in bytes.
     pub(crate) tmpfs_bytes: u64,
     /// Non-root container user and group IDs.
     pub(crate) user: (u32, u32),
@@ -332,7 +333,7 @@ const ISOLATION_ARGUMENTS: [&str; 12] = [
     "--network",
     "none",
     "--ipc",
-    "private",
+    "none",
     "--read-only",
     "--cap-drop",
     "ALL",
@@ -351,7 +352,7 @@ fn limit_arguments(settings: &DockerSettings) -> [String; 10] {
         String::from("--user"),
         format!("{}:{}", settings.user.0, settings.user.1),
         String::from("--tmpfs"),
-        format!("/tmp:rw,noexec,nosuid,nodev,size={}", settings.tmpfs_bytes),
+        format!("/tmp:ro,noexec,nosuid,nodev,size={}", settings.tmpfs_bytes),
     ]
 }
 
@@ -442,7 +443,7 @@ impl DockerBoundary {
     ///
     /// Returns [`ReleaseError::Boundary`] for invalid settings, an unusable
     /// daemon socket, an unpinned image, unmountable roots or host inputs
-    /// that overlap a mounted root.
+    /// that overlap a mounted root, or an image with declared volumes.
     pub(crate) fn new(
         roots: &BoundaryRoots,
         settings: DockerSettings,
@@ -460,6 +461,7 @@ impl DockerBoundary {
             &mounted,
             settings.host_limits,
         )?;
+        client.require_no_image_volumes(image.id())?;
         Ok(Self {
             client,
             settings,

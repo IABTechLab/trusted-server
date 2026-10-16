@@ -204,3 +204,14 @@ fn truncated_executables_are_rejected_without_panic() {
 
     assert_truncations_rejected(&macho(&spec), |bytes| inspect_macho(bytes, &policy));
 }
+
+#[test]
+fn macos_temporary_directory_paths_remain_rejected() {
+    let mut spec = MachoSpec::conforming();
+    spec.payload = b"/tmp/example/generated.rs";
+    assert_eq!(
+        violation(inspect(&spec)),
+        Violation::EmbeddedPath,
+        "should retain the macOS policy until its filesystem boundary is qualified"
+    );
+}

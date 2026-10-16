@@ -247,7 +247,7 @@ fn mismatched_inputs_or_another_asset_are_rejected() {
     let native = finish(built(
         "ts-aarch64-apple-darwin",
         Role::Canonical,
-        b"fictional executable",
+        b"fictional executable /trusted-server/src/main.rs",
     ));
     let reproduction = completed(
         FASTLY_ASSET,
