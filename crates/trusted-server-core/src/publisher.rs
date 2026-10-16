@@ -6615,9 +6615,10 @@ pub(crate) fn build_bid_map_with_auction_id(
                         serde_json::Value::String(auction_id.to_owned()),
                     );
                 }
-                // Winning creative dimensions — the bridge sizes the inline
-                // render from these, falling back to the first configured slot
-                // format only when absent, which mis-sizes a multi-size slot.
+                // Winning creative dimensions. The bridge sizes the inline
+                // render from these. When they are absent it falls back to the
+                // first size of the slot's viewport band, then to the first
+                // configured format, which mis-sizes a multi-size slot.
                 // Omit a zero dimension (missing OpenRTB w/h parse to 0) so the
                 // bridge falls back rather than sizing the frame to 0.
                 if bid.width > 0 {
@@ -7674,7 +7675,8 @@ fn permissions_json_or_empty(permissions_json: &str) -> Cow<'_, str> {
 /// Build the `tsjs.adSlots` `<script>` tag from matched slots.
 ///
 /// Property names match what the client-side TSJS bundle expects:
-/// `gam_unit_path`, `div_id`, `formats`, and `targeting`.
+/// `gam_unit_path`, `div_id`, `formats`, and `targeting`, with
+/// `viewport_sizes` added when a format names a viewport bound.
 pub(crate) fn build_ad_slots_script(
     matched_slots: &[crate::creative_opportunities::CreativeOpportunitySlot],
     co_config: &crate::creative_opportunities::CreativeOpportunitiesConfig,
