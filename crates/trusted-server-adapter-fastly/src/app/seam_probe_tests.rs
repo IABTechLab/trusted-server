@@ -472,6 +472,7 @@ fn robots_txt_is_answered_before_the_edge_cookie_steps_and_the_filters() {
         let request = request_builder()
             .method(method)
             .uri(format!("https://test-publisher.com{path}"))
+            .header("host", "test-publisher.com")
             .body(Body::empty())
             .expect("should build request");
         block_on(super::dispatch_fallback(&state, &services, request))
