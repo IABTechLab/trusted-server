@@ -692,16 +692,11 @@ fn middleware_stream_processors(
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
 ) -> Result<TextPass, Report<TrustedServerError>> {
-    use crate::middleware::{
-        MiddlewareContext, is_dispatched_media_type, is_utf8_or_undeclared_charset,
-    };
+    use crate::middleware::MiddlewareContext;
 
-    let media_type = media_type_of(response.content_type);
-    if !is_dispatched_media_type(&media_type)
-        || !is_utf8_or_undeclared_charset(response.content_type)
-    {
+    let Some(media_type) = text_entry_media_type(response.content_type) else {
         return Ok(TextPass::default());
-    }
+    };
     let mut processors = Vec::new();
     let mut response_headers = Vec::new();
     for phase in &MiddlewarePhase::ALL {
@@ -736,6 +731,48 @@ fn middleware_stream_processors(
         processors,
         response_headers,
     })
+}
+
+/// The media type the entries match a response that is not HTML by, or
+/// `None` when no middleware runs on it: HTML and the React Server
+/// Components stream, which have processors of their own, a type no entry
+/// may cover, and a charset other than UTF-8.
+fn text_entry_media_type(content_type: &str) -> Option<String> {
+    use crate::middleware::{is_dispatched_media_type, is_utf8_or_undeclared_charset};
+
+    let media_type = media_type_of(content_type);
+    let runs = !is_html_content_type(content_type)
+        && !content_type_contains_ascii_case_insensitive(content_type, "text/x-component")
+        && is_dispatched_media_type(&media_type)
+        && is_utf8_or_undeclared_charset(content_type);
+    runs.then_some(media_type)
+}
+
+/// Keeps a response that is not HTML out of shared caches when a `[[serve]]`
+/// entry covers it and a module left state on the request, because the
+/// entry's middleware are handed that state. Called once the serve
+/// middleware's headers are written, so none of them can undo it.
+fn apply_text_entry_cache_rules(
+    response: &mut Response<EdgeBody>,
+    params: &OwnedProcessResponseParams,
+    settings: &Settings,
+    integration_registry: &IntegrationRegistry,
+) {
+    let Some(media_type) = text_entry_media_type(&params.content_type) else {
+        return;
+    };
+    let serve = MiddlewarePhase::Serve;
+    let served = !integration_registry
+        .middleware_chain(
+            settings.phase_entries(serve),
+            serve,
+            &media_type,
+            &params.request_path,
+        )
+        .is_empty();
+    if served && !params.request_state.is_empty() {
+        enforce_terminal_private_cache_privacy(response);
+    }
 }
 
 /// What the entries covering a text response do to it: the processors over
@@ -2112,6 +2149,7 @@ pub async fn buffer_publisher_response_async(
             )
             .await?;
             write_response_headers(&mut response, response_headers);
+            apply_text_entry_cache_rules(&mut response, &params, settings, integration_registry);
             // Authorized template cache transforms are emitted as identity by
             // `process_response_streaming_async`; inline transforms retain the origin
             // coding. This avoids recompressing and immediately decoding a full document.
@@ -2928,6 +2966,7 @@ pub async fn publisher_response_into_streaming_response(
                     }
                 };
             write_response_headers(&mut response, processor.take_response_headers());
+            apply_text_entry_cache_rules(&mut response, &params, &settings, integration_registry);
             // The guard is created before the lazy stream so an auction whose
             // response body is dropped unpolled still logs the loss.
             let dispatched_auction = params.dispatched_auction.take().map(|dispatched| {
@@ -21380,6 +21419,129 @@ mod tests {
             "should hand back the header the serve middleware writes on a streamed text response"
         );
         assert_eq!(String::from_utf8(output).expect("text"), "plain\n");
+    }
+
+    /// The answers to `GET /a.txt` through the publisher path, the origin
+    /// answering `status` with `plain\n` as UTF-8 text and the headers given,
+    /// finalized as the adapters that buffer do and then as Fastly does.
+    /// With `marked`, a module leaves state on the request.
+    async fn text_answers_through_the_publisher(
+        settings: Settings,
+        marked: bool,
+        status: u16,
+        origin_headers: &[(&str, &str)],
+    ) -> Vec<(Response<EdgeBody>, String)> {
+        let settings = Arc::new(settings);
+        let registry = IntegrationRegistry::new(&settings).expect("should build a registry");
+        let orchestrator = Arc::new(AuctionOrchestrator::new(
+            crate::auction::test_support::legacy_auction_config(&settings),
+        ));
+        let mut answers = Vec::new();
+        for streaming in [false, true] {
+            let stub = Arc::new(StubHttpClient::new());
+            let mut headers = vec![("content-type", "text/plain; charset=utf-8")];
+            headers.extend_from_slice(origin_headers);
+            stub.push_response_with_headers(status, b"plain\n".to_vec(), headers);
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let mut request = HttpRequest::builder()
+                .method(Method::GET)
+                .uri("https://publisher.example/a.txt")
+                .header(header::HOST, "publisher.example")
+                .body(EdgeBody::empty())
+                .expect("should build request");
+            if marked {
+                crate::integrations::registry_test_support::request_fixture::mark(&mut request);
+            }
+            let consent = crate::consent::ConsentContext {
+                jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                ..Default::default()
+            };
+            let mut ec_context = EcContext::new_for_test_with_ip(None, consent, None);
+            let proxied = handle_publisher_request(
+                AppContext {
+                    settings: &settings,
+                    integration_registry: &registry,
+                },
+                &services,
+                None,
+                &mut ec_context,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &[],
+                    registry: None,
+                },
+                request,
+                EdgeCacheHeader::SMaxageFallback,
+            )
+            .await
+            .expect("should proxy the request");
+            let response = if streaming {
+                publisher_response_into_streaming_response(
+                    proxied,
+                    &Method::GET,
+                    Arc::clone(&settings),
+                    &registry,
+                    Arc::clone(&orchestrator),
+                    services.clone(),
+                )
+                .await
+            } else {
+                buffer_publisher_response_async(
+                    proxied,
+                    &Method::GET,
+                    &settings,
+                    &registry,
+                    &orchestrator,
+                    &services,
+                )
+                .await
+            }
+            .expect("should finalize the response");
+            let (parts, body) = response.into_parts();
+            let body = match body {
+                EdgeBody::Stream(mut stream) => {
+                    let mut out = Vec::new();
+                    while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+                        out.extend_from_slice(&chunk.expect("should read a chunk"));
+                    }
+                    out
+                }
+                other => other.into_bytes().expect("should hold the bytes").to_vec(),
+            };
+            answers.push((
+                Response::from_parts(parts, EdgeBody::empty()),
+                String::from_utf8(body).expect("text"),
+            ));
+        }
+        answers
+    }
+
+    #[tokio::test]
+    async fn a_text_response_whose_serve_entry_is_handed_request_state_is_private() {
+        let origin = [("cache-control", "public, max-age=600"), ("etag", "\"v1\"")];
+        for (marked, cache_control) in [(true, "no-store, private"), (false, "public, max-age=600")]
+        {
+            let answers = text_answers_through_the_publisher(
+                settings_serving_the_text_header(),
+                marked,
+                200,
+                &origin,
+            )
+            .await;
+            for (response, _) in &answers {
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(header::CACHE_CONTROL)
+                        .and_then(|value| value.to_str().ok()),
+                    Some(cache_control),
+                    "should keep a text response shaped from one reader's state out of \
+                     shared caches, and no other"
+                );
+            }
+        }
     }
 
     #[test]
