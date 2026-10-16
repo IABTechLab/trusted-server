@@ -646,6 +646,7 @@ mod tests {
     use crate::ec::tests::{CANONICAL_COOKIE_VALUE, CANONICAL_KV_KEY, CanonicalizingModule};
     use crate::error::IntoHttpResponse as _;
     use crate::openrtb::Uid;
+    use crate::permissions::{Permission, PermissionSet, PermissionState};
     use crate::platform::test_support::{
         NoopBackend, NoopConfigStore, NoopGeo, NoopHttpClient, NoopSecretStore, StubHttpClient,
         noop_services,
@@ -1312,7 +1313,11 @@ mod tests {
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         // The default consent context keeps the jurisdiction unknown, so the
         // server-side auction gate fails closed; the EC gate is off to match.
-        let mut ec_context = make_ec_context(false, Some(&ec_id));
+        // The reader permits ad performance measurement alone, so the skip is
+        // still recorded.
+        let mut ec_context = make_ec_context(false, Some(&ec_id)).with_permissions_for_test(
+            PermissionState::new(PermissionSet::none().with(Permission::MeasureAdPerformance)),
+        );
 
         let body = json!({
             "adUnits": [
@@ -1375,6 +1380,60 @@ mod tests {
         assert!(
             !ndjson.contains(&ec_id),
             "telemetry must not serialize EC identifiers"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_consent_denied_auction_sends_no_row_without_the_ad_measurement_permission() {
+        // The server-side auction gate refuses this reader, who has set no
+        // permission at all. Every row describes the reader, so none is sent.
+        let settings = create_test_settings();
+        let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
+            enabled: true,
+            provider_names: vec!["panic_provider".to_string()],
+            timeout_ms: 2000,
+            adserver_name: None,
+            ..Default::default()
+        });
+        orchestrator.register_provider(Arc::new(PanicOnBidProvider));
+        let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
+        let services = services_with_telemetry(Arc::clone(&telemetry_sink));
+        let mut ec_context = make_ec_context(false, None);
+        let body = json!({
+            "adUnits": [{
+                "code": "div-gpt-ad-1",
+                "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+            }]
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://test-publisher.com/auction")
+            .header(header::USER_AGENT, "FictionalBrowser/1.0 (FictionalOS)")
+            .body(EdgeBody::from(
+                serde_json::to_vec(&body).expect("should serialize body"),
+            ))
+            .expect("should build auction request");
+
+        handle_auction(
+            &settings,
+            &orchestrator,
+            None,
+            None,
+            &mut ec_context,
+            &services,
+            req,
+        )
+        .await
+        .expect("gated auction should still return a valid response");
+
+        let batches = telemetry_sink
+            .batches
+            .lock()
+            .expect("should lock telemetry batches");
+        assert!(
+            batches.is_empty(),
+            "should send no row about a reader who has not permitted ad measurement, got {:?}",
+            *batches
         );
     }
 

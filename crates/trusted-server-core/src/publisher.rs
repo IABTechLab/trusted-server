@@ -644,6 +644,8 @@ struct ProcessResponseParams<'a> {
     request_path: &'a str,
     settings: &'a Settings,
     content_type: &'a str,
+    /// See [`OwnedProcessResponseParams::status`].
+    status: StatusCode,
     integration_registry: &'a IntegrationRegistry,
     /// Head script carrying this request's permission state, or [`None`] under a
     /// shared-template mode. See [`template_permissions_script`].
@@ -670,6 +672,7 @@ struct PublisherBodyProcessor {
 struct TextResponse<'a> {
     /// The response's `Content-Type`, parameters and all.
     content_type: &'a str,
+    status: StatusCode,
     request_path: &'a str,
     request_host: &'a str,
     request_scheme: &'a str,
@@ -681,9 +684,8 @@ struct TextResponse<'a> {
 /// The stream processors the entries covering a response that is not HTML
 /// run on its body, the fetch entry's and then the serve entry's, with the
 /// headers the serve entry's middleware write on the response, or none
-/// when its media type is not one a middleware runs on, its charset is not
-/// UTF-8 or no entry covers it. Both phases run here because the template
-/// cache stores HTML alone.
+/// when [`text_entry_media_type`] gives no media type or no entry covers
+/// it. Both phases run here because the template cache stores HTML alone.
 ///
 /// # Errors
 ///
@@ -694,16 +696,11 @@ fn middleware_stream_processors(
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
 ) -> Result<TextPass, Report<TrustedServerError>> {
-    use crate::middleware::{
-        MiddlewareContext, is_dispatched_media_type, is_utf8_or_undeclared_charset,
-    };
+    use crate::middleware::MiddlewareContext;
 
-    let media_type = media_type_of(response.content_type);
-    if !is_dispatched_media_type(&media_type)
-        || !is_utf8_or_undeclared_charset(response.content_type)
-    {
+    let Some(media_type) = text_entry_media_type(response.content_type, response.status) else {
         return Ok(TextPass::default());
-    }
+    };
     let mut processors = Vec::new();
     let mut response_headers = Vec::new();
     for phase in &MiddlewarePhase::ALL {
@@ -738,6 +735,61 @@ fn middleware_stream_processors(
         processors,
         response_headers,
     })
+}
+
+/// The media type the entries match a response that is not HTML by, or
+/// `None` when no middleware runs on it: HTML and the React Server
+/// Components stream, which have processors of their own, a type no entry
+/// may cover, a charset other than UTF-8, and a status other than `200`.
+/// Only a `200` carries the whole file, so a partial `206` or an error
+/// body is left as the origin sent it.
+fn text_entry_media_type(content_type: &str, status: StatusCode) -> Option<String> {
+    use crate::middleware::{is_dispatched_media_type, is_utf8_or_undeclared_charset};
+
+    let media_type = media_type_of(content_type);
+    let runs = status == StatusCode::OK
+        && !is_html_content_type(content_type)
+        && !content_type_contains_ascii_case_insensitive(content_type, "text/x-component")
+        && is_dispatched_media_type(&media_type)
+        && is_utf8_or_undeclared_charset(content_type);
+    runs.then_some(media_type)
+}
+
+/// Fits the headers of a response that is not HTML to the entries covering
+/// it. A body an entry covers loses the origin's `ETag` and `Last-Modified`,
+/// because its middleware may change it while the origin's file stays the
+/// same, so a conditional request carrying them would bring a `304` for the
+/// body as it was. A body a `[[serve]]` entry covers is also kept out of
+/// shared caches when a module left state on the request, because the
+/// entry's middleware are handed that state. Called once the serve
+/// middleware's headers are written, so none of them can undo it.
+fn apply_text_entry_cache_rules(
+    response: &mut Response<EdgeBody>,
+    params: &OwnedProcessResponseParams,
+    settings: &Settings,
+    integration_registry: &IntegrationRegistry,
+) {
+    let Some(media_type) = text_entry_media_type(&params.content_type, params.status) else {
+        return;
+    };
+    let covered = |phase: MiddlewarePhase| {
+        !integration_registry
+            .middleware_chain(
+                settings.phase_entries(phase),
+                phase,
+                &media_type,
+                &params.request_path,
+            )
+            .is_empty()
+    };
+    let served = covered(MiddlewarePhase::Serve);
+    if served && !params.request_state.is_empty() {
+        // Removes the validators too.
+        enforce_terminal_private_cache_privacy(response);
+    } else if served || covered(MiddlewarePhase::Fetch) {
+        response.headers_mut().remove(header::ETAG);
+        response.headers_mut().remove(header::LAST_MODIFIED);
+    }
 }
 
 /// What the entries covering a text response do to it: the processors over
@@ -825,6 +877,7 @@ impl PublisherBodyProcessor {
             let pass = middleware_stream_processors(
                 &TextResponse {
                     content_type: &params.content_type,
+                    status: params.status,
                     request_path: &params.request_path,
                     request_host: &params.request_host,
                     request_scheme: &params.request_scheme,
@@ -948,6 +1001,7 @@ fn process_response_streaming<W: Write>(
         let pass = middleware_stream_processors(
             &TextResponse {
                 content_type: params.content_type,
+                status: params.status,
                 request_path: params.request_path,
                 request_host: params.request_host,
                 request_scheme: params.request_scheme,
@@ -1988,6 +2042,9 @@ pub struct OwnedProcessResponseParams {
     /// `[[serve]]` entries that cover the document.
     pub(crate) request_path: String,
     pub(crate) content_type: String,
+    /// The origin's status, which decides whether the entries' middleware
+    /// run on a body that is not HTML. See [`text_entry_media_type`].
+    pub(crate) status: StatusCode,
     pub(crate) ad_slots_script: Option<String>,
     pub(crate) ad_bids_state: AdBidsState,
     /// Observation context for the in-flight auction.
@@ -2114,6 +2171,7 @@ pub async fn buffer_publisher_response_async(
             )
             .await?;
             write_response_headers(&mut response, response_headers);
+            apply_text_entry_cache_rules(&mut response, &params, settings, integration_registry);
             // Authorized template cache transforms are emitted as identity by
             // `process_response_streaming_async`; inline transforms retain the origin
             // coding. This avoids recompressing and immediately decoding a full document.
@@ -2477,6 +2535,7 @@ fn build_template_assembly_params(
         // Set by the caller, with the rest of what belongs to the request.
         request_path: String::new(),
         content_type: entry.metadata.content_type.clone(),
+        status: StatusCode::OK,
         // The template already carries the head seam; re-injecting would duplicate it.
         permissions_json,
         ad_slots_script: None,
@@ -2939,6 +2998,7 @@ pub async fn publisher_response_into_streaming_response(
                     }
                 };
             write_response_headers(&mut response, processor.take_response_headers());
+            apply_text_entry_cache_rules(&mut response, &params, &settings, integration_registry);
             // The guard is created before the lazy stream so an auction whose
             // response body is dropped unpolled still logs the loss.
             let dispatched_auction = params.dispatched_auction.take().map(|dispatched| {
@@ -3271,6 +3331,7 @@ pub fn stream_publisher_body<W: Write>(
         request_path: &params.request_path,
         settings,
         content_type: &params.content_type,
+        status: params.status,
         integration_registry,
         permissions_script: permissions_script.as_deref(),
         ad_slots_script: params.ad_slots_script.as_deref(),
@@ -4769,7 +4830,7 @@ fn apply_origin_cache_intent(
     if bypass {
         request.with_cache_bypass()
     } else if readthrough_applies {
-        // The same reader-facing key and all-scope key used by the purge endpoint.
+        // The reader-facing key and the all-scope key that `ts cache purge` names.
         // Fastly accepts multiple space-separated surrogate keys without changing TTL.
         request.with_shared_cache(format!(
             "{TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY} {}",
@@ -5898,6 +5959,7 @@ pub async fn handle_publisher_request(
                     request_scheme: request_scheme.to_string(),
                     request_path: request_path.clone(),
                     content_type,
+                    status,
                     permissions_json,
                     ad_slots_script: ad_slots_script.clone(),
                     ad_bids_state: ad_bids_state.clone(),
@@ -9542,6 +9604,7 @@ mod tests {
             request_scheme: "https".to_owned(),
             request_path: "/".to_owned(),
             content_type: "application/json".to_owned(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -21302,6 +21365,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/a.txt".to_owned(),
             content_type: content_type.to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -21375,6 +21439,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/a.txt".to_owned(),
             content_type: "text/plain; charset=utf-8".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -21427,6 +21492,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/a.txt".to_owned(),
             content_type: content_type.to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -21527,6 +21593,183 @@ mod tests {
             "should hand back the header the serve middleware writes on a streamed text response"
         );
         assert_eq!(String::from_utf8(output).expect("text"), "plain\n");
+    }
+
+    /// The answers to `GET /a.txt` through the publisher path, the origin
+    /// answering `status` with `plain\n` as UTF-8 text and the headers given,
+    /// finalized as the adapters that buffer do and then as Fastly does.
+    /// With `marked`, a module leaves state on the request.
+    async fn text_answers_through_the_publisher(
+        settings: Settings,
+        marked: bool,
+        status: u16,
+        origin_headers: &[(&str, &str)],
+    ) -> Vec<(Response<EdgeBody>, String)> {
+        let settings = Arc::new(settings);
+        let registry = IntegrationRegistry::new(&settings).expect("should build a registry");
+        let orchestrator = Arc::new(AuctionOrchestrator::new(
+            crate::auction::test_support::legacy_auction_config(&settings),
+        ));
+        let mut answers = Vec::new();
+        for streaming in [false, true] {
+            let stub = Arc::new(StubHttpClient::new());
+            let mut headers = vec![("content-type", "text/plain; charset=utf-8")];
+            headers.extend_from_slice(origin_headers);
+            stub.push_response_with_headers(status, b"plain\n".to_vec(), headers);
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let mut request = HttpRequest::builder()
+                .method(Method::GET)
+                .uri("https://publisher.example/a.txt")
+                .header(header::HOST, "publisher.example")
+                .body(EdgeBody::empty())
+                .expect("should build request");
+            if marked {
+                crate::integrations::registry_test_support::request_fixture::mark(&mut request);
+            }
+            let consent = crate::consent::ConsentContext {
+                jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                ..Default::default()
+            };
+            let mut ec_context = EcContext::new_for_test_with_ip(None, consent, None);
+            let proxied = handle_publisher_request(
+                AppContext {
+                    settings: &settings,
+                    integration_registry: &registry,
+                },
+                &services,
+                None,
+                &mut ec_context,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &[],
+                    registry: None,
+                },
+                request,
+                EdgeCacheHeader::SMaxageFallback,
+            )
+            .await
+            .expect("should proxy the request");
+            let response = if streaming {
+                publisher_response_into_streaming_response(
+                    proxied,
+                    &Method::GET,
+                    Arc::clone(&settings),
+                    &registry,
+                    Arc::clone(&orchestrator),
+                    services.clone(),
+                )
+                .await
+            } else {
+                buffer_publisher_response_async(
+                    proxied,
+                    &Method::GET,
+                    &settings,
+                    &registry,
+                    &orchestrator,
+                    &services,
+                )
+                .await
+            }
+            .expect("should finalize the response");
+            let (parts, body) = response.into_parts();
+            let body = match body {
+                EdgeBody::Stream(mut stream) => {
+                    let mut out = Vec::new();
+                    while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+                        out.extend_from_slice(&chunk.expect("should read a chunk"));
+                    }
+                    out
+                }
+                other => other.into_bytes().expect("should hold the bytes").to_vec(),
+            };
+            answers.push((
+                Response::from_parts(parts, EdgeBody::empty()),
+                String::from_utf8(body).expect("text"),
+            ));
+        }
+        answers
+    }
+
+    #[tokio::test]
+    async fn a_text_response_whose_serve_entry_is_handed_request_state_is_private() {
+        let origin = [("cache-control", "public, max-age=600"), ("etag", "\"v1\"")];
+        for (marked, cache_control) in [(true, "no-store, private"), (false, "public, max-age=600")]
+        {
+            let answers = text_answers_through_the_publisher(
+                settings_serving_the_text_header(),
+                marked,
+                200,
+                &origin,
+            )
+            .await;
+            for (response, _) in &answers {
+                assert_eq!(
+                    response
+                        .headers()
+                        .get(header::CACHE_CONTROL)
+                        .and_then(|value| value.to_str().ok()),
+                    Some(cache_control),
+                    "should keep a text response shaped from one reader's state out of \
+                     shared caches, and no other"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_text_body_is_handed_to_a_middleware_only_when_the_status_is_200() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+        let settings = settings_running_the_middleware_fixture(vec![PhaseEntry {
+            media_type: fixture::TEXT_MEDIA_TYPE.to_owned(),
+            path: None,
+            middleware: vec![fixture::TEXT.to_owned()],
+        }]);
+        for (status, body) in [
+            (200, format!("plain\n{}", fixture::TEXT_LINE)),
+            (206, "plain\n".to_owned()),
+            (404, "plain\n".to_owned()),
+            (500, "plain\n".to_owned()),
+        ] {
+            let answers =
+                text_answers_through_the_publisher(settings.clone(), false, status, &[]).await;
+            for (response, text) in &answers {
+                assert_eq!(response.status().as_u16(), status);
+                assert_eq!(
+                    text, &body,
+                    "should change a whole file and leave a {status} as the origin sent it"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_text_body_a_middleware_changes_loses_the_origin_validators() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+        let origin = [
+            ("etag", "\"v1\""),
+            ("last-modified", "Wed, 21 Oct 2015 07:28:00 GMT"),
+        ];
+        for (path, keeps_validators) in [(None, false), (Some("/elsewhere/"), true)] {
+            let settings = settings_running_the_middleware_fixture(vec![PhaseEntry {
+                media_type: fixture::TEXT_MEDIA_TYPE.to_owned(),
+                path: path.map(str::to_owned),
+                middleware: vec![fixture::TEXT.to_owned()],
+            }]);
+            let answers = text_answers_through_the_publisher(settings, false, 200, &origin).await;
+            for (response, _) in &answers {
+                for name in [header::ETAG, header::LAST_MODIFIED] {
+                    assert_eq!(
+                        response.headers().contains_key(&name),
+                        keeps_validators,
+                        "{name} should stay on a body no middleware changes, and on no other"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -21753,6 +21996,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/css".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -21816,6 +22060,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -21900,6 +22145,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/html; charset=utf-8".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -21993,6 +22239,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/html; charset=utf-8".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -22101,6 +22348,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -22150,6 +22398,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -22279,6 +22528,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -22346,6 +22596,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -22416,6 +22667,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -22486,6 +22738,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -22556,6 +22809,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -22606,6 +22860,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/css".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -22832,6 +23087,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/html; charset=utf-8".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: Some(
                     r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
@@ -22910,6 +23166,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/html; charset=utf-8".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: Some(
                     r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
@@ -22990,6 +23247,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -23064,6 +23322,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/css".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -23220,6 +23479,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: Some(
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
@@ -23896,6 +24156,7 @@ mod tests {
                 request_scheme: "https".to_string(),
                 request_path: "/".to_owned(),
                 content_type: "text/html; charset=utf-8".to_string(),
+                status: http::StatusCode::OK,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -24094,6 +24355,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: Some(
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
@@ -24176,6 +24438,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "Text/HTML; Charset=utf-8".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: Some(
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
@@ -24241,6 +24504,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/html".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -24361,6 +24625,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -24421,6 +24686,7 @@ mod tests {
             request_scheme: "https".to_string(),
             request_path: "/".to_owned(),
             content_type: "text/html".to_string(),
+            status: http::StatusCode::OK,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -27226,7 +27492,9 @@ mod tests {
     /// The same capturing setup also covers how both paths key the identity
     /// graph. A module whose canonical form differs from the cookie value has
     /// its row read under the canonical key, so the partner ID stored there
-    /// reaches the dispatched auction request.
+    /// reaches the dispatched auction request. It also covers that neither
+    /// path sends a telemetry row about a reader the consent gate refuses and
+    /// who has not permitted ad performance measurement.
     mod navigation_publisher_domain_tests {
         use super::*;
         use crate::auction::provider::{AuctionProvider, ProviderRequestOutcome};
@@ -27383,6 +27651,26 @@ mod tests {
                 ..Default::default()
             };
             EcContext::new_for_test(None, consent)
+        }
+
+        /// [`EcContext`] in an unknown jurisdiction with no consent record,
+        /// which the server-side auction gate refuses, for a reader who has
+        /// set no permission, ad performance measurement included.
+        fn consent_denying_ec_context() -> EcContext {
+            EcContext::new_for_test_gated(None, crate::consent::ConsentContext::default(), false)
+        }
+
+        /// Asserts the sink received no telemetry row at all.
+        fn assert_no_telemetry(telemetry_sink: &RecordingTelemetrySink) {
+            let batches = telemetry_sink
+                .batches
+                .lock()
+                .expect("should lock telemetry batches");
+            assert!(
+                batches.is_empty(),
+                "should send no row about a reader who has not permitted ad measurement, got {:?}",
+                *batches
+            );
         }
 
         fn services_with(
@@ -27556,6 +27844,94 @@ mod tests {
             .expect("should return ok response");
 
             assert_configured_domain(&captured, &telemetry_sink);
+        }
+
+        #[tokio::test]
+        async fn navigation_sends_no_row_when_consent_denies_without_ad_measurement() {
+            let settings = settings_with_capturing_provider();
+            let captured = Arc::new(Mutex::new(None));
+            let orchestrator = orchestrator_capturing_request(&settings, &captured);
+            let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"<html><head></head><body>ok</body></html>".to_vec());
+            let services = services_with(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>,
+                Arc::clone(&telemetry_sink),
+            );
+            let mut ec_context = consent_denying_ec_context();
+            let req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri(format!("https://{EDGE_HOST}/2024/01/my-article/"))
+                .header(header::HOST, EDGE_HOST)
+                .header(header::USER_AGENT, "FictionalBrowser/1.0 (FictionalOS)")
+                .header("sec-fetch-dest", "document")
+                .body(EdgeBody::empty())
+                .expect("should build test request");
+
+            let registry = test_registry(&settings);
+            let _ = handle_publisher_request(
+                AppContext {
+                    settings: &settings,
+                    integration_registry: &registry,
+                },
+                &services,
+                None,
+                &mut ec_context,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &article_slot(),
+                    registry: None,
+                },
+                req,
+                EdgeCacheHeader::SMaxageFallback,
+            )
+            .await
+            .expect("should proxy publisher request");
+
+            assert_no_telemetry(&telemetry_sink);
+        }
+
+        #[tokio::test]
+        async fn page_bids_sends_no_row_when_consent_denies_without_ad_measurement() {
+            let settings = settings_with_capturing_provider();
+            let captured = Arc::new(Mutex::new(None));
+            let orchestrator = orchestrator_capturing_request(&settings, &captured);
+            let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
+            let services = services_with(
+                Arc::new(crate::platform::test_support::NoopHttpClient),
+                Arc::clone(&telemetry_sink),
+            );
+            let mut ec_context = consent_denying_ec_context();
+            let mut req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "https://{EDGE_HOST}/_ts/page-bids?path=/2024/01/my-article/"
+                ))
+                .header(header::HOST, EDGE_HOST)
+                .header(header::USER_AGENT, "FictionalBrowser/1.0 (FictionalOS)")
+                .body(EdgeBody::empty())
+                .expect("should build test request");
+            req.headers_mut().insert(
+                header::HeaderName::from_static("sec-fetch-site"),
+                HeaderValue::from_static("same-origin"),
+            );
+
+            let _ = handle_page_bids(
+                &settings,
+                &services,
+                None,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &article_slot(),
+                    registry: None,
+                },
+                &mut ec_context,
+                req,
+            )
+            .await
+            .expect("should return ok response");
+
+            assert_no_telemetry(&telemetry_sink);
         }
 
         #[tokio::test]
