@@ -270,7 +270,8 @@ pub trait DeviceModule: Send + Sync {
     ///
     /// The call carries the permissions resolved for the request, so a module
     /// whose use of the evidence needs a permission the reader has not given
-    /// answers `None` without using it.
+    /// answers `None` without using it. A backend the module registers during
+    /// the call has its transport timers capped at the auction's timeout.
     ///
     /// The default returns nothing, so no existing module changes. A module
     /// that resolves nothing returns `None` rather than an empty value.

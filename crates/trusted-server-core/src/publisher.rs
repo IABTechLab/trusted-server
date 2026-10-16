@@ -5547,6 +5547,7 @@ pub async fn handle_publisher_request(
                 ec_context.permissions(),
                 settings,
                 services,
+                auction_timeout_ms,
             )
             .await;
             let auction_context = AuctionContext {
@@ -7916,6 +7917,9 @@ pub async fn handle_page_bids(
                 },
             );
 
+            let timeout_ms = co_config
+                .auction_timeout_ms
+                .unwrap_or(settings.auction.timeout_ms);
             // Fill the device object the bidder prices on.
             crate::auction::formats::attach_device_attributes(
                 &mut auction_request,
@@ -7923,11 +7927,9 @@ pub async fn handle_page_bids(
                 ec_context.permissions(),
                 settings,
                 services,
+                timeout_ms,
             )
             .await;
-            let timeout_ms = co_config
-                .auction_timeout_ms
-                .unwrap_or(settings.auction.timeout_ms);
             let auction_context = AuctionContext {
                 settings,
                 request: &req,

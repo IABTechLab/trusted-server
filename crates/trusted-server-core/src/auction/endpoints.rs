@@ -362,6 +362,7 @@ pub async fn handle_auction(
         ec_context.permissions(),
         settings,
         services,
+        settings.auction.timeout_ms,
     )
     .await;
 
@@ -664,15 +665,20 @@ mod tests {
     use crate::openrtb::Uid;
     use crate::permissions::{Permission, PermissionSet, PermissionState};
     use crate::platform::test_support::{
-        DetectionServiceDevice, NoopBackend, NoopConfigStore, NoopGeo, NoopHttpClient,
-        NoopSecretStore, StubHttpClient, noop_services,
+        DetectionServiceDevice, NamingBackend, NoopBackend, NoopConfigStore, NoopGeo,
+        NoopHttpClient, NoopSecretStore, StubHttpClient,
+        build_services_with_backend_and_http_client, noop_services,
     };
-    use crate::platform::{ClientInfo, PlatformHttpClient, PlatformHttpRequest, PlatformResponse};
+    use crate::platform::{
+        BackendNamingPolicy, ClientInfo, PlatformBackend, PlatformHttpClient, PlatformHttpRequest,
+        PlatformResponse,
+    };
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     #[derive(Default)]
     struct RecordingTelemetrySink {
@@ -2153,6 +2159,34 @@ mod tests {
             captured_attributes(&captured),
             None,
             "a reader who did not give the module's permission should have no device described"
+        );
+    }
+
+    #[tokio::test]
+    async fn auction_caps_the_transport_timers_of_the_device_modules_backend() {
+        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
+        let services = build_services_with_backend_and_http_client(
+            Arc::clone(&backend) as Arc<dyn PlatformBackend>,
+            Arc::new(NoopHttpClient),
+        );
+        let module = Arc::new(DetectionServiceDevice::new(PermissionSet::none(), None));
+
+        let _ = auction_with_device_module(make_non_regulated_ec_context(None), &module, services)
+            .await;
+
+        let limit = Duration::from_millis(u64::from(create_test_settings().auction.timeout_ms));
+        let specs = backend
+            .specs
+            .lock()
+            .expect("should lock registered backends");
+        let spec = specs
+            .iter()
+            .find(|spec| spec.host == "detect.example")
+            .expect("the device module should register its service's backend");
+        assert_eq!(
+            (spec.first_byte_timeout, spec.between_bytes_timeout),
+            (limit, limit),
+            "the module's service should hold the auction no longer than the auction's own timeout"
         );
     }
 }

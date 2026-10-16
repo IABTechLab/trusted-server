@@ -10,6 +10,8 @@ use http::{HeaderValue, Request, Response, StatusCode, header};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
+use std::time::Duration;
 use url::Url;
 use uuid::Uuid;
 
@@ -26,7 +28,9 @@ use crate::openrtb::{
     to_openrtb_i32,
 };
 use crate::permissions::PermissionState;
-use crate::platform::RuntimeServices;
+use crate::platform::{
+    BackendNamingPolicy, PlatformBackend, PlatformBackendSpec, PlatformError, RuntimeServices,
+};
 use crate::settings::Settings;
 
 use super::orchestrator::OrchestrationResult;
@@ -560,13 +564,16 @@ pub(crate) fn convert_to_openrtb_response_with_report(
 /// after each request that makes an outbound auction call is built.
 ///
 /// The module's call carries `permissions`, those resolved for the request,
-/// so the module can do nothing the reader has not agreed to.
+/// so the module can do nothing the reader has not agreed to. A backend the
+/// module registers during the call waits no longer than `timeout_ms`, the
+/// auction's own timeout, for its service.
 pub async fn attach_device_attributes(
     request: &mut AuctionRequest,
     http_req: &http::Request<EdgeBody>,
     permissions: &PermissionState,
     settings: &Settings,
     services: &RuntimeServices,
+    timeout_ms: u32,
 ) {
     let Some(module) = services.device_module() else {
         return;
@@ -577,11 +584,15 @@ pub async fn attach_device_attributes(
         .map_or_else(String::new, |address| address.to_string());
     let request_info =
         crate::evidence::BorrowedRequestInfo::new(&client_ip, Some(http_req.headers()));
+    let module_services = services.clone().with_backend(Arc::new(CappedBackend {
+        inner: Arc::clone(&services.backend),
+        limit: Duration::from_millis(u64::from(timeout_ms)),
+    }));
     let context = ModuleContext::new(ModuleRequest::of(http_req, services.client_info()))
         .with_evidence(&request_info)
         .with_permissions(permissions)
         .with_settings(settings)
-        .with_services(services);
+        .with_services(&module_services);
     let Some(attributes) = module
         .advertising_attributes(context.call(module.id(), module.required_permissions()))
         .await
@@ -603,6 +614,46 @@ pub async fn attach_device_attributes(
             attributes: None,
         })
         .attributes = Some(attributes);
+}
+
+/// Registers backends through `inner` with both transport timers capped at
+/// `limit`.
+///
+/// The timers bound the wait for the first byte and between two bytes, not
+/// the whole call, so connecting and a slow trickle can still lengthen the
+/// call, as they can an auction provider's.
+struct CappedBackend {
+    inner: Arc<dyn PlatformBackend>,
+    limit: Duration,
+}
+
+impl CappedBackend {
+    fn capped(&self, spec: &PlatformBackendSpec) -> PlatformBackendSpec {
+        PlatformBackendSpec {
+            first_byte_timeout: spec.first_byte_timeout.min(self.limit),
+            between_bytes_timeout: spec.between_bytes_timeout.min(self.limit),
+            ..spec.clone()
+        }
+    }
+}
+
+impl PlatformBackend for CappedBackend {
+    fn naming_policy(&self) -> BackendNamingPolicy {
+        self.inner.naming_policy()
+    }
+
+    fn predict_name(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+        self.inner.predict_name(&self.capped(spec))
+    }
+
+    fn ensure(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+        self.inner.ensure(&self.capped(spec))
+    }
+
+    fn canonicalize_transport_timeout_ms(&self, remaining_ms: u32, configured_ms: u32) -> u32 {
+        self.inner
+            .canonicalize_transport_timeout_ms(remaining_ms, configured_ms)
+    }
 }
 
 #[cfg(test)]
@@ -694,6 +745,9 @@ mod tests {
         request
     }
 
+    /// The auction timeout the device calls in these tests run under.
+    const TIMEOUT_MS: u32 = 2000;
+
     #[tokio::test]
     async fn the_selected_module_fills_the_device_object() {
         let services = crate::platform::test_support::noop_services_with_device_module(
@@ -714,6 +768,7 @@ mod tests {
             &PermissionState::default(),
             &crate::test_support::tests::create_test_settings(),
             &services,
+            TIMEOUT_MS,
         )
         .await;
 
@@ -742,6 +797,7 @@ mod tests {
             &PermissionState::default(),
             &crate::test_support::tests::create_test_settings(),
             &services,
+            TIMEOUT_MS,
         )
         .await;
 
@@ -767,6 +823,7 @@ mod tests {
             &PermissionState::default(),
             &crate::test_support::tests::create_test_settings(),
             &services,
+            TIMEOUT_MS,
         )
         .await;
 
@@ -792,6 +849,7 @@ mod tests {
             &PermissionState::default(),
             &crate::test_support::tests::create_test_settings(),
             &services,
+            TIMEOUT_MS,
         )
         .await;
 
@@ -820,6 +878,7 @@ mod tests {
             &PermissionState::default(),
             &crate::test_support::tests::create_test_settings(),
             &services,
+            TIMEOUT_MS,
         )
         .await;
 
