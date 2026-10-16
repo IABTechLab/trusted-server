@@ -424,7 +424,6 @@ fn content_length_exceeds_limit(req: &Request<EdgeBody>, limit: usize) -> bool {
 mod tests {
     use super::*;
     use crate::consent::types::ConsentContext;
-    use crate::constants::COOKIE_TS_EC_RESOLVED;
     use crate::ec::finalize::ec_finalize_response;
     use crate::ec::module::{
         CLIENT_FIXED_MODULE_KEY, EcModuleSelection, EdgeCookieModule, GeneratedEdgeCookie,
@@ -1413,6 +1412,9 @@ mod tests {
             .build()
     }
 
+    /// The resolved marker's name under the default public prefix.
+    const RESOLVED_MARKER: &str = "ts-ecr";
+
     /// The publisher cookies a browser holds, by name.
     type Jar = BTreeMap<String, String>;
 
@@ -1531,7 +1533,7 @@ mod tests {
             "the first post should create the identity"
         );
         assert_eq!(
-            jar.get(COOKIE_TS_EC_RESOLVED).map(String::as_str),
+            jar.get(RESOLVED_MARKER).map(String::as_str),
             Some("1"),
             "the resolve should set the marker"
         );
@@ -1544,7 +1546,7 @@ mod tests {
             "core should recognize the demo module's own identifier when it comes back"
         );
         assert_eq!(
-            jar.get(COOKIE_TS_EC_RESOLVED).map(String::as_str),
+            jar.get(RESOLVED_MARKER).map(String::as_str),
             Some("1"),
             "the next view should keep the marker once it is set, got {jar:?}"
         );
@@ -1562,7 +1564,7 @@ mod tests {
             view_page(&settings, &services, &graph, &mut jar).await;
             // The page script posts only when it finds no marker, which its
             // own tests pin in `ec_client_fixed/index.test.ts`.
-            if !jar.contains_key(COOKIE_TS_EC_RESOLVED) {
+            if !jar.contains_key(RESOLVED_MARKER) {
                 posts += 1;
                 post_fixed_word(&settings, &services, &graph, &mut jar).await;
             }
