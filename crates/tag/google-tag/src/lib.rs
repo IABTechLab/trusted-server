@@ -936,6 +936,15 @@ mod tests {
     }
 
     #[test]
+    fn module_constant_is_the_crate_folder() {
+        assert_eq!(
+            super::MODULE,
+            trusted_server_core::module_name!(),
+            "should be named by the folder this crate lives in"
+        );
+    }
+
+    #[test]
     fn an_unnamed_integration_does_not_register() {
         // Arrange
         let settings = create_test_settings();
