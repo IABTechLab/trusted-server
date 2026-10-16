@@ -9,8 +9,6 @@ use std::sync::Arc;
 
 use edgezero_adapter_fastly::config_store::FastlyConfigStore as EdgeZeroFastlyConfigStore;
 use edgezero_adapter_fastly::request::into_core_request;
-use edgezero_adapter_fastly::runtime_env_config;
-use edgezero_core::app::Hooks as _;
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::error::EdgeError;
@@ -426,11 +424,9 @@ fn heap_mib() -> String {
 
 /// Handles a request through the `EdgeZero` router path.
 fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, request_id: &str) {
-    let runtime_env = runtime_env_config(TrustedServerApp::stores());
     // Settled before anything reads settings, so every path below reads the
     // blob of the publisher this request is for.
-    let runtime_stores = match stores_for_request(RuntimeStoreConfig::from_env(&runtime_env), &req)
-    {
+    let runtime_stores = match stores_for_request(RuntimeStoreConfig::logical(), &req) {
         Ok(stores) => stores,
         Err(refusal) => {
             refusal_response(&refusal).send_to_client();
@@ -1293,12 +1289,11 @@ mod tests {
         );
     }
 
-    /// The stores a service with no runtime overrides resolves, with
-    /// `selector` as its `__KEY` selector.
+    /// The logical stores, with `selector` as the service's selector.
     fn stores_with_selector(selector: &str) -> RuntimeStoreConfig {
         RuntimeStoreConfig {
             config_key: selector.to_owned(),
-            ..RuntimeStoreConfig::from_env(&edgezero_core::env_config::EnvConfig::default())
+            ..RuntimeStoreConfig::logical()
         }
     }
 
