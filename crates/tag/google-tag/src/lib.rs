@@ -1019,6 +1019,34 @@ mod tests {
         );
     }
 
+    /// The value `trusted-server.example.toml` gives `setting` in its
+    /// `[tag.google-tag]` table.
+    fn example_value(setting: &str) -> String {
+        let prefix = format!("# {setting} = \"");
+        trusted_server_core::test_support::template::EXAMPLE_TEMPLATE
+            .lines()
+            .skip_while(|line| *line != "# [tag.google-tag]")
+            .take_while(|line| line.starts_with('#'))
+            .find_map(|line| line.strip_prefix(prefix.as_str())?.strip_suffix('"'))
+            .unwrap_or_else(|| panic!("the example should give `{setting}` a value"))
+            .to_owned()
+    }
+
+    #[test]
+    fn the_example_s_placeholder_ids_are_refused() {
+        // Arrange, Act, Assert
+        // A table uncommented with its placeholders left in should be refused,
+        // rather than write a tag or a container that is not the publisher's.
+        for setting in ["analytics_tag_id", "container_id"] {
+            let placeholder = example_value(setting);
+            let refusal = refusal_for(&settings_with_google(&json!({ setting: placeholder })));
+            assert!(
+                refusal.contains(setting),
+                "the example's `{placeholder}` should be refused for `{setting}`: {refusal}"
+            );
+        }
+    }
+
     #[test]
     fn the_tag_snippet_is_googles_own_with_the_id_substituted() {
         // Arrange
