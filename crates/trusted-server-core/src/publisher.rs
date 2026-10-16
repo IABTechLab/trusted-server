@@ -12299,7 +12299,9 @@ mod tests {
                 );
                 if stored {
                     assert!(
-                        page.contains(&fixture::reader_marker(fixture::NOTHING_OF_THE_READER)),
+                        page.contains(&fixture::prepared_reader_marker(
+                            fixture::NOTHING_OF_THE_READER
+                        )),
                         "should prepare a page stored for every reader with nothing of the \
                          reader whose request fetched it: {page}"
                     );
