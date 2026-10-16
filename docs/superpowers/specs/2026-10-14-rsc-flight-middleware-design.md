@@ -1,11 +1,11 @@
 # Design Spec: The Flight rewriter is a middleware of the Next.js module
 
-**Status:** Proposed, 2026-10-14. Implemented on a working branch of the fork, with no pull request raised yet.
+**Status:** Proposed, 2026-10-14. Raised as draft pull request IABTechLab/trusted-server#1381 (from jwrosewell/trusted-server#35), for Tech Lab review.
 **Author:** 51Degrees (contributed), for Tech Lab review
 **Related specs:** `2026-09-07-850-parser-aware-body-hold-nextjs-streaming-design.md`, `2026-10-14-source-modules-design.md`
-**Related PRs:** none yet
+**Related PRs:** IABTechLab/trusted-server#1381, jwrosewell/trusted-server#35
 **Issues:** IABTechLab/trusted-server#1340
-**Last updated:** 2026-10-15
+**Last updated:** 2026-10-16
 
 > **Why this spec exists.** Core rewrote the addresses inside a React Server Components Flight stream by its media type, in a module of its own, and the publisher path named that media type to call it. This change moves the rewriter into the Next.js module as the middleware `framework.nextjs.flight`, so the publisher path no longer names the media type. A deployment that fronts a Next.js site selects the module and names the middleware in a `[[fetch]]` entry, and section 2 says what happens to a deployment that does not.
 
