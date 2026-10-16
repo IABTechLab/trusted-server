@@ -467,6 +467,29 @@ mod tests {
         );
     }
 
+    /// A table naming no module takes the one loading cache module the build
+    /// links, so a stock build holds each answer only while this list links
+    /// exactly one. A second would leave the table holding nothing, with no
+    /// message.
+    #[test]
+    fn a_table_naming_no_module_holds_with_the_stock_loading_cache() {
+        let settings = trusted_server_core::test_support::tests::create_test_settings();
+        assert!(
+            settings.cache.robots_txt.module.is_none(),
+            "the test settings should name no module"
+        );
+
+        let caches = trusted_server_core::integrations::loading_caches_from(&settings, &builders())
+            .expect("a table naming no module is not an error");
+
+        assert!(
+            caches
+                .for_feature(trusted_server_core::settings::ROBOTS_TXT_CACHE)
+                .keeps_values(),
+            "a stock build should hold each robots.txt module's answer"
+        );
+    }
+
     /// `ts config validate` validates against this list, so it accepts the
     /// stock loading cache by name and refuses a misspelling, which the
     /// service would otherwise refuse only as it starts.

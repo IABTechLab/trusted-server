@@ -662,3 +662,101 @@ async fn remove_drops_the_memory_copy_and_the_stored_one() {
     assert_eq!(fresh, "new");
     assert_eq!(runs.load(Ordering::SeqCst), 2);
 }
+
+/// A memory lifetime of zero keeps no memory copy, so every call reads the
+/// store, and callers asking at the same moment still share one load.
+#[test]
+fn a_memory_lifetime_of_zero_keeps_no_memory_copy_and_still_loads_once() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let caches = Arc::new(LoadingCaches::new());
+    let kv = Arc::new(MemoryKv::default());
+    let services = services(Arc::clone(&kv));
+    let mut no_memory = spec();
+    no_memory.lifetimes.memory = Duration::ZERO;
+
+    let answers = ask_from_many_threads(&caches, &services, &no_memory, || {
+        counted(&runs, "value")
+    });
+
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "the source should be asked once"
+    );
+    for answer in answers {
+        assert_eq!(answer.expect("every caller should get the value"), "value");
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("should build a runtime");
+    let reads = kv.reads();
+    let again = runtime
+        .block_on(caches.get_or_load(&services, &no_memory, &key("k"), never()))
+        .expect("the store should answer");
+    assert_eq!(again, "value");
+    assert_eq!(kv.reads(), reads + 1, "with no memory copy the store is read");
+}
+
+/// A caller whose load is dropped before it ends hands the load on, so a
+/// caller waiting on it loads for itself rather than waiting for ever.
+#[tokio::test(flavor = "current_thread")]
+async fn a_waiting_caller_loads_when_the_caller_leading_the_load_is_dropped() {
+    let caches = LoadingCaches::new();
+    let services = services(Arc::new(MemoryKv::default()));
+    let (spec, key) = (spec(), key("k"));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let unending: Loader =
+        Box::new(|| Box::pin(std::future::pending::<Result<LoadedValue, LoadError>>()));
+
+    let mut leading = caches.get_or_load(&services, &spec, &key, unending);
+    assert!(
+        futures::poll!(leading.as_mut()).is_pending(),
+        "the first caller's load should be running"
+    );
+    let mut waiting = caches.get_or_load(&services, &spec, &key, counted(&runs, "value"));
+    assert!(
+        futures::poll!(waiting.as_mut()).is_pending(),
+        "the second caller should wait on the first caller's load"
+    );
+    drop(leading);
+
+    let value = waiting
+        .await
+        .expect("the waiting caller should load for itself");
+    assert_eq!(value, "value");
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "the waiting caller's own load should run"
+    );
+}
+
+/// A store that fails every call, as the Axum adapter's does, holds nothing.
+/// A failed read is a miss and a failed write still serves the value, so the
+/// memory copy alone answers until it is removed.
+#[tokio::test(flavor = "current_thread")]
+async fn a_store_that_fails_every_call_leaves_the_memory_copy_answering() {
+    let services = services(Arc::new(UnavailableKvStore));
+    let caches = LoadingCaches::new();
+    let runs = Arc::new(AtomicUsize::new(0));
+
+    let value = caches
+        .get_or_load(&services, &spec(), &key("k"), counted(&runs, "value"))
+        .await
+        .expect("a store that fails should not fail the load");
+    let again = caches
+        .get_or_load(&services, &spec(), &key("k"), never())
+        .await
+        .expect("the memory copy should answer");
+    caches.remove(&services, &spec(), &key("k")).await;
+    let fresh = caches
+        .get_or_load(&services, &spec(), &key("k"), counted(&runs, "fresh"))
+        .await
+        .expect("should load again once the memory copy is removed");
+
+    assert_eq!(value, "value");
+    assert_eq!(again, "value");
+    assert_eq!(fresh, "fresh");
+    assert_eq!(runs.load(Ordering::SeqCst), 2);
+}
