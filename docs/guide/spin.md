@@ -15,9 +15,26 @@ auction provider. When startup fails, its hardened router preserves `/health`
 but answers publisher routes with 503; neither response proves successful
 configuration.
 
+## Prerequisites
+
+Spin 4.1.0 or newer. `spin-sdk` 7 imports `wasi:http/types@0.3.0`, which Spin
+4.0.x does not provide, so an older runtime cannot start the component. Install
+or upgrade from the [Spin install guide](https://spinframework.dev/install).
+
+Nothing in the build catches this. The component compiles, `cargo
+test-spin` passes, and only `spin up` reports:
+
+```
+Error: component imports instance `wasi:http/types@0.3.0`, but a
+matching implementation was not found in the linker
+```
+
+`./scripts/smoke-spin.sh` checks the runtime version before it starts the app,
+so it fails with a clear message rather than that linker error.
+
 ## Verify the complete local handoff
 
-With the Spin CLI installed, run:
+With Spin 4.1.0 or newer installed, run:
 
 ```bash
 ./scripts/smoke-spin.sh
