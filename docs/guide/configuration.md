@@ -1879,15 +1879,15 @@ See [Didomi](/guide/integrations/didomi) for the routed endpoint shapes.
 
 **Section**: `[cmp.inmobi]`
 
-| Field        | Type   | Default  | Contract                                                                                                    |
-| ------------ | ------ | -------- | ----------------------------------------------------------------------------------------------------------- |
-| `script_url` | URL    | Required | The account's Choice loader, `https` on `cmp.inmobi.com` or `cdn.inmobi.com`, with no user name or password |
-| `cmp_id`     | Number | `10`     | The IAB registered CMP identifier the GPP stub answers `ping` with while the prompt loads                   |
+| Field        | Type   | Default  | Contract                                                                                                        |
+| ------------ | ------ | -------- | --------------------------------------------------------------------------------------------------------------- |
+| `script_url` | URL    | Required | The account's Choice loader, `https` on `cmp.inmobi.com` or `cdn.inmobi.com`, with no user name or password     |
+| `cmp_id`     | Number | `10`     | The IAB registered CMP identifier, from 1 to 4095, that the GPP stub answers `ping` with while the prompt loads |
 
-The table refuses a field it does not read. Selecting the module with no
-`[[fetch]]` entry naming `cmp.inmobi` is refused, because the
-prompt would never be written, and the entry names it before any middleware
-that writes a vendor's tag. See [InMobi Choice](/guide/integrations/inmobi)
+The table refuses a field it does not read. Selecting the module is refused
+when the `[[fetch]]` entries leave any page without `cmp.inmobi`, because the
+prompt would not be written there, and each entry names it before any
+middleware that writes a vendor's tag. See [InMobi Choice](/guide/integrations/inmobi)
 for the tag's parts and what the module keeps to.
 
 ### Google Tag Manager Integration
@@ -2719,8 +2719,9 @@ Check `X-TS-Template-Cache: hit` to verify template reuse.
 
 `template_cache_vary` is necessary because lookup occurs before the origin can
 return `Vary`. Presence, empty values, repeated raw field values, host/scheme,
-origin identity, complete template-shaping settings, TSJS content, core build
-inputs, and schema version all participate in an opaque SHA-256 cache key. The
+origin identity, complete template-shaping settings, TSJS content, the text
+each middleware gives as its `template_key`, core build inputs, and schema
+version all participate in an opaque SHA-256 cache key. The
 build digest covers every core source file (including Rust-inlined head scripts)
 except hidden, `#`-prefixed, and `~`-suffixed editor artifacts, plus the core
 build script, core and workspace manifests, `edgezero.toml`, and the workspace
