@@ -23,7 +23,12 @@ const LEGACY_ADMIN_DENY_METHODS: &[&str] =
 /// `get_settings()` rejects by design, which would turn every route into a
 /// startup error page (and its route table into the fallback-only set).
 fn test_settings() -> trusted_server_core::settings::Settings {
-    trusted_server_core::settings::Settings::from_toml(
+    test_settings_with("")
+}
+
+/// The route tests' settings with `extra` appended.
+fn test_settings_with(extra: &str) -> trusted_server_core::settings::Settings {
+    trusted_server_core::settings::Settings::from_toml(&format!(
         r#"
             [source]
             module = "origin"
@@ -44,8 +49,9 @@ fn test_settings() -> trusted_server_core::settings::Settings {
 
             [geo]
             assume_single_jurisdiction = true
-        "#,
-    )
+            {extra}
+        "#
+    ))
     .expect("should parse route test settings")
 }
 
@@ -283,8 +289,15 @@ async fn tsjs_route_matching_hash_uses_s_maxage_fallback() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn finalize_middleware_sets_geo_unavailable_header() {
-    let mut svc = make_service();
+async fn finalize_middleware_writes_the_operators_headers_and_no_geo_header() {
+    let mut settings = test_settings();
+    settings
+        .response_headers
+        .insert("X-Finalized".to_owned(), "1".to_owned());
+    let mut svc = EdgeZeroAxumService::new(
+        TrustedServerApp::routes_with_settings(settings)
+            .expect("should build router from test settings"),
+    );
 
     let req = Request::builder()
         .method("POST")
@@ -303,10 +316,20 @@ async fn finalize_middleware_sets_geo_unavailable_header() {
 
     assert_eq!(
         resp.headers()
-            .get("x-geo-info-available")
+            .get("x-finalized")
             .and_then(|v| v.to_str().ok()),
-        Some("false"),
-        "finalize middleware should set X-Geo-Info-Available: false on every response"
+        Some("1"),
+        "the finalize middleware should write the operator's headers on every response"
+    );
+    let geo_headers: Vec<&str> = resp
+        .headers()
+        .keys()
+        .map(axum::http::HeaderName::as_str)
+        .filter(|name| name.starts_with("x-geo-"))
+        .collect();
+    assert!(
+        geo_headers.is_empty(),
+        "the finalize middleware should write no x-geo-* header: {geo_headers:?}"
     );
 }
 
@@ -381,6 +404,7 @@ async fn key_administration_paths_are_answered_here_and_never_proxied() {
     for path in [
         "/_ts/admin/keys/rotate",
         "/_ts/admin/keys/deactivate",
+        "/_ts/admin/cache/purge",
         "/admin/keys/rotate",
         "/admin/keys/deactivate",
     ] {
@@ -857,6 +881,221 @@ async fn health_carries_no_version() {
     assert!(
         response.headers().get("x-ts-version").is_none(),
         "should write no version on /health, which the service_version middleware writes on a page"
+    );
+}
+
+/// A publisher whose origin has no `ads.txt` gets one made of the sellers
+/// lines, through this adapter's router and the stock sellers module.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_sellers_module_makes_an_ads_txt_the_origin_does_not_have() {
+    use std::sync::Arc;
+
+    use trusted_server_core::platform::PlatformHttpClient;
+    use trusted_server_core::platform::test_support::{
+        StubHttpClient, build_services_with_http_client,
+    };
+
+    const SELLERS: &str = r#"
+        [ads-txt]
+        modules = ["sellers"]
+
+        [ads-txt.sellers]
+        lines = ["ssp.example, 12345, DIRECT, f08c47fec0942fa0"]
+
+        [[fetch]]
+        media_type = "text/plain"
+        path = "/ads.txt"
+        middleware = ["ads-txt.sellers"]
+    "#;
+
+    let origin = Arc::new(StubHttpClient::new());
+    origin.push_response_with_headers(
+        404,
+        b"<html><body>Not found</body></html>".to_vec(),
+        vec![
+            ("content-type", "text/html; charset=utf-8"),
+            ("set-cookie", "session=origin; Path=/"),
+            ("cache-control", "public, max-age=600"),
+        ],
+    );
+    let router = TrustedServerApp::routes_with_settings_and_services(
+        test_settings_with(SELLERS),
+        build_services_with_http_client(Arc::clone(&origin) as Arc<dyn PlatformHttpClient>),
+    )
+    .expect("should build the router with the sellers module");
+    let request = edgezero_core::http::request_builder()
+        .method("GET")
+        .uri("https://test-publisher.example.com/ads.txt")
+        .header("host", "test-publisher.example.com")
+        .body(edgezero_core::body::Body::empty())
+        .expect("should build the ads.txt request");
+
+    let response = router
+        .oneshot(request)
+        .await
+        .expect("should answer the ads.txt request");
+
+    assert_eq!(
+        response.status(),
+        200,
+        "should make the file the origin does not have"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("text/plain; charset=utf-8")
+    );
+    assert!(
+        response.headers().get("set-cookie").is_none()
+            && response.headers().get("cache-control").is_none(),
+        "should carry none of the headers the origin sent with its 404: {:?}",
+        response.headers()
+    );
+    let body = response
+        .into_body()
+        .into_bytes()
+        .expect("should buffer the made file");
+    assert_eq!(
+        body.as_ref(),
+        b"ssp.example, 12345, DIRECT, f08c47fec0942fa0\n",
+        "should be the sellers lines alone"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// robots.txt
+// ---------------------------------------------------------------------------
+
+/// The route test settings with a `[robots-txt]` section that refuses every
+/// crawler and keeps one path open, and the entry that places the file.
+fn settings_refusing_every_crawler() -> trusted_server_core::settings::Settings {
+    trusted_server_core::settings::Settings::from_toml(
+        r#"
+            [publisher]
+            domain = "test-publisher.example.com"
+            cookie_domain = ".test-publisher.example.com"
+            origin_url = "https://origin.test-publisher.example.com"
+            proxy_secret = "integration-test-proxy-secret"
+
+            [ec]
+            module = "hmac"
+
+            [ec.hmac]
+            passphrase = "test-secret-key-32-bytes-minimum"
+
+            [geo]
+            assume_single_jurisdiction = true
+
+            [robots-txt]
+            modules = "refuse_all"
+            always_allow = ["/ads.txt"]
+
+            [[fetch]]
+            media_type = "text/plain"
+            path = "/robots.txt"
+            middleware = ["robots_txt"]
+        "#,
+    )
+    .expect("should parse robots.txt test settings")
+}
+
+/// `/robots.txt` is the publisher path's, answered against an origin that
+/// answers each request in turn. A `GET` has the origin's file replaced by
+/// the refusal, a `HEAD` has the file made where the origin has none and
+/// gets no body, and a `POST` keeps the origin's `404`, because a file is
+/// made only for a `GET` or a `HEAD`. Each carries the refusal's
+/// `X-Robots-Tag`, the file's own answer included.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn robots_txt_is_served_through_the_publisher_path_with_its_tag() {
+    use std::sync::Arc;
+
+    use edgezero_core::http::Response;
+    use trusted_server_core::platform::PlatformHttpClient;
+    use trusted_server_core::platform::test_support::{
+        StubHttpClient, build_services_with_http_client,
+    };
+
+    let origin = Arc::new(StubHttpClient::new());
+    origin.push_response_with_headers(
+        200,
+        b"User-agent: *\nAllow: /\n".to_vec(),
+        vec![("content-type", "text/plain")],
+    );
+    for _ in 0..2 {
+        origin.push_response_with_headers(
+            404,
+            b"<html><body>not found</body></html>".to_vec(),
+            vec![("content-type", "text/html")],
+        );
+    }
+    let router = TrustedServerApp::routes_with_settings_and_services(
+        settings_refusing_every_crawler(),
+        build_services_with_http_client(Arc::clone(&origin) as Arc<dyn PlatformHttpClient>),
+    )
+    .expect("should build router with a stub origin");
+    let robots_txt = |method: &str| {
+        edgezero_core::http::request_builder()
+            .method(method)
+            .uri("https://test-publisher.example.com/robots.txt")
+            .header("host", "test-publisher.example.com")
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build request")
+    };
+    let tag = |response: &Response| {
+        response
+            .headers()
+            .get("x-robots-tag")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+    };
+    let body = |response: Response| {
+        let bytes = response
+            .into_body()
+            .into_bytes()
+            .expect("should hold the answer in memory");
+        String::from_utf8(bytes.to_vec()).expect("the body is text")
+    };
+
+    let get = router
+        .clone()
+        .oneshot(robots_txt("GET"))
+        .await
+        .expect("should serve the GET");
+    assert_eq!(get.status(), 200);
+    assert_eq!(tag(&get).as_deref(), Some("noindex, nofollow"));
+    assert_eq!(body(get), "User-agent: *\nAllow: /ads.txt\nDisallow: /\n");
+
+    let head = router
+        .clone()
+        .oneshot(robots_txt("HEAD"))
+        .await
+        .expect("should serve the HEAD");
+    assert_eq!(
+        head.status(),
+        200,
+        "the file is made where the origin has none"
+    );
+    assert_eq!(tag(&head).as_deref(), Some("noindex, nofollow"));
+    assert_eq!(body(head), "", "a HEAD gets no body");
+
+    let post = router
+        .clone()
+        .oneshot(robots_txt("POST"))
+        .await
+        .expect("should serve the POST");
+    assert_eq!(
+        post.status(),
+        404,
+        "a file is made only for a GET or a HEAD"
+    );
+    assert_eq!(tag(&post).as_deref(), Some("noindex, nofollow"));
+
+    assert_eq!(
+        origin.recorded_request_methods(),
+        ["GET", "HEAD", "POST"],
+        "each request reaches the origin"
     );
 }
 
