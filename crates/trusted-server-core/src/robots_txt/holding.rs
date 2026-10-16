@@ -51,15 +51,11 @@ const DEFAULT_LIFETIMES: CacheLifetimes = CacheLifetimes {
 
 /// The cache contributors' answers are held in, with the lifetimes
 /// `[cache.robots-txt]` sets.
-///
-/// Its loads run in the caller, because a contributor may block the thread it
-/// runs on while it asks its service.
 pub(crate) fn cache_spec(settings: &Settings) -> CacheSpec {
     CacheSpec {
         name: CACHE,
         lifetimes: settings.cache.robots_txt.lifetimes(DEFAULT_LIFETIMES),
         memory_entries: 64,
-        detachable: false,
     }
 }
 
@@ -158,8 +154,8 @@ async fn held_answer(
     })
 }
 
-/// What a load owns to ask one contributor, because it may outlive the
-/// request that started it.
+/// What a load owns to ask one contributor, because the cache keeps the load
+/// with its key rather than borrowing the request.
 struct Ask {
     /// The name the contributor was declared under.
     id: &'static str,

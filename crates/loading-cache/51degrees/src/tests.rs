@@ -195,7 +195,6 @@ fn spec() -> CacheSpec {
             store_idle: Duration::from_secs(60),
         },
         memory_entries: 16,
-        detachable: false,
     }
 }
 
@@ -329,6 +328,40 @@ fn many_callers_on_many_threads_load_a_missing_key_once_in_the_caller() {
     for answer in answers {
         assert_eq!(answer.expect("every caller should get the value"), "value");
     }
+}
+
+/// A load runs on the thread of the caller that leads it, as nothing runs a
+/// load apart from its caller.
+#[test]
+fn a_load_runs_on_the_thread_of_the_caller_that_leads_it() {
+    let caches = LoadingCaches::new();
+    let services = services(Arc::new(MemoryKv::default()));
+    let ran_on = Arc::new(Mutex::new(None));
+    let seen = Arc::clone(&ran_on);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("should build a runtime");
+
+    runtime
+        .block_on(caches.get_or_load(
+            &services,
+            &spec(),
+            &key("k"),
+            Box::new(move || {
+                Box::pin(async move {
+                    *seen.lock().expect("should lock the record") =
+                        Some(std::thread::current().id());
+                    Ok(LoadedValue::new(Bytes::from_static(b"value")))
+                })
+            }),
+        ))
+        .expect("should load");
+
+    assert_eq!(
+        *ran_on.lock().expect("should lock the record"),
+        Some(std::thread::current().id())
+    );
 }
 
 #[test]

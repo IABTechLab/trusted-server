@@ -821,10 +821,8 @@ caller made, so a copy is shared by every instance that reads the same store.
 
 Code in core, or in a module, loads through the cache with
 `RuntimeServices::load_cached`. It names its cache with a `CacheSpec`, being
-the cache's name, the lifetimes of the memory and store copies, how many
-values the memory copy holds and whether a load may run apart from the request
-that started it, which only a load that never blocks its thread may. Its key
-is a `StoreKey`, which starts with the publisher's `ServerKeyPrefix` from the
+the cache's name, the lifetimes of the memory and store copies and how many
+values the memory copy holds. Its key is a `StoreKey`, which starts with the publisher's `ServerKeyPrefix` from the
 loaded settings, so two publishers sharing a store never share a copy. The
 `Loader` it hands over owns everything it uses, and answers a `LoadedValue`,
 with a lifetime of its own where the source gives one. Its value serves every

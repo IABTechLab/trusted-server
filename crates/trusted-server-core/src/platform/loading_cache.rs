@@ -101,9 +101,9 @@ pub type LoadFuture = Pin<Box<dyn Future<Output = Result<LoadedValue, LoadError>
 /// it. Services it needs come from [`RuntimeServices::without_reader`], never
 /// the request's own.
 ///
-/// It owns everything it uses, and is `Send`, so a host that can run work on
-/// its own can start it on another thread and keep it running after the
-/// caller that started it has gone.
+/// It runs in the caller that leads the load. It owns everything it uses,
+/// and is `Send`, because a cache may keep it with the key it loads, in
+/// memory every thread of the process can reach.
 pub type Loader = Box<dyn FnOnce() -> LoadFuture + Send>;
 
 /// How long one cache's copies last.
@@ -118,8 +118,8 @@ pub struct CacheLifetimes {
     pub store_idle: Duration,
 }
 
-/// One cache: its name, the lifetimes its copies get, and how its loads may
-/// run.
+/// One cache: its name, the lifetimes its copies get, and how many values
+/// its memory copy holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CacheSpec {
     /// The cache's name, which is part of every key it writes.
@@ -128,10 +128,6 @@ pub struct CacheSpec {
     pub lifetimes: CacheLifetimes,
     /// The most values the brief copy in memory holds.
     pub memory_entries: usize,
-    /// Whether a load may run apart from the caller that started it, on a
-    /// host that can run work on its own. False for a load that blocks the
-    /// thread it runs on, which only the caller's own thread can afford.
-    pub detachable: bool,
 }
 
 /// A key in a shared store, being the publisher's prefix and the cache's name
@@ -336,7 +332,6 @@ mod tests {
                 store_idle: Duration::from_secs(1),
             },
             memory_entries: 1,
-            detachable: false,
         }
     }
 
