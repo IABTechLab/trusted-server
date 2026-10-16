@@ -66,16 +66,20 @@ middleware's head markup in the order the entry names them, and nothing
 advertising related may run before the reader answers the prompt, so name
 `cmp.inmobi` before any middleware that writes a vendor's tag, as the example
 above does ahead of Google Tag Manager. A serve middleware's head markup is
-written after every fetch middleware's, so a prompt placed in `[[serve]]`
-comes after a vendor's tag that a `[[fetch]]` entry writes. Place the prompt
-in `[[fetch]]` wherever a fetch middleware writes a vendor's tag.
+written after what each fetch middleware writes ahead of the script bundle,
+and the module cannot tell which middleware write a vendor's tag there, so a
+`[[serve]]` entry may name the prompt only for pages whose `[[fetch]]` entry
+names no other middleware.
 
 Selecting the module is refused when the settings load and by `ts config
 validate` if the entries leave any page served as `text/html` without the
 prompt, and the refusal names those pages. A page takes the first entry of
 each phase that covers it, so each page has to take an entry of one phase or
 the other that names `cmp.inmobi`. With the prompt in `[[fetch]]` alone,
-every entry names it, and one with no `path` comes after any that has one.
+every entry names it, and one with no `path` comes after any that has one. A
+`[[serve]]` entry naming it for a page whose `[[fetch]]` entry names another
+middleware is refused too, and so is naming it for one page in both phases,
+which would write it twice.
 
 The tag is written at the start of the head, ahead of the page's own
 `<meta charset>`, and is about 3.6 KB. A browser looks for `<meta charset>`

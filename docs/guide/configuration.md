@@ -1934,7 +1934,11 @@ See [Didomi](/guide/integrations/didomi) for the routed endpoint shapes.
 The table refuses a field it does not read. Selecting the module is refused
 when the `[[fetch]]` and `[[serve]]` entries leave any page without
 `cmp.inmobi`, because the prompt would not be written there, and each entry
-names it before any middleware that writes a vendor's tag. See [InMobi Choice](/guide/integrations/inmobi)
+names it before any middleware that writes a vendor's tag. A `[[serve]]` entry
+naming it for a page whose `[[fetch]]` entry names another middleware is
+refused, because a serve middleware's head markup is written after what each
+fetch middleware writes ahead of the script bundle, and so is naming it for one
+page in both phases, which would write it twice. See [InMobi Choice](/guide/integrations/inmobi)
 for the tag's parts and what the module keeps to.
 
 ### Google Tag Manager Integration

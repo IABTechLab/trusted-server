@@ -267,19 +267,68 @@ fn page_paths(settings: &Settings) -> Vec<&str> {
     paths
 }
 
+/// Refuse a document that would write the prompt on a page after the fetch
+/// phase's head markup, or in both phases.
+///
+/// A serve middleware's head markup is written straight before the script
+/// bundle, after what the fetch phase wrote ahead of it, so a prompt that a
+/// `[[serve]]` entry names follows whatever the `[[fetch]]` entry for the
+/// same page writes there. Which of those middleware write a vendor's tag is
+/// not known here, so any is refused.
+fn require_the_prompt_once_and_first(
+    settings: &Settings,
+) -> Result<(), Report<TrustedServerError>> {
+    for path in page_paths(settings) {
+        let serve = settings.serve.for_response(HTML_MEDIA_TYPE, path);
+        if !serve.iter().any(|name| name == MODULE) {
+            continue;
+        }
+        let fetch = settings.fetch.for_response(HTML_MEDIA_TYPE, path);
+        let ahead: Vec<&str> = fetch
+            .iter()
+            .map(String::as_str)
+            .filter(|name| *name != MODULE)
+            .collect();
+        if !ahead.is_empty() {
+            return Err(Report::new(TrustedServerError::Settings {
+                message: format!(
+                    "[[serve]] names `{MODULE}` for a page at `{path}`, where [[fetch]] names \
+                     [{}]. A serve middleware's head markup is written after what each fetch \
+                     middleware writes ahead of the script bundle, so a vendor's tag any of \
+                     those write there would come ahead of the consent prompt. Name \
+                     `{MODULE}` first in that [[fetch]] entry instead",
+                    ahead.join(", ")
+                ),
+            }));
+        }
+        if fetch.iter().any(|name| name == MODULE) {
+            return Err(Report::new(TrustedServerError::Settings {
+                message: format!(
+                    "[[fetch]] and [[serve]] both name `{MODULE}` for a page at `{path}`, so \
+                     the consent prompt would be written on it twice. Name it in one phase's \
+                     entry for that page"
+                ),
+            }));
+        }
+    }
+    Ok(())
+}
+
 /// Validates the `InMobi` Choice configuration and reports whether a section
 /// selects the module.
 ///
 /// # Errors
 ///
 /// Returns an error when the configuration cannot be parsed, fails
-/// validation, carries a script URL that should not be served, or names the
-/// prompt in no entry.
+/// validation, carries a script URL that should not be served, would write
+/// the prompt twice or after the fetch phase's head markup, or leaves a page
+/// without it.
 pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
     let Some(config) = settings.module_config::<InMobiChoiceConfig>(MODULE)? else {
         return Ok(false);
     };
     validate_script_url(&config.script_url)?;
+    require_the_prompt_once_and_first(settings)?;
     require_an_entry(settings)?;
     Ok(true)
 }
@@ -289,7 +338,8 @@ pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServer
 /// # Errors
 ///
 /// Returns an error when the configuration cannot be parsed, carries a
-/// script URL that should not be served, or names the prompt in no entry.
+/// script URL that should not be served, would write the prompt twice or
+/// after the fetch phase's head markup, or leaves a page without it.
 pub fn register(
     settings: &Settings,
 ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
@@ -297,6 +347,7 @@ pub fn register(
         return Ok(None);
     };
     validate_script_url(&config.script_url)?;
+    require_the_prompt_once_and_first(settings)?;
     require_an_entry(settings)?;
     Ok(Some(
         IntegrationRegistration::builder(INMOBI_INTEGRATION_ID)
@@ -384,7 +435,7 @@ fn escape_attribute(value: &str) -> String {
 mod tests {
     use super::*;
     use trusted_server_core::html_processor::test_support::{
-        assert_page_is_recorded, page_settings,
+        assert_page_is_recorded, page_settings, place_on_every_page, processed_page,
     };
     use trusted_server_core::integrations::{IntegrationDocumentState, IntegrationRegistry};
     use trusted_server_core::middleware::test_support::context;
@@ -499,6 +550,271 @@ mod tests {
                 ],
                 ..MiddlewareAction::pass()
             }
+        }
+    }
+
+    /// The name an entry gives [`VendorTag`], and the module that supplies
+    /// it, selected by `[vendor] module = "tag"`.
+    const VENDOR_TAG: &str = "vendor.tag";
+
+    /// The module that supplies [`VendorTag`].
+    fn vendor_builder() -> IntegrationBuilder {
+        IntegrationBuilder::new(
+            "vendor_tag",
+            env!("CARGO_PKG_NAME"),
+            |_| {
+                Ok(Some(
+                    IntegrationRegistration::builder("vendor_tag")
+                        .without_js()
+                        .with_middleware(Arc::new(VendorTag))
+                        .build(),
+                ))
+            },
+            |_| Ok(true),
+        )
+        .with_module_name(VENDOR_TAG)
+    }
+
+    /// An entry of `phase` for `text/html`, under `path` where one is given,
+    /// naming `middleware` in order.
+    fn entry(phase: MiddlewarePhase, path: Option<&str>, middleware: &[&str]) -> String {
+        let path = path.map_or_else(String::new, |path| format!("path = \"{path}\"\n"));
+        let names: Vec<String> = middleware
+            .iter()
+            .map(|name| format!("\"{name}\""))
+            .collect();
+        format!(
+            "[[{phase}]]\nmedia_type = \"text/html\"\n{path}middleware = [{}]\n\n",
+            names.join(", ")
+        )
+    }
+
+    /// A document selecting the prompt and the vendor's tag, with `entries`
+    /// placing them, every `[[fetch]]` entry before any `[[serve]]` one.
+    fn placed(entries: &[String]) -> Settings {
+        page_settings(&format!(
+            "[cmp]\nmodule = \"inmobi\"\n\n[cmp.inmobi]\nscript_url = \"{REAL}\"\n\n\
+             [vendor]\nmodule = \"tag\"\n\n{}",
+            entries.concat()
+        ))
+    }
+
+    /// The page a reader receives from `settings`, run through both phases,
+    /// or why the service refuses to start.
+    fn served(settings: &Settings) -> Result<String, String> {
+        let registry = IntegrationRegistry::with_registrations(
+            settings,
+            &[super::builder(), vendor_builder()],
+        )
+        .map_err(|refused| refused.current_context().to_string())?;
+        Ok(processed_page(
+            settings,
+            &registry,
+            "<html><head><title>A page</title></head><body><p>Text</p></body></html>",
+            8192,
+        ))
+    }
+
+    /// The prompt's loader, the last of its three parts.
+    fn loader() -> String {
+        format!("<script defer src=\"{REAL}\"></script>")
+    }
+
+    /// Wherever the service starts with the prompt and a vendor's tag placed,
+    /// a reader's page carries the whole prompt ahead of the tag, and the
+    /// placement that would write the tag first is refused.
+    #[test]
+    fn no_placement_the_service_starts_with_puts_a_vendor_tag_ahead_of_the_prompt() {
+        use MiddlewarePhase::{Fetch, Serve};
+        // (case, entries, whether the service starts)
+        let cases = [
+            (
+                "both in [[fetch]], the prompt first",
+                vec![entry(Fetch, None, &[MODULE, VENDOR_TAG])],
+                true,
+            ),
+            (
+                "both in [[serve]], the prompt first",
+                vec![entry(Serve, None, &[MODULE, VENDOR_TAG])],
+                true,
+            ),
+            (
+                "the prompt in [[fetch]], the tag in [[serve]]",
+                vec![
+                    entry(Fetch, None, &[MODULE]),
+                    entry(Serve, None, &[VENDOR_TAG]),
+                ],
+                true,
+            ),
+            (
+                "the prompt in [[serve]], the tag in [[fetch]]",
+                vec![
+                    entry(Fetch, None, &[VENDOR_TAG]),
+                    entry(Serve, None, &[MODULE]),
+                ],
+                false,
+            ),
+        ];
+        for (case, entries, starts) in cases {
+            let settings = placed(&entries);
+            match served(&settings) {
+                Ok(page) => {
+                    let position = |needle: &str| {
+                        page.find(needle)
+                            .unwrap_or_else(|| panic!("{case}: {needle} should be written: {page}"))
+                    };
+                    assert!(
+                        position(&loader()) < position("vendor.example"),
+                        "{case}: the reader's page carries the vendor's tag ahead of the \
+                         prompt: {page}"
+                    );
+                    assert!(starts, "{case}: the service should refuse to start: {page}");
+                }
+                Err(refused) => {
+                    assert!(!starts, "{case}: the service should start: {refused}");
+                    assert!(
+                        refused.contains(
+                            "[[serve]] names `cmp.inmobi` for a page at `/`, where [[fetch]] \
+                             names [vendor.tag]"
+                        ),
+                        "{case}: {refused}"
+                    );
+                    let validated = validate(&settings)
+                        .expect_err("`ts config validate` should refuse it too")
+                        .current_context()
+                        .to_string();
+                    assert_eq!(validated, refused, "{case}");
+                }
+            }
+        }
+    }
+
+    /// The prompt is refused after the fetch phase's head markup on the pages
+    /// both phases reach and on no others, whatever paths the entries cover.
+    #[test]
+    fn a_prompt_after_the_fetch_phase_is_refused_on_the_pages_both_phases_reach() {
+        use MiddlewarePhase::{Fetch, Serve};
+        // (case, entries, whether it is refused)
+        let cases = [
+            (
+                "the tag under /news/, the prompt in [[serve]] everywhere",
+                vec![
+                    entry(Fetch, Some("/news/"), &[VENDOR_TAG]),
+                    entry(Serve, None, &[MODULE]),
+                ],
+                true,
+            ),
+            (
+                "the tag everywhere, the prompt in [[serve]] under /sport/",
+                vec![
+                    entry(Fetch, None, &[VENDOR_TAG]),
+                    entry(Serve, Some("/sport/"), &[MODULE]),
+                ],
+                true,
+            ),
+            (
+                "the tag under /news/, the prompt in [[serve]] under /news/sport/",
+                vec![
+                    entry(Fetch, Some("/news/"), &[VENDOR_TAG]),
+                    entry(Serve, Some("/news/sport/"), &[MODULE]),
+                ],
+                true,
+            ),
+            (
+                "the tag under /news/sport/, the prompt in [[serve]] under /news/",
+                vec![
+                    entry(Fetch, Some("/news/sport/"), &[VENDOR_TAG]),
+                    entry(Serve, Some("/news/"), &[MODULE]),
+                ],
+                true,
+            ),
+            (
+                "the tag under /news/ after the prompt, the prompt in [[serve]] elsewhere",
+                vec![
+                    entry(Fetch, Some("/news/"), &[MODULE, VENDOR_TAG]),
+                    // Keeps the serve prompt off the pages under /news/.
+                    entry(Serve, Some("/news/"), &[VENDOR_TAG]),
+                    entry(Serve, None, &[MODULE]),
+                ],
+                false,
+            ),
+        ];
+        for (case, entries, refused) in cases {
+            let settings = placed(&entries);
+            assert_eq!(
+                validate(&settings).is_err(),
+                refused,
+                "{case}: {:?}",
+                validate(&settings)
+            );
+            assert_eq!(register(&settings).is_err(), refused, "{case}");
+        }
+    }
+
+    /// Named for one page in both phases, the prompt would be written on it
+    /// twice, loader and all, so the service refuses to start. Named in each
+    /// phase for pages that never meet, it is written once on each.
+    #[test]
+    fn a_prompt_named_for_one_page_in_both_phases_is_refused() {
+        use MiddlewarePhase::{Fetch, Serve};
+        let both = placed(&[entry(Fetch, None, &[MODULE]), entry(Serve, None, &[MODULE])]);
+        match served(&both) {
+            Ok(page) => panic!(
+                "the service should refuse to start, and wrote the prompt's loader {} times: \
+                 {page}",
+                page.matches(&loader()).count()
+            ),
+            Err(refused) => assert!(
+                refused.contains(
+                    "[[fetch]] and [[serve]] both name `cmp.inmobi` for a page at `/`, so the \
+                     consent prompt would be written on it twice"
+                ),
+                "{refused}"
+            ),
+        }
+        assert!(
+            validate(&both).is_err(),
+            "`ts config validate` should refuse it too"
+        );
+
+        // (case, entries, whether it is refused)
+        let cases = [
+            (
+                "[[fetch]] everywhere, [[serve]] under /sport/",
+                vec![
+                    entry(Fetch, None, &[MODULE]),
+                    entry(Serve, Some("/sport/"), &[MODULE]),
+                ],
+                true,
+            ),
+            (
+                "[[fetch]] under /news/, [[serve]] everywhere",
+                vec![
+                    entry(Fetch, Some("/news/"), &[MODULE]),
+                    entry(Serve, None, &[MODULE]),
+                ],
+                true,
+            ),
+            (
+                "[[fetch]] under /news/, [[serve]] elsewhere",
+                vec![
+                    entry(Fetch, Some("/news/"), &[MODULE]),
+                    // Keeps the serve prompt off the pages under /news/.
+                    entry(Serve, Some("/news/"), &[VENDOR_TAG]),
+                    entry(Serve, None, &[MODULE]),
+                ],
+                false,
+            ),
+        ];
+        for (case, entries, refused) in cases {
+            let settings = placed(&entries);
+            assert_eq!(
+                validate(&settings).is_err(),
+                refused,
+                "{case}: {:?}",
+                validate(&settings)
+            );
+            assert_eq!(register(&settings).is_err(), refused, "{case}");
         }
     }
 
@@ -1013,6 +1329,32 @@ mod tests {
                 env!("CARGO_MANIFEST_DIR"),
                 "/src/fixtures/page-change.recorded.html"
             ),
+        );
+    }
+
+    /// Named in `[[serve]]` in place of `[[fetch]]`, the prompt passes the
+    /// registry's check and gives a reader the recorded page, because a page
+    /// with no other middleware gets it in the same place from either phase.
+    #[test]
+    fn placed_in_serve_the_prompt_gives_a_reader_the_recorded_page() {
+        let mut settings = page_settings(include_str!("fixtures/page-change.settings.toml"));
+        settings.fetch = PhaseEntries::default();
+        place_on_every_page(&mut settings, MiddlewarePhase::Serve, &[MODULE]);
+        let registry = IntegrationRegistry::with_registrations(&settings, &[super::builder()])
+            .expect("the registry should accept the prompt in a serve entry");
+
+        let page = processed_page(
+            &settings,
+            &registry,
+            include_str!("fixtures/page-change.input.html"),
+            8192,
+        );
+
+        assert_eq!(page.matches(&loader()).count(), 1, "{page}");
+        assert_eq!(
+            page,
+            include_str!("fixtures/page-change.recorded.html"),
+            "a serve entry should give the reader the page a fetch entry does"
         );
     }
 }
