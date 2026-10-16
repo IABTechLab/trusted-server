@@ -274,8 +274,15 @@ async fn tsjs_route_matching_hash_uses_s_maxage_fallback() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn finalize_middleware_sets_geo_unavailable_header() {
-    let mut svc = make_service();
+async fn finalize_middleware_writes_the_operators_headers_and_no_geo_header() {
+    let mut settings = test_settings();
+    settings
+        .response_headers
+        .insert("X-Finalized".to_owned(), "1".to_owned());
+    let mut svc = EdgeZeroAxumService::new(
+        TrustedServerApp::routes_with_settings(settings)
+            .expect("should build router from test settings"),
+    );
 
     let req = Request::builder()
         .method("POST")
@@ -294,10 +301,20 @@ async fn finalize_middleware_sets_geo_unavailable_header() {
 
     assert_eq!(
         resp.headers()
-            .get("x-geo-info-available")
+            .get("x-finalized")
             .and_then(|v| v.to_str().ok()),
-        Some("false"),
-        "finalize middleware should set X-Geo-Info-Available: false on every response"
+        Some("1"),
+        "the finalize middleware should write the operator's headers on every response"
+    );
+    let geo_headers: Vec<&str> = resp
+        .headers()
+        .keys()
+        .map(axum::http::HeaderName::as_str)
+        .filter(|name| name.starts_with("x-geo-"))
+        .collect();
+    assert!(
+        geo_headers.is_empty(),
+        "the finalize middleware should write no x-geo-* header: {geo_headers:?}"
     );
 }
 

@@ -77,9 +77,9 @@
 //! When [`build_state`] fails, [`startup_error_router`] returns a minimal router
 //! that responds to all routes with the startup error. This router does **not**
 //! attach middleware. Startup-error responses may still receive entry-point
-//! finalization (geo and TS headers) when settings can be reloaded via
+//! finalization (TS headers) when settings can be reloaded via
 //! [`load_settings_from_config_store`]; if settings loading itself fails, they
-//! are returned without geo or TS headers.
+//! are returned without TS headers.
 
 use std::sync::Arc;
 
@@ -128,7 +128,7 @@ use trusted_server_core::integrations::{
 use trusted_server_core::module_context::ModuleRequest;
 use trusted_server_core::permissions::PermissionState;
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, GeoModule, LoadingCaches, PlatformKvStore, RuntimeServices, StoreName,
+    ClientInfo, GeoInfo, LoadingCaches, PlatformKvStore, RuntimeServices, StoreName,
     build_geo_module,
 };
 use trusted_server_core::proxy::{
@@ -493,16 +493,10 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
     services.with_prefixes(prefixes)
 }
 
-/// Builds the services graph handed to a module on a response-side finalize
-/// path.
-///
-/// The finalize paths run after the handler, where the per-request services
-/// built by [`build_per_request_services`] are already out of scope, but a geo
-/// module still needs real platform services to resolve a location. The
-/// middleware builds this once and clones it per request with
-/// [`RuntimeServices::with_client_info`], and the entry point rebuilds it per
-/// call.
-pub(crate) fn build_finalize_services(
+/// Builds the services graph handed to a module the entry point calls outside
+/// the router, which is the device module, before the per-request services
+/// built by [`build_per_request_services`] exist.
+pub(crate) fn build_entry_point_services(
     settings: &Settings,
     kv_store: Arc<dyn PlatformKvStore>,
     loading_caches: Arc<LoadingCaches>,
@@ -518,16 +512,6 @@ pub(crate) fn build_finalize_services(
         .geo(build_geo_module(settings, Arc::new(FastlyPlatformGeo)))
         .client_info(ClientInfo::default())
         .build()
-}
-
-/// The geo module a response's headers are resolved with: the one `[geo]
-/// module` selects from the registry, and otherwise the host's own lookup or
-/// the disabled module, as `build_geo_module` chooses between them.
-pub(crate) fn finalize_geo_module(state: &AppState) -> Arc<dyn GeoModule> {
-    state
-        .registry
-        .geo_module()
-        .unwrap_or_else(|| build_geo_module(&state.settings, Arc::new(FastlyPlatformGeo)))
 }
 
 fn publisher_fallback_methods() -> [Method; 7] {
@@ -1539,18 +1523,8 @@ impl TrustedServerApp {
     }
 
     fn routes_for_state(state: &Arc<AppState>) -> RouterService {
-        let mut router = RouterService::builder().middleware(
-            FinalizeResponseMiddleware::new(
-                Arc::clone(&state.settings),
-                finalize_geo_module(state),
-                build_finalize_services(
-                    &state.settings,
-                    Arc::clone(&state.default_kv_store),
-                    Arc::clone(&state.loading_caches),
-                ),
-            )
-            .with_registry(Arc::clone(&state.registry)),
-        );
+        let mut router = RouterService::builder()
+            .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)));
 
         let fallback_handler = fallback_route_handler(Arc::clone(state));
 
@@ -1657,7 +1631,6 @@ mod tests {
 
     use error_stack::Report;
     use futures::executor::block_on;
-    use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
     use trusted_server_core::ec::device::DeviceSignals;
     use trusted_server_core::error::TrustedServerError;
     use trusted_server_core::integrations::{
@@ -3031,7 +3004,7 @@ mod tests {
         assert!(
             response
                 .headers()
-                .get(HEADER_X_GEO_INFO_AVAILABLE)
+                .get(crate::middleware::HEADER_X_TS_FINALIZED)
                 .is_none(),
             "router-level 405 bypasses FinalizeResponseMiddleware; lib.rs entry-point covers this"
         );
