@@ -16,6 +16,7 @@ import type {
   GptSlotHandoff,
   TsjsApi,
 } from '../../core/types';
+import { viewportBandSizes } from '../../core/viewport_sizes';
 import {
   APS_UNIVERSAL_CREATIVE_RENDERER,
   APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
@@ -855,8 +856,19 @@ function displayTargetElementId(target: GoogleTagDisplayTarget): string | undefi
   return (target as Element).id || undefined;
 }
 
-/** Defines the slot and applies its viewport bands as a size mapping. */
-function defineWithViewportSizes<S extends { defineSizeMapping?(mapping: unknown): unknown }>(
+/**
+ * Defines the slot and applies its viewport bands as a size mapping, recording
+ * the slot in `viewportMappedSlots` once the mapping is applied.
+ *
+ * Defines nothing where the band at the current viewport width asks for no
+ * size, as no ad can serve there and GPT would otherwise size or collapse the
+ * slot's container after the page has painted. A mapping that throws leaves the
+ * slot defined with every format, so the caller still adds it to the service.
+ */
+function defineWithViewportSizes<
+  S extends object & { defineSizeMapping?(mapping: unknown): unknown },
+>(
+  ts: TsjsApi,
   api: {
     defineSlot?(adUnitPath: string, size: Array<number | number[]>, elementId?: string): S | null;
     sizeMapping?(): ViewportSizeBuilder;
@@ -864,14 +876,23 @@ function defineWithViewportSizes<S extends { defineSizeMapping?(mapping: unknown
   slot: AuctionSlot,
   elementId: string
 ): S | null | undefined {
+  if (viewportBandSizes(slot)?.length === 0) {
+    log.debug('GPT slot asks for no size at this viewport width', { divId: slot.div_id });
+    return null;
+  }
   const definedSlot = api.defineSlot?.(slot.gam_unit_path, slot.formats, elementId);
   const bands = slot.viewport_sizes;
   if (definedSlot && bands?.length && api.sizeMapping && definedSlot.defineSizeMapping) {
-    const builder = api.sizeMapping();
-    for (const [viewport, sizes] of bands) {
-      builder.addSize(viewport, sizes);
+    try {
+      const builder = api.sizeMapping();
+      for (const [viewport, sizes] of bands) {
+        builder.addSize(viewport, sizes);
+      }
+      definedSlot.defineSizeMapping(builder.build());
+      (ts.viewportMappedSlots ??= new WeakSet()).add(definedSlot);
+    } catch (error) {
+      log.warn('GPT size mapping failed; slot keeps every format', { divId: slot.div_id, error });
     }
-    definedSlot.defineSizeMapping(builder.build());
   }
   return definedSlot;
 }
@@ -1183,7 +1204,7 @@ function schedulePublisherFirstImpressionFallback(
       let tsOwned = false;
       if (!gptSlot) {
         gptSlot =
-          withGptSlotHandoffInternal(ts, () => defineWithViewportSizes(g, slot, element.id)) ??
+          withGptSlotHandoffInternal(ts, () => defineWithViewportSizes(ts, g, slot, element.id)) ??
           undefined;
         if (!gptSlot) {
           releaseTrustedServerFirstImpressionClaim(ts, element, claim);
@@ -1379,7 +1400,7 @@ export function installTsAdInit(): void {
           // defineSlot() for this div is handed the same slot by the scoped GPT
           // wrapper, preventing a competing container-slot request.
           const defined = withGptSlotHandoffInternal(ts, () =>
-            defineWithViewportSizes(g, slot, actualDivId)
+            defineWithViewportSizes(ts, g, slot, actualDivId)
           );
           if (!defined) {
             releaseTrustedServerFirstImpressionClaim(ts, el, firstImpression);
@@ -2176,10 +2197,11 @@ export function installTsRenderBridge(): void {
     const attemptId = safelyRecordCreativeRequest(slotId);
 
     const slot = window.tsjs?.adSlots?.find((s) => s.id === slotId);
-    // Prefer the winning creative's own dimensions; the first configured slot
-    // format is only a fallback and mis-sizes a multi-size slot whose winner is
-    // not the first format.
-    const [fallbackWidth, fallbackHeight] = slot?.formats?.[0] ?? [728, 90];
+    // Prefer the winning creative's own dimensions. Without them, use the first
+    // size of the slot's viewport band at this width, then the first configured
+    // format, which mis-sizes a multi-size slot whose winner is another format.
+    const [fallbackWidth, fallbackHeight] = viewportBandSizes(slot)?.[0] ??
+      slot?.formats?.[0] ?? [728, 90];
     const width = matchedBid.w ?? fallbackWidth;
     const height = matchedBid.h ?? fallbackHeight;
     const inlineAdm = isNonEmptyString(matchedBid.adm) ? matchedBid.adm : undefined;

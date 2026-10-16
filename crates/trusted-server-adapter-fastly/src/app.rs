@@ -77,9 +77,9 @@
 //! When [`build_state`] fails, [`startup_error_router`] returns a minimal router
 //! that responds to all routes with the startup error. This router does **not**
 //! attach middleware. Startup-error responses may still receive entry-point
-//! finalization (geo and TS headers) when settings can be reloaded via
+//! finalization (TS headers) when settings can be reloaded via
 //! [`load_settings_from_config_store`]; if settings loading itself fails, they
-//! are returned without geo or TS headers.
+//! are returned without TS headers.
 
 use std::sync::Arc;
 
@@ -126,7 +126,7 @@ use trusted_server_core::integrations::{
 use trusted_server_core::module_context::ModuleRequest;
 use trusted_server_core::permissions::PermissionState;
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, GeoModule, LoadingCaches, PlatformKvStore, RuntimeServices, StoreName,
+    ClientInfo, GeoInfo, LoadingCaches, PlatformKvStore, RuntimeServices, StoreName,
     build_geo_module,
 };
 use trusted_server_core::proxy::{
@@ -426,6 +426,7 @@ pub fn shipped_module_builders() -> Vec<IntegrationBuilder> {
         trusted_server_ad_tag_google::builder(),
         trusted_server_ad_tag_google::diagnostics::builder(),
         trusted_server_ads_txt_iabtl::builder(),
+        trusted_server_headers_geo::builder(),
         // Run by `[shared.51degrees]` rather than selected by a section.
         trusted_server_middleware_51degrees::builder(),
         // The analytics module `[analytics]` selects, which changes no page.
@@ -566,16 +567,10 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
     services.with_prefixes(prefixes)
 }
 
-/// Builds the services graph handed to a module on a response-side finalize
-/// path.
-///
-/// The finalize paths run after the handler, where the per-request services
-/// built by [`build_per_request_services`] are already out of scope, but a geo
-/// module still needs real platform services to resolve a location. The
-/// middleware builds this once and clones it per request with
-/// [`RuntimeServices::with_client_info`], and the entry point rebuilds it per
-/// call.
-pub(crate) fn build_finalize_services(
+/// Builds the services graph handed to a module the entry point calls outside
+/// the router, which is the device module, before the per-request services
+/// built by [`build_per_request_services`] exist.
+pub(crate) fn build_entry_point_services(
     settings: &Settings,
     kv_store: Arc<dyn PlatformKvStore>,
     loading_caches: Arc<LoadingCaches>,
@@ -591,16 +586,6 @@ pub(crate) fn build_finalize_services(
         .geo(build_geo_module(settings, Arc::new(FastlyPlatformGeo)))
         .client_info(ClientInfo::default())
         .build()
-}
-
-/// The geo module a response's headers are resolved with: the one `[geo]
-/// module` selects from the registry, and otherwise the host's own lookup or
-/// the disabled module, as `build_geo_module` chooses between them.
-pub(crate) fn finalize_geo_module(state: &AppState) -> Arc<dyn GeoModule> {
-    state
-        .registry
-        .geo_module()
-        .unwrap_or_else(|| build_geo_module(&state.settings, Arc::new(FastlyPlatformGeo)))
 }
 
 fn publisher_fallback_methods() -> [Method; 7] {
@@ -1611,18 +1596,8 @@ impl TrustedServerApp {
     }
 
     fn routes_for_state(state: &Arc<AppState>) -> RouterService {
-        let mut router = RouterService::builder().middleware(
-            FinalizeResponseMiddleware::new(
-                Arc::clone(&state.settings),
-                finalize_geo_module(state),
-                build_finalize_services(
-                    &state.settings,
-                    Arc::clone(&state.default_kv_store),
-                    Arc::clone(&state.loading_caches),
-                ),
-            )
-            .with_registry(Arc::clone(&state.registry)),
-        );
+        let mut router = RouterService::builder()
+            .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)));
 
         let fallback_handler = fallback_route_handler(Arc::clone(state));
 
@@ -1728,7 +1703,6 @@ mod tests {
 
     use error_stack::Report;
     use futures::executor::block_on;
-    use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
     use trusted_server_core::ec::device::DeviceSignals;
     use trusted_server_core::error::TrustedServerError;
     use trusted_server_core::integrations::{
@@ -2268,6 +2242,7 @@ mod tests {
         for path in [
             "/_ts/admin/keys/rotate",
             "/_ts/admin/keys/deactivate",
+            "/_ts/admin/cache/purge",
             "/admin/keys/rotate",
             "/admin/keys/deactivate",
         ] {
@@ -2316,6 +2291,10 @@ mod tests {
             "/admin/keys/rotate/extra".to_owned(),
             "/admin/keys%2Frotate".to_owned(),
             "/admin%2fkeys/rotate".to_owned(),
+            // Multi-encoded separators survive a single decode, so the reservation
+            // decodes to a fixed point before the publisher fallback runs.
+            "/admin%252Fkeys/rotate".to_owned(),
+            "/_ts%252Fadmin/ec".to_owned(),
         ] {
             for method in [Method::GET, Method::POST] {
                 let request = request_builder()
@@ -3133,7 +3112,7 @@ mod tests {
         assert!(
             response
                 .headers()
-                .get(HEADER_X_GEO_INFO_AVAILABLE)
+                .get(crate::middleware::HEADER_X_TS_FINALIZED)
                 .is_none(),
             "router-level 405 bypasses FinalizeResponseMiddleware; lib.rs entry-point covers this"
         );
@@ -3371,6 +3350,118 @@ mod tests {
         );
     }
 
+    /// `/robots.txt` is the publisher path's, streamed against an origin that
+    /// answers each request in turn. A `GET` has the origin's file replaced
+    /// by the refusal, a `HEAD` has the file made where the origin has none
+    /// and gets no body, and a `POST` keeps the origin's `404`, because a
+    /// file is made only for a `GET` or a `HEAD`. Finalizing gives each the
+    /// refusal's `X-Robots-Tag`, the file's own answer included.
+    #[test]
+    fn robots_txt_is_served_through_the_publisher_path_with_its_tag() {
+        use trusted_server_core::platform::test_support::{
+            StubHttpClient, build_services_with_http_client,
+        };
+
+        let settings = Settings::from_toml(
+            r#"
+            [publisher]
+            domain = "test-publisher.com"
+            cookie_domain = ".test-publisher.com"
+            origin_url = "https://origin.test-publisher.com"
+            proxy_secret = "unit-test-proxy-secret"
+
+            [ec]
+            module = "hmac"
+
+            [ec.hmac]
+            passphrase = "test-secret-key-32-bytes-minimum"
+
+            [geo]
+            assume_single_jurisdiction = true
+
+            [request_signing]
+            enabled = false
+
+            [robots-txt]
+            modules = "refuse_all"
+            always_allow = ["/ads.txt"]
+
+            [[fetch]]
+            media_type = "text/plain"
+            path = "/robots.txt"
+            middleware = ["robots_txt"]
+            "#,
+        )
+        .expect("should parse robots.txt test settings");
+        let state = build_state_from_settings(settings).expect("should build state");
+        let origin = Arc::new(StubHttpClient::new());
+        origin.push_response_with_headers(
+            200,
+            b"User-agent: *\nAllow: /\n".to_vec(),
+            vec![("content-type", "text/plain")],
+        );
+        for _ in 0..2 {
+            origin.push_response_with_headers(
+                404,
+                b"<html><body>not found</body></html>".to_vec(),
+                vec![("content-type", "text/html")],
+            );
+        }
+        let services =
+            build_services_with_http_client(Arc::clone(&origin) as Arc<dyn PlatformHttpClient>);
+        let served = |method: Method| {
+            let request = request_builder()
+                .method(method)
+                .uri("https://test-publisher.com/robots.txt")
+                .header(header::HOST, "test-publisher.com")
+                .body(Body::empty())
+                .expect("should build request");
+            let mut response = block_on(super::dispatch_fallback(&state, &services, request));
+            crate::middleware::apply_finalize_headers(&state.settings, None, &mut response);
+            response
+        };
+        let tag = |response: &Response| {
+            response
+                .headers()
+                .get("x-robots-tag")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+        let body = |response: Response| {
+            let bytes = block_on(response.into_body().into_bytes_bounded(1024 * 1024))
+                .expect("should read the body");
+            String::from_utf8(bytes.to_vec()).expect("the body is text")
+        };
+
+        let get = served(Method::GET);
+        assert_eq!(get.status(), StatusCode::OK);
+        assert_eq!(tag(&get).as_deref(), Some("noindex, nofollow"));
+        assert_eq!(body(get), "User-agent: *\nAllow: /ads.txt\nDisallow: /\n");
+
+        let head = served(Method::HEAD);
+        assert_eq!(
+            head.status(),
+            StatusCode::OK,
+            "the file is made where the origin has none"
+        );
+        assert_eq!(tag(&head).as_deref(), Some("noindex, nofollow"));
+        assert_eq!(body(head), "", "a HEAD gets no body");
+
+        let post = served(Method::POST);
+        assert_eq!(
+            post.status(),
+            StatusCode::NOT_FOUND,
+            "a file is made only for a GET or a HEAD"
+        );
+        assert_eq!(tag(&post).as_deref(), Some("noindex, nofollow"));
+
+        assert_eq!(
+            origin.recorded_request_methods(),
+            ["GET", "HEAD", "POST"],
+            "each request reaches the origin"
+        );
+    }
+
     #[test]
     fn dispatch_runs_request_filter_and_threads_response_effects() {
         // Regression guard for the EdgeZero request-filter bypass: the publisher
@@ -3558,6 +3649,7 @@ mod tests {
                 "ad-tag.google",
                 "ad-tag.google.diagnostics",
                 "ads-txt.iabtl",
+                "headers.geo",
                 "51degrees",
                 "analytics.tinybird",
                 "auction-protocol.openrtb",
