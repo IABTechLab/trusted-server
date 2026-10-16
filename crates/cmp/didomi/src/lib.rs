@@ -1525,4 +1525,33 @@ mod tests {
             ),
         );
     }
+
+    /// Named in `[[serve]]` in place of `[[fetch]]`, the page change passes
+    /// the registry's check and gives a reader the recorded page, because a
+    /// page with no other middleware gets it in the same place from either
+    /// phase.
+    #[test]
+    fn placed_in_serve_the_page_change_gives_a_reader_the_recorded_page() {
+        use trusted_server_core::html_processor::test_support::{
+            page_settings, place_on_every_page, processed_page,
+        };
+        let mut settings = page_settings(include_str!("fixtures/page-change.settings.toml"));
+        settings.fetch = trusted_server_core::middleware::PhaseEntries::default();
+        place_on_every_page(&mut settings, MiddlewarePhase::Serve, &[MODULE]);
+        let registry = IntegrationRegistry::with_registrations(&settings, &[super::builder()])
+            .expect("the registry should accept the page change in a serve entry");
+
+        let page = processed_page(
+            &settings,
+            &registry,
+            include_str!("fixtures/page-change.input.html"),
+            8192,
+        );
+
+        assert_eq!(
+            page,
+            include_str!("fixtures/page-change.recorded.html"),
+            "a serve entry should give the reader the page a fetch entry does"
+        );
+    }
 }
