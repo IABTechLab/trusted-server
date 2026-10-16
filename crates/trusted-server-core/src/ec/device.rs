@@ -268,6 +268,10 @@ pub trait DeviceModule: Send + Sync {
 
     /// Attributes for the bid request, when this module can resolve them.
     ///
+    /// The call carries the permissions resolved for the request, so a module
+    /// whose use of the evidence needs a permission the reader has not given
+    /// answers `None` without using it.
+    ///
     /// The default returns nothing, so no existing module changes. A module
     /// that resolves nothing returns `None` rather than an empty value.
     async fn advertising_attributes(&self, _call: ModuleCall<'_>) -> Option<DeviceAttributes> {

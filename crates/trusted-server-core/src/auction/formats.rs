@@ -25,6 +25,7 @@ use crate::openrtb::{
     BidExt, BidTrustedServerExt, OpenRtbBid, OpenRtbResponse, ResponseExt, SeatBid, ToExt,
     to_openrtb_i32,
 };
+use crate::permissions::PermissionState;
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 
@@ -557,9 +558,13 @@ pub(crate) fn convert_to_openrtb_response_with_report(
 
 /// Fills the bid request's device attributes from the selected device module,
 /// after each request that makes an outbound auction call is built.
+///
+/// The module's call carries `permissions`, those resolved for the request,
+/// so the module can do nothing the reader has not agreed to.
 pub async fn attach_device_attributes(
     request: &mut AuctionRequest,
     http_req: &http::Request<EdgeBody>,
+    permissions: &PermissionState,
     settings: &Settings,
     services: &RuntimeServices,
 ) {
@@ -574,6 +579,7 @@ pub async fn attach_device_attributes(
         crate::evidence::BorrowedRequestInfo::new(&client_ip, Some(http_req.headers()));
     let context = ModuleContext::new(ModuleRequest::of(http_req, services.client_info()))
         .with_evidence(&request_info)
+        .with_permissions(permissions)
         .with_settings(settings)
         .with_services(services);
     let Some(attributes) = module
@@ -705,6 +711,7 @@ mod tests {
         attach_device_attributes(
             &mut request,
             &empty_request(),
+            &PermissionState::default(),
             &crate::test_support::tests::create_test_settings(),
             &services,
         )
@@ -732,6 +739,7 @@ mod tests {
         attach_device_attributes(
             &mut request,
             &empty_request(),
+            &PermissionState::default(),
             &crate::test_support::tests::create_test_settings(),
             &services,
         )
@@ -756,6 +764,7 @@ mod tests {
         attach_device_attributes(
             &mut request,
             &empty_request(),
+            &PermissionState::default(),
             &crate::test_support::tests::create_test_settings(),
             &services,
         )
@@ -780,6 +789,7 @@ mod tests {
         attach_device_attributes(
             &mut request,
             &empty_request(),
+            &PermissionState::default(),
             &crate::test_support::tests::create_test_settings(),
             &services,
         )
@@ -807,6 +817,7 @@ mod tests {
         attach_device_attributes(
             &mut request,
             &empty_request(),
+            &PermissionState::default(),
             &crate::test_support::tests::create_test_settings(),
             &services,
         )
