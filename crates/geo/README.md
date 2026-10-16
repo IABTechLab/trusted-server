@@ -16,6 +16,7 @@ code with no country prefix (`CA`). The permission model keys its country and
 region rules on these codes, matched case-insensitively, so the Fastly and
 other modules feed the same rules without translation.
 
-The platform-neutral `PlatformGeo` trait and the `DisabledGeo` default (no
-location) both live in `trusted-server-core`, so the default deployment resolves
-no location until a module is selected.
+The platform-neutral `PlatformGeo` trait and `DisabledGeo` both live in
+`trusted-server-core`. With no `[geo] module`, or `module = "platform"`, the
+adapter uses its host platform's own lookup. `module = "none"` selects
+`DisabledGeo`, which resolves no location and makes no host call.
