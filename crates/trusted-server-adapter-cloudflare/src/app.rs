@@ -445,6 +445,23 @@ where
     }
 }
 
+/// Answers the attestation pages without the request preparers, so no
+/// preparer can change or refuse the request whose host and nonce are signed.
+fn attestation_route_handler(
+    state: Arc<AppState>,
+) -> impl Fn(RequestContext) -> BoxedHandlerFuture + Clone + 'static {
+    move |ctx: RequestContext| {
+        let state = Arc::clone(&state);
+        Box::pin(async move {
+            Ok(handle_prefix(
+                &state.settings,
+                &PlatformIdentity::named("cloudflare"),
+                &ctx.into_request(),
+            ))
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Publisher response helper
 // ---------------------------------------------------------------------------
@@ -985,13 +1002,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         // Routes chosen by the settings, so not in the fixed table.
         let routes = prefix_routes(&state.settings);
         if !routes.is_empty() {
-            let attestation = make_handler(Arc::clone(&state), |s, _services, req| async move {
-                Ok(handle_prefix(
-                    &s.settings,
-                    &PlatformIdentity::named("cloudflare"),
-                    &req,
-                ))
-            });
+            let attestation = attestation_route_handler(Arc::clone(&state));
             for route in &routes {
                 for method in publisher_fallback_methods() {
                     if matches!(method, Method::GET | Method::HEAD) || route.every_method {
