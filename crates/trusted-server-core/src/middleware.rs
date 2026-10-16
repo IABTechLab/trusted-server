@@ -423,6 +423,13 @@ impl PhaseEntry {
                 .as_deref()
                 .is_none_or(|prefix| path.starts_with(prefix))
     }
+
+    /// The prefix the paths the entry covers begin with. The path of a
+    /// request for a page begins with `/`, so `/` covers the same pages as
+    /// no path at all.
+    fn prefix(&self) -> &str {
+        self.path.as_deref().unwrap_or("/")
+    }
 }
 
 /// One phase's entries, in the order written.
@@ -563,13 +570,9 @@ impl PhaseEntries {
             }
             if let Some(earlier) = self.0[..index].iter().position(|earlier| {
                 earlier.media_type == entry.media_type
-                    && match (&earlier.path, &entry.path) {
-                        (None, _) => true,
-                        (Some(covering), Some(path)) => path.starts_with(covering.as_str()),
-                        (Some(_), None) => false,
-                    }
+                    && entry.prefix().starts_with(earlier.prefix())
             }) {
-                return Err(if self.0[earlier].path == entry.path {
+                return Err(if self.0[earlier].prefix() == entry.prefix() {
                     format!(
                         "{at} covers the same pages as [[{phase}]] entry {}, and a response \
                          takes the first entry that covers it, so this one is never reached. \

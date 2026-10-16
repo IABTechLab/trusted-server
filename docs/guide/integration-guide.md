@@ -204,9 +204,10 @@ A middleware works on `text/html` unless it says otherwise, with
 handle is refused when the registry is built. On a media type other than
 HTML an action may carry a stream processor alone, which is handed the body
 after core has moved the origin's addresses in it, chunk by chunk, with the
-last chunk marked. Head markup and the element and text handlers are
-decisions about HTML, and an action that makes one on another media type is
-refused by name when the chain is planned.
+last chunk marked, and only for a `200`, whose body is the whole file. Head
+markup and the element and text handlers are decisions about HTML, and an
+action that makes one on another media type is refused by name when the
+chain is planned.
 
 A middleware named in an entry with a path, for a media type other than
 HTML, also runs where the origin answers `404 Not Found` for a path under
@@ -380,12 +381,13 @@ that supply a module of one type under one name.
 
 A robots.txt contributor implements `RobotsTxtContributor`. It returns groups
 of records and never bytes, so it cannot produce a malformed file. Trusted
-Server asks it for the request without its query, holds the answer until the
-contributor's `refresh` is due, and writes the file from every contributor
-`[robots-txt] modules` names, in that order. `fingerprint` names the settings
-an answer was given for, so an answer held for other settings is never
-served. Trusted Server hashes it into the key the answer is held under, so
-nothing of it is written to the store.
+Server asks it for the request without its query, on the host the request was
+addressed to and with no client information or host signals in its services,
+holds the answer for that host until the contributor's `refresh` is due, and
+writes the file from every contributor `[robots-txt] modules` names, in that
+order. `fingerprint` names the settings an answer was given for, so an answer
+held for other settings is never served. Trusted Server hashes it into the key
+the answer is held under, so nothing of it is written to the store.
 
 The Fastly adapter is the one adapter that classifies a request, so a device
 module is asked there and on no other adapter. It is shown the User-Agent and
@@ -478,8 +480,9 @@ that names it refuses startup.
 | `MiddlewarePhase::Serve` | On each reader's copy, whether the page came from the store or from the origin     | What the module's request hooks left for it |
 
 A stored page is keyed by the settings and core's build, so a fetch
-middleware that writes markup compiled into its own crate returns that
-markup from `template_key`, and a change to it stores pages again.
+middleware that writes markup or an address compiled into its own crate
+returns that text from `template_key`, and a change to it stores pages
+again.
 
 A middleware is asked once for each document, by `create`, and what it
 answers is used for that document alone, so a handler may hold state between
@@ -504,8 +507,9 @@ A middleware can rely on these rules.
   removed is not asked about again.
 - A script's text arrives in chunks. A handler that needs the whole script
   removes each chunk while keeping a copy, and writes back what it kept with
-  the last chunk. A replacement is written as it is, with no character
-  escaped.
+  the last chunk. A replacement is written as it is, except that a `<` that
+  would end the script, or begin `<script` after `<!--`, is written as
+  `\u003c`.
 - A fetch middleware is told nothing about the reader, because what it leaves
   is what a shared template stores. `MiddlewareContext::document_state` is
   shared by the middleware working on one document in one phase.

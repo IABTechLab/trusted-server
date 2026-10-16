@@ -801,6 +801,17 @@ async fn execute_named(
         return Ok(http_error(&report));
     }
 
+    // A crawler asking for robots.txt is answered once the modules have
+    // prepared the request, before the Edge Cookie steps and the request
+    // filters, so nothing is read from its cookies or written back, and no
+    // filter's answer stands in for the file.
+    if matches!(handler, NamedRouteHandler::RobotsTxt) {
+        let response = handle_robots_txt(&state.settings, &services, &state.registry, req)
+            .await
+            .unwrap_or_else(|error| http_error(&error));
+        return Ok(response);
+    }
+
     let mut ec = build_ec_request_state(&state.settings, &services, &req).await;
     // EcContext creation errors short-circuit before filters, mirroring legacy:
     // the legacy path returns its error response before running filter_request.
@@ -945,7 +956,7 @@ async fn run_named_route(
             handle_first_party_proxy_rebuild(&state.settings, services, req).await
         }
         NamedRouteHandler::RobotsTxt => {
-            handle_robots_txt(&state.settings, services, &state.registry, req).await
+            unreachable!("robots.txt is answered before EC setup")
         }
     }
 }
@@ -2096,6 +2107,7 @@ mod tests {
         for path in [
             "/_ts/admin/keys/rotate",
             "/_ts/admin/keys/deactivate",
+            "/_ts/admin/cache/purge",
             "/admin/keys/rotate",
             "/admin/keys/deactivate",
         ] {
@@ -2144,6 +2156,10 @@ mod tests {
             "/admin/keys/rotate/extra".to_owned(),
             "/admin/keys%2Frotate".to_owned(),
             "/admin%2fkeys/rotate".to_owned(),
+            // Multi-encoded separators survive a single decode, so the reservation
+            // decodes to a fixed point before the publisher fallback runs.
+            "/admin%252Fkeys/rotate".to_owned(),
+            "/_ts%252Fadmin/ec".to_owned(),
         ] {
             for method in [Method::GET, Method::POST] {
                 let request = request_builder()
