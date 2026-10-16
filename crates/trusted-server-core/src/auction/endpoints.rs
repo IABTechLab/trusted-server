@@ -2189,4 +2189,37 @@ mod tests {
             "the module's service should hold the auction no longer than the auction's own timeout"
         );
     }
+
+    #[tokio::test]
+    async fn auction_drops_device_values_a_bidder_cannot_read() {
+        let module = Arc::new(DetectionServiceDevice::new(
+            PermissionSet::none(),
+            Some(DeviceAttributes {
+                device_type: Some(99),
+                make: Some(String::new()),
+                model: Some("   ".to_owned()),
+                os: Some("Android".to_owned()),
+                os_version: None,
+                screen_width: Some(0),
+                screen_height: Some(-1),
+            }),
+        ));
+
+        let captured = auction_with_device_module(
+            make_non_regulated_ec_context(None),
+            &module,
+            noop_services(),
+        )
+        .await;
+
+        assert_eq!(
+            captured_attributes(&captured),
+            Some(DeviceAttributes {
+                os: Some("Android".to_owned()),
+                ..DeviceAttributes::default()
+            }),
+            "a device type outside the list, a size that is not positive and a blank string \
+             should not reach the bidder"
+        );
+    }
 }

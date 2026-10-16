@@ -39,9 +39,10 @@ use crate::settings::Settings;
 /// device object simply omits the rest, which is what a bidder expects.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceAttributes {
-    /// `OpenRTB` device type, from the specification's table: 1 mobile or
-    /// tablet, 2 personal computer, 3 connected television, 4 phone, 5 tablet,
-    /// 6 connected device, 7 set top box.
+    /// `OpenRTB` device type, from the device types list of `AdCOM` 1.0,
+    /// which `OpenRTB` 2.6 refers to: 1 mobile or tablet, 2 personal
+    /// computer, 3 connected television, 4 phone, 5 tablet, 6 connected
+    /// device, 7 set top box, 8 out-of-home device.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_type: Option<i32>,
     /// Hardware vendor, the `make` field.
@@ -64,6 +65,9 @@ pub struct DeviceAttributes {
     pub screen_height: Option<i32>,
 }
 
+/// The values of the device types list of `AdCOM` 1.0.
+const DEVICE_TYPES: std::ops::RangeInclusive<i32> = 1..=8;
+
 impl DeviceAttributes {
     /// Whether anything was resolved.
     ///
@@ -74,6 +78,56 @@ impl DeviceAttributes {
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
     }
+
+    /// The same attributes without the values a bidder cannot read, being a
+    /// device type outside the list, a screen size that is not positive and a
+    /// blank string. Each value dropped is logged with the id of `module`, the
+    /// module that answered it.
+    #[must_use]
+    pub(crate) fn checked(self, module: &str) -> Self {
+        Self {
+            device_type: kept_number(module, "device_type", self.device_type, |found| {
+                DEVICE_TYPES.contains(&found)
+            }),
+            make: kept_text(module, "make", self.make),
+            model: kept_text(module, "model", self.model),
+            os: kept_text(module, "os", self.os),
+            os_version: kept_text(module, "os_version", self.os_version),
+            screen_width: kept_number(module, "screen_width", self.screen_width, |found| found > 0),
+            screen_height: kept_number(module, "screen_height", self.screen_height, |found| {
+                found > 0
+            }),
+        }
+    }
+}
+
+/// `value` when `readable` holds for it, and otherwise nothing.
+fn kept_number(
+    module: &str,
+    field: &str,
+    value: Option<i32>,
+    readable: fn(i32) -> bool,
+) -> Option<i32> {
+    value.filter(|&found| {
+        let keep = readable(found);
+        if !keep {
+            log::warn!(
+                "device module `{module}`: omitting {field}={found}, which a bidder cannot read"
+            );
+        }
+        keep
+    })
+}
+
+/// `value` unless it is blank, and otherwise nothing.
+fn kept_text(module: &str, field: &str, value: Option<String>) -> Option<String> {
+    value.filter(|found| {
+        let keep = !found.trim().is_empty();
+        if !keep {
+            log::warn!("device module `{module}`: omitting a blank {field}");
+        }
+        keep
+    })
 }
 
 /// Device signals derived from a single request.
@@ -271,7 +325,9 @@ pub trait DeviceModule: Send + Sync {
     /// The call carries the permissions resolved for the request, so a module
     /// whose use of the evidence needs a permission the reader has not given
     /// answers `None` without using it. A backend the module registers during
-    /// the call has its transport timers capped at the auction's timeout.
+    /// the call has its transport timers capped at the auction's timeout, and
+    /// core drops a device type outside the list, a screen size that is not
+    /// positive and a blank string before it attaches the answer.
     ///
     /// The default returns nothing, so no existing module changes. A module
     /// that resolves nothing returns `None` rather than an empty value.
@@ -917,6 +973,50 @@ mod tests {
             assert_eq!(signals.human_confidence, HumanConfidence::Unknown);
         }
         assert_eq!(HumanConfidence::default(), HumanConfidence::Unknown);
+    }
+
+    #[test]
+    fn checked_keeps_only_the_values_a_bidder_can_read() {
+        for (device_type, kept) in [(0, None), (1, Some(1)), (8, Some(8)), (9, None)] {
+            let attributes = DeviceAttributes {
+                device_type: Some(device_type),
+                ..DeviceAttributes::default()
+            };
+            assert_eq!(
+                attributes.checked("test").device_type,
+                kept,
+                "device type {device_type} should be kept only when it is in the list"
+            );
+        }
+        for (size, kept) in [(-1, None), (0, None), (1, Some(1))] {
+            let attributes = DeviceAttributes {
+                screen_width: Some(size),
+                screen_height: Some(size),
+                ..DeviceAttributes::default()
+            };
+            let checked = attributes.checked("test");
+            assert_eq!(
+                (checked.screen_width, checked.screen_height),
+                (kept, kept),
+                "screen size {size} should be kept only when it is positive"
+            );
+        }
+        for (text, kept) in [("", None), (" \t", None), ("Android", Some("Android"))] {
+            let attributes = DeviceAttributes {
+                make: Some(text.to_owned()),
+                model: Some(text.to_owned()),
+                os: Some(text.to_owned()),
+                os_version: Some(text.to_owned()),
+                ..DeviceAttributes::default()
+            };
+            let checked = attributes.checked("test");
+            let kept = kept.map(str::to_owned);
+            assert_eq!(
+                [checked.make, checked.model, checked.os, checked.os_version],
+                [kept.clone(), kept.clone(), kept.clone(), kept],
+                "{text:?} should be kept only when it is not blank"
+            );
+        }
     }
 
     #[test]
