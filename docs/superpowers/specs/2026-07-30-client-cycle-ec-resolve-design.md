@@ -16,7 +16,7 @@ normative rather than deferred.
 implementation. IABTechLab/trusted-server#1345 (Tech Lab draft) carries the
 permission model that the implementation builds on.
 IABTechLab/trusted-server#1342 holds every design document of the stack.
-**Last updated:** 2026-10-15
+**Last updated:** 2026-10-16
 
 > **Why this spec exists.** A client-cycle Edge Cookie module lets a browser
 > post a value to a public endpoint (`POST /_ts/api/v1/ec/resolve`), and the
@@ -133,16 +133,15 @@ against.
      number (ASN) and metro code from the geo lookup, the publisher domain, and
      the device class signals the adapter derived for the request.
 
-4. **Round-trip through the lifecycle contract.** Implemented for a module that
-   accepts its own identifier. Read-back goes through the selected module's
-   `accepts_id`, the KV key through `normalize_id_for_kv`, and withdrawal finds
-   the row through the owning module's key, as it does for any other identity.
-   A round-trip test drives an opaque client identifier through organic
-   deferral, resolve, cookie set, and verbatim read-back, using a test-only
-   module that overrides `accepts_id`. The demo module `client_fixed` does not
-   override `accepts_id`, so core does not recognize the demo's own cookie
-   (§5). No test withdraws a client-set identity, and for 24 hours after a
-   withdrawal a later resolve can revive the row (item 3).
+4. **Round-trip through the lifecycle contract.** Implemented. Read-back goes
+   through the selected module's `accepts_id`, the KV key through
+   `normalize_id_for_kv`, and withdrawal finds the row through the owning
+   module's key, as it does for any other identity. A round-trip test drives
+   an opaque client identifier through organic deferral, resolve, cookie set,
+   and verbatim read-back, using a test-only module that overrides
+   `accepts_id`. The demo module `client_fixed` accepts its own fixed word,
+   and a test withdraws its identity (§5). For 24 hours after a withdrawal a
+   later resolve can revive the row (item 3).
 
 5. **Exist on every adapter, where parity means identical behavior, including
    identical refusal.** Partially implemented, documented.
@@ -329,8 +328,9 @@ and `503` answers.
   browser, which applies the two in order, ends without a marker. The page
   script posts once more on its next view, and that post carries the new
   identity, which the module owns, so the marker then stays. The marker stays
-  only for a module that owns its own cookie, and the demo module does not
-  (§5). No test runs the handler and the finalization step together (§7.8).
+  only for a module that owns its own cookie, as the demo module does (§5).
+  No test runs the handler and the finalization step together after a module
+  switch (§7.8).
 - **The page leg is permission-gated before vendor contact.** The demo
   module contacts no vendor (it posts a constant), but it follows the rule
   a vendor module will follow, which is to declare the Data Use its
@@ -406,23 +406,15 @@ compiled only into a build with neither the feature nor `cfg(test)`, so no test
 run reaches them. A fixed shared word is not an identity. The demo exists to
 exercise verify-before-create end to end in tests and demonstrations.
 
-The demo module does not override `accepts_id`, so it inherits the default,
-which accepts only the built-in HMAC shape (64 hex characters, a dot and six
-letters or digits). The word `an-ec` is not that shape, so when the
-`cfix~an-ec` cookie comes back, core finds that the selected module does not
-own it. Three things follow from that in the code.
+The demo module's `accepts_id` accepts its fixed word and nothing else, so when
+the `cfix~an-ec` cookie comes back, core finds that the selected module owns
+it. Three things follow from that in the code.
 
-- The request context holds no identity, so the check for a different identity
-  (§3.8) never fires.
-- The finalization step sees a `ts-ec` the selected module does not own and
-  expires `ts-ecr` on every response to a request whose gate is open (§4), so
-  the demo page script posts on every page view.
-- Withdrawal derives no row key for the cookie, so it expires the cookie in the
-  browser and writes no tombstone, and the row the resolve wrote stays live.
-
-No test reads the demo module's cookie back, because the round-trip test uses a
-test-only module that overrides `accepts_id`. Whether the demo module is meant
-to own its cookie is an open question (§7.11).
+- The request context holds the identity.
+- The finalization step leaves `ts-ecr` alone (§4), so the demo page script
+  posts once and not on later page views.
+- Withdrawal tombstones the row the resolve wrote and expires the cookie and
+  the marker in the browser.
 
 ## 6. Testing
 
@@ -445,6 +437,14 @@ to own its cookie is an open question (§7.11).
 - Two finalization tests (`ec/finalize.rs`) assert that a request carrying a
   `ts-ec` the selected module does not own expires the `ts-ecr` marker, and
   that a `ts-ec` the module owns leaves the marker alone.
+- Three demo tests (`ec/resolve.rs`) run the `client_fixed` module through
+  permission assembly, the handler and the finalization step, with a browser
+  cookie jar between requests. They assert that the cookie comes back
+  recognized with its marker kept, that the page script posts on the first of
+  three views only, and that a withdrawal tombstones the row and expires both
+  cookies. A module test (`ec/module.rs`) pins that `client_fixed` owns
+  `cfix~an-ec` and not the bare word, another word under its code, its word
+  under another code or an HMAC-shaped value under its code.
 - The cross-language constant test pins the fixed word, the marker cookie name
   and the required Data Use to the page-script source.
 - A Fastly adapter test pins that a POST to the path reaches the handler.
@@ -453,10 +453,9 @@ to own its cookie is an open question (§7.11).
   (`index.test.ts`).
 - No test on the series branch covers a repeat resolve for the same identity,
   an `application/json` body, a `Content-Type` with a charset parameter or
-  capital letters, withdrawal of a client-set identity, the handler and the
-  finalization step together (§4), the endpoint path constant, the non-routing
-  on Axum, Cloudflare and Spin, the demo module's cookie coming back (§5), or
-  the two production refusals of §5.
+  capital letters, the handler and the finalization step together after a
+  module switch (§4), the endpoint path constant, the non-routing on Axum,
+  Cloudflare and Spin, or the two production refusals of §5.
 - Remaining for the vendor scheme are a real-browser integration round trip
   (JS → POST → Set-Cookie → next request recognized) in the browser suite, and
   the §3.9 reservation tests (crash-between-steps, lease takeover, concurrent
@@ -464,7 +463,7 @@ to own its cookie is an open question (§7.11).
 
 ## 7. Open questions
 
-Items 0 to 6 are carried to the vendor-scheme issue. Items 7 to 11 are about the
+Items 0 to 6 are carried to the vendor-scheme issue. Items 7 to 10 are about the
 code on `split/4-client-resolve`, and each states what the code does and asks
 whether that is intended.
 
@@ -505,19 +504,13 @@ whether that is intended.
 8. Whether the finalization step should leave the marker alone on the response
    of a resolve that has just set it. The first resolve after a module switch
    sets `ts-ecr=1` and the finalization step then expires it (§4), so one more
-   post is needed, and no test covers the two together.
+   post is needed, and no test covers the two together after a module switch.
 9. What the demo page script should do after an answer other than `200`. It
    ignores the status and posts again on every later page view (§4).
 10. Whether a client-cycle selection with no `[ec] ec_store` should fail as
     `identify` does, with a `503` and a log line saying the store is not
     configured, and not answer `204`. Every post that reaches step 9 of the table in §3 answers
     `204` and logs a warning.
-11. Whether the demo module `client_fixed` is meant to own its cookie. The demo
-    module does not override `accepts_id`, so core does not recognize
-    `cfix~an-ec` when the cookie comes back, and the consequences in §5
-    follow. The code question is whether the demo should accept its fixed word
-    in `accepts_id`, as the test-only module of the round-trip test accepts its
-    own identifiers.
 
 ## 8. Differences from the 2026-07-31 draft
 
@@ -543,3 +536,4 @@ whether that is intended.
 | 2026-08-25 | Revised against the implementation.                                                                                                                                                                                                                                                                                                                                                           |
 | 2026-10-06 | Said module where it said provider, as the code does.                                                                                                                                                                                                                                                                                                                                         |
 | 2026-10-15 | Fixes from review round 1. The conditional storage write claim, the graph write and its effect on withdrawal, the order of the checks and their answers, the configuration key, the adapters, the effects on other deployments, the marker and page script behavior, the demo module's cookie, the tests, the pull request and RFC section references, the open questions and the review log. |
+| 2026-10-16 | The demo module `client_fixed` accepts its own fixed word in `accepts_id`, so core recognizes its cookie, keeps the marker and tombstones the row on withdrawal (§5).                                                                                                                                                                                                                         |
