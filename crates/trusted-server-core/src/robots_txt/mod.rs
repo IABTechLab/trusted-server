@@ -362,8 +362,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::holding::tests::{
-        ECHOED, Echoing, MemoryKvStore, Scripted, request, robots_request, rules, services_with,
-        settings,
+        ECHOED, Echoing, MemoryKvStore, PUBLISHER, Scripted, request, robots_request, rules,
+        services_with, settings,
     };
     use super::*;
     use crate::integrations::{IntegrationBuilder, IntegrationRegistration, IntegrationRegistry};
@@ -584,10 +584,12 @@ mod tests {
             "the entry names the middleware"
         );
         let request = robots_request();
+        let addressed_host = crate::http_util::addressed_host(&request);
         let module_context =
             ModuleContext::new(ModuleRequest::of(&request, services.client_info()))
                 .with_settings(settings)
-                .with_services(services);
+                .with_services(services)
+                .with_addressed_host(&addressed_host);
         let state = crate::integrations::IntegrationDocumentState::default();
         let prepared = Prepared::default();
         let context = crate::middleware::MiddlewareContext {
@@ -624,10 +626,12 @@ mod tests {
         let settings = settings();
         let services = services_with(Arc::default(), Arc::default());
         let request = robots_request();
+        let addressed_host = crate::http_util::addressed_host(&request);
         let module_context =
             ModuleContext::new(ModuleRequest::of(&request, services.client_info()))
                 .with_settings(&settings)
-                .with_services(&services);
+                .with_services(&services)
+                .with_addressed_host(&addressed_host);
         let state = crate::integrations::IntegrationDocumentState::default();
         let context = crate::middleware::test_support::context(
             crate::middleware::MiddlewarePhase::Fetch,
@@ -781,6 +785,211 @@ mod tests {
         assert!(message.contains("`nobody`"), "{message}");
         assert!(message.contains("refuse_all"), "{message}");
         assert!(message.contains("allow_all"), "{message}");
+    }
+
+    /// A crawler's request for the file, addressed to `host`, carrying
+    /// `headers` as well.
+    fn robots_request_to(host: &str, headers: &[(&str, &str)]) -> http::Request<EdgeBody> {
+        let mut builder = http::Request::builder()
+            .uri(format!("https://{host}{ROBOTS_TXT_PATH}"))
+            .header(header::HOST, host);
+        for &(name, value) in headers {
+            builder = builder.header(name, value);
+        }
+        builder
+            .body(EdgeBody::empty())
+            .expect("should build the request")
+    }
+
+    /// The file the publisher path answers `request` with, under `settings`
+    /// with the echoing contributor registered, while `origin` answers `404`
+    /// so the middleware makes the file.
+    async fn file_through_the_publisher_path(
+        settings: &Settings,
+        services: &RuntimeServices,
+        origin: &crate::platform::test_support::StubHttpClient,
+        request: http::Request<EdgeBody>,
+    ) -> String {
+        let registry = IntegrationRegistry::with_registrations(settings, &[echo_builder()])
+            .expect("should build the registry");
+        let orchestrator = crate::auction::AuctionOrchestrator::new(
+            crate::auction::test_support::legacy_auction_config(settings),
+        );
+        origin.push_response_with_headers(
+            404,
+            b"not found".to_vec(),
+            vec![("content-type", "text/html")],
+        );
+        let method = request.method().clone();
+        let answer = crate::publisher::handle_publisher_request(
+            crate::publisher::AppContext {
+                settings,
+                integration_registry: &registry,
+            },
+            services,
+            None,
+            &mut crate::ec::EcContext::default(),
+            crate::publisher::AuctionDispatch {
+                orchestrator: &orchestrator,
+                slots: &[],
+                registry: None,
+            },
+            request,
+            crate::cache_policy::EdgeCacheHeader::SMaxageFallback,
+        )
+        .await
+        .expect("should answer the request");
+        let response = crate::publisher::buffer_publisher_response_async(
+            answer,
+            &method,
+            settings,
+            &registry,
+            &orchestrator,
+            services,
+        )
+        .await
+        .expect("should make the file");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response
+            .into_body()
+            .into_bytes_bounded(4096)
+            .await
+            .expect("should read the file");
+        String::from_utf8(body.to_vec()).expect("the file is text")
+    }
+
+    /// Services asking `origin`, holding answers in memory, as one instance
+    /// of a host does.
+    fn services_asking(
+        origin: &Arc<crate::platform::test_support::StubHttpClient>,
+    ) -> RuntimeServices {
+        crate::platform::test_support::build_services_with_http_client(
+            Arc::clone(origin) as Arc<dyn crate::platform::PlatformHttpClient>
+        )
+        .with_kv_store(Arc::new(MemoryKvStore::default()))
+        .with_loading_cache(Arc::new(
+            crate::platform::test_support::MemoryLoadingCache::default(),
+        ))
+    }
+
+    /// One deployment may serve several hosts, and each is answered with
+    /// what its contributors gave for that host, never with an answer held
+    /// for another.
+    #[tokio::test]
+    async fn each_host_is_answered_for_itself() {
+        let settings = settings_selecting(
+            serde_json::json!({ "modules": ["echo"] }),
+            ECHO_BUILDER_MODULE,
+        );
+        let origin = Arc::new(crate::platform::test_support::StubHttpClient::new());
+        let services = services_asking(&origin);
+
+        for host in [PUBLISHER, "other.publisher.example"] {
+            let file = file_through_the_publisher_path(
+                &settings,
+                &services,
+                &origin,
+                robots_request_to(host, &[]),
+            )
+            .await;
+
+            assert!(
+                file.contains(&format!("Disallow: /{host}/robots.txt?")),
+                "{host} should be answered for itself: {file}"
+            );
+        }
+    }
+
+    /// `Forwarded` and `X-Forwarded-Host` name whatever host a client likes,
+    /// and the publisher path's own host follows them, so a contributor is
+    /// asked for the host the request was addressed to, and an answer made
+    /// for a claimed host is never held for the real one.
+    #[tokio::test]
+    async fn a_forwarded_host_is_never_the_host_a_contributor_is_asked_for() {
+        let settings = settings_selecting(
+            serde_json::json!({ "modules": ["echo"] }),
+            ECHO_BUILDER_MODULE,
+        );
+        let origin = Arc::new(crate::platform::test_support::StubHttpClient::new());
+        let services = services_asking(&origin);
+        let claiming = robots_request_to(
+            PUBLISHER,
+            &[
+                ("forwarded", "host=elsewhere.example"),
+                ("x-forwarded-host", "elsewhere.example"),
+            ],
+        );
+
+        let claimed =
+            file_through_the_publisher_path(&settings, &services, &origin, claiming).await;
+        let after = file_through_the_publisher_path(
+            &settings,
+            &services,
+            &origin,
+            robots_request_to(PUBLISHER, &[]),
+        )
+        .await;
+
+        for file in [claimed, after] {
+            assert!(
+                !file.contains("elsewhere.example"),
+                "a claimed host should never reach the file: {file}"
+            );
+            assert!(
+                file.contains(&format!("Disallow: /{PUBLISHER}/robots.txt?")),
+                "the file should be made for the host addressed: {file}"
+            );
+        }
+    }
+
+    /// An answer is held for the host the request was addressed to, so a
+    /// call that does not carry that host asks no contributor and refuses
+    /// the request. The refusal asks nothing, so it is still made.
+    #[tokio::test]
+    async fn without_the_addressed_host_only_the_refusal_is_made() {
+        let scripted = Arc::new(Scripted::new(vec![Ok(rules("User-Agent: *\nAllow: /"))]));
+        let asking = middleware::RobotsTxt::new(
+            parsed(serde_json::json!({ "modules": ["scripted"] })),
+            vec![(
+                "scripted",
+                Some(Arc::clone(&scripted) as Arc<dyn RobotsTxtContributor>),
+            )],
+        );
+        let refusing = middleware::RobotsTxt::new(RobotsTxtConfig::refuse_all(), Vec::new());
+        let settings = settings();
+        let services = services_with(Arc::default(), Arc::default());
+        let request = robots_request();
+        let module_context =
+            ModuleContext::new(ModuleRequest::of(&request, services.client_info()))
+                .with_settings(&settings)
+                .with_services(&services);
+        let state = crate::integrations::IntegrationDocumentState::default();
+        let context = crate::middleware::test_support::context(
+            crate::middleware::MiddlewarePhase::Fetch,
+            &state,
+        );
+        let call = module_context.call(
+            middleware::MODULE,
+            crate::permissions::PermissionSet::none(),
+        );
+
+        let refusal = asking
+            .prepare(call, &context)
+            .expect("the middleware prepares")
+            .await
+            .expect_err("no contributor is asked without the host");
+        let file = refusing
+            .prepare(call, &context)
+            .expect("the middleware prepares")
+            .await
+            .expect("the refusal is made without the host");
+
+        assert_eq!(refusal.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(scripted.times_asked(), 0, "no contributor should be asked");
+        assert_eq!(
+            *file.downcast::<String>().expect("the file is text"),
+            "User-agent: *\nDisallow: /\n"
+        );
     }
 
     /// A contributor with nothing to add, which answers a comment and no
