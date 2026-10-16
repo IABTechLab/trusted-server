@@ -202,9 +202,10 @@ through `read` on the trait, to read its signal from the request, and the
 module answers a `SignalRecord`: the string as received, whether it decoded,
 could not be read, has expired or was left as received, where it came from,
 whether the module says the regulation its scheme answers for applies, the
-sections a sectioned signal carries, and the decoded form in the module's
-own type, which core carries without reading. The records, with the
-request's jurisdiction, are the `ConsentContext` the assembly, the bid
+sections a sectioned signal carries, the permissions the signal itself
+consents to, and the decoded form in the module's own type, which core
+carries without reading. The records, with the request's jurisdiction, are
+the `ConsentContext` the assembly, the server-side auction gate, the bid
 request builders and the identity graph read. A module reads its own record
 back in `signal`, `withdraws` and `valid_signal`, so it answers the same as
 every other reader of the request and nothing decodes a string twice. The
