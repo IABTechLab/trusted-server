@@ -36,15 +36,13 @@ boundary; see the [Integration Guide](../../docs/guide/integration-guide.md).
 
 ## Build and test
 
-From the repository root:
+From the repository root, run core's own tests on the host target:
 
 ```bash
-cargo build-fastly
-cargo test-fastly
+cargo test -p trusted-server-core --target "$(rustc -vV | sed -n 's/host: //p')"
 ```
 
-The Fastly aliases compile and test the core for `wasm32-wasip1` through
-Viceroy. Cloudflare and native adapter suites exercise the same core under
-their target configurations. Use [TESTING.md](../../TESTING.md) for the complete
-target matrix and [Architecture](../../docs/guide/architecture.md) for the
+Each adapter's test alias builds and tests the same core for that adapter's
+target, and [TESTING.md](../../TESTING.md) lists them with the complete target
+matrix. [Architecture](../../docs/guide/architecture.md) gives the
 request-level system view.
