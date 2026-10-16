@@ -64,11 +64,11 @@ pub trait RobotsTxtContributor: Send + Sync + core::fmt::Debug {
     /// addressed to, and serves it to every crawler of that host. So the call
     /// carries the request the answer was asked for, being its method, path,
     /// host and scheme without its query, with the host never taken from a
-    /// forwarded header, and the request's services, and nothing about who
-    /// asked. An implementation hands its own function to
-    /// [`ModuleCall::inject`], naming what it needs. Its answer must be the
-    /// same for every request for that host, because it is served for all of
-    /// them.
+    /// forwarded header, and the request's services with no client
+    /// information and no host signals, and nothing about who asked. An
+    /// implementation hands its own function to [`ModuleCall::inject`],
+    /// naming what it needs. Its answer must be the same for every request
+    /// for that host, because it is served for all of them.
     ///
     /// A contribution with no groups is an answer, and is held as one, but a
     /// file in which nothing holds a rule fails closed with `503`. An error

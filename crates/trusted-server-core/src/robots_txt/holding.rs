@@ -82,7 +82,10 @@ pub(crate) async fn contribution_for(
     {
         return Ok(held.contribution.clone());
     }
-    let context = ModuleContext::new(request.view()).with_services(services);
+    // The answer is served to every crawler, so the contributor's services
+    // carry nothing of the connection that asked.
+    let services_handed = services.clone().without_connection();
+    let context = ModuleContext::new(request.view()).with_services(&services_handed);
     let asked = contributor
         .contribute(context.call(holder.id, contributor.required_permissions()))
         .await;

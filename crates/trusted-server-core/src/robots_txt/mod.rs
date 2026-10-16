@@ -1046,4 +1046,113 @@ mod tests {
             "User-agent: *\nDisallow: /private/\n\n# nothing to add\n"
         );
     }
+
+    /// A contributor whose rule says what it could read of the connection
+    /// that asked.
+    #[derive(Debug)]
+    struct ReadsTheConnection;
+
+    impl ReadsTheConnection {
+        fn rules(&self, services: &RuntimeServices) -> Contribution {
+            let client = services.client_info();
+            Contribution::parse(&format!(
+                "User-Agent: ConnectionBot\nDisallow: /ip-{}/tls-{}/ja4-{}/edge-{}/signals-{}",
+                client.client_ip.is_some(),
+                client.tls_protocol.is_some(),
+                client.tls_ja4.is_some(),
+                client.server_hostname.is_some(),
+                services.host_signals().is_some(),
+            ))
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl RobotsTxtContributor for ReadsTheConnection {
+        fn refresh(&self) -> core::time::Duration {
+            core::time::Duration::from_secs(60)
+        }
+
+        fn fingerprint(&self) -> String {
+            "connection".to_owned()
+        }
+
+        async fn contribute(
+            &self,
+            call: crate::module_context::ModuleCall<'_>,
+        ) -> Result<Contribution, Report<TrustedServerError>> {
+            Ok(call.inject(self, Self::rules)?)
+        }
+    }
+
+    /// The signals a host computes from a crawler's connection.
+    #[derive(Debug)]
+    struct CrawlerSignals;
+
+    impl crate::evidence::HostSignals for CrawlerSignals {
+        fn ja4(&self) -> Option<&str> {
+            Some("t13d1516h2_8daaf6152771_02713d6af862")
+        }
+
+        fn h2(&self) -> Option<&str> {
+            Some("1:65536;2:0;4:6291456")
+        }
+    }
+
+    /// The id of the builder that registers the connection reading
+    /// contributor.
+    const CONNECTION_BUILDER: &str = "robots-txt-connection";
+
+    /// The module name that builder is selected by.
+    const CONNECTION_BUILDER_MODULE: &str = "testing.robots-txt-connection";
+
+    fn register_connection(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder(CONNECTION_BUILDER)
+                .with_robots_txt_contributor("robots-txt.connection", Arc::new(ReadsTheConnection))
+                .build(),
+        ))
+    }
+
+    /// The answer is served to every crawler, so the services a contributor
+    /// is handed carry nothing of the connection that asked: no address, no
+    /// TLS details, no edge server and no host signals.
+    #[tokio::test]
+    async fn a_contributor_is_handed_nothing_of_the_connection_that_asked() {
+        let settings = settings_selecting(
+            serde_json::json!({ "modules": ["connection"] }),
+            CONNECTION_BUILDER_MODULE,
+        );
+        let builder = IntegrationBuilder::new(
+            CONNECTION_BUILDER,
+            CONNECTION_BUILDER,
+            register_connection,
+            accept,
+        )
+        .with_module_name(CONNECTION_BUILDER_MODULE);
+        let registry = IntegrationRegistry::with_registrations(&settings, &[builder])
+            .expect("should build the registry");
+        let connection = crate::platform::ClientInfo {
+            client_ip: Some("203.0.113.7".parse().expect("should parse the address")),
+            tls_protocol: Some("TLSv1.3".to_owned()),
+            tls_ja4: Some("t13d1516h2_8daaf6152771_02713d6af862".to_owned()),
+            server_hostname: Some("cache-edge-1".to_owned()),
+            ..crate::platform::ClientInfo::default()
+        };
+        let services = RuntimeServices {
+            host_signals: Some(Arc::new(CrawlerSignals)),
+            ..services_with(Arc::default()).with_client_info(connection)
+        };
+
+        let response = handle_robots_txt(&settings, &services, &registry, robots_request())
+            .await
+            .expect("should answer");
+        let file = text_of(response).await;
+
+        assert!(
+            file.contains("Disallow: /ip-false/tls-false/ja4-false/edge-false/signals-false"),
+            "the contributor should read nothing of the connection: {file}"
+        );
+    }
 }
