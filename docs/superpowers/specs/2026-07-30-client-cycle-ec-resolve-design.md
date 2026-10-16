@@ -67,7 +67,7 @@ against.
    accepted origin under RFC 6454, meaning the scheme, host and port triple of
    RFC 6454 section 4 compared by the rule of its section 5, with a missing
    port standing for the scheme's default, and with a value that is not a
-   serialized origin under its section 6.1 never matching. The default
+   serialized origin under its section 6.2 never matching. The default
    accepted set is the single origin `https://{publisher.domain}` and nothing
    else, so a sibling subdomain, the `http://` scheme and a non-default port
    are all refused. A missing, unreadable or foreign `Origin`, the opaque value
@@ -274,8 +274,9 @@ whose name starts with `x-ts-`, or any of `cache-control`, `connection`,
 `te`, `trailer`, `transfer-encoding` and `upgrade`. A module that asks for any
 of these has broken its contract, so the request fails at step 5 and the
 header is not dropped, on the path that creates an identifier and on the path
-that does not. Each answer in the table has a test, and the `500` is tested
-through the refusal of a reserved response header.
+that does not. Each answer in the table has a test. For the `500`, the test checks the error
+that refusing a reserved response header returns, which `error.rs` maps to
+`500`.
 
 ### Effects on deployments that select a server-side module
 
@@ -528,6 +529,7 @@ whether that is intended.
 ## Review log
 
 1. **Round 1, 2026-10-15.** A review in a fresh session, against `split/4-client-resolve` at `a70e9d20c`. Issues found, two of them blocking. The two were the statement that no production adapter offers a conditional storage write, which the Fastly store and the revival of withdrawn rows disprove, and the statement that resolve writes the graph row exactly as organic creation does, when resolve leaves a live row alone and revives a withdrawal tombstone. This revision states what the code does in both cases, adds the order of the checks, the configuration key, the adapters, the effects on other deployments, the demo module's cookie and the untested paths, and leaves five code questions under Open questions until the code changes.
+2. **Round 2, 2026-10-16.** A lighter review in a fresh session, checking the round 1 fixes and the demo module's fix against `split/4-client-resolve` at `7ab530225`. Approved, none blocking. This revision cites RFC 6454 section 6.2 for the opaque origin, as the code does, and says the `500` is tested as the error that `error.rs` maps to `500`.
 
 ## Revision record
 
@@ -537,3 +539,4 @@ whether that is intended.
 | 2026-10-06 | Said module where it said provider, as the code does.                                                                                                                                                                                                                                                                                                                                         |
 | 2026-10-15 | Fixes from review round 1. The conditional storage write claim, the graph write and its effect on withdrawal, the order of the checks and their answers, the configuration key, the adapters, the effects on other deployments, the marker and page script behavior, the demo module's cookie, the tests, the pull request and RFC section references, the open questions and the review log. |
 | 2026-10-16 | The demo module `client_fixed` accepts its own fixed word in `accepts_id`, so core recognizes its cookie, keeps the marker and tombstones the row on withdrawal (§5).                                                                                                                                                                                                                         |
+| 2026-10-16 | Review round 2, approved, with the RFC 6454 section and the 500 test wording corrected.                                                                                                                                                                                                                                                                                                       |
