@@ -63,16 +63,44 @@ pub struct InMobiChoiceConfig {
     /// because this becomes a `<script src>` on every page.
     pub script_url: String,
 
-    /// The IAB registered CMP identifier, which is 10 for `InMobi`.
+    /// The IAB registered CMP identifier, which is 10 for `InMobi`, from 1 to
+    /// [`MAX_CMP_ID`].
     ///
     /// The GPP stub the middleware writes answers `ping` with it while the
     /// prompt loads, as `InMobi`'s own tag does.
-    #[serde(default = "default_cmp_id")]
+    #[serde(default = "default_cmp_id", deserialize_with = "deserialize_cmp_id")]
     pub cmp_id: u16,
 }
 
+/// The largest CMP id, because a TC string holds the id in 12 bits.
+const MAX_CMP_ID: u16 = 4095;
+
 fn default_cmp_id() -> u16 {
     10
+}
+
+/// Reads `cmp_id` as a whole number from 1 to [`MAX_CMP_ID`], or refuses it
+/// with a message naming the setting, which a type's own parse error does
+/// not. Zero is what a stub reports before it knows its id, so it is no id.
+fn deserialize_cmp_id<'de, D>(deserializer: D) -> Result<u16, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+
+    let id = i64::deserialize(deserializer).map_err(|error| {
+        D::Error::custom(format!(
+            "`cmp_id` is not a whole number from 1 to {MAX_CMP_ID}: {error}"
+        ))
+    })?;
+    u16::try_from(id)
+        .ok()
+        .filter(|id| (1..=MAX_CMP_ID).contains(id))
+        .ok_or_else(|| {
+            D::Error::custom(format!(
+                "`cmp_id` is {id}, and a CMP id is a whole number from 1 to {MAX_CMP_ID}"
+            ))
+        })
 }
 
 impl IntegrationConfig for InMobiChoiceConfig {}
@@ -665,6 +693,74 @@ mod tests {
 
         assert!(markup.contains("})(42);</script>"), "{markup}");
         assert!(!markup.contains("})(10);</script>"), "{markup}");
+    }
+
+    /// A CMP id is a whole number the IAB assigned, which a TC string holds
+    /// in 12 bits, so any other value is refused when the settings load, with
+    /// a message naming the setting.
+    #[test]
+    fn a_cmp_id_outside_1_to_4095_is_refused_naming_the_setting() {
+        let with_cmp_id = |value: &str| {
+            settings_with_rest(&format!(
+                "cmp_id = {value}\n{}",
+                html_entry(None, &[MODULE])
+            ))
+        };
+        let load = |settings: &Settings| {
+            trusted_server_core::config::validate_settings_for_runtime_with(
+                settings,
+                &[super::builder()],
+            )
+        };
+
+        // (case, the value as written, what the refusal must say)
+        let cases = [
+            (
+                "zero, which a stub reports before it has an id",
+                "0",
+                "`cmp_id` is 0,",
+            ),
+            (
+                "past the 12 bits a TC string holds",
+                "4096",
+                "`cmp_id` is 4096,",
+            ),
+            (
+                "past what the field could hold",
+                "70000",
+                "`cmp_id` is 70000,",
+            ),
+            ("below zero", "-1", "`cmp_id` is -1,"),
+            ("a string", "\"10\"", "`cmp_id` is not a whole number"),
+            ("a fraction", "10.5", "`cmp_id` is not a whole number"),
+        ];
+        for (case, value, reason) in cases {
+            let settings = with_cmp_id(value);
+            for (call, refusal) in [
+                ("loading the settings", load(&settings).err()),
+                ("validate", validate(&settings).err()),
+                ("register", register(&settings).err()),
+            ] {
+                let message = refusal
+                    .unwrap_or_else(|| panic!("{case}: {call} should refuse cmp_id = {value}"))
+                    .current_context()
+                    .to_string();
+                assert!(
+                    message.contains("[cmp.inmobi]") && message.contains(reason),
+                    "{case}: {call} should say {reason:?}, and said {message:?}"
+                );
+            }
+        }
+
+        for (value, id) in [("1", 1), ("4095", 4095)] {
+            let settings = with_cmp_id(value);
+            load(&settings).expect("should load a CMP id in range");
+            let config = settings
+                .module_config::<InMobiChoiceConfig>(MODULE)
+                .expect("should read the table")
+                .expect("should select the module");
+            assert_eq!(config.cmp_id, id);
+        }
     }
 
     #[test]
