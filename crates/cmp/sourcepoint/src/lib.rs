@@ -2386,7 +2386,7 @@ mod tests {
     fn the_page_change_may_run_in_either_phase() {
         let integration = SourcepointIntegration::new(Arc::new(config()));
         assert_eq!(
-            PageChange(integration).phases(),
+            PageChange::new(integration).phases(),
             MiddlewarePhase::ALL,
             "the publisher chooses the phase by the entry"
         );
