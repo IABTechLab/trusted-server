@@ -177,14 +177,16 @@ fn page_paths(settings: &Settings) -> Vec<&str> {
 }
 
 /// Refuse a document that would write the prompt on a page after the fetch
-/// phase's head markup.
+/// phase's head markup, or in both phases.
 ///
-/// A serve middleware's head markup is written after every fetch
-/// middleware's, so a prompt that a `[[serve]]` entry names follows whatever
-/// the `[[fetch]]` entry for the same page writes into the head. Which of
-/// those middleware write a vendor's tag is not known here, so any is
-/// refused.
-fn require_the_prompt_first(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
+/// A serve middleware's head markup is written straight before the script
+/// bundle, after what the fetch phase wrote ahead of it, so a prompt that a
+/// `[[serve]]` entry names follows whatever the `[[fetch]]` entry for the
+/// same page writes there. Which of those middleware write a vendor's tag is
+/// not known here, so any is refused.
+fn require_the_prompt_once_and_first(
+    settings: &Settings,
+) -> Result<(), Report<TrustedServerError>> {
     for path in page_paths(settings) {
         let serve = settings.serve.for_response(HTML_MEDIA_TYPE, path);
         if !serve.iter().any(|name| name == MODULE) {
@@ -200,10 +202,20 @@ fn require_the_prompt_first(settings: &Settings) -> Result<(), Report<TrustedSer
             return Err(Report::new(TrustedServerError::Settings {
                 message: format!(
                     "[[serve]] names `{MODULE}` for a page at `{path}`, where [[fetch]] names \
-                     [{}]. A serve middleware's head markup is written after every fetch \
-                     middleware's, so a vendor's tag any of those write would come ahead of \
-                     the consent prompt. Name `{MODULE}` first in that [[fetch]] entry instead",
+                     [{}]. A serve middleware's head markup is written after what each fetch \
+                     middleware writes ahead of the script bundle, so a vendor's tag any of \
+                     those write there would come ahead of the consent prompt. Name \
+                     `{MODULE}` first in that [[fetch]] entry instead",
                     ahead.join(", ")
+                ),
+            }));
+        }
+        if fetch.iter().any(|name| name == MODULE) {
+            return Err(Report::new(TrustedServerError::Settings {
+                message: format!(
+                    "[[fetch]] and [[serve]] both name `{MODULE}` for a page at `{path}`, so \
+                     the consent prompt would be written on it twice. Name it in one phase's \
+                     entry for that page"
                 ),
             }));
         }
@@ -218,7 +230,7 @@ fn require_the_prompt_first(settings: &Settings) -> Result<(), Report<TrustedSer
 ///
 /// Returns an error when the configuration cannot be parsed, fails
 /// validation, carries a script URL that should not be served, names the
-/// prompt in no entry, or would write it after the fetch phase's head
+/// prompt in no entry, or would write it twice or after the fetch phase's head
 /// markup.
 pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
     let Some(config) = settings.module_config::<InMobiChoiceConfig>(MODULE)? else {
@@ -226,7 +238,7 @@ pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServer
     };
     validate_script_url(&config.script_url)?;
     require_an_entry(settings)?;
-    require_the_prompt_first(settings)?;
+    require_the_prompt_once_and_first(settings)?;
     Ok(true)
 }
 
@@ -236,7 +248,7 @@ pub(crate) fn validate(settings: &Settings) -> Result<bool, Report<TrustedServer
 ///
 /// Returns an error when the configuration cannot be parsed, carries a
 /// script URL that should not be served, names the prompt in no entry, or
-/// would write it after the fetch phase's head markup.
+/// would write it twice or after the fetch phase's head markup.
 pub fn register(
     settings: &Settings,
 ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
@@ -245,7 +257,7 @@ pub fn register(
     };
     validate_script_url(&config.script_url)?;
     require_an_entry(settings)?;
-    require_the_prompt_first(settings)?;
+    require_the_prompt_once_and_first(settings)?;
     Ok(Some(
         IntegrationRegistration::builder(INMOBI_INTEGRATION_ID)
             // No browser module. The two stubs and the Choice script are the
@@ -573,6 +585,71 @@ mod tests {
                 "the tag under /news/, the prompt in [[serve]] under /sport/",
                 vec![
                     entry(Fetch, Some("/news/"), &[VENDOR_TAG]),
+                    entry(Serve, Some("/sport/"), &[MODULE]),
+                ],
+                false,
+            ),
+        ];
+        for (case, entries, refused) in cases {
+            let settings = placed(&entries);
+            assert_eq!(
+                validate(&settings).is_err(),
+                refused,
+                "{case}: {:?}",
+                validate(&settings)
+            );
+            assert_eq!(register(&settings).is_err(), refused, "{case}");
+        }
+    }
+
+    /// Named for one page in both phases, the prompt would be written on it
+    /// twice, loader and all, so the service refuses to start. Named in each
+    /// phase for pages that never meet, it is written once on each.
+    #[test]
+    fn a_prompt_named_for_one_page_in_both_phases_is_refused() {
+        use MiddlewarePhase::{Fetch, Serve};
+        let both = placed(&[entry(Fetch, None, &[MODULE]), entry(Serve, None, &[MODULE])]);
+        match served(&both) {
+            Ok(page) => panic!(
+                "the service should refuse to start, and wrote the prompt's loader {} times: \
+                 {page}",
+                page.matches(&loader()).count()
+            ),
+            Err(refused) => assert!(
+                refused.contains(
+                    "[[fetch]] and [[serve]] both name `cmp.inmobi` for a page at `/`, so the \
+                     consent prompt would be written on it twice"
+                ),
+                "{refused}"
+            ),
+        }
+        assert!(
+            validate(&both).is_err(),
+            "`ts config validate` should refuse it too"
+        );
+
+        // (case, entries, whether it is refused)
+        let cases = [
+            (
+                "[[fetch]] everywhere, [[serve]] under /sport/",
+                vec![
+                    entry(Fetch, None, &[MODULE]),
+                    entry(Serve, Some("/sport/"), &[MODULE]),
+                ],
+                true,
+            ),
+            (
+                "[[fetch]] under /news/, [[serve]] everywhere",
+                vec![
+                    entry(Fetch, Some("/news/"), &[MODULE]),
+                    entry(Serve, None, &[MODULE]),
+                ],
+                true,
+            ),
+            (
+                "[[fetch]] under /news/, [[serve]] under /sport/",
+                vec![
+                    entry(Fetch, Some("/news/"), &[MODULE]),
                     entry(Serve, Some("/sport/"), &[MODULE]),
                 ],
                 false,

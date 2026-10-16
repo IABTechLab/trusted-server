@@ -1936,9 +1936,10 @@ The table refuses a field it does not read. Selecting the module with no
 prompt would never be written, and the entry names it before any middleware
 that writes a vendor's tag. A `[[serve]]` entry naming it for a page whose
 `[[fetch]]` entry names another middleware is refused, because a serve
-middleware's head markup is written after every fetch middleware's. See
-[InMobi Choice](/guide/integrations/inmobi) for the tag's parts and what the
-module keeps to.
+middleware's head markup is written after what each fetch middleware writes
+ahead of the script bundle, and so is naming it for one page in both phases,
+which would write it twice. See [InMobi Choice](/guide/integrations/inmobi)
+for the tag's parts and what the module keeps to.
 
 ### Google Tag Manager Integration
 
