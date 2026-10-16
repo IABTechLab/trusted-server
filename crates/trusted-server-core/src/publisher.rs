@@ -5401,11 +5401,14 @@ pub async fn handle_publisher_request(
         });
     // Every other response the origin sends may be kept as it sent it, in
     // every assembly mode, keyed the way a page is and kept for as long as
-    // the origin allows, see `asset_cache`.
+    // the origin allows, see `asset_cache`. A request that sends the origin a
+    // cookie is fetched for itself, because nothing shows whether the cookie
+    // shaped the answer.
     let request_can_use_asset_copy = method_is_cacheable
         && !request_is_document
         && !request_host.is_empty()
         && !authorization_disqualifies
+        && !req.headers().contains_key(header::COOKIE)
         && !request_requires_origin
         && services
             .loading_cache_for(crate::settings::ASSETS_CACHE)
@@ -8912,6 +8915,96 @@ mod tests {
                 "an authenticated request never shares a copy"
             );
             assert!(asset_copy_lifetimes(&cache).is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_request_carrying_a_cookie_is_fetched_for_itself_and_kept_for_no_one() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryLoadingCache::default());
+            let services = services(&stub, &cache);
+            let settings = settings();
+            // The origin answers each reader from their cookie without naming
+            // it in `Vary`, which the cache cannot see.
+            for reader in ["one", "two"] {
+                queue(
+                    &stub,
+                    "application/json",
+                    format!("{{\"reader\":\"{reader}\"}}").as_bytes(),
+                    &[("cache-control", "max-age=300")],
+                );
+            }
+
+            for reader in ["one", "two"] {
+                let mut request = asset_request("/account.json", "empty");
+                request.headers_mut().insert(
+                    header::COOKIE,
+                    HeaderValue::from_str(&format!("session={reader}"))
+                        .expect("should be a header value"),
+                );
+                let answer = body_of(run(&settings, &services, request).await).await;
+                assert_eq!(
+                    answer,
+                    format!("{{\"reader\":\"{reader}\"}}").into_bytes(),
+                    "reader {reader} is served the answer made for their own cookie"
+                );
+            }
+
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                2,
+                "each reader's request is fetched for itself"
+            );
+            assert!(
+                asset_copy_lifetimes(&cache).is_empty(),
+                "no answer to a request carrying a cookie is kept"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_answer_that_sets_a_cookie_is_served_only_to_the_reader_it_was_made_for() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryLoadingCache::default());
+            let services = services(&stub, &cache);
+            let settings = settings();
+            for reader in ["one", "two"] {
+                let cookie = format!("visitor={reader}");
+                queue(
+                    &stub,
+                    "text/css",
+                    format!("/* {reader} */").as_bytes(),
+                    &[
+                        ("cache-control", "public, max-age=300"),
+                        ("set-cookie", cookie.as_str()),
+                    ],
+                );
+            }
+
+            for reader in ["one", "two"] {
+                let response = run(&settings, &services, asset_request("/site.css", "style")).await;
+                let cookie = format!("visitor={reader}");
+                assert!(
+                    response
+                        .headers()
+                        .get_all(header::SET_COOKIE)
+                        .iter()
+                        .any(|value| value.as_bytes() == cookie.as_bytes()),
+                    "reader {reader} is served the cookie the origin set for them"
+                );
+                assert_eq!(
+                    body_of(response).await,
+                    format!("/* {reader} */").into_bytes()
+                );
+            }
+
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                2,
+                "each reader's request is fetched for itself"
+            );
+            assert!(
+                asset_copy_lifetimes(&cache).is_empty(),
+                "an answer that sets a cookie is kept for no one"
+            );
         }
 
         #[tokio::test]

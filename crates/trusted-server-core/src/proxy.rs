@@ -1251,7 +1251,9 @@ pub async fn handle_asset_proxy_request(
 /// answer, one whose `Cache-Control` asks for the origin, as the publisher
 /// path reads it, one that names no host, and any request while the cache
 /// `[cache.assets]` selects keeps nothing. The route's origin and prefix are
-/// part of the key, so two routes to one address keep their own copies.
+/// part of the key, so two routes to one address keep their own copies. A
+/// route sends its origin no cookie, see [`ASSET_PROXY_FORWARD_HEADERS`], so
+/// a reader's cookies cannot shape the answer and do not keep it from a copy.
 fn asset_route_copy_key(
     services: &RuntimeServices,
     req: &Request<EdgeBody>,
@@ -5222,6 +5224,41 @@ mod tests {
             assert!(
                 crate::platform::test_support::asset_copy_lifetimes(&cache).is_empty(),
                 "should keep no copy"
+            );
+        });
+    }
+
+    #[test]
+    fn a_reader_s_cookie_never_reaches_an_asset_route_s_origin_so_its_answer_is_shared() {
+        futures::executor::block_on(async {
+            let stub = held_asset_stub();
+            shareable_stylesheet(&stub);
+            let cache = Arc::new(crate::platform::test_support::MemoryLoadingCache::default());
+            let services = asset_route_services(&stub, &cache);
+            let uri = "https://www.example.com/.images/site.css";
+
+            for reader in ["one", "two"] {
+                let mut request = build_http_request(Method::GET, uri);
+                request.headers_mut().insert(
+                    header::COOKIE,
+                    HeaderValue::from_str(&format!("session={reader}"))
+                        .expect("should be a header value"),
+                );
+                let answer = asset_route_answer(&services, request).await;
+                assert_eq!(answer.status(), StatusCode::OK);
+            }
+
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                1,
+                "should ask the origin once for both readers"
+            );
+            assert!(
+                stub.recorded_request_headers()
+                    .iter()
+                    .flatten()
+                    .all(|(name, _)| !name.eq_ignore_ascii_case("cookie")),
+                "should send the route's origin no cookie"
             );
         });
     }
