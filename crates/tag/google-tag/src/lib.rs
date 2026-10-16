@@ -1473,6 +1473,47 @@ mod tests {
     }
 
     #[test]
+    fn a_page_through_both_modules_ends_with_one_first_party_loader() {
+        // Arrange
+        // The Tag Manager module serves the configured tag, so its fetch
+        // middleware points the page's own loader at the first-party path, and
+        // this module's serve middleware then removes that loader and writes
+        // its own, which names the same path.
+        let settings = settings_with_google_and_tag_manager(
+            &json!({ "analytics_tag_id": TEST_TAG_ID }),
+            &json!({
+                "container_id": "GTM-ABCD1234",
+                "allowed_tag_ids": [TEST_TAG_ID],
+            }),
+        );
+
+        // Act
+        let processed = process_for(
+            &settings,
+            HEAD_WITH_ITS_OWN_TAG,
+            &[google_tag_manager::MODULE],
+            &storage_only_permissions(),
+        );
+
+        // Assert
+        assert_eq!(
+            processed.matches("gtag/js?id=").count(),
+            1,
+            "the page should end with one loader for the tag: {processed}"
+        );
+        assert!(
+            processed.contains(&format!(
+                "src=\"/integrations/google_tag_manager/gtag/js?id={TEST_TAG_ID}\""
+            )),
+            "the loader should name the first-party path: {processed}"
+        );
+        assert!(
+            !processed.contains("www.googletagmanager.com/gtag/js"),
+            "nothing should load the tag from Google's host: {processed}"
+        );
+    }
+
+    #[test]
     fn a_page_loading_another_tag_keeps_it() {
         // Arrange
         let settings = settings_with_google(&json!({ "analytics_tag_id": TEST_TAG_ID }));
