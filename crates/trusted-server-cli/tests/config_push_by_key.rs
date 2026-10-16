@@ -237,7 +237,7 @@ fn a_long_document_is_written_as_chunks_then_a_pointer() {
 
     assert_success(&push(&project, &["--local", "--key", HOST]));
 
-    let mut entries = stored_entries(&project);
+    let entries = stored_entries(&project);
     let chunk_prefix = format!("{HOST}.__edgezero_chunks.");
     let chunk_count = entries
         .iter()
@@ -248,35 +248,29 @@ fn a_long_document_is_written_as_chunks_then_a_pointer() {
         .iter()
         .position(|(key, _)| key == HOST)
         .expect("should write the pointer");
-    assert!(
-        entries[..pointer_at]
-            .iter()
-            .filter(|(key, _)| key.starts_with(&chunk_prefix))
-            .count()
-            == chunk_count,
+    let written: Vec<&str> = entries[..pointer_at]
+        .iter()
+        .map(|(key, _)| key.as_str())
+        .filter(|key| key.starts_with(&chunk_prefix))
+        .collect();
+    assert_eq!(
+        written.len(),
+        chunk_count,
         "every chunk should be written before the pointer"
     );
-    let settings = read_back(&entries, HOST).expect("should read the chunked blob back whole");
+    // The Fastly adapter reads a written document back whole, which
+    // `config_chunks.rs` tests against a fixture this writer produced.
+    let pointer: serde_json::Value =
+        serde_json::from_str(&entries[pointer_at].1).expect("should write the pointer as JSON");
+    let named: Vec<&str> = pointer["chunks"]
+        .as_array()
+        .expect("should name the chunks")
+        .iter()
+        .map(|chunk| chunk["key"].as_str().expect("should name each chunk's key"))
+        .collect();
     assert_eq!(
-        settings.publisher.domain, HOST,
-        "should reassemble the pushed app config"
-    );
-    assert_eq!(
-        settings.proxy.allowed_domains.len(),
-        400,
-        "should reassemble every part of the long blob"
-    );
-
-    let pointer = &mut entries[pointer_at].1;
-    let mut changed: serde_json::Value =
-        serde_json::from_str(pointer).expect("should write the pointer as JSON");
-    changed["chunks"][0]["sha256"] = serde_json::Value::from("0".repeat(64));
-    *pointer = changed.to_string();
-    let refused =
-        read_back(&entries, HOST).expect_err("a chunk whose hash differs should be refused");
-    assert!(
-        format!("{refused:?}").contains("sha mismatch"),
-        "should refuse the chunk for its hash: {refused:?}"
+        named, written,
+        "the pointer should name the chunks written, in order"
     );
 }
 

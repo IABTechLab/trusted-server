@@ -242,4 +242,29 @@ mod tests {
             value
         );
     }
+
+    #[test]
+    fn a_written_document_is_read_back_whole() {
+        // What `ts config push --local --key a.publisher.example` wrote for a
+        // document too long for one entry, in the order it wrote them.
+        let written: Vec<(String, String)> =
+            serde_json::from_str(include_str!("fixtures/config-push-chunks.json"))
+                .expect("should parse the fixture");
+        assert!(written.len() > 2, "the fixture should hold chunks");
+        let (key, pointer) = written.last().cloned().expect("should hold the pointer");
+        assert_eq!(
+            key, "a.publisher.example",
+            "the pointer should be written last"
+        );
+
+        let document = whole_entry(pointer, reader(written.into_iter().collect()))
+            .expect("should read the written document back whole");
+
+        let envelope: serde_json::Value =
+            serde_json::from_str(&document).expect("should read back the envelope");
+        assert_eq!(
+            envelope["data"]["publisher"]["domain"], "a.publisher.example",
+            "should reassemble the pushed app config"
+        );
+    }
 }
