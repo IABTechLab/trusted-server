@@ -3033,7 +3033,7 @@ pub struct CacheSettings {
     )]
     pub robots_txt: LoadingCacheConfig,
     /// How long the copies of the assets the publisher's origin sends last,
-    /// `[cache.assets]`.
+    /// `[cache.assets]`. A `module` of [`ASSETS_CACHE_OFF`] keeps none.
     #[serde(default, skip_serializing_if = "LoadingCacheConfig::is_default")]
     pub assets: LoadingCacheConfig,
     /// The caches modules declare and load through, each in its own
@@ -3060,6 +3060,10 @@ pub const ASSETS_CACHE: &str = "assets";
 /// copies, so one line selects both.
 pub const ASSETS_VARY_CACHE: &str = "assets-vary";
 
+/// The `module` that turns both asset caches off in `[cache.assets]`, so
+/// every asset is fetched from its origin for each request.
+pub const ASSETS_CACHE_OFF: &str = "none";
+
 /// How long one loading cache's copies last, each field defaulting to the
 /// cache's own default when absent.
 ///
@@ -3071,7 +3075,8 @@ pub const ASSETS_VARY_CACHE: &str = "assets-vary";
 pub struct LoadingCacheConfig {
     /// The module whose loading cache holds this cache's copies, as its short
     /// name or in full, for example `51degrees` or `loading-cache.51degrees`.
-    /// Absent, no copy is kept and every call loads.
+    /// Absent, the one loading cache module the build links holds them, and
+    /// no copy is kept when it links none or several.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub module: Option<String>,
     /// How long the brief copy in process memory is used, in seconds. Zero

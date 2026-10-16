@@ -9007,6 +9007,50 @@ mod tests {
             );
         }
 
+        /// A loading cache module's cache, which keeps what it loads.
+        fn memory_module_cache() -> Arc<dyn crate::platform::PlatformLoadingCache> {
+            Arc::new(MemoryLoadingCache::default())
+        }
+
+        #[tokio::test]
+        async fn assets_turned_off_in_the_settings_are_fetched_for_every_request() {
+            let module = crate::integrations::IntegrationBuilder::implementations(
+                "loading-cache.memory",
+                "a-crate",
+            )
+            .with_loading_cache(memory_module_cache);
+            for (written, fetches) in [(None, 1), (Some(crate::settings::ASSETS_CACHE_OFF), 2)] {
+                let mut settings = crate::test_support::tests::create_test_settings();
+                settings.cache.assets.module = written.map(str::to_owned);
+                let caches = crate::integrations::loading_caches_from(
+                    &settings,
+                    std::slice::from_ref(&module),
+                )
+                .expect("should select the asset caches");
+                let settings = Arc::new(settings);
+                let stub = Arc::new(StubHttpClient::new());
+                let services = build_services_with_http_client(Arc::clone(&stub) as _)
+                    .with_loading_caches(caches);
+                for _ in 0..2 {
+                    queue(
+                        &stub,
+                        "text/css",
+                        b"body{}",
+                        &[("cache-control", "public, max-age=300")],
+                    );
+                    let response =
+                        run(&settings, &services, asset_request("/site.css", "style")).await;
+                    assert_eq!(body_of(response).await, b"body{}");
+                }
+
+                assert_eq!(
+                    stub.recorded_request_uris().len(),
+                    fetches,
+                    "[cache.assets] module {written:?}"
+                );
+            }
+        }
+
         #[tokio::test]
         async fn a_page_navigation_never_reads_an_asset_copy() {
             let stub = Arc::new(StubHttpClient::new());
