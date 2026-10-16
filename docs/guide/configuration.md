@@ -1959,7 +1959,7 @@ On a configured Fastly asset-rehost route, a matching rule is authoritative
 over the third-party origin's cache defaults, including `no-store`, because
 Trusted Server owns the rehosted copy. A later Trusted Server or operator-applied
 `private` or `no-store` directive still vetoes public policy reapplication and
-removes shared-cache headers.
+removes the shared-cache headers Trusted Server writes.
 
 TS-owned validated hash URLs such as `/static/tsjs=...js?v=<hash>` use their
 built-in cache policy and do not require an asset rule. Shared-cache keys for
@@ -2344,15 +2344,19 @@ See [Didomi](/guide/integrations/didomi) for the routed endpoint shapes.
 
 **Section**: `[cmp.inmobi]`
 
-| Field        | Type   | Default  | Contract                                                                                                    |
-| ------------ | ------ | -------- | ----------------------------------------------------------------------------------------------------------- |
-| `script_url` | URL    | Required | The account's Choice loader, `https` on `cmp.inmobi.com` or `cdn.inmobi.com`, with no user name or password |
-| `cmp_id`     | Number | `10`     | The IAB registered CMP identifier the GPP stub answers `ping` with while the prompt loads                   |
+| Field        | Type   | Default  | Contract                                                                                                        |
+| ------------ | ------ | -------- | --------------------------------------------------------------------------------------------------------------- |
+| `script_url` | URL    | Required | The account's Choice loader, `https` on `cmp.inmobi.com` or `cdn.inmobi.com`, with no user name or password     |
+| `cmp_id`     | Number | `10`     | The IAB registered CMP identifier, from 1 to 4095, that the GPP stub answers `ping` with while the prompt loads |
 
-The table refuses a field it does not read. Selecting the module with no
-`[[fetch]]` entry naming `cmp.inmobi` is refused, because the
-prompt would never be written, and the entry names it before any middleware
-that writes a vendor's tag. See [InMobi Choice](/guide/integrations/inmobi)
+The table refuses a field it does not read. Selecting the module is refused
+when the `[[fetch]]` and `[[serve]]` entries leave any page without
+`cmp.inmobi`, because the prompt would not be written there, and each entry
+names it before any middleware that writes a vendor's tag. A `[[serve]]` entry
+naming it for a page whose `[[fetch]]` entry names another middleware is
+refused, because a serve middleware's head markup is written after what each
+fetch middleware writes ahead of the script bundle, and so is naming it for one
+page in both phases, which would write it twice. See [InMobi Choice](/guide/integrations/inmobi)
 for the tag's parts and what the module keeps to.
 
 ### 51Degrees Integration
@@ -3233,8 +3237,8 @@ positive shared freshness. `private`, `no-store`, `no-cache`, exhausted or
 malformed freshness, `Set-Cookie`, `Vary: *`, `Vary: Cookie`, uncovered `Vary`
 names, response-bound CSP nonces, pass-through or ambiguous authorization,
 diagnostics sessions, range or conditional requests, positive or malformed
-request `max-age`, `min-fresh`, and unsupported CDN-specific cache policy fields
-all bypass the template cache. Fastly
+request `max-age`, `min-fresh`, and a policy in `CDN-Cache-Control` or in the
+running platform's own cache header all bypass the template cache. Fastly
 `Surrogate-Control` is the narrow exception: the template cache accepts exactly one positive
 `max-age` plus optional valid `stale-while-revalidate` and `stale-if-error`
 delta-seconds. Restrictive, duplicated, malformed, or unknown directives fail
@@ -3253,8 +3257,9 @@ Check `X-TS-Template-Cache: hit` to verify template reuse.
 
 `template_cache_vary` is necessary because lookup occurs before the origin can
 return `Vary`. Presence, empty values, repeated raw field values, host/scheme,
-origin identity, complete template-shaping settings, TSJS content, core build
-inputs, and schema version all participate in an opaque SHA-256 cache key. The
+origin identity, complete template-shaping settings, TSJS content, the text
+each middleware gives as its `template_key`, core build inputs, and schema
+version all participate in an opaque SHA-256 cache key. The
 build digest covers every core source file (including Rust-inlined head scripts)
 except hidden, `#`-prefixed, and `~`-suffixed editor artifacts, plus the core
 build script, core and workspace manifests, `edgezero.toml`, and the workspace

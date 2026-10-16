@@ -286,9 +286,12 @@ fn registered_integrations() -> &'static [IntegrationBuilder] {
 }
 
 /// The second header Compute reads a shared cache policy from, beside
-/// `Surrogate-Control`, which core strips from every response it makes
-/// private.
+/// `Surrogate-Control`. Core never writes it, and declaring it keeps an origin
+/// response with a policy in it out of the stored copies.
 pub const FASTLY_SURROGATE_CONTROL_HEADER: &str = "fastly-surrogate-control";
+
+/// The header core writes a shared cache policy in on this adapter.
+pub(crate) const EDGE_CACHE_HEADER: EdgeCacheHeader = EdgeCacheHeader::SurrogateControl;
 
 /// The header the entry point sets to `1` on a request that arrived over TLS,
 /// after stripping any a client sent. Core reads it for the scheme and never
@@ -1165,7 +1168,7 @@ async fn dispatch_fallback(
     };
 
     let result = if uses_dynamic_tsjs_fallback(&method, &path) {
-        handle_tsjs_dynamic(&req, &state.registry, EdgeCacheHeader::SurrogateControl)
+        handle_tsjs_dynamic(&req, &state.registry, EDGE_CACHE_HEADER)
     } else if state.registry.has_route(&method, &path) {
         // Integration-proxy responses are not bounded by
         // publisher.max_buffered_body_bytes. Publisher fallback below uses the
@@ -1241,7 +1244,7 @@ async fn dispatch_fallback(
                     &mut ec.ec_context,
                     auction,
                     req,
-                    EdgeCacheHeader::SurrogateControl,
+                    EDGE_CACHE_HEADER,
                 )
                 .await
                 {
@@ -1919,6 +1922,51 @@ mod tests {
             "ts.test-publisher.com"
         );
         assert_eq!(services.public_prefix().as_str(), "ts");
+    }
+
+    /// A response core makes private carries the private policy in the
+    /// headers core owns and keeps the platform header the origin sent, which
+    /// is a fetch middleware's to remove. The adapter declares its own
+    /// platform's header and no other.
+    #[test]
+    fn a_private_response_follows_its_policy_and_keeps_the_origins_header() {
+        build_state_from_settings(test_settings()).expect("should build test state");
+        assert_eq!(
+            trusted_server_core::platform::platform_cache_headers(),
+            vec![super::FASTLY_SURROGATE_CONTROL_HEADER],
+            "should declare Compute's own header and no other platform's"
+        );
+        let mut response = edgezero_core::http::response_builder()
+            .header(super::FASTLY_SURROGATE_CONTROL_HEADER, "max-age=600")
+            .body(Body::empty())
+            .expect("should build the response");
+        trusted_server_core::cache_policy::CachePolicy::public_immutable(
+            std::time::Duration::from_secs(600),
+        )
+        .apply_to_response(&mut response, super::EDGE_CACHE_HEADER);
+
+        trusted_server_core::response_privacy::enforce_private_no_store(&mut response);
+
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store, private"),
+            "should carry the private policy"
+        );
+        assert!(
+            !response.headers().contains_key("surrogate-control"),
+            "should remove the policy core wrote"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(super::FASTLY_SURROGATE_CONTROL_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("max-age=600"),
+            "should keep the header the origin sent"
+        );
     }
 
     #[test]

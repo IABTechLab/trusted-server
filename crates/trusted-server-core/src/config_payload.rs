@@ -377,6 +377,30 @@ mod tests {
     }
 
     #[test]
+    fn the_load_looks_up_the_secret_of_a_module_selected_by_its_full_name() {
+        let mut value = serde_json::to_value(test_settings()).expect("should serialize settings");
+        value
+            .as_object_mut()
+            .expect("settings should serialize as an object")
+            .insert(
+                "testing".to_owned(),
+                serde_json::json!({
+                    "module": "testing.probe",
+                    "probe": { "lock": true, "key_name": "module-key" },
+                }),
+            );
+        let settings = Settings::from_json_value(value).expect("should read the module's table");
+
+        let loaded = load_with_module(&settings);
+
+        assert_eq!(
+            loaded.section_table("testing", "probe").get("key_name"),
+            Some(&serde_json::json!("resolved-module-secret")),
+            "should keep the setting in the table the module reads and look it up"
+        );
+    }
+
+    #[test]
     fn a_table_s_key_name_is_left_as_written_without_its_module_s_builder() {
         let mut settings = test_settings();
         settings
