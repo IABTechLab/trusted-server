@@ -809,27 +809,36 @@ async fn prepare_document(
     Ok(())
 }
 
+/// The request's services with nothing of the reader's connection, being
+/// what the fetch phase of a document that may be stored is prepared with.
+struct StoredDocumentServices(RuntimeServices);
+
+impl StoredDocumentServices {
+    fn of(services: &RuntimeServices) -> Self {
+        Self(services.clone().without_client())
+    }
+}
+
 /// The context a phase's preparations of a document are called with. The
-/// fetch phase of a document that may be stored is handed the request's
-/// services and nothing of the reader, because what its preparations answer
-/// is stored with the document. Every other preparation, the serve phase's
-/// on every document included, is handed the reader's state.
+/// fetch phase of a document that may be stored is handed `stored` and
+/// nothing of the reader, because what its preparations answer is stored
+/// with the document. Every other preparation, the serve phase's on every
+/// document included, is handed the reader's state.
 fn preparation_context<'r>(
     request: ModuleRequest<'r>,
-    stored: bool,
+    stored: Option<&'r StoredDocumentServices>,
     ec_context: &'r EcContext,
     services: &'r RuntimeServices,
 ) -> ModuleContext<'r> {
     let context = ModuleContext::new(request);
-    if stored {
-        context.with_services(services)
-    } else {
-        context.with_request_state(ec_context, services)
+    match stored {
+        Some(StoredDocumentServices(stored)) => context.with_services(stored),
+        None => context.with_request_state(ec_context, services),
     }
 }
 
 /// The contexts the two phases of a fetched document are prepared with. The
-/// fetch phase's carries the services alone when the document may be stored,
+/// fetch phase's carries `stored` alone when the document may be stored,
 /// because what it answers is stored with the document, and the serve
 /// phase's carries the reader's state on every document, because what it
 /// answers is this reader's, so the reader a document is fetched for is
@@ -839,14 +848,14 @@ fn preparation_contexts<'r>(
     request_host: &'r str,
     request_scheme: &'r str,
     request_path: &'r str,
-    stored: bool,
+    stored: Option<&'r StoredDocumentServices>,
     ec_context: &'r EcContext,
     services: &'r RuntimeServices,
 ) -> (ModuleContext<'r>, ModuleContext<'r>) {
     let request = || ModuleRequest::new(request_method, request_host, request_scheme, request_path);
     (
         preparation_context(request(), stored, ec_context, services),
-        preparation_context(request(), false, ec_context, services),
+        preparation_context(request(), None, ec_context, services),
     )
 }
 
@@ -5994,12 +6003,15 @@ pub async fn handle_publisher_request(
 
     let prepared = Arc::new(Prepared::default());
     if route == ResponseRoute::Stream {
+        let stored = template_cache_key
+            .is_some()
+            .then(|| StoredDocumentServices::of(services));
         let (fetch_context, serve_context) = preparation_contexts(
             &request_method,
             request_host,
             request_scheme,
             &request_path,
-            template_cache_key.is_some(),
+            stored.as_ref(),
             ec_context,
             services,
         );
@@ -11834,6 +11846,100 @@ mod tests {
                         1,
                         "should serve the {reader} {label} reader what the middleware wrote, \
                          once: {page}"
+                    );
+                }
+            }
+        }
+
+        /// The client IP of the reader [`services_for_a_reader`] carries.
+        const READER_IP: &str = "203.0.113.9";
+        /// The `User-Agent` that reader sends.
+        const READER_AGENT: &str = "Mozilla/5.0 ReaderAgent/1.0";
+        /// The TLS JA4 fingerprint of that reader's connection.
+        const READER_JA4: &str = "t13d1516h2_8daaf6152771_02713d6af862";
+
+        /// The host's client signals for that reader.
+        #[derive(Debug)]
+        struct ReaderSignals;
+
+        impl crate::evidence::HostSignals for ReaderSignals {
+            fn ja4(&self) -> Option<&str> {
+                Some(READER_JA4)
+            }
+
+            fn h2(&self) -> Option<&str> {
+                Some("1:65536;4:6291456|15663105|0|m,a,s,p")
+            }
+        }
+
+        /// [`services`], carrying the connection of one reader, being the
+        /// client IP, the TLS details and the host's client signals.
+        fn services_for_a_reader(
+            http_client: Arc<StubHttpClient>,
+            cache: Arc<MemoryTemplateCache>,
+        ) -> RuntimeServices {
+            RuntimeServices::builder()
+                .config_store(Arc::new(NoopConfigStore))
+                .secret_store(Arc::new(NoopSecretStore))
+                .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+                .backend(Arc::new(StubBackend))
+                .http_client(http_client)
+                .geo(Arc::new(NoopGeo))
+                .client_info(ClientInfo {
+                    client_ip: Some(READER_IP.parse().expect("should parse the reader's IP")),
+                    tls_protocol: Some("TLSv1.3".to_owned()),
+                    tls_ja4: Some(READER_JA4.to_owned()),
+                    ..ClientInfo::default()
+                })
+                .host_signals(Arc::new(ReaderSignals))
+                .template_cache(cache)
+                .build()
+        }
+
+        #[tokio::test]
+        async fn a_fetch_preparation_of_a_stored_page_reads_nothing_of_the_reader() {
+            use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+            for (mode, stored) in [("esi", true), ("inline", false)] {
+                let stub = Arc::new(StubHttpClient::new());
+                let cache = Arc::new(MemoryTemplateCache::default());
+                let services = services_for_a_reader(Arc::clone(&stub), Arc::clone(&cache));
+                let settings = Arc::new(settings_with_fetch_entry(
+                    mode,
+                    "reader",
+                    None,
+                    &[fixture::PREPARING],
+                ));
+                let mut request = navigation_request();
+                request
+                    .headers_mut()
+                    .insert(header::USER_AGENT, HeaderValue::from_static(READER_AGENT));
+                queue_shareable_html(&stub);
+
+                let page = page_of(run(&settings, &services, request).await).await;
+
+                assert_eq!(
+                    stored_cache_keys(&cache).len(),
+                    usize::from(stored),
+                    "should store the {mode} page only where it may be stored"
+                );
+                if stored {
+                    assert!(
+                        page.contains(&fixture::reader_marker(fixture::NOTHING_OF_THE_READER)),
+                        "should prepare a page stored for every reader with nothing of the \
+                         reader whose request fetched it: {page}"
+                    );
+                    for value in [READER_IP, READER_AGENT, READER_JA4] {
+                        assert!(
+                            !page.contains(value),
+                            "should keep {value} out of the stored page: {page}"
+                        );
+                    }
+                } else {
+                    assert!(
+                        page.contains(&format!("client IP {READER_IP}")),
+                        "should prepare a page that is not stored with the reader, or the \
+                         stored page proves nothing: {page}"
                     );
                 }
             }
@@ -22119,10 +22225,16 @@ mod tests {
         )
         .with_module_for_test(Arc::new(crate::ec::tests::CanonicalizingModule));
         let services = noop_services();
+        let stored_services = StoredDocumentServices::of(&services);
         let method = Method::GET;
         let handed = |stored: bool| {
             let request = ModuleRequest::new(&method, "publisher.example", "https", "/article");
-            let context = preparation_context(request, stored, &ec_context, &services);
+            let context = preparation_context(
+                request,
+                stored.then_some(&stored_services),
+                &ec_context,
+                &services,
+            );
             let call = context.call("testing.preparation", PermissionSet::none());
             (
                 <&PermissionState>::from_module_context(&call).is_ok(),
@@ -22138,7 +22250,8 @@ mod tests {
         assert_eq!(
             handed(true),
             (false, false),
-            "should hand a document that may be stored neither the reader's permissions nor              Edge Cookie"
+            "should hand a document that may be stored neither the reader's permissions nor \
+             Edge Cookie"
         );
     }
 
@@ -22152,6 +22265,7 @@ mod tests {
         )
         .with_module_for_test(Arc::new(crate::ec::tests::CanonicalizingModule));
         let services = noop_services();
+        let stored_services = StoredDocumentServices::of(&services);
         let method = Method::GET;
         let handed = |context: &ModuleContext<'_>| {
             let call = context.call("testing.preparation", PermissionSet::none());
@@ -22167,7 +22281,7 @@ mod tests {
                 "publisher.example",
                 "https",
                 "/article",
-                stored,
+                stored.then_some(&stored_services),
                 &ec_context,
                 &services,
             );

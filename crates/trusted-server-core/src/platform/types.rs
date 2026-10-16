@@ -405,6 +405,20 @@ impl RuntimeServices {
         }
     }
 
+    /// Returns a clone of this instance carrying nothing of the client, being
+    /// empty client metadata and no host-computed client signals.
+    ///
+    /// For work whose answer is kept and served to other readers, which must
+    /// not depend on the reader whose request ran it.
+    #[must_use]
+    pub fn without_client(self) -> Self {
+        Self {
+            client_info: ClientInfo::default(),
+            host_signals: None,
+            ..self
+        }
+    }
+
     /// Returns a clone of this instance with the Edge Cookie module replaced.
     ///
     /// Adapters use this to apply the module-supplied module selected by

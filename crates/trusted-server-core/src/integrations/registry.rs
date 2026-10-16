@@ -2972,12 +2972,88 @@ pub(crate) mod test_support {
         pub(crate) const NOTHING_PREPARED: &str =
             "<meta name=\"middleware-fixture-prepared\" content=\"nothing prepared\">";
 
+        /// What the reader marker says when the preparation could read
+        /// nothing of the reader.
+        pub(crate) const NOTHING_OF_THE_READER: &str = "nothing of the reader";
+
         /// The marker the preparing middleware writes, naming the module it
         /// was called as and the host it was told of.
         pub(crate) fn prepared_marker(module: &str, request_host: &str) -> String {
             format!(
                 "<meta name=\"middleware-fixture-prepared\" content=\"{module} for {request_host}\">"
             )
+        }
+
+        /// The marker the preparing middleware writes after
+        /// [`prepared_marker`], saying what its preparation could read of the
+        /// reader.
+        pub(crate) fn reader_marker(seen: &str) -> String {
+            format!("<meta name=\"middleware-fixture-reader\" content=\"{seen}\">")
+        }
+
+        /// What a preparation called with `call` can read of the reader,
+        /// through the services or as a value of its own.
+        fn reader_seen(call: &ModuleCall<'_>) -> String {
+            use crate::consent::ConsentContext;
+            use crate::ec::device::DeviceSignals;
+            use crate::evidence::RequestInfo;
+            use crate::geo::GeoInfo;
+            use crate::module_context::{EdgeCookie, FromModuleContext};
+            use crate::permissions::PermissionState;
+            use crate::platform::{ClientInfo, RuntimeServices};
+
+            let mut seen = Vec::new();
+            if let Ok(services) = <&RuntimeServices>::from_module_context(call) {
+                let client = services.client_info();
+                if let Some(ip) = client.client_ip {
+                    seen.push(format!("client IP {ip}"));
+                }
+                if client.tls_protocol.is_some()
+                    || client.tls_cipher.is_some()
+                    || client.tls_ja4.is_some()
+                    || client.h2_fingerprint.is_some()
+                {
+                    seen.push("TLS details".to_owned());
+                }
+                if services.host_signals().is_some() {
+                    seen.push("client signals".to_owned());
+                }
+            }
+            if let Ok(evidence) = <&dyn RequestInfo>::from_module_context(call) {
+                seen.push(format!(
+                    "evidence with user-agent {}",
+                    evidence.user_agent()
+                ));
+            }
+            for (value, handed) in [
+                (
+                    "connection",
+                    <&ClientInfo>::from_module_context(call).is_ok(),
+                ),
+                (
+                    "consent",
+                    <&ConsentContext>::from_module_context(call).is_ok(),
+                ),
+                (
+                    "permissions",
+                    <&PermissionState>::from_module_context(call).is_ok(),
+                ),
+                ("geo", <&GeoInfo>::from_module_context(call).is_ok()),
+                (
+                    "device signals",
+                    <&DeviceSignals>::from_module_context(call).is_ok(),
+                ),
+                ("Edge Cookie", EdgeCookie::from_module_context(call).is_ok()),
+            ] {
+                if handed {
+                    seen.push(value.to_owned());
+                }
+            }
+            if seen.is_empty() {
+                NOTHING_OF_THE_READER.to_owned()
+            } else {
+                seen.join(", ")
+            }
         }
 
         struct Preparing;
@@ -2997,7 +3073,8 @@ pub(crate) mod test_support {
                 context: &'a MiddlewareContext<'a>,
             ) -> Option<Preparation<'a>> {
                 Some(Box::pin(async move {
-                    let marker = prepared_marker(call.module(), context.request_host);
+                    let marker = prepared_marker(call.module(), context.request_host)
+                        + &reader_marker(&reader_seen(&call));
                     Ok(Box::new(marker) as Box<dyn std::any::Any + Send>)
                 }))
             }
