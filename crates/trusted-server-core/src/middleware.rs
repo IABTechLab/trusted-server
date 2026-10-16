@@ -489,6 +489,16 @@ pub trait Middleware: Send + Sync {
         media_type == HTML_MEDIA_TYPE
     }
 
+    /// Whether this middleware writes the whole document, whatever the origin
+    /// sent. Where a `[[fetch]]` entry with a `path` names it, core makes the
+    /// document on an empty one in place of any answer it would not hand the
+    /// middleware as a `200` of the entry's media type, as it does where the
+    /// origin answers `404`. `false` by default, for a middleware that changes
+    /// what the origin sent.
+    fn writes_whole_document(&self) -> bool {
+        false
+    }
+
     /// The phases an entry may name this middleware in.
     fn phases(&self) -> &[MiddlewarePhase];
 
@@ -795,6 +805,15 @@ impl MiddlewareChain {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.middleware.is_empty()
+    }
+
+    /// Whether a middleware in the chain writes the whole document, see
+    /// [`Middleware::writes_whole_document`].
+    #[must_use]
+    pub fn writes_whole_document(&self) -> bool {
+        self.middleware
+            .iter()
+            .any(|middleware| middleware.writes_whole_document())
     }
 
     /// Runs the preparation of every middleware that has one, in the order

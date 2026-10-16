@@ -1,8 +1,9 @@
 //! `/robots.txt` as a middleware of core's own, named `robots_txt` in a
 //! `[[fetch]]` entry on the file's path. Its preparation makes the file from
 //! the selected contributors, through their holding, and its action replaces
-//! the origin's file with it. Where the origin has no file, or answers with a
-//! page, the creating rule runs it on an empty one.
+//! the origin's file with it. Where the origin answers with anything else,
+//! being no file, a page, an error or a redirect among them, the creating rule
+//! runs it on an empty one.
 
 use std::any::Any;
 use std::time::Duration;
@@ -71,6 +72,13 @@ impl Middleware for RobotsTxt {
 
     fn handles_media_type(&self, media_type: &str) -> bool {
         media_type == MEDIA_TYPE
+    }
+
+    // A crawler takes an error, a redirect, an empty answer, or an origin
+    // file the action cannot replace, as permission or as the origin's own
+    // rules, so the file is made in place of each.
+    fn writes_whole_document(&self) -> bool {
+        true
     }
 
     fn phases(&self) -> &[MiddlewarePhase] {
