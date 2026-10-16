@@ -24,12 +24,16 @@ const TEST_VAR: &str = "TSJS_TEST";
 
 fn main() {
     // Cargo scans directories recursively, so these cover every TS source.
+    // Every path must exist: a missing entry makes Cargo rerun this script on
+    // every build, the opposite of the intent.
     for path in [
         "lib/src",
         "lib/build-all.mjs",
+        "lib/build-prebid-external.mjs",
         "lib/package.json",
         "lib/package-lock.json",
         "lib/tsconfig.json",
+        "lib/vite.config.ts",
     ] {
         println!("cargo:rerun-if-changed={path}");
     }

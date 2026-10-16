@@ -10,9 +10,9 @@
 //!
 //! Answers are held in the loading cache through [`crate::engine_cache`], each
 //! whole call being the load, so a question many requests ask at once is asked
-//! once. The visitor's address is in the evidence and so in the key, which
-//! means an answer carrying a location is only served back to a request from
-//! the same address. Failures are not held.
+//! once. The evidence is the `User-Agent` and the `Sec-CH-UA` hints alone, so
+//! one answer serves every reader whose browser sends the same values.
+//! Failures are not held.
 
 use std::time::Duration;
 
@@ -31,14 +31,12 @@ use crate::hints_engine::engine_base;
 /// sends, so the key cannot drift from the request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Evidence {
-    /// The visitor's address, sent as `client-ip`.
-    pub client_ip: String,
     /// The visitor's `User-Agent`.
     pub user_agent: String,
-    /// What the browser gathered and left in `51D_` cookies, in the order of
-    /// [`BROWSER_EVIDENCE`]. Different evidence is a different question, so
-    /// it is held as a different entry.
-    pub browser: Vec<(&'static str, String)>,
+    /// The `Sec-CH-UA` hints the browser sent, by lower case header name and
+    /// in name order. Different hints are a different question, so they are
+    /// held as a different entry.
+    pub client_hints: Vec<(String, String)>,
 }
 
 /// A decoded cloud response, the answer to one call's question.
@@ -71,32 +69,20 @@ impl CloudAnswer {
     }
 }
 
-/// The evidence names the browser writes and the service reads, sent as form
-/// fields under the cookies' own names. They are the service's own names, so
-/// they are read whichever script gathered them.
-pub const BROWSER_EVIDENCE: &[&str] = &[
-    "51D_ScreenPixelsWidth",
-    "51D_ScreenPixelsHeight",
-    "51D_GetHighEntropyValues",
-];
-
-/// The form fields the call sends for `evidence`, under the bare names the
-/// service reads.
+/// The form fields the call sends for `evidence`, under the bare header names
+/// the service reads.
 ///
 /// No usage is sent, so no identifier comes back. An empty value is left out,
 /// because sending one asks about an empty `User-Agent`.
 #[must_use]
 pub fn evidence_fields(evidence: &Evidence) -> Vec<(String, String)> {
     let mut fields = Vec::new();
-    if !evidence.client_ip.trim().is_empty() {
-        fields.push(("client-ip".to_owned(), evidence.client_ip.clone()));
-    }
     if !evidence.user_agent.trim().is_empty() {
         fields.push(("user-agent".to_owned(), evidence.user_agent.clone()));
     }
-    for (name, value) in &evidence.browser {
+    for (name, value) in &evidence.client_hints {
         if !value.is_empty() {
-            fields.push(((*name).to_owned(), value.clone()));
+            fields.push((name.clone(), value.clone()));
         }
     }
     fields
@@ -403,9 +389,8 @@ mod tests {
 
     fn evidence() -> Evidence {
         Evidence {
-            client_ip: "2.125.160.216".to_owned(),
             user_agent: "Mozilla/5.0".to_owned(),
-            browser: Vec::new(),
+            client_hints: Vec::new(),
         }
     }
 
@@ -492,49 +477,27 @@ mod tests {
         );
     }
 
+    /// The `User-Agent` and each hint reach the service under the bare
+    /// header names it reads.
     #[tokio::test]
-    async fn the_address_reaches_the_service_under_the_bare_name_it_reads() {
+    async fn the_evidence_reaches_the_service_under_the_bare_names_it_reads() {
         let client = Arc::new(ScriptedHttpClient::new(&[DATA]));
         let services = services_with(client.clone(), Arc::new(MemoryKvStore::default()));
-
-        pipeline()
-            .answer(&evidence(), &services)
-            .await
-            .expect("the call should succeed");
-
-        let sent = client.sent();
-        let body = &sent.last().expect("the data request").body;
-        assert!(
-            body.contains("client-ip=2.125.160.216"),
-            "the bare evidence name is what the service reads, got {body}"
-        );
-        assert!(
-            body.contains("user-agent=Mozilla%2F5.0"),
-            "and the User-Agent beside it, got {body}"
-        );
-    }
-
-    /// The browser's evidence reaches the service under the cookie's own
-    /// name, which the service reads without regard to case.
-    #[tokio::test]
-    async fn the_browser_evidence_reaches_the_service_under_its_own_name() {
-        let client = Arc::new(ScriptedHttpClient::new(&[DATA]));
-        let services = services_with(client.clone(), Arc::new(MemoryKvStore::default()));
-        let with_screen = Evidence {
-            browser: vec![("51D_ScreenPixelsWidth", "1080".to_owned())],
+        let with_hint = Evidence {
+            client_hints: vec![("sec-ch-ua-mobile".to_owned(), "?0".to_owned())],
             ..evidence()
         };
 
         pipeline()
-            .answer(&with_screen, &services)
+            .answer(&with_hint, &services)
             .await
             .expect("the call should succeed");
 
         let sent = client.sent();
         let body = &sent.last().expect("the data request").body;
         assert!(
-            body.contains("51D_ScreenPixelsWidth=1080"),
-            "the browser's own work must reach the service, got {body}"
+            body.contains("user-agent=Mozilla%2F5.0") && body.contains("sec-ch-ua-mobile=%3F0"),
+            "the bare evidence names are what the service reads, got {body}"
         );
     }
 
@@ -542,14 +505,17 @@ mod tests {
     /// describe an empty `User-Agent`.
     #[test]
     fn an_empty_value_is_left_out_of_the_evidence() {
-        let address_only = Evidence {
+        let hints_only = Evidence {
             user_agent: String::new(),
-            ..evidence()
+            client_hints: vec![
+                ("sec-ch-ua-mobile".to_owned(), "?0".to_owned()),
+                ("sec-ch-ua-model".to_owned(), String::new()),
+            ],
         };
 
         assert_eq!(
-            evidence_fields(&address_only),
-            vec![("client-ip".to_owned(), "2.125.160.216".to_owned())]
+            evidence_fields(&hints_only),
+            vec![("sec-ch-ua-mobile".to_owned(), "?0".to_owned())]
         );
     }
 
@@ -617,7 +583,7 @@ mod tests {
     /// which holds the answers on a host with no value cache, and the second
     /// asks the service nothing.
     #[tokio::test]
-    async fn a_second_instance_from_the_same_address_asks_the_cloud_nothing() {
+    async fn a_second_instance_with_the_same_evidence_asks_the_cloud_nothing() {
         let store = Arc::new(MemoryKvStore::default());
         let first = Arc::new(ScriptedHttpClient::new(&[DATA]));
         pipeline()
@@ -649,8 +615,8 @@ mod tests {
         );
     }
 
-    /// With a host value cache and no key-value store, a second lookup from
-    /// the same address asks the cloud nothing.
+    /// With a host value cache and no key-value store, a second lookup with
+    /// the same evidence asks the cloud nothing.
     #[tokio::test]
     async fn the_host_value_cache_answers_a_second_lookup_without_the_store() {
         let cache = Arc::new(MemoryValueCache::default());
@@ -677,7 +643,7 @@ mod tests {
         assert_eq!(
             second.sent().len(),
             0,
-            "the second lookup from the same address is answered from the value cache"
+            "the second lookup with the same evidence is answered from the value cache"
         );
         assert_eq!(browser_name(&answer), Some("Chrome"));
     }
@@ -688,28 +654,20 @@ mod tests {
     async fn different_evidence_still_costs_a_call() {
         for (case, changed, why) in [
             (
-                "a different address",
-                Evidence {
-                    client_ip: "8.8.8.8".to_owned(),
-                    ..evidence()
-                },
-                "the answer carries the visitor's location",
-            ),
-            (
                 "a different User-Agent",
                 Evidence {
                     user_agent: "curl/8".to_owned(),
                     ..evidence()
                 },
-                "the device half of the answer depends on the User-Agent",
+                "the answer depends on the User-Agent",
             ),
             (
-                "evidence the browser gathered",
+                "a hint the browser sent",
                 Evidence {
-                    browser: vec![("51D_ScreenPixelsWidth", "1080".to_owned())],
+                    client_hints: vec![("sec-ch-ua-mobile".to_owned(), "?1".to_owned())],
                     ..evidence()
                 },
-                "what the browser gathered changes the question",
+                "a hint changes the question",
             ),
         ] {
             let store = Arc::new(MemoryKvStore::default());

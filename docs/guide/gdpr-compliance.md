@@ -6,8 +6,8 @@ Consent signal handling in Trusted Server.
 
 A permission signal module reads each consent signal from the request
 and decodes it, one module per scheme, and the resolved permissions
-gate consent-gated activities such as EC creation, the server-side
-auction and EID forwarding. The publisher configures how signals are
+gate consent-gated activities such as EC creation and EID
+forwarding. The publisher configures how signals are
 interpreted, meaning how Global Privacy Control is read, how
 conflicting signals are resolved, and when stored signals expire,
 through the `[consent]` table the modules read.

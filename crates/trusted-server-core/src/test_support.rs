@@ -209,7 +209,7 @@ pub mod tests {
     }
 
     /// The consent of a reader in a jurisdiction that requires a signal who
-    /// gave one, as the modules read it, paired with
+    /// gave one to storage alone, as the modules read it, paired with
     /// [`storage_only_permissions`] for a request where EC is allowed while
     /// EID persistence is not.
     #[must_use]
@@ -217,7 +217,8 @@ pub mod tests {
         ConsentContext::new(Jurisdiction::Gdpr).with_record(
             SignalRecord::new("example", SignalStatus::Decoded)
                 .with_value("example-signal")
-                .with_applies(true),
+                .with_applies(true)
+                .with_consented(storage_only_permissions().permissions()),
         )
     }
 }

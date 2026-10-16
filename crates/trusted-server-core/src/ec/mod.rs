@@ -1159,6 +1159,14 @@ impl EcContext {
             && self.permissions.is_set(Permission::SelectPersonalisedAds)
     }
 
+    /// Whether a server-side auction may be dispatched for this request, read
+    /// from the request's consent records and jurisdiction rather than its
+    /// permissions, see [`crate::consent::consent_allows_server_side_auction`].
+    #[must_use]
+    pub fn server_side_auction_allowed(&self) -> bool {
+        consent_mod::consent_allows_server_side_auction(&self.consent)
+    }
+
     /// Returns the permissions resolved for this request.
     ///
     /// Assembled once at construction, the country/region baseline augmented by
@@ -1223,7 +1231,6 @@ impl EcContext {
         consent: ConsentContext,
         ec_allowed: bool,
     ) -> Self {
-        let permissions = permissions_for_test(ec_allowed, &consent.jurisdiction);
         Self {
             ec_was_present: ec_value.is_some(),
             cookie_ec_value: ec_value.clone(),
@@ -1231,7 +1238,7 @@ impl EcContext {
             ec_generated: false,
             consent,
             ec_allowed,
-            permissions,
+            permissions: permissions_for_test(ec_allowed),
             client_ip: None,
             geo_info: None,
             device_signals: None,
@@ -1260,7 +1267,7 @@ impl EcContext {
     #[must_use]
     pub fn new_for_test_withdrawn(ec_value: Option<String>, consent: ConsentContext) -> Self {
         let mut context = Self::new_for_test_gated(ec_value, consent, false);
-        context.permissions = context.permissions.clone().with_storage_withdrawn(true);
+        context.permissions = PermissionState::default().with_storage_withdrawn(true);
         context
     }
 
@@ -1272,7 +1279,6 @@ impl EcContext {
         consent: ConsentContext,
         client_ip: Option<String>,
     ) -> Self {
-        let permissions = permissions_for_test(true, &consent.jurisdiction);
         Self {
             ec_was_present: ec_value.is_some(),
             cookie_ec_value: ec_value.clone(),
@@ -1280,7 +1286,7 @@ impl EcContext {
             ec_generated: false,
             consent,
             ec_allowed: true,
-            permissions,
+            permissions: permissions_for_test(true),
             client_ip,
             geo_info: None,
             device_signals: None,
@@ -1310,7 +1316,6 @@ impl EcContext {
         consent: ConsentContext,
         ec_allowed: bool,
     ) -> Self {
-        let permissions = permissions_for_test(ec_allowed, &consent.jurisdiction);
         Self {
             ec_value,
             cookie_ec_value,
@@ -1318,7 +1323,7 @@ impl EcContext {
             ec_generated,
             consent,
             ec_allowed,
-            permissions,
+            permissions: permissions_for_test(ec_allowed),
             client_ip: None,
             geo_info: None,
             device_signals: None,
@@ -1365,24 +1370,16 @@ impl EcContext {
 /// The permissions a test context stands in for: storage and personalised-ad
 /// selection when the gate is open, none when it is closed.
 #[cfg(test)]
-/// The permission state a test context stands on: the Edge Cookie pair when
-/// the gate is open, and basic ad selection wherever the jurisdiction's
-/// baseline grants it outright, which is what the server-side auction gate
-/// reads.
-fn permissions_for_test(ec_allowed: bool, jurisdiction: &Jurisdiction) -> PermissionState {
-    let mut set = crate::permissions::PermissionSet::none();
+fn permissions_for_test(ec_allowed: bool) -> PermissionState {
     if ec_allowed {
-        set = set
-            .with(Permission::StoreOnDevice)
-            .with(Permission::SelectPersonalisedAds);
+        PermissionState::new(
+            [Permission::StoreOnDevice, Permission::SelectPersonalisedAds]
+                .into_iter()
+                .collect(),
+        )
+    } else {
+        PermissionState::default()
     }
-    if matches!(
-        jurisdiction,
-        Jurisdiction::NonRegulated | Jurisdiction::UsState(_)
-    ) {
-        set = set.with(Permission::SelectBasicAds);
-    }
-    PermissionState::new(set)
 }
 
 /// Returns the current Unix timestamp in seconds, falling back to zero on clock failure.

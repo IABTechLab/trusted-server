@@ -171,6 +171,7 @@ pub fn effective(consent: &ConsentContext) -> Option<&TcfConsent> {
 pub fn record(effective: TcfConsent, raw: Option<&str>) -> SignalRecord {
     let record = SignalRecord::new(SCHEME, SignalStatus::Decoded)
         .with_applies(true)
+        .with_consented(consented(&effective))
         .with_decoded(TcfRecord { effective });
     match raw {
         Some(raw) => record.with_value(raw),
@@ -215,11 +216,16 @@ impl TcfModule {
         let raw_tc = evidence.cookie(COOKIE_EUCONSENT_V2);
         let (raw_gpp, raw_sid) = gpp::strings(evidence);
         let section_ids = gpp::section_ids_of(raw_gpp, raw_sid);
-        let applies =
-            raw_tc.is_some() || section_ids.is_some_and(|ids| ids.contains(&GPP_SECTION_ID));
+        let in_gpp = section_ids.is_some_and(|ids| ids.contains(&GPP_SECTION_ID));
+        let applies = raw_tc.is_some() || in_gpp;
         let with_value = |record: SignalRecord| match raw_tc {
             Some(raw) => record.with_value(raw),
             None => record,
+        };
+        let unreadable = || {
+            Some(with_value(
+                SignalRecord::new(SCHEME, SignalStatus::Unreadable).with_applies(applies),
+            ))
         };
 
         if settings.consent.mode == ConsentMode::Proxy {
@@ -233,24 +239,36 @@ impl TcfModule {
         }
 
         let tcf_settings = Self::settings(settings);
-        let embedded = raw_gpp
-            .and_then(|raw| gpp::section(raw, GPP_SECTION_ID))
-            .and_then(|section| match decode_tc_string(&section) {
-                Ok(decoded) => Some(decoded),
-                Err(error) => {
-                    log::warn!("GPP contains an EU TCF section that could not be decoded: {error}");
-                    None
-                }
-            });
         let standalone = match raw_tc.map(decode_tc_string) {
             None => None,
             Some(Ok(decoded)) => Some(decoded),
             Some(Err(error)) => {
                 log::warn!("Failed to decode TC String: {error}");
-                return Some(with_value(
-                    SignalRecord::new(SCHEME, SignalStatus::Unreadable).with_applies(applies),
-                ));
+                return unreadable();
             }
+        };
+        // The EU section a GPP string carries, or its hint names, is a TC
+        // String too, so one that cannot be read is unreadable as a
+        // standalone string is, whatever the standalone string says.
+        let embedded = match raw_gpp {
+            Some(raw) if in_gpp => {
+                match gpp::section(raw, GPP_SECTION_ID).map(|section| decode_tc_string(&section)) {
+                    Some(Ok(decoded)) => Some(decoded),
+                    Some(Err(error)) => {
+                        log::warn!(
+                            "GPP contains an EU TCF section that could not be decoded: {error}"
+                        );
+                        return unreadable();
+                    }
+                    None => {
+                        log::warn!(
+                            "The EU TCF section the GPP string names could not be read from it"
+                        );
+                        return unreadable();
+                    }
+                }
+            }
+            _ => None,
         };
         let effective = match (standalone, embedded) {
             (Some(standalone), Some(embedded)) => {
@@ -278,6 +296,7 @@ impl TcfModule {
         Some(with_value(
             SignalRecord::new(SCHEME, SignalStatus::Decoded)
                 .with_applies(applies)
+                .with_consented(consented(&effective))
                 .with_decoded(TcfRecord { effective }),
         ))
     }
@@ -389,6 +408,19 @@ fn mapped() -> PermissionSet {
             .filter(|permission| mapping::purpose_for(*permission).is_some())
             .collect()
     })
+}
+
+/// Every Data Use whose purpose `record` consents to. The record reports
+/// these whatever the policy makes of it, so a reader that asks for the
+/// visitor's consent itself, as the server-side auction gate does, sees it.
+fn consented(record: &TcfConsent) -> PermissionSet {
+    mapped()
+        .iter()
+        .filter(|permission| {
+            mapping::purpose_for(*permission)
+                .is_some_and(|purpose| record.has_purpose_consent(usize::from(purpose)))
+        })
+        .collect()
 }
 
 /// Whether a record allows identifiers to travel in the bidstream, which is
@@ -583,6 +615,47 @@ mod tests {
     }
 
     #[test]
+    fn a_decoded_record_reports_what_its_purposes_consent_to() {
+        let tc = encode_tc_string(&[true], now_deciseconds());
+        let read =
+            read_with(&format!("euconsent-v2={tc}"), &Settings::default()).expect("should read");
+        assert_eq!(
+            read.consented(),
+            PermissionSet::none().with(Permission::StoreOnDevice),
+            "Purpose 1 alone is consent to device storage and to nothing else"
+        );
+        let consent = ConsentContext::default().with_record(read);
+        assert_eq!(
+            answer(
+                &consent,
+                &SignalPolicy::default(),
+                Permission::StoreOnDevice
+            ),
+            ConsentSignal::Neutral,
+            "a policy that silences the record leaves the module silent"
+        );
+        assert!(
+            consent
+                .record(SCHEME)
+                .is_some_and(|held| held.consented().contains(Permission::StoreOnDevice)),
+            "while the record still holds the consent the visitor gave"
+        );
+        let contextual = record(tcf_with_purposes(&[2]), None).consented();
+        assert!(
+            contextual.contains(Permission::SelectBasicAds)
+                && !contextual.contains(Permission::StoreOnDevice),
+            "Purpose 2 alone is consent to basic ad selection and not to storage"
+        );
+        let old = encode_tc_string(&[true], 0);
+        let expired =
+            read_with(&format!("euconsent-v2={old}"), &Settings::default()).expect("should read");
+        assert!(
+            expired.consented().is_empty(),
+            "an expired record holds no consent"
+        );
+    }
+
+    #[test]
     fn an_unreadable_tc_string_is_recorded_as_such() {
         let record =
             read_with("euconsent-v2=not-a-tc-string", &Settings::default()).expect("should read");
@@ -658,6 +731,123 @@ mod tests {
         assert!(
             read_with("__gpp_sid=7", &Settings::default()).is_none(),
             "a hint naming no EU section is nothing for this module"
+        );
+    }
+
+    #[test]
+    fn a_tc_string_that_cannot_be_read_consents_to_nothing_it_governs() {
+        let read =
+            read_with("euconsent-v2=not-a-tc-string", &Settings::default()).expect("should read");
+        assert!(read.consented().is_empty(), "the record holds no consent");
+        let consent = ConsentContext::default().with_record(read);
+        for permission in mapped().iter() {
+            assert_eq!(
+                answer(&consent, shipped_policy(), permission),
+                ConsentSignal::Revoke,
+                "every purpose the module maps is refused, {} included",
+                permission.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn an_eu_section_in_a_gpp_string_that_cannot_be_read_is_unreadable() {
+        let settings = Settings::default();
+        // Header "DBACNY" carries sections 2 and 6, and section 2 here is not
+        // a TC String.
+        let unreadable_section = "__gpp=DBACNY~not-a-tc-string~1YNN";
+        let read = read_with(unreadable_section, &settings).expect("should read");
+        assert_eq!(read.status(), SignalStatus::Unreadable);
+        assert!(read.applies(), "section 2 says the regulation applies");
+        let read =
+            read_with("__gpp=not-a-gpp-string; __gpp_sid=2,6", &settings).expect("should read");
+        assert_eq!(
+            read.status(),
+            SignalStatus::Unreadable,
+            "so is a string the hint says carries the section and that cannot be parsed"
+        );
+        let tc = fresh_tc_string();
+        let read = read_with(
+            &format!("euconsent-v2={tc}; {unreadable_section}"),
+            &settings,
+        )
+        .expect("should read");
+        assert_eq!(
+            read.status(),
+            SignalStatus::Unreadable,
+            "whatever a readable standalone string beside it says"
+        );
+        let consent = ConsentContext::default().with_record(read);
+        for permission in mapped().iter() {
+            assert_eq!(
+                answer(&consent, shipped_policy(), permission),
+                ConsentSignal::Revoke,
+                "every purpose the module maps is refused, {} included",
+                permission.as_str()
+            );
+        }
+        assert_eq!(
+            TcfModule::new().read_signal(&consent),
+            None,
+            "and the standalone string is not vouched for"
+        );
+        assert_eq!(
+            read_with("__gpp_sid=2", &settings)
+                .as_ref()
+                .map(SignalRecord::status),
+            Some(SignalStatus::Absent),
+            "a hint with no string beside it leaves nothing to read"
+        );
+    }
+
+    #[test]
+    fn the_auction_gate_reads_the_record_this_module_reports() {
+        use trusted_server_core::consent::consent_allows_server_side_auction;
+        use trusted_server_core::consent::jurisdiction::Jurisdiction;
+
+        let settings = Settings::default();
+        let gate = |cookie: &str, jurisdiction: Jurisdiction| {
+            let consent = ConsentContext::new(jurisdiction);
+            let consent = match read_with(cookie, &settings) {
+                Some(read) => consent.with_record(read),
+                None => consent,
+            };
+            consent_allows_server_side_auction(&consent)
+        };
+        let california = || Jurisdiction::UsState("CA".to_owned());
+        let storage_only = encode_tc_string(&[true], now_deciseconds());
+        let contextual_only = encode_tc_string(&[false, true], now_deciseconds());
+        let expired = encode_tc_string(&[true], 0);
+        assert!(
+            gate(&format!("euconsent-v2={storage_only}"), Jurisdiction::Gdpr),
+            "Purpose 1 alone runs the auction in a GDPR place"
+        );
+        assert!(
+            !gate(
+                &format!("euconsent-v2={contextual_only}"),
+                Jurisdiction::Gdpr
+            ),
+            "Purpose 2 alone does not"
+        );
+        assert!(
+            !gate(&format!("euconsent-v2={expired}"), california()),
+            "an expired string shuts the gate outside GDPR too"
+        );
+        assert!(
+            !gate("__gpp_sid=2", california()),
+            "so does an EU section named only by a hint"
+        );
+        assert!(
+            !gate("euconsent-v2=not-a-tc-string", california()),
+            "and a TC String that cannot be read"
+        );
+        assert!(
+            !gate("__gpp=DBACNY~not-a-tc-string~1YNN", california()),
+            "and an EU section of a GPP string that cannot be read"
+        );
+        assert!(
+            gate("other=1", california()),
+            "a US state with no EU signal runs it"
         );
     }
 

@@ -178,12 +178,13 @@ its signal from the request, through `read` on the trait, and answers a
 record: the string as received, whether it decoded, could not be read, has
 expired or was left as received, where it came from, whether the module says
 the regulation its scheme answers for applies, the sections a sectioned
-signal carries, and the decoded form in the module's own type. The records
-every module answered, with the request's jurisdiction, are the consent
-context the permission assembly, the bid request builders and the identity
-graph read. A module reads its own record back when a permission is asked,
-so it answers the same as every other reader of the request about expiry and
-which string is in force, and nothing decodes a string twice.
+signal carries, the permissions the signal itself consents to, and the
+decoded form in the module's own type. The records every module answered,
+with the request's jurisdiction, are the consent context the permission
+assembly, the server-side auction gate, the bid request builders and the
+identity graph read. A module reads its own record back when a permission
+is asked, so it answers the same as every other reader of the request about
+expiry and which string is in force, and nothing decodes a string twice.
 
 ## The terms the data is available under
 
