@@ -905,7 +905,9 @@ auction_timeout_ms = 500
 # Google's tag, Tag Manager container and AdSense loader written on the page
 # from these settings, for a publisher whose pages cannot carry them. The
 # consent mode defaults are written first, and the four consent types Google
-# requires for its own services default to denied.
+# requires for its own services default to denied. The loaders and the
+# noscript iframe reach only a reader whose permissions allow storage on the
+# device.
 # Name "google-tag" in [tag] modules and "tag.google-tag" in a [[serve]] entry
 # for "text/html".
 # [tag.google-tag]
