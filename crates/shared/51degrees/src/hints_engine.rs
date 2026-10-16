@@ -77,8 +77,9 @@ impl ClientHintsCall {
     /// hints or the call could not be made. A failure is a logged line, never
     /// an error the request carries.
     ///
-    /// The evidence is the request's, the same every 51Degrees module sends,
-    /// so the answer is the one already held for this request.
+    /// The evidence is the request's `User-Agent` and `Sec-CH-UA` hints alone,
+    /// so the answer held for one reader serves every reader whose browser
+    /// sends the same values.
     pub async fn accept_ch(
         &self,
         request_info: &dyn RequestInfo,
@@ -237,23 +238,94 @@ mod tests {
         assert_eq!(sent.len(), 1, "one data call");
     }
 
-    /// The address is sent with the `User-Agent`, as every 51Degrees module
-    /// sends it, so the one answer held for this request is the answer the
-    /// hints are read from.
+    /// A reader from `address`, on Chrome, carrying the `Sec-CH-UA` hints
+    /// Chrome sends unasked, cookies, and a header that is not a hint.
+    fn reader(address: &str, cookies: &'static str) -> OwnedRequestInfo {
+        let mut headers = http::HeaderMap::new();
+        for (name, value) in [
+            ("user-agent", "Mozilla/5.0"),
+            ("sec-ch-ua", "\"Chromium\";v=\"140\""),
+            ("sec-ch-ua-mobile", "?0"),
+            ("sec-ch-ua-platform", "\"Windows\""),
+            ("cookie", cookies),
+            ("accept-language", "en-GB"),
+        ] {
+            headers.insert(
+                http::HeaderName::from_static(name),
+                http::HeaderValue::from_static(value),
+            );
+        }
+        OwnedRequestInfo::new(address.to_owned(), headers)
+    }
+
+    /// The request the client builds carries the `User-Agent` and the
+    /// `Sec-CH-UA` hints, and neither the reader's address nor a cookie nor
+    /// any other header.
     #[tokio::test]
-    async fn the_address_is_sent_so_the_one_answer_is_shared() {
+    async fn no_address_and_no_cookie_reaches_the_request_the_client_builds() {
         let client = Arc::new(ScriptedHttpClient::new(&[DATA]));
         let services = services_with(client.clone(), Arc::new(MemoryKvStore::default()));
 
-        call().accept_ch(&chrome(), &services).await;
+        call()
+            .accept_ch(
+                &reader("2.125.160.216", "51D_ScreenPixelsWidth=1080; ts-ec=an-id"),
+                &services,
+            )
+            .await;
 
         let sent = client.sent();
         assert_eq!(sent.len(), 1);
-        assert!(
-            sent[0].body.contains("client-ip=2.125.160.216"),
-            "{}",
-            sent[0].body
+        let body = &sent[0].body;
+        for field in [
+            "user-agent=",
+            "sec-ch-ua=",
+            "sec-ch-ua-mobile=",
+            "sec-ch-ua-platform=",
+        ] {
+            assert!(body.contains(field), "{field} in {body}");
+        }
+        let request = format!("{} {} {:?}", sent[0].uri, body, sent[0].headers);
+        for absent in [
+            "client-ip",
+            "2.125.160.216",
+            "cookie",
+            "51D_",
+            "1080",
+            "ts-ec",
+            "an-id",
+            "accept-language",
+            "en-GB",
+        ] {
+            assert!(
+                !request
+                    .to_ascii_lowercase()
+                    .contains(&absent.to_ascii_lowercase()),
+                "{absent} reached the service: {request}"
+            );
+        }
+    }
+
+    /// Two readers on the same browser share one answer and one call,
+    /// whatever their addresses and cookies.
+    #[tokio::test]
+    async fn one_answer_serves_every_reader_on_the_same_browser() {
+        let client = Arc::new(ScriptedHttpClient::new(&[DATA]));
+        let services = services_with(client.clone(), Arc::new(MemoryKvStore::default()));
+
+        let first = call()
+            .accept_ch(&reader("2.125.160.216", "ts-ec=one"), &services)
+            .await;
+        let second = call()
+            .accept_ch(&reader("192.0.2.1", "ts-ec=two"), &services)
+            .await;
+
+        assert_eq!(
+            client.sent().len(),
+            1,
+            "the second reader reads the held answer"
         );
+        assert!(first.is_some());
+        assert_eq!(first, second);
     }
 
     /// A request with no `User-Agent` names no browser for the service to

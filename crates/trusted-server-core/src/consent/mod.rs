@@ -75,15 +75,30 @@ pub fn request_jurisdiction(
 
 /// Whether a server-side auction may be dispatched for this request.
 ///
-/// Reads the resolved permission state rather than any scheme's record, so
-/// the place baseline and every configured module have already had their
-/// say. The auction selects advertising from the request, so it runs when
-/// [`Permission::SelectBasicAds`] is set, which under a baseline that requires
-/// a signal means a module granted it, and under a baseline that grants it
-/// outright means no module revoked it.
+/// Fails closed where the request's jurisdiction is GDPR or unknown, or a
+/// record says the regulation its scheme answers for applies. The auction
+/// then runs only when a record that applies holds the visitor's consent to
+/// store and access information on the device,
+/// [`Permission::StoreOnDevice`]. A request from a known jurisdiction outside
+/// GDPR with no record that applies runs freely.
+///
+/// The gate reads the records and the jurisdiction, not the resolved
+/// permissions, so the place rules, the permission policy, an opt-out and a
+/// module that grants without a record that applies leave it unchanged.
 #[must_use]
-pub fn permissions_allow_server_side_auction(permissions: &PermissionState) -> bool {
-    permissions.is_set(Permission::SelectBasicAds)
+pub fn consent_allows_server_side_auction(consent: &ConsentContext) -> bool {
+    let requires_consent = consent.applies()
+        || matches!(
+            consent.jurisdiction,
+            jurisdiction::Jurisdiction::Gdpr | jurisdiction::Jurisdiction::Unknown
+        );
+    if !requires_consent {
+        return true;
+    }
+    consent
+        .records
+        .iter()
+        .any(|record| record.applies() && record.consented().contains(Permission::StoreOnDevice))
 }
 
 /// Filters Extended User IDs through the resolved permission state.
@@ -172,6 +187,7 @@ fn log_consent_context(ctx: &ConsentContext) {
 mod tests {
     use http::HeaderMap;
 
+    use super::jurisdiction::Jurisdiction;
     use super::*;
     use crate::evidence::{OwnedRequestInfo, RequestInfo};
     use crate::module_context::{ModuleCall, test_support};
@@ -315,35 +331,217 @@ mod tests {
         );
     }
 
+    /// A record of a regulation that applies, holding the visitor's consent
+    /// to `consented`, as a module reports a consent string it decoded.
+    fn consenting(consented: &[Permission]) -> SignalRecord {
+        SignalRecord::new("consent", SignalStatus::Decoded)
+            .with_value("consent-string")
+            .with_applies(true)
+            .with_consented(consented.iter().copied().collect())
+    }
+
+    /// The permissions the shipped policy resolves in a place where the
+    /// modules grant `granted` and revoke `revoked`.
+    fn resolved(
+        country: &str,
+        region: Option<&str>,
+        granted: &[Permission],
+        revoked: &[Permission],
+    ) -> PermissionState {
+        PermissionMaps::standard().resolve_with(Some(country), region, |permission, _| {
+            if granted.contains(&permission) {
+                ConsentSignal::Grant
+            } else if revoked.contains(&permission) {
+                ConsentSignal::Revoke
+            } else {
+                ConsentSignal::Neutral
+            }
+        })
+    }
+
+    /// Whether the gate passes a request in `jurisdiction` carrying
+    /// `records`, whose modules resolved `permissions`.
+    fn gate(
+        jurisdiction: Jurisdiction,
+        records: Vec<SignalRecord>,
+        permissions: PermissionState,
+    ) -> bool {
+        let consent = records.into_iter().fold(
+            ConsentContext::new(jurisdiction),
+            ConsentContext::with_record,
+        );
+        crate::ec::EcContext::new_for_test(None, consent)
+            .with_permissions_for_test(permissions)
+            .server_side_auction_allowed()
+    }
+
+    fn california() -> Jurisdiction {
+        Jurisdiction::UsState("CA".to_owned())
+    }
+
     #[test]
-    fn the_auction_runs_where_basic_ad_selection_is_set() {
-        // US/CA maps to us-opt-out, where advertising_marketing.first_party.contextual
-        // is granted with no signal.
-        let permissions = PermissionMaps::standard().resolve(Some("US"), |_| false);
+    fn the_auction_runs_freely_only_outside_gdpr_with_no_record_that_applies() {
+        let allows = |consent: ConsentContext| consent_allows_server_side_auction(&consent);
         assert!(
-            permissions_allow_server_side_auction(&permissions),
-            "a granted baseline with no signal allows the auction"
+            allows(ConsentContext::new(california())),
+            "a US state with no record that applies runs the auction"
         );
-        // FR maps to gdpr-eu, where every purpose requires a signal, so with
-        // none the auction fails closed.
-        let permissions = PermissionMaps::standard().resolve(Some("FR"), |_| false);
+        assert!(allows(ConsentContext::new(Jurisdiction::NonRegulated)));
         assert!(
-            !permissions_allow_server_side_auction(&permissions),
-            "a requires-signal baseline with no signal fails closed"
+            !allows(ConsentContext::new(Jurisdiction::Gdpr)),
+            "GDPR with no consent fails closed"
         );
-        // A signal granting basic ad selection opens it.
-        let permissions = PermissionMaps::standard().resolve(Some("FR"), |permission| {
-            permission == Permission::SelectBasicAds
-        });
         assert!(
-            permissions_allow_server_side_auction(&permissions),
-            "a module granting basic ad selection allows the auction"
+            !allows(ConsentContext::new(Jurisdiction::Unknown)),
+            "an unknown jurisdiction with no consent fails closed"
         );
-        // An unresolved place takes the top node, which requires a signal.
-        let permissions = PermissionMaps::standard().resolve(None, |_| false);
         assert!(
-            !permissions_allow_server_side_auction(&permissions),
-            "an unknown place without a signal fails closed"
+            allows(
+                ConsentContext::new(Jurisdiction::Gdpr)
+                    .with_record(consenting(&[Permission::StoreOnDevice]))
+            ),
+            "consent to storage from a record that applies runs it"
+        );
+        assert!(
+            !allows(
+                ConsentContext::new(Jurisdiction::Gdpr)
+                    .with_record(consenting(&[Permission::StoreOnDevice]).with_applies(false))
+            ),
+            "and only from a record that applies"
+        );
+    }
+
+    // Each request below is one whose resolved permissions answer the other
+    // way, so each test shows the gate reading the records and the
+    // jurisdiction, not the permissions.
+
+    #[test]
+    fn the_gate_asks_for_consent_to_storage_not_to_basic_ad_selection() {
+        assert!(
+            gate(
+                Jurisdiction::Gdpr,
+                vec![consenting(&[Permission::StoreOnDevice])],
+                resolved(
+                    "FR",
+                    None,
+                    &[Permission::StoreOnDevice],
+                    &[Permission::SelectBasicAds]
+                ),
+            ),
+            "consent to storage alone runs the auction, though basic ad selection is unset"
+        );
+        assert!(
+            !gate(
+                Jurisdiction::Gdpr,
+                vec![consenting(&[Permission::SelectBasicAds])],
+                resolved(
+                    "FR",
+                    None,
+                    &[Permission::SelectBasicAds],
+                    &[Permission::StoreOnDevice]
+                ),
+            ),
+            "consent to basic ad selection alone does not, though it is set"
+        );
+    }
+
+    #[test]
+    fn an_expired_record_that_applies_shuts_the_gate_in_every_place() {
+        let expired = SignalRecord::new("consent", SignalStatus::Expired)
+            .with_value("consent-string")
+            .with_applies(true);
+        assert!(
+            !gate(
+                california(),
+                vec![expired],
+                resolved("US", Some("CA"), &[], &[])
+            ),
+            "an expired record answers nothing, and the auction still waits for consent \
+             where the place grants basic ad selection outright"
+        );
+    }
+
+    #[test]
+    fn the_gate_reads_a_record_whatever_the_policy_lets_it_answer() {
+        // A policy that silences the record leaves every permission at the
+        // place's baseline, and the record's own consent still decides.
+        assert!(
+            gate(
+                Jurisdiction::Gdpr,
+                vec![consenting(&[Permission::StoreOnDevice])],
+                resolved("FR", None, &[], &[]),
+            ),
+            "a silenced record consenting to storage runs the auction"
+        );
+        assert!(
+            !gate(
+                california(),
+                vec![consenting(&[])],
+                resolved("US", Some("CA"), &[], &[])
+            ),
+            "and a silenced record refusing it shuts the gate where the place grants \
+             basic ad selection"
+        );
+    }
+
+    #[test]
+    fn a_grant_from_a_module_with_no_record_that_applies_leaves_the_gate_shut() {
+        // A module answering a preference of its own, with no record that
+        // applies, grants storage and basic ad selection in a GDPR place.
+        let granted = [Permission::StoreOnDevice, Permission::SelectBasicAds];
+        assert!(
+            !gate(
+                Jurisdiction::Gdpr,
+                vec![],
+                resolved("FR", None, &granted, &[])
+            ),
+            "the grant does not stand in for consent from a record that applies"
+        );
+        assert!(
+            !gate(
+                Jurisdiction::Gdpr,
+                vec![consenting(&[])],
+                resolved("FR", None, &granted, &[])
+            ),
+            "nor stand over a record that applies and refuses storage"
+        );
+    }
+
+    #[test]
+    fn the_gate_follows_the_jurisdiction_not_the_place_rules_or_an_opt_out() {
+        assert!(
+            gate(
+                Jurisdiction::NonRegulated,
+                vec![],
+                PermissionState::default()
+            ),
+            "a place outside GDPR whose rules leave basic ad selection unset still runs it"
+        );
+        // An opt-out whose policy revokes basic ad selection, as `revokes: all`
+        // does.
+        let opted_out = SignalRecord::new("opt-out", SignalStatus::Decoded).with_value("opted-out");
+        assert!(
+            gate(
+                california(),
+                vec![opted_out],
+                resolved("US", Some("CA"), &[], &[Permission::SelectBasicAds]),
+            ),
+            "and an opt-out does not stop it"
+        );
+    }
+
+    #[test]
+    fn a_record_that_applies_with_nothing_decoded_shuts_the_gate_in_every_place() {
+        // A module that sees its regulation applies with no string it could
+        // decode, such as a hint naming a section with no string beside it.
+        let absent = SignalRecord::new("consent", SignalStatus::Absent).with_applies(true);
+        assert!(
+            !gate(
+                california(),
+                vec![absent],
+                resolved("US", Some("CA"), &[], &[])
+            ),
+            "the regulation applies, so the auction waits for consent to storage"
         );
     }
 

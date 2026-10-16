@@ -1,62 +1,42 @@
-//! The evidence a cloud call sends for a request, being the address, the
-//! `User-Agent` and what the browser gathered.
+//! The evidence a cloud call sends for a request, being the `User-Agent` and
+//! the `Sec-CH-UA` client hints the browser sent with it.
 //!
-//! The answer is held by the evidence, so the same visitor asking again
-//! costs no call.
-
-use std::net::IpAddr;
+//! Which hints the service asks for depends on the browser alone, so nothing
+//! else is sent, neither the address nor a cookie. The answer is held by the
+//! evidence, so every reader whose browser sends the same values shares one
+//! answer and one call.
 
 use trusted_server_core::evidence::RequestInfo;
 
-use crate::client::{BROWSER_EVIDENCE, Evidence};
+use crate::client::Evidence;
 
-/// Builds the evidence for a request.
-///
-/// The address is parsed and written back out, so the same address written two
-/// ways, such as `2001:db8::1` and `2001:0db8:0000::0001`, gives one key and
-/// one call.
+/// Builds the evidence for a request, being its `User-Agent` and each of its
+/// `Sec-CH-UA` headers, by lower case name and in name order, so the same
+/// headers always give the same cache key.
 #[must_use]
 pub fn evidence_for(request_info: &dyn RequestInfo) -> Evidence {
-    let raw = request_info.client_ip();
-    let client_ip = raw
-        .parse::<IpAddr>()
-        .map_or_else(|_| raw.to_owned(), |address| address.to_string());
+    let mut client_hints: Vec<(String, String)> = request_info
+        .header_names()
+        .into_iter()
+        .filter(|name| is_user_agent_hint(name))
+        .filter_map(|name| {
+            request_info
+                .header(name)
+                .map(|value| (name.to_ascii_lowercase(), value.to_owned()))
+        })
+        .collect();
+    client_hints.sort();
     Evidence {
-        client_ip,
         user_agent: request_info.user_agent().to_owned(),
-        browser: browser_evidence(request_info),
+        client_hints,
     }
 }
 
-/// Reads the evidence the browser gathered from the request's cookies.
-///
-/// The screen and the high entropy client hints exist only in the browser, so
-/// a page writes them to `51D_` cookies. A first page view has none, and the
-/// service answers from the `User-Agent`.
-fn browser_evidence(request_info: &dyn RequestInfo) -> Vec<(&'static str, String)> {
-    let Some(header) = request_info.header("cookie") else {
-        return Vec::new();
-    };
-    let mut found = Vec::new();
-    // In BROWSER_EVIDENCE order rather than header order, so the same cookies
-    // always give the same cache key.
-    for name in BROWSER_EVIDENCE {
-        if let Some(value) = cookie_value(header, name) {
-            found.push((*name, value));
-        }
-    }
-    found
-}
-
-/// The value of one cookie in a `Cookie` header, or `None`.
-///
-/// Split on the first `=` only, because a base64 value carries `=` padding.
-fn cookie_value(header: &str, name: &str) -> Option<String> {
-    header.split(';').find_map(|part| {
-        let part = part.trim();
-        let (key, value) = part.split_once('=')?;
-        (key == name && !value.is_empty()).then(|| value.to_owned())
-    })
+/// Whether `name` is `Sec-CH-UA` or one of the `Sec-CH-UA-` hints, which
+/// describe the browser and the device it runs on.
+fn is_user_agent_hint(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    name == "sec-ch-ua" || name.starts_with("sec-ch-ua-")
 }
 
 #[cfg(test)]
@@ -68,109 +48,54 @@ mod tests {
     const CHROME: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                           (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
 
-    fn request_with_cookies(cookies: &str) -> OwnedRequestInfo {
-        let mut headers = http::HeaderMap::new();
-        headers.insert(
-            http::header::USER_AGENT,
-            http::HeaderValue::from_static(CHROME),
-        );
-        headers.insert(
-            http::header::COOKIE,
-            http::HeaderValue::from_str(cookies).expect("should build the test header"),
-        );
-        OwnedRequestInfo::new("2.125.160.216".to_owned(), headers)
-    }
-
-    /// The browser's evidence is read off its `51D_` cookies, in a fixed order
-    /// whatever order the browser sent them in, because the evidence is part
-    /// of the cache key.
-    #[test]
-    fn the_browsers_evidence_is_read_off_its_cookies() {
-        /// A case's label, the `Cookie` header, and the evidence expected.
-        type Case = (
-            &'static str,
-            &'static str,
-            &'static [(&'static str, &'static str)],
-        );
-
-        const SCREEN: &[(&str, &str)] = &[
-            ("51D_ScreenPixelsWidth", "1080"),
-            ("51D_ScreenPixelsHeight", "2424"),
-        ];
-        let cases: &[Case] = &[
-            (
-                // The screen exists only in the browser, so this is the only way
-                // the server ever learns it.
-                "the screen, beside another cookie",
-                "ts-ec=something; 51D_ScreenPixelsWidth=1080; 51D_ScreenPixelsHeight=2424",
-                SCREEN,
-            ),
-            (
-                "the screen, sent the other way round",
-                "51D_ScreenPixelsHeight=2424; 51D_ScreenPixelsWidth=1080",
-                SCREEN,
-            ),
-            (
-                // Nothing has run in the browser yet on a first page view.
-                "a first page view",
-                "ts-ec=something",
-                &[],
-            ),
-            (
-                // The high entropy hints are base64 with `=` padding, which a split
-                // on every `=` would cut off.
-                "a base64 value and its padding",
-                "51D_GetHighEntropyValues=eyJtb2RlbCI6IlBpeGVsIn0=",
-                &[("51D_GetHighEntropyValues", "eyJtb2RlbCI6IlBpeGVsIn0=")],
-            ),
-            (
-                // An empty value tells the service nothing and would only split
-                // the cache.
-                "an empty value",
-                "51D_ScreenPixelsWidth=; 51D_ScreenPixelsHeight=2424",
-                &[("51D_ScreenPixelsHeight", "2424")],
-            ),
-        ];
-        for &(case, cookies, expected) in cases {
-            let expected: Vec<(&str, String)> = expected
-                .iter()
-                .map(|(name, value)| (*name, (*value).to_owned()))
-                .collect();
-
-            assert_eq!(
-                evidence_for(&request_with_cookies(cookies)).browser,
-                expected,
-                "{case}"
+    /// A request from an address, carrying `headers`.
+    fn request_with(headers: &[(&'static str, &'static str)]) -> OwnedRequestInfo {
+        let mut map = http::HeaderMap::new();
+        for (name, value) in headers {
+            map.append(
+                http::HeaderName::from_static(name),
+                http::HeaderValue::from_static(value),
             );
         }
+        OwnedRequestInfo::new("2.125.160.216".to_owned(), map)
     }
 
-    /// The address is written back out in its one canonical form, so the same
-    /// address written two ways is one cache key and one call. An address that
-    /// does not parse is passed on as it came.
+    /// The `User-Agent` and the `Sec-CH-UA` hints are the whole of the
+    /// evidence. The address, the cookies, a hint outside that family and
+    /// every other header are left out.
     #[test]
-    fn the_address_is_sent_in_one_form() {
-        for (case, address, expected) in [
-            (
-                "an IPv6 address written out in full",
-                "2001:0db8:0000::0001",
-                "2001:db8::1",
-            ),
-            (
-                "the same address written short",
-                "2001:db8::1",
-                "2001:db8::1",
-            ),
-            ("an IPv4 address", "192.0.2.1", "192.0.2.1"),
-            (
-                "an address that does not parse",
-                "not-an-address",
-                "not-an-address",
-            ),
-        ] {
-            let request = OwnedRequestInfo::new(address.to_owned(), http::HeaderMap::new());
+    fn the_evidence_is_the_user_agent_and_the_sec_ch_ua_hints() {
+        let request = request_with(&[
+            ("user-agent", CHROME),
+            ("sec-ch-ua-platform", "\"Windows\""),
+            ("sec-ch-ua", "\"Chromium\";v=\"140\""),
+            ("sec-ch-ua-mobile", "?0"),
+            ("sec-ch-prefers-color-scheme", "dark"),
+            ("cookie", "51D_ScreenPixelsWidth=1080; ts-ec=something"),
+            ("accept-language", "en-GB"),
+        ]);
 
-            assert_eq!(evidence_for(&request).client_ip, expected, "{case}");
-        }
+        assert_eq!(
+            evidence_for(&request),
+            Evidence {
+                user_agent: CHROME.to_owned(),
+                client_hints: vec![
+                    ("sec-ch-ua".to_owned(), "\"Chromium\";v=\"140\"".to_owned()),
+                    ("sec-ch-ua-mobile".to_owned(), "?0".to_owned()),
+                    ("sec-ch-ua-platform".to_owned(), "\"Windows\"".to_owned()),
+                ],
+            }
+        );
+    }
+
+    /// The hints are in name order whatever order the browser sent them in,
+    /// because the evidence is part of the cache key.
+    #[test]
+    fn the_hints_are_in_name_order_whatever_order_they_came_in() {
+        let one = request_with(&[("sec-ch-ua-mobile", "?0"), ("sec-ch-ua", "\"A\"")]);
+        let other = request_with(&[("sec-ch-ua", "\"A\""), ("sec-ch-ua-mobile", "?0")]);
+
+        assert_eq!(evidence_for(&one), evidence_for(&other));
+        assert_eq!(evidence_for(&one).client_hints[0].0, "sec-ch-ua");
     }
 }
