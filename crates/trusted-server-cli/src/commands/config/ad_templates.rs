@@ -487,13 +487,26 @@ fn format_slot(slot: &CreativeOpportunitySlot, gam_network_id: &str, section: &s
     )
 }
 
+/// Formats one format for `--details`, with any viewport bound under the name
+/// the configuration gives it.
 fn format_format(format: &CreativeOpportunityFormat) -> String {
     let media_type = match format.media_type {
         MediaType::Banner => "banner",
         MediaType::Video => "video",
         MediaType::Native => "native",
     };
-    format!("{}x{} {media_type}", format.width, format.height)
+    let bounds: String = [
+        format
+            .min_viewport_width
+            .map(|min| format!(" min_viewport_width={min}")),
+        format
+            .max_viewport_width
+            .map(|max| format!(" max_viewport_width={max}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    format!("{}x{} {media_type}{bounds}", format.width, format.height)
 }
 
 fn format_providers(slot: &CreativeOpportunitySlot) -> String {
@@ -612,6 +625,44 @@ mod tests {
         assert!(
             output.contains("formats=[300x250 banner]"),
             "should include details"
+        );
+    }
+
+    #[test]
+    fn match_details_include_each_formats_viewport_bounds() {
+        let config_text = format!(
+            "{}\n\
+             [[creative_opportunities.slot]]\n\
+             id = \"billboard\"\n\
+             page_patterns = [\"/video/*\"]\n\
+             formats = [\n\
+             {{ width = 970, height = 250, min_viewport_width = 1040 }},\n\
+             {{ width = 728, height = 90, min_viewport_width = 800, max_viewport_width = 1039 }},\n\
+             {{ width = 320, height = 50, max_viewport_width = 599 }},\n\
+             ]\n",
+            config_with_slots()
+        );
+        let (_temp, config) = project_with_config(&config_text);
+        let mut out = Vec::new();
+
+        run_ad_templates_with_writer(
+            &AdTemplatesCommand::Match(AdTemplatesMatchArgs {
+                config,
+                path_or_url: "/video/clip".to_string(),
+                details: true,
+            }),
+            &mut out,
+        )
+        .expect("should match slots");
+
+        let output = String::from_utf8(out).expect("should be utf8");
+        assert!(
+            output.contains(
+                "formats=[970x250 banner min_viewport_width=1040, \
+                 728x90 banner min_viewport_width=800 max_viewport_width=1039, \
+                 320x50 banner max_viewport_width=599]"
+            ),
+            "should print each format's viewport bounds: {output}"
         );
     }
 
