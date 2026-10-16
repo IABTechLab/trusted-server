@@ -58,9 +58,6 @@ pub struct AnswerCache {
 
 impl AnswerCache {
     /// The cache with the lifetimes `config` sets.
-    ///
-    /// Its loads run in the caller, because a load blocks the thread it runs
-    /// on while the service answers.
     #[must_use]
     pub fn new(config: &LoadingCacheConfig) -> Self {
         Self {
@@ -68,7 +65,6 @@ impl AnswerCache {
                 name: CACHE,
                 lifetimes: config.lifetimes(DEFAULT_LIFETIMES),
                 memory_entries: 4096,
-                detachable: false,
             },
         }
     }
@@ -269,7 +265,6 @@ mod tests {
                 store_idle: Duration::from_secs(120),
             }
         );
-        assert!(!cache.spec.detachable);
     }
 
     /// The lifetimes come from the cache's own `[cache.51degrees-answers]`
