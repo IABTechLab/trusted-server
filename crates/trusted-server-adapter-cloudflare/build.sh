@@ -33,4 +33,9 @@ if [ -z "$WORKER_VERSION" ]; then
   echo "error: could not determine the worker crate version from Cargo.lock" >&2
   exit 1
 fi
-cargo install -q --force --version "=$WORKER_VERSION" worker-build && worker-build --release
+# `--locked` installs against the lockfile worker-build publishes, rather
+# than re-resolving its dependency tree. Without it the install breaks on
+# upstream yanks it has no say over: `binary-install` 0.4.1 requires
+# `zip ^2.1.3`, and the whole `zip` 2.x line is yanked, so a fresh resolve
+# fails outright. A warm Cargo index masked this until the index refreshed.
+cargo install -q --force --version "=$WORKER_VERSION" --locked worker-build && worker-build --release
