@@ -373,6 +373,7 @@ mod tests {
 
     #[test]
     fn client_configs_are_cached_by_verification_and_http1_only() {
+        crate::tls::install_crypto_provider();
         let secure = client_config(VerifyMode::Secure);
         let secure_again = client_config(VerifyMode::Secure);
         let insecure = client_config(VerifyMode::Insecure);
