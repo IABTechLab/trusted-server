@@ -903,6 +903,23 @@ No module is the default, so a default deployment is not tied to any host geo se
 module = "platform"
 ```
 
+**Location headers.** No response carries an `x-geo-*` header unless the
+deployment selects `headers.geo` and names it in a `[[serve]]` entry. On the
+responses the entry covers, the middleware then writes the location already
+resolved for the request, being `x-geo-city`, `x-geo-country`,
+`x-geo-continent`, `x-geo-coordinates`, `x-geo-metro-code` and `x-geo-region`
+where the answer has them, and `x-geo-info-available` as `true` or `false`.
+Selecting the module without such an entry is refused when the settings load.
+
+```toml
+[headers]
+modules = ["geo"]
+
+[[serve]]
+media_type = "text/html"
+middleware = ["headers.geo"]
+```
+
 **Environment Override**:
 
 ```bash
