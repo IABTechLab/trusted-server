@@ -63,9 +63,6 @@ fastly compute serve
 
 ## Development
 
-> [!IMPORTANT]
-> Every feature pull request needs a spec. When in doubt, write one. See [Features start with a spec](CONTRIBUTING.md#features-start-with-a-spec).
-
 ```bash
 # Format code
 cargo fmt
@@ -87,6 +84,9 @@ cargo test-spin        # Spin adapter (native host)
 # Install the pre-commit URL-host linter hook (once per checkout)
 ts dev install-hooks
 ```
+
+> [!IMPORTANT]
+> Every feature pull request needs a spec. When in doubt, write one. See [Features start with a spec](CONTRIBUTING.md#features-start-with-a-spec).
 
 Contributors should run `ts dev install-hooks` to enable the pre-commit
 URL-host linter; see [CONTRIBUTING.md](CONTRIBUTING.md) for that and the rest of
