@@ -1074,6 +1074,14 @@ async fn dispatch_fallback(
         return http_error(&report);
     }
 
+    // A crawler asking for robots.txt is answered once the modules have
+    // prepared the request, before the Edge Cookie steps and the request
+    // filters, so nothing is read from its cookies or written back, and no
+    // filter's answer stands in for the file.
+    if asks_for_robots_txt(&state.settings, &method, &path) {
+        return answer_robots_txt(state, services, req, &method).await;
+    }
+
     let mut ec = build_ec_request_state(&state.settings, services, &req).await;
     if let Some(report) = ec.setup_error.take() {
         let response = http_error(&report);
@@ -1204,6 +1212,58 @@ async fn dispatch_fallback(
 
     let response = result.unwrap_or_else(|e| http_error(&e));
     attach_dispatch_extensions(response, ec, effects)
+}
+
+/// Whether the request is a crawler's `GET` or `HEAD` of the robots.txt that
+/// `[robots-txt]` makes.
+fn asks_for_robots_txt(settings: &Settings, method: &Method, path: &str) -> bool {
+    settings.robots_txt.is_some()
+        && path == trusted_server_core::robots_txt::ROBOTS_TXT_PATH
+        && matches!(*method, Method::GET | Method::HEAD)
+}
+
+/// Answers robots.txt through the publisher path with an empty Edge Cookie
+/// context and no auction, so none of the crawler's cookies or consent
+/// signals are read, and attaches no Edge Cookie state, so the finalize step
+/// writes nothing back.
+async fn answer_robots_txt(
+    state: &AppState,
+    services: &RuntimeServices,
+    req: Request,
+    method: &Method,
+) -> Response {
+    let answer = handle_publisher_request(
+        AppContext {
+            settings: &state.settings,
+            integration_registry: state.registry.as_ref(),
+        },
+        services,
+        None,
+        &mut EcContext::default(),
+        AuctionDispatch {
+            orchestrator: &state.orchestrator,
+            slots: &[],
+            registry: None,
+        },
+        req,
+        EdgeCacheHeader::SurrogateControl,
+    )
+    .await;
+    let response = match answer {
+        Ok(answer) => {
+            publisher_response_into_streaming_response(
+                answer,
+                method,
+                Arc::clone(&state.settings),
+                state.registry.as_ref(),
+                Arc::clone(&state.orchestrator),
+                services.clone(),
+            )
+            .await
+        }
+        Err(report) => Err(report),
+    };
+    response.unwrap_or_else(|report| http_error(&report))
 }
 
 /// Returns `true` when an asset response should carry a (streamed) body.
