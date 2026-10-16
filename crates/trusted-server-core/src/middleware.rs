@@ -552,6 +552,13 @@ impl PhaseEntry {
                 .as_deref()
                 .is_none_or(|prefix| path.starts_with(prefix))
     }
+
+    /// The prefix the paths the entry covers begin with. The path of a
+    /// request for a page begins with `/`, so `/` covers the same pages as
+    /// no path at all.
+    fn prefix(&self) -> &str {
+        self.path.as_deref().unwrap_or("/")
+    }
 }
 
 /// One phase's entries, in the order written.
@@ -606,29 +613,22 @@ impl PhaseEntries {
     }
 
     /// The entry that makes the document the origin does not have at
-    /// `path`, being the one with the longest path prefix covering it that
-    /// names a middleware, for a media type core streams other than HTML. The
-    /// first written wins between two of the same length.
+    /// `path`, being the first written, for a media type core streams other
+    /// than HTML, whose `path` is `path` itself and that names a middleware.
+    /// A longer path the entry's `path` begins, and a folder, written with its
+    /// closing slash, get nothing made, so a page the origin does not have
+    /// keeps the origin's answer.
     #[must_use]
     pub fn making(&self, path: &str) -> Option<&PhaseEntry> {
-        self.0
-            .iter()
-            .filter(|entry| {
-                entry.media_type != HTML_MEDIA_TYPE
-                    && is_dispatched_media_type(&entry.media_type)
-                    && entry
-                        .path
-                        .as_deref()
-                        .is_some_and(|prefix| path.starts_with(prefix))
-                    && !entry.middleware.is_empty()
-            })
-            .fold(None, |best: Option<&PhaseEntry>, entry| {
-                let length = |entry: &PhaseEntry| entry.path.as_deref().map_or(0, str::len);
-                match best {
-                    Some(best) if length(best) >= length(entry) => Some(best),
-                    _ => Some(entry),
-                }
-            })
+        if path.ends_with('/') {
+            return None;
+        }
+        self.0.iter().find(|entry| {
+            entry.media_type != HTML_MEDIA_TYPE
+                && is_dispatched_media_type(&entry.media_type)
+                && entry.path.as_deref() == Some(path)
+                && !entry.middleware.is_empty()
+        })
     }
 
     /// Checks each entry's media type, path and names, and that no entry is
@@ -692,13 +692,9 @@ impl PhaseEntries {
             }
             if let Some(earlier) = self.0[..index].iter().position(|earlier| {
                 earlier.media_type == entry.media_type
-                    && match (&earlier.path, &entry.path) {
-                        (None, _) => true,
-                        (Some(covering), Some(path)) => path.starts_with(covering.as_str()),
-                        (Some(_), None) => false,
-                    }
+                    && entry.prefix().starts_with(earlier.prefix())
             }) {
-                return Err(if self.0[earlier].path == entry.path {
+                return Err(if self.0[earlier].prefix() == entry.prefix() {
                     format!(
                         "{at} covers the same pages as [[{phase}]] entry {}, and a response \
                          takes the first entry that covers it, so this one is never reached. \
