@@ -31,8 +31,7 @@ use crate::settings::Settings;
 /// Kept apart from [`DeviceSignals`] on purpose. Those signals answer one
 /// question, whether this request looks like a browser, and are stored in the
 /// identity graph. These answer a different one, what a bidder is being asked
-/// to price, and are stored nowhere. Merging them would put advertising fields
-/// into a type the identity path serialises.
+/// to price, and are stored nowhere.
 ///
 /// Every field is optional because every source is partial. A module that
 /// resolves a device type but not a model fills what it has, and the `OpenRTB`
