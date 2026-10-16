@@ -204,15 +204,25 @@ A middleware works on `text/html` unless it says otherwise, with
 handle is refused when the registry is built. On a media type other than
 HTML an action may carry a stream processor alone, which is handed the body
 after core has moved the origin's addresses in it, chunk by chunk, with the
-last chunk marked. Head markup and the element and text handlers are
-decisions about HTML, and an action that makes one on another media type is
-refused by name when the chain is planned.
+last chunk marked, and only for a `200`, whose body is the whole file. Head
+markup and the element and text handlers are decisions about HTML, and an
+action that makes one on another media type is refused by name when the
+chain is planned.
 
 A middleware named in an entry with a path, for a media type other than
-HTML, also runs where the origin answers `404 Not Found` for a path under
-it, on an empty document of the entry's media type, and what it writes is
-the file. A middleware that adds to a file therefore writes the same on an
+HTML, also runs where the origin answers `404 Not Found` for that path
+itself, on an empty document of the entry's media type, and what it writes
+is the file. A middleware that adds to a file therefore writes the same on an
 empty one, with nothing before its first line.
+
+An entry's `path` is a prefix, so a middleware made for one file says which
+path is the file with `handles_path`, and is left out everywhere else the
+entry covers. One that writes the whole file, whatever the origin sent, says
+so with `writes_whole_document`, and the file is then made in place of any
+answer it would not be handed as a `200` of the entry's media type. One that
+needs the origin's whole body says so with `needs_whole_body`, and the origin
+is then asked without the reader's conditional and range headers. Core's
+`robots_txt` middleware says all three.
 
 ```rust
 struct Sellers;
@@ -249,8 +259,8 @@ A middleware whose decision needs the request's services, or has to wait on
 the key-value store or the network, answers `prepare` with a future. Core
 runs it in the request's handler, before the document is processed, as the
 module the middleware belongs to and with the permissions it declares in
-`required_permissions`. What the future answers is kept under the
-middleware's name in the context's `prepared`, and `create`, which stays
+`required_permissions`. What the future answers is kept under the phase and
+the middleware's name in the context's `prepared`, and `create`, which stays
 synchronous, takes it from there as the type it prepared. A middleware that
 prepares nothing leaves `prepare` at its default and is asked `create` as
 before.
@@ -285,15 +295,18 @@ stored or served from the store, so a middleware that cannot make the
 document it is responsible for fails closed rather than letting an empty or
 unchanged one through. `Refusal::service_unavailable` is the one for a
 source that cannot answer now. The preparations of one document run in the
-order the entry names the middleware, and the first refusal ends them.
+order the entry names the middleware, and the first refusal ends them. Core
+logs a refusal as a warning naming the middleware, and answers a status that
+is not a client or server error with `500`.
 
 On a document that may be stored the fetch phase's preparations are handed
-the request's services and nothing of the reader, because what they answer
-is stored with the document. The serve phase is prepared with the reader's
-state on every document, the one fetched for this reader as much as a copy
-read from the store, so what a serve middleware finds prepared never depends
-on whether its reader was the first. On a document that is not stored both
-phases are prepared with the reader's state.
+the request's services with no client IP, TLS details or client signals, and
+nothing else of the reader, because what they answer is stored with the
+document. The serve phase is prepared with the reader's state on every
+document, the one fetched for this reader as much as a copy read from the
+store, so what a serve middleware finds prepared never depends on whether its
+reader was the first. On a document that is not stored both phases are
+prepared with the reader's state.
 
 ## Proxy implementation rules
 
@@ -435,12 +448,13 @@ that supply a module of one type under one name.
 
 A robots.txt contributor implements `RobotsTxtContributor`. It returns groups
 of records and never bytes, so it cannot produce a malformed file. Trusted
-Server asks it for the request without its query, holds the answer until the
-contributor's `refresh` is due, and writes the file from every contributor
-`[robots-txt] modules` names, in that order. `fingerprint` names the settings
-an answer was given for, so an answer held for other settings is never
-served. Trusted Server hashes it into the key the answer is held under, so
-nothing of it is written to the store.
+Server asks it for the request without its query, on the host the request was
+addressed to and with no client information or host signals in its services,
+holds the answer for that host until the contributor's `refresh` is due, and
+writes the file from every contributor `[robots-txt] modules` names, in that
+order. `fingerprint` names the settings an answer was given for, so an answer
+held for other settings is never served. Trusted Server hashes it into the key
+the answer is held under, so nothing of it is written to the store.
 
 The Fastly adapter is the one adapter that classifies a request, so a device
 module is asked there and on no other adapter. It is shown the User-Agent and
@@ -533,8 +547,9 @@ that names it refuses startup.
 | `MiddlewarePhase::Serve` | On each reader's copy, whether the page came from the store or from the origin     | What the module's request hooks left for it |
 
 A stored page is keyed by the settings and core's build, so a fetch
-middleware that writes markup compiled into its own crate returns that
-markup from `template_key`, and a change to it stores pages again.
+middleware that writes markup or an address compiled into its own crate
+returns that text from `template_key`, and a change to it stores pages
+again.
 
 A middleware is asked once for each document, by `create`, and what it
 answers is used for that document alone, so a handler may hold state between
@@ -559,8 +574,9 @@ A middleware can rely on these rules.
   removed is not asked about again.
 - A script's text arrives in chunks. A handler that needs the whole script
   removes each chunk while keeping a copy, and writes back what it kept with
-  the last chunk. A replacement is written as it is, with no character
-  escaped.
+  the last chunk. A replacement is written as it is, except that a `<` that
+  would end the script, or begin `<script` after `<!--`, is written as
+  `\u003c`.
 - A fetch middleware is told nothing about the reader, because what it leaves
   is what a shared template stores. `MiddlewareContext::document_state` is
   shared by the middleware working on one document in one phase.
@@ -839,8 +855,9 @@ supplies nothing else starts from `IntegrationBuilder::implementations(...)`
 and is named by its id. An adapter takes the selections from the settings and
 the builders it is given with `loading_caches_from` when it builds its state,
 which refuses a name no builder offers a cache from, and hands them to every
-request's services as `LoadingCaches`. A feature that selects nothing loads
-through `NoLoadingCache`. The stock list carries
+request's services as `LoadingCaches`. A feature whose table names no module
+takes the one loading cache module the build links, and loads through
+`NoLoadingCache` when the build links none or several. The stock list carries
 `crates/loading-cache/51degrees`.
 
 ```rust
@@ -861,13 +878,14 @@ caller made, so a copy is shared by every instance that reads the same store.
 
 Code in core, or in a module, loads through the cache with
 `RuntimeServices::load_cached`. It names its cache with a `CacheSpec`, being
-the cache's name, the lifetimes of the memory and store copies, how many
-values the memory copy holds and whether a load may run apart from the request
-that started it, which only a load that never blocks its thread may. Its key
-is a `StoreKey`, which starts with the publisher's `ServerKeyPrefix` from
-`services.server_key_prefix()`, so two publishers sharing a store never share
-a copy. The `Loader` it hands over owns everything it uses, and answers a
-`LoadedValue`, with a lifetime of its own where the source gives one.
+the cache's name, the lifetimes of the memory and store copies and how many
+values the memory copy holds. Its key is a `StoreKey`, which starts with the
+publisher's `ServerKeyPrefix` from `services.server_key_prefix()`, so two
+publishers sharing a store never share a copy. The `Loader` it hands over
+owns everything it uses, and answers a `LoadedValue`, with a lifetime of its
+own where the source gives one. Its value serves every reader, so any
+services it needs come from `services.clone().without_connection()`, never
+the request's own, and `load_cached` hands the cache the same.
 
 ```rust
 let key = StoreKey::new(services.server_key_prefix(), CACHE, digest);

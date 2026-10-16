@@ -424,6 +424,27 @@ async fn every_route_prepares_the_request_exactly_once() {
     );
 }
 
+/// A closed path is answered before any module's preparer runs, as the other
+/// adapters answer it, so no preparer sees or answers a request to it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_closed_path_is_answered_before_any_preparer_runs() {
+    let settings = settings_with(PROBE_BLOCK);
+    let mut service = service_with(settings, &[seam_probe::builder()]);
+
+    let response = get_counted(&mut service, "/_ts/admin/keys/rotate", "closed-path").await;
+
+    assert_eq!(
+        response.status().as_u16(),
+        404,
+        "the closed path should be answered here"
+    );
+    assert_eq!(
+        seam_probe::prepare_runs_for("closed-path"),
+        0,
+        "no preparer should run for a closed path"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 3. Deploy validation reaches a vendor's own rule
 // ---------------------------------------------------------------------------
