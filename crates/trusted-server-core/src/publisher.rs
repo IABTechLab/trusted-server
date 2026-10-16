@@ -5420,6 +5420,10 @@ pub async fn handle_publisher_request(
     let request_info = RequestInfo::from_request(&req, services.client_info());
     let request_host = &request_info.host;
     let request_scheme = &request_info.scheme;
+    // The host the request was addressed to, which a forwarded header never
+    // names. What a preparation holds for every request to a host is keyed
+    // on this, so one request cannot claim another host's answer.
+    let addressed_host = crate::http_util::addressed_host(&req);
 
     log::debug!(
         "Request info: host={}, scheme={} (X-Forwarded-Host: {:?}, Host: {:?}, X-Forwarded-Proto: {:?})",
@@ -6173,6 +6177,7 @@ pub async fn handle_publisher_request(
                     );
                     let module_context = ModuleContext::new(module_request)
                         .with_settings(settings)
+                        .with_addressed_host(&addressed_host)
                         .with_request_state(ec_context, services);
                     let stored_origin_host = location.host_header();
                     let document = TextResponse {
@@ -6592,6 +6597,8 @@ pub async fn handle_publisher_request(
             ec_context,
             services,
         );
+        let fetch_context = fetch_context.with_addressed_host(&addressed_host);
+        let serve_context = serve_context.with_addressed_host(&addressed_host);
         let document = TextResponse {
             content_type: &content_type,
             status,
