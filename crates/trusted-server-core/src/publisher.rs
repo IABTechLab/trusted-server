@@ -753,8 +753,12 @@ fn text_entry_media_type(content_type: &str, status: StatusCode) -> Option<Strin
     runs.then_some(media_type)
 }
 
-/// Keeps a response that is not HTML out of shared caches when a `[[serve]]`
-/// entry covers it and a module left state on the request, because the
+/// Fits the headers of a response that is not HTML to the entries covering
+/// it. A body an entry covers loses the origin's `ETag` and `Last-Modified`,
+/// because its middleware may change it while the origin's file stays the
+/// same, so a conditional request carrying them would bring a `304` for the
+/// body as it was. A body a `[[serve]]` entry covers is also kept out of
+/// shared caches when a module left state on the request, because the
 /// entry's middleware are handed that state. Called once the serve
 /// middleware's headers are written, so none of them can undo it.
 fn apply_text_entry_cache_rules(
@@ -766,17 +770,23 @@ fn apply_text_entry_cache_rules(
     let Some(media_type) = text_entry_media_type(&params.content_type, params.status) else {
         return;
     };
-    let serve = MiddlewarePhase::Serve;
-    let served = !integration_registry
-        .middleware_chain(
-            settings.phase_entries(serve),
-            serve,
-            &media_type,
-            &params.request_path,
-        )
-        .is_empty();
+    let covered = |phase: MiddlewarePhase| {
+        !integration_registry
+            .middleware_chain(
+                settings.phase_entries(phase),
+                phase,
+                &media_type,
+                &params.request_path,
+            )
+            .is_empty()
+    };
+    let served = covered(MiddlewarePhase::Serve);
     if served && !params.request_state.is_empty() {
+        // Removes the validators too.
         enforce_terminal_private_cache_privacy(response);
+    } else if served || covered(MiddlewarePhase::Fetch) {
+        response.headers_mut().remove(header::ETAG);
+        response.headers_mut().remove(header::LAST_MODIFIED);
     }
 }
 
@@ -21584,6 +21594,33 @@ mod tests {
                     text, &body,
                     "should change a whole file and leave a {status} as the origin sent it"
                 );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_text_body_a_middleware_changes_loses_the_origin_validators() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+        let origin = [
+            ("etag", "\"v1\""),
+            ("last-modified", "Wed, 21 Oct 2015 07:28:00 GMT"),
+        ];
+        for (path, keeps_validators) in [(None, false), (Some("/elsewhere/"), true)] {
+            let settings = settings_running_the_middleware_fixture(vec![PhaseEntry {
+                media_type: fixture::TEXT_MEDIA_TYPE.to_owned(),
+                path: path.map(str::to_owned),
+                middleware: vec![fixture::TEXT.to_owned()],
+            }]);
+            let answers = text_answers_through_the_publisher(settings, false, 200, &origin).await;
+            for (response, _) in &answers {
+                for name in [header::ETAG, header::LAST_MODIFIED] {
+                    assert_eq!(
+                        response.headers().contains_key(&name),
+                        keeps_validators,
+                        "{name} should stay on a body no middleware changes, and on no other"
+                    );
+                }
             }
         }
     }
