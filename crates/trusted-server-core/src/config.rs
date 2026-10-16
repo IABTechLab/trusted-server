@@ -1511,10 +1511,11 @@ passphrase = "production-secret-key-32-bytes-min"
     /// refusing the misspelling or starts refusing the module offered.
     #[test]
     fn deploy_validation_refuses_a_loading_cache_module_nothing_offers() {
-        let builders = [
-            IntegrationBuilder::implementations("loading-cache.example", "example-crate")
-                .with_loading_cache(example_loading_cache),
-        ];
+        let builders =
+            [
+                IntegrationBuilder::implementations("loading-cache.example", "example-crate")
+                    .with_loading_cache(example_loading_cache),
+            ];
         let mut settings = valid_settings();
 
         settings.cache.robots_txt.module = Some("example".to_owned());
