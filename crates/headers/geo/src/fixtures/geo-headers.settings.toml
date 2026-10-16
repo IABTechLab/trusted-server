@@ -1,0 +1,6 @@
+[headers]
+modules = ["geo"]
+
+[[serve]]
+media_type = "text/html"
+middleware = ["headers.geo"]

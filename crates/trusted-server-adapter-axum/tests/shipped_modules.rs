@@ -41,6 +41,58 @@ fn a_feature_selects_the_stock_loading_cache_by_name() {
     );
 }
 
+/// A table naming no module takes the one loading cache module the build
+/// links, so a stock build holds each answer only while the adapter links
+/// exactly one. A second would leave the table holding nothing, with no
+/// message.
+#[test]
+fn a_table_naming_no_module_holds_with_the_stock_loading_cache() {
+    let settings = trusted_server_core::test_support::tests::create_test_settings();
+    assert!(
+        settings.cache.robots_txt.module.is_none(),
+        "the test settings should name no module"
+    );
+
+    let caches = trusted_server_core::integrations::loading_caches_from(
+        &settings,
+        &shipped_module_builders(),
+    )
+    .expect("a table naming no module is not an error");
+
+    assert!(
+        caches
+            .for_feature(trusted_server_core::settings::ROBOTS_TXT_CACHE)
+            .keeps_values(),
+        "a stock build should hold each robots.txt module's answer"
+    );
+}
+
+/// `ts config validate` validates against the linked list, so it accepts the
+/// stock loading cache by name and refuses a misspelling, which the service
+/// would otherwise refuse only as it starts.
+#[test]
+fn deploy_validation_knows_the_stock_loading_cache() {
+    use trusted_server_core::config::validate_settings_for_deploy_with;
+
+    let linked = shipped_module_builders();
+    let mut settings = trusted_server_core::test_support::tests::create_test_settings();
+
+    settings.cache.robots_txt.module = Some("51degrees".to_owned());
+    validate_settings_for_deploy_with(&settings, &linked)
+        .expect("the stock loading cache should pass deploy validation");
+
+    settings.cache.robots_txt.module = Some("51degreez".to_owned());
+    let error = validate_settings_for_deploy_with(&settings, &linked)
+        .expect_err("a module nothing offers should be refused");
+    assert!(
+        format!("{error:?}").contains(
+            "[cache.robots-txt] module names `51degreez`, which no linked crate offers a \
+             loading cache from. The loading cache modules this build has are: 51degrees"
+        ),
+        "should name the table and the stock loading cache: {error:?}"
+    );
+}
+
 /// The `ts` tool registers the builders it links, so validating a
 /// deployment's settings before a push runs each module's own rules.
 #[test]

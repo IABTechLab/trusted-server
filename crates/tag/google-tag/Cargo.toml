@@ -24,6 +24,7 @@ url = { workspace = true }
 validator = { workspace = true }
 
 [dev-dependencies]
+futures = { workspace = true }
 serde_json = { workspace = true }
 trusted-server-core = { workspace = true, features = ["test-utils"] }
 
