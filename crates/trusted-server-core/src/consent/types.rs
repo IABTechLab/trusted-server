@@ -12,7 +12,7 @@ use core::fmt;
 use std::sync::Arc;
 
 use super::jurisdiction::Jurisdiction;
-use crate::permissions::ValidSignal;
+use crate::permissions::{PermissionSet, ValidSignal};
 
 /// The consent context for a request, as the permission signal modules
 /// filled it.
@@ -113,6 +113,7 @@ pub struct SignalRecord {
     source: ConsentSource,
     applies: bool,
     sections: Vec<u16>,
+    consented: PermissionSet,
     decoded: Option<Arc<dyn Any + Send + Sync>>,
 }
 
@@ -128,6 +129,7 @@ impl SignalRecord {
             source: ConsentSource::None,
             applies: false,
             sections: Vec::new(),
+            consented: PermissionSet::none(),
             decoded: None,
         }
     }
@@ -172,6 +174,15 @@ impl SignalRecord {
         self
     }
 
+    /// The same record carrying the permissions the signal itself holds the
+    /// visitor's consent to, read from the signal alone, whatever the policy
+    /// and the place rules make of it.
+    #[must_use]
+    pub fn with_consented(mut self, consented: PermissionSet) -> Self {
+        self.consented = consented;
+        self
+    }
+
     /// The scheme, as the module names it and a reader asks for it.
     #[must_use]
     pub fn scheme(&self) -> &'static str {
@@ -211,6 +222,14 @@ impl SignalRecord {
         &self.sections
     }
 
+    /// The permissions the signal holds the visitor's consent to, and none
+    /// for a signal that carries no consent, such as an opt-out, or one that
+    /// did not decode.
+    #[must_use]
+    pub fn consented(&self) -> PermissionSet {
+        self.consented
+    }
+
     /// The decoded form, when the module stored one of type `T`.
     #[must_use]
     pub fn decoded<T: Any>(&self) -> Option<&T> {
@@ -229,6 +248,7 @@ impl fmt::Debug for SignalRecord {
             .field("source", &self.source)
             .field("applies", &self.applies)
             .field("sections", &self.sections)
+            .field("consented", &self.consented)
             .field("decoded", &self.decoded.is_some())
             .finish()
     }
@@ -373,6 +393,30 @@ mod tests {
             "what the module read stays on record"
         );
         assert!(dropped.applies(), "and so does what it said applies");
+    }
+
+    #[test]
+    fn a_record_carries_what_the_visitor_consented_to_whoever_vouched() {
+        use crate::permissions::Permission;
+
+        let storage = PermissionSet::none().with(Permission::StoreOnDevice);
+        assert!(
+            SignalRecord::new("example", SignalStatus::Decoded)
+                .consented()
+                .is_empty(),
+            "a record holds no consent unless its module says so"
+        );
+        let mut context = ConsentContext::default().with_record(
+            SignalRecord::new("example", SignalStatus::Decoded)
+                .with_value("v")
+                .with_consented(storage),
+        );
+        context.keep_only(&[]);
+        assert_eq!(
+            context.record("example").map(SignalRecord::consented),
+            Some(storage),
+            "what the module read stays on record when the string goes no further"
+        );
     }
 
     #[test]
