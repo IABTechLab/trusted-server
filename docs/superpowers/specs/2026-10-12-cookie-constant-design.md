@@ -7,7 +7,7 @@
 **Issues:** [IABTechLab/trusted-server#1275](https://github.com/IABTechLab/trusted-server/issues/1275). [IABTechLab/trusted-server#777](https://github.com/IABTechLab/trusted-server/issues/777) lists the stack
 **Last updated:** 2026-10-16
 
-> **Why this spec exists.** `COOKIE_MTM_PREF`, the name of the cookie that the Preference Management Platform (PMP) writes the Model Terms for Marketing preference into, is declared in core's constants on the rows below this one, although the Model Terms signal module is the only code that reads the cookie. This change declares the name in that module and changes no behavior.
+> **Why this spec exists.** `COOKIE_MTM_PREF`, the name of the cookie that the Preference Management Platform (PMP) writes the Model Terms for Marketing preference into, is declared in core's constants on the rows below this one, although the Model Terms signal module is the only code that reads the cookie. This change declares the name in that module, and the fixes after review withhold the cookie from Prebid Server wherever the consent cookies are withheld.
 
 ## 1. Problem
 
@@ -33,11 +33,15 @@ Line numbers in this document are those of commit `af8af38f5`, the head of IABTe
 
 **What the module does with the cookie does not change.** The diff changes no other line of the module. `preference()` reads the first pair named `__mtm_pref` in the request's first `Cookie` header, through `RequestInfo::cookie`. A cookie that is absent, or whose value is not one of the three words once the spaces around it are removed, is read as no answer, and the module then answers `Neutral` for every permission, so the country and region rules stand (lines 117 to 127 and 189 to 194). What each word grants or revokes, and the terms the module declares, are as on row 16.
 
+**The fixes after review.** Three commits on top of the move fix what the reviews found. `f8d0ccfe3` takes the cookie's name out of the README of core's permission signal module, which now says the module declares the name, and corrects "two words" to three in the comment on `valid_signal` and in the `mtm` row of the Permission Signals guide. `389903405` withholds the cookie from Prebid Server, as below. `71e039d4c` adds the test of the cookie's name in section 5.
+
+**What reaches Prebid Server.** With `consent_forwarding = "openrtb_only"`, the Prebid Server crate removes the four consent cookies and `__mtm_pref` from the `Cookie` header it sends, because the preference records the visitor's choice as the consent cookies do. The crate reads the name from the Model Terms crate, so core still names no scheme's cookie. In `cookies_only` and `both` the header is forwarded whole, the preference included.
+
 **Why a constant and not a setting.** The name is what the module and whatever platform writes the cookie have to agree on, and the constant's comment says that the name is "not a Trusted Server name", so that anyone can build a platform that sets the cookie. A deployment that renamed the cookie would stop reading the answer of every platform that keeps to the agreed name. A setting would also be the first setting of any permission signal module, and the `[permission-signal]` section accepts only `modules` today and refuses any other key by name (`crates/trusted-server-core/src/settings.rs`, lines 1334 to 1340).
 
 ## 3. What changes for a deployment
 
-**Nothing a deployment can observe.** This change adds no setting, so no setting selects the change and every deployment gets it. The cookie's name and the way the module reads the cookie are the same, so no deployment behaves differently and the PMP needs no change. The `[permission-signal]` section accepts the same key, `modules`, with the same default and the same checks. A deployment that lists `mtm`, or leaves `modules` out so that every module an adapter offers runs, reads the same cookie as before.
+**One change a deployment can observe.** A deployment with `consent_forwarding = "openrtb_only"` no longer sends `__mtm_pref` to Prebid Server. This change adds no setting, so every deployment gets it. The cookie's name and the way the module reads the cookie are the same, so no other deployment behaves differently and the PMP needs no change. The `[permission-signal]` section accepts the same key, `modules`, with the same default and the same checks. A deployment that lists `mtm`, or leaves `modules` out so that every module an adapter offers runs, reads the same cookie as before.
 
 **What breaks for code.** The constant moves from `trusted_server_core::constants::COOKIE_MTM_PREF` to `trusted_server_permission_signal_mtm::COOKIE_MTM_PREF`, and stays public. Only two files in this repository imported the old path, being the module itself and the Axum adapter's test, and the change updates both. `main` does not declare the constant, so no crate built against `main` imports it. A crate built against rows 4 to 16 that imports the old path stops compiling until the crate changes the path. No row after 17 imports the constant from core (checked through row 50).
 
@@ -55,20 +59,19 @@ Only the Axum adapter's tests send the cookie through the module, in `permission
 ## 4. What is not in this change
 
 - **Other cookie names in core's constants.** `COOKIE_TS_EIDS` (line 14), `COOKIE_SHAREDID` (line 16) and the four names of the IAB consent cookies, `euconsent-v2`, `__gpp`, `__gpp_sid` and `us_privacy` (lines 151 to 154), each name the cookie of one scheme or one vendor and stay in core's constants on this row. The Fastly adapter reads `COOKIE_SHAREDID` at lines 636 and 955 of its `src/app.rs`. The EIDs cookie's name changes at row 27 and leaves core at row 41. Row 27 ([IABTechLab/trusted-server#1368](https://github.com/IABTechLab/trusted-server/pull/1368), which lets a module name the browser's cookies) replaces `COOKIE_TS_EIDS` with `COOKIE_EIDS`, which holds `eids` and stays at line 17 of core's `constants.rs` through row 40, and core writes the cookie's whole name after the deployment's public prefix, so the name is `ts-eids` under core's own prefix. Row 41 ([IABTechLab/trusted-server#1382](https://github.com/IABTechLab/trusted-server/pull/1382)) deletes `COOKIE_EIDS` and the Prebid crate declares the name instead, as `EID_COOKIE` (`crates/auction/prebid/src/eids.rs`, line 24), so core names the EIDs cookie nowhere from row 41. Row 42 ([IABTechLab/trusted-server#1383](https://github.com/IABTechLab/trusted-server/pull/1383)) moves the consent cookie names. `COOKIE_SHAREDID` is still in core on row 50.
-- **The README and the guide.** The README of core's permission signal module (`crates/trusted-server-core/src/permission_signal/README.md`) names `__mtm_pref` in a sentence on lines 39 and 40, and the Edge Cookies guide (`docs/guide/edge-cookies.md`, line 96) lists the cookie among the signals that the permission signal modules read. Neither changes here. The README is the only file in `crates/trusted-server-core` that names the cookie, and it still does on row 50. Open question 2 asks about the README.
+- **The Edge Cookies guide.** `docs/guide/edge-cookies.md` (line 96) lists the cookie among the signals that the permission signal modules read. That is a guide and not core, and it does not change.
 - **The permission model design.** `2026-07-30-permission-model-design.md`, section 4.6, still says that the cookie's constant is `COOKIE_MTM_PREF` in core, and this change does not amend that document.
-- **What reaches Prebid Server.** The cookie reaches Prebid Server in every `consent_forwarding` mode, as it did before this change. Only the `openrtb_only` mode removes cookies from the forwarded `Cookie` header (line 1145 of `crates/auction/prebid-server/src/lib.rs`), and the mode removes the four in `CONSENT_COOKIE_NAMES` (`crates/trusted-server-core/src/cookies.rs`, lines 22 to 27), which do not include `__mtm_pref`. Open question 4 asks whether that is intended.
-- **A setting or a new test.** The change adds neither. Section 5 says what no test covers.
+- **A setting.** The change adds none.
 
 ## 5. Acceptance
 
-**Checks that can be repeated.** In a clone of IABTechLab/trusted-server, this search prints one line, which is in the README of core's permission signal module, so no Rust file in `crates/trusted-server-core` names the constant or the cookie.
+**Checks that can be repeated.** In a clone of IABTechLab/trusted-server, this search prints nothing, so no file in `crates/trusted-server-core` names the constant or the cookie.
 
 ```text
-git grep -n -e COOKIE_MTM_PREF -e __mtm_pref af8af38f5 -- crates/trusted-server-core
+git grep -n -e COOKIE_MTM_PREF -e __mtm_pref 71e039d4c -- crates/trusted-server-core
 ```
 
-Because no test fails if the literal changes (see below), this diff must also print two lines that are the same apart from their `-` and `+`, being the removed and the added declaration, `pub const COOKIE_MTM_PREF: &str = "__mtm_pref";`.
+This diff must also print two lines that are the same apart from their `-` and `+`, being the removed and the added declaration, `pub const COOKIE_MTM_PREF: &str = "__mtm_pref";`.
 
 ```text
 git diff 7b19336ec...af8af38f5 | grep __mtm_pref
@@ -78,19 +81,18 @@ git diff 7b19336ec...af8af38f5 | grep __mtm_pref
 
 **Local checks.** The description of IABTechLab/trusted-server#1358 records `cargo test-fastly` and `cargo test-axum`, `cargo clippy-fastly` and `cargo clippy-axum`, `cargo fmt --all -- --check`, the JavaScript tests and format check, the docs format check and the WebAssembly build of the Fastly adapter as run. The description marks a manual run with `fastly compute serve` as not done.
 
+**Tests added.**
+
+1. **The cookie's name.** `the_platforms_own_set_cookie_strings_name_the_cookie_the_module_reads`, in the Model Terms crate, asserts that the name in each of the PMP's `Set-Cookie` strings (`PMP_SET_COOKIE`) equals `COOKIE_MTM_PREF`. With the constant changed to another name, this test fails and the crate's other 14 tests pass.
+2. **What reaches Prebid Server.** `openrtb_only_withholds_the_model_terms_preference_from_prebid_server`, `cookies_only_forwards_the_model_terms_preference_to_prebid_server` and `both_forwards_the_model_terms_preference_to_prebid_server`, in the Prebid Server crate, send a page request carrying a session cookie, `euconsent-v2` and `__mtm_pref` through the dispatch path and read the `Cookie` header Prebid Server receives. Without the fix the first fails.
+
 **What no test covers.**
 
-1. **The cookie's name.** No test compares the name the PMP writes with `COOKIE_MTM_PREF`. The module's tests build the cookie header from the constant (`with_cookie`, line 261) and so does the Axum test (line 630). The fixtures of the PMP's `Set-Cookie` strings (`PMP_SET_COOKIE`, lines 292 to 313, which the comment above them calls the PMP's own output) carry the literal `__mtm_pref`, but the tests that use them read only the value and the absence of `HttpOnly` (lines 316 to 319 and 323 to 357), never the name. From reading the tests, a change to the literal at line 74 would move the code and the tests together and fail none of them.
-2. **The adapters' own lists.** No test refers to `shipped_signal_modules`, the private function in each adapter's `src/app.rs` that lists the modules, so no test checks that an adapter registers the Model Terms module. The Fastly, Cloudflare and Spin adapters also have no test that reads the cookie.
+1. **The adapters' own lists.** No test refers to `shipped_signal_modules`, the private function in each adapter's `src/app.rs` that lists the modules, so no test checks that an adapter registers the Model Terms module. The Fastly, Cloudflare and Spin adapters also have no test that reads the cookie.
 
 ## 6. Open questions
 
-These are for the reviewer. This revision records what the code does and decides none of them.
-
-1. Should a test assert that the cookie name in each `PMP_SET_COOKIE` fixture equals `COOKIE_MTM_PREF`, so that a changed literal fails a test? The name matters because a module that reads the wrong name sees no answer from any visitor, and a visitor's `standard` choice then no longer revokes the four uses that depend on browsing history (lines 94 to 103 and 217 to 224) where the country baseline grants them.
-2. Should the README of core's permission signal module stop naming `__mtm_pref`? The README says on its lines 21 and 22 that core "holds no scheme's wire format and no scheme's meaning", and the identifier modules design (`2026-10-14-identifier-modules-design.md`, row 41) says that core names the Model Terms cookie nowhere.
-3. Should the doc comment on `valid_signal` (lines 239 and 240 of the module), which says that a value that is not "one of the two words" is not an answer, say three words, as the module reads three? The row for `mtm` in the Permission Signals guide (`docs/guide/permission-signals.md`, line 123) also says "one of two words".
-4. Is it intended that `__mtm_pref` reaches Prebid Server when the four consent cookies are removed in `openrtb_only` mode? With the name out of core, removing the cookie would need a list that core can read without naming the cookie. On row 42 the list moves into the Prebid Server crate, built from the constants of the TCF, GPP and US Privacy crates, and still does not hold the Model Terms cookie. Neither the issue (IABTechLab/trusted-server#1275) nor the pull request description (IABTechLab/trusted-server#1358) says whether that is intended.
+None remain. The four questions of the round 1 revision, being the test of the cookie's name, the README naming the cookie, the "two words" comment and the cookie reaching Prebid Server in `openrtb_only` mode, are fixed as section 2 says.
 
 ## Review log
 
@@ -104,3 +106,4 @@ These are for the reviewer. This revision records what the code does and decides
 | 2026-10-12 | First draft, from the pull request and its issue as they stand.                                                                                                                                                                                                                                                                                                      |
 | 2026-10-15 | Fixes from review round 1. The header and the pull requests it names, where the constant arrived, the three files and what each changes, the reworded comment, why a constant and not a setting, what changes for a deployment and for code, the adapters, the names left in core, the acceptance checks, the untested paths, the open questions and the review log. |
 | 2026-10-16 | Fixes from review round 2. The earlier pull request on this repository, closed without being merged, named in the header, the rows at which the EIDs cookie's constant is renamed and then deleted from core (section 4), and the review log.                                                                                                                        |
+| 2026-10-16 | Fixes from code review. `__mtm_pref` is withheld from Prebid Server in `openrtb_only` mode (`389903405`), a test checks the cookie's name against the PMP's `Set-Cookie` strings (`71e039d4c`), core's README no longer names the cookie, and the comment on `valid_signal` and the Permission Signals guide say three words (`f8d0ccfe3`).                          |
