@@ -1119,7 +1119,8 @@ has none.
 **Refused when the settings load**: a line that is not a data record or a
 variable, naming which part is wrong, a comment, an empty list, and a
 document that selects the module but names it in no `[[fetch]]` entry for
-`text/plain`, where the lines would never be written.
+`text/plain` with `path = "/ads.txt"`, where the lines would never be
+written into the file or make it.
 
 **Example**:
 
