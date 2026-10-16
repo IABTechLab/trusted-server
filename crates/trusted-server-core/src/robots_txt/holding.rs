@@ -505,7 +505,10 @@ pub(crate) mod tests {
             .kv_store(Arc::new(MemoryKvStore::default()))
             .backend(Arc::new(crate::platform::test_support::NoopBackend))
             .http_client(Arc::new(StubHttpClient::new()))
-            .geo(Arc::new(crate::platform::test_support::NoopGeo))
+            .geo(Arc::new(crate::platform::PlatformGeoModule::new(
+                "noop",
+                Arc::new(crate::platform::test_support::NoopGeo),
+            )))
             .client_info(crate::platform::ClientInfo {
                 client_ip: Some(std::net::IpAddr::from([203, 0, 113, 7])),
                 tls_ja4: Some("t13d1516h2_reader".to_owned()),
