@@ -25,9 +25,9 @@ use trusted_server_core::ec::admin::{
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
 use trusted_server_core::integrations::{IntegrationRegistry, ProxyDispatchInput};
-use trusted_server_core::platform::RuntimeServices;
 #[cfg(target_arch = "wasm32")]
 use trusted_server_core::platform::StoreName;
+use trusted_server_core::platform::{ClientInfo, GeoInfo, RuntimeServices};
 use trusted_server_core::proxy::{
     handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
     handle_first_party_proxy_sign,
@@ -41,6 +41,7 @@ use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
 };
 use trusted_server_core::settings::Settings;
+use trusted_server_core::trace::{TraceMetadata, TracePreDispatchHook};
 
 use crate::middleware::{AuthMiddleware, FinalizeResponseMiddleware, SanitizeRequestMiddleware};
 use crate::platform::build_runtime_services;
@@ -596,7 +597,12 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             }
         };
 
+        let trace_state = Arc::clone(&state);
         let mut router = RouterService::builder()
+            .pre_dispatch_hook(Arc::new(TracePreDispatchHook::new(
+                Arc::clone(&state.settings),
+                Arc::new(move |request| trace_metadata(&trace_state, request)),
+            )))
             // Outermost middleware: strips the configured trusted-client-IP
             // headers before anything else sees the request. Must stay first —
             // any middleware registered ahead of it would observe the
@@ -770,6 +776,46 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
         }
 
         router.build()
+    }
+}
+
+fn trace_metadata(state: &AppState, request: &Request) -> TraceMetadata {
+    if let Some(services) = &state.services {
+        let client_info = services.client_info().clone();
+        let geo = client_info.client_ip.and_then(|client_ip| {
+            services.geo().lookup(Some(client_ip)).unwrap_or_else(|_| {
+                log::warn!("trace_geo_unavailable");
+                None
+            })
+        });
+        return TraceMetadata { client_info, geo };
+    }
+    let client_ip = request
+        .headers()
+        .get("cf-connecting-ip")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok());
+    let geo = request
+        .headers()
+        .get("cf-ipcountry")
+        .and_then(|value| value.to_str().ok())
+        .filter(|country| *country != "XX")
+        .map(|country| GeoInfo {
+            city: String::new(),
+            country: country.to_owned(),
+            continent: String::new(),
+            latitude: 0.0,
+            longitude: 0.0,
+            metro_code: 0,
+            region: None,
+            asn: None,
+        });
+    TraceMetadata {
+        client_info: ClientInfo {
+            client_ip,
+            ..ClientInfo::default()
+        },
+        geo,
     }
 }
 
@@ -1014,6 +1060,115 @@ mod tests {
             error.to_string(),
             "Cloudflare TRUSTED_SERVER_CONFIG value at `app_config` must be a string",
             "configuration error should name the malformed legacy key"
+        );
+    }
+}
+#[cfg(test)]
+mod trace_dispatch_tests {
+    use super::*;
+    use futures::executor::block_on;
+    use trusted_server_core::trace::TraceTerminalResponse;
+
+    fn router(enabled: bool) -> RouterService {
+        let settings = Settings::from_toml(&format!(
+            r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "example-user"
+            password = "example-password"
+            [publisher]
+            domain = "publisher.example.com"
+            cookie_domain = ".publisher.example.com"
+            origin_url = "https://origin.example.com"
+            proxy_secret = "fictional-proxy-secret"
+            [ec]
+            passphrase = "fictional-passphrase-at-least-32-bytes"
+            [request_signing]
+            enabled = false
+            config_store_id = "fictional-config"
+            secret_store_id = "fictional-secrets"
+            [integrations.gpt_diagnostics]
+            enabled = true
+            trace_page_enabled = {enabled}
+        "#
+        ))
+        .expect("should parse trace settings");
+        TrustedServerApp::routes_with_settings(settings).expect("should build adapter routes")
+    }
+
+    #[test]
+    fn trace_dispatch_reserves_all_methods_before_ordinary_lifecycle() {
+        let router = router(true);
+        for (method, path, status) in [
+            (Method::GET, "/_ts/trace/state", StatusCode::OK),
+            (Method::HEAD, "/_ts/trace", StatusCode::OK),
+            (Method::GET, "/_ts/trace/assets/v1.js", StatusCode::OK),
+            (Method::POST, "/_ts/trace/enable", StatusCode::FORBIDDEN),
+            (
+                Method::PATCH,
+                "/_ts/trace/state",
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+            (
+                Method::from_bytes(b"EXAMPLE-METHOD").expect("should parse extension method"),
+                "/_ts/trace",
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+            (Method::GET, "/_ts/trace/extra", StatusCode::NOT_FOUND),
+            (Method::GET, "/%5Fts/trace", StatusCode::BAD_REQUEST),
+        ] {
+            let head = method == Method::HEAD;
+            let request = edgezero_core::http::request_builder()
+                .method(method)
+                .uri(format!("https://publisher.example.com{path}"))
+                .body(edgezero_core::body::Body::empty())
+                .expect("should build trace request");
+            let response =
+                block_on(router.oneshot(request)).expect("should return local trace policy");
+            assert_eq!(response.status(), status, "should bypass ordinary dispatch");
+            assert!(
+                response
+                    .extensions()
+                    .get::<TraceTerminalResponse>()
+                    .is_some(),
+                "should mark terminal trace responses"
+            );
+            assert!(
+                !response.headers().contains_key(header::SET_COOKIE),
+                "should never manufacture a mutation"
+            );
+            if head {
+                assert_eq!(
+                    response
+                        .into_body()
+                        .into_bytes()
+                        .expect("should buffer HEAD")
+                        .len(),
+                    0,
+                    "should remove HEAD bodies"
+                );
+            }
+        }
+        let response = block_on(
+            self::router(false).oneshot(
+                edgezero_core::http::request_builder()
+                    .uri("/_ts/trace/state")
+                    .body(edgezero_core::body::Body::empty())
+                    .expect("should build disabled request"),
+            ),
+        )
+        .expect("should reserve disabled namespace");
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "should hide disabled feature"
+        );
+        assert!(
+            response
+                .extensions()
+                .get::<TraceTerminalResponse>()
+                .is_some(),
+            "should harden disabled feature"
         );
     }
 }

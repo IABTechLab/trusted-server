@@ -1,6 +1,7 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce, aead::Aead as _, aead::KeyInit as _};
 use edgezero_core::body::Body as EdgeBody;
+use edgezero_core::request::{InboundOrigin, RequestIngress};
 use error_stack::Report;
 use http::{Request, Response, StatusCode, header};
 use sha2::{Digest as _, Sha256};
@@ -10,6 +11,7 @@ use subtle::ConstantTimeEq as _;
 use crate::cache_policy::{CachePolicy, EdgeCacheHeader};
 use crate::constants::INTERNAL_HEADERS;
 use crate::error::TrustedServerError;
+use crate::forwarder::public_origin;
 use crate::platform::ClientInfo;
 use crate::settings::{Settings, TrustedClientIpConfig};
 
@@ -117,177 +119,105 @@ pub fn is_navigation_request(req: &Request<EdgeBody>) -> bool {
         })
 }
 
-/// Extracted request information for host rewriting.
+/// Validated adapter runtime origin used when immutable ingress has no origin.
 ///
-/// This struct captures the effective host and scheme from an incoming request.
-/// The parser checks forwarded headers (`Forwarded`, `X-Forwarded-Host`,
-/// `X-Forwarded-Proto`) as fallbacks, but on the Fastly edge
-/// [`sanitize_forwarded_headers`] strips those headers before this method is
-/// called, so the `Host` header and Fastly SDK TLS detection are the effective
-/// sources in production.
+/// Adapters construct this only from trusted runtime metadata. It supplies a
+/// fallback for [`RequestInfo`] without changing [`RequestIngress`] or granting
+/// origin trust to trace actions.
+#[derive(Clone)]
+pub struct RuntimeRequestOrigin(InboundOrigin);
+
+impl RuntimeRequestOrigin {
+    /// Wrap an origin already validated by [`InboundOrigin::parse`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use edgezero_core::request::{InboundOrigin, OriginSource};
+    /// use trusted_server_core::http_util::RuntimeRequestOrigin;
+    /// let origin = InboundOrigin::parse(
+    ///     "https", "publisher.example.com:8443", OriginSource::RuntimeUri,
+    /// )?;
+    /// let runtime_origin = RuntimeRequestOrigin::new(origin);
+    /// # Ok::<(), edgezero_core::error::EdgeError>(())
+    /// ```
+    #[must_use]
+    pub fn new(origin: InboundOrigin) -> Self {
+        Self(origin)
+    }
+}
+
+/// Effective public request information for URL rewriting.
+///
+/// Authenticated forwarding takes precedence over transport origin. Without
+/// authenticated metadata, immutable ingress, adapter runtime origin, Host and
+/// platform TLS facts remain the sources; raw forwarding headers never grant
+/// origin trust.
 #[derive(Debug, Clone)]
 pub struct RequestInfo {
-    /// The effective host for URL rewriting (typically the `Host` header after edge sanitization).
+    /// The effective public authority, including a non-default port.
     pub host: String,
-    /// The effective scheme (typically from Fastly SDK TLS detection after edge sanitization).
+    /// The effective public HTTP or HTTPS scheme.
     pub scheme: String,
 }
 
 impl RequestInfo {
-    /// Extract request info from a Fastly request.
+    /// Extract public origin information from a prepared request.
     ///
-    /// Host fallback order (first present wins):
-    /// 1. `Forwarded` header (`host=...`)
-    /// 2. `X-Forwarded-Host`
-    /// 3. `Host` header
+    /// # Examples
     ///
-    /// Scheme fallback order:
-    /// 1. Fastly SDK TLS detection
-    /// 2. `Forwarded` header (`proto=...`)
-    /// 3. `X-Forwarded-Proto`
-    /// 4. `Fastly-SSL`
-    /// 5. Default `http`
-    ///
-    /// In production the forwarded headers are stripped by
-    /// [`sanitize_forwarded_headers`] at the edge, so `Host` and
-    /// [`ClientInfo`] TLS detection are the only sources that fire.
+    /// ```ignore
+    /// let info = RequestInfo::from_request(&request, &client_info);
+    /// let origin = format!("{}://{}", info.scheme, info.host);
+    /// ```
+    #[must_use]
     pub fn from_request(req: &Request<EdgeBody>, client_info: &ClientInfo) -> Self {
-        let host = extract_request_host(req);
-        let scheme = detect_request_scheme(
-            req,
-            client_info.tls_protocol.as_deref(),
-            client_info.tls_cipher.as_deref(),
-        );
-
+        if let Some(origin) = public_origin(req) {
+            return Self {
+                host: origin.authority.clone(),
+                scheme: origin.scheme.clone(),
+            };
+        }
+        let runtime_origin = req
+            .extensions()
+            .get::<RequestIngress>()
+            .and_then(RequestIngress::origin)
+            .or_else(|| {
+                req.extensions()
+                    .get::<RuntimeRequestOrigin>()
+                    .map(|origin| &origin.0)
+            });
+        let host = runtime_origin
+            .map(InboundOrigin::authority)
+            .or_else(|| {
+                req.headers()
+                    .get(header::HOST)
+                    .and_then(|value| value.to_str().ok())
+            })
+            .unwrap_or_default()
+            .to_owned();
+        let scheme = runtime_origin
+            .map(|origin| origin.scheme().to_owned())
+            .unwrap_or_else(|| detect_request_scheme(req, client_info));
         Self { host, scheme }
     }
 }
 
-fn extract_request_host(req: &Request<EdgeBody>) -> String {
-    req.headers()
-        .get("forwarded")
-        .and_then(|h| h.to_str().ok())
-        .and_then(|value| parse_forwarded_param(value, "host"))
-        .or_else(|| {
-            req.headers()
-                .get("x-forwarded-host")
-                .and_then(|h| h.to_str().ok())
-                .and_then(parse_list_header_value)
-        })
-        .or_else(|| {
-            req.headers()
-                .get(header::HOST)
-                .and_then(|h| h.to_str().ok())
-        })
-        .unwrap_or_default()
-        .to_owned()
-}
-
-fn parse_forwarded_param<'a>(forwarded: &'a str, param: &str) -> Option<&'a str> {
-    for entry in forwarded.split(',') {
-        for part in entry.split(';') {
-            let mut iter = part.splitn(2, '=');
-            let key = iter.next().unwrap_or("").trim();
-            let value = iter.next().unwrap_or("").trim();
-            if key.is_empty() || value.is_empty() {
-                continue;
-            }
-            if key.eq_ignore_ascii_case(param) {
-                let value = strip_quotes(value);
-                if !value.is_empty() {
-                    return Some(value);
-                }
-            }
-        }
-    }
-    None
-}
-
-fn parse_list_header_value(value: &str) -> Option<&str> {
-    value
-        .split(',')
-        .map(str::trim)
-        .find(|part| !part.is_empty())
-        .map(strip_quotes)
-        .filter(|part| !part.is_empty())
-}
-
-fn strip_quotes(value: &str) -> &str {
-    let trimmed = value.trim();
-    if trimmed.len() >= 2 && trimmed.starts_with('"') && trimmed.ends_with('"') {
-        &trimmed[1..trimmed.len() - 1]
-    } else {
-        trimmed
-    }
-}
-
-fn normalize_scheme(value: &str) -> Option<String> {
-    let scheme = value.trim().to_ascii_lowercase();
-    (scheme == "https" || scheme == "http").then_some(scheme)
-}
-
-/// Detects the request scheme (HTTP or HTTPS) using Fastly SDK methods and headers.
-///
-/// Tries multiple methods in order of reliability:
-/// 1. Fastly SDK TLS detection methods (most reliable)
-/// 2. Forwarded header (RFC 7239)
-/// 3. X-Forwarded-Proto header
-/// 4. Fastly-SSL header (trusted on `EdgeZero` path; can be spoofed on legacy path)
-/// 5. Default to HTTP
-fn detect_request_scheme(
-    req: &Request<EdgeBody>,
-    tls_protocol: Option<&str>,
-    tls_cipher: Option<&str>,
-) -> String {
-    // 1. First try ClientInfo TLS fields populated at the adapter entry point.
-    if let Some(tls_protocol) = tls_protocol {
-        log::debug!("TLS protocol detected: {tls_protocol}");
+fn detect_request_scheme(req: &Request<EdgeBody>, client_info: &ClientInfo) -> String {
+    if client_info.tls_protocol.is_some() || client_info.tls_cipher.is_some() {
         return "https".to_owned();
     }
-
-    // Also check TLS cipher - if present, connection is HTTPS.
-    if tls_cipher.is_some() {
-        log::debug!("TLS cipher detected, using HTTPS");
-        return "https".to_owned();
-    }
-
-    // 2. Try the Forwarded header (RFC 7239)
-    if let Some(forwarded) = req.headers().get("forwarded")
-        && let Ok(forwarded_str) = forwarded.to_str()
-        && let Some(proto) = parse_forwarded_param(forwarded_str, "proto")
-        && let Some(scheme) = normalize_scheme(proto)
-    {
-        return scheme;
-    }
-
-    // 3. Try X-Forwarded-Proto header
-    if let Some(proto) = req.headers().get("x-forwarded-proto")
-        && let Ok(proto_str) = proto.to_str()
-        && let Some(value) = parse_list_header_value(proto_str)
-        && let Some(scheme) = normalize_scheme(value)
-    {
-        return scheme;
-    }
-
-    // 4. Check Fastly-SSL header. On the `EdgeZero` path this is injected from
-    //    authoritative Fastly TLS metadata after spoofable headers are stripped,
-    //    so it is reliable. On direct or legacy paths it can be spoofed by clients.
-    //
-    //    Layering wart: this is a vendor-specific header name living in
-    //    platform-neutral core. It is only a fallback — signal #1 above
-    //    (`ClientInfo::tls_protocol`) is the neutral path adapters populate. The
-    //    `fastly-ssl` fallback (plus its entry in `SPOOFABLE_FORWARDED_HEADERS`
-    //    and the origin-forwarding strip in `publisher::rewrite_origin_request`)
-    //    should be replaced by a platform-neutral scheme signal in a separate
-    //    change, after confirming the legacy path is covered by `ClientInfo`.
-    if let Some(ssl) = req.headers().get("fastly-ssl")
-        && let Ok(ssl_str) = ssl.to_str()
-        && (ssl_str == "1" || ssl_str.to_lowercase() == "true")
+    // Fastly injects this signal from runtime TLS metadata after removing the
+    // client-supplied copy. Preserve the compatibility fallback for requests
+    // without a runtime ingress extension.
+    if req
+        .headers()
+        .get("fastly-ssl")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
     {
         return "https".to_owned();
     }
-
-    // Default to HTTP
     "http".to_owned()
 }
 
@@ -573,6 +503,101 @@ mod tests {
     // RequestInfo tests
 
     #[test]
+    fn request_info_prioritizes_forwarder_then_ingress_then_runtime_origin() {
+        let mut settings = crate::test_support::tests::create_test_settings();
+        settings.publisher.domain = "publisher.example.com".to_owned();
+        settings.trusted_forwarder = Some(crate::settings::TrustedForwarderConfig {
+            auth_header: crate::forwarder::FORWARDER_AUTH_HEADER.to_owned(),
+            shared_secret: crate::redacted::Redacted::new(
+                "fictional-forwarder-secret-0123456789".to_owned(),
+            ),
+        });
+        for (accepted, ingress_available, expected_host, expected_scheme) in [
+            (true, true, "publisher.example.com:8443", "https"),
+            (false, true, "internal.example.com:8080", "http"),
+            (false, false, "runtime.example.com:9443", "https"),
+        ] {
+            let mut request = build_request(Method::GET, "/article");
+            set_header(&mut request, "host", "client-supplied.example.com");
+            set_header(
+                &mut request,
+                "x-forwarded-host",
+                "publisher.example.com:8443",
+            );
+            set_header(&mut request, "x-forwarded-proto", "https");
+            if accepted {
+                set_header(
+                    &mut request,
+                    crate::forwarder::FORWARDER_AUTH_HEADER,
+                    "fictional-forwarder-secret-0123456789",
+                );
+            }
+            request.extensions_mut().insert(RuntimeRequestOrigin::new(
+                InboundOrigin::parse(
+                    "https",
+                    "runtime.example.com:9443",
+                    edgezero_core::request::OriginSource::RuntimeUri,
+                )
+                .expect("should validate runtime origin"),
+            ));
+            request.extensions_mut().insert(
+                RequestIngress::new(
+                    edgezero_core::request::CapturedTarget::Unavailable(
+                        edgezero_core::request::TargetUnavailable::NotExposed,
+                    ),
+                    ingress_available.then(|| {
+                        InboundOrigin::parse(
+                            "http",
+                            "internal.example.com:8080",
+                            edgezero_core::request::OriginSource::RuntimeUri,
+                        )
+                        .expect("should validate ingress origin")
+                    }),
+                    edgezero_core::request::HeaderFidelity::default(),
+                    Vec::new(),
+                )
+                .expect("should freeze ingress"),
+            );
+            crate::forwarder::prepare_trusted_forwarder(&mut request, &settings);
+
+            let info = RequestInfo::from_request(&request, &default_client_info());
+
+            assert_eq!(
+                info.host, expected_host,
+                "should honor public, immutable ingress and runtime authority precedence"
+            );
+            assert_eq!(
+                info.scheme, expected_scheme,
+                "should honor public, immutable ingress and runtime scheme precedence"
+            );
+        }
+    }
+
+    #[test]
+    fn request_info_ignores_unauthenticated_public_origin_hints() {
+        let mut request = build_request(Method::GET, "http://upstream.example.com/path");
+        set_header(&mut request, "host", "upstream.example.com");
+        set_header(
+            &mut request,
+            "forwarded",
+            "proto=https;host=other.example.com",
+        );
+        set_header(&mut request, "x-forwarded-host", "other.example.com");
+        set_header(&mut request, "x-forwarded-proto", "https");
+
+        let info = RequestInfo::from_request(&request, &default_client_info());
+
+        assert_eq!(
+            info.host, "upstream.example.com",
+            "should require authenticated public host metadata"
+        );
+        assert_eq!(
+            info.scheme, "http",
+            "should require authenticated public scheme metadata"
+        );
+    }
+
+    #[test]
     fn test_request_info_from_host_header() {
         let mut req = build_request(Method::GET, "https://test.example.com/page");
         set_header(&mut req, "host", "test.example.com");
@@ -590,71 +615,6 @@ mod tests {
     }
 
     #[test]
-    fn test_request_info_x_forwarded_host_precedence() {
-        let mut req = build_request(Method::GET, "https://test.example.com/page");
-        set_header(&mut req, "host", "internal-proxy.local");
-        set_header(
-            &mut req,
-            "x-forwarded-host",
-            "public.example.com, proxy.local",
-        );
-
-        let info = RequestInfo::from_request(&req, &default_client_info());
-        assert_eq!(
-            info.host, "public.example.com",
-            "Host should prefer X-Forwarded-Host over Host"
-        );
-    }
-
-    #[test]
-    fn test_request_info_scheme_from_x_forwarded_proto() {
-        let mut req = build_request(Method::GET, "https://test.example.com/page");
-        set_header(&mut req, "host", "test.example.com");
-        set_header(&mut req, "x-forwarded-proto", "https, http");
-
-        let info = RequestInfo::from_request(&req, &default_client_info());
-        assert_eq!(
-            info.scheme, "https",
-            "Scheme should prefer the first X-Forwarded-Proto value"
-        );
-
-        // Test HTTP
-        let mut req = build_request(Method::GET, "http://test.example.com/page");
-        set_header(&mut req, "host", "test.example.com");
-        set_header(&mut req, "x-forwarded-proto", "http");
-
-        let info = RequestInfo::from_request(&req, &default_client_info());
-        assert_eq!(
-            info.scheme, "http",
-            "Scheme should use the X-Forwarded-Proto value when present"
-        );
-    }
-
-    #[test]
-    fn request_info_forwarded_header_precedence() {
-        // Forwarded header takes precedence over X-Forwarded-Proto
-        let mut req = build_request(Method::GET, "https://test.example.com/page");
-        set_header(
-            &mut req,
-            "forwarded",
-            "for=192.0.2.60;proto=\"HTTPS\";host=\"public.example.com:443\"",
-        );
-        set_header(&mut req, "host", "internal-proxy.local");
-        set_header(&mut req, "x-forwarded-host", "proxy.local");
-        set_header(&mut req, "x-forwarded-proto", "http");
-
-        let info = RequestInfo::from_request(&req, &default_client_info());
-        assert_eq!(
-            info.host, "public.example.com:443",
-            "Host should prefer Forwarded host over X-Forwarded-Host"
-        );
-        assert_eq!(
-            info.scheme, "https",
-            "Scheme should prefer Forwarded proto over X-Forwarded-Proto"
-        );
-    }
-
-    #[test]
     fn test_request_info_scheme_from_fastly_ssl() {
         let mut req = build_request(Method::GET, "https://test.example.com/page");
         set_header(&mut req, "fastly-ssl", "1");
@@ -663,26 +623,6 @@ mod tests {
         assert_eq!(
             info.scheme, "https",
             "Scheme should fall back to Fastly-SSL when other signals are missing"
-        );
-    }
-
-    #[test]
-    fn test_request_info_chained_proxy_scenario() {
-        // Simulate: Client (HTTPS) -> Proxy A -> Trusted Server (HTTP internally)
-        // Proxy A sets X-Forwarded-Host and X-Forwarded-Proto
-        let mut req = build_request(Method::GET, "http://trusted-server.internal/page");
-        set_header(&mut req, "host", "trusted-server.internal");
-        set_header(&mut req, "x-forwarded-host", "public.example.com");
-        set_header(&mut req, "x-forwarded-proto", "https");
-
-        let info = RequestInfo::from_request(&req, &default_client_info());
-        assert_eq!(
-            info.host, "public.example.com",
-            "Host should use X-Forwarded-Host in chained proxy scenarios"
-        );
-        assert_eq!(
-            info.scheme, "https",
-            "Scheme should use X-Forwarded-Proto in chained proxy scenarios"
         );
     }
 

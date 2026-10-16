@@ -9,7 +9,7 @@ import unicorn from 'eslint-plugin-unicorn';
 export default [
   // Files/folders to ignore
   {
-    ignores: ['node_modules', 'dist', 'coverage'],
+    ignores: ['node_modules', 'dist', 'coverage', 'trace-assets/**'],
   },
   // Base JS recommended
   js.configs.recommended,

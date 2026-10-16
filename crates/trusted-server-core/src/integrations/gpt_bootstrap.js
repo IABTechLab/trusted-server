@@ -326,7 +326,11 @@
   // and deliberately identical to the bundle scheduler — the impression is
   // spent on a viewed tab, and the post-hydration guarantee holds whenever
   // the request is actually issued.
-  ts.scheduleInitialAdInit = function (initialBids, initialSlots) {
+  ts.scheduleInitialAdInit = function (
+    initialBids,
+    initialSlots,
+    traceAuctionTransport,
+  ) {
     // The bundle may replace this scheduler after the fallback claims the initial
     // pass. Keep the latch on the shared document API so replacement cannot reset it.
     if ((ts.navGeneration || 0) !== 0 || ts.initialAdInitScheduled) return;
@@ -338,6 +342,17 @@
     if (initialBids !== undefined) ts.bids = initialBids;
     var fire = function () {
       if ((ts.navGeneration || 0) !== 0) return;
+      try {
+        if (window.__tsjs_trace_active === true && ts.traceGpt) {
+          ts.traceGpt.observeTransport(
+            initialSlots === undefined ? ts.adSlots : initialSlots,
+            traceAuctionTransport,
+            "initial_navigation_ssat",
+          );
+        }
+      } catch (_) {
+        // Trace failure cannot interrupt the initial advertising pass.
+      }
       if (typeof ts.adInit === "function") ts.adInit();
     };
     var afterFrames = function () {
@@ -348,6 +363,49 @@
     if (document.readyState === "complete") afterFrames();
     else window.addEventListener("load", afterFrames, { once: true });
   };
+
+  function recordTraceOpportunity(gptSlot, slot, bid, fallback) {
+    if (window.__tsjs_trace_active !== true) return;
+    try {
+      var bridge = ts.traceGpt;
+      if (!bridge || !bridge.identity(slot) || !ts.gptDiagnosticsRecorder) return;
+      var trace = bridge.opportunity(slot, bid.hb_auction_id);
+      var handoff =
+        ts.gptSlotHandoffs && ts.gptSlotHandoffs[gptSlot.getSlotElementId()];
+      var requestedSizes = fallback ? slot.formats : handoff && handoff.formats;
+      var nonempty = function (value) {
+        return typeof value === "string" && value.length > 0;
+      };
+      // Mirror the bundle's opportunity classification at the same concrete
+      // GPT binding. Token validation remains in the single core bridge.
+      var hasTargeting = [
+        "hb_pb",
+        "hb_bidder",
+        "hb_adid",
+        "hb_cache_host",
+        "hb_cache_path",
+      ].some(function (key) {
+        return nonempty(bid[key]);
+      });
+      var opportunity = !hasTargeting
+        ? "no_candidate"
+        : nonempty(bid.hb_adid) &&
+            (nonempty(bid.adm) ||
+              (nonempty(bid.hb_cache_host) && nonempty(bid.hb_cache_path)))
+          ? "renderable_candidate"
+          : "unrenderable_candidate";
+      ts.gptDiagnosticsRecorder.recordTrustedServerOpportunity(
+        gptSlot,
+        slot.id,
+        opportunity,
+        trace.auctionId,
+        requestedSizes,
+        trace.identity,
+      );
+    } catch (_) {
+      // Diagnostics never change targeting, display, or refresh.
+    }
+  }
 
   function findSlotByElementId(pubads, elementId) {
     var slots = pubads.getSlots ? pubads.getSlots() : [];
@@ -721,6 +779,7 @@
           ts.prevGptSlots = ts.prevGptSlots || [];
           ts.prevGptSlots.push(gptSlot);
         }
+        recordTraceOpportunity(gptSlot, slot, bid, true);
         if (!ts.servicesEnabled) {
           pubads.enableSingleRequest();
           window.googletag.enableServices();
@@ -866,6 +925,7 @@
         // by the bundle's render bridge (index.ts) once it loads.
         divToSlotId[actualDivId] = slot.id;
         var slotElementId = s.getSlotElementId();
+        recordTraceOpportunity(s, slot, b, false);
         var targetingKeys = Object.keys(slot.targeting || {});
         nextSlotTargetingKeys[actualDivId] = targetingKeys;
         if (slotElementId && slotElementId !== actualDivId) {

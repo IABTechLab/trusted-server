@@ -1,3 +1,7 @@
+import type { TraceCollector } from '../trace/collector';
+import type { TraceGptIdentity } from '../trace/types';
+import type { TraceGptBridge } from '../trace/gpt';
+
 // Shared TypeScript types for the tsjs core API and extensions.
 export type Size = readonly [number, number];
 
@@ -27,6 +31,10 @@ export interface AuctionSlot {
   div_id: string;
   formats: Array<[number, number]>;
   targeting?: Record<string, string>;
+  ext?: {
+    trusted_server?: { trace_slot_ref?: unknown; [key: string]: unknown };
+    [key: string]: unknown;
+  };
 }
 
 /** Debug-only copy of server-side bid fields exposed for pipeline inspection. */
@@ -332,7 +340,8 @@ export interface GptDiagnosticsRecorder {
     auctionSlotId: string,
     opportunity: GptDiagnosticsTrustedServerOpportunity,
     trustedServerAuctionId?: string,
-    requestedSlotSizes?: ReadonlyArray<Size>
+    requestedSlotSizes?: ReadonlyArray<Size>,
+    traceIdentity?: TraceGptIdentity
   ): void;
   /** Mark slots whose next observed GPT request follows the Prebid refresh path. */
   recordPrebidRefresh(slots: GptDiagnosticsSlotHandle[]): void;
@@ -404,6 +413,10 @@ export interface FirstImpressionState {
 }
 
 export interface TsjsApi {
+  /** Internal trace observations, installed only for a literal activated document. */
+  traceEvidence?: TraceCollector;
+  /** Internal active-only bridge shared with the early GPT bootstrap. */
+  traceGpt?: TraceGptBridge;
   version: string;
   que: Array<() => void>;
   addAdUnits(units: AdUnit | AdUnit[]): void;
@@ -515,7 +528,8 @@ export interface TsjsApi {
    */
   scheduleInitialAdInit?: (
     initialBids?: Record<string, AuctionBidData>,
-    initialSlots?: AuctionSlot[]
+    initialSlots?: AuctionSlot[],
+    traceAuctionTransport?: unknown
   ) => void;
   /** Read-only GPT lifecycle diagnostics API, present only in an activated tab. */
   gptDiagnostics?: GptDiagnosticsApi;
