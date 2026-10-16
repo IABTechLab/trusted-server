@@ -22005,13 +22005,14 @@ mod tests {
 
     /// With `refuse_all` selected no other answer of the origin's takes the
     /// place of the file. A crawler takes an error, a redirect or an empty
-    /// answer as permission, and a file core cannot replace as the origin's
-    /// rules, so the refusal is made in place of each, with status `200`.
+    /// answer as permission, a `304` as leave to keep the copy it holds, and a
+    /// file core cannot replace as the origin's rules, so the refusal is made
+    /// in place of each, with status `200`.
     #[tokio::test]
     async fn robots_txt_is_made_in_place_of_any_answer_the_middleware_cannot_replace() {
         let permissive: &[u8] = b"User-agent: *\nAllow: /\n";
         let plain = ("content-type", "text/plain");
-        let answers: [(u16, &[u8], Vec<(&'static str, &'static str)>); 11] = [
+        let answers: [(u16, &[u8], Vec<(&'static str, &'static str)>); 12] = [
             (401, b"login", vec![("content-type", "text/html")]),
             (403, permissive, vec![plain]),
             (410, b"", vec![plain]),
@@ -22039,6 +22040,7 @@ mod tests {
                 b"User-agent: *\n",
                 vec![plain, ("content-range", "bytes 0-13/23")],
             ),
+            (304, b"", vec![plain, ("etag", "\"origin-etag\"")]),
         ];
 
         for (status, body, headers) in answers {
