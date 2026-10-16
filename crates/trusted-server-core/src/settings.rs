@@ -4820,8 +4820,13 @@ fn validation_error_summary(errors: &validator::ValidationErrors) -> String {
             };
             match kind {
                 validator::ValidationErrorsKind::Field(validations) => {
+                    // A validator's message, where it gives one, says why the
+                    // value was refused, which the code alone does not.
                     for validation in validations {
-                        messages.push(format!("{path}: {}", validation.code));
+                        messages.push(match &validation.message {
+                            Some(message) => format!("{path}: {} ({message})", validation.code),
+                            None => format!("{path}: {}", validation.code),
+                        });
                     }
                 }
                 validator::ValidationErrorsKind::Struct(inner) => {
