@@ -13,12 +13,11 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use base64::Engine as _;
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use edgezero_core::body::Body as EdgeBody;
 use http::{HeaderValue, Method, Request, Response, StatusCode, header};
+use p256::ecdsa::Signature;
 use p256::ecdsa::signature::Signer as _;
-use p256::ecdsa::{Signature, SigningKey};
-use p256::pkcs8::DecodePrivateKey as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use validator::{Validate, ValidationError};
@@ -32,6 +31,11 @@ use crate::settings::Settings;
 
 // `ATTESTATION_KEYS`, written by build.rs from the schedule the build names.
 include!(concat!(env!("OUT_DIR"), "/attestation_keys.rs"));
+
+/// The reading of a signing key, shared with the build script, which refuses
+/// a schedule key that cannot sign.
+#[path = "../signing_key.rs"]
+mod signing_key;
 
 /// The build script's reading of a key schedule, compiled here so a test can
 /// call it.
@@ -494,13 +498,7 @@ pub fn signed_bytes(context: &str, payload: &[u8]) -> Vec<u8> {
 /// Signs `payload` under `context` with a key held as base64 DER text,
 /// returning the raw 64 byte `r` and `s` pair.
 fn sign(context: &str, payload: &[u8], key_text: &str) -> Result<Vec<u8>, &'static str> {
-    let der = STANDARD
-        .decode(key_text.trim())
-        .map_err(|_| "the key is not base64")?;
-    let secret = p256::SecretKey::from_sec1_der(&der)
-        .or_else(|_| p256::SecretKey::from_pkcs8_der(&der))
-        .map_err(|_| "the key is not a P-256 private key in SEC1 or PKCS #8 DER")?;
-    let signature: Signature = SigningKey::from(secret).sign(&signed_bytes(context, payload));
+    let signature: Signature = signing_key::read(key_text)?.sign(&signed_bytes(context, payload));
     Ok(signature.to_bytes().to_vec())
 }
 
@@ -773,6 +771,7 @@ fn validate_https_url(value: &str) -> Result<(), ValidationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::STANDARD;
     use p256::ecdsa::VerifyingKey;
     use p256::ecdsa::signature::Verifier as _;
     use p256::pkcs8::{DecodePublicKey as _, EncodePublicKey as _};
@@ -981,6 +980,40 @@ mod tests {
                 Err(refusal.to_owned()),
                 "{case} should be refused"
             );
+        }
+    }
+
+    /// A key that cannot sign stops the build however late it starts, so no
+    /// built binary carries one. The message names the key's line and id and
+    /// never the key.
+    #[test]
+    fn a_schedule_key_that_cannot_sign_is_refused_without_showing_it() {
+        let first = key_text(&FIRST);
+        let latest = i64::MAX;
+        let ed25519_seed = STANDARD.encode([0x33u8; 32]);
+        for (case, key, reason) in [
+            (
+                "a key that is not base64",
+                "not-base64-at-all",
+                "the key is not base64",
+            ),
+            (
+                "a key that is not a P-256 private key",
+                ed25519_seed.as_str(),
+                "the key is not a P-256 private key in SEC1 or PKCS #8 DER",
+            ),
+        ] {
+            let schedule =
+                format!("example-first\t1000\t{first}\nexample-later\t{latest}\t{key}\n");
+            let refused = key_schedule::constant_source(Some(&schedule))
+                .expect_err("should refuse the schedule");
+
+            assert_eq!(
+                refused,
+                format!("line 2 holds key `example-later`, which cannot sign, as {reason}"),
+                "{case} should be refused"
+            );
+            assert!(!refused.contains(key), "{case} should never show the key");
         }
     }
 
