@@ -48,10 +48,10 @@ media_type = "text/html"
 middleware = ["cmp.inmobi", "tag.google-tag-manager"]
 ```
 
-| Field        | Type   | Default  | Contract                                                                                                    |
-| ------------ | ------ | -------- | ----------------------------------------------------------------------------------------------------------- |
-| `script_url` | URL    | Required | The account's Choice loader, `https` on `cmp.inmobi.com` or `cdn.inmobi.com`, with no user name or password |
-| `cmp_id`     | Number | `10`     | The IAB registered CMP identifier the GPP stub answers `ping` with while the prompt loads                   |
+| Field        | Type   | Default  | Contract                                                                                                        |
+| ------------ | ------ | -------- | --------------------------------------------------------------------------------------------------------------- |
+| `script_url` | URL    | Required | The account's Choice loader, `https` on `cmp.inmobi.com` or `cdn.inmobi.com`, with no user name or password     |
+| `cmp_id`     | Number | `10`     | The IAB registered CMP identifier, from 1 to 4095, that the GPP stub answers `ping` with while the prompt loads |
 
 The table refuses a field it does not read.
 
@@ -70,9 +70,12 @@ written after every fetch middleware's, so a prompt placed in `[[serve]]`
 comes after a vendor's tag that a `[[fetch]]` entry writes. Place the prompt
 in `[[fetch]]` wherever a fetch middleware writes a vendor's tag.
 
-Selecting the module with no `text/html` entry of either phase naming it is
-refused when the settings load and by `ts config validate`, because the
-prompt would never be written.
+Selecting the module is refused when the settings load and by `ts config
+validate` if the entries leave any page served as `text/html` without the
+prompt, and the refusal names those pages. A page takes the first entry of
+each phase that covers it, so each page has to take an entry of one phase or
+the other that names `cmp.inmobi`. With the prompt in `[[fetch]]` alone,
+every entry names it, and one with no `path` comes after any that has one.
 
 The tag is written at the start of the head, ahead of the page's own
 `<meta charset>`, and is about 3.6 KB. A browser looks for `<meta charset>`
@@ -108,8 +111,8 @@ following, and they are what every `[cmp]` module is held to.
    other path.
 5. A script address written into every page is checked at load against
    what it is, not what it looks like.
-6. A selected prompt that no entry places is refused rather than silently
-   left unwritten.
+6. A selected prompt that the entries leave off any page is refused rather
+   than silently left unwritten.
 
 ## Tests
 
