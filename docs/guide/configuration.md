@@ -1709,8 +1709,8 @@ cache, with the module's short name or its name in full. A stock build links
 one loading cache module the build links, so a stock build holds answers
 without a line in the document, and keeps no copy when the build links none
 or several, making each answer every time it is asked for. A name that no
-linked crate offers a cache from is refused when the service starts, with
-the names that could be written.
+linked crate offers a cache from is refused by `ts config validate` and when
+the service starts, with the names that could be written.
 
 | Table                | Field                | Default                 | Range         | Description                                                                     |
 | -------------------- | -------------------- | ----------------------- | ------------- | ------------------------------------------------------------------------------- |

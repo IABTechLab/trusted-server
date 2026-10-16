@@ -799,14 +799,7 @@ pub fn loading_caches_from(
     settings: &Settings,
     builders: &[IntegrationBuilder],
 ) -> Result<Arc<crate::platform::LoadingCaches>, Report<TrustedServerError>> {
-    let offered: Vec<(&'static str, LoadingCacheFactory)> = builders
-        .iter()
-        .filter_map(|builder| {
-            builder
-                .loading_cache()
-                .map(|factory| (builder.id(), factory))
-        })
-        .collect();
+    let offered = offered_caches(builders);
     let mut made: Vec<(&'static str, Arc<dyn crate::platform::PlatformLoadingCache>)> = Vec::new();
     let mut caches = crate::platform::LoadingCaches::default();
     for (table, config) in settings.cache.loading_caches() {
@@ -818,28 +811,81 @@ pub fn loading_caches_from(
             None if offered.len() == 1 => offered[0].0,
             None => continue,
         };
-        let Some((name, factory)) = offered.iter().find(|(name, _)| {
-            *name == written || crate::module_name::short_form(LOADING_CACHE_TYPE, name) == written
-        }) else {
-            return Err(Report::new(TrustedServerError::Configuration {
-                message: format!(
-                    "[cache.{table}] module names `{written}`, which no linked crate offers \
-                     a loading cache from. The loading cache modules this build has are: {}",
-                    offered_cache_names(&offered)
-                ),
-            }));
-        };
-        let cache = match made.iter().find(|(made_name, _)| made_name == name) {
+        let (name, factory) = named_cache(table, written, &offered)?;
+        let cache = match made.iter().find(|(made_name, _)| *made_name == name) {
             Some((_, cache)) => Arc::clone(cache),
             None => {
                 let cache = factory();
-                made.push((*name, Arc::clone(&cache)));
+                made.push((name, Arc::clone(&cache)));
                 cache
             }
         };
         caches.insert(table, cache);
     }
     Ok(Arc::new(caches))
+}
+
+/// Refuses a `[cache.<name>]` table whose `module` no linked builder offers
+/// a loading cache from, as [`loading_caches_from`] does. The deploy check
+/// runs it, so a misspelt module fails `ts config validate` rather than the
+/// service.
+///
+/// # Errors
+///
+/// When a table names a module no linked builder offers a cache from, naming
+/// the table and the modules that do.
+pub fn check_loading_cache_modules(
+    settings: &Settings,
+    builders: &[IntegrationBuilder],
+) -> Result<(), Report<TrustedServerError>> {
+    let offered = offered_caches(builders);
+    for (table, config) in settings.cache.loading_caches() {
+        if let Some(written) = config.module.as_deref() {
+            named_cache(table, written, &offered)?;
+        }
+    }
+    Ok(())
+}
+
+/// The loading cache each builder offers, by its module name.
+fn offered_caches(builders: &[IntegrationBuilder]) -> Vec<(&'static str, LoadingCacheFactory)> {
+    builders
+        .iter()
+        .filter_map(|builder| {
+            builder
+                .loading_cache()
+                .map(|factory| (builder.id(), factory))
+        })
+        .collect()
+}
+
+/// The offered cache that `[cache.<table>] module` names as `written`, by the
+/// module's short name or in full.
+///
+/// # Errors
+///
+/// When nothing offered has that name, naming the table and the modules that
+/// offer a cache.
+fn named_cache(
+    table: &str,
+    written: &str,
+    offered: &[(&'static str, LoadingCacheFactory)],
+) -> Result<(&'static str, LoadingCacheFactory), Report<TrustedServerError>> {
+    offered
+        .iter()
+        .find(|(name, _)| {
+            *name == written || crate::module_name::short_form(LOADING_CACHE_TYPE, name) == written
+        })
+        .copied()
+        .ok_or_else(|| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "[cache.{table}] module names `{written}`, which no linked crate offers \
+                     a loading cache from. The loading cache modules this build has are: {}",
+                    offered_cache_names(offered)
+                ),
+            })
+        })
 }
 
 /// The type folder loading cache modules live under, which their short

@@ -467,6 +467,32 @@ mod tests {
         );
     }
 
+    /// `ts config validate` validates against this list, so it accepts the
+    /// stock loading cache by name and refuses a misspelling, which the
+    /// service would otherwise refuse only as it starts.
+    #[test]
+    fn deploy_validation_knows_the_stock_loading_cache() {
+        use trusted_server_core::config::validate_settings_for_deploy_with;
+
+        let stock = builders();
+        let mut settings = trusted_server_core::test_support::tests::create_test_settings();
+
+        settings.cache.robots_txt.module = Some("51degrees".to_owned());
+        validate_settings_for_deploy_with(&settings, &stock)
+            .expect("the stock loading cache should pass deploy validation");
+
+        settings.cache.robots_txt.module = Some("51degreez".to_owned());
+        let error = validate_settings_for_deploy_with(&settings, &stock)
+            .expect_err("a module nothing offers should be refused");
+        assert!(
+            format!("{error:?}").contains(
+                "[cache.robots-txt] module names `51degreez`, which no linked crate offers a \
+                 loading cache from. The loading cache modules this build has are: 51degrees"
+            ),
+            "should name the table and the stock loading cache: {error:?}"
+        );
+    }
+
     #[test]
     fn a_deployment_s_builders_follow_the_stock_ones() {
         let stock = builders().len();
