@@ -179,9 +179,10 @@ pub struct RuntimeServices {
     pub(crate) value_cache: Option<Arc<dyn super::PlatformValueCache>>,
     /// The loading cache each `[cache.<name>]` table selected, which loads a
     /// missing value once per key and keeps its copies in
-    /// [`value_cache`](Self::value_cache) or the key-value store. A cache whose
-    /// table selected none loads through [`super::NoLoadingCache`], which holds
-    /// nothing.
+    /// [`value_cache`](Self::value_cache) or the key-value store. A table
+    /// naming no module takes the one loading cache module the build links,
+    /// and with none linked, or several, its cache loads through
+    /// [`super::NoLoadingCache`], which holds nothing.
     pub(crate) loading_caches: Arc<super::LoadingCaches>,
     /// Shared transformed-template cache. Defaults to
     /// [`UnavailableTemplateCache`], so adapters without one degrade to transforming
@@ -288,6 +289,10 @@ impl RuntimeServices {
     /// or from `load`, kept in this request's stores. See
     /// [`super::PlatformLoadingCache::get_or_load`].
     ///
+    /// The cache is handed these services [without the
+    /// connection](Self::without_connection), because one load serves every
+    /// caller waiting on it.
+    ///
     /// # Errors
     ///
     /// The error of the load this caller waited on.
@@ -298,7 +303,7 @@ impl RuntimeServices {
         load: super::Loader,
     ) -> Result<bytes::Bytes, super::LoadError> {
         self.loading_cache_for(spec.name)
-            .get_or_load(self, spec, key, load)
+            .get_or_load(&self.clone().without_connection(), spec, key, load)
             .await
     }
 
@@ -424,6 +429,14 @@ impl RuntimeServices {
         }
     }
 
+    /// Returns a clone of this instance with backend registration replaced
+    /// by `backend`, for a caller that bounds what a module it calls may
+    /// register.
+    #[must_use]
+    pub(crate) fn with_backend(self, backend: Arc<dyn PlatformBackend>) -> Self {
+        Self { backend, ..self }
+    }
+
     /// Returns a clone of this instance with the resolved Edge Cookie module
     /// replaced.
     ///
@@ -466,6 +479,22 @@ impl RuntimeServices {
     pub fn with_client_info(self, client_info: ClientInfo) -> Self {
         Self {
             client_info,
+            ..self
+        }
+    }
+
+    /// Returns a clone of this instance with nothing of the connection it was
+    /// built for, being default client metadata and no host signals. The
+    /// stores, caches, backends, HTTP client and modules stay.
+    ///
+    /// For work whose answer is held and served to everyone who asks, such as
+    /// a load a cache shares, so that nothing of one connection can reach what
+    /// the others are given.
+    #[must_use]
+    pub fn without_connection(self) -> Self {
+        Self {
+            client_info: ClientInfo::default(),
+            host_signals: None,
             ..self
         }
     }
