@@ -3549,7 +3549,9 @@ describe('prebid/installRefreshHandler', () => {
       });
     });
 
-    function installBandedSlot(viewportWidth: number) {
+    // A slot Trusted Server defined carries its bands as a size mapping, and a
+    // slot the publisher defined first carries none.
+    function installBandedSlot(viewportWidth: number, { definedWithMapping = true } = {}) {
       Object.defineProperty(window, 'innerWidth', { configurable: true, value: viewportWidth });
       const originalRefresh = vi.fn();
       const gptSlot = {
@@ -3565,6 +3567,7 @@ describe('prebid/installRefreshHandler', () => {
         pubads: () => pubads,
       };
       testWindow.tsjs = {
+        ...(definedWithMapping ? { viewportMappedSlots: new WeakSet([gptSlot]) } : {}),
         adSlots: [
           {
             id: 'billboard',
@@ -3627,6 +3630,43 @@ describe('prebid/installRefreshHandler', () => {
 
       expect(mockRequestBids).not.toHaveBeenCalled();
       expect(originalRefresh).toHaveBeenCalled();
+    });
+
+    it('offers a slot the publisher defined its formats, as its ad request has no band', () => {
+      const { pubads } = installBandedSlot(375, { definedWithMapping: false });
+
+      pubads.refresh();
+
+      expect(mockRequestBids).toHaveBeenCalledWith(
+        expect.objectContaining({
+          adUnits: [
+            expect.objectContaining({
+              code: 'div-ad-billboard',
+              mediaTypes: {
+                banner: {
+                  sizes: [
+                    [970, 250],
+                    [300, 250],
+                    [320, 50],
+                  ],
+                },
+              },
+            }),
+          ],
+        })
+      );
+    });
+
+    it('auctions a slot the publisher defined where its band asks for no size', () => {
+      const { pubads } = installBandedSlot(700, { definedWithMapping: false });
+
+      pubads.refresh();
+
+      expect(mockRequestBids).toHaveBeenCalledWith(
+        expect.objectContaining({
+          adUnits: [expect.objectContaining({ code: 'div-ad-billboard' })],
+        })
+      );
     });
   });
 
