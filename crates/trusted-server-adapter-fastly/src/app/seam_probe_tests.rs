@@ -16,7 +16,10 @@ use error_stack::Report;
 use futures::executor::block_on;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::evidence::OwnedRequestInfo;
-use trusted_server_core::integrations::{IntegrationBuilder, IntegrationRegistration};
+use trusted_server_core::integrations::{
+    IntegrationBuilder, IntegrationRegistration, IntegrationRequestFilter, RequestFilterDecision,
+    RequestFilterEffects, RequestFilterInput,
+};
 use trusted_server_core::module_context::{ModuleContext, ModuleRequest};
 use trusted_server_core::settings::Settings;
 use trusted_server_core::tsjs::tsjs_script_src;
@@ -24,8 +27,8 @@ use trusted_server_core::tsjs_bundle::{JsModulePart, compile_time_parts};
 use trusted_server_integration_seam_probe as seam_probe;
 
 use super::{
-    AppState, TrustedServerApp, build_finalize_services, build_state_from_settings,
-    build_state_with_registrations, register_integrations,
+    AppState, EcFinalizeState, TrustedServerApp, build_finalize_services,
+    build_state_from_settings, build_state_with_registrations, register_integrations,
 };
 
 /// Largest response body these tests read, ample for the served script.
@@ -345,6 +348,96 @@ fn robots_txt_is_this_servers_only_when_the_settings_carry_the_section() {
             "{method} /robots.txt should be answered here: {methods:?}"
         );
     }
+}
+
+/// The id of a module whose request filter answers every request with a
+/// challenge, as bot protection does.
+const CHALLENGE_ID: &str = "robots-txt-challenge";
+
+/// The module name that module is selected by.
+const CHALLENGE_MODULE: &str = "testing.robots-txt-challenge";
+
+/// Answers every request with a `403` challenge.
+struct Challenging;
+
+#[async_trait::async_trait(?Send)]
+impl IntegrationRequestFilter for Challenging {
+    fn integration_id(&self) -> &'static str {
+        CHALLENGE_ID
+    }
+
+    async fn filter_request(
+        &self,
+        _input: RequestFilterInput<'_>,
+    ) -> Result<RequestFilterDecision, Report<TrustedServerError>> {
+        let response = edgezero_core::http::response_builder()
+            .status(403)
+            .body(Body::from("a challenge"))
+            .expect("should build the challenge");
+        Ok(RequestFilterDecision::Respond {
+            response: Box::new(response),
+            effects: RequestFilterEffects::default(),
+        })
+    }
+}
+
+fn register_challenge(
+    _settings: &Settings,
+) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+    Ok(Some(
+        IntegrationRegistration::builder(CHALLENGE_ID)
+            .with_request_filter(Arc::new(Challenging))
+            .build(),
+    ))
+}
+
+fn accept_challenge(_settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+    Ok(true)
+}
+
+/// A crawler asking for robots.txt is answered before the Edge Cookie steps
+/// and the request filters, so a filter that answers every other request with
+/// a challenge never stands in for the file, and no Edge Cookie state rides
+/// on the answer.
+#[test]
+fn robots_txt_is_answered_before_the_edge_cookie_steps_and_the_filters() {
+    let settings = settings_with(&format!(
+        r#"
+        [robots-txt]
+        modules = "refuse_all"
+        {HMAC_BLOCK}
+
+        [testing]
+        modules = ["robots-txt-challenge"]
+        "#
+    ));
+    let challenge = IntegrationBuilder::new(
+        CHALLENGE_ID,
+        CHALLENGE_ID,
+        register_challenge,
+        accept_challenge,
+    )
+    .with_module_name(CHALLENGE_MODULE);
+    let router = router_with(settings, &[challenge]);
+
+    let other = get(&router, "/.well-known/trusted-server.json", None);
+    assert_eq!(
+        other.status().as_u16(),
+        403,
+        "the filter should answer another named route"
+    );
+
+    let file = get(&router, "/robots.txt", None);
+    assert_eq!(
+        file.status().as_u16(),
+        200,
+        "the file should be served, not the filter's challenge"
+    );
+    assert!(
+        file.extensions().get::<EcFinalizeState>().is_none(),
+        "no Edge Cookie state should ride on the file"
+    );
+    assert_eq!(body_text(file), "User-agent: *\nDisallow: /\n");
 }
 
 /// A request prepares exactly once whether a named route or the fallback
