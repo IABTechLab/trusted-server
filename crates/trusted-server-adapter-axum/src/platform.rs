@@ -26,7 +26,9 @@ fn normalize_env_segment(s: &str) -> String {
     s.to_uppercase().replace(['-', '.', ' '], "_")
 }
 
-fn config_env_var(store_name: &str, key: &str) -> String {
+/// Returns the environment-variable name for a config store entry.
+#[must_use]
+pub fn config_env_var(store_name: &str, key: &str) -> String {
     format!(
         "TRUSTED_SERVER_CONFIG_{}_{}",
         normalize_env_segment(store_name),
@@ -522,16 +524,13 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
 ///
 /// # Degraded features in dev
 ///
-/// KV store is [`trusted_server_core::platform::UnavailableKvStore`] — any route
-/// touching synthetic-ID or consent KV will degrade gracefully. A `warn` log is
+/// The generic runtime KV slot uses
+/// [`trusted_server_core::platform::UnavailableKvStore`]. A `warn` log is
 /// emitted once per process.
 pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> RuntimeServices {
     static KV_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     KV_WARNED.get_or_init(|| {
-        log::warn!(
-            "Axum dev server: KV store is unavailable (UnavailableKvStore). \
-             Routes that depend on synthetic-ID or consent KV will degrade gracefully."
-        );
+        log::warn!("Axum dev server: generic runtime KV is unavailable (UnavailableKvStore).");
     });
 
     let client_ip = edgezero_adapter_axum::context::AxumRequestContext::get(ctx.request())
@@ -605,6 +604,15 @@ mod tests {
         assert!(
             !capabilities.has_enforceable_total_request_deadline(),
             "reqwest's transport timeout is not an adapter-enforced auction deadline"
+        );
+    }
+
+    #[test]
+    fn config_env_var_normalizes_store_and_key() {
+        assert_eq!(
+            config_env_var("my-store.name", "my key"),
+            "TRUSTED_SERVER_CONFIG_MY_STORE_NAME_MY_KEY",
+            "should normalize environment-variable segments"
         );
     }
 

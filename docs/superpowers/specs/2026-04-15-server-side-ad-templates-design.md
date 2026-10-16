@@ -68,10 +68,14 @@ across every navigation in the user's clickstream rather than once per session.
   pipeline. The GAM call (`securepubads.g.doubleclick.net`) moving server-side is
   aspirational, contingent on Google agreement, and is not committed for any phase
   (see §9.6).
-- Eliminating Prebid entirely — a stripped-down Prebid bundle (_slim-Prebid_) is
+- Eliminating Prebid entirely. A stripped-down Prebid bundle (_slim-Prebid_) is
   lazy-loaded post-`window.load` to handle scroll/refresh auctions and userID
-  enrichment. **TS owns the first impression; Prebid owns subsequent refresh
-  auctions.**
+  enrichment. **The first valid claimant owns each navigation's first impression.**
+  A publisher auction, GPT request, or GPT render consumes the claim before late
+  page-bids data can target or refresh that slot. If TS claims first, it suppresses
+  one correlated losing publisher delivery during a bounded lease. Later publisher
+  refresh auctions proceed normally. Strict TS-first delivery would require holding
+  publisher delivery and remains a separate design choice.
 - Dynamic slot discovery (reading the DOM) — this design commits to pre-defined,
   URL-matched slot templates. Smart Slots' dynamic injection behavior is replaced by
   server knowledge.

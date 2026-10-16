@@ -10,23 +10,16 @@ use crate::settings::{IntegrationConfig, Settings};
 
 const NEXTJS_INTEGRATION_ID: &str = "nextjs";
 
-mod html_post_process;
 mod rsc;
 mod rsc_placeholders;
+mod rsc_stream;
 mod script_rewriter;
 mod shared;
 
-// Re-export deprecated legacy functions for backward compatibility.
-// Production code should use the placeholder-based approach via NextJsHtmlPostProcessor.
-#[allow(
-    deprecated,
-    reason = "legacy HTML post-processing functions remain re-exported for compatibility"
-)]
-pub use html_post_process::{post_process_rsc_html, post_process_rsc_html_in_place};
 pub use rsc::rewrite_rsc_scripts_combined;
 
-use html_post_process::NextJsHtmlPostProcessor;
 use rsc_placeholders::NextJsRscPlaceholderRewriter;
+use rsc_stream::NextJsRscStreamProcessorFactory;
 use script_rewriter::NextJsNextDataRewriter;
 
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
@@ -94,17 +87,16 @@ pub fn register(
     // Register a structured (Pages Router __NEXT_DATA__) rewriter.
     let structured = Arc::new(NextJsNextDataRewriter::new(config.clone())?);
 
-    // Insert placeholders for App Router RSC payload scripts during the initial HTML rewrite pass,
-    // then substitute them during post-processing without re-parsing HTML.
+    // Insert placeholders for App Router RSC payload scripts during the HTML rewrite pass,
+    // then substitute them through the bounded output stream processor.
     let placeholders = Arc::new(NextJsRscPlaceholderRewriter::new(config.clone()));
 
-    // Register post-processor for cross-script RSC T-chunks
-    let post_processor = Arc::new(NextJsHtmlPostProcessor::new(config.clone()));
+    let stream_processor = Arc::new(NextJsRscStreamProcessorFactory::new(config.clone()));
 
     let builder = IntegrationRegistration::builder(NEXTJS_INTEGRATION_ID)
         .with_script_rewriter(structured)
         .with_script_rewriter(placeholders)
-        .with_html_post_processor(post_processor);
+        .with_html_stream_processor(stream_processor);
 
     Ok(Some(builder.build()))
 }
@@ -693,19 +685,12 @@ mod tests {
     }
 
     /// Regression test: a fragmented `self.__next_f.push([1, "…"])` RSC script
-    /// must still have its origin URLs rewritten after going through the full
-    /// streaming pipeline into the accumulating post-processor. Exercises the
-    /// "fallback" branch of `NextJsHtmlPostProcessor` where no placeholders
-    /// were captured during streaming (because every fragment returned `Keep`
-    /// on `!is_last`) and `post_process_rsc_html_in_place_with_limit` has to
-    /// re-parse the accumulated HTML to find RSC push scripts.
+    /// must still have its origin URLs rewritten through the streaming pipeline.
     #[test]
-    fn small_chunk_rsc_push_survives_fragmentation_via_post_processor_fallback() {
+    fn small_chunk_rsc_push_survives_fragmentation() {
         // Build an RSC push script whose payload contains multiple origin URLs.
         // With chunk_size = 128, this script's text node will be fragmented at
-        // chunk boundaries by the streaming input, so NextJsRscPlaceholderRewriter
-        // will return Keep on every fragment and the post-processor fallback
-        // has to rewrite on the accumulated HTML.
+        // chunk boundaries by the streaming input.
         let html = format!(
             r#"<html><body><script>self.__next_f.push([1,"1:{{\"link\":\"https://origin.example.com/a\",\"img\":\"https://origin.example.com/img.png\",\"nested\":{{\"url\":\"https://origin.example.com/deep/path?q=1\",\"extra\":\"{}\"}}}}"])</script></body></html>"#,
             "x".repeat(400), // pad to guarantee chunk-boundary fragmentation
@@ -770,5 +755,186 @@ mod tests {
             processed.contains(r#""])</script>"#),
             "push call must close properly \u{2014} `\"])` followed by </script>. Got: {processed}"
         );
+    }
+
+    /// Build the production HTML processor for the Next.js integration and run
+    /// `html` through it at `chunk_size`, returning the streamed output.
+    fn stream_nextjs_html(html: &str, chunk_size: usize) -> String {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "nextjs",
+                &json!({
+                    "enabled": true,
+                    "rewrite_attributes": ["href", "link", "url"],
+                }),
+            )
+            .expect("should update nextjs config");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create registry");
+        let processor = create_html_processor(config_from_settings(&settings, &registry));
+        let mut pipeline = StreamingPipeline::new(
+            PipelineConfig {
+                input_compression: Compression::None,
+                output_compression: Compression::None,
+                chunk_size,
+            },
+            processor,
+        );
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .expect("should stream HTML");
+        String::from_utf8(output).expect("should emit UTF-8 HTML")
+    }
+
+    /// Regression test: only `self.`/`window.` own `__next_f`. A publisher script
+    /// that happens to hold a property of that name must stream through byte for
+    /// byte, at any fragmentation.
+    #[test]
+    fn foreign_next_f_receivers_stream_through_unchanged() {
+        for receiver in [
+            "myAnalytics",
+            "foo.bar",
+            "window.myapp",
+            "a__next_f_store",
+            "myself",
+        ] {
+            let script =
+                format!(r#"{receiver}.__next_f.push([1,"https://origin.example.com/track"])"#);
+            let html = format!("<html><body><script>{script}</script></body></html>");
+            for chunk_size in [8, 32, 8192] {
+                let processed = stream_nextjs_html(&html, chunk_size);
+                assert_eq!(
+                    processed, html,
+                    "`{receiver}.__next_f` is not a Flight receiver and must not be rewritten at chunk size {chunk_size}"
+                );
+            }
+        }
+    }
+
+    /// Regression test: a genuine receiver must still be rewritten when the
+    /// stream splits it from its `__next_f` identifier.
+    #[test]
+    fn split_flight_receivers_are_still_rewritten() {
+        for receiver in ["self", "window"] {
+            let html = format!(
+                r#"<html><body><script>{receiver}.__next_f.push([1,"{{\"url\":\"https://origin.example.com/page\"}}"])</script></body></html>"#
+            );
+            for chunk_size in [8, 32, 8192] {
+                let processed = stream_nextjs_html(&html, chunk_size);
+                assert!(
+                    processed.contains("test.example.com/page")
+                        && !processed.contains("origin.example.com/page"),
+                    "`{receiver}.__next_f` should be rewritten at chunk size {chunk_size}. Got: {processed}"
+                );
+            }
+        }
+    }
+
+    /// Regression test: an escape whose body straddles a multi-byte character
+    /// must not panic the T-chunk escape scanner.
+    #[test]
+    fn malformed_escapes_at_character_boundaries_do_not_panic() {
+        for payload in [
+            r#"1:T9,\x4ézzzzzzzz"#,
+            r#"1:T9,\u12😀zzzzzzzz"#,
+            r#"1:T9,\ud83d\u12😀zzzz"#,
+        ] {
+            let html = format!(
+                r#"<html><body><script>self.__next_f.push([1,"{payload}"])</script></body></html>"#
+            );
+            let processed = stream_nextjs_html(&html, 8192);
+            assert!(
+                processed.contains(payload),
+                "malformed escape payload should stream through unchanged. Got: {processed}"
+            );
+        }
+    }
+
+    /// Regression test: two independent payloads that each fit the configured
+    /// limit must both be rewritten, whether they arrive in one source chunk or
+    /// separate ones. The limit bounds one script and one unresolved group, not
+    /// every placeholder queued during a single parser call.
+    #[test]
+    fn independent_payloads_do_not_share_the_group_limit() {
+        let first = r#"{\"url\":\"https://origin.example.com/first\"}"#;
+        let second = r#"{\"url\":\"https://origin.example.com/second\"}"#;
+        let html = format!(
+            "<html><body><script>self.__next_f.push([1,\"{first}\"])</script>\
+             <script>self.__next_f.push([1,\"{second}\"])</script></body></html>"
+        );
+
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "nextjs",
+                &json!({
+                    "enabled": true,
+                    "rewrite_attributes": ["href", "link", "url"],
+                    // Fits either script alone, not both payloads together.
+                    "max_combined_payload_bytes": 80,
+                }),
+            )
+            .expect("should update nextjs config");
+        let registry = IntegrationRegistry::with_plan(
+            &settings,
+            Arc::new(
+                crate::auction::compile_auction_plan(&settings)
+                    .expect("should compile auction plan"),
+            ),
+        )
+        .expect("should create registry");
+        let processor = create_html_processor(config_from_settings(&settings, &registry));
+        let mut pipeline = StreamingPipeline::new(
+            PipelineConfig {
+                input_compression: Compression::None,
+                output_compression: Compression::None,
+                chunk_size: 8192,
+            },
+            processor,
+        );
+        let mut output = Vec::new();
+        pipeline
+            .process(Cursor::new(html.as_bytes()), &mut output)
+            .expect("should stream HTML");
+        let processed = String::from_utf8(output).expect("should emit UTF-8 HTML");
+
+        assert!(
+            processed.contains("test.example.com/first")
+                && processed.contains("test.example.com/second"),
+            "both independent payloads should be rewritten in one parser call. Got: {processed}"
+        );
+        assert!(
+            !processed.contains("origin.example.com"),
+            "no origin host should survive. Got: {processed}"
+        );
+    }
+
+    /// Regression test: Next.js always emits a `self.`/`window.` receiver. A bare
+    /// `__next_f.push(...)` has no receiver to verify, and the boundary check
+    /// cannot reject it because nothing precedes the identifier, so only the
+    /// qualified-receiver requirement keeps it from being claimed.
+    #[test]
+    fn unqualified_next_f_push_streams_through_unchanged() {
+        let html = concat!(
+            r#"<html><body><script>__next_f.push([1,"#,
+            r#""{\"url\":\"https://origin.example.com/page\"}"])</script></body></html>"#
+        );
+        for chunk_size in [8, 32, 8192] {
+            let processed = stream_nextjs_html(html, chunk_size);
+            assert_eq!(
+                processed, html,
+                "an unqualified `__next_f` receiver should stream through unchanged at chunk size {chunk_size}"
+            );
+        }
     }
 }

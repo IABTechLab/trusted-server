@@ -124,6 +124,19 @@ pub fn enforce_basic_auth(
     }
 }
 
+/// Username from a basic-auth request, for audit logging.
+///
+/// Returns the username alone. The password is a shared static secret and must never reach
+/// a log line.
+///
+/// This parses a header; it verifies nothing. Call it only on a request
+/// [`enforce_basic_auth`] has already accepted, where the username identifies which
+/// operator credential was used.
+#[must_use]
+pub fn authenticated_username(req: &Request<EdgeBody>) -> Option<String> {
+    extract_credentials(req).map(|(username, _password, _digest)| username)
+}
+
 fn extract_credentials(req: &Request<EdgeBody>) -> Option<(String, String, [u8; 32])> {
     let mut header_values = req.headers().get_all(header::AUTHORIZATION).iter();
     let header_value = header_values.next()?;

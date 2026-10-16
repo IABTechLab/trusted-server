@@ -51,6 +51,7 @@ pub struct AppState {
     settings: Arc<Settings>,
     orchestrator: Arc<AuctionOrchestrator>,
     registry: Arc<IntegrationRegistry>,
+    services: Option<RuntimeServices>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -81,6 +82,13 @@ fn build_state() -> Result<Arc<AppState>, Report<TrustedServerError>> {
 fn build_state_with_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
+    build_state_with_services(settings, None)
+}
+
+fn build_state_with_services(
+    settings: Settings,
+    services: Option<RuntimeServices>,
+) -> Result<Arc<AppState>, Report<TrustedServerError>> {
     let plan = Arc::new(compile_auction_plan(&settings)?);
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Axum)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
@@ -90,7 +98,16 @@ fn build_state_with_settings(
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
+        services,
     }))
+}
+
+impl AppState {
+    fn services_for_request(&self, ctx: &RequestContext) -> RuntimeServices {
+        self.services
+            .clone()
+            .unwrap_or_else(|| build_runtime_services(ctx))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -142,7 +159,7 @@ where
     F: FnOnce(Arc<AppState>, RuntimeServices, Request) -> Fut,
     Fut: Future<Output = Result<Response, Report<TrustedServerError>>>,
 {
-    let services = build_runtime_services(&ctx);
+    let services = state.services_for_request(&ctx);
     let mut req = ctx.into_request();
     if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
         &state.settings,
@@ -278,6 +295,7 @@ enum NamedRouteHandler {
     TrustedServerDiscovery,
     VerifySignature,
     AdminNotSupported,
+    CachePurgeNotSupported,
     AdminEcNotSupported,
     AdminEidsLookup,
     /// Legacy `/admin/keys/*` aliases — denied locally with 404 so they never
@@ -307,7 +325,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_routes() -> [NamedRoute; 16] {
+fn named_routes() -> [NamedRoute; 17] {
     [
         NamedRoute {
             path: "/.well-known/trusted-server.json",
@@ -331,6 +349,14 @@ fn named_routes() -> [NamedRoute; 16] {
             path: "/_ts/admin/keys/deactivate",
             primary_methods: &[Method::POST],
             handler: NamedRouteHandler::AdminNotSupported,
+        },
+        // Every method, for the same reason as the Fastly adapter: a method this route
+        // does not claim falls through to the publisher with the caller's `Authorization`
+        // header still attached.
+        NamedRoute {
+            path: "/_ts/admin/cache/purge",
+            primary_methods: LEGACY_ADMIN_DENY_METHODS,
+            handler: NamedRouteHandler::CachePurgeNotSupported,
         },
         // Admin EC lookup routes. Registered explicitly (like the key routes
         // above) so they never fall through to the publisher fallback, and
@@ -431,6 +457,22 @@ fn named_route_handler(
                     }
                     NamedRouteHandler::VerifySignature => {
                         handle_verify_signature(&state.settings, &services, req)
+                    }
+                    NamedRouteHandler::CachePurgeNotSupported => {
+                        // The Axum dev server has no template cache to purge. 501 rather
+                        // than a fallthrough 404, so a CMS webhook can tell "not supported
+                        // here" from "endpoint does not exist".
+                        let body = edgezero_core::body::Body::from(
+                            "Template cache purge is not supported on the Axum dev server.\n\
+                             Use the Fastly adapter (via Viceroy or deployed) to purge.\n",
+                        );
+                        let mut resp = Response::new(body);
+                        *resp.status_mut() = StatusCode::NOT_IMPLEMENTED;
+                        resp.headers_mut().insert(
+                            header::CONTENT_TYPE,
+                            HeaderValue::from_static("text/plain; charset=utf-8"),
+                        );
+                        Ok(resp)
                     }
                     NamedRouteHandler::AdminNotSupported => {
                         // Config/secret-store writes are backed by read-only env vars on the
@@ -601,6 +643,30 @@ impl TrustedServerApp {
         settings: Settings,
     ) -> Result<RouterService, Report<TrustedServerError>> {
         let state = build_state_with_settings(settings)?;
+        Ok(build_router(&state))
+    }
+
+    /// Build the full router with explicit settings and runtime services.
+    ///
+    /// Each request receives a clone of the supplied services, allowing callers
+    /// to exercise production routes with deterministic platform dependencies.
+    /// The supplied client metadata applies to every request to this router.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the auction orchestrator or integration registry
+    /// cannot be initialized.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let router = TrustedServerApp::routes_with_settings_and_services(settings, services)?;
+    /// ```
+    pub fn routes_with_settings_and_services(
+        settings: Settings,
+        services: RuntimeServices,
+    ) -> Result<RouterService, Report<TrustedServerError>> {
+        let state = build_state_with_services(settings, Some(services))?;
         Ok(build_router(&state))
     }
 }

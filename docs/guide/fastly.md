@@ -2,6 +2,17 @@
 
 This guide covers setting up your Fastly account and Compute service for Trusted Server.
 
+## Support status
+
+| Adapter  | Release status | Health     | Startup status | Startup health | Provider fan-out | Trusted-client-IP handling     | Request normalization |
+| -------- | -------------- | ---------- | -------------- | -------------- | ---------------- | ------------------------------ | --------------------- |
+| `fastly` | production     | pre router | `500`          | yes            | multiple         | entry-point resolve + sanitize | none                  |
+
+The row above summarizes the
+[adapter-support contract](./api-reference#adapter-and-startup-support). A healthy
+response does not prove that configuration loaded: Fastly serves `/health`
+before it constructs the application.
+
 ## Create a Fastly Account
 
 1. Go to [manage.fastly.com](https://manage.fastly.com) and create an account if you don't have one
@@ -260,6 +271,16 @@ Used for storing public configuration (e.g., public keys, key metadata):
 fastly config-store create --name jwks_store
 ```
 
+Trusted Server's app config lives under logical store ID
+`trusted_server_config`. Select its physical store in each deployment
+environment, the same way as the secret store below. Production and staging
+isolate their app config by selecting different physical stores, because the
+config entry key is the logical ID on every target:
+
+```bash
+export EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=<physical-config-store>
+```
+
 ### Secret Stores
 
 Trusted Server keeps static app-config credentials under logical store ID
@@ -267,27 +288,40 @@ Trusted Server keeps static app-config credentials under logical store ID
 as `ts_secrets`. Request-signing private keys remain in their separate,
 runtime-managed store.
 
-Set the physical mapping before provisioning:
+Create or select the service before provisioning a non-default mapping. Set its
+ID in `fastly.toml` or `FASTLY_SERVICE_ID`; if both are set, they must agree.
+Provisioning rejects non-default mappings without a service ID. Set the physical
+mapping in the selected deployment environment before provisioning and
+deploying, alongside any config-store or KV-store overrides:
 
 ```bash
 export EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME=ts_secrets
 ts provision --adapter fastly
 ```
 
-Provisioning creates or reuses the physical store and persists this runtime
-mapping in Fastly Config Store `edgezero_runtime_env`, scoped to the current
-Fastly service:
+Provisioning creates or reuses the physical store. A managed deployment reads
+the selector from its deployment environment and links the selected physical
+store to the target service version under the logical ID
+`trusted_server_secrets`. The runtime opens the store by that logical ID; no
+selector is stored in a Config Store and no service ID appears in the variable
+name.
 
-```text
-EDGEZERO__SERVICES__<SERVICE_ID>__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME=ts_secrets
-```
+Each GitHub Environment or deploy process uses the same canonical names and may
+select different physical resources. Production and staging can therefore run
+identical package bytes against different stores. A staged deploy links the
+staging environment's selected stores into only the staged version. Selected
+resources must already exist before deployment.
 
-The runtime ignores legacy unscoped entries. The Fastly service must link both
-`ts_secrets` and `edgezero_runtime_env` to the active service version. The
-custom streaming entry point reads the service-scoped mapping before loading
-app config, so every startup and reload resolves static credentials from
-`ts_secrets` while the portable manifest continues to declare
-`trusted_server_secrets`.
+The custom streaming entry point opens `trusted_server_secrets` before loading
+app config, so every startup and reload resolves static credentials from the
+physical store linked under that ID while the portable manifest continues to
+declare `trusted_server_secrets`. Local Viceroy configuration exposes the store
+under the logical ID directly; see `[local_server.secret_stores]` in
+`fastly.toml`.
+
+The app-config store is selected the same way, through
+`EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME` in the deployment
+environment. No runtime mapping is stored in a Config Store.
 
 Create the separate request-signing store when that feature is enabled:
 
@@ -295,8 +329,56 @@ Create the separate request-signing store when that feature is enabled:
 fastly secret-store create --name signing_keys
 ```
 
-Do not copy the same app credential store under a second hardcoded
-`trusted_server_secrets` Fastly link. Configure the mapping instead.
+The deployment creates the `trusted_server_secrets` link itself from the
+selected physical store. Do not create that link by hand.
+
+### Upgrading from EdgeZero v0.0.8
+
+Services deployed before this change link the physical store directly, such as
+`ts_secrets`, together with an `edgezero_runtime_env` Config Store. This binary
+opens `trusted_server_secrets` instead, and only a managed deployment creates
+that link. A plain `fastly compute publish` clones the active version's links,
+so it activates a version whose link is missing: app config fails to load and
+every publisher route returns 500 while `/health` keeps answering 200.
+
+When upgrading an existing service:
+
+- Deploy only through the managed path, so the `trusted_server_secrets` link
+  exists before activation: run
+  `ts deploy --adapter fastly --application-release <release-root>` with
+  `EDGEZERO_MANIFEST` set to the release's `edgezero.toml`, or use EdgeZero's
+  `deploy-fastly` action.
+- Move each physical-name selector into the deploy environment before the
+  first managed deploy. Copy every service-scoped
+  `EDGEZERO__SERVICES__<SERVICE_ID>__STORES__<KIND>__<ID>__NAME` entry from
+  `edgezero_runtime_env` to the unscoped
+  `EDGEZERO__STORES__<KIND>__<ID>__NAME` variable. An unset selector falls
+  back to the logical ID, so the deploy links whichever account-level store
+  carries that name, which can belong to another service.
+- Select a KV store for logical ID `trusted_server_kv`. The managed deploy
+  links every declared store, and this one is usually absent on Fastly. Set
+  `EDGEZERO__STORES__KV__TRUSTED_SERVER_KV__NAME` to an existing KV store or
+  run `ts provision --adapter fastly`; otherwise the deploy stops with
+  "selected Fastly KV store `trusted_server_kv` does not exist".
+- Re-push staging app config under the logical key into the staging Config
+  Store, with `EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME` set to
+  that store. Entries previously pushed under `<logical-store-id>_staging` are
+  ignored. Do not rerun an existing `ts config push --adapter fastly --staging`
+  runbook unchanged: `--staging` no longer selects a separate key, so without
+  the `__NAME` selector it writes the production entry in the logical-ID store,
+  and production instances load it on their next start.
+- Remove any `EDGEZERO__STORES__CONFIG__<ID>__KEY` selectors. On Fastly the
+  CLI rejects any config key other than the logical store ID, so a leftover
+  selector makes `ts config push` and `ts deploy` fail until it is removed.
+- Delete the stale `edgezero_runtime_env` link and any `*_staging` config
+  entries only after no active, staged, or rollback version depends on them.
+  A version-linked selector on an older staged version still reads
+  `<logical-store-id>_staging`, so removing the entry while that version is
+  deployed makes its publisher routes return 500. This release no longer
+  reads that store. If you set the optional `TS__SANDBOX__*` reuse bounds
+  there, move them into the app-config store under the logical ID
+  `trusted_server_config`, without the `EDGEZERO__SERVICES__<SERVICE_ID>__`
+  prefix.
 
 ## Create EC KV Store
 
@@ -320,7 +402,8 @@ passphrase = "ec_passphrase"
 ec_store = "ec_identity_store"
 ```
 
-Store the high-entropy passphrase under that key in `ts_secrets`. The resolved
+Store the high-entropy passphrase under that key in the physical store
+selected for `trusted_server_secrets`. The resolved
 value, rather than the key name, must contain at least 32 characters. Pipe the
 value over standard input so it never appears in the process argument list:
 
@@ -343,7 +426,40 @@ Verify stores are linked to your active service version:
 fastly resource-link list --service-id <service-id> --version <active-version>
 ```
 
-If EC sync returns `kv_unavailable` or identify responses are degraded, first check that the identity store is present and linked to the active version. Legacy partner/consent KV bindings can be removed once no deployment-specific tooling depends on them.
+If EC sync returns `kv_unavailable` or identify responses are degraded, first check that the identity store is present and linked to the active version.
+
+Before upgrading a deployment that used the legacy consent store, remove `[consent].consent_store` from TOML or JSON/app-config; strict configuration loading rejects the removed field. Remove its local Viceroy fixture and active Fastly resource link as well. The old records are not read or migrated into `ec.ec_store` and must not be copied there. You may retain the old store unchanged for a defined rollback window, then delete the store and its records. Withdrawals processed after the upgrade do not actively delete retained legacy records; they remain until their original TTL expires or an operator deletes them. If a rollback uses an older release that reads the legacy store, account for those stale records and keep the rollback window short.
+
+## Verify the complete local handoff
+
+Run the repository smoke from a clean shell:
+
+```bash
+./scripts/smoke-fastly.sh
+```
+
+The script creates an isolated application config, applies its publisher-origin
+overrides, and runs strict validation. It then executes `ts config push
+--adapter fastly --local`, adds all three required entries to
+`[local_server.secret_stores.trusted_server_secrets]`, and starts
+`fastly compute serve`
+through Viceroy. The required keys are `handler_password`,
+`publisher_proxy_secret`, and `ec_passphrase`.
+
+The check deliberately proves both halves of startup. With no config entry, it
+requires `/health` to return 200 while the publisher route returns 500 with the
+missing `trusted_server_config` diagnostic. It then removes each required
+secret independently and requires the corresponding setting path to fail.
+Finally, the publisher request must return 200, retain the stub-origin
+sentinel, rewrite an origin URL to the Fastly listener, and omit the original
+URL. A green health response cannot satisfy that final assertion.
+
+The script copies `edgezero.toml` and `fastly.toml` into a per-run temporary
+project before pushing local configuration or adding synthetic secrets. The
+tracked manifests remain untouched, including when smoke runs overlap. Its trap
+stops Viceroy and the stub origin and removes the temporary project. For a
+deployed service, provision and link the stores described above and write the
+three secrets through Fastly's secret-store interface.
 
 ## Next Steps
 
@@ -351,3 +467,5 @@ If EC sync returns `kv_unavailable` or identify responses are degraded, first ch
 - See [Configuration](/guide/configuration) for detailed configuration options
 - See [EC Setup Guide](/guide/ec-setup-guide) for end-to-end EC verification
 - See [Request Signing](/guide/request-signing) for setting up cryptographic signing
+- Compare the [Cloudflare](./cloudflare), [Spin](./spin), and [Axum](./axum-dev)
+  adapter journeys

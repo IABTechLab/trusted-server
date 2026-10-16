@@ -1,0 +1,6 @@
+# Illustrates local merging only; validate actual PBS fields at the selected release.
+port: 8000
+external_url: https://pbs.example.com
+auction_timeouts_ms:
+  default: 1000
+  max: 1200
