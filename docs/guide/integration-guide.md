@@ -250,8 +250,8 @@ A middleware whose decision needs the request's services, or has to wait on
 the key-value store or the network, answers `prepare` with a future. Core
 runs it in the request's handler, before the document is processed, as the
 module the middleware belongs to and with the permissions it declares in
-`required_permissions`. What the future answers is kept under the
-middleware's name in the context's `prepared`, and `create`, which stays
+`required_permissions`. What the future answers is kept under the phase and
+the middleware's name in the context's `prepared`, and `create`, which stays
 synchronous, takes it from there as the type it prepared. A middleware that
 prepares nothing leaves `prepare` at its default and is asked `create` as
 before.
@@ -286,15 +286,18 @@ stored or served from the store, so a middleware that cannot make the
 document it is responsible for fails closed rather than letting an empty or
 unchanged one through. `Refusal::service_unavailable` is the one for a
 source that cannot answer now. The preparations of one document run in the
-order the entry names the middleware, and the first refusal ends them.
+order the entry names the middleware, and the first refusal ends them. Core
+logs a refusal as a warning naming the middleware, and answers a status that
+is not a client or server error with `500`.
 
 On a document that may be stored the fetch phase's preparations are handed
-the request's services and nothing of the reader, because what they answer
-is stored with the document. The serve phase is prepared with the reader's
-state on every document, the one fetched for this reader as much as a copy
-read from the store, so what a serve middleware finds prepared never depends
-on whether its reader was the first. On a document that is not stored both
-phases are prepared with the reader's state.
+the request's services with no client IP, TLS details or client signals, and
+nothing else of the reader, because what they answer is stored with the
+document. The serve phase is prepared with the reader's state on every
+document, the one fetched for this reader as much as a copy read from the
+store, so what a serve middleware finds prepared never depends on whether its
+reader was the first. On a document that is not stored both phases are
+prepared with the reader's state.
 
 ## Proxy implementation rules
 

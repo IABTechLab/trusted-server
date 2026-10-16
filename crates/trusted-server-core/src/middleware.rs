@@ -33,8 +33,9 @@
 //! A middleware whose decision needs the request's services, or has to wait
 //! on a store or the network, prepares. Before the document is processed it
 //! is called in the request's handler, and what it answers is kept for its
-//! `create` under its name. It may refuse the request instead, which is then
-//! answered with the status it gives and no document, and nothing is stored.
+//! `create` under its phase and name. It may refuse the request instead,
+//! which is then logged and answered with the status it gives and no
+//! document, and nothing is stored.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -390,7 +391,8 @@ fn selectors_of_text(handlers: &[Box<dyn TextHandler>]) -> Vec<String> {
 /// [`Middleware::prepare`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refusal {
-    /// The status the request is answered with.
+    /// The status the request is answered with, a client or server error.
+    /// Any other is answered as `500 Internal Server Error`.
     pub status: StatusCode,
     /// What `Retry-After` says, for a status that asks the caller back.
     pub retry_after: Option<Duration>,
@@ -408,6 +410,28 @@ impl Refusal {
             retry_after: Some(retry_after),
             message: message.into(),
         }
+    }
+
+    /// The refusal as the request is answered with it, logged once as a
+    /// warning naming `middleware`. A status that is not a client or server
+    /// error becomes `500 Internal Server Error`, because a refusal gives no
+    /// document.
+    fn checked(mut self, middleware: &str, phase: MiddlewarePhase) -> Self {
+        if self.status.is_client_error() || self.status.is_server_error() {
+            log::warn!(
+                "The middleware `{middleware}` refused the request in the {phase} phase with {}",
+                self.status
+            );
+        } else {
+            log::warn!(
+                "The middleware `{middleware}` refused the request in the {phase} phase with {}, \
+                 which a refusal may not use, so it is answered with {}",
+                self.status,
+                StatusCode::INTERNAL_SERVER_ERROR
+            );
+            self.status = StatusCode::INTERNAL_SERVER_ERROR;
+        }
+        self
     }
 }
 
@@ -809,7 +833,9 @@ impl MiddlewareChain {
     ///
     /// # Errors
     ///
-    /// The first refusal, which ends the request.
+    /// The first refusal, which ends the request. It is logged once, as a
+    /// warning naming the middleware, and one whose status is not a client
+    /// or server error is answered as `500 Internal Server Error`.
     pub async fn prepare(
         &self,
         module_context: &ModuleContext<'_>,
@@ -819,7 +845,9 @@ impl MiddlewareChain {
             let id = middleware.middleware_id();
             let call = module_context.call(id, middleware.required_permissions());
             if let Some(preparation) = middleware.prepare(call, context) {
-                let value = preparation.await?;
+                let value = preparation
+                    .await
+                    .map_err(|refusal| refusal.checked(id, context.phase))?;
                 context.prepared.insert(context.phase, id, value);
             }
         }
