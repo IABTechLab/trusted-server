@@ -97,7 +97,7 @@ pub fn handle_identify(
             } else {
                 // Extract only this partner's UID.
                 if let Some(partner_uid) = entry.ids.get(&partner.source_domain)
-                    && !partner_uid.uid.is_empty()
+                    && partner_uid.is_usable(super::checked_current_timestamp())
                 {
                     uid = Some(partner_uid.uid.clone());
                 }
@@ -125,6 +125,9 @@ pub fn handle_identify(
     }
 
     let eid = uid.as_ref().map(|u| Eid {
+        inserter: None,
+        matcher: None,
+        mm: None,
         source: partner.source_domain.clone(),
         uids: vec![Uid {
             id: u.clone(),
@@ -374,6 +377,7 @@ mod tests {
             pull_sync_allowed_domains: vec![],
             pull_sync_ttl_sec: EcPartner::default_pull_sync_ttl_sec(),
             pull_sync_rate_limit: EcPartner::default_pull_sync_rate_limit(),
+            identity_owner: None,
             ts_pull_token: None,
         }
     }
@@ -584,6 +588,70 @@ mod tests {
             "should return 204 when EC is unavailable"
         );
         assert_no_store(&response);
+    }
+
+    #[test]
+    fn handle_identify_omits_expired_identity() {
+        let settings = create_test_settings();
+        let graph = KvIdentityGraph::in_memory("identify-store");
+        let registry =
+            PartnerRegistry::from_config(&[make_test_partner("ids.example.com", VALID_API_TOKEN)])
+                .expect("should build registry");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let mut entry =
+            crate::ec::kv_types::KvEntry::minimal("ids.example.com", "expired-uid", 1_000);
+        entry
+            .ids
+            .get_mut("ids.example.com")
+            .expect("should contain record")
+            .expires_at = Some(1);
+        entry.network = Some(crate::ec::kv_types::KvNetwork {
+            cluster_size: Some(1),
+        });
+        graph.create(&ec_id, &entry).expect("should seed identity");
+        let (_, generation_before) = graph
+            .get(&ec_id)
+            .expect("should read identity")
+            .expect("should find identity");
+        let req = Request::builder()
+            .method("GET")
+            .uri("https://publisher.example.com/_ts/api/v1/identify")
+            .header("authorization", format!("Bearer {VALID_API_TOKEN}"))
+            .body(EdgeBody::empty())
+            .expect("should build identify request");
+        let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+
+        let response = handle_identify(&settings, &graph, &registry, &req, &ec_context)
+            .expect("should build identify response");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "should retain the identify response contract"
+        );
+        assert_no_store(&response);
+        let body: serde_json::Value = serde_json::from_slice(
+            &response
+                .into_body()
+                .into_bytes()
+                .expect("should read response"),
+        )
+        .expect("should decode identify response");
+        assert!(
+            body.get("uid").is_none() && body.get("eid").is_none(),
+            "should omit the expired UID and EID"
+        );
+        let (retained, generation_after) = graph
+            .get(&ec_id)
+            .expect("should read retained identity")
+            .expect("should retain identity");
+        assert_eq!(
+            retained, entry,
+            "should retain lifecycle state without cleanup"
+        );
+        assert_eq!(
+            generation_after, generation_before,
+            "should not write merely to omit an expired ID"
+        );
     }
 
     #[test]

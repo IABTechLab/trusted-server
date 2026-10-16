@@ -105,7 +105,7 @@ use trusted_server_core::auction::{
 };
 use trusted_server_core::cache_policy::EdgeCacheHeader;
 use trusted_server_core::config_payload::DEFAULT_SECRET_STORE_ID;
-use trusted_server_core::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
+use trusted_server_core::constants::COOKIE_SHAREDID;
 use trusted_server_core::ec::admin::{
     deny_admin_diagnostic_fallback, handle_admin_ec_lookup, handle_admin_eids_lookup,
 };
@@ -323,7 +323,6 @@ pub(crate) struct EcFinalizeState {
     /// in response extensions, so `edgezero_main` rebuilds the graph from
     /// settings when this is set.
     pub(crate) use_finalize_kv: bool,
-    pub(crate) eids_cookie: Option<String>,
     pub(crate) sharedid_cookie: Option<String>,
     pub(crate) is_real_browser: bool,
     /// Per-request services carried to the entry point so the pull-sync
@@ -339,7 +338,6 @@ struct EcRequestState {
     ec_context: EcContext,
     kv_graph: Option<KvIdentityGraph>,
     finalize_kv_graph: Option<KvIdentityGraph>,
-    eids_cookie: Option<String>,
     sharedid_cookie: Option<String>,
     is_real_browser: bool,
     services: RuntimeServices,
@@ -359,7 +357,6 @@ impl EcRequestState {
         EcFinalizeState {
             ec_context: self.ec_context,
             use_finalize_kv: self.finalize_kv_graph.is_some(),
-            eids_cookie: self.eids_cookie,
             sharedid_cookie: self.sharedid_cookie,
             is_real_browser: self.is_real_browser,
             services: self.services,
@@ -417,7 +414,6 @@ fn build_ec_request_state(
         );
     }
 
-    let eids_cookie = crate::extract_cookie_value(req, COOKIE_TS_EIDS);
     let sharedid_cookie = crate::extract_cookie_value(req, COOKIE_SHAREDID);
 
     let geo_info = services
@@ -428,7 +424,7 @@ fn build_ec_request_state(
             None
         });
 
-    let (ec_context, setup_error) =
+    let (mut ec_context, setup_error) =
         match EcContext::read_from_request_with_geo(settings, req, services, geo_info.as_ref()) {
             Ok(mut context) => {
                 context.set_device_signals(device_signals);
@@ -456,12 +452,12 @@ fn build_ec_request_state(
         None
     };
     let kv_graph = if is_real_browser { kv_graph } else { None };
+    ec_context.set_identity_handoff_supported(finalize_kv_graph.is_some());
 
     EcRequestState {
         ec_context,
         kv_graph,
         finalize_kv_graph,
-        eids_cookie,
         sharedid_cookie,
         is_real_browser,
         services: services.clone(),
@@ -737,7 +733,6 @@ async fn run_named_route(
 fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) -> Response {
     let device_signals = device_signals_for(&req);
     let is_real_browser = device_signals.looks_like_browser();
-    let eids_cookie = crate::extract_cookie_value(&req, COOKIE_TS_EIDS);
     let sharedid_cookie = crate::extract_cookie_value(&req, COOKIE_SHAREDID);
 
     let result = crate::require_identity_graph(&state.settings).and_then(|kv| {
@@ -752,7 +747,6 @@ fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) ->
     response.extensions_mut().insert(EcFinalizeState {
         ec_context: EcContext::default(),
         use_finalize_kv: false,
-        eids_cookie,
         sharedid_cookie,
         is_real_browser,
         services: services.clone(),
@@ -2534,12 +2528,13 @@ mod tests {
         let response = route(&router, request);
 
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
         assert!(
             response
                 .extensions()
                 .get::<super::EcFinalizeState>()
                 .is_none(),
-            "admin EIDs diagnostics should not attach EC finalization state"
+            "retired admin diagnostics should not attach EC finalization state"
         );
     }
 

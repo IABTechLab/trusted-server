@@ -56,6 +56,7 @@ publisher, trusted-client-IP, EC, handler, Tinybird, DataDome, and S3 fields:
 - `publisher.proxy_secret`
 - `trusted_client_ip.shared_secret`, when trusted client-IP forwarding is configured
 - `ec.passphrase`
+- `ec.identity_handoff.keys[*].secret`, for each provisioned handoff signing key
 - `ec.partners[*].api_token`, when inbound identify or batch sync is used
 - `ec.partners[*].ts_pull_token`, when pull sync is enabled
 - `handlers[*].password`
@@ -99,6 +100,7 @@ serialization, runtime, and secret axes for every exceptional field:
 | `DataDomeProtectionTestBypassConfig.credential_secret_name`  | canonical  | canonical                           | serialized    | active               | store resolved           |
 | `DataDomeProtectionTestBypassConfig.credential_secret_store` | deprecated | canonical                           | skipped       | normalized away      | none                     |
 | `Ec.passphrase`                                              | canonical  | canonical                           | serialized    | active               | store resolved           |
+| `IdentityHandoffKey.secret`                                  | canonical  | canonical                           | serialized    | active when provided | store resolved           |
 | `EcPartner.api_token`                                        | canonical  | canonical                           | serialized    | active               | store resolved           |
 | `EcPartner.ts_pull_token`                                    | canonical  | canonical                           | serialized    | active               | store resolved           |
 | `Handler.password`                                           | canonical  | canonical                           | serialized    | active               | store resolved           |
@@ -646,6 +648,7 @@ be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
 | `pull_sync_concurrency`   | Integer        | No       | Maximum concurrent pull-sync requests per organic response              |
 | `cluster_trust_threshold` | Integer        | No       | Cluster size threshold for identity trust decisions                     |
 | `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps |
+| `identity_handoff`        | Table          | No       | Authenticated short-lived capture handoff, disabled by default          |
 | `partners`                | Array          | No       | Static partner registry entries                                         |
 
 ::: tip Partner keying
@@ -656,6 +659,29 @@ be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
 the partner calls the inbound identify or batch-sync APIs. A partner without
 `api_token` remains available for source-domain lookup, bidstream EIDs, and
 outbound pull sync, but cannot authenticate to those inbound APIs.
+
+Optional `identity_owner` selects one registered integration whose capture
+capability claims the source. Deploy validation, config push and startup reject
+missing or non-claiming owners and owned sources with legacy pull enabled.
+For owned sources, `api_token` still permits read-only `identify`; `batch-sync`
+returns 403 before accessing storage. Ownership also excludes the source from
+legacy pull dispatch, completeness and marker fingerprints. Disable capture
+without removing ownership when stopping acquisition. Changing owners requires
+an operator migration and old-invocation drain, not automatic fallback.
+
+Provider expiry, writer and opaque revision are optional schema-v1 KV fields.
+Known-expired IDs are omitted from auctions and `identify` without cleanup
+writes. Unowned legacy pull remains fill-missing-only even for expired records.
+Drain metadata-unaware readers and writers before enabling managed capture.
+`/auction` body EIDs and the browser-written `ts-eids` cookie enrich existing
+consenting rows conservatively. Body EIDs take precedence for auction forwarding;
+publisher and SPA auctions retain cookie fallback. EID diagnostic response headers
+and authenticated `/_ts/admin/eids` remain available. Their retirement is deferred
+to a separate PR; inbound diagnostic headers remain stripped. The optional
+`ts-eids-s` cookie is a separate authenticated server-capture handoff only and does
+not collect browser IDs. See the
+[Prebid identity transport](./integrations/prebid.md) and
+[Lockr capture gates](./integrations/lockr.md).
 
 **Example**:
 
@@ -671,6 +697,65 @@ bidstream_enabled = true
 # api_token = "partner_api_token"  # only for inbound identify or batch sync
 # ts_pull_token = "partner_ts_pull_token"  # required when pull sync is enabled
 ```
+
+### `[ec.identity_handoff]`
+
+The authenticated `ts-eids-s` capture handoff is an explicit publisher opt-in.
+It defaults off with no keys. Keep it off until capture, consent, source
+ownership, deployment compatibility, synthetic checks, and live acceptance have
+all passed for the publisher route.
+
+```toml
+[ec.identity_handoff]
+enabled = false
+active_key_id = "handoff-2026-10"
+
+[[ec.identity_handoff.keys]]
+id = "handoff-2026-10"
+secret = "identity_handoff_2026_10"
+```
+
+`secret` is a key name in `trusted_server_secrets`. Its resolved value must be
+URL-safe unpadded base64 for exactly 32 random bytes. Use a dedicated value, not
+`ec.passphrase` or another application credential. Key IDs must be unique,
+non-empty ASCII alphanumeric, `_`, or `-`, with at most 32 characters. Configure
+no more than four keys. When `enabled = true`, `active_key_id` must name one of
+them.
+
+Generate a value locally, then write it directly to the mapped secret store:
+
+```bash
+openssl rand 32 | openssl base64 -A | tr '+/' '-_' | tr -d '='
+```
+
+Trusted Server resolves every provided key at startup, even while handoff is
+disabled, and fails startup if a value is missing, malformed, or does not decode
+to exactly 32 bytes. This lets operators provision and check keys before opting
+in. Store changes are startup-scoped.
+
+For rotation, add the new key and secret while retaining the old key. Push and
+deploy that verification set first. After every instance can read both keys,
+change `active_key_id` to the new key and push again. Remove the old key only
+after old invocations have drained and at least the five-minute handoff lifetime
+has elapsed since all instances began issuing with the new key. The active key
+signs new envelopes; retained keys verify envelopes created before the switch.
+
+The cookie value has a fixed five-minute maximum lifetime and a 2,048-byte
+encoded-value limit. Provider expiry may shorten the lifetime. The handoff is
+eligible for an absent or known-expired registered source on an existing live,
+consenting EC root. Current consent, source ownership, bidstream policy, the
+integration's capture switch, and the shared handoff switch all still apply.
+Usable stored IDs win. A valid capture can supply an auction ID over an expired
+record without changing KV or renewing its handoff deadline. A matching
+known-expired UID requires a known refreshed provider expiry. Empty or invalidated
+records still block fallback.
+
+Persistence retry is best-effort. A later qualifying request may stage one
+bounded fill-absent attempt after the response is sent on Fastly. There is no
+durable queue, recursive retry, root creation, existing-source persistence
+refresh, or first-auction guarantee. Expired-source auction fallback never stages
+a replacement write; persistence replay remains absent-source-only. Keep rollout and live acceptance gated as described in
+the [Lockr integration guide](./integrations/lockr.md).
 
 **Environment Override**:
 

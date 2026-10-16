@@ -85,6 +85,18 @@ pull_sync_concurrency = 3
 # cluster_trust_threshold = 10    # entries with cluster_size <= this are individual users
 # cluster_recheck_secs = 3600     # re-evaluate cluster_size after this many seconds
 
+# Optional authenticated server-capture handoff. It defaults off. Keep it off
+# until capture, consent, ownership, key rotation, deployment compatibility, and
+# live acceptance gates pass. The resolved secret must be URL_SAFE_NO_PAD base64
+# for exactly 32 random bytes and must not reuse ec.passphrase.
+# [ec.identity_handoff]
+# enabled = false
+# active_key_id = "handoff-2026-10"
+#
+# [[ec.identity_handoff.keys]]
+# id = "handoff-2026-10"
+# secret = "identity_handoff_2026_10"  # Key in trusted_server_secrets
+
 # Example partner configuration. Provision referenced keys in
 # trusted_server_secrets before validating/pushing.
 # [[ec.partners]]
@@ -586,6 +598,13 @@ geo_query_parameters = false
 # sdk_url = "https://identity.example.com/trusted-server.js"
 # cache_ttl_seconds = 3600
 # rewrite_sdk = true
+# capture_identity = false                           # require provider approval and old-binary drain
+# capture_global_withdrawal = false                  # require confirmed global revoke semantics
+
+# The separate [ec.identity_handoff] opt-in stays off until its synthetic and
+# live acceptance gates pass. It supplies auction IDs for absent or expired
+# sources, expires within five minutes, and retries persistence only for absent
+# sources. The browser-written ts-eids cookie remains a separate legacy path.
 
 # DataDome bot protection. Proxies tags.js + signal-collection API first-party.
 # Kept active but disabled so `ts audit` can flip `enabled` when detected.
