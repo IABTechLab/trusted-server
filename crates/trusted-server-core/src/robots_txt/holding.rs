@@ -1,9 +1,10 @@
 //! Each contributor's answer, held between requests by the loading cache.
 //!
 //! A contributor's answer is loaded through
-//! [`RuntimeServices::load_cached`], so the contributor is asked once however
-//! many requests want its rules at the same moment, and the copy in the host's
-//! shared store answers every instance until the contributor's refresh is due.
+//! [`RuntimeServices::load_cached`], so requests that share the cache's memory
+//! copy and want its rules at the same moment ask the contributor once, and
+//! the copy in the host's shared store answers every instance until the
+//! contributor's refresh is due.
 //!
 //! The last answer a contributor gave is also kept apart from the cache, for
 //! far longer than any refresh, and read only when the contributor fails. It is

@@ -10,7 +10,8 @@ use trusted_server_core::platform::test_support::{
 };
 use trusted_server_core::platform::{
     CacheLifetimes, CacheSpec, ClientInfo, LoadError, LoadedValue, Loader, PlatformLoadingCache,
-    PlatformValueCache, RuntimeServices, ServerKeyPrefix, StoreKey, ValueLookup, ValueReservation,
+    PlatformValueCache, RuntimeServices, ServerKeyPrefix, StoreKey, UnavailableKvStore,
+    ValueLookup, ValueReservation,
 };
 
 use super::*;
@@ -168,7 +169,9 @@ impl PlatformValueCache for ReservingCache {
     }
 }
 
-fn services_builder(kv: Arc<MemoryKv>) -> trusted_server_core::platform::RuntimeServicesBuilder {
+fn services_builder(
+    kv: Arc<impl KvStore + 'static>,
+) -> trusted_server_core::platform::RuntimeServicesBuilder {
     RuntimeServices::builder()
         .config_store(Arc::new(NoopConfigStore))
         .secret_store(Arc::new(NoopSecretStore))
@@ -179,7 +182,7 @@ fn services_builder(kv: Arc<MemoryKv>) -> trusted_server_core::platform::Runtime
         .client_info(ClientInfo::default())
 }
 
-fn services(kv: Arc<MemoryKv>) -> RuntimeServices {
+fn services(kv: Arc<impl KvStore + 'static>) -> RuntimeServices {
     services_builder(kv).build()
 }
 
@@ -277,6 +280,36 @@ fn the_builder_offers_a_cache_that_keeps_values() {
     assert!(
         !crate::builder().supplies_integration(),
         "the cache is offered whatever the settings say, and no section selects it"
+    );
+}
+
+/// Each application state is given a cache of its own, so two states never
+/// share a memory copy. Cloudflare builds a state for every request, and a
+/// Worker request that waits on another request's load fails.
+#[tokio::test(flavor = "current_thread")]
+async fn each_application_state_is_given_a_cache_of_its_own() {
+    // A store that keeps nothing, so only a memory copy could answer.
+    let services = services(Arc::new(UnavailableKvStore));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let state = factory();
+
+    state
+        .get_or_load(&services, &spec(), &key("k"), counted(&runs, "value"))
+        .await
+        .expect("should load");
+    state
+        .get_or_load(&services, &spec(), &key("k"), never())
+        .await
+        .expect("the state's own memory copy should answer");
+    factory()
+        .get_or_load(&services, &spec(), &key("k"), counted(&runs, "value"))
+        .await
+        .expect("another state should load for itself");
+
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        2,
+        "each state should load for itself"
     );
 }
 
