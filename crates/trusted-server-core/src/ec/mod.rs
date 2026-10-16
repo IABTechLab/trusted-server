@@ -2654,6 +2654,32 @@ pub(crate) mod tests {
         assert!(!entry.consent.ok, "the withdrawal should tombstone the row");
     }
 
+    /// A pull-sync marker under `/` is sent on a request addressed by path,
+    /// and a withdrawal there expires it under the removed prefix and under
+    /// `/`, as it expires the Edge Cookie.
+    #[tokio::test]
+    async fn a_withdrawal_under_a_removed_prefix_also_expires_a_root_pull_sync_marker() {
+        let settings = create_test_settings();
+        let cookie = format!(
+            "ts-ec={}; ts-ec-pull-complete=v1.1.fingerprint.tag",
+            valid_ec_id("c", "RtCk02")
+        );
+        let req = addressed_test_request(&[("cookie", &cookie)]);
+        let mut ec = EcContext::read_from_request(&settings, &req, &noop_services())
+            .expect("should read EC context")
+            .with_storage_withdrawn_for_test(true);
+        let graph = KvIdentityGraph::in_memory("test-ec-store");
+
+        let cookies = finalized_set_cookies(&settings, &mut ec, &graph).await;
+
+        let marker_paths: Vec<&str> = names_and_paths(&cookies)
+            .into_iter()
+            .filter(|(name, _)| *name == "ts-ec-pull-complete")
+            .map(|(_, path)| path)
+            .collect();
+        assert_eq!(marker_paths, ["/publisher-a.example", "/"]);
+    }
+
     /// A cookie a module may set for itself, used to check which module
     /// responses keep their headers.
     const MODULE_EVIDENCE_COOKIE: &str = "acme-evidence=abc123; Path=/; Secure";

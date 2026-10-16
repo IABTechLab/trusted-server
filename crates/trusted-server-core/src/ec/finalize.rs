@@ -81,6 +81,12 @@ pub async fn ec_finalize_response(
         if storage_withdrawn && ec_context.pull_sync_marker().was_present() {
             let public = ec_context.public_prefix().clone();
             expire_marker(&public, ec_context.pull_sync_marker_mut(), response);
+            // A marker under `/` is sent on a request under a removed prefix
+            // as well, so it is expired there too, as the Edge Cookie is.
+            if public.cookie_path() != "/" {
+                let root = public.under_path(None);
+                expire_marker(&root, ec_context.pull_sync_marker_mut(), response);
+            }
         }
 
         finalize_unusable_consent(
