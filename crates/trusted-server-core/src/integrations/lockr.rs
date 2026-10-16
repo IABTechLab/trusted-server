@@ -19,6 +19,7 @@ use validator::Validate;
 
 use crate::constants::INTERNAL_HEADERS;
 use crate::error::TrustedServerError;
+use crate::integrations::sdk_url::parse_sdk_network_url;
 use crate::integrations::{
     AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
     IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
@@ -99,18 +100,7 @@ impl LockrIntegration {
     /// Check if a URL is a Lockr SDK URL.
     fn is_lockr_sdk_url(&self, url: &str) -> bool {
         // Keep browser/Rust cases in test/fixtures/sdk-url-ownership.json aligned.
-        let value = url.trim_matches([' ', '\t', '\n', '\r', '\x0c', '\x0b']);
-        let parsed = if value.starts_with("//") {
-            url::Url::parse(&format!("https:{value}"))
-        } else {
-            if !value.split_once("://").is_some_and(|(scheme, _)| {
-                scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
-            }) {
-                return false;
-            }
-            url::Url::parse(value)
-        };
-        let Ok(parsed) = parsed else {
+        let Some(parsed) = parse_sdk_network_url(url) else {
             return false;
         };
         let host = parsed.host_str().unwrap_or_default();
@@ -453,15 +443,9 @@ mod tests {
     use edgezero_core::http::Method as HttpMethod;
     use serde_json::json;
 
+    use crate::integrations::sdk_url_test_support::{assert_sdk_url_rewrite, sdk_url_cases};
     use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
     use crate::test_support::tests::create_test_settings;
-
-    #[derive(Deserialize)]
-    struct SdkUrlCase {
-        name: String,
-        url: String,
-        owner: Option<String>,
-    }
 
     fn test_config() -> LockrConfig {
         LockrConfig {
@@ -488,13 +472,9 @@ mod tests {
 
     #[test]
     fn sdk_url_ownership_matches_shared_corpus() {
-        let cases: Vec<SdkUrlCase> = serde_json::from_str(include_str!(
-            "../../../trusted-server-js/lib/test/fixtures/sdk-url-ownership.json"
-        ))
-        .expect("should parse shared SDK URL ownership corpus");
         let integration = LockrIntegration::new(test_config());
 
-        for case in cases {
+        for case in sdk_url_cases() {
             let matches = case.owner.as_deref() == Some(LOCKR_INTEGRATION_ID);
             assert_eq!(
                 integration.is_lockr_sdk_url(&case.url),
@@ -504,27 +484,7 @@ mod tests {
                 case.url
             );
 
-            let expected = if matches {
-                AttributeRewriteAction::Replace("/integrations/lockr/sdk".to_string())
-            } else {
-                AttributeRewriteAction::Keep
-            };
-            for (attribute, element) in [("src", "script"), ("href", "link")] {
-                let context = IntegrationAttributeContext {
-                    attribute_name: attribute,
-                    element_name: element,
-                    request_host: "edge.example.com",
-                    request_scheme: "https",
-                    origin_host: "origin.example.com",
-                };
-                assert_eq!(
-                    integration.rewrite(attribute, &case.url, &context),
-                    expected,
-                    "should apply expected {attribute} rewrite for {}: {}",
-                    case.name,
-                    case.url
-                );
-            }
+            assert_sdk_url_rewrite(integration.as_ref(), &case, "/integrations/lockr/sdk");
         }
     }
 

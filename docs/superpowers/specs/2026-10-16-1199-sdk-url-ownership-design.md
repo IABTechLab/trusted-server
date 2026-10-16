@@ -44,8 +44,9 @@ In particular, do not edit `src/integrations/lockr/index.ts` in the JS library.
 ## Matching contract
 
 Use the browser `URL` parser and Rust's existing `url::Url` dependency. Keep the
-small parsing and matching logic local to each integration unless implementation
-reveals enough shared policy to justify a helper. Do not redesign shared guards.
+input normalization and parsing policy shared within each language. Keep vendor
+hostname and pathname checks local to each integration. Do not redesign shared
+guards.
 
 ### Input forms
 
@@ -108,6 +109,12 @@ Runtime changes belong in:
 - `crates/trusted-server-js/lib/src/integrations/permutive/script_guard.ts`
 - `crates/trusted-server-core/src/integrations/lockr.rs`
 - `crates/trusted-server-core/src/integrations/permutive.rs`
+- `crates/trusted-server-core/src/integrations/sdk_url.rs`
+- `crates/trusted-server-js/lib/src/shared/sdk_url.ts`
+
+Rust corpus loading and attribute-rewrite assertions are shared in the test-only
+`crates/trusted-server-core/src/integrations/sdk_url_test_support.rs` module.
+Direct private-matcher assertions remain in each integration's tests.
 
 Create `crates/trusted-server-js/lib/test/fixtures/sdk-url-ownership.json`. Each
 case records a descriptive name, input URL, and expected integration ID or null.
