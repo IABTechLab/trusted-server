@@ -861,9 +861,9 @@ auction_timeout_ms = 500
 # is the whole configuration and it needs no table of its own.
 
 # InMobi Choice consent prompt. `script_url` is required, https on cmp.inmobi.com
-# or cdn.inmobi.com with no user name or password. Name `cmp.inmobi` in the
-# [[fetch]] entry before any middleware that writes a vendor's tag. Selected
-# with [cmp] module = "inmobi".
+# or cdn.inmobi.com with no user name or password, and `cmp_id` is 1 to 4095.
+# Name `cmp.inmobi` in every [[fetch]] entry, before any middleware that writes
+# a vendor's tag. Selected with [cmp] module = "inmobi".
 # [cmp.inmobi]
 # script_url = "https://cmp.inmobi.com/choice/<account>/<site>/choice.js?tag_version=V3"
 # cmp_id = 10

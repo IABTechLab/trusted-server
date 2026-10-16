@@ -126,7 +126,7 @@ question about a jurisdiction and a publisher.
 | `gpp`        | `crates/permission-signal/gpp`        | The `__gpp` string and its `__gpp_sid` hint, for the US sale opt-out               |
 | `us-privacy` | `crates/permission-signal/us-privacy` | The `us_privacy` string, or one constructed from the header in a US state          |
 | `tcf`        | `crates/permission-signal/tcf`        | The `euconsent-v2` string and the EU section of a GPP string, with the purpose map |
-| `mtm`        | `crates/permission-signal/mtm`        | The PMP answer, one of two words, under the Model Terms for Marketing              |
+| `mtm`        | `crates/permission-signal/mtm`        | The PMP answer, one of three words, under the Model Terms for Marketing            |
 
 The three opt-outs are separate so that a publisher who does not act on Global
 Privacy Control can remove it and keep the other two. What an opt-out takes
