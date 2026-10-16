@@ -10,7 +10,7 @@ requests #1043 and #1044.
 **Related specs:** `2026-07-30-permission-model-design.md`,
 `2026-07-30-provider-migration-rollout-design.md`,
 `2026-07-30-client-cycle-ec-resolve-design.md`
-**Last updated:** 2026-10-15
+**Last updated:** 2026-10-16
 
 > **Why this spec exists.** Core once decided three things for every
 > deployment, which are whether to create an Edge Cookie identity, how to
@@ -456,13 +456,19 @@ different reasons, stated separately because only one of them is structural:
   from the SDK on every request, whichever device module is selected, and sets
   them as the internal headers `x-ts-tls-ja4` and `x-ts-h2-fingerprint`,
   replacing any copy the client sent. The adapter then always builds its
-  `HostSignals` service from those two headers. Neither header is in
-  `INTERNAL_HEADERS` (`constants.rs`), and the Lockr and Permutive proxies copy
-  every `x-` request header that list does not name, so both values can reach
-  those two services (open question 1). Identity rows persist the derived
-  classification fields (the JA4 class segment and a 12-hex-character hash
-  prefix of the HTTP/2 SETTINGS signal), not raw signals, and the neutral
-  default persists neither because the builtin module produces no such fields.
+  `HostSignals` service from those two headers. Both are listed in
+  `HOST_SIGNAL_HEADERS` (`constants.rs`), from which `INTERNAL_HEADERS` is
+  built, so the Lockr and Permutive proxies, which copy every `x-` request
+  header that list does not name, drop them. `rewrite_origin_request`
+  (`publisher.rs`) removes them from the publisher origin request, which
+  carries the reader's other headers onward, and every other request core
+  sends onward copies a fixed list of headers, so no request leaves with either
+  header. The DataDome protection call is separate, because it sends the JA4
+  and HTTP/2 values from `ClientInfo` as fields of its own. Identity rows
+  persist the derived classification fields (the JA4 class segment and a
+  12-hex-character hash prefix of the HTTP/2 SETTINGS signal), not raw signals,
+  and the neutral default persists neither because the builtin module produces
+  no such fields.
 - **Device: a declared permission.** Row 4 gives `DeviceModule` a
   `required_permissions` method with an empty default, and no per-request device
   gate exists to honor a declaration. Row 7 therefore refuses at startup a
@@ -481,9 +487,13 @@ state, before the adapter serves a request. That covers an implementation that
 core does not build and the adapter does not inject, and a module that needs
 host signals the adapter does not supply. Fastly, Cloudflare and Spin keep the module that
 check resolved (`build_reusable_module`), and Axum checks and keeps nothing
-(`ensure_module_available`). When the adapter's check fails, every route on that
-adapter answers with the startup error, status 500 for an Edge Cookie error, so
-a bad selection never degrades into a deployment that quietly runs stateless.
+(`ensure_module_available`). When the adapter's check fails, the adapter serves
+an error in place of every route, so a bad selection never degrades into a
+deployment that quietly runs stateless. Fastly, Axum and Cloudflare answer with
+status 500 and the body "An internal error occurred", and the error text appears
+only in the log. The Fastly entry point still answers `GET /health` with 200
+before the application is built. Spin answers 503 "Service Unavailable" on every
+route except `GET /health`, which answers 200.
 
 | Configuration state                                                                                                           | Behavior                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | ----------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -491,7 +501,7 @@ a bad selection never degrades into a deployment that quietly runs stateless.
 | `[ec.<name>]` table present, `module` unset                                                                                   | **Settings error.** A half-migrated configuration would otherwise run stateless and show up as a drop in revenue. An operator who genuinely wants stateless deletes the table.                                                                                                                                                                                                                                                                       |
 | `module = "none"` (explicit stateless)                                                                                        | Valid, and means exactly what omitting the selector means. Any configured module table alongside it is a settings error, the same stray-table rule as below.                                                                                                                                                                                                                                                                                         |
 | A configured `[ec.<name>]` table that `module` does not select                                                                | **Settings error**, the rule §2.1 states for every module type. An unreferenced table is almost always a mistyped selector or a stale block, and accepting one silently invites configuration drift.                                                                                                                                                                                                                                                 |
-| `[ec] module` names an implementation that is neither built into core nor injected by the adapter                             | Error when the adapter builds application state, listing the implementations this deployment has, which are `hmac`, `host_signals` and the injected module's id when there is one. The operator sees at once whether a module is missing or the name is mistyped.                                                                                                                                                                                    |
+| `[ec] module` names an implementation that is neither built into core nor injected by the adapter                             | Error when the adapter builds application state, listing the implementations this deployment has, which are `hmac`, `host_signals` and the injected module's id when there is one. The list appears only in the log, because the response carries the generic body above, and from it the operator can tell whether a module is missing or the name is mistyped.                                                                                     |
 | `module = "host_signals"` on an adapter that supplies no host signals                                                         | A startup error of the same kind on Axum, Cloudflare and Spin. On Fastly the adapter always supplies the signals service, and the module is built for each request from that request's signals.                                                                                                                                                                                                                                                      |
 | `module = "client_fixed"`                                                                                                     | This branch has no such module, so the row for an unknown implementation applies. Row 5 adds it behind the `client-fixed-demo` cargo feature and makes its selection in a production build a startup error.                                                                                                                                                                                                                                          |
 | No `module`, no module table                                                                                                  | Valid, the neutral default for that concern.                                                                                                                                                                                                                                                                                                                                                                                                         |
@@ -499,9 +509,9 @@ a bad selection never degrades into a deployment that quietly runs stateless.
 | Any unknown key in `[ec]`, `[device]`, `[geo]`, or a module's own table                                                       | Settings error. In `[device]`, `[geo]`, `[ec.hmac]` and `[ec.host_signals]` an unknown key is refused by name. In `[ec]`, a key that is not a table is refused as an unknown field and the message lists the keys `[ec]` reads, and a table is read as a module table, so the stray-table rule applies to it. `[ec.providers]` is refused by name. A key from a feature no row builds, such as `legacy_providers` or `versions`, fails the same way. |
 | `[device] module` names an implementation the build does not have                                                             | Settings error saying the module is not available in this build. Unlike the Edge Cookie error, the message does not list what the build has, which is `builtin` (the default) and `fastly`.                                                                                                                                                                                                                                                          |
 | `[geo] module` names anything other than `platform` or `none`                                                                 | Settings error saying the module is not available in this build. Valid states are unset (the default, the host platform's lookup), `platform` (the same, spelled out) and `none` (no location).                                                                                                                                                                                                                                                      |
-| `[device] module = "fastly"` on Axum, Cloudflare or Spin                                                                      | Accepted, and nothing reads it. Only the Fastly adapter builds a device module (open question 2).                                                                                                                                                                                                                                                                                                                                                    |
+| `[device] module = "fastly"` on Axum, Cloudflare or Spin                                                                      | Accepted, and nothing reads it. Only the Fastly adapter builds a device module (open question 1).                                                                                                                                                                                                                                                                                                                                                    |
 | `[geo]` unset or `platform` on Axum or Spin                                                                                   | Valid, and the host lookup resolves nothing there, so the jurisdiction is unknown for every request. Cloudflare reads a location from the `cf-` request headers, where `cf-ipcountry` comes on every plan and the region only with Cloudflare's Enterprise visitor-location transform. Fastly uses its own geolocation.                                                                                                                              |
-| An EC module is selected and no location is ever resolved (`[geo] module = "none"`, or Axum or Spin)                          | Valid, and no identifier is ever created, because an unknown jurisdiction fails the gate (section 5). No startup check warns about the pairing, and the consent pipeline logs one runtime warning when a request has no geo (open question 3). Row 4 changes the default and adds the `assume_single_jurisdiction` check.                                                                                                                            |
+| An EC module is selected and no location is ever resolved (`[geo] module = "none"`, or Axum or Spin)                          | Valid, and no identifier is ever created, because an unknown jurisdiction fails the gate (section 5). No startup check warns about the pairing, and the consent pipeline logs one runtime warning when a request has no geo (open question 2). Row 4 changes the default and adds the `assume_single_jurisdiction` check.                                                                                                                            |
 
 Vendor module tables deserve their own note. An `[ec.<name>]` table that names an
 implementation core does not build is kept as raw values
@@ -760,14 +770,23 @@ Built, in the crates named:
   without them, and the startup refusal of a selected host-signals module on a
   host that supplies none.
 - Switching tests, named in section 6.1.
+- Host signal header tests proving that the Lockr API proxy
+  (`lockr_api_proxy_does_not_forward_host_signal_headers`), each of the five
+  Permutive proxy routes (`permutive_proxy_does_not_forward_host_signal_headers`)
+  and the publisher origin fetch, streamed or not
+  (`publisher_origin_fetch_drops_host_signal_headers`), drop `x-ts-tls-ja4` and
+  `x-ts-h2-fingerprint` while still forwarding the reader's other headers, and
+  a test that every host signal header is an internal header
+  (`every_host_signal_header_is_an_internal_header` in `constants.rs`).
 
 Not covered by any test on this branch:
 
 - An adapter routing its geo through `build_geo_module`. Nothing fails if an
   adapter stops doing so.
 - `[device] module = "fastly"` on an adapter other than Fastly.
-- The two TLS headers. No test sets `x-ts-tls-ja4` or `x-ts-h2-fingerprint`, and
-  no test checks which request headers the Lockr and Permutive proxies forward.
+- The Fastly entry point setting `x-ts-tls-ja4` and `x-ts-h2-fingerprint`, and
+  the adapter building its `HostSignals` service from them. No adapter test
+  names either header.
 - The two Fastly crates, which hold no tests.
 
 Row 4 and row 5 add the tests for the work they build.
@@ -833,25 +852,18 @@ No row of the stack builds the following:
 The code decides none of the following, and this spec does not decide them
 either.
 
-1. **Two TLS headers and two third parties.** The Fastly entry point sets
-   `x-ts-tls-ja4` and `x-ts-h2-fingerprint` on every request that carries the
-   signals. `INTERNAL_HEADERS` does not list them, and the Lockr and Permutive
-   proxies copy every `x-` request header that list does not name. Nothing in
-   the code removes the two headers first, so both values can reach those two
-   services. Whether the entry point should set them only when a selected module
-   reads them, whether `INTERNAL_HEADERS` should list them, or both, is open.
-2. **A selection an adapter cannot satisfy.** An Edge Cookie module that an
+1. **A selection an adapter cannot satisfy.** An Edge Cookie module that an
    adapter cannot supply stops startup. `[device] module = "fastly"` on Axum,
    Cloudflare or Spin is accepted and nothing reads it, and `platform` geo on
    Axum or Spin resolves nothing. Whether those adapters should refuse these
    selections, as they refuse `host_signals`, is open.
-3. **Edge Cookie without a location.** With an `[ec]` module and either
+2. **Edge Cookie without a location.** With an `[ec]` module and either
    `[geo] module = "none"` or an adapter whose host lookup resolves nothing, the
    jurisdiction is always unknown, no identifier is ever created, and nothing at
    startup says so. Row 4 changes the default and refuses the pairing unless
    `assume_single_jurisdiction` is set. Whether this branch needs a check of its
    own before row 4 merges is open.
-4. **The end of the bare form.** The `hmac` module reads the pre-envelope bare
+3. **The end of the bare form.** The `hmac` module reads the pre-envelope bare
    identifier with no end date, and nothing rewrites a bare cookie or row as a
    coded one. A comment in the cookie lifetime test in `ec/cookies.rs` refers to
    a retirement condition for the bare reader that `module_owns_id` does not
@@ -877,6 +889,11 @@ either.
    and failure cases and a rollout order, and drops the history of earlier
    revisions, while the four questions under Open questions wait for code
    changes.
+2. **Round 2, 2026-10-16.** A lighter review in a fresh session, checking the
+   round 1 fixes against `split/2-device-geo` at `138faf1c1`. Issues found, none
+   blocking. This revision corrects what each adapter answers when its startup
+   check fails, and says that the list of implementations appears only in the
+   log.
 
 ## Revision record
 
@@ -887,3 +904,4 @@ either.
 | 2026-09-01 | The fallback baseline for a request with no resolvable country moved to the top node of the `rules:` tree in `permissions.yaml`, where `jurisdiction` is a per-node inherited attribute, and `[geo] default_country` was retired. The two `[consent]` applicability lists retire into the same tree (permission-model spec §3.2, §3.4 and §12).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | 2026-10-06 | What an operator selects is a module, and the selector key reads `module` (§2.1).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | 2026-10-15 | Fixes from review round 1. The page now describes the code on `split/2-device-geo` and names the row that builds each later feature, so the permission checks, the browser round trip, the registration hooks and the flip of the geo default are no longer described as built here. The geo default, the passphrase key, the Edge Cookie trait, the identity graph key, the parity of device and creation between adapters and the host signals capture are corrected. The selector key reads `module` or `modules` throughout §2.1. An adapter table, the missing settings, failure cases and rollout order, and a list of open questions are added. The history of earlier revisions moved into this table, and the former sections 12 and 13, which compared the page with issue #778 and with the first draft, are replaced by the open questions and this table. |
+| 2026-10-16 | The host signal headers `x-ts-tls-ja4` and `x-ts-h2-fingerprint` are internal headers, so the Lockr and Permutive proxies drop them and the publisher origin request removes them, with a test for each path, and the open question about them is closed (§5, §10, §12). From review round 2, what each adapter answers when its startup check fails and that the list of implementations appears only in the log (§6).                                                                                                                                                                                                                                                                                                                                                                                                                                                |
