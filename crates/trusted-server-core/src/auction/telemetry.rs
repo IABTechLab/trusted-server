@@ -540,7 +540,11 @@ pub fn warn_once_when_analytics_is_unsent(
     adapter: &str,
     logged: &AtomicBool,
 ) {
-    if settings.analytics_module().is_none()
+    let selects_a_module = settings
+        .sections
+        .section("analytics")
+        .is_some_and(|section| !section.selected().is_empty());
+    if !selects_a_module
         || supplied.is_some_and(|services| services.auction_telemetry_sink().is_enabled())
         || logged.swap(true, Ordering::Relaxed)
     {
