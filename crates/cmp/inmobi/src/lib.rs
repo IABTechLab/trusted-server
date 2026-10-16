@@ -20,7 +20,7 @@ use validator::Validate;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::integrations::{IntegrationBuilder, IntegrationRegistration};
 use trusted_server_core::middleware::{
-    HTML_MEDIA_TYPE, Middleware, MiddlewareAction, MiddlewareContext, MiddlewarePhase,
+    HTML_MEDIA_TYPE, Middleware, MiddlewareAction, MiddlewareContext, MiddlewarePhase, PhaseEntry,
 };
 use trusted_server_core::settings::{IntegrationConfig, Settings};
 
@@ -127,22 +127,60 @@ fn validate_script_url(url: &str) -> Result<(), Report<TrustedServerError>> {
     Ok(())
 }
 
-/// Refuse a document that selects the prompt but names it in no entry for
-/// `text/html`, where it would load and never be written.
+/// Refuse a document that selects the prompt but leaves a page served as
+/// `text/html` without it.
+///
+/// A response takes the first entry that covers it, so every `text/html`
+/// entry up to the first that covers every path has to name the prompt, and
+/// such an entry has to exist. A path covers every page when the home page,
+/// `/`, begins with it.
 fn require_an_entry(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
-    let placed = settings.fetch.entries().iter().any(|entry| {
-        entry.media_type == HTML_MEDIA_TYPE && entry.middleware.iter().any(|name| name == MODULE)
-    });
-    if placed {
-        return Ok(());
+    let refusal = |gap: String| {
+        Report::new(TrustedServerError::Settings {
+            message: format!("[cmp] selects `inmobi`, but {gap}"),
+        })
+    };
+    let names_the_prompt = |entry: &PhaseEntry| entry.middleware.iter().any(|name| name == MODULE);
+    let entries = settings
+        .fetch
+        .entries()
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.media_type == HTML_MEDIA_TYPE);
+    if !entries.clone().any(|(_, entry)| names_the_prompt(entry)) {
+        return Err(refusal(format!(
+            "no [[fetch]] entry for \"{HTML_MEDIA_TYPE}\" names `{MODULE}`, so the consent \
+             prompt would never be written. Name it in that entry, before any middleware \
+             that writes a vendor's tag"
+        )));
     }
-    Err(Report::new(TrustedServerError::Settings {
-        message: format!(
-            "[cmp] selects `inmobi`, but no [[fetch]] entry for \"{HTML_MEDIA_TYPE}\" names \
-             `{MODULE}`, so the consent prompt would never be written. Name it in that \
-             entry, before any middleware that writes a vendor's tag"
-        ),
-    }))
+    let mut paths: Vec<String> = Vec::new();
+    for (index, entry) in entries {
+        let path = entry.path.as_deref().filter(|path| !"/".starts_with(path));
+        if !names_the_prompt(entry) {
+            let pages = match path {
+                Some(path) => format!("the pages under `{path}`"),
+                None if paths.is_empty() => "every page".to_owned(),
+                None => format!("every page outside {}", paths.join(", ")),
+            };
+            return Err(refusal(format!(
+                "[[fetch]] entry {} covers {pages} and does not name `{MODULE}`, so those \
+                 pages would be served with no consent prompt. Name it in that entry, before \
+                 any middleware that writes a vendor's tag",
+                index + 1
+            )));
+        }
+        match path {
+            Some(path) => paths.push(format!("`{path}`")),
+            None => return Ok(()),
+        }
+    }
+    Err(refusal(format!(
+        "the [[fetch]] entries for \"{HTML_MEDIA_TYPE}\" cover only the pages under {}, so \
+         every other page, `/` among them, would be served with no consent prompt. Name \
+         `{MODULE}` in an entry with no path as well, after the entries with one",
+        paths.join(", ")
+    )))
 }
 
 /// Validates the `InMobi` Choice configuration and reports whether a section
@@ -260,7 +298,7 @@ mod tests {
     };
     use trusted_server_core::integrations::IntegrationDocumentState;
     use trusted_server_core::middleware::test_support::context;
-    use trusted_server_core::middleware::{MiddlewareChain, PhaseEntries, PhaseEntry};
+    use trusted_server_core::middleware::{MiddlewareChain, PhaseEntries};
 
     const REAL: &str = "https://cmp.inmobi.com/choice/EXAMPLEacct00/www.publisher.example/choice.js?tag_version=V3";
 
@@ -274,6 +312,56 @@ mod tests {
              [[fetch]]\nmedia_type = \"text/html\"\nmiddleware = [\"cmp.inmobi\"]\n",
             serde_json::to_string(url).expect("a string")
         ))
+    }
+
+    /// A document selecting the prompt at [`REAL`], with `rest` written after
+    /// `script_url`, being more of `[cmp.inmobi]` and then the entries.
+    fn settings_with_rest(rest: &str) -> Settings {
+        page_settings(&format!(
+            "[cmp]\nmodule = \"inmobi\"\n\n[cmp.inmobi]\nscript_url = \"{REAL}\"\n{rest}"
+        ))
+    }
+
+    /// A `[[fetch]]` entry for `text/html`, covering the pages under `path`
+    /// where one is given, that names `middleware` in order.
+    fn html_entry(path: Option<&str>, middleware: &[&str]) -> String {
+        let path = path
+            .map(|path| format!("path = \"{path}\"\n"))
+            .unwrap_or_default();
+        format!(
+            "\n[[fetch]]\nmedia_type = \"text/html\"\n{path}middleware = {}\n",
+            serde_json::to_string(middleware).expect("a list")
+        )
+    }
+
+    /// Whether a page asked for at `path` gets the prompt from `settings`'
+    /// entries.
+    fn gets_the_prompt(settings: &Settings, path: &str) -> bool {
+        settings
+            .fetch
+            .for_response(HTML_MEDIA_TYPE, path)
+            .iter()
+            .any(|name| name == MODULE)
+    }
+
+    /// Checks that `validate` and `register` both refuse `settings`, each
+    /// with a message that says every one of `reasons`.
+    fn assert_refused(settings: &Settings, reasons: &[&str]) {
+        for (call, refusal) in [
+            ("validate", validate(settings).err()),
+            ("register", register(settings).err()),
+        ] {
+            let message = refusal
+                .unwrap_or_else(|| panic!("{call} should refuse the document"))
+                .current_context()
+                .to_string();
+            for reason in reasons {
+                assert!(
+                    message.contains(reason),
+                    "{call} should say {reason:?}, and said {message:?}"
+                );
+            }
+        }
     }
 
     /// The head markup `middleware` write in `phase`, in the order written.
@@ -406,6 +494,84 @@ mod tests {
             "{refused:?}"
         );
         assert!(register(&settings).is_err());
+    }
+
+    /// A prompt entry with a path, and no entry for the rest of the site,
+    /// leaves every other page with no prompt, so it is refused naming the
+    /// pages it leaves out.
+    #[test]
+    fn a_prompt_entry_limited_to_a_path_is_refused_naming_the_pages_left_out() {
+        let settings = settings_with_rest(&html_entry(Some("/news/"), &[MODULE]));
+        assert!(
+            gets_the_prompt(&settings, "/news/today") && !gets_the_prompt(&settings, "/"),
+            "the entry puts the prompt on the pages under /news/ alone"
+        );
+
+        assert_refused(
+            &settings,
+            &[
+                "cover only the pages under `/news/`",
+                "`/` among them",
+                "with no consent prompt",
+            ],
+        );
+    }
+
+    /// A response takes the first entry that covers it, so an earlier entry
+    /// for part of the site that does not name the prompt leaves those pages
+    /// without it, whatever a later entry names.
+    #[test]
+    fn an_earlier_entry_without_the_prompt_is_refused_naming_its_pages() {
+        let settings = settings_with_rest(&format!(
+            "{}{}",
+            html_entry(Some("/news/"), &["vendor.tag"]),
+            html_entry(None, &[MODULE, "vendor.tag"])
+        ));
+        assert!(
+            !gets_the_prompt(&settings, "/news/today") && gets_the_prompt(&settings, "/"),
+            "the pages under /news/ get the vendor's tag and no prompt"
+        );
+
+        assert_refused(
+            &settings,
+            &[
+                "[[fetch]] entry 1 covers the pages under `/news/` and does not name \
+                 `cmp.inmobi`",
+                "with no consent prompt",
+            ],
+        );
+    }
+
+    /// Entries that each name the prompt, the last covering every path, put
+    /// it on every page and are accepted, and so is one entry for `/`.
+    #[test]
+    fn entries_that_put_the_prompt_on_every_page_are_accepted() {
+        for entries in [
+            format!(
+                "{}{}",
+                html_entry(Some("/news/"), &[MODULE, "vendor.tag"]),
+                html_entry(None, &[MODULE])
+            ),
+            html_entry(Some("/"), &[MODULE]),
+        ] {
+            let settings = settings_with_rest(&entries);
+            for path in ["/", "/news/today", "/sport/"] {
+                assert!(
+                    gets_the_prompt(&settings, path),
+                    "{path} should get the prompt from {entries}"
+                );
+            }
+            assert!(
+                validate(&settings).expect("should accept the entries"),
+                "{entries}"
+            );
+            assert!(
+                register(&settings)
+                    .expect("should accept the entries")
+                    .is_some(),
+                "{entries}"
+            );
+        }
     }
 
     /// A script URL that should never reach a reader's browser is refused at
