@@ -75,8 +75,9 @@ cargo build --package trusted-server-adapter-fastly --release --target wasm32-wa
 # Run locally with Fastly simulator
 fastly compute serve
 
-# Deploy to Fastly
-fastly compute publish
+# Deploy to Fastly (managed path; links logical stores to the version)
+EDGEZERO_MANIFEST="<release-root>/edgezero.toml" \
+  ts deploy --adapter fastly --service-id <service-id> --application-release "<release-root>"
 
 # Run Axum dev server (native — no Viceroy). Settings load at runtime from the
 # platform config store on every adapter; publish an operator config with
