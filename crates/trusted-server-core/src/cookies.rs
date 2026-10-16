@@ -87,6 +87,29 @@ pub fn handle_request_cookies(
     }
 }
 
+/// Every value of the cookie `name` in the request's `Cookie` header, in the
+/// order the browser sent them, parsed as [`handle_request_cookies`] parses
+/// them.
+///
+/// A browser sends one pair for each cookie of a name it holds, such as one
+/// under `/` and one under a publisher's path, where a [`CookieJar`] keeps
+/// one. A missing or non-UTF-8 header gives none.
+#[must_use]
+pub(crate) fn cookie_values<B>(req: &Request<B>, name: &str) -> Vec<String> {
+    let Some(header_value) = req
+        .headers()
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Vec::new();
+    };
+    Cookie::split_parse(header_value.trim())
+        .filter_map(Result::ok)
+        .filter(|cookie| cookie.name() == name)
+        .map(|cookie| cookie.value().to_owned())
+        .collect()
+}
+
 /// Returns the named value from the request's selected `Cookie` header.
 ///
 /// Values are trimmed and may contain additional `=` characters. A missing or
@@ -207,6 +230,13 @@ mod tests {
                 "removed prefix `{prefix}`"
             );
         }
+    }
+
+    #[test]
+    fn cookie_values_gives_every_value_of_a_name_in_the_order_sent() {
+        let req = build_request(Some("ts-ec=publisher; other=1; ts-ec=root"));
+        assert_eq!(cookie_values(&req, "ts-ec"), ["publisher", "root"]);
+        assert!(cookie_values(&build_request(None), "ts-ec").is_empty());
     }
 
     #[test]
