@@ -174,6 +174,15 @@ impl ResolvedRequest {
         self
     }
 
+    /// The same request for `host`, for an answer that is held under the host
+    /// it is made for, which must be the host the caller read and not one a
+    /// forwarded header names.
+    #[must_use]
+    pub(crate) fn with_host(mut self, host: String) -> Self {
+        self.host = host;
+        self
+    }
+
     /// The borrowed view a context carries.
     #[must_use]
     pub fn view(&self) -> ModuleRequest<'_> {

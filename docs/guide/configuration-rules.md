@@ -298,6 +298,7 @@ endpoint = "https://house.example.com/openrtb2/auction"
 | `profile = "standard"`                                                               | `implementation = "auction-protocol.openrtb"`                                                      |
 | `profile = "prebid-server"` and `profile = "aps"`                                    | `implementation = "auction.prebid-server"` and `implementation = "auction.aps"`                    |
 | `[auction] mediator = "adserver_mock"` and `[integrations.adserver_mock]`            | `[ad-server] module = "mock"` and `[ad-server.mock]`                                               |
+| `[tinybird]` with `enabled = true`                                                   | `[analytics] module = "tinybird"` and `[analytics.tinybird]`                                       |
 | `[integrations.aps] rendering_mode`                                                  | `rendering_mode` in the `[demand.<name>]` table of the `auction.aps` implementation                |
 | `[debug.auction_html_comment_options] include_mediator_response`                     | `include_adserver_response`                                                                        |
 

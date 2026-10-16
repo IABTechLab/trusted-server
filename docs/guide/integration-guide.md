@@ -334,12 +334,13 @@ that supply a module of one type under one name.
 
 A robots.txt contributor implements `RobotsTxtContributor`. It returns groups
 of records and never bytes, so it cannot produce a malformed file. Trusted
-Server asks it for the request without its query, holds the answer until the
-contributor's `refresh` is due, and writes the file from every contributor
-`[robots-txt] modules` names, in that order. `fingerprint` names the settings
-an answer was given for, so an answer held for other settings is never
-served. Trusted Server hashes it into the key the answer is held under, so
-nothing of it is written to the store.
+Server asks it for the request without its query, on the host the request was
+addressed to and with no client information or host signals in its services,
+holds the answer for that host until the contributor's `refresh` is due, and
+writes the file from every contributor `[robots-txt] modules` names, in that
+order. `fingerprint` names the settings an answer was given for, so an answer
+held for other settings is never served. Trusted Server hashes it into the key
+the answer is held under, so nothing of it is written to the store.
 
 The Fastly adapter is the one adapter that classifies a request, so a device
 module is asked there and on no other adapter. It is shown the User-Agent and
@@ -458,8 +459,9 @@ A middleware can rely on these rules.
   removed is not asked about again.
 - A script's text arrives in chunks. A handler that needs the whole script
   removes each chunk while keeping a copy, and writes back what it kept with
-  the last chunk. A replacement is written as it is, with no character
-  escaped.
+  the last chunk. A replacement is written as it is, except that a `<` that
+  would end the script, or begin `<script` after `<!--`, is written as
+  `\u003c`.
 - A fetch middleware is told nothing about the reader, because what it leaves
   is what a shared template stores. `MiddlewareContext::document_state` is
   shared by the middleware working on one document in one phase.
