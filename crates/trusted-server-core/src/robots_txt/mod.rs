@@ -335,9 +335,14 @@ async fn answer(
         };
         selected.push(Some(contributor));
     }
-    // The answers are held and served to every crawler, so the contributors
-    // are handed the request with nothing one crawler put in the address.
-    let request = ResolvedRequest::of(req, services.client_info()).without_query();
+    // The answers are held and served to every crawler of the host, so the
+    // contributors are handed the request with nothing one crawler put in
+    // the address, for the host it was addressed to and never one a
+    // forwarded header names. That host is part of the key an answer is
+    // held under.
+    let request = ResolvedRequest::of(req, services.client_info())
+        .without_query()
+        .with_host(crate::http_util::addressed_host(req));
     Ok(respond(
         file_for(
             config,
@@ -356,7 +361,7 @@ async fn answer(
 type Selected = Option<(&'static str, Arc<dyn RobotsTxtContributor>)>;
 
 /// The file for `config`, from the contributions of `selected` in order,
-/// each asked for `request` and held for `publisher`.
+/// each asked for `request` and held for `publisher` and the request's host.
 async fn file_for(
     config: &RobotsTxtConfig,
     selected: &[Selected],
@@ -806,5 +811,98 @@ mod tests {
         assert!(message.contains("`nobody`"), "{message}");
         assert!(message.contains("refuse_all"), "{message}");
         assert!(message.contains("allow_all"), "{message}");
+    }
+
+    /// The body of a response, as text.
+    async fn text_of(response: Response<EdgeBody>) -> String {
+        let body = response
+            .into_body()
+            .into_bytes_bounded(4096)
+            .await
+            .expect("should read the body");
+        String::from_utf8(body.to_vec()).expect("the file is text")
+    }
+
+    /// A crawler's request for the file, addressed to `host`, carrying
+    /// `headers` as well.
+    fn robots_request_to(host: &str, headers: &[(&str, &str)]) -> Request<EdgeBody> {
+        let mut builder = Request::builder()
+            .uri(ROBOTS_TXT_PATH)
+            .header(header::HOST, host);
+        for &(name, value) in headers {
+            builder = builder.header(name, value);
+        }
+        builder
+            .body(EdgeBody::empty())
+            .expect("should build the request")
+    }
+
+    /// One deployment may serve several hosts, and each is answered with
+    /// what its contributors gave for that host, never with an answer held
+    /// for another.
+    #[tokio::test]
+    async fn each_host_is_answered_for_itself() {
+        let settings = settings_selecting_echo();
+        let registry = IntegrationRegistry::with_registrations(&settings, &[echo_builder()])
+            .expect("should build the registry");
+        let services = services_with(Arc::default());
+
+        for host in [PUBLISHER, "other.publisher.example"] {
+            let response = handle_robots_txt(
+                &settings,
+                &services,
+                &registry,
+                robots_request_to(host, &[]),
+            )
+            .await
+            .expect("should answer");
+            let file = text_of(response).await;
+
+            assert!(
+                file.contains(&format!("Disallow: /{host}/robots.txt?")),
+                "{host} should be answered for itself: {file}"
+            );
+        }
+    }
+
+    /// `Forwarded` and `X-Forwarded-Host` name whatever host a client likes,
+    /// so a contributor is asked for the host the request was addressed to,
+    /// and an answer made for a claimed host is never held for the real one.
+    #[tokio::test]
+    async fn a_forwarded_host_is_never_the_host_a_contributor_is_asked_for() {
+        let settings = settings_selecting_echo();
+        let registry = IntegrationRegistry::with_registrations(&settings, &[echo_builder()])
+            .expect("should build the registry");
+        let services = services_with(Arc::default());
+        let claiming = robots_request_to(
+            PUBLISHER,
+            &[
+                ("forwarded", "host=elsewhere.example"),
+                ("x-forwarded-host", "elsewhere.example"),
+            ],
+        );
+
+        let claimed = handle_robots_txt(&settings, &services, &registry, claiming)
+            .await
+            .expect("should answer");
+        let after = handle_robots_txt(
+            &settings,
+            &services,
+            &registry,
+            robots_request_to(PUBLISHER, &[]),
+        )
+        .await
+        .expect("should answer");
+
+        for file in [text_of(claimed).await, text_of(after).await] {
+            assert!(
+                !file.contains("elsewhere.example"),
+                "a claimed host should never reach the file: {file}"
+            );
+            assert!(
+                file.contains(&format!("Disallow: /{PUBLISHER}/robots.txt?")),
+                "the file should be made for the host addressed: {file}"
+            );
+        }
     }
 }
