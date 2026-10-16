@@ -659,7 +659,11 @@ mod tests {
             StatusCode::SERVICE_UNAVAILABLE,
             "a crawler reads an empty or allow everything file as permission"
         );
-        assert!(response.headers().contains_key(header::RETRY_AFTER));
+        assert_eq!(
+            response.headers().get(header::RETRY_AFTER),
+            Some(&HeaderValue::from_static("600")),
+            "a crawler should be told to come back in ten minutes"
+        );
         assert_eq!(
             response.headers().get(header::CACHE_CONTROL),
             Some(&HeaderValue::from_static("no-store")),

@@ -20,7 +20,8 @@ use trusted_server_core::integrations::{
     IntegrationBuilder, IntegrationRegistration, IntegrationRequestFilter, RequestFilterDecision,
     RequestFilterEffects, RequestFilterInput,
 };
-use trusted_server_core::module_context::{ModuleContext, ModuleRequest};
+use trusted_server_core::module_context::{ModuleCall, ModuleContext, ModuleRequest};
+use trusted_server_core::robots_txt::{Contribution, RobotsTxtContributor};
 use trusted_server_core::settings::Settings;
 use trusted_server_core::tsjs::tsjs_script_src;
 use trusted_server_core::tsjs_bundle::{JsModulePart, compile_time_parts};
@@ -438,6 +439,143 @@ fn robots_txt_is_answered_before_the_edge_cookie_steps_and_the_filters() {
         "no Edge Cookie state should ride on the file"
     );
     assert_eq!(body_text(file), "User-agent: *\nDisallow: /\n");
+}
+
+/// Sends one request with `method` and returns the response.
+fn send(router: &RouterService, method: Method, path: &str) -> Response {
+    let request = request_builder()
+        .method(method)
+        .uri(format!("https://test-publisher.com{path}"))
+        .body(Body::empty())
+        .expect("should build request");
+    block_on(router.oneshot(request)).expect("should route request")
+}
+
+/// The value of the header `name`, as text.
+fn header_text<'r>(response: &'r Response, name: &str) -> Option<&'r str> {
+    response
+        .headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+}
+
+/// A `HEAD` for the file is answered here with the headers a `GET` is given
+/// and no body.
+#[test]
+fn a_head_of_robots_txt_is_answered_with_the_headers_and_no_body() {
+    let router = router_with(
+        settings_with(&format!(
+            r#"
+            [robots-txt]
+            modules = "refuse_all"
+            {HMAC_BLOCK}
+            {PROBE_BLOCK}
+            "#
+        )),
+        &[seam_probe::builder()],
+    );
+
+    let response = send(&router, Method::HEAD, "/robots.txt");
+
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(
+        header_text(&response, "content-type"),
+        Some("text/plain; charset=utf-8")
+    );
+    assert_eq!(
+        header_text(&response, "cache-control"),
+        Some("public, max-age=3600")
+    );
+    assert!(body_text(response).is_empty(), "a HEAD carries no body");
+}
+
+/// The id of the module that answers once.
+const ANSWERS_ONCE_ID: &str = "robots-txt-answers-once";
+
+/// A robots.txt contributor that answers the first time it is asked and fails
+/// every time after, whose answer is due for a refresh at once.
+#[derive(Debug, Default)]
+struct AnswersOnce {
+    asked: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait(?Send)]
+impl RobotsTxtContributor for AnswersOnce {
+    fn refresh(&self) -> std::time::Duration {
+        std::time::Duration::ZERO
+    }
+
+    fn fingerprint(&self) -> String {
+        "answers-once".to_owned()
+    }
+
+    async fn contribute(
+        &self,
+        _call: ModuleCall<'_>,
+    ) -> Result<Contribution, Report<TrustedServerError>> {
+        if self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            Ok(Contribution::parse("User-Agent: OnceBot\nDisallow: /"))
+        } else {
+            Err(Report::new(TrustedServerError::Proxy {
+                message: "the rules service is down".to_owned(),
+            }))
+        }
+    }
+}
+
+fn register_answers_once(
+    _settings: &Settings,
+) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+    Ok(Some(
+        IntegrationRegistration::builder(ANSWERS_ONCE_ID)
+            .with_robots_txt_contributor(
+                "robots-txt.answers-once",
+                Arc::new(AnswersOnce::default()),
+            )
+            .build(),
+    ))
+}
+
+fn accept_answers_once(_settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+    Ok(true)
+}
+
+/// This adapter holds no answer, so every request for the file asks each
+/// module, and a module that fails with nothing held makes the file a `503`
+/// that tells a crawler to come back in ten minutes and is not stored.
+#[test]
+fn with_nothing_held_a_module_that_fails_makes_the_file_unavailable() {
+    let settings = settings_with(&format!(
+        r#"
+        [robots-txt]
+        modules = ["answers-once"]
+        {HMAC_BLOCK}
+
+        [testing]
+        modules = ["robots-txt-answers-once"]
+        "#
+    ));
+    let builder = IntegrationBuilder::new(
+        ANSWERS_ONCE_ID,
+        ANSWERS_ONCE_ID,
+        register_answers_once,
+        accept_answers_once,
+    )
+    .with_module_name("testing.robots-txt-answers-once");
+    let router = router_with(settings, &[builder]);
+
+    let first = get(&router, "/robots.txt", None);
+    assert_eq!(first.status().as_u16(), 200);
+    assert_eq!(body_text(first), "User-Agent: OnceBot\nDisallow: /\n");
+
+    let second = get(&router, "/robots.txt", None);
+    assert_eq!(
+        second.status().as_u16(),
+        503,
+        "nothing is held here, so the module is asked again and its failure fails the file"
+    );
+    assert_eq!(header_text(&second, "retry-after"), Some("600"));
+    assert_eq!(header_text(&second, "cache-control"), Some("no-store"));
 }
 
 /// A request prepares exactly once whether a named route or the fallback
