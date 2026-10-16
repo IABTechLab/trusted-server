@@ -197,6 +197,56 @@ pub mod fixtures {
     pub const PUBLISHER_PAGE_HTML: &str = include_str!("html_processor.test.html");
 }
 
+/// What a test logs on its own thread, for a test of a log line.
+///
+/// The first use installs a logger for the whole test binary that keeps the
+/// records of a thread while it captures and drops every other record.
+#[cfg(test)]
+pub(crate) mod logs {
+    use std::cell::RefCell;
+    use std::future::Future;
+    use std::sync::Once;
+
+    thread_local! {
+        static CAPTURED: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+    }
+
+    struct ThreadLogger;
+
+    impl log::Log for ThreadLogger {
+        fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
+            CAPTURED.with(|captured| captured.borrow().is_some())
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            CAPTURED.with(|captured| {
+                if let Some(lines) = captured.borrow_mut().as_mut() {
+                    lines.push(format!("{} {}", record.level(), record.args()));
+                }
+            });
+        }
+
+        fn flush(&self) {}
+    }
+
+    static LOGGER: ThreadLogger = ThreadLogger;
+    static INSTALL: Once = Once::new();
+
+    /// What `future` answers, and each line it logs on this thread at
+    /// warning level or above, as the level and then the message, such as
+    /// `WARN ...`. A future that runs on another thread logs nothing here.
+    pub(crate) async fn logged_by<F: Future>(future: F) -> (F::Output, Vec<String>) {
+        INSTALL.call_once(|| {
+            log::set_logger(&LOGGER).expect("should be the only logger the tests install");
+            log::set_max_level(log::LevelFilter::Warn);
+        });
+        CAPTURED.with(|captured| *captured.borrow_mut() = Some(Vec::new()));
+        let output = future.await;
+        let lines = CAPTURED.with(|captured| captured.borrow_mut().take().unwrap_or_default());
+        (output, lines)
+    }
+}
+
 /// The operator-facing settings template, for tests that check what it
 /// documents.
 #[cfg(any(test, feature = "test-utils"))]
@@ -251,6 +301,31 @@ pub mod template {
         }
 
         out.join("\n")
+    }
+
+    /// Only the block of [`EXAMPLE_TEMPLATE`] that begins at the line
+    /// `# {header}`, uncommented, for a test that adds a documented section to
+    /// settings of its own. The block ends at the first line that is not a
+    /// comment.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the template documents no such block.
+    #[must_use]
+    pub fn documented_block(header: &str) -> String {
+        let header_line = format!("# {header}");
+        let block: Vec<&str> = EXAMPLE_TEMPLATE
+            .lines()
+            .skip_while(|line| *line != header_line)
+            .take_while(|line| line.trim_start().starts_with('#'))
+            .map(|line| {
+                line.strip_prefix("# ")
+                    .or_else(|| line.strip_prefix('#'))
+                    .unwrap_or(line)
+            })
+            .collect();
+        assert!(!block.is_empty(), "the template should document {header}");
+        block.join("\n")
     }
 }
 
