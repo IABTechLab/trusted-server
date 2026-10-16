@@ -838,6 +838,177 @@ fn a_handler_that_holds_a_script_writes_it_back_whole() {
     );
 }
 
+const SCRIPT_PAGE: &str = "<html><body><script>one(); two();</script><p>after</p></body></html>";
+
+/// A middleware that writes `script` as the text of every script.
+fn writes_script(script: &str) -> Arc<dyn Middleware> {
+    let script = script.to_owned();
+    text("example.script", "script", move || {
+        let script = script.clone();
+        move |_text: &str, is_last: bool| {
+            if is_last {
+                ScriptRewriteAction::replace(script.clone())
+            } else {
+                ScriptRewriteAction::remove_node()
+            }
+        }
+    })
+}
+
+/// The text of each script in `page`, and the name of each element, as a
+/// browser's tokenizer reads the page.
+fn as_a_browser_reads(page: &str) -> (Vec<String>, Vec<String>) {
+    let scripts = std::cell::RefCell::new((String::new(), Vec::new()));
+    let elements = std::cell::RefCell::new(Vec::new());
+    lol_html::rewrite_str(
+        page,
+        lol_html::RewriteStrSettings {
+            element_content_handlers: vec![
+                lol_html::element!("*", |element| {
+                    elements.borrow_mut().push(element.tag_name());
+                    Ok(())
+                }),
+                lol_html::text!("script", |text| {
+                    let mut scripts = scripts.borrow_mut();
+                    let (script, read) = &mut *scripts;
+                    script.push_str(text.as_str());
+                    if text.last_in_text_node() {
+                        read.push(std::mem::take(script));
+                    }
+                    Ok(())
+                }),
+            ],
+            ..lol_html::RewriteStrSettings::new()
+        },
+    )
+    .expect("should read the page");
+    (scripts.into_inner().1, elements.into_inner())
+}
+
+/// Asserts that a browser reads `page` as one script holding `script`,
+/// followed by the paragraph, and no other element.
+fn assert_script_stays_whole(page: &str, script: &str) {
+    let (scripts, elements) = as_a_browser_reads(page);
+    assert_eq!(
+        scripts,
+        [script],
+        "should read the script's text as written, up to its own end tag: {page}"
+    );
+    assert_eq!(
+        elements,
+        ["html", "body", "script", "p"],
+        "should read what follows the script as markup, and nothing in it: {page}"
+    );
+}
+
+#[test]
+fn script_text_that_would_end_the_script_is_written_so_the_script_stays_whole() {
+    for (written, expected) in [
+        (
+            "var s = \"</script><img src=x onerror=alert(1)>\";",
+            "var s = \"\\u003c/script><img src=x onerror=alert(1)>\";",
+        ),
+        (
+            "var s = \"</SCRIPT ><img src=x onerror=alert(1)>\";",
+            "var s = \"\\u003c/SCRIPT ><img src=x onerror=alert(1)>\";",
+        ),
+    ] {
+        let page = page(&chain_of(vec![writes_script(written)]), SCRIPT_PAGE);
+
+        assert!(
+            page.contains(&format!("<script>{expected}</script><p>after</p>")),
+            "should write the `<` of the closing tag as `\\u003c`: {page}"
+        );
+        assert_script_stays_whole(&page, expected);
+    }
+}
+
+#[test]
+fn script_text_with_a_comment_opening_leaves_the_end_tag_closing_the_script() {
+    // After `<!--`, `<script` would keep the script's own end tag from
+    // closing it, and the rest of the page would be read as script.
+    for (written, expected) in [
+        ("var s = \"<!--\";", "var s = \"<!--\";"),
+        (
+            "var s = \"<!--<script>\";",
+            "var s = \"<!--\\u003cscript>\";",
+        ),
+    ] {
+        let page = page(&chain_of(vec![writes_script(written)]), SCRIPT_PAGE);
+
+        assert!(
+            page.contains(&format!("<script>{expected}</script><p>after</p>")),
+            "should write `<!--` as it is, and the `<` of a script tag after it as \
+             `\\u003c`: {page}"
+        );
+        assert_script_stays_whole(&page, expected);
+    }
+}
+
+#[test]
+fn script_text_written_in_pieces_cannot_end_the_script_between_them() {
+    // The page is read a byte at a time, so the script's text arrives in
+    // several chunks. The handler writes the `<` of a closing tag in place
+    // of the first chunk and the rest of the tag in place of the last.
+    let chain = chain_of(vec![text("example.pieces", "script", || {
+        let mut first = true;
+        move |_text: &str, is_last: bool| {
+            if is_last {
+                ScriptRewriteAction::replace("/script><img src=x onerror=alert(1)>")
+            } else if std::mem::take(&mut first) {
+                ScriptRewriteAction::replace("<")
+            } else {
+                ScriptRewriteAction::remove_node()
+            }
+        }
+    })]);
+
+    let page = page_with(config(), &chain, SCRIPT_PAGE, 1);
+
+    let expected = "\\u003c/script><img src=x onerror=alert(1)>";
+    assert!(
+        page.contains(&format!("<script>{expected}</script><p>after</p>")),
+        "should escape a closing tag whose `<` was written with an earlier chunk: {page}"
+    );
+    assert_script_stays_whole(&page, expected);
+}
+
+#[test]
+fn script_text_a_serve_middleware_writes_cannot_end_the_script_either() {
+    let chain = serve_chain_of(vec![writes_script(
+        "var s = \"</script><img src=x onerror=alert(1)>\";",
+    )]);
+
+    let page = served(&chain, SCRIPT_PAGE);
+
+    let expected = "var s = \"\\u003c/script><img src=x onerror=alert(1)>\";";
+    assert!(
+        page.contains(&format!("<script>{expected}</script><p>after</p>")),
+        "should keep the text a serve middleware writes inside its script: {page}"
+    );
+    assert_script_stays_whole(&page, expected);
+}
+
+#[test]
+fn a_script_no_middleware_changes_is_written_as_the_page_wrote_it() {
+    // An old page hides a script inside `<!--` and writes a script tag from
+    // within it, which the parser reads as the script's own text.
+    let html = "<html><body><script><!--\ndocument.write('<script src=\"a.js\"></script>');\n\
+                //--></script><p>after</p></body></html>";
+    let chain = chain_of(vec![text("example.keep", "script", || {
+        |_text: &str, _is_last: bool| ScriptRewriteAction::keep()
+    })]);
+
+    for chunk_size in [1, 7, 8192] {
+        assert_eq!(
+            page_with(config(), &chain, html, chunk_size),
+            html,
+            "should leave a script no middleware changed byte for byte, read {chunk_size} \
+             bytes at a time"
+        );
+    }
+}
+
 /// Appends a comment to the document, and swaps one word for another.
 struct Rewording {
     from: &'static str,
