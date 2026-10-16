@@ -718,4 +718,72 @@ mod tests {
             "should still forward required headers (user-agent)"
         );
     }
+
+    #[test]
+    fn permutive_proxy_does_not_forward_host_signal_headers() {
+        // Every proxied route forwards the reader's custom `x-` headers, so
+        // each must filter out the host's TLS and HTTP/2 client signals.
+        let routes = [
+            "/integrations/permutive/api/v2.0/events",
+            "/integrations/permutive/secure-signal/v1/segments",
+            "/integrations/permutive/events/v1/track",
+            "/integrations/permutive/sync/v1/sync",
+            "/integrations/permutive/cdn/v1/config.json",
+        ];
+        let stub = Arc::new(StubHttpClient::new());
+        for _ in routes {
+            stub.push_response(200, b"ok".to_vec());
+        }
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let settings = create_test_settings();
+        let integration = PermutiveIntegration::new(PermutiveConfig {
+            enabled: true,
+            organization_id: "myorg".to_string(),
+            workspace_id: "workspace-123".to_string(),
+            project_id: String::new(),
+            api_endpoint: default_api_endpoint(),
+            secure_signals_endpoint: default_secure_signals_endpoint(),
+            cache_ttl_seconds: 3600,
+            rewrite_sdk: true,
+        });
+
+        for route in routes {
+            let req = http::Request::builder()
+                .method(http::Method::GET)
+                .uri(format!("https://publisher.example{route}"))
+                .header("x-ts-tls-ja4", "t13d1516h2_8daaf6152771_02713d6af862")
+                .header(
+                    "x-ts-h2-fingerprint",
+                    "1:65536;4:6291456|15663105|0|m,a,s,p",
+                )
+                .header("x-permutive-trace", "kept")
+                .body(EdgeBody::empty())
+                .expect("should build request");
+            futures::executor::block_on(integration.handle(&settings, &services, req))
+                .expect("should proxy request");
+        }
+
+        let recorded = stub.recorded_request_headers();
+        assert_eq!(
+            recorded.len(),
+            routes.len(),
+            "should forward one request per route"
+        );
+        for (route, headers) in routes.iter().zip(&recorded) {
+            for name in ["x-ts-tls-ja4", "x-ts-h2-fingerprint"] {
+                assert!(
+                    headers.iter().all(|(header_name, _)| header_name != name),
+                    "{route} should not forward the host signal header `{name}`"
+                );
+            }
+            assert!(
+                headers
+                    .iter()
+                    .any(|(name, value)| name == "x-permutive-trace" && value == "kept"),
+                "{route} should still forward the reader's other custom headers"
+            );
+        }
+    }
 }

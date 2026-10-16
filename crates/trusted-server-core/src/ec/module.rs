@@ -951,6 +951,14 @@ impl EdgeCookieModule for ClientFixedModule {
         })
     }
 
+    fn accepts_id(&self, value: &str) -> bool {
+        // The built-in default accepts only the HMAC `<hash>.<suffix>` shape,
+        // so the fixed word would never be read back, keyed or withdrawn. The
+        // fixed word is the only identifier this module creates, so it is the
+        // only one it owns.
+        value == EXPECTED_VALUE
+    }
+
     fn normalize_id_for_kv(&self, value: &str) -> String {
         // The fixed word has no dot separator, so the built-in default (which
         // normalizes the HMAC `<hash>.<suffix>` shape) would corrupt it as a
@@ -2195,6 +2203,29 @@ mod tests {
                 generated.id.as_deref(),
                 expected,
                 "{case}: should create exactly what the module verifies"
+            );
+        }
+    }
+
+    #[test]
+    fn client_fixed_owns_the_one_identifier_it_creates() {
+        // Read-back, the identity-graph key and withdrawal all ask the
+        // selected module whether it owns the cookie that came back.
+        let coded = format!("cfix~{EXPECTED_VALUE}");
+        assert!(
+            module_owns_id(&ClientFixedModule, &coded),
+            "`client_fixed` should own the coded fixed word it creates"
+        );
+        let hmac_shaped = format!("cfix~{}.ABC123", "a".repeat(64));
+        for other in [
+            "cfix~another-word",
+            EXPECTED_VALUE,
+            "hmac~an-ec",
+            hmac_shaped.as_str(),
+        ] {
+            assert!(
+                !module_owns_id(&ClientFixedModule, other),
+                "`client_fixed` should not own {other}"
             );
         }
     }
