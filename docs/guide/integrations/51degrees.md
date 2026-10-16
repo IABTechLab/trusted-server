@@ -32,14 +32,14 @@ names in the request's state. On the way out it writes:
    the lower case hint names each followed by the origin and separated by
    semicolons.
 
-Each header keeps the first line the response already carries under that
-name, with the hints added after it, so a policy the publisher's origin sets
-is kept and a hint the origin already asks for is named once. A delegation
-comes after the origin's own policy members, so for a hint the service names
-it overrides an origin policy that denies the hint, such as `ch-ua-model=()`.
-A browser engine the service names no hints for, such as Firefox or Safari,
-is given none of them. A request that is not a page navigation asks the
-service nothing, and a page navigation is a `GET` or `HEAD` with
+Each header keeps every line the response already carries under that name,
+with the hints added after them, so a policy the publisher's origin sets is
+kept and a hint the origin already asks for is named once. A delegation comes
+after the origin's own policy members, so for a hint the service names it
+overrides an origin policy that denies the hint, such as `ch-ua-model=()`. A
+browser engine the service names no hints for, such as Firefox or Safari, is
+given none of them. A request that is not a page navigation asks the service
+nothing, and a page navigation is a `GET` or `HEAD` with
 `Sec-Fetch-Dest: document` or an `Accept` naming `text/html`.
 
 A browser keeps the hints an origin asked for until a response from that
@@ -101,27 +101,28 @@ copies, as for every declared cache. An answer is held for an hour at most.
 The middleware writes its headers and tag where a `[[serve]]` entry names
 `51degrees.client_hints`, and in no other phase, because the list is the
 service's answer for one reader's browser and what the fetch phase leaves is
-stored for every reader. A deployment that names it in no entry sends no
-client hints headers and no tag, but the request filter that asks the service
-is run by `[shared.51degrees]` alone and reads no entry or `path`, so it asks
-about every page navigation. Only the Fastly adapter runs request filters, so
-on Axum, Cloudflare and Spin the middleware asks the service nothing and
-writes nothing. The headers are written on every response the publisher path
-sends for a path the entry covers, a redirect included, and the tag on each
-page.
+stored for every reader. The request filter asks the service only about a page
+navigation whose path an entry naming the middleware covers, by the same rule
+as the headers, so a deployment that names it in no entry sends no client
+hints headers and no tag and asks the service nothing. Only the Fastly adapter
+runs request filters, so on Axum, Cloudflare and Spin the middleware asks the
+service nothing and writes nothing. The headers are written on every response
+the publisher path sends for a path the entry covers, a redirect included, and
+the tag on each page.
 
 A page the middleware leaves names for keeps to the origin path, because the
 names are left in the request's state, which is what core does for every
-request a module leaves a value on. That page, whether or not an entry covers
-it, is never read from a shared template and never stored as one, and is sent
-`private, no-store`.
+request a module leaves a value on. That page is never read from a shared
+template and never stored as one, and is sent `private, no-store`.
 
-The first call for an address, `User-Agent` and `51D_` cookies costs one round
-trip to the service before the page. On Fastly the call fails after one second
-if it cannot connect, and once connected it waits `timeout_ms` for the first
-byte and again for each gap between bytes. The answer is held, so every later
-request with the same evidence reads it. A service that does not answer leaves
-the page with no headers and no tag, and a logged line says why.
+The call sends the browser's `User-Agent` and its `Sec-CH-UA` hints, and
+neither the reader's address nor a cookie. The first call for a `User-Agent`
+and set of those hints costs one round trip to the service before the page,
+and every reader whose browser sends the same values then reads the held
+answer. On Fastly the call fails after one second if it cannot connect, and
+once connected it waits `timeout_ms` for the first byte and again for each gap
+between bytes. A service that does not answer leaves the page with no headers
+and no tag, and a logged line says why.
 
 ## What is checked
 
@@ -135,9 +136,10 @@ the names that are declared.
 ## Tests
 
 The module's own tests cover the headers on a document, `critical` off, a
-document with no names, what the response already carried, the tag's shape
-and the origin it delegates to, the request filter against a scripted service
-for a Chromium, a Gecko and a WebKit browser, each table refusing a key it
-does not know, and that no entry means no headers. The shared crate's tests
-cover the call's form, the credential it presents, what it holds and what it
-refuses.
+document with no names, every line the response already carried, the tag's
+shape and the origin it delegates to, the request filter against a scripted
+service for a Chromium, a Gecko and a WebKit browser, an entry's `path`
+deciding whether the service is asked, each table refusing a key it does not
+know, and that no entry means no headers and no call. The shared crate's tests
+cover the call's form, the credential it presents, that no address and no
+cookie is sent, what it holds and what it refuses.

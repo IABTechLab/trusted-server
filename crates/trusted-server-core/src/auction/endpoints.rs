@@ -9,7 +9,7 @@ use serde_json::Value as JsonValue;
 
 use crate::auction::formats::AdRequest;
 use crate::auction::orchestrator::OrchestrationResult;
-use crate::consent::{gate_eids_by_permissions, permissions_allow_server_side_auction};
+use crate::consent::gate_eids_by_permissions;
 use crate::ec::EcContext;
 use crate::ec::EcKvSnapshot;
 use crate::ec::eids::{Eid, Uid, resolve_partner_ids, to_eids};
@@ -221,14 +221,15 @@ pub async fn handle_auction(
         );
     }
 
-    // Server-side auction permission gate. The publisher-navigation and
-    // `/_ts/page-bids` paths fail closed where the resolved permissions do
-    // not set basic ad selection. `/auction` is the programmatic entry point
-    // for the same server-side auction, so it must gate identically: returning
-    // a no-bid response here prevents outbound demand calls and the forwarding
-    // of request-derived signals (UA/IP/geo, and cookies under some
+    // Server-side auction consent gate. The publisher-navigation and
+    // `/_ts/page-bids` paths fail closed for GDPR or unknown jurisdictions, and
+    // where a consent record says its regulation applies, unless a record
+    // that applies consents to storage. `/auction` is the programmatic entry
+    // point for the same server-side auction, so it must gate identically:
+    // returning a no-bid response here prevents outbound demand calls and the
+    // forwarding of request-derived signals (UA/IP/geo, and cookies under some
     // consent-forwarding modes) for traffic that must not run an auction.
-    if !permissions_allow_server_side_auction(ec_context.permissions()) {
+    if !ec_context.server_side_auction_allowed() {
         log::info!(
             "/auction: server-side auction consent gate denied; returning no-bid response without contacting providers"
         );
@@ -1287,10 +1288,11 @@ mod tests {
 
     #[tokio::test]
     async fn auction_endpoint_consent_gate_returns_no_bid_without_contacting_providers() {
-        // A request whose resolved permissions do not set basic ad selection
-        // must not run a server-side auction. The /auction endpoint must short-circuit to a
-        // no-bid response before dispatching to any provider — matching the
-        // publisher-navigation and /_ts/page-bids paths.
+        // A GDPR or unknown jurisdiction with no consent record granting
+        // storage must not run a server-side auction. The /auction endpoint
+        // must short-circuit to a no-bid response before dispatching to any
+        // provider, matching the publisher-navigation and /_ts/page-bids
+        // paths.
         let settings = create_test_settings();
         let config = AuctionConfig {
             enabled: true,
@@ -1415,9 +1417,9 @@ mod tests {
 
     #[tokio::test]
     async fn auction_strips_client_eids_when_ec_identity_denied() {
-        // A US-state opt-out: the server-side auction permission gate still
-        // allows a non-personalized auction, because the opt-out leaves basic
-        // ad selection set, but EC identity use is denied (`ec_allowed()` is
+        // A US-state opt-out: the server-side auction consent gate still
+        // allows a non-personalized auction, because no consent record says a
+        // regulation applies, but EC identity use is denied (`ec_allowed()` is
         // false). Client EIDs supplied in the request body/cookie must NOT be
         // forwarded, so the outgoing auction request must have
         // `user.eids == None`.
