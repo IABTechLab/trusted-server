@@ -300,6 +300,7 @@ endpoint = "https://house.example.com/openrtb2/auction"
 | --------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
 | `[integrations.<id>]` with `enabled = true`                                                   | the module in the section of its type, and `[<type>.<name>]` only for settings                     |
 | `[ec.providers.<name>]`                                                                       | `[ec.<name>]`                                                                                      |
+| `[device] module = "fastly"`                                                                  | `[device] module = "platform"`                                                                     |
 | `[permission_signal] sources`                                                                 | `[permission-signal] modules`                                                                      |
 | `host-signals`, `client-fixed`, `gpp-sale-opt-out`, `gpp_sale_opt_out`, `us_privacy`          | `host_signals`, `client_fixed`, `gpp`, `us-privacy`                                                |
 | `[auction.providers.<id>]` with `protocol`, `profile` and `profile_config`                    | `[demand] modules` and `[demand.<name>]`, with `implementation` and the settings flat in the table |
