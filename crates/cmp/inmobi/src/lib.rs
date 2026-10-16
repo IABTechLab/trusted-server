@@ -1150,7 +1150,9 @@ mod tests {
                 "cmp_id = {value}\n{}",
                 html_entry(None, &[MODULE])
             ));
-            settings.publisher.origin_url = "https://origin.publisher.example".to_owned();
+            settings.set_origin_source(&trusted_server_core::source::OriginSettings::new(
+                "https://origin.publisher.example",
+            ));
             settings
         };
         let load = |settings: &Settings| {
