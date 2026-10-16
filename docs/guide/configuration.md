@@ -3058,8 +3058,7 @@ selection is a deploy-time input: a managed `ts deploy --adapter fastly` links
 the physical store named by
 `EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME` to the service version
 under the logical ID. On Fastly the CLI rejects a `__KEY` selector other than
-the logical ID, and it pushes a `--key` other than the logical ID only with
-`--local`.
+the logical ID, and it pushes a `--key` other than the logical ID itself.
 
 Keep the `__NAME` selector set in the shell or deploy job for every push, so
 `ts config push` writes into the same physical store the deployment links.
@@ -3083,8 +3082,8 @@ Push each key in lower case. The runtime lowercases the request's host and
 answered `421`.
 
 ```bash
-ts config push --adapter fastly --local --key www.publisher-a.example --app-config publisher-a.toml
-ts config push --adapter fastly --local --key www.publisher-b.example --app-config publisher-b.toml
+ts config push --adapter fastly --key www.publisher-a.example --app-config publisher-a.toml
+ts config push --adapter fastly --key www.publisher-b.example --app-config publisher-b.toml
 
 fastly config-store-entry update --upsert \
   --store-id <id of the store linked as trusted_server_config> \
@@ -3092,10 +3091,12 @@ fastly config-store-entry update --upsert \
   --value '{host}'
 ```
 
-`ts config push` writes a key other than `trusted_server_config` only with
-`--local`, into the local store in `fastly.toml`. Copy the entries it writes
-into a live store with `fastly config-store-entry update`, a long blob's
-chunks before its pointer. The selector is read on every request, so the
+`ts config push` writes a key other than `trusted_server_config` itself,
+because EdgeZero writes no other key on Fastly. It writes the live store that
+`EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME` selects through the
+`fastly` CLI, with the token in `FASTLY_API_TOKEN`, and with `--local` it
+writes the local store in `fastly.toml` instead. A long blob's chunks are
+written before its pointer. The selector is read on every request, so the
 blobs come first.
 
 | A request for                                               | Reads the blob at         | Is answered                      |

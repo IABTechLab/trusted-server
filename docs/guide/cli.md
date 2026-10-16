@@ -276,7 +276,10 @@ commands above do.
 `--staging` on `config push` / `config diff` writes and compares the
 `<logical-store-id>` key in the physical store selected by the current
 environment. It is mutually exclusive with `--key`. On Fastly, `ts` pushes a
-`--key` other than the logical store ID itself, and only with `--local`.
+`--key` other than the logical store ID itself, into the local store in
+`fastly.toml` with `--local`, and otherwise into the live store that
+`EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME` selects, through the
+`fastly` CLI with the token in `FASTLY_API_TOKEN`.
 
 Inspect and verify deployments with the deploy lifecycle commands. All three are
 Fastly-only — the axum, cloudflare, and spin adapters reject them:
