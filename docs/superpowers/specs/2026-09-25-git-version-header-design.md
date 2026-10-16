@@ -23,6 +23,8 @@ monitors need to see from a response that production runs a release, and which
 one. Staging keeps deploying branches and commits, so it needs to be
 identifiable too.
 
+> **Release-scope update:** Merged #1213's tag/branch/override examples describe development source builds. The [October release contract](2026-10-09-1235-release-attestation-design.md#r-facts) adds strict `TRUSTED_SERVER__RELEASE_BUILD=1`: canonical attested builds require the approved full source commit, reject Git fallback, and return that commit in `x-ts-version`. The external release tag stays in the signed index; header values do not prove attested bytes. Development goals and acceptance examples below remain applicable outside release mode.
+
 ## Goals
 
 - Report the deployed git version in `x-ts-version`: the tag when the deployed

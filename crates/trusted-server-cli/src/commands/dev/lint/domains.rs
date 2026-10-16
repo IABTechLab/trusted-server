@@ -112,8 +112,11 @@ pub const REFERENCE_HOSTS: &[&str] = &[
     "iabtechlab.github.io",
     "iabeurope.github.io",
     // Specs (supply chain)
+    "actions.github.io",
     "in-toto.io",
     "rslstandard.org",
+    "slsa.dev",
+    "spdx.dev",
     // Specs (other)
     "webassembly.org",
     // Fastly docs
@@ -497,6 +500,36 @@ fn canonical_host(authority: &str) -> String {
     }
 }
 
+// These are exact standard identifiers, rather than general host permissions.
+const STANDARD_IDENTIFIERS: &[&str] = &[
+    "http://json-schema.org/draft-07/schema#",
+    "https://json-schema.org/draft/2020-12/schema",
+    "http://spdx.org/rdf/terms/2.3",
+    "http://spdx.org/rdf/terms#none",
+    "http://spdx.org/rdf/terms#noassertion",
+];
+
+fn is_standard_identifier(line: &str, start: usize) -> bool {
+    let Some(prefix) = line.get(..start) else {
+        return false;
+    };
+    let Some(suffix) = line.get(start..) else {
+        return false;
+    };
+    if prefix.chars().next_back().is_some_and(|character| {
+        !character.is_whitespace() && !matches!(character, '"' | '\'' | '`' | '(' | '[' | '<' | '{')
+    }) {
+        return false;
+    }
+    STANDARD_IDENTIFIERS.iter().any(|identifier| {
+        suffix.strip_prefix(identifier).is_some_and(|rest| {
+            rest.chars().next().is_none_or(|character| {
+                character.is_whitespace() || matches!(character, '"' | '\'' | '`')
+            })
+        })
+    })
+}
+
 /// Extract and normalise every host from absolute URLs on `line`.
 ///
 /// The scheme itself marks these as URLs, so an authority that merely
@@ -507,6 +540,11 @@ fn extract_absolute_hosts(line: &str) -> Vec<String> {
     let line = unescape_solidus(line);
     absolute_url_regex()
         .captures_iter(&line)
+        .filter(|capture| {
+            !capture
+                .get(0)
+                .is_some_and(|matched| is_standard_identifier(&line, matched.start()))
+        })
         .filter_map(|c| c.get(1).map(|m| canonical_host(m.as_str())))
         .filter(|host| host.chars().any(char::is_alphanumeric))
         .collect()
@@ -1366,6 +1404,245 @@ mod scan_line_tests {
             "//www.googletagmanager.com/gtm.js",
         ] {
             assert!(hosts(line).is_empty(), "should be clean: {line}");
+        }
+    }
+
+    fn standard_identifiers() -> [&'static str; 5] {
+        [
+            "http://json-schema.org/draft-07/schema#",
+            "https://json-schema.org/draft/2020-12/schema",
+            "http://spdx.org/rdf/terms/2.3",
+            "http://spdx.org/rdf/terms#none",
+            "http://spdx.org/rdf/terms#noassertion",
+        ]
+    }
+
+    fn standard_host(identifier: &str) -> String {
+        Url::parse(identifier)
+            .expect("should parse exact standard identifier")
+            .host_str()
+            .expect("should include standard host")
+            .to_owned()
+    }
+
+    #[test]
+    fn normative_identifiers_accept_exact_json_and_quoted_prose() {
+        for identifier in standard_identifiers() {
+            for line in [
+                format!(r#"{{"$schema":"{identifier}"}}"#),
+                format!("The identifier is `{identifier}` in this fixture."),
+                identifier.to_owned(),
+                format!("'{}'", identifier.replace('/', "\\/")),
+            ] {
+                assert!(
+                    hosts(&line).is_empty(),
+                    "should accept exact standard identifier: {line}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn normative_identifiers_reject_prefixed_text_and_every_uri_continuation() {
+        for identifier in standard_identifiers() {
+            let expected = standard_host(identifier);
+            for suffix in [
+                "/",
+                "/extra",
+                "?query",
+                "#fragment",
+                "%20",
+                "@reserved.invalid",
+                ":80",
+                ";extra",
+                ")",
+                ",",
+                "*",
+                "extra",
+            ] {
+                let line = format!("\"{identifier}{suffix}\"");
+                assert_eq!(
+                    hosts(&line),
+                    vec![expected.clone()],
+                    "should reject continued standard URI: {line}"
+                );
+            }
+            assert_eq!(
+                hosts(&format!("\"prefixed{identifier}\"")),
+                vec![expected],
+                "should reject identifier embedded in prefixed text"
+            );
+        }
+    }
+
+    #[test]
+    fn normative_identifiers_require_source_opening_prefix_boundaries() {
+        for identifier in standard_identifiers() {
+            let host = standard_host(identifier);
+            for prefix in [
+                ":",
+                "=",
+                "/",
+                ";",
+                ")",
+                "]",
+                "}",
+                "@",
+                "%",
+                "?",
+                "#",
+                "urn:reference:",
+                "query=",
+            ] {
+                assert_eq!(
+                    hosts(&format!("{prefix}{identifier}\"")),
+                    vec![host.clone()],
+                    "should reject nested or continued URI prefixes"
+                );
+            }
+            for prefix in [" ", "\t", "\"", "'", "`", "(", "[", "<", "{"] {
+                assert!(
+                    hosts(&format!("{prefix}{identifier}\"")).is_empty(),
+                    "should accept source-opening prefix boundary"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn normative_identifiers_reject_scheme_authority_and_host_variants() {
+        for identifier in standard_identifiers() {
+            let parsed = Url::parse(identifier).expect("should parse standard URI");
+            let scheme = parsed.scheme();
+            let host = standard_host(identifier);
+            let rest = identifier
+                .strip_prefix(&format!("{scheme}://{host}"))
+                .expect("should provide canonical authority");
+            for authority in [
+                format!("user@{host}"),
+                format!("{host}:80"),
+                format!("subdomain.{host}"),
+                format!("lookalike-{host}"),
+                format!("{host}.unreviewed"),
+                host.replacen('o', "%6f", 1),
+                host.to_uppercase(),
+            ] {
+                let line = format!("\"{scheme}://{authority}{rest}\"");
+                assert!(
+                    !hosts(&line).is_empty(),
+                    "should reject noncanonical standard authority: {line}"
+                );
+            }
+            for line in [
+                format!("\"//{host}{rest}\""),
+                format!("\"{}://{host}{rest}\"", scheme.to_uppercase()),
+                format!(
+                    "\"{}://{host}{rest}\"",
+                    if scheme == "http" { "https" } else { "http" }
+                ),
+            ] {
+                assert_eq!(
+                    hosts(&line),
+                    vec![host.clone()],
+                    "should reject noncanonical scheme or protocol-relative URI: {line}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn normative_identifiers_do_not_hide_same_host_urls_in_either_order() {
+        for identifier in standard_identifiers() {
+            let host = standard_host(identifier);
+            let noncanonical = format!("{identifier}/unregistered");
+            for line in [
+                format!("\"{identifier}\" \"{noncanonical}\""),
+                format!("\"{noncanonical}\" \"{identifier}\""),
+            ] {
+                assert_eq!(
+                    hosts(&line),
+                    vec![host.clone()],
+                    "should retain the noncanonical occurrence before host deduplication"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn normative_identifiers_preserve_other_host_violations() {
+        for identifier in standard_identifiers() {
+            let other = if standard_host(identifier) == "spdx.org" {
+                "https://json-schema.org/unregistered"
+            } else {
+                "http://spdx.org/unregistered"
+            };
+            assert_eq!(
+                hosts(&format!("\"{identifier}\" \"{other}\"")),
+                vec![standard_host(other)],
+                "should retain other disallowed URL beside exact identifier"
+            );
+        }
+    }
+
+    #[test]
+    fn normative_identifiers_leave_host_suppressions_unused() {
+        for identifier in standard_identifiers() {
+            let host = standard_host(identifier);
+            let outcome = scan_line(&format!("\"{identifier}\" // allow-domain: {host}"));
+            assert!(
+                outcome.violations.is_empty(),
+                "should accept exact identifier without suppression"
+            );
+            assert_eq!(
+                outcome.unused_suppressions,
+                vec![host],
+                "should report unused host suppression"
+            );
+        }
+    }
+
+    #[test]
+    fn release_policy_standard_identifiers_pass_without_suppression() {
+        let policy = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/release-policy.json"));
+        for line in policy.lines() {
+            assert!(
+                hosts(line).is_empty(),
+                "should accept reviewed production policy identifiers: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn release_policy_standard_hosts_reject_subdomains_and_lookalikes() {
+        let policy: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/release-policy.json"
+        )))
+        .expect("should parse the production release policy");
+        let predicates = policy["predicates"]
+            .as_object()
+            .expect("should provide fixed predicate identities");
+        for predicate in predicates.values() {
+            let identifier = predicate
+                .as_str()
+                .expect("should provide a string predicate identifier");
+            let authority = identifier
+                .strip_prefix("https://")
+                .expect("should use an HTTPS predicate identifier")
+                .split('/')
+                .next()
+                .expect("should contain the standard host");
+            for host in [
+                format!("subdomain.{authority}"),
+                format!("{authority}.unreviewed"),
+                format!("lookalike-{authority}"),
+            ] {
+                assert_eq!(
+                    hosts(&format!("https://{host}/example")),
+                    vec![host],
+                    "should reject unreviewed standard-host variants"
+                );
+            }
         }
     }
 

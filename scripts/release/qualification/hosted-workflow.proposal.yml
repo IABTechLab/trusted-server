@@ -1,0 +1,49 @@
+# Inert proposal: this file is deliberately outside .github/workflows.
+# Action pins here require manual review/maintenance; Dependabot does not scan this path.
+# Register only in a separately authorized disposable mirror after Task 9 and
+# independently authenticated candidate acquisitions are reviewed.
+name: Disposable release environment qualification
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: disposable-release-qualification
+  cancel-in-progress: false
+jobs:
+  qualification:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            environment: gnu-builder-x86_64
+          - runner: macos-15
+            environment: macos15-aarch64
+          - runner: macos-15-intel
+            environment: macos15-x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0 (Node 24)
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Refuse incomplete shared recipes and staging acquisitions
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/qualification-logs"
+          /bin/sh scripts/release/bootstrap.sh qualify check-ready 2>&1 | tee "$RUNNER_TEMP/qualification-logs/readiness.log"
+      - name: Retain diagnostic logs
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0 (Node 24)
+        with:
+          name: qualification-${{ matrix.environment }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/qualification-logs/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0

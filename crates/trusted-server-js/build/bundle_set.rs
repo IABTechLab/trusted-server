@@ -14,6 +14,14 @@ pub(crate) fn bundle_file_name(id: &str) -> String {
     format!("tsjs-{id}.js")
 }
 
+/// Whether the ID is an ASCII identifier safe in a file and generated Rust.
+pub(crate) fn safe_module_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
 /// Return the module IDs `build-all.mjs` builds from `lib_src`.
 ///
 /// Mirrors the discovery in `build-all.mjs`: `core` plus every
@@ -51,6 +59,17 @@ pub(crate) fn expected_module_ids(lib_src: &Path) -> Result<Vec<String>, String>
     let mut ids = Vec::with_capacity(integrations.len() + 1);
     ids.push(CORE_MODULE_ID.to_owned());
     ids.extend(integrations);
+    if let Some(id) = ids.iter().find(|id| !safe_module_id(id)) {
+        return Err(format!("module ID {id} must be a safe ASCII identifier"));
+    }
+    if ids
+        .iter()
+        .filter(|id| id.as_str() == CORE_MODULE_ID)
+        .count()
+        != 1
+    {
+        return Err("duplicate core module ID".to_owned());
+    }
     Ok(ids)
 }
 
@@ -60,6 +79,19 @@ pub(crate) fn expected_module_ids(lib_src: &Path) -> Result<Vec<String>, String>
 ///
 /// Returns a message when the directory or a bundle's metadata cannot be read.
 pub(crate) fn scan_bundle_dir(dir: &Path) -> Result<Vec<(String, u64)>, String> {
+    scan(dir, true)
+}
+
+/// Scan development prebuilt bundles, ignoring legacy nonbundle output.
+///
+/// # Errors
+///
+/// Returns a message when the directory or a bundle's metadata cannot be read.
+pub(crate) fn scan_legacy_bundle_dir(dir: &Path) -> Result<Vec<(String, u64)>, String> {
+    scan(dir, false)
+}
+
+fn scan(dir: &Path, checked: bool) -> Result<Vec<(String, u64)>, String> {
     let entries = fs::read_dir(dir)
         .map_err(|err| format!("failed to read bundle directory {}: {err}", dir.display()))?;
     let mut found = Vec::new();
@@ -71,12 +103,21 @@ pub(crate) fn scan_bundle_dir(dir: &Path) -> Result<Vec<(String, u64)>, String> 
             .strip_prefix("tsjs-")
             .and_then(|stem| stem.strip_suffix(".js"))
         else {
+            if checked {
+                return Err(format!("unexpected file in bundle directory: {file_name}"));
+            }
             continue;
         };
-        let len = entry
-            .metadata()
-            .map_err(|err| format!("failed to read metadata for {file_name}: {err}"))?
-            .len();
+        let metadata = if checked {
+            fs::symlink_metadata(entry.path())
+        } else {
+            fs::metadata(entry.path())
+        }
+        .map_err(|err| format!("failed to read metadata for {file_name}: {err}"))?;
+        if !safe_module_id(id) || !metadata.is_file() {
+            return Err(format!("unsafe or nonregular bundle: {file_name}"));
+        }
+        let len = metadata.len();
         found.push((id.to_owned(), len));
     }
     Ok(found)
@@ -106,6 +147,10 @@ pub(crate) fn check_bundle_set(expected: &[String], found: &[(String, u64)]) -> 
     unexpected.sort_unstable();
 
     let mut problems = Vec::new();
+    let mut ids = std::collections::BTreeSet::new();
+    if found.iter().any(|(id, _)| !ids.insert(id)) {
+        problems.push("duplicate bundle IDs".to_owned());
+    }
     if !missing.is_empty() {
         problems.push(format!("missing bundles: {missing:?}"));
     }
@@ -136,6 +181,30 @@ mod tests {
             .into_iter()
             .map(str::to_owned)
             .collect()
+    }
+
+    #[test]
+    fn module_identifiers_accept_only_safe_ascii() {
+        for id in ["core", "example_1", "example-2", "UPPER"] {
+            assert!(safe_module_id(id), "should accept safe ID {id}");
+        }
+        for id in ["", "../core", "has space", "quote\"", "é", "a/b", "a\\b"] {
+            assert!(!safe_module_id(id), "should reject unsafe ID {id:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_found_ids_including_core() {
+        for id in ["core", "gpt"] {
+            let mut entries = found(&[("core", 10), ("gpt", 20), ("prebid", 30)]);
+            entries.push((id.to_owned(), 10));
+            let error = check_bundle_set(&expected(), &entries)
+                .expect_err("should reject duplicate found ID");
+            assert!(
+                error.contains("duplicate bundle IDs"),
+                "should explain duplicate: {error}"
+            );
+        }
     }
 
     fn found(entries: &[(&str, u64)]) -> Vec<(String, u64)> {
