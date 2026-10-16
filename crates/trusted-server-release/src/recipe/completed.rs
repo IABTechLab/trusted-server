@@ -44,6 +44,7 @@ pub(super) struct SuccessFacts {
     pub(super) stderr_sha256: String,
     pub(super) artifact: CopiedArtifact,
     pub(super) output_dir: PathBuf,
+    pub(super) normalized_manifest_digests: std::collections::BTreeMap<String, String>,
     pub(super) derived_manifest_digests: std::collections::BTreeMap<String, String>,
 }
 
@@ -119,12 +120,23 @@ impl RecipeCompleted {
         &self.facts.materials_digest
     }
 
-    /// Digests of normalized Git manifests the build consumed, by vendor directory.
+    /// Digests of the Git manifests the producer normalized, by vendor directory.
     ///
-    /// These manifests are derived and unauthenticated: only their original
-    /// was matched with the verified tree. A non-empty set marks the build as
-    /// built from derived inputs, so it is unqualified, and a qualified
-    /// authority must refuse to attest it.
+    /// Each was derived from the verified Git tree alone by the producer's
+    /// reviewed normalization; on their own they do not make the build
+    /// unqualified. They are also covered by the materials digest.
+    pub(crate) fn normalized_manifest_digests(
+        &self,
+    ) -> &std::collections::BTreeMap<String, String> {
+        &self.facts.normalized_manifest_digests
+    }
+
+    /// Digests of caller-derived Git manifests the build consumed, by vendor directory.
+    ///
+    /// Production vendoring accepts no caller-supplied manifest, so this is
+    /// empty there. A non-empty set marks the build as built from derived
+    /// inputs, so it is unqualified, and a qualified authority must refuse
+    /// to attest it.
     pub(crate) fn derived_manifest_digests(&self) -> &std::collections::BTreeMap<String, String> {
         &self.facts.derived_manifest_digests
     }

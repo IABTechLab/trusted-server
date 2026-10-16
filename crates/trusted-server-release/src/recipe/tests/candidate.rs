@@ -27,10 +27,10 @@ const ACQUISITION: &str = "unauthenticated-ordinary-ci";
 const FIXTURE_FIELDS: [&str; 10] = [
     "acquisition",
     "cargo_lock_sha256",
+    "comparison_manifests",
     "git",
     "image_id",
     "kind",
-    "normalized",
     "registry",
     "rustc_version",
     "schema_version",
@@ -54,14 +54,16 @@ pub(super) struct GitObjects {
     pub(super) objects: PathBuf,
 }
 
-/// One normalized Git manifest with the committed original it came from.
+/// The manifest `cargo vendor` wrote for one locked Git package.
+///
+/// It is a differential comparison fixture only: the producer never vendors
+/// it, and it names which locked Git packages to supply closures for.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct NormalizedPair {
+pub(super) struct ComparisonManifest {
     pub(super) name: String,
     pub(super) version: String,
     pub(super) selector: String,
-    pub(super) cargo_toml: PathBuf,
-    pub(super) cargo_toml_orig: PathBuf,
+    pub(super) cargo_vendor_manifest: PathBuf,
 }
 
 /// The parsed, unauthenticated ordinary CI Cargo fixture.
@@ -73,7 +75,7 @@ pub(super) struct CargoFixture {
     pub(super) image_id: String,
     pub(super) registry: BTreeMap<(String, String), PathBuf>,
     pub(super) git: Vec<GitObjects>,
-    pub(super) normalized: Vec<NormalizedPair>,
+    pub(super) comparison_manifests: Vec<ComparisonManifest>,
 }
 
 fn fixture_error(detail: impl std::fmt::Display) -> Report<ReleaseError> {
@@ -126,7 +128,7 @@ impl CargoFixture {
     /// Returns [`ReleaseError::Recipe`] for another schema, kind or
     /// acquisition, a missing or extra field, a malformed commit, digest or
     /// image ID, a path that is absolute or dotted, a repeated registry
-    /// identity, no Git source, or a normalized manifest whose selector names
+    /// identity, no Git source, or a comparison manifest whose selector names
     /// no retained Git source.
     pub(super) fn parse(root: &Path, document: &Value) -> Result<Self, Report<ReleaseError>> {
         let fields: BTreeSet<&str> = document
@@ -168,7 +170,7 @@ impl CargoFixture {
         }
         Ok(Self {
             registry: registry(root, document)?,
-            normalized: normalized(root, document, &git)?,
+            comparison_manifests: comparison_manifests(root, document, &git)?,
             root: root.to_owned(),
             source_commit,
             cargo_lock_sha256,
@@ -212,25 +214,25 @@ fn registry(
     Ok(registry)
 }
 
-/// Parses the normalized manifest pairs; each must name a retained Git source.
-fn normalized(
+/// Parses the `cargo vendor` comparison manifests; each must name a retained
+/// Git source.
+fn comparison_manifests(
     root: &Path,
     document: &Value,
     git: &[GitObjects],
-) -> Result<Vec<NormalizedPair>, Report<ReleaseError>> {
-    entries(document, "normalized")?
+) -> Result<Vec<ComparisonManifest>, Report<ReleaseError>> {
+    entries(document, "comparison_manifests")?
         .iter()
         .map(|entry| {
-            let pair = NormalizedPair {
+            let pair = ComparisonManifest {
                 name: text(entry, "name")?.to_owned(),
                 version: text(entry, "version")?.to_owned(),
                 selector: text(entry, "selector")?.to_owned(),
-                cargo_toml: below(root, entry, "cargo_toml")?,
-                cargo_toml_orig: below(root, entry, "cargo_toml_orig")?,
+                cargo_vendor_manifest: below(root, entry, "cargo_vendor_manifest")?,
             };
             if !git.iter().any(|source| source.selector == pair.selector) {
                 return Err(fixture_error(format!(
-                    "normalized {} names no retained Git source",
+                    "comparison manifest {} names no retained Git source",
                     pair.name
                 )));
             }
@@ -293,6 +295,8 @@ pub(super) fn cargo_measurement(completed: &RecipeCompleted) -> Value {
         "stdout_sha256": completed.stdout_sha256(),
         "stderr_sha256": completed.stderr_sha256(),
         "elapsed_seconds": completed.elapsed().as_secs(),
+        "normalized_manifest_count": completed.normalized_manifest_digests().len(),
+        "normalized_manifest_digests": completed.normalized_manifest_digests(),
         "derived_manifest_digests": completed.derived_manifest_digests().len(),
         "release_qualification": false,
     })
@@ -417,9 +421,9 @@ fn fixture_description_parses_relative_inputs() {
         "should resolve Git objects below the root"
     );
     assert_eq!(
-        parsed.normalized[0].cargo_toml_orig,
-        root.join("normalized/example-git-0.1.0/Cargo.toml.orig"),
-        "should resolve the committed original below the root"
+        parsed.comparison_manifests[0].cargo_vendor_manifest,
+        root.join("cargo-vendor/example-git-0.1.0/Cargo.toml"),
+        "should resolve the comparison manifest below the root"
     );
     assert_eq!(
         parsed.probe(),
@@ -456,8 +460,9 @@ fn fixture_description_rejects_unsafe_or_foreign_inputs() {
                 .expect("should hold registry entries")
                 .push(first);
         }),
-        ("orphan normalized", |value| {
-            value["normalized"][0]["selector"] = json!("git+https://example.com/other?tag=v2");
+        ("orphan comparison manifest", |value| {
+            value["comparison_manifests"][0]["selector"] =
+                json!("git+https://example.com/other?tag=v2");
         }),
     ];
     for (label, edit) in cases {
@@ -574,12 +579,11 @@ fn description() -> Value {
         "git": [
             {"selector": selector, "revision": "c".repeat(40), "objects": "git/0/objects"}
         ],
-        "normalized": [{
+        "comparison_manifests": [{
             "name": "example-git",
             "version": "0.1.0",
             "selector": selector,
-            "cargo_toml": "normalized/example-git-0.1.0/Cargo.toml",
-            "cargo_toml_orig": "normalized/example-git-0.1.0/Cargo.toml.orig",
+            "cargo_vendor_manifest": "cargo-vendor/example-git-0.1.0/Cargo.toml",
         }],
     })
 }

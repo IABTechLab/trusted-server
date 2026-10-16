@@ -42,23 +42,46 @@ pub(super) struct Built {
     role: Role,
 }
 
-pub(super) fn built(asset: &'static str, role: Role, bytes: &[u8]) -> Built {
-    built_with(asset, role, bytes, false)
+/// Which Git manifest digests the fictional materials token records.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum ManifestMarks {
+    /// Only committed manifests: nothing normalized or derived.
+    Committed,
+    /// One producer-normalized manifest.
+    Normalized,
+    /// One caller-derived manifest.
+    Derived,
 }
 
-/// Builds a bound recipe, optionally over materials with a derived manifest.
-pub(super) fn built_with(asset: &'static str, role: Role, bytes: &[u8], derived: bool) -> Built {
+pub(super) fn built(asset: &'static str, role: Role, bytes: &[u8]) -> Built {
+    built_with(asset, role, bytes, ManifestMarks::Committed)
+}
+
+/// Builds a bound recipe over materials carrying the given manifest marks.
+pub(super) fn built_with(
+    asset: &'static str,
+    role: Role,
+    bytes: &[u8],
+    marks: ManifestMarks,
+) -> Built {
     let fixture = Fixture::new(COMMIT);
-    let prepared = if derived {
-        let text = role.spec_label();
-        let request = fixture.request(asset, text, COMMIT);
-        let tools = fixture.tools_for(request.asset.artifact().target);
-        let materials = fixture
-            .materials(COMMIT)
-            .with_derived_for_tests("example-1.0.0", &"d".repeat(64));
-        fixture.bind_parts(request, role, COMMIT, tools, materials)
-    } else {
-        fixture.bind(asset, role)
+    let marked = |materials: PreparedCargoMaterials| match marks {
+        ManifestMarks::Committed => materials,
+        ManifestMarks::Normalized => {
+            materials.with_normalized_for_tests("example-git", &"e".repeat(64))
+        }
+        ManifestMarks::Derived => {
+            materials.with_derived_for_tests("example-1.0.0", &"d".repeat(64))
+        }
+    };
+    let prepared = match marks {
+        ManifestMarks::Committed => fixture.bind(asset, role),
+        ManifestMarks::Normalized | ManifestMarks::Derived => {
+            let request = fixture.request(asset, role.spec_label(), COMMIT);
+            let tools = fixture.tools_for(request.asset.artifact().target);
+            let materials = marked(fixture.materials(COMMIT));
+            fixture.bind_parts(request, role, COMMIT, tools, materials)
+        }
     }
     .expect("should bind the recipe");
     let artifact = AssetId::parse(asset)
@@ -452,27 +475,37 @@ fn execute_stays_closed_for_an_ordinary_ci_selection() {
 }
 
 #[test]
-fn derived_manifest_digests_are_carried_into_the_completion() {
-    let mut plain = built(
-        "ts-aarch64-apple-darwin",
-        Role::Canonical,
-        b"fictional native executable",
-    );
-    let stdout = plain.stdout(|_| {});
-    let completed = plain.finish(stdout).expect("should complete the run");
+fn manifest_digests_are_carried_into_the_completion() {
+    let finish = |marks: ManifestMarks| {
+        let mut built = built_with(
+            "ts-aarch64-apple-darwin",
+            Role::Canonical,
+            b"fictional native executable",
+            marks,
+        );
+        let stdout = built.stdout(|_| {});
+        let completed = built.finish(stdout).expect("should complete the run");
+        (built, completed)
+    };
+    let (_plain, completed) = finish(ManifestMarks::Committed);
     assert!(
-        completed.derived_manifest_digests().is_empty(),
-        "should carry no derived manifest when none was used"
+        completed.derived_manifest_digests().is_empty()
+            && completed.normalized_manifest_digests().is_empty(),
+        "should carry no normalized or derived manifest when none was used"
     );
 
-    let mut derived = built_with(
-        "ts-aarch64-apple-darwin",
-        Role::Canonical,
-        b"fictional native executable",
-        true,
+    let (_normalized, completed) = finish(ManifestMarks::Normalized);
+    assert_eq!(
+        completed.normalized_manifest_digests().get("example-git"),
+        Some(&"e".repeat(64)),
+        "should carry the producer-normalized manifest digest"
     );
-    let stdout = derived.stdout(|_| {});
-    let completed = derived.finish(stdout).expect("should complete the run");
+    assert!(
+        completed.derived_manifest_digests().is_empty(),
+        "should not treat a producer-normalized manifest as derived"
+    );
+
+    let (_derived, completed) = finish(ManifestMarks::Derived);
     assert_eq!(
         completed.derived_manifest_digests().get("example-1.0.0"),
         Some(&"d".repeat(64)),
@@ -484,7 +517,7 @@ fn derived_manifest_digests_are_carried_into_the_completion() {
 fn candidate_measurements_report_no_release_qualification() {
     let asset = "trusted-server-fastly.wasm";
     let kept = wasm_with(&[(".debug_info", b"i"), (".debug_line", b"l")]);
-    let mut built = built_with(asset, Role::Canonical, &kept, true);
+    let mut built = built_with(asset, Role::Canonical, &kept, ManifestMarks::Normalized);
     let stdout = built.stdout(|_| {});
     let completed = built.finish(stdout).expect("should complete the run");
 
@@ -514,8 +547,17 @@ fn candidate_measurements_report_no_release_qualification() {
         "should report the copied artifact size"
     );
     assert_eq!(
-        measurement["derived_manifest_digests"], 1,
-        "should count the derived manifests that keep the build unqualified"
+        measurement["normalized_manifest_count"], 1,
+        "should count the producer-normalized manifests"
+    );
+    assert_eq!(
+        measurement["normalized_manifest_digests"]["example-git"],
+        "e".repeat(64),
+        "should report each producer-normalized manifest digest"
+    );
+    assert_eq!(
+        measurement["derived_manifest_digests"], 0,
+        "should report that no caller-derived manifest was consumed"
     );
     for field in ["rust_tools_digest", "materials_digest", "plan_digest"] {
         assert_eq!(

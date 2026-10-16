@@ -24,9 +24,11 @@ use crate::error::ReleaseError;
 use crate::process::Cancellation;
 use crate::source::ApprovedSource;
 pub(crate) use archive::VerifiedOriginal;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use cargo_vendor::resolution_differences;
 #[allow(unused_imports, reason = "consumed by the Task 9 recipe")]
 pub(crate) use cargo_vendor::{
-    GitSourceConfig, GitVendorInput, NormalizedManifest, PreparedCargoMaterials, VendorInputs,
+    GitSourceConfig, GitVendorInput, PreparedCargoMaterials, VendorInputs,
 };
 pub(crate) use extract::ExtractedOriginal;
 use locked::{CargoMaterials, NpmMaterial, parse_cargo, parse_npm};

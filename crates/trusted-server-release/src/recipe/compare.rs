@@ -101,6 +101,11 @@ fn check_pair(
         reproduction.materials_digest(),
     )?;
     same_input(
+        "producer-normalized Git manifests",
+        canonical.normalized_manifest_digests(),
+        reproduction.normalized_manifest_digests(),
+    )?;
+    same_input(
         "derived Git manifests",
         canonical.derived_manifest_digests(),
         reproduction.derived_manifest_digests(),
@@ -146,11 +151,11 @@ pub(super) fn read_artifact(completed: &RecipeCompleted) -> Result<Vec<u8>, Repo
 ///
 /// Returns [`ReleaseError::Recipe`] when the pair is not the canonical then
 /// the reproduction build of the Fastly asset, the builds used different
-/// source, lock, materials, derived manifests, JS handoff or tools, the
-/// ambient records do not vary
-/// exactly what [`AmbientClaim::standard`] states, an artifact no longer
-/// rehashes, or the final bytes differ; a difference reports both sizes and
-/// digests, the first differing offset, the bytes there and their section.
+/// source, lock, materials, normalized or derived manifests, JS handoff or
+/// tools, the ambient records do not vary exactly what
+/// [`AmbientClaim::standard`] states, an artifact no longer rehashes, or the
+/// final bytes differ; a difference reports both sizes and digests, the first
+/// differing offset, the bytes there and their section.
 pub(crate) fn check_fastly_equality(
     canonical: &RecipeCompleted,
     reproduction: &RecipeCompleted,

@@ -238,8 +238,10 @@ for (const { selector, revision } of gitPackages) {
   git.push({ selector, revision, objects })
 }
 
-// 6. Normalized Git manifests from `cargo vendor`, paired with the committed
-//    original read from the Git object database at the locked revision.
+// 6. Comparison manifests from `cargo vendor`. The producer normalizes every
+//    inheriting Git manifest itself from the verified tree; these are kept
+//    only so the ignored CI test can compare its output with Cargo's for
+//    dependency resolution (evidence, never a vendor input).
 run(
   path.join(tools, 'bin/cargo'),
   ['vendor', '--locked', '--offline', '--versioned-dirs', vendor],
@@ -253,7 +255,7 @@ const metadata = JSON.parse(
   ).toString('utf8')
 )
 const checkouts = path.join(cargoHome, 'git/checkouts') + path.sep
-const normalized = []
+const comparisonManifests = []
 let vendoredOriginals = 0
 for (const record of gitPackages) {
   const described = metadata.packages.filter(
@@ -280,7 +282,7 @@ for (const record of gitPackages) {
   const directory = `${record.name}-${record.version}`
   const vendored = path.join(vendor, directory)
   if (fs.existsSync(path.join(vendored, 'Cargo.toml.orig'))) vendoredOriginals++
-  const output = `normalized/${directory}`
+  const output = `cargo-vendor/${directory}`
   fs.mkdirSync(path.join(destination, output), {
     recursive: true,
     mode: 0o700,
@@ -290,20 +292,11 @@ for (const record of gitPackages) {
     path.join(destination, output, 'Cargo.toml'),
     fs.constants.COPYFILE_EXCL
   )
-  fs.writeFileSync(
-    path.join(destination, output, 'Cargo.toml.orig'),
-    original,
-    {
-      flag: 'wx',
-      mode: 0o600,
-    }
-  )
-  normalized.push({
+  comparisonManifests.push({
     name: record.name,
     version: record.version,
     selector: record.selector,
-    cargo_toml: `${output}/Cargo.toml`,
-    cargo_toml_orig: `${output}/Cargo.toml.orig`,
+    cargo_vendor_manifest: `${output}/Cargo.toml`,
   })
 }
 
@@ -341,13 +334,13 @@ fs.writeFileSync(
     rustc_version: rustcVersion,
     registry,
     git,
-    normalized,
+    comparison_manifests: comparisonManifests,
   }) + '\n',
   { flag: 'wx', mode: 0o600 }
 )
 process.stdout.write(
   `Prepared ${registry.length} registry originals, ${git.length} Git object ` +
-    `stores and ${normalized.length} normalized Git manifests ` +
-    `(cargo vendor wrote Cargo.toml.orig for ${vendoredOriginals}) by ` +
+    `stores and ${comparisonManifests.length} cargo vendor comparison ` +
+    `manifests (cargo vendor wrote Cargo.toml.orig for ${vendoredOriginals}) by ` +
     'unauthenticated ordinary CI acquisition; this is not release qualification\n'
 )

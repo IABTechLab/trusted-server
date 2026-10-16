@@ -4,16 +4,14 @@ use std::os::unix::fs::PermissionsExt as _;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
+use super::super::git_tree::{PackageRoot, Store, ancestor_manifests};
 use super::support::*;
 use crate::materials::locked::GitPackage;
-use crate::materials::{
-    GitVendorInput, LockedMaterials, NormalizedManifest, PreparedCargoMaterials, VendorInputs,
-};
+use crate::materials::{GitVendorInput, LockedMaterials, PreparedCargoMaterials, VendorInputs};
 
-const INHERITING: &str = "[package]\nname = \"example-core\"\nversion.workspace = true\nedition.workspace = true\n\n[dependencies]\nexample-dep = { workspace = true }\n";
-const NORMALIZED: &str =
-    "[package]\nname = \"example-core\"\nversion = \"0.4.0\"\nedition = \"2021\"\n";
+const INHERITING: &str = "[package]\nname = \"example-core\"\nversion.workspace = true\nedition.workspace = true\n\n[dependencies]\nexample-dep = { workspace = true, features = [\"extra\"] }\n";
 const PLAIN: &str = "[package]\nname = \"example-core\"\nversion = \"0.4.0\"\nedition = \"2021\"\n";
+const WORKSPACE_ROOT: &str = "[workspace]\nmembers = [\"crates/core\"]\n\n[workspace.package]\nversion = \"0.4.0\"\nedition = \"2021\"\n\n[workspace.dependencies]\nexample-dep = { version = \"1\", features = [\"base\"] }\n";
 
 /// A fictional workspace: root manifest plus `crates/core` and a nested package.
 struct Workspace {
@@ -22,7 +20,15 @@ struct Workspace {
     manifest_blob: String,
 }
 
-fn workspace(core_manifest: &str, extra_core_entries: &[(&str, &str, &str)]) -> Workspace {
+fn workspace(core_manifest: &str, extra_core_files: &[(&str, &[u8])]) -> Workspace {
+    workspace_with_root(core_manifest, Some(WORKSPACE_ROOT), extra_core_files)
+}
+
+fn workspace_with_root(
+    core_manifest: &str,
+    workspace_manifest: Option<&str>,
+    extra_core_files: &[(&str, &[u8])],
+) -> Workspace {
     let objects = Objects::new();
     let manifest_blob = objects.blob(core_manifest.as_bytes());
     let lib = objects.blob(b"pub fn core() {}\n");
@@ -35,21 +41,30 @@ fn workspace(core_manifest: &str, extra_core_entries: &[(&str, &str, &str)]) -> 
         ("100644", "Cargo.toml", &nested_manifest),
         ("40000", "src", &nested_src),
     ]);
+    let extra_blobs: Vec<(&str, String)> = extra_core_files
+        .iter()
+        .map(|(name, bytes)| (*name, objects.blob(bytes)))
+        .collect();
     let mut entries: Vec<(&str, &str, &str)> = vec![
         ("100644", "Cargo.toml", &manifest_blob),
         ("100755", "run.sh", &script),
         ("40000", "nested", &nested),
         ("40000", "src", &src),
     ];
-    entries.extend_from_slice(extra_core_entries);
+    entries.extend(
+        extra_blobs
+            .iter()
+            .map(|(name, oid)| ("100644", *name, oid.as_str())),
+    );
     entries.sort_by_key(|entry| entry.1);
     let core = objects.tree(&entries);
     let crates = objects.tree(&[("40000", "core", &core)]);
-    let workspace_manifest = objects.blob(b"[workspace]\nmembers = [\"crates/core\"]\n");
-    let root_tree = objects.tree(&[
-        ("40000", "crates", &crates),
-        ("100644", "Cargo.toml", &workspace_manifest),
-    ]);
+    let root_blob = workspace_manifest.map(|text| objects.blob(text.as_bytes()));
+    let mut root_entries = vec![("40000", "crates", crates.as_str())];
+    if let Some(blob) = &root_blob {
+        root_entries.insert(0, ("100644", "Cargo.toml", blob.as_str()));
+    }
+    let root_tree = objects.tree(&root_entries);
     Workspace {
         objects,
         root_tree,
@@ -63,11 +78,7 @@ struct Run {
     outcome: Result<PreparedCargoMaterials, String>,
 }
 
-fn run(
-    locked: &LockedMaterials,
-    material: &crate::materials::git::VerifiedGitMaterial,
-    normalized: Option<NormalizedManifest>,
-) -> Run {
+fn run(locked: &LockedMaterials, material: &crate::materials::git::VerifiedGitMaterial) -> Run {
     let output = temporary();
     let root = output.path().to_owned();
     let package = &locked.cargo.git_packages[0];
@@ -75,7 +86,6 @@ fn run(
         material,
         name: &package.name,
         version: &package.version,
-        normalized,
     }];
     let outcome = locked
         .prepare_cargo_vendor(
@@ -99,13 +109,6 @@ fn locked_core() -> LockedMaterials {
     locked(&[], vec![git_package("example-core", "0.4.0")])
 }
 
-fn normalized(cargo_toml: &str, orig: &str) -> Option<NormalizedManifest> {
-    Some(NormalizedManifest {
-        cargo_toml: cargo_toml.as_bytes().to_vec(),
-        cargo_toml_orig: orig.as_bytes().to_vec(),
-    })
-}
-
 fn rejection(run: Run) -> String {
     run.outcome.expect_err("should reject the Git package")
 }
@@ -114,7 +117,7 @@ fn rejection(run: Run) -> String {
 fn plain_manifest_package_is_vendored_without_derivation() {
     let built = workspace(PLAIN, &[]);
     let material = built.objects.material(SELECTOR, REVISION, &built.root_tree);
-    let result = run(&locked_core(), &material, None);
+    let result = run(&locked_core(), &material);
     let materials = result.outcome.expect("should vendor the plain package");
     let package = result.root.join("vendor/example-core");
     assert_eq!(
@@ -161,8 +164,9 @@ fn plain_manifest_package_is_vendored_without_derivation() {
         "should list files and a null package checksum like cargo vendor"
     );
     assert!(
-        materials.derived_manifest_digests().is_empty(),
-        "should record no derived manifest"
+        materials.normalized_manifest_digests().is_empty()
+            && materials.derived_manifest_digests().is_empty(),
+        "should record no normalized or derived manifest"
     );
     assert_eq!(
         materials.git_sources().len(),
@@ -178,37 +182,40 @@ fn plain_manifest_package_is_vendored_without_derivation() {
 }
 
 #[test]
-fn workspace_inheritance_requires_a_matching_normalized_manifest() {
+fn workspace_inheritance_is_normalized_by_the_producer_from_the_verified_tree() {
     let built = workspace(INHERITING, &[]);
     let material = built.objects.material(SELECTOR, REVISION, &built.root_tree);
-    let missing = rejection(run(&locked_core(), &material, None));
-    assert!(
-        missing.contains("normalized manifest is required"),
-        "should require normalization: {missing}"
-    );
-
-    let accepted = run(
-        &locked_core(),
-        &material,
-        normalized(NORMALIZED, INHERITING),
-    );
-    let materials = accepted.outcome.expect("should accept the normalized pair");
+    let accepted = run(&locked_core(), &material);
+    let materials = accepted
+        .outcome
+        .expect("should normalize the inheriting manifest itself");
     let package = accepted.root.join("vendor/example-core");
+    let written = fs::read(package.join("Cargo.toml")).expect("should read manifest");
+    let parsed: toml::Table =
+        toml::from_str(std::str::from_utf8(&written).expect("should write a UTF-8 manifest"))
+            .expect("should write TOML");
+    let expected: toml::Table = toml::from_str(
+        "[package]\nname = \"example-core\"\nversion = \"0.4.0\"\nedition = \"2021\"\n\n[dependencies.example-dep]\nversion = \"1\"\nfeatures = [\"base\", \"extra\"]\n",
+    )
+    .expect("should parse the expected manifest");
     assert_eq!(
-        fs::read(package.join("Cargo.toml")).expect("should read manifest"),
-        NORMALIZED.as_bytes(),
-        "should vendor the normalized manifest"
+        parsed, expected,
+        "should resolve inherited fields and dependencies from the workspace root"
     );
     assert_eq!(
         fs::read(package.join("Cargo.toml.orig")).expect("should read original"),
         INHERITING.as_bytes(),
         "should keep the committed manifest as the original"
     );
-    let digest = hex::encode(Sha256::digest(NORMALIZED.as_bytes()));
+    let digest = hex::encode(Sha256::digest(&written));
     assert_eq!(
-        materials.derived_manifest_digests().get("example-core"),
+        materials.normalized_manifest_digests().get("example-core"),
         Some(&digest),
-        "should record the normalized manifest digest as derived"
+        "should record the producer-normalized manifest digest"
+    );
+    assert!(
+        materials.derived_manifest_digests().is_empty(),
+        "should record no caller-derived manifest"
     );
     let checksum: Value = serde_json::from_slice(
         &fs::read(package.join(".cargo-checksum.json")).expect("should read checksums"),
@@ -224,47 +231,58 @@ fn workspace_inheritance_requires_a_matching_normalized_manifest() {
         json!(hex::encode(Sha256::digest(INHERITING.as_bytes()))),
         "should checksum the original"
     );
+
+    let again = run(&locked_core(), &material);
+    again.outcome.expect("should normalize again");
+    assert_eq!(
+        fs::read(again.root.join("vendor/example-core/Cargo.toml"))
+            .expect("should read the second manifest"),
+        written,
+        "should normalize to identical bytes every time"
+    );
 }
 
 #[test]
-fn normalized_manifest_must_derive_from_the_verified_blob_and_resolve_inheritance() {
-    let built = workspace(INHERITING, &[]);
-    let material = built.objects.material(SELECTOR, REVISION, &built.root_tree);
-    let cases: [(&str, Option<NormalizedManifest>, &str); 5] = [
+fn unresolvable_workspace_inheritance_fails_closed() {
+    let cases: [(&str, Workspace, &str, &str); 4] = [
         (
-            "forged original",
-            normalized(NORMALIZED, "[package]\nname = \"example-core\"\n"),
-            "differs from the verified tree",
+            "no workspace root in the tree",
+            workspace_with_root(INHERITING, None, &[]),
+            "0.4.0",
+            "no workspace root encloses it",
         ),
         (
-            "other name",
-            normalized(
-                &NORMALIZED.replace("example-core", "example-other"),
+            "root without the inherited dependency",
+            workspace_with_root(
                 INHERITING,
+                Some(
+                    "[workspace]\n\n[workspace.package]\nversion = \"0.4.0\"\nedition = \"2021\"\n",
+                ),
+                &[],
             ),
-            "does not declare package",
+            "0.4.0",
+            "which is not defined",
         ),
         (
-            "other version",
-            normalized(&NORMALIZED.replace("0.4.0", "0.4.1"), INHERITING),
-            "does not declare package",
+            "inherited version other than the lock",
+            workspace(INHERITING, &[]),
+            "0.5.0",
+            "does not declare package example-core 0.5.0",
         ),
         (
-            "still inheriting",
-            normalized(INHERITING, INHERITING),
-            "does not declare package",
-        ),
-        (
-            "inherited dependency",
-            normalized(
-                &format!("{NORMALIZED}[dependencies]\nexample-dep = {{ workspace = true }}\n"),
-                INHERITING,
+            "member patch section",
+            workspace(
+                &format!("{INHERITING}\n[patch.crates-io]\nexample-dep = {{ path = \"x\" }}\n"),
+                &[],
             ),
-            "still inherits",
+            "0.4.0",
+            "declares [patch]",
         ),
     ];
-    for (label, pair, expected) in cases {
-        let message = rejection(run(&locked_core(), &material, pair));
+    for (label, built, version, expected) in cases {
+        let material = built.objects.material(SELECTOR, REVISION, &built.root_tree);
+        let locked = locked(&[], vec![git_package("example-core", version)]);
+        let message = rejection(run(&locked, &material));
         assert!(
             message.contains(expected),
             "should reject {label}: {message}"
@@ -278,12 +296,12 @@ fn package_identity_and_root_must_be_unambiguous() {
     let material = built.objects.material(SELECTOR, REVISION, &built.root_tree);
     let other_version = locked(&[], vec![git_package("example-core", "0.5.0")]);
     assert!(
-        rejection(run(&other_version, &material, None)).contains("declares example-core 0.4.0"),
+        rejection(run(&other_version, &material)).contains("declares example-core 0.4.0"),
         "should reject a manifest whose version differs from the lock"
     );
     let unknown = locked(&[], vec![git_package("example-missing", "0.4.0")]);
     assert!(
-        rejection(run(&unknown, &material, None)).contains("no Git directory declares"),
+        rejection(run(&unknown, &material)).contains("no Git directory declares"),
         "should reject a package no directory declares"
     );
 
@@ -294,29 +312,19 @@ fn package_identity_and_root_must_be_unambiguous() {
     let root = objects.tree(&[("40000", "a", &first), ("40000", "b", &second)]);
     let material = objects.material(SELECTOR, REVISION, &root);
     assert!(
-        rejection(run(&locked_core(), &material, None)).contains("ambiguous Git package roots"),
+        rejection(run(&locked_core(), &material)).contains("ambiguous Git package roots"),
         "should reject two directories declaring the package"
     );
 }
 
 #[test]
 fn tree_entries_that_would_alias_the_manifest_or_escape_are_rejected() {
-    let objects = Objects::new();
-    let blob = objects.blob(PLAIN.as_bytes());
-    let orig = objects.blob(b"committed orig\n");
-    let tree = objects.tree(&[
-        ("100644", "Cargo.toml", &blob),
-        ("100644", "Cargo.toml.orig", &orig),
-    ]);
-    let material = objects.material(SELECTOR, REVISION, &tree);
-    let conflict = rejection(run(
-        &locked_core(),
-        &material,
-        normalized(NORMALIZED, PLAIN),
-    ));
+    let built = workspace(INHERITING, &[("Cargo.toml.orig", b"committed orig\n")]);
+    let material = built.objects.material(SELECTOR, REVISION, &built.root_tree);
+    let conflict = rejection(run(&locked_core(), &material));
     assert!(
         conflict.contains("repeated"),
-        "should reject a committed Cargo.toml.orig beside a normalized pair: {conflict}"
+        "should reject a committed Cargo.toml.orig beside a normalized manifest: {conflict}"
     );
 
     for (label, mode, name) in [
@@ -333,7 +341,7 @@ fn tree_entries_that_would_alias_the_manifest_or_escape_are_rejected() {
         let tree = objects.tree(&[("100644", "Cargo.toml", &manifest), (mode, name, &extra)]);
         let material = objects.material(SELECTOR, REVISION, &tree);
         assert!(
-            run(&locked_core(), &material, None).outcome.is_err(),
+            run(&locked_core(), &material).outcome.is_err(),
             "should reject a {label} entry"
         );
     }
@@ -369,7 +377,7 @@ fn git_inputs_must_be_exactly_the_locked_bound_closures() {
     for (label, package) in cases {
         let locked = locked(&[], vec![package]);
         assert!(
-            rejection(run(&locked, &material, None)).contains("not bound to its locked source"),
+            rejection(run(&locked, &material)).contains("not bound to its locked source"),
             "should reject a closure with another {label}"
         );
     }
@@ -398,13 +406,11 @@ fn git_inputs_must_be_exactly_the_locked_bound_closures() {
             material: &material,
             name: "example-core",
             version: "0.4.0",
-            normalized: None,
         },
         GitVendorInput {
             material: &material,
             name: "example-core",
             version: "0.4.0",
-            normalized: None,
         },
     ];
     assert!(
@@ -439,7 +445,7 @@ fn store_objects_are_rehashed_before_use() {
         .join(&forged[2..]);
     fs::copy(&other, &object).expect("should swap the committed manifest object for forged bytes");
     let material = built.objects.material(SELECTOR, REVISION, &built.root_tree);
-    let message = rejection(run(&locked_core(), &material, None));
+    let message = rejection(run(&locked_core(), &material));
     assert!(
         message.contains("do not match their identity"),
         "should reject an edited store object: {message}"
@@ -456,7 +462,7 @@ fn store_objects_are_rehashed_before_use() {
     assert!(lib > 3, "should have written several objects");
     let missing_root = built.objects.material(SELECTOR, REVISION, &"5".repeat(40));
     assert!(
-        rejection(run(&locked_core(), &missing_root, None)).contains("cannot be opened"),
+        rejection(run(&locked_core(), &missing_root)).contains("cannot be opened"),
         "should reject a root tree absent from the store"
     );
 }
@@ -465,7 +471,7 @@ fn store_objects_are_rehashed_before_use() {
 fn git_package_directory_is_its_bare_name_and_never_shared() {
     let built = workspace(PLAIN, &[]);
     let material = built.objects.material(SELECTOR, REVISION, &built.root_tree);
-    let accepted = run(&locked_core(), &material, None);
+    let accepted = run(&locked_core(), &material);
     accepted.outcome.expect("should vendor the Git package");
     assert!(
         accepted
@@ -491,7 +497,6 @@ fn git_package_directory_is_its_bare_name_and_never_shared() {
         material: &material,
         name: "example-core",
         version: "0.4.0",
-        normalized: None,
     }];
     let error = locked
         .prepare_cargo_vendor(
@@ -512,21 +517,28 @@ fn git_package_directory_is_its_bare_name_and_never_shared() {
 
 #[test]
 fn git_packages_sharing_a_name_fail_closed() {
-    let built = workspace(INHERITING, &[]);
-    let material = built.objects.material(SELECTOR, REVISION, &built.root_tree);
+    let versions = ["0.4.0", "0.5.0"];
+    let materials = versions.map(|version| {
+        let root = WORKSPACE_ROOT.replace("0.4.0", version);
+        let built = workspace_with_root(INHERITING, Some(&root), &[]);
+        built.objects.material(SELECTOR, REVISION, &built.root_tree)
+    });
     let locked = locked(
         &[],
-        vec![
-            git_package("example-core", "0.4.0"),
-            git_package("example-core", "0.5.0"),
-        ],
+        versions
+            .iter()
+            .map(|version| git_package("example-core", version))
+            .collect(),
     );
-    let inputs = ["0.4.0", "0.5.0"].map(|version| GitVendorInput {
-        material: &material,
-        name: "example-core",
-        version,
-        normalized: normalized(&NORMALIZED.replace("0.4.0", version), INHERITING),
-    });
+    let inputs: Vec<GitVendorInput<'_>> = versions
+        .iter()
+        .zip(&materials)
+        .map(|(version, material)| GitVendorInput {
+            material,
+            name: "example-core",
+            version,
+        })
+        .collect();
     let output = temporary();
     let error = locked
         .prepare_cargo_vendor(
@@ -542,5 +554,76 @@ fn git_packages_sharing_a_name_fail_closed() {
     assert!(
         format!("{error:?}").contains("cannot be created exclusively"),
         "should fail closed on the shared directory: {error:?}"
+    );
+}
+
+#[test]
+fn ancestor_walk_reads_every_manifest_above_the_package_nearest_first() {
+    let objects = Objects::new();
+    let core_manifest = objects.blob(INHERITING.as_bytes());
+    let core = objects.tree(&[("100644", "Cargo.toml", &core_manifest)]);
+    let umbrella = b"[package]\nname = \"example-umbrella\"\nversion = \"9.9.9\"\n";
+    let umbrella_manifest = objects.blob(umbrella);
+    let crates = objects.tree(&[
+        ("100644", "Cargo.toml", &umbrella_manifest),
+        ("40000", "core", &core),
+    ]);
+    let root_manifest = objects.blob(WORKSPACE_ROOT.as_bytes());
+    let root_tree = objects.tree(&[
+        ("100644", "Cargo.toml", &root_manifest),
+        ("40000", "crates", &crates),
+    ]);
+    let store = Store::new(objects.store.path());
+    let package = PackageRoot {
+        tree: core.clone(),
+        manifest: core_manifest.clone(),
+        path: "crates/core".to_owned(),
+    };
+    let found = ancestor_manifests(&store, &root_tree, &package)
+        .expect("should walk the verified package path");
+    let seen: Vec<(&str, &[u8])> = found
+        .iter()
+        .map(|ancestor| (ancestor.directory.as_str(), ancestor.bytes.as_slice()))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("crates", umbrella.as_slice()),
+            ("", WORKSPACE_ROOT.as_bytes()),
+        ],
+        "should list the intermediate package manifest before the workspace root"
+    );
+
+    let elsewhere = PackageRoot {
+        tree: crates.clone(),
+        ..package.clone()
+    };
+    let wrong_tree = ancestor_manifests(&store, &root_tree, &elsewhere)
+        .expect_err("should refuse a path that leads to another tree");
+    assert!(
+        format!("{wrong_tree:?}").contains("does not lead to the package tree"),
+        "should report the mismatched package tree: {wrong_tree:?}"
+    );
+    let absent = PackageRoot {
+        path: "crates/absent".to_owned(),
+        ..package
+    };
+    let missing = ancestor_manifests(&store, &root_tree, &absent)
+        .expect_err("should refuse a path absent from the tree");
+    assert!(
+        format!("{missing:?}").contains("is not a tree in the verified closure"),
+        "should report the missing directory: {missing:?}"
+    );
+}
+
+#[test]
+fn git_targets_that_leave_the_package_are_refused() {
+    let escaping = format!("{PLAIN}build = \"../shared/build.rs\"\n");
+    let built = workspace(&escaping, &[]);
+    let material = built.objects.material(SELECTOR, REVISION, &built.root_tree);
+    let message = rejection(run(&locked_core(), &material));
+    assert!(
+        message.contains("leaves the vendored package directory"),
+        "should refuse a build script outside the package: {message}"
     );
 }

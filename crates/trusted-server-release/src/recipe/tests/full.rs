@@ -25,7 +25,7 @@ use super::candidate::{
 use super::*;
 use crate::boundary::{Boundary, DenialProof, ImageSelection, ProbeProgram};
 use crate::documents::{parse_json, read_bounded};
-use crate::materials::{GitVendorInput, LockedMaterials, NormalizedManifest, VendorInputs};
+use crate::materials::{GitVendorInput, LockedMaterials, VendorInputs, resolution_differences};
 use crate::preflight::child::build_child_for_tests;
 use crate::preflight::{AuditedEnvironment, audit_environment};
 use crate::preparation::tests::full::{JsFixtureRun, run_two_fresh_js_builds};
@@ -274,6 +274,10 @@ fn cargo_children_inherit_denial() {
 }
 
 /// Prepares the vendor tree from the fixture's retained originals.
+///
+/// The fixture's `cargo vendor` manifests only name which locked Git packages
+/// to supply closures for; the producer normalizes every inheriting manifest
+/// itself from the verified tree.
 fn prepare_vendor(
     fixture: &CargoFixture,
     locked: &LockedMaterials,
@@ -293,30 +297,19 @@ fn prepare_vendor(
                 .expect("should verify the retained locked Git closure")
         })
         .collect();
-    let manifests: Vec<_> = fixture
-        .normalized
-        .iter()
-        .map(|pair| NormalizedManifest {
-            cargo_toml: fs::read(&pair.cargo_toml).expect("should read the normalized manifest"),
-            cargo_toml_orig: fs::read(&pair.cargo_toml_orig)
-                .expect("should read the committed manifest"),
-        })
-        .collect();
     let inputs: Vec<GitVendorInput<'_>> = fixture
-        .normalized
+        .comparison_manifests
         .iter()
-        .zip(&manifests)
-        .map(|(pair, manifest)| {
+        .map(|package| {
             let index = fixture
                 .git
                 .iter()
-                .position(|source| source.selector == pair.selector)
+                .position(|source| source.selector == package.selector)
                 .expect("should name a retained Git source");
             GitVendorInput {
                 material: &verified[index],
-                name: &pair.name,
-                version: &pair.version,
-                normalized: Some(manifest.clone()),
+                name: &package.name,
+                version: &package.version,
             }
         })
         .collect();
@@ -333,6 +326,59 @@ fn prepare_vendor(
         .expect("should vendor every locked original")
 }
 
+/// Compares every producer-normalized manifest with the one `cargo vendor`
+/// wrote, before anything is built, and requires equal resolution facts.
+///
+/// This is ordinary CI differential evidence, not authority: the comparison
+/// manifests are unauthenticated and never reach the vendor tree.
+fn normalized_manifest_differential(
+    fixture: &CargoFixture,
+    materials: &PreparedCargoMaterials,
+) -> serde_json::Value {
+    let mut packages = serde_json::Map::new();
+    let mut differing = 0_usize;
+    for package in &fixture.comparison_manifests {
+        let directory = materials.vendor_dir().join(&package.name);
+        let producer =
+            fs::read(directory.join("Cargo.toml")).expect("should read the producer manifest");
+        let cargo_vendor = fs::read(&package.cargo_vendor_manifest)
+            .expect("should read the cargo vendor comparison manifest");
+        let build_rs_present = directory.join("build.rs").is_file();
+        let differences = resolution_differences(&producer, &cargo_vendor, build_rs_present)
+            .expect("should compare the producer and cargo vendor manifests");
+        differing += usize::from(!differences.is_empty());
+        packages.insert(
+            package.name.clone(),
+            serde_json::json!({
+                "producer_normalized": materials
+                    .normalized_manifest_digests()
+                    .contains_key(&package.name),
+                "differences": differences,
+            }),
+        );
+    }
+    let measurement = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "kind": "ordinary-ci-normalized-manifest-differential",
+        "compared": packages.len(),
+        "normalized_manifest_count": materials.normalized_manifest_digests().len(),
+        "derived_manifest_digests": materials.derived_manifest_digests().len(),
+        "differing": differing,
+        "packages": packages,
+        "authority": "evidence-only",
+        "release_qualification": false,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&measurement).expect("should encode the differential")
+    );
+    assert_eq!(
+        differing, 0,
+        "should resolve every Git manifest as cargo vendor does: {measurement}"
+    );
+    measurement
+}
+
 /// One confined Fastly build with the private roots its output lives in.
 struct FastlyBuild {
     _materials: tempfile::TempDir,
@@ -342,6 +388,8 @@ struct FastlyBuild {
     host_roots: Vec<String>,
     /// The checkout root as the confined build saw it.
     execution_checkout: String,
+    /// The producer-normalized versus `cargo vendor` manifest comparison.
+    differential: serde_json::Value,
 }
 
 fn path_text(path: &Path) -> String {
@@ -374,6 +422,7 @@ fn build_fastly(
         fixture.cargo_lock_sha256,
         "should vendor from the fixture's Cargo.lock"
     );
+    let differential = normalized_manifest_differential(fixture, &materials);
     let work = tempfile::tempdir().expect("should create the build roots");
     let base = fs::canonicalize(work.path()).expect("should resolve the build roots");
     for directory in ["cargo-state", "output"] {
@@ -436,8 +485,9 @@ fn build_fastly(
         .rehash_for_handoff()
         .expect("should rehash the artifact before reporting it");
     assert!(
-        !completed.derived_manifest_digests().is_empty(),
-        "should mark the build as consuming derived Git manifests"
+        completed.derived_manifest_digests().is_empty()
+            && !completed.normalized_manifest_digests().is_empty(),
+        "should build from producer-normalized Git manifests and no caller-derived one"
     );
     println!(
         "{}",
@@ -452,6 +502,7 @@ fn build_fastly(
         completed,
         host_roots,
         execution_checkout,
+        differential,
     }
 }
 
@@ -509,6 +560,17 @@ fn fastly_canonical_and_reproduction_builds_are_byte_identical() {
         measurement["builds"][role]["ambient"]["execution_checkout_root"] =
             serde_json::json!(build.execution_checkout);
     }
+    let differential = serde_json::json!({
+        "canonical": canonical.differential,
+        "reproduction": reproduction.differential,
+    });
+    fs::write(
+        fixture
+            .root
+            .join("normalized-manifest-differential-measurement.json"),
+        serde_json::to_string_pretty(&differential).expect("should encode the differential"),
+    )
+    .expect("should retain the normalized manifest differential");
     measurement["remap_scan"] = serde_json::json!({
         "forbidden": ["/boundary/", "host build roots", "fixture root", "RUNNER_TEMP"],
         "found": scan.found(),

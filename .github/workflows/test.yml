@@ -486,7 +486,9 @@ jobs:
           cargo test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --nocapture
           cat "$TS_RELEASE_CARGO_FIXTURE_ROOT/cargo-denial-measurement.json"
 
-      # The canonical and reproduction builds use the same JS handoff in
+      # Before each build, the producer-normalized Git manifests are compared
+      # with cargo vendor's for dependency resolution (evidence only). The
+      # canonical and reproduction builds use the same JS handoff in
       # separate fresh roots and boundaries; the final Fastly files must be
       # byte-identical. Both outputs then pass the final-byte Viceroy runtime
       # gate, and a closed-origin run must be rejected despite a healthy probe.
@@ -500,6 +502,7 @@ jobs:
           cargo test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --list > "$TEST_LIST"
           awk '/: test$/ { count++ } END { if (count != 1) { print "Expected exactly one Fastly canonical/reproduction equality fixture"; exit 1 } }' "$TEST_LIST"
           cargo test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --nocapture
+          cat "$TS_RELEASE_CARGO_FIXTURE_ROOT/normalized-manifest-differential-measurement.json"
           cat "$TS_RELEASE_CARGO_FIXTURE_ROOT/cargo-canonical-reproduction-equality-measurement.json"
           cat "$TS_RELEASE_CARGO_FIXTURE_ROOT/fastly-runtime-gate-measurement.json"
 

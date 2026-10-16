@@ -15,6 +15,7 @@ use std::path::Path;
 use error_stack::Report;
 use flate2::read::ZlibDecoder;
 
+use super::normalize::AncestorManifest;
 use super::writer::PackageWriter;
 use crate::error::ReleaseError;
 use crate::git_objects::checked_sha1;
@@ -260,6 +261,65 @@ pub(super) fn find_package(
             "ambiguous Git package roots: several directories declare package {name}"
         ))),
     }
+}
+
+/// Reads every `Cargo.toml` in the directories above `root`, nearest first.
+///
+/// The walk descends from the repository root along the package path within
+/// the same verified tree, so a workspace root can only come from that tree.
+/// The package directory's own manifest is not included.
+///
+/// # Errors
+///
+/// Returns [`ReleaseError::Material`] when a directory on the package path
+/// is missing or not a tree, or an object cannot be read.
+pub(super) fn ancestor_manifests(
+    store: &Store<'_>,
+    root_tree: &str,
+    root: &PackageRoot,
+) -> Result<Vec<AncestorManifest>, Report<ReleaseError>> {
+    let mut found = Vec::new();
+    let mut tree = root_tree.to_owned();
+    let mut directory = String::new();
+    let parts: Vec<&str> = root
+        .path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.len() >= DEPTH_LIMIT {
+        return Err(material_error("Git package tree exceeds the depth limit"));
+    }
+    for part in parts {
+        let entries = store.tree(&tree)?;
+        if let Some(manifest) = entries
+            .iter()
+            .find(|entry| !entry.directory && entry.name == "Cargo.toml")
+        {
+            found.push(AncestorManifest {
+                directory: directory.clone(),
+                bytes: store.read("blob", &manifest.oid, MANIFEST_LIMIT)?,
+            });
+        }
+        tree = entries
+            .into_iter()
+            .find(|entry| entry.directory && entry.name == part)
+            .map(|entry| entry.oid)
+            .ok_or_else(|| {
+                material_error("Git package path is not a tree in the verified closure")
+            })?;
+        directory = if directory.is_empty() {
+            part.to_owned()
+        } else {
+            format!("{directory}/{part}")
+        };
+    }
+    if tree != root.tree {
+        return Err(material_error(
+            "Git package path does not lead to the package tree",
+        ));
+    }
+    found.reverse();
+    Ok(found)
 }
 
 /// Writes the package tree below `root.tree` through `writer`.

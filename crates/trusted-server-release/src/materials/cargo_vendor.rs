@@ -12,13 +12,18 @@
 //!
 //! A Git package whose manifest inherits from its workspace
 //! (`version.workspace = true`) cannot be used from a directory source as it
-//! is. The caller may supply a normalized `Cargo.toml` together with the
-//! `Cargo.toml.orig` it was derived from; the pair is accepted only when the
-//! original equals the manifest blob of the verified tree. The normalization
-//! itself is not authenticated, so its digest is recorded as derived and
-//! unqualified in [`PreparedCargoMaterials::derived_manifest_digests`].
+//! is. The producer resolves that inheritance itself (see [`normalize`]) from
+//! the package manifest and the enclosing workspace root manifest of the same
+//! verified tree, writes the result as `Cargo.toml` and keeps the committed
+//! manifest as `Cargo.toml.orig`. No caller-supplied manifest is accepted.
+//! The normalization is a reviewed producer transformation: its digests are
+//! recorded in [`PreparedCargoMaterials::normalized_manifest_digests`] and do
+//! not by themselves make a build unqualified.
 
+#[cfg(test)]
+mod differential;
 mod git_tree;
+mod normalize;
 mod source;
 mod writer;
 
@@ -36,7 +41,10 @@ use super::{LockedMaterials, material_error};
 use crate::error::ReleaseError;
 use crate::process::Cancellation;
 use crate::tool_tree::tool_tree_digest;
-use git_tree::{Store, find_package, materialize};
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use differential::resolution_differences;
+use git_tree::{Store, ancestor_manifests, find_package, materialize};
+use normalize::{PackageManifest, check_target_paths, normalize_manifest};
 pub(crate) use source::GitSourceConfig;
 use writer::PackageWriter;
 
@@ -49,16 +57,10 @@ const FILE_LIMIT: u64 = 128 * 1024 * 1024;
 /// Most files copied from one extracted crate.
 const FILE_COUNT_LIMIT: usize = 100_000;
 
-/// A normalized Git manifest and the original it claims to normalize.
-#[derive(Clone, Debug)]
-pub(crate) struct NormalizedManifest {
-    /// The manifest Cargo will read, with workspace inheritance resolved.
-    pub(crate) cargo_toml: Vec<u8>,
-    /// The manifest as committed; it must equal the verified tree blob.
-    pub(crate) cargo_toml_orig: Vec<u8>,
-}
-
 /// A verified Git closure for one locked Git package.
+///
+/// It carries no manifest: every vendored manifest comes from the verified
+/// tree, normalized by the producer when it inherits from its workspace.
 pub(crate) struct GitVendorInput<'a> {
     /// The verified closure for the package's locked source and revision.
     pub(crate) material: &'a VerifiedGitMaterial,
@@ -66,8 +68,6 @@ pub(crate) struct GitVendorInput<'a> {
     pub(crate) name: &'a str,
     /// Locked package version.
     pub(crate) version: &'a str,
-    /// Optional normalized manifest pair.
-    pub(crate) normalized: Option<NormalizedManifest>,
 }
 
 /// Every original the vendor tree is prepared from.
@@ -89,6 +89,7 @@ pub(crate) struct PreparedCargoMaterials {
     source_commit: String,
     cargo_lock_sha256: String,
     git_sources: Vec<GitSourceConfig>,
+    normalized_manifests: BTreeMap<String, String>,
     derived_manifests: BTreeMap<String, String>,
 }
 
@@ -123,10 +124,20 @@ impl PreparedCargoMaterials {
         &self.git_sources
     }
 
-    /// Manifest digests derived from a caller-supplied normalization.
+    /// Digests of the manifests the producer normalized, by vendor directory.
     ///
-    /// Keyed by vendor directory name. These are derived and unqualified:
-    /// only the accompanying original was matched with the verified tree.
+    /// Each was derived by [`normalize`] from the verified tree alone, a
+    /// reviewed transformation; it does not make the build unqualified.
+    pub(crate) fn normalized_manifest_digests(&self) -> &BTreeMap<String, String> {
+        &self.normalized_manifests
+    }
+
+    /// Digests of caller-derived manifests, by vendor directory.
+    ///
+    /// [`LockedMaterials::prepare_cargo_vendor`] accepts no caller-supplied
+    /// manifest, so it always leaves this empty. It stays part of the token
+    /// so any caller-derived manifest, such as one a test constructs, still
+    /// marks the build unqualified.
     pub(crate) fn derived_manifest_digests(&self) -> &BTreeMap<String, String> {
         &self.derived_manifests
     }
@@ -165,6 +176,15 @@ impl PreparedCargoMaterials {
         self
     }
 
+    /// Records a producer-normalized manifest digest on a test token.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_normalized_for_tests(mut self, directory: &str, digest: &str) -> Self {
+        self.normalized_manifests
+            .insert(directory.to_owned(), digest.to_owned());
+        self
+    }
+
     /// Builds a token over an existing `root/vendor`, for tests only.
     ///
     /// # Errors
@@ -193,6 +213,7 @@ impl PreparedCargoMaterials {
                 .iter()
                 .map(|selector| GitSourceConfig::parse(selector))
                 .collect::<Result<_, _>>()?,
+            normalized_manifests: BTreeMap::new(),
             derived_manifests: BTreeMap::new(),
         })
     }
@@ -399,8 +420,8 @@ impl LockedMaterials {
     ///
     /// Returns [`ReleaseError::Material`] for a non-fresh root, a missing,
     /// extra or unverifiable original, a manifest that does not declare the
-    /// locked identity, an ambiguous or missing Git package root, a
-    /// normalized manifest whose original differs from the tree, a repeated
+    /// locked identity, an ambiguous or missing Git package root, a Git
+    /// manifest whose workspace inheritance cannot be normalized, a repeated
     /// vendor directory, or an expired or cancelled attempt.
     pub(crate) fn prepare_cargo_vendor(
         &self,
@@ -430,12 +451,12 @@ impl LockedMaterials {
             attempt_check(deadline, cancellation)?;
             self.vendor_registry(name, version, path, &vendor, deadline, cancellation)?;
         }
-        let mut derived = BTreeMap::new();
+        let mut normalized = BTreeMap::new();
         for package in &self.cargo.git_packages {
             attempt_check(deadline, cancellation)?;
             let input = self.matching_git_input(package, inputs)?;
             if let Some(digest) = vendor_git(package, input, &vendor)? {
-                derived.insert(git_directory_name(&package.name)?, digest);
+                normalized.insert(git_directory_name(&package.name)?, digest);
             }
         }
         attempt_check(deadline, cancellation)?;
@@ -446,7 +467,8 @@ impl LockedMaterials {
             source_commit: self.source_commit.clone(),
             cargo_lock_sha256: self.cargo_lock_sha256.clone(),
             git_sources: sources.into_values().collect(),
-            derived_manifests: derived,
+            normalized_manifests: normalized,
+            derived_manifests: BTreeMap::new(),
         })
     }
 
@@ -479,7 +501,8 @@ impl LockedMaterials {
     }
 }
 
-/// Vendors one Git package; returns the normalized manifest digest if one was used.
+/// Vendors one Git package; returns the producer-normalized manifest digest
+/// when the committed manifest inherits from its workspace.
 fn vendor_git(
     package: &GitPackage,
     input: &GitVendorInput<'_>,
@@ -490,6 +513,7 @@ fn vendor_git(
     let root = find_package(&store, input.material.root_tree(), &package.name)?;
     let committed = store.read("blob", &root.manifest, MANIFEST_LIMIT)?;
     let table = parse_manifest(&committed)?;
+    check_target_paths(&table)?;
     match declared_identity(&table) {
         Some((name, _)) if name != package.name => {
             return Err(material_error(format!(
@@ -506,32 +530,20 @@ fn vendor_git(
         Some(_) => {}
         None => return Err(material_error("Git manifest declares no package")),
     }
-    let inherits = inherits_workspace(&toml::Value::Table(table));
-    let (manifest, original) = match (&input.normalized, inherits) {
-        (None, true) => {
-            return Err(material_error(format!(
-                "Git package {} inherits from its workspace; a normalized manifest is required",
-                package.name
-            )));
-        }
-        (None, false) => (committed, None),
-        (Some(normalized), _) => {
-            if normalized.cargo_toml_orig != committed {
-                return Err(material_error(format!(
-                    "Cargo.toml.orig for {} differs from the verified tree manifest",
-                    package.name
-                )));
-            }
-            require_identity(&normalized.cargo_toml, &package.name, &package.version)?;
-            let resolved = parse_manifest(&normalized.cargo_toml)?;
-            if inherits_workspace(&toml::Value::Table(resolved)) {
-                return Err(material_error(format!(
-                    "normalized manifest for {} still inherits from a workspace",
-                    package.name
-                )));
-            }
-            (normalized.cargo_toml.clone(), Some(committed))
-        }
+    let (manifest, original) = if inherits_workspace(&toml::Value::Table(table)) {
+        let ancestors = ancestor_manifests(&store, input.material.root_tree(), &root)?;
+        let normalized = normalize_manifest(
+            &PackageManifest {
+                name: &package.name,
+                version: &package.version,
+                directory: &root.path,
+                bytes: &committed,
+            },
+            &ancestors,
+        )?;
+        (normalized, Some(committed))
+    } else {
+        (committed, None)
     };
     let mut writer = PackageWriter::create(vendor, &directory)?;
     materialize(&store, &root, &mut writer)?;
@@ -539,11 +551,11 @@ fn vendor_git(
     if let Some(original) = &original {
         writer.write("Cargo.toml.orig", original, false)?;
     }
-    let derived = original
+    let normalized = original
         .as_ref()
         .and_then(|_| writer.digest_of("Cargo.toml").map(str::to_owned));
     writer.finish(None)?;
-    Ok(derived)
+    Ok(normalized)
 }
 
 #[cfg(test)]

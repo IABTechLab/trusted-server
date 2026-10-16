@@ -253,7 +253,7 @@ impl PreparedRecipe {
             && !self.materials.derived_manifest_digests().is_empty()
         {
             return Err(Report::new(ReleaseError::Unqualified)
-                .attach("a build from derived manifests cannot carry qualified authority"));
+                .attach("a build from caller-derived manifests cannot carry qualified authority"));
         }
         RecipeCompleted::record_success(SuccessFacts {
             asset: self.request.asset,
@@ -274,6 +274,7 @@ impl PreparedRecipe {
             stderr_sha256: run.stderr_sha256,
             artifact: copied,
             output_dir: self.request.output.clone(),
+            normalized_manifest_digests: self.materials.normalized_manifest_digests().clone(),
             derived_manifest_digests: self.materials.derived_manifest_digests().clone(),
         })
     }
