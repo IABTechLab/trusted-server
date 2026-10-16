@@ -57,7 +57,7 @@ use crate::cache_policy::{
     CachePolicy, EdgeCacheHeader, cache_control_headers_are_private_or_no_store,
 };
 use crate::consent::{consent_allows_server_side_auction, gate_eids_by_permissions};
-use crate::constants::{COOKIE_EIDS, COOKIE_SHAREDID, HEADER_X_COMPRESS_HINT};
+use crate::constants::{COOKIE_EIDS, COOKIE_SHAREDID, HEADER_X_COMPRESS_HINT, HOST_SIGNAL_HEADERS};
 use crate::cookies::handle_request_cookies;
 use crate::cookies::template_cache_policy::{TemplateCookieDecision, evaluate_cookie_policy};
 use crate::creative_opportunities::{
@@ -3670,8 +3670,9 @@ fn should_preload_ec_snapshot(input: &EcSnapshotPreloadInput) -> bool {
 /// Rewrites a downstream request into an outbound publisher-origin request.
 ///
 /// Restricts advertised encodings to those the rewrite pipeline can handle,
-/// strips the internal `fastly-ssl` scheme signal so it never leaks to the
-/// backend, and retargets the URI and `Host` header at the origin.
+/// strips the internal `fastly-ssl` scheme signal and the host signal headers
+/// so they never leak to the backend, and retargets the URI and `Host` header
+/// at the origin.
 fn rewrite_origin_request(
     req: &mut Request<EdgeBody>,
     target_uri: Uri,
@@ -3687,6 +3688,11 @@ fn rewrite_origin_request(
     // separate change. Until then we strip it here so the edge signal never
     // reaches publisher backends.
     req.headers_mut().remove("fastly-ssl");
+    // The origin request carries the reader's other headers onward, so the
+    // host's TLS and HTTP/2 client signals are removed by name.
+    for name in HOST_SIGNAL_HEADERS {
+        req.headers_mut().remove(*name);
+    }
     *req.uri_mut() = target_uri;
     req.headers_mut().insert(
         header::HOST,
@@ -5548,11 +5554,14 @@ pub async fn handle_publisher_request(
         });
     // Every other response the origin sends may be kept as it sent it, in
     // every assembly mode, keyed the way a page is and kept for as long as
-    // the origin allows, see `asset_cache`.
+    // the origin allows, see `asset_cache`. A request that sends the origin a
+    // cookie is fetched for itself, because nothing shows whether the cookie
+    // shaped the answer.
     let request_can_use_asset_copy = method_is_cacheable
         && !request_is_document
         && !request_host.is_empty()
         && !authorization_disqualifies
+        && !req.headers().contains_key(header::COOKIE)
         && !request_requires_origin
         && services
             .loading_cache_for(crate::settings::ASSETS_CACHE)
@@ -9063,6 +9072,140 @@ mod tests {
                 "an authenticated request never shares a copy"
             );
             assert!(asset_copy_lifetimes(&cache).is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_request_carrying_a_cookie_is_fetched_for_itself_and_kept_for_no_one() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryLoadingCache::default());
+            let services = services(&stub, &cache);
+            let settings = settings();
+            // The origin answers each reader from their cookie without naming
+            // it in `Vary`, which the cache cannot see.
+            for reader in ["one", "two"] {
+                queue(
+                    &stub,
+                    "application/json",
+                    format!("{{\"reader\":\"{reader}\"}}").as_bytes(),
+                    &[("cache-control", "max-age=300")],
+                );
+            }
+
+            for reader in ["one", "two"] {
+                let mut request = asset_request("/account.json", "empty");
+                request.headers_mut().insert(
+                    header::COOKIE,
+                    HeaderValue::from_str(&format!("session={reader}"))
+                        .expect("should be a header value"),
+                );
+                let answer = body_of(run(&settings, &services, request).await).await;
+                assert_eq!(
+                    answer,
+                    format!("{{\"reader\":\"{reader}\"}}").into_bytes(),
+                    "reader {reader} is served the answer made for their own cookie"
+                );
+            }
+
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                2,
+                "each reader's request is fetched for itself"
+            );
+            assert!(
+                asset_copy_lifetimes(&cache).is_empty(),
+                "no answer to a request carrying a cookie is kept"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_answer_that_sets_a_cookie_is_served_only_to_the_reader_it_was_made_for() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryLoadingCache::default());
+            let services = services(&stub, &cache);
+            let settings = settings();
+            for reader in ["one", "two"] {
+                let cookie = format!("visitor={reader}");
+                queue(
+                    &stub,
+                    "text/css",
+                    format!("/* {reader} */").as_bytes(),
+                    &[
+                        ("cache-control", "public, max-age=300"),
+                        ("set-cookie", cookie.as_str()),
+                    ],
+                );
+            }
+
+            for reader in ["one", "two"] {
+                let response = run(&settings, &services, asset_request("/site.css", "style")).await;
+                let cookie = format!("visitor={reader}");
+                assert!(
+                    response
+                        .headers()
+                        .get_all(header::SET_COOKIE)
+                        .iter()
+                        .any(|value| value.as_bytes() == cookie.as_bytes()),
+                    "reader {reader} is served the cookie the origin set for them"
+                );
+                assert_eq!(
+                    body_of(response).await,
+                    format!("/* {reader} */").into_bytes()
+                );
+            }
+
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                2,
+                "each reader's request is fetched for itself"
+            );
+            assert!(
+                asset_copy_lifetimes(&cache).is_empty(),
+                "an answer that sets a cookie is kept for no one"
+            );
+        }
+
+        /// A loading cache module's cache, which keeps what it loads.
+        fn memory_module_cache() -> Arc<dyn crate::platform::PlatformLoadingCache> {
+            Arc::new(MemoryLoadingCache::default())
+        }
+
+        #[tokio::test]
+        async fn assets_turned_off_in_the_settings_are_fetched_for_every_request() {
+            let module = crate::integrations::IntegrationBuilder::implementations(
+                "loading-cache.memory",
+                "a-crate",
+            )
+            .with_loading_cache(memory_module_cache);
+            for (written, fetches) in [(None, 1), (Some(crate::settings::ASSETS_CACHE_OFF), 2)] {
+                let mut settings = crate::test_support::tests::create_test_settings();
+                settings.cache.assets.module = written.map(str::to_owned);
+                let caches = crate::integrations::loading_caches_from(
+                    &settings,
+                    std::slice::from_ref(&module),
+                )
+                .expect("should select the asset caches");
+                let settings = Arc::new(settings);
+                let stub = Arc::new(StubHttpClient::new());
+                let services = build_services_with_http_client(Arc::clone(&stub) as _)
+                    .with_loading_caches(caches);
+                for _ in 0..2 {
+                    queue(
+                        &stub,
+                        "text/css",
+                        b"body{}",
+                        &[("cache-control", "public, max-age=300")],
+                    );
+                    let response =
+                        run(&settings, &services, asset_request("/site.css", "style")).await;
+                    assert_eq!(body_of(response).await, b"body{}");
+                }
+
+                assert_eq!(
+                    stub.recorded_request_uris().len(),
+                    fetches,
+                    "[cache.assets] module {written:?}"
+                );
+            }
         }
 
         #[tokio::test]
@@ -20885,6 +21028,58 @@ mod tests {
             vec![true],
             "publisher origin fetch should request streams when the platform supports them"
         );
+    }
+
+    #[tokio::test]
+    async fn publisher_origin_fetch_drops_host_signal_headers() {
+        // The origin request carries the reader's other headers onward, so the
+        // host's TLS and HTTP/2 client signals must be removed whether or not
+        // the origin response is streamed.
+        for streaming in [false, true] {
+            let settings = create_test_settings();
+            let stub = Arc::new(StubHttpClient::new());
+            stub.set_streaming_responses_supported(streaming);
+            stub.push_response_with_headers(
+                200,
+                b"<html><body>origin</body></html>".to_vec(),
+                vec![("content-type", "text/html; charset=utf-8")],
+            );
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri("https://publisher.example/page")
+                .header(header::HOST, "publisher.example")
+                .header("x-ts-tls-ja4", "t13d1516h2_8daaf6152771_02713d6af862")
+                .header(
+                    "x-ts-h2-fingerprint",
+                    "1:65536;4:6291456|15663105|0|m,a,s,p",
+                )
+                .header("x-publisher-trace", "kept")
+                .body(EdgeBody::empty())
+                .expect("should build request");
+
+            let _ = run_publisher_proxy(&settings, &services, req).await;
+
+            let headers = stub
+                .recorded_request_headers()
+                .into_iter()
+                .next()
+                .expect("should record one origin request");
+            for name in ["x-ts-tls-ja4", "x-ts-h2-fingerprint"] {
+                assert!(
+                    headers.iter().all(|(header_name, _)| header_name != name),
+                    "origin fetch (streaming {streaming}) should not forward `{name}`"
+                );
+            }
+            assert!(
+                headers
+                    .iter()
+                    .any(|(name, value)| name == "x-publisher-trace" && value == "kept"),
+                "origin fetch (streaming {streaming}) should keep the reader's other headers"
+            );
+        }
     }
 
     #[tokio::test]

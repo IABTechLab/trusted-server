@@ -1262,7 +1262,7 @@ middleware = ["ads-txt.sellers"]
 
 What every module of one vendor shares, in one `[shared.<vendor>]` table per vendor. Core reads none of a table. The vendor's modules read their own through `Settings::shared_config`, and the table's presence is what runs the builder that registers them, so settings without it run none of that vendor's modules and a selection naming one is refused with the table to add. A builder a table runs is selected by no section. A table that no module in the deployment reads is refused at startup, and so is a table whose name is not lower case letters, digits, `_` or `-`.
 
-A secret in a shared table is written as the name of its entry in the secret store, declared by the vendor's builder as a module's own secret settings are, and resolved when the table is present.
+A secret in a shared table is written as the name of its entry in the secret store, declared by the vendor's builder as a module's own secret settings are, checked at push to name a key, and resolved when the table is present.
 
 ```toml
 [shared.example]
@@ -1857,16 +1857,20 @@ says `private`, `no-store` or `no-cache` or gives no lifetime, one that varies
 on `*` or on `Cookie`, one larger than a megabyte, an answer the platform's
 image optimizer makes, and the answer to a request carrying `Authorization`, a
 conditional header, a range, or a `Cache-Control` of `no-cache`, `no-store`,
-`min-fresh` or a nonzero `max-age`. A response that may not be shared is served to
-the request whose load fetched it from that one fetch.
+`min-fresh` or a nonzero `max-age`. A response that may not be shared is served
+to the request whose load fetched it from that one fetch. A request that sends
+the publisher's origin a cookie always goes to the origin, and its answer is not
+kept, because the cache cannot see whether the cookie shaped it. An asset route
+sends its origin no cookie. `[cache.assets] module = "none"` keeps no asset, so
+every asset is fetched from its origin for each request.
 
 | Table                | Field                | Default            | Range         | Description                                                                     |
 | -------------------- | -------------------- | ------------------ | ------------- | ------------------------------------------------------------------------------- |
-| `[cache.robots-txt]` | `module`             | none               |               | The module whose loading cache holds each robots.txt module's answer.           |
+| `[cache.robots-txt]` | `module`             | the linked module  |               | The module whose loading cache holds each robots.txt module's answer.           |
 | `[cache.robots-txt]` | `memory_seconds`     | `60`               | 0 to 31536000 | How long the copy in memory is used. Zero keeps none.                           |
 | `[cache.robots-txt]` | `store_seconds`      | `604800`, a week   | 1 to 31536000 | The longest a module's answer is used. The module's own refresh ends it sooner. |
 | `[cache.robots-txt]` | `store_idle_seconds` | `2592000`, 30 days | 1 to 31536000 | How long an answer in the shared store lasts unused.                            |
-| `[cache.assets]`     | `module`             | none               |               | The module whose loading cache holds the publisher's assets and route answers.  |
+| `[cache.assets]`     | `module`             | the linked module  |               | The loading cache module for assets and route answers. `none` keeps none.       |
 | `[cache.assets]`     | `memory_seconds`     | `5`                | 0 to 31536000 | How long the copy in memory is used. Zero keeps none.                           |
 | `[cache.assets]`     | `store_seconds`      | `3600`, an hour    | 1 to 31536000 | The longest a copy is used. The origin's own lifetime ends it sooner.           |
 | `[cache.assets]`     | `store_idle_seconds` | `86400`, a day     | 1 to 31536000 | How long a copy in the shared store lasts unused.                               |
@@ -3486,115 +3490,30 @@ EdgeZero entry point. The former `edgezero_enabled` and `edgezero_rollout_pct`
 canary keys are no longer read.
 
 `[stores.config].default` in `edgezero.toml` supplies the logical config store
-ID and default blob key, currently `trusted_server_config`. Fastly has no
-process environment. Its entry point reads service-scoped overrides from the
-`edgezero_runtime_env` Config Store before opening the app-config store:
+ID, currently `trusted_server_config`. The Fastly runtime opens the store by
+that logical ID and reads the entry under the same key on every target, unless
+the store's `TS__CONFIG__KEY` entry names another
+([One blob for each host](#one-blob-for-each-host)). Store
+selection is a deploy-time input: a managed `ts deploy --adapter fastly` links
+the physical store named by
+`EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME` to the service version
+under the logical ID. On Fastly the CLI rejects a `__KEY` selector other than
+the logical ID, and it pushes a `--key` other than the logical ID itself.
 
-```mermaid
-flowchart TD
-    A[Manifest default store ID] --> B[Resolve store name and blob key]
-    C[Service-scoped entries in edgezero_runtime_env] --> B
-    B --> D[Open the resolved resource-link name]
-    D --> E[Read the selected blob key from the linked physical store]
-```
-
-For this logical ID, the runtime selectors are:
-
-```text
-EDGEZERO__SERVICES__<SERVICE_ID>__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME
-EDGEZERO__SERVICES__<SERVICE_ID>__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY
-```
-
-The runtime ignores unscoped entries. Missing or blank selectors fall back to
-the logical ID. A resource link must exist under the resolved name, not always
-under `trusted_server_config`.
-
-### Initial setup with a service-specific store
-
-Fastly store names are account-level. Choose a physical name that is not used
-by another service. The default physical name is safe only if the service owns
-that store exclusively.
-
-Create the Fastly service and an editable service version before provisioning
-non-default mappings. Select its ID through top-level `service_id` in
-`fastly.toml` or `FASTLY_SERVICE_ID`. If both are set, they must agree. Do not
-reuse the checked-in service ID for your deployment. Without a service ID,
-provisioning rejects non-default mappings before creating resources.
-
-The following example is for initial setup before the service receives traffic.
-Replace the service ID and choose your own physical store name:
-
-```bash
-export FASTLY_SERVICE_ID="<service-id>"
-export EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=example_config
-
-ts provision --adapter fastly --dry-run
-ts provision --adapter fastly
-```
-
-Provisioning creates the stores and persists the selected name in the
-service-scoped `edgezero_runtime_env` entry. Keep all intended store-name
-overrides set when provisioning, including any [secret-store mapping](/guide/fastly#secret-stores).
-Provisioning reconciles mappings for all declared stores, so omitting a previous
-override can remove it.
-
-For an existing service, Fastly does not reapply `[setup]` entries. Follow the
-provisioner's resource-link instructions. Both the app-config store and the
-runtime-env store must be linked to the same editable version. For this example:
-
-```bash
-fastly resource-link create --service-id "$FASTLY_SERVICE_ID" --version latest --autoclone \
-  --resource-id <config-store-id> --name example_config
-fastly resource-link create --service-id "$FASTLY_SERVICE_ID" --version latest --autoclone \
-  --resource-id <runtime-env-store-id> --name edgezero_runtime_env
-
-ts config push --adapter fastly --dry-run
-ts config push --adapter fastly
-fastly compute publish --service-id "$FASTLY_SERVICE_ID" --version latest
-```
-
-Look up each store ID by its name before linking. Confirm the push dry run names
-`example_config`, not the account-level default. Publish the application to the
-linked version only after seeding its config store; a missing or invalid blob
-makes application startup fail closed. Do not activate a new service's empty
-version before uploading the application. If your deployment separates upload
-from activation, activate the prepared version with
-`fastly service-version activate --service-id "$FASTLY_SERVICE_ID" --version <version>`
-only after both the code and config are ready.
-
-Keep the `__NAME` override in your deployment environment for **every subsequent
-push**. The CLI reads its process environment, not the service's persisted
-runtime mapping. Omitting the override can write to the wrong physical store.
-Reject empty values in deployment scripts rather than relying on the fallback.
-
-For a live service, changing entries in its active `edgezero_runtime_env` store
-changes runtime selection immediately, independently of service-version
-activation. Do not use the initial-setup sequence to migrate a live mapping.
-Prepare and seed the destination and make its resource link available to the
-active version before switching the selector, or use an isolated staged runtime
-configuration.
-
-An existing deployment may instead link a service-specific physical store under
-the logical name `trusted_server_config`, with no runtime `__NAME` override.
-That alias works, but the CLI still needs the physical-name override on every
-push. Do not add a runtime override unless a link under the newly selected name
-also exists.
-
-### Selecting another blob key
-
-A normal push writes at the logical store ID. A runtime `__KEY` override does
-not change that write destination. To select another production key, first push
-with `ts config push --adapter fastly --key <key>`, then set the matching
-service-scoped `__KEY` entry in `edgezero_runtime_env`. Changing that entry affects
-the active service immediately. Do not point the production selector at a
-staging key; staged deployments need their own runtime-env store.
+Keep the `__NAME` selector set in the shell or deploy job for every push, so
+`ts config push` writes into the same physical store the deployment links.
+Isolate staging by selecting a different physical store. See
+[Secret Stores](/guide/fastly#secret-stores) and the
+[CLI lifecycle commands](/guide/cli#lifecycle-commands) for the full deploy and
+staging flow.
 
 ### One blob for each host
 
 One Fastly service can serve several publishers, each from an app-config blob
-of its own. Write `{host}` in the `__KEY` selector and the runtime replaces it
-with the host of each request before it reads any settings, so every host
-reads the blob stored under its own name.
+of its own. The `TS__CONFIG__KEY` entry in the store linked as
+`trusted_server_config` is the service's selector. Write `{host}` in it and the
+runtime replaces it with the host of each request before it reads any
+settings, so every host reads the blob stored under its own name.
 
 Push a blob for each host the service answers for, then set the selector.
 Push each key in lower case. The runtime lowercases the request's host and
@@ -3607,13 +3526,18 @@ ts config push --adapter fastly --key www.publisher-a.example --app-config publi
 ts config push --adapter fastly --key www.publisher-b.example --app-config publisher-b.toml
 
 fastly config-store-entry update --upsert \
-  --store-id <runtime-env-store-id> \
-  --key "EDGEZERO__SERVICES__${FASTLY_SERVICE_ID}__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY" \
+  --store-id <id of the store linked as trusted_server_config> \
+  --key TS__CONFIG__KEY \
   --value '{host}'
 ```
 
-The selector takes effect on the active service as soon as it is written, as
-any entry of its `edgezero_runtime_env` store does, so the blobs come first.
+`ts config push` writes a key other than `trusted_server_config` itself,
+because EdgeZero writes no other key on Fastly. It writes the live store that
+`EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME` selects through the
+`fastly` CLI, with the token in `FASTLY_API_TOKEN`, and with `--local` it
+writes the local store in `fastly.toml` instead. A long blob's chunks are
+written before its pointer. The selector is read on every request, so the
+blobs come first.
 
 | A request for                                               | Reads the blob at         | Is answered                      |
 | ----------------------------------------------------------- | ------------------------- | -------------------------------- |
@@ -3621,8 +3545,17 @@ any entry of its `edgezero_runtime_env` store does, so the blobs come first.
 | `WWW.Publisher-A.example:443` or `www.publisher-a.example.` | `www.publisher-a.example` | From publisher A's config        |
 | `www.publisher-b.example`                                   | `www.publisher-b.example` | From publisher B's config        |
 | A host with no blob                                         | None                      | `421 Misdirected Request`        |
-| A `Host` that is not a host name, or no `Host`              | None                      | `421 Misdirected Request`        |
+| A `Host` that is not a host name, not UTF-8, or absent      | None                      | `421 Misdirected Request`        |
+| A host whose key would be over 255 characters               | None                      | `421 Misdirected Request`        |
 | `/health`, for any host                                     | None                      | `200`, before any config is read |
+| Any host, under a malformed selector                        | None                      | `500`                            |
+| Any host, where the store cannot be read                    | None                      | `500`                            |
+
+A selector is malformed when it is empty, carries whitespace, a control
+character or `{host}` more than once, carries a brace outside its `{host}`
+(such as `{Host}`), or is longer than 255 characters. Without the entry every
+request reads `trusted_server_config`, and a selector without `{host}` is the
+key of one blob for every host.
 
 A host with no blob is never answered from the logical store ID or from
 another host's blob, because a shared fallback is how a host nobody configured
@@ -3630,8 +3563,8 @@ comes to be served another publisher's site. A host name is letters, digits
 and hyphens in labels joined by single dots, and no label starts or ends with
 a hyphen. An IPv4 address such as `127.0.0.1` passes, and an IPv6 literal such
 as `[::1]` is refused. Nothing else is looked up, so a request cannot name the
-logical store ID or a part of a stored blob, each of which carries an
-underscore.
+logical store ID, the selector or a part of a stored blob, each of which
+carries an underscore.
 
 - A publisher with several names has a blob under each. `www.publisher.example`
   and `publisher.example` are two keys, and what each serves is for the
@@ -3642,11 +3575,19 @@ underscore.
   maps, so each publisher's blob names keys of its own.
 - Request signing keys belong to the service, so every publisher on it signs
   with the same keys.
-- `ts deploy --staging` points a staged version's selector at
-  `<logical-store-id>_staging`, which carries no placeholder. A staged version
-  therefore reads that one blob for every host and never a production blob.
+- A staged version reads the selector and the blobs of the store its version
+  links as `trusted_server_config`, so a staging store of its own may carry a
+  selector of its own, such as `{host}_staging`.
 - Only the Fastly adapter reads the placeholder. The Axum, Cloudflare and Spin
   adapters read one app-config blob.
+
+A service that wrote its selector as the service-scoped `__KEY` entry of
+`edgezero_runtime_env` follows
+[Upgrading from EdgeZero v0.0.8](/guide/fastly#upgrading-from-edgezero-v0-0-8)
+and writes the same value into `TS__CONFIG__KEY` before it deploys a build
+that reads that entry. It also removes any blob at `trusted_server_config` from
+a store that holds a blob for each host, so a store that loses its selector
+serves no host from it.
 
 `./scripts/config-by-host-local-test.sh` serves two publishers from one local
 Viceroy instance. It checks that each host is answered from its own blob and
@@ -3665,9 +3606,10 @@ by its host, as in the section above, or three things, being the selector
 values, the path the request continues with, and the path prefix it removed.
 Which part of a path names a publisher is the deployment's decision.
 
-- Each selector value takes the place of `{host}` in the `__KEY` selector in
-  turn and is keyed as a host is, and the first whose blob exists is read. Push
-  a blob, in lower case, under each value the hook can name.
+- Each selector value takes the place of `{host}` in the selector in turn and
+  is keyed as a host is, and the first whose blob exists is read. A value whose
+  key would be over 255 characters is passed over without a lookup. Push a
+  blob, in lower case, under each value the hook can name.
 - A miss on every value is answered `421`, as a host with no blob is. The
   request is never served from the logical store ID, from the blob of the host
   it arrived on, or from any other key the hook did not name.
@@ -3690,20 +3632,19 @@ Which part of a path names a publisher is the deployment's decision.
 
 ### Local development
 
-The repository's Viceroy configuration uses the default logical app-config name
-and key. Clear production overrides for the local push:
+The repository's Viceroy configuration uses the logical app-config store ID and
+key. Clear any production key override for the local push:
 
 ```bash
-env -u EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME \
-  -u EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY \
+env -u EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__KEY \
   ts config push --adapter fastly --local
 ```
 
-`--local` writes under `[local_server.config_stores.<resolved-name>]` in the
-tracked `fastly.toml`. If you customize Viceroy's service-scoped runtime selectors,
-keep that local name and the pushed key aligned with them. Review the generated
-diff and do not commit deployment-specific app-config entries. Credentials belong
-in secret stores; the app-config blob contains their key references.
+`--local` writes under `[local_server.config_stores.trusted_server_config]` in
+the tracked `fastly.toml`, the logical store ID, regardless of any `__NAME`
+selector. Review the generated diff and do not commit deployment-specific
+app-config entries. Credentials belong in secret stores; the app-config blob
+contains their key references.
 
 ### Rollback
 
