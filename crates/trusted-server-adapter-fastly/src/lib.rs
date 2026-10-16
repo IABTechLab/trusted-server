@@ -214,7 +214,8 @@ fn stores_with_key(
 /// its path. Otherwise the blob is the first of the hook's selector values
 /// whose blob exists, the path becomes the hook's continuing path with the
 /// query kept, and the prefix the hook removed is returned for the core
-/// request.
+/// request. The hook is handed the request's `Host`, or none where it is
+/// absent or not UTF-8.
 ///
 /// # Errors
 ///
@@ -225,7 +226,7 @@ fn address_request(
     stores: RuntimeStoreConfig,
     req: &mut FastlyRequest,
 ) -> Result<(RuntimeStoreConfig, Option<RemovedPathPrefix>), config_selection::Refusal> {
-    let host = req.get_header_str(header::HOST.as_str());
+    let host = request_host(req);
     match addressing.address(host, req.get_path()) {
         Addressing::ByHost => Ok((stores_for_request(stores, req)?, None)),
         Addressing::Addressed(address) => {
@@ -1987,6 +1988,72 @@ mod tests {
         assert!(
             matches!(refusal, config_selection::Refusal::StoreUnavailable(_)),
             "should refuse rather than read the logical key, got {refusal:?}"
+        );
+    }
+
+    /// A request addressing that records the host it is handed and addresses
+    /// every request by its host.
+    struct RecordsHost(std::sync::Mutex<Vec<Option<String>>>);
+
+    impl RequestAddressing for RecordsHost {
+        fn address(&self, host: Option<&str>, _path: &str) -> Addressing {
+            self.0
+                .lock()
+                .expect("should lock")
+                .push(host.map(str::to_owned));
+            Addressing::ByHost
+        }
+    }
+
+    #[test]
+    fn a_hook_is_handed_no_host_for_a_value_that_is_not_utf8() {
+        let hook = RecordsHost(std::sync::Mutex::default());
+        let mut req = request_with_host_not_utf8();
+
+        let refusal = address_request(&hook, stores_with_selector("{host}"), &mut req)
+            .expect_err("should refuse a Host that is not UTF-8 when addressed by host");
+
+        assert_eq!(
+            *hook.0.lock().expect("should lock"),
+            [None],
+            "the hook should be handed no host for a Host that is not UTF-8"
+        );
+        assert_eq!(
+            refusal,
+            config_selection::Refusal::NoConfigForHost,
+            "a request addressed by its host should then be refused as one with no host"
+        );
+    }
+
+    #[test]
+    fn a_request_addressed_by_its_path_with_a_host_that_is_not_utf8_is_served_without_a_panic() {
+        // The local Viceroy configuration fills `jwks_store`, and
+        // `current-kid` is a key in it that is also a host name, so the
+        // lookup here is a real one.
+        let stores = RuntimeStoreConfig {
+            config_store_name: trusted_server_core::platform::StoreName::from("jwks_store"),
+            ..stores_with_selector("{host}")
+        };
+        let mut req = addressed_page("front.example");
+        req.set_header(header::HOST.as_str(), HOST_NOT_UTF8);
+
+        let (resolved, _) =
+            address_request(&NamesSelectorValues(&["current-kid"]), stores, &mut req)
+                .expect("should serve the request from the value the hook names");
+
+        assert_eq!(
+            resolved.config_key, "current-kid",
+            "should read the blob the hook's value names, whatever the Host"
+        );
+        assert_eq!(
+            entry_request(&req).host(),
+            "",
+            "the module request should carry no host where Host is not UTF-8"
+        );
+        assert_eq!(
+            EntryRequest::of(&req).host,
+            "",
+            "the kept request should carry no host where Host is not UTF-8"
         );
     }
 
