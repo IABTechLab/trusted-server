@@ -15,6 +15,7 @@ is an ISO 3166-1 alpha-2 code (`US`) and the region is the ISO 3166-2 subdivisio
 code with no country prefix (`CA`), so the Fastly and other modules feed the
 same downstream rules without translation.
 
-The platform-neutral `PlatformGeo` trait and the `DisabledGeo` default (no
-location) both live in `trusted-server-core`, so the default deployment resolves
-no location until a module is selected.
+The platform-neutral `PlatformGeo` trait and `DisabledGeo` both live in
+`trusted-server-core`. With no `[geo] module`, or `module = "platform"`, the
+adapter uses its host platform's own lookup. `module = "none"` selects
+`DisabledGeo`, which resolves no location and makes no host call.
