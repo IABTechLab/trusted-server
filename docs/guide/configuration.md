@@ -903,6 +903,23 @@ No module is the default, so a default deployment is not tied to any host geo se
 module = "platform"
 ```
 
+**Location headers.** No response carries an `x-geo-*` header unless the
+deployment selects `headers.geo` and names it in a `[[serve]]` entry. On the
+responses the entry covers, the middleware then writes the location already
+resolved for the request, being `x-geo-city`, `x-geo-country`,
+`x-geo-continent`, `x-geo-coordinates`, `x-geo-metro-code` and `x-geo-region`
+where the answer has them, and `x-geo-info-available` as `true` or `false`.
+Selecting the module without such an entry is refused when the settings load.
+
+```toml
+[headers]
+modules = ["geo"]
+
+[[serve]]
+media_type = "text/html"
+middleware = ["headers.geo"]
+```
+
 **Environment Override**:
 
 ```bash
@@ -1981,6 +1998,7 @@ generated configuration places it in.
 | `ad-tag.google.loader`        | `[[serve]]` | Writes the loader tag into the head, after the bootstrap, when `write_loader` is set, for a reader whose permissions allow storage on the device                                                                                                                                                                                                                  |
 | `ad-tag.google.diagnostics`   | `[[serve]]` | For a request that activated diagnostics, writes the bootstrap ahead of the script bundle and the tag that loads the diagnostics module straight after it                                                                                                                                                                                                         |
 | `ads-txt.sellers`             | `[[fetch]]` | Writes the lines `[ads-txt.sellers]` gives at the end of the publisher's `ads.txt`, on `text/plain` alone                                                                                                                                                                                                                                                         |
+| `headers.geo`                 | `[[serve]]` | Writes the location the request resolved as the `x-geo-*` response headers, or `x-geo-info-available: false` where none is known. `[headers] modules = ["geo"]` selects it                                                                                                                                                                                        |
 | `robots_txt`                  | `[[fetch]]` | Makes the `robots.txt` that `[robots-txt]` describes, in place of whatever the origin answers, on `text/plain` and at `/robots.txt` alone                                                                                                                                                                                                                         |
 | `service_version`             | `[[serve]]` | Writes `X-TS-Version`, the git version the build compiled in, and `X-TS-Service-Version`, the platform's version number of the service, when each is known. Core supplies it, so no section selects it                                                                                                                                                            |
 
