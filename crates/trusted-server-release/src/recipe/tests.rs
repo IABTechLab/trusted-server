@@ -66,8 +66,11 @@ fn asset_selection_comes_from_fixed_table_not_json() {
 
 #[test]
 fn unknown_role_is_rejected() {
-    assert_eq!(Role::parse("A").expect("should accept A"), Role::A);
-    assert_eq!(Role::parse("B").expect("should accept B"), Role::B);
+    assert_eq!(Role::parse("A").expect("should accept A"), Role::Canonical);
+    assert_eq!(
+        Role::parse("B").expect("should accept B"),
+        Role::Reproduction
+    );
     for text in ["", "a", "b", "C", "AB", " A"] {
         assert!(
             Role::parse(text).is_err_and(|error| format!("{error:?}").contains("unknown role")),
@@ -116,7 +119,7 @@ impl Workspace {
         RecipeInput {
             asset: "ts-aarch64-apple-darwin",
             variant: "default",
-            role: "A",
+            role: Role::Canonical.spec_label(),
             commit: COMMIT,
             js_dir: &paths[0],
             js_inventory: &paths[1],
@@ -281,7 +284,7 @@ fn overlapping_roots_are_rejected() {
     }
 }
 
-fn observed_a() -> ObservedAmbient {
+fn observed_canonical() -> ObservedAmbient {
     ObservedAmbient {
         umask: 0o022,
         jobs: 4,
@@ -290,12 +293,12 @@ fn observed_a() -> ObservedAmbient {
         child_locale: "C".to_owned(),
         child_timezone: "UTC".to_owned(),
         execution_uid: 501,
-        checkout_root: PathBuf::from("/example/release-a"),
+        checkout_root: PathBuf::from("/example/release-canonical"),
         started_at_seconds: 1_700_000_000,
     }
 }
 
-fn observed_b() -> ObservedAmbient {
+fn observed_reproduction() -> ObservedAmbient {
     ObservedAmbient {
         umask: 0o027,
         jobs: 2,
@@ -304,23 +307,27 @@ fn observed_b() -> ObservedAmbient {
         child_locale: "C".to_owned(),
         child_timezone: "UTC".to_owned(),
         execution_uid: 501,
-        checkout_root: PathBuf::from("/example/release-b"),
+        checkout_root: PathBuf::from("/example/release-reproduction"),
         started_at_seconds: 1_700_000_900,
     }
 }
 
-fn checked_a() -> CheckedAmbient {
-    CheckedAmbient::check(Role::A, &AmbientProfile::A, observed_a())
-        .expect("should accept the baseline A ambient")
+fn checked_canonical() -> CheckedAmbient {
+    CheckedAmbient::check(
+        Role::Canonical,
+        &AmbientProfile::CANONICAL,
+        observed_canonical(),
+    )
+    .expect("should accept the baseline canonical ambient")
 }
 
-fn checked_b() -> CheckedAmbient {
+fn checked_reproduction() -> CheckedAmbient {
     CheckedAmbient::check(
-        Role::B,
+        Role::Reproduction,
         &AmbientProfile::alternate_for_tests(),
-        observed_b(),
+        observed_reproduction(),
     )
-    .expect("should accept the baseline B ambient")
+    .expect("should accept the baseline reproduction ambient")
 }
 
 mod ambient;

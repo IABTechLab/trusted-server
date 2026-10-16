@@ -416,10 +416,7 @@ struct FixedRecipe {
 /// Complete effective settings shared by every executable recipe.
 fn artifact_settings() -> Value {
     json!({
-        "ambient_profiles": {
-            "A": AmbientProfile::A.to_json(),
-            "B": AmbientProfile::B_PENDING.to_json(),
-        },
+        "ambient_profiles": AmbientProfile::tracked_json(),
         "aws_lc_target_selector": true,
         "aws_lc_use_system": false,
         "cargo_config": ".cargo/config.toml",

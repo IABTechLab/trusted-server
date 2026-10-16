@@ -43,8 +43,8 @@ impl Fixture {
             "materials/vendor/example-1.0.0",
             "cargo-state",
             "output",
-            "checkout-a",
-            "checkout-b",
+            "checkout-canonical",
+            "checkout-reproduction",
             "tools/bin",
             "other-source",
             "other-work",
@@ -118,20 +118,20 @@ impl Fixture {
 
     pub(super) fn ambient(&self, role: Role) -> CheckedAmbient {
         match role {
-            Role::A => CheckedAmbient::check(
-                Role::A,
-                &AmbientProfile::A,
+            Role::Canonical => CheckedAmbient::check(
+                Role::Canonical,
+                &AmbientProfile::CANONICAL,
                 ObservedAmbient {
-                    checkout_root: self.base.join("checkout-a"),
-                    ..observed_a()
+                    checkout_root: self.base.join("checkout-canonical"),
+                    ..observed_canonical()
                 },
             ),
-            Role::B => CheckedAmbient::check(
-                Role::B,
+            Role::Reproduction => CheckedAmbient::check(
+                Role::Reproduction,
                 &AmbientProfile::alternate_for_tests(),
                 ObservedAmbient {
-                    checkout_root: self.base.join("checkout-b"),
-                    ..observed_b()
+                    checkout_root: self.base.join("checkout-reproduction"),
+                    ..observed_reproduction()
                 },
             ),
         }
@@ -188,16 +188,16 @@ impl Fixture {
         asset: &str,
         role: Role,
     ) -> Result<PreparedRecipe, Report<ReleaseError>> {
-        let text = if role == Role::A { "A" } else { "B" };
+        let text = role.spec_label();
         self.bind_with(self.request(asset, text, COMMIT), role, COMMIT)
     }
 
     /// The fake namespace mirroring the boundary's mount layout for `role`.
     pub(super) fn paths(&self, role: Role) -> PrefixPaths {
-        let checkout = if role == Role::A {
-            "checkout-a"
+        let checkout = if role == Role::Canonical {
+            "checkout-canonical"
         } else {
-            "checkout-b"
+            "checkout-reproduction"
         };
         PrefixPaths::new()
             .with(&self.base.join(checkout), "/boundary/immutable/0", false)

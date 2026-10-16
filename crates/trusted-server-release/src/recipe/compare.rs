@@ -1,10 +1,12 @@
-//! Complete final-byte comparison of the role A and role B Fastly builds.
+//! Complete final-byte comparison of the canonical and reproduction Fastly
+//! builds.
 //!
 //! The Fastly executable has no normalized or excluded region: the two final
 //! files must be identical byte for byte. Before comparing bytes, the pair
-//! must be one A and one B build of the same asset from the same source,
-//! `Cargo.lock`, vendored materials, JS handoff and Rust tools, and their
-//! ambient records must vary exactly what the standard claim states.
+//! must be one canonical and one reproduction build of the same asset from
+//! the same source, `Cargo.lock`, vendored materials, JS handoff and Rust
+//! tools, and their ambient records must vary exactly what the standard claim
+//! states.
 
 use std::io::Read as _;
 
@@ -17,12 +19,13 @@ use super::artifact::EXECUTABLE_LIMIT;
 use super::{AssetId, RecipeCompleted, Role, recipe_error};
 use crate::error::ReleaseError;
 
-/// The only asset whose A/B outputs must be byte-identical.
+/// The only asset whose canonical and reproduction outputs must be byte-identical.
 pub(crate) const FASTLY_ASSET: &str = "trusted-server-fastly.wasm";
 /// Bytes shown from each side at the first difference.
 const WINDOW: usize = 16;
 
-/// Proof that the A and B Fastly builds produced identical final bytes.
+/// Proof that the canonical and reproduction Fastly builds produced identical
+/// final bytes.
 ///
 /// It has private fields and only [`check_fastly_equality`] constructs it.
 #[derive(Debug)]
@@ -55,51 +58,63 @@ impl FastlyEqualityChecked {
     }
 }
 
-/// Requires `first` and `second` to be equal, naming `label` otherwise.
+/// Requires `canonical` and `reproduction` to be equal, naming `label` otherwise.
 fn same_input<T: PartialEq + ?Sized>(
     label: &str,
-    first: &T,
-    second: &T,
+    canonical: &T,
+    reproduction: &T,
 ) -> Result<(), Report<ReleaseError>> {
-    if first == second {
+    if canonical == reproduction {
         return Ok(());
     }
     Err(recipe_error(format!(
-        "A and B Fastly builds used different {label}"
+        "canonical and reproduction Fastly builds used different {label}"
     )))
 }
 
-/// Requires one A and one B build of the Fastly asset over identical inputs.
-fn check_pair(a: &RecipeCompleted, b: &RecipeCompleted) -> Result<(), Report<ReleaseError>> {
-    if a.role() != Role::A || b.role() != Role::B {
+/// Requires one canonical and one reproduction build of the Fastly asset over
+/// identical inputs.
+fn check_pair(
+    canonical: &RecipeCompleted,
+    reproduction: &RecipeCompleted,
+) -> Result<(), Report<ReleaseError>> {
+    if canonical.role() != Role::Canonical || reproduction.role() != Role::Reproduction {
         return Err(recipe_error(
-            "Fastly equality needs a role A then a role B build",
+            "Fastly equality needs a canonical then a reproduction build",
         ));
     }
     let fastly = AssetId::parse(FASTLY_ASSET)?;
-    if a.asset() != fastly || b.asset() != fastly {
+    if canonical.asset() != fastly || reproduction.asset() != fastly {
         return Err(recipe_error(format!(
             "Fastly equality compares only {FASTLY_ASSET}"
         )));
     }
-    same_input("source commits", a.commit(), b.commit())?;
+    same_input("source commits", canonical.commit(), reproduction.commit())?;
     same_input(
         "Cargo.lock files",
-        a.cargo_lock_sha256(),
-        b.cargo_lock_sha256(),
+        canonical.cargo_lock_sha256(),
+        reproduction.cargo_lock_sha256(),
     )?;
     same_input(
         "vendored materials",
-        a.materials_digest(),
-        b.materials_digest(),
+        canonical.materials_digest(),
+        reproduction.materials_digest(),
     )?;
     same_input(
         "derived Git manifests",
-        a.derived_manifest_digests(),
-        b.derived_manifest_digests(),
+        canonical.derived_manifest_digests(),
+        reproduction.derived_manifest_digests(),
     )?;
-    same_input("JS handoffs", &a.js_digests(), &b.js_digests())?;
-    same_input("Rust tools", a.rust_tools_digest(), b.rust_tools_digest())
+    same_input(
+        "JS handoffs",
+        &canonical.js_digests(),
+        &reproduction.js_digests(),
+    )?;
+    same_input(
+        "Rust tools",
+        canonical.rust_tools_digest(),
+        reproduction.rust_tools_digest(),
+    )
 }
 
 /// Reads the retained artifact and requires its recorded size and digest.
@@ -124,31 +139,40 @@ fn read_artifact(completed: &RecipeCompleted) -> Result<Vec<u8>, Report<ReleaseE
     Ok(bytes)
 }
 
-/// Compares the complete final Fastly files of a role A and a role B build.
+/// Compares the complete final Fastly files of a canonical and a reproduction
+/// build.
 ///
 /// # Errors
 ///
-/// Returns [`ReleaseError::Recipe`] when the pair is not role A then role B
-/// of the Fastly asset, the builds used different source, lock, materials,
-/// derived manifests, JS handoff or tools, the ambient records do not vary
+/// Returns [`ReleaseError::Recipe`] when the pair is not the canonical then
+/// the reproduction build of the Fastly asset, the builds used different
+/// source, lock, materials, derived manifests, JS handoff or tools, the
+/// ambient records do not vary
 /// exactly what [`AmbientClaim::standard`] states, an artifact no longer
 /// rehashes, or the final bytes differ; a difference reports both sizes and
 /// digests, the first differing offset, the bytes there and their section.
 pub(crate) fn check_fastly_equality(
-    a: &RecipeCompleted,
-    b: &RecipeCompleted,
+    canonical: &RecipeCompleted,
+    reproduction: &RecipeCompleted,
 ) -> Result<FastlyEqualityChecked, Report<ReleaseError>> {
-    check_pair(a, b)?;
-    let ambient = AmbientRecord::pair(a.ambient(), b.ambient(), &AmbientClaim::standard())?;
-    let first = read_artifact(a)?;
-    let second = read_artifact(b)?;
-    if first != second {
-        return Err(recipe_error(describe_mismatch(&first, &second)));
+    check_pair(canonical, reproduction)?;
+    let ambient = AmbientRecord::pair(
+        canonical.ambient(),
+        reproduction.ambient(),
+        &AmbientClaim::standard(),
+    )?;
+    let canonical_bytes = read_artifact(canonical)?;
+    let reproduction_bytes = read_artifact(reproduction)?;
+    if canonical_bytes != reproduction_bytes {
+        return Err(recipe_error(describe_mismatch(
+            &canonical_bytes,
+            &reproduction_bytes,
+        )));
     }
     Ok(FastlyEqualityChecked {
-        asset: a.asset(),
-        sha256: a.artifact().sha256().to_owned(),
-        size: a.artifact().size(),
+        asset: canonical.asset(),
+        sha256: canonical.artifact().sha256().to_owned(),
+        size: canonical.artifact().size(),
         ambient,
     })
 }
@@ -184,28 +208,29 @@ fn section_at(bytes: &[u8], offset: usize) -> String {
 }
 
 /// Describes a final-byte mismatch with bounded diagnostics.
-pub(super) fn describe_mismatch(first: &[u8], second: &[u8]) -> String {
-    let offset = first_difference(first, second).unwrap_or(first.len());
+pub(super) fn describe_mismatch(canonical: &[u8], reproduction: &[u8]) -> String {
+    let offset = first_difference(canonical, reproduction).unwrap_or(canonical.len());
     let window = |bytes: &[u8]| {
         let end = bytes.len().min(offset.saturating_add(WINDOW));
         hex::encode(bytes.get(offset..end).unwrap_or_default())
     };
-    let differing = first
+    let differing = canonical
         .iter()
-        .zip(second)
+        .zip(reproduction)
         .filter(|(left, right)| left != right)
         .count()
-        + first.len().abs_diff(second.len());
+        + canonical.len().abs_diff(reproduction.len());
     format!(
-        "final Fastly bytes differ: A size {} sha256 {}, B size {} sha256 {}; \
-         first differing offset {offset} (A {}: {}, B {}: {}); {differing} differing bytes",
-        first.len(),
-        hex::encode(Sha256::digest(first)),
-        second.len(),
-        hex::encode(Sha256::digest(second)),
-        section_at(first, offset),
-        window(first),
-        section_at(second, offset),
-        window(second),
+        "final Fastly bytes differ: canonical size {} sha256 {}, \
+         reproduction size {} sha256 {}; first differing offset {offset} \
+         (canonical {}: {}, reproduction {}: {}); {differing} differing bytes",
+        canonical.len(),
+        hex::encode(Sha256::digest(canonical)),
+        reproduction.len(),
+        hex::encode(Sha256::digest(reproduction)),
+        section_at(canonical, offset),
+        window(canonical),
+        section_at(reproduction, offset),
+        window(reproduction),
     )
 }

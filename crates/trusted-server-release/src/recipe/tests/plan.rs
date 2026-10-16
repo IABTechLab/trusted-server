@@ -49,8 +49,12 @@ fn cargo_plan_has_fixed_release_frozen_json_flags_and_exact_source_replacement()
         "should select a nonzero number of assets"
     );
     for (index, artifact) in FIXED_ARTIFACTS.iter().enumerate() {
-        let role = if index % 2 == 0 { Role::A } else { Role::B };
-        let jobs = if role == Role::A { "4" } else { "2" };
+        let role = if index % 2 == 0 {
+            Role::Canonical
+        } else {
+            Role::Reproduction
+        };
+        let jobs = if role == Role::Canonical { "4" } else { "2" };
         let fixture = Fixture::new(COMMIT);
         let prepared = fixture
             .bind(artifact.name, role)
@@ -89,10 +93,10 @@ fn cargo_plan_has_fixed_release_frozen_json_flags_and_exact_source_replacement()
             fixture.base.join("tools/bin/cargo"),
             "should run the selected Cargo by its host path"
         );
-        let checkout = if role == Role::A {
-            "checkout-a"
+        let checkout = if role == Role::Canonical {
+            "checkout-canonical"
         } else {
-            "checkout-b"
+            "checkout-reproduction"
         };
         assert_eq!(
             plan.working_directory,
@@ -192,7 +196,7 @@ fn granular(fixture: &Fixture, omit: &[&str]) -> PrefixPaths {
         ),
         (
             "checkout",
-            fixture.base.join("checkout-a"),
+            fixture.base.join("checkout-canonical"),
             "/c/checkout",
             false,
         ),
@@ -208,7 +212,7 @@ fn granular(fixture: &Fixture, omit: &[&str]) -> PrefixPaths {
 fn path_variables_outside_every_root_are_rejected() {
     let fixture = Fixture::new(COMMIT);
     let prepared = fixture
-        .bind("ts-aarch64-apple-darwin", Role::A)
+        .bind("ts-aarch64-apple-darwin", Role::Canonical)
         .expect("should bind the recipe");
     prepared
         .plan(&granular(&fixture, &[]))
@@ -242,7 +246,11 @@ fn path_variables_outside_every_root_are_rejected() {
 #[test]
 fn child_home_and_cargo_home_must_be_the_request_state() {
     let fixture = Fixture::new(COMMIT);
-    let request = fixture.request("ts-aarch64-apple-darwin", "A", COMMIT);
+    let request = fixture.request(
+        "ts-aarch64-apple-darwin",
+        Role::Canonical.spec_label(),
+        COMMIT,
+    );
     let commit = CommitId::parse(COMMIT).expect("should parse commit");
     let mut forged = child_request(&request);
     forged.home = fixture.base.join("other-work/home");
@@ -255,7 +263,7 @@ fn child_home_and_cargo_home_must_be_the_request_state() {
         completed: &fixture.completed,
         tools: fixture.tools_for(ReleaseTarget::Aarch64AppleDarwin),
         materials: fixture.materials(COMMIT),
-        ambient: fixture.ambient(Role::A),
+        ambient: fixture.ambient(Role::Canonical),
         request,
     });
     assert!(
@@ -286,10 +294,10 @@ fn cargo_plan_rejects_inherited_rustflags_and_selectors() {
     }
     let fixture = Fixture::new(COMMIT);
     let prepared = fixture
-        .bind("ts-x86_64-unknown-linux-gnu", Role::A)
+        .bind("ts-x86_64-unknown-linux-gnu", Role::Canonical)
         .expect("should bind from a benign environment");
     let plan = prepared
-        .plan(&fixture.paths(Role::A))
+        .plan(&fixture.paths(Role::Canonical))
         .expect("should derive the plan");
     for name in plan.environment.keys() {
         assert!(
@@ -344,9 +352,9 @@ fn cargo_plan_rejects_inherited_rustflags_and_selectors() {
 fn plan_digest_binds_every_part_of_the_plan() {
     let fixture = Fixture::new(COMMIT);
     let prepared = fixture
-        .bind("ts-aarch64-apple-darwin", Role::A)
+        .bind("ts-aarch64-apple-darwin", Role::Canonical)
         .expect("should bind the recipe");
-    let paths = fixture.paths(Role::A);
+    let paths = fixture.paths(Role::Canonical);
     let plan = prepared.plan(&paths).expect("should derive the plan");
     let digest = plan.digest().expect("should digest the plan");
     assert_eq!(digest.len(), 64, "should be a SHA-256 hex digest");
@@ -386,7 +394,7 @@ fn plan_digest_binds_every_part_of_the_plan() {
         );
     }
     let mut moved = prepared.plan(&paths).expect("should derive the plan");
-    moved.working_directory = fixture.base.join("checkout-b");
+    moved.working_directory = fixture.base.join("checkout-reproduction");
     assert_ne!(
         moved.digest().expect("should digest the moved plan"),
         digest,
@@ -396,7 +404,7 @@ fn plan_digest_binds_every_part_of_the_plan() {
 
 #[test]
 fn plan_carries_the_role_umask() {
-    for (role, expected) in [(Role::A, 0o022), (Role::B, 0o027)] {
+    for (role, expected) in [(Role::Canonical, 0o022), (Role::Reproduction, 0o027)] {
         let fixture = Fixture::new(COMMIT);
         let prepared = fixture
             .bind("ts-aarch64-apple-darwin", role)
@@ -414,7 +422,7 @@ fn plan_carries_the_role_umask() {
 
 #[test]
 fn confined_command_applies_the_role_umask_and_keeps_host_program_paths() {
-    for (role, expected) in [(Role::A, "022"), (Role::B, "027")] {
+    for (role, expected) in [(Role::Canonical, "022"), (Role::Reproduction, "027")] {
         let fixture = Fixture::new(COMMIT);
         let prepared = fixture
             .bind("ts-aarch64-apple-darwin", role)
@@ -459,7 +467,7 @@ fn real_boundary_translates_every_plan_path() {
     use crate::boundary::Boundary;
     let fixture = Fixture::new(COMMIT);
     let prepared = fixture
-        .bind("ts-aarch64-apple-darwin", Role::A)
+        .bind("ts-aarch64-apple-darwin", Role::Canonical)
         .expect("should bind the recipe");
     let roots = prepared.boundary_roots().expect("should derive roots");
     let boundary = Boundary::mac_sandbox_for_tests(roots).expect("should configure, not run");
@@ -487,7 +495,7 @@ fn real_boundary_translates_every_plan_path() {
 fn execution_paths_with_control_characters_or_separators_are_rejected() {
     let fixture = Fixture::new(COMMIT);
     let prepared = fixture
-        .bind("ts-aarch64-apple-darwin", Role::A)
+        .bind("ts-aarch64-apple-darwin", Role::Canonical)
         .expect("should bind the recipe");
     for bad in [
         "/c/bin\nx",

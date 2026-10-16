@@ -161,7 +161,7 @@ fn tool_digest_detects_edits_hard_links_and_escaping_aliases() {
 fn tools_edited_after_binding_are_rejected_at_the_execute_gate() {
     let fixture = Fixture::new(COMMIT);
     let prepared = fixture
-        .bind("ts-aarch64-apple-darwin", Role::A)
+        .bind("ts-aarch64-apple-darwin", Role::Canonical)
         .expect("should bind the recipe");
     prepared
         .check_tools()
@@ -207,7 +207,7 @@ fn handoff_edits_and_cargo_home_caches_are_rejected_around_the_run() {
     let fixture = Fixture::new(COMMIT);
     let retained = fixture.retained();
     let prepared = fixture
-        .bind("ts-aarch64-apple-darwin", Role::A)
+        .bind("ts-aarch64-apple-darwin", Role::Canonical)
         .expect("should bind the recipe");
     prepared
         .check_inputs()

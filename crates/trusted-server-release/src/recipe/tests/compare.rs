@@ -42,19 +42,20 @@ fn finish(mut built: Built) -> Completed {
     }
 }
 
-fn rejection(a: &RecipeCompleted, b: &RecipeCompleted) -> String {
-    match check_fastly_equality(a, b) {
+fn rejection(canonical: &RecipeCompleted, reproduction: &RecipeCompleted) -> String {
+    match check_fastly_equality(canonical, reproduction) {
         Ok(_) => panic!("should reject the pair"),
         Err(error) => format!("{error:?}"),
     }
 }
 
 #[test]
-fn identical_a_and_b_fastly_bytes_are_accepted_with_the_standard_claim() {
+fn identical_canonical_and_reproduction_fastly_bytes_are_accepted_with_the_standard_claim() {
     let bytes = module(b"info");
-    let a = completed(FASTLY_ASSET, Role::A, &bytes, false);
-    let b = completed(FASTLY_ASSET, Role::B, &bytes, false);
-    let checked = check_fastly_equality(&a, &b).expect("should accept identical final bytes");
+    let canonical = completed(FASTLY_ASSET, Role::Canonical, &bytes, false);
+    let reproduction = completed(FASTLY_ASSET, Role::Reproduction, &bytes, false);
+    let checked = check_fastly_equality(&canonical, &reproduction)
+        .expect("should accept identical final bytes");
     assert_eq!(
         checked.asset().artifact().name,
         FASTLY_ASSET,
@@ -72,7 +73,7 @@ fn identical_a_and_b_fastly_bytes_are_accepted_with_the_standard_claim() {
         "should bind the honest ambient placement"
     );
 
-    let measurement = super::candidate::equality_measurement(&a, &b, &checked);
+    let measurement = super::candidate::equality_measurement(&canonical, &reproduction, &checked);
     assert_eq!(
         (
             &measurement["kind"],
@@ -80,13 +81,13 @@ fn identical_a_and_b_fastly_bytes_are_accepted_with_the_standard_claim() {
             &measurement["release_qualification"],
         ),
         (
-            &serde_json::json!("ordinary-ci-fastly-ab-equality"),
+            &serde_json::json!("ordinary-ci-fastly-canonical-reproduction-equality"),
             &serde_json::json!(true),
             &serde_json::json!(false),
         ),
         "should report candidate equality without release qualification"
     );
-    for (role, umask, jobs) in [("A", "022", 4), ("B", "027", 2)] {
+    for (role, umask, jobs) in [("canonical", "022", 4), ("reproduction", "027", 2)] {
         let build = &measurement["builds"][role];
         assert_eq!(
             build["artifact"]["sha256"],
@@ -116,17 +117,17 @@ fn identical_a_and_b_fastly_bytes_are_accepted_with_the_standard_claim() {
 
 #[test]
 fn one_byte_difference_reports_sizes_digests_and_first_offset() {
-    let a = completed(FASTLY_ASSET, Role::A, &module(b"info"), false);
-    let b = completed(FASTLY_ASSET, Role::B, &module(b"inFo"), false);
-    let message = rejection(&a, &b);
+    let canonical = completed(FASTLY_ASSET, Role::Canonical, &module(b"info"), false);
+    let reproduction = completed(FASTLY_ASSET, Role::Reproduction, &module(b"inFo"), false);
+    let message = rejection(&canonical, &reproduction);
     let offset =
         first_difference(&module(b"info"), &module(b"inFo")).expect("should find the changed byte");
     for part in [
         "final Fastly bytes differ".to_owned(),
         format!("first differing offset {offset}"),
-        format!("A size {}", module(b"info").len()),
-        a.artifact().sha256().to_owned(),
-        b.artifact().sha256().to_owned(),
+        format!("canonical size {}", module(b"info").len()),
+        canonical.artifact().sha256().to_owned(),
+        reproduction.artifact().sha256().to_owned(),
         "custom section \".debug_info\"".to_owned(),
         "1 differing bytes".to_owned(),
     ] {
@@ -149,7 +150,7 @@ fn first_difference_covers_prefixes_and_equal_inputs() {
     );
     let message = describe_mismatch(b"ab", b"abc");
     assert!(
-        message.contains("A size 2") && message.contains("B size 3"),
+        message.contains("canonical size 2") && message.contains("reproduction size 3"),
         "should report both sizes: {message}"
     );
     assert!(
@@ -168,13 +169,13 @@ fn first_difference_covers_prefixes_and_equal_inputs() {
 #[test]
 fn same_role_or_swapped_pairs_are_rejected() {
     let bytes = module(b"info");
-    let a = completed(FASTLY_ASSET, Role::A, &bytes, false);
-    let other_a = completed(FASTLY_ASSET, Role::A, &bytes, false);
-    let b = completed(FASTLY_ASSET, Role::B, &bytes, false);
-    for (first, second) in [(&a, &other_a), (&b, &a)] {
+    let canonical = completed(FASTLY_ASSET, Role::Canonical, &bytes, false);
+    let other_canonical = completed(FASTLY_ASSET, Role::Canonical, &bytes, false);
+    let reproduction = completed(FASTLY_ASSET, Role::Reproduction, &bytes, false);
+    for (first, second) in [(&canonical, &other_canonical), (&reproduction, &canonical)] {
         assert!(
-            rejection(first, second).contains("role A then a role B"),
-            "should require exactly role A then role B"
+            rejection(first, second).contains("a canonical then a reproduction build"),
+            "should require exactly the canonical then the reproduction build"
         );
     }
 }
@@ -182,31 +183,31 @@ fn same_role_or_swapped_pairs_are_rejected() {
 #[test]
 fn mismatched_inputs_or_another_asset_are_rejected() {
     let bytes = module(b"info");
-    let a = completed(FASTLY_ASSET, Role::A, &bytes, false);
-    let derived = completed(FASTLY_ASSET, Role::B, &bytes, true);
+    let canonical = completed(FASTLY_ASSET, Role::Canonical, &bytes, false);
+    let derived = completed(FASTLY_ASSET, Role::Reproduction, &bytes, true);
     assert!(
-        rejection(&a, &derived).contains("derived Git manifests"),
+        rejection(&canonical, &derived).contains("derived Git manifests"),
         "should reject builds over different derived manifests"
     );
     let native = finish(built(
         "ts-aarch64-apple-darwin",
-        Role::A,
+        Role::Canonical,
         b"fictional executable",
     ));
-    let b = completed(FASTLY_ASSET, Role::B, &bytes, false);
+    let reproduction = completed(FASTLY_ASSET, Role::Reproduction, &bytes, false);
     assert!(
-        rejection(&native, &b).contains("compares only"),
+        rejection(&native, &reproduction).contains("compares only"),
         "should compare only the Fastly asset"
     );
 }
 
-/// One forged input of role B and the label its rejection must name.
+/// One forged input of the reproduction build and the label its rejection must name.
 type Forge = (&'static str, fn(&mut SuccessFacts));
 
 #[test]
 fn each_mismatched_input_is_rejected_by_name() {
     let bytes = module(b"info");
-    let a = completed(FASTLY_ASSET, Role::A, &bytes, false);
+    let canonical = completed(FASTLY_ASSET, Role::Canonical, &bytes, false);
     let cases: [Forge; 8] = [
         ("source commits", |facts| {
             facts.commit = CommitId::parse(OTHER_COMMIT).expect("should parse commit");
@@ -234,12 +235,12 @@ fn each_mismatched_input_is_rejected_by_name() {
         }),
     ];
     for (label, forge) in cases {
-        let mut b = completed(FASTLY_ASSET, Role::B, &bytes, false);
-        forge(b.completed.facts_mut_for_tests());
-        let message = rejection(&a, &b);
+        let mut reproduction = completed(FASTLY_ASSET, Role::Reproduction, &bytes, false);
+        forge(reproduction.completed.facts_mut_for_tests());
+        let message = rejection(&canonical, &reproduction);
         assert!(
             message.contains(label),
-            "should reject a B build with mismatched {label}: {message}"
+            "should reject a reproduction build with mismatched {label}: {message}"
         );
     }
 }
@@ -247,11 +248,12 @@ fn each_mismatched_input_is_rejected_by_name() {
 #[test]
 fn artifact_changed_after_completion_is_rejected() {
     let bytes = module(b"info");
-    let a = completed(FASTLY_ASSET, Role::A, &bytes, false);
-    let b = completed(FASTLY_ASSET, Role::B, &bytes, false);
-    std::fs::write(b.artifact().path(), module(b"inFo")).expect("should tamper with B");
+    let canonical = completed(FASTLY_ASSET, Role::Canonical, &bytes, false);
+    let reproduction = completed(FASTLY_ASSET, Role::Reproduction, &bytes, false);
+    std::fs::write(reproduction.artifact().path(), module(b"inFo"))
+        .expect("should tamper with the reproduction build");
     assert!(
-        rejection(&a, &b).contains("artifact bytes changed"),
+        rejection(&canonical, &reproduction).contains("artifact bytes changed"),
         "should rehash both artifacts before comparing"
     );
 }

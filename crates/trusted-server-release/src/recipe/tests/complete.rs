@@ -50,7 +50,7 @@ pub(super) fn built(asset: &'static str, role: Role, bytes: &[u8]) -> Built {
 pub(super) fn built_with(asset: &'static str, role: Role, bytes: &[u8], derived: bool) -> Built {
     let fixture = Fixture::new(COMMIT);
     let prepared = if derived {
-        let text = if role == Role::A { "A" } else { "B" };
+        let text = role.spec_label();
         let request = fixture.request(asset, text, COMMIT);
         let tools = fixture.tools_for(request.asset.artifact().target);
         let materials = fixture
@@ -144,11 +144,11 @@ fn rejection(result: Result<RecipeCompleted, Report<ReleaseError>>) -> String {
 #[test]
 fn successful_run_binds_every_input_and_copies_the_artifact() {
     let bytes = b"fictional native executable";
-    let mut built = built("ts-aarch64-apple-darwin", Role::A, bytes);
+    let mut built = built("ts-aarch64-apple-darwin", Role::Canonical, bytes);
     let stdout = built.stdout(|_| {});
     let expected_plan = built
         .prepared()
-        .plan(&built.fixture.paths(Role::A))
+        .plan(&built.fixture.paths(Role::Canonical))
         .expect("should derive the plan")
         .digest()
         .expect("should digest the plan");
@@ -169,7 +169,7 @@ fn successful_run_binds_every_input_and_copies_the_artifact() {
         "ts-aarch64-apple-darwin",
         "should bind the asset"
     );
-    assert_eq!(completed.role(), Role::A, "should bind the role");
+    assert_eq!(completed.role(), Role::Canonical, "should bind the role");
     assert_eq!(
         completed.commit().as_str(),
         COMMIT,
@@ -207,7 +207,7 @@ fn successful_run_binds_every_input_and_copies_the_artifact() {
     );
     assert_eq!(
         completed.ambient().role(),
-        Role::A,
+        Role::Canonical,
         "should bind the ambient"
     );
     assert_eq!(
@@ -300,7 +300,7 @@ fn rehash_rejects_changed_output_and_retained_stream() {
     for (label, tamper) in tampers {
         let mut built = built(
             "ts-aarch64-apple-darwin",
-            Role::A,
+            Role::Canonical,
             b"fictional native executable",
         );
         let stdout = built.stdout(|_| {});
@@ -334,7 +334,7 @@ fn malformed_streams_complete_nothing_and_copy_nothing() {
     for (label, edit) in edits {
         let mut built = built(
             "ts-aarch64-apple-darwin",
-            Role::A,
+            Role::Canonical,
             b"fictional native executable",
         );
         let stdout = built.stdout(edit);
@@ -355,7 +355,7 @@ fn malformed_streams_complete_nothing_and_copy_nothing() {
 fn changed_tools_or_materials_or_existing_output_reject_completion() {
     let mut built_tools = built(
         "ts-aarch64-apple-darwin",
-        Role::A,
+        Role::Canonical,
         b"fictional native executable",
     );
     let stdout = built_tools.stdout(|_| {});
@@ -368,7 +368,7 @@ fn changed_tools_or_materials_or_existing_output_reject_completion() {
 
     let mut built_materials = built(
         "ts-aarch64-apple-darwin",
-        Role::A,
+        Role::Canonical,
         b"fictional native executable",
     );
     let stdout = built_materials.stdout(|_| {});
@@ -387,7 +387,7 @@ fn changed_tools_or_materials_or_existing_output_reject_completion() {
 
     let mut built_output = built(
         "ts-aarch64-apple-darwin",
-        Role::A,
+        Role::Canonical,
         b"fictional native executable",
     );
     let stdout = built_output.stdout(|_| {});
@@ -409,7 +409,7 @@ fn changed_tools_or_materials_or_existing_output_reject_completion() {
 fn wasm_artifacts_must_keep_debug_sections() {
     let asset = "trusted-server-fastly.wasm";
     let stripped = wasm_with(&[("name", b"n")]);
-    let mut built_stripped = built(asset, Role::A, &stripped);
+    let mut built_stripped = built(asset, Role::Canonical, &stripped);
     let stdout = built_stripped.stdout(|_| {});
     let message = rejection(built_stripped.finish(stdout));
     assert!(
@@ -418,7 +418,7 @@ fn wasm_artifacts_must_keep_debug_sections() {
     );
 
     let kept = wasm_with(&[(".debug_info", b"i"), (".debug_line", b"l")]);
-    let mut built_kept = built(asset, Role::A, &kept);
+    let mut built_kept = built(asset, Role::Canonical, &kept);
     let stdout = built_kept.stdout(|_| {});
     let completed = built_kept
         .finish(stdout)
@@ -429,7 +429,7 @@ fn wasm_artifacts_must_keep_debug_sections() {
         "should publish under the asset name"
     );
 
-    let mut built_text = built(asset, Role::A, b"not wasm at all");
+    let mut built_text = built(asset, Role::Canonical, b"not wasm at all");
     let stdout = built_text.stdout(|_| {});
     assert!(
         built_text.finish(stdout).is_err(),
@@ -441,7 +441,7 @@ fn wasm_artifacts_must_keep_debug_sections() {
 fn execute_stays_closed_for_an_ordinary_ci_selection() {
     let built = built(
         "ts-aarch64-apple-darwin",
-        Role::A,
+        Role::Canonical,
         b"fictional native executable",
     );
     assert_eq!(
@@ -455,7 +455,7 @@ fn execute_stays_closed_for_an_ordinary_ci_selection() {
 fn derived_manifest_digests_are_carried_into_the_completion() {
     let mut plain = built(
         "ts-aarch64-apple-darwin",
-        Role::A,
+        Role::Canonical,
         b"fictional native executable",
     );
     let stdout = plain.stdout(|_| {});
@@ -467,7 +467,7 @@ fn derived_manifest_digests_are_carried_into_the_completion() {
 
     let mut derived = built_with(
         "ts-aarch64-apple-darwin",
-        Role::A,
+        Role::Canonical,
         b"fictional native executable",
         true,
     );
@@ -484,7 +484,7 @@ fn derived_manifest_digests_are_carried_into_the_completion() {
 fn candidate_measurements_report_no_release_qualification() {
     let asset = "trusted-server-fastly.wasm";
     let kept = wasm_with(&[(".debug_info", b"i"), (".debug_line", b"l")]);
-    let mut built = built_with(asset, Role::A, &kept, true);
+    let mut built = built_with(asset, Role::Canonical, &kept, true);
     let stdout = built.stdout(|_| {});
     let completed = built.finish(stdout).expect("should complete the run");
 
@@ -498,7 +498,7 @@ fn candidate_measurements_report_no_release_qualification() {
         "should never claim release qualification"
     );
     assert_eq!(measurement["asset"], asset, "should name the asset");
-    assert_eq!(measurement["role"], "A", "should name the role");
+    assert_eq!(measurement["role"], "canonical", "should name the role");
     assert_eq!(
         measurement["source_commit"], COMMIT,
         "should bind the commit"

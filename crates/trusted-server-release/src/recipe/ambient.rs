@@ -1,4 +1,5 @@
-//! Ambient build conditions: compiled profiles, observations and A/B pairing.
+//! Ambient build conditions: compiled profiles, observations and the
+//! canonical/reproduction pairing.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -16,7 +17,8 @@ const NORMALIZED_LOCALE: &str = "C";
 /// Timezone every compiler child sees, whatever the host reports.
 const NORMALIZED_TIMEZONE: &str = "UTC";
 
-/// A qualified alternate B profile; none exists, so production B stays closed.
+/// A qualified alternate reproduction profile; none exists, so the production
+/// reproduction build stays closed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum QualifiedAlternate {}
 
@@ -32,8 +34,9 @@ pub(crate) struct AmbientProfile {
 }
 
 impl AmbientProfile {
-    /// Profile of the first build; its symbolic user and root are qualification-selected.
-    pub(crate) const A: Self = Self {
+    /// Profile of the canonical build; its symbolic user and root are
+    /// qualification-selected.
+    pub(crate) const CANONICAL: Self = Self {
         checkout_root: "external-release-A",
         execution_user: "qualification-selected",
         jobs: 4,
@@ -42,8 +45,8 @@ impl AmbientProfile {
         umask: 0o022,
     };
 
-    /// Placeholder of the second build; its alternates await qualification.
-    pub(crate) const B_PENDING: Self = Self {
+    /// Placeholder of the reproduction build; its alternates await qualification.
+    pub(crate) const REPRODUCTION_PENDING: Self = Self {
         checkout_root: "external-release-B",
         execution_user: "qualified-alternate-or-unsupported",
         jobs: 2,
@@ -56,13 +59,13 @@ impl AmbientProfile {
     ///
     /// # Errors
     ///
-    /// Returns [`ReleaseError::Unqualified`] for role B: its alternate
-    /// locale, timezone and user have not been qualified.
+    /// Returns [`ReleaseError::Unqualified`] for the reproduction build: its
+    /// alternate locale, timezone and user have not been qualified.
     pub(crate) fn for_role(role: Role) -> Result<Self, Report<ReleaseError>> {
         match role {
-            Role::A => Ok(Self::A),
-            Role::B => Err(Report::new(ReleaseError::Unqualified)
-                .attach("role B alternate ambient profile is not qualified")),
+            Role::Canonical => Ok(Self::CANONICAL),
+            Role::Reproduction => Err(Report::new(ReleaseError::Unqualified)
+                .attach("reproduction build alternate ambient profile is not qualified")),
         }
     }
 
@@ -87,8 +90,27 @@ impl AmbientProfile {
             locale,
             timezone,
             execution_user: "qualification-selected",
-            ..Self::B_PENDING
+            ..Self::REPRODUCTION_PENDING
         }
+    }
+
+    /// The compiled profiles `release-tools.json` tracks, by role.
+    fn tracked() -> [(Role, Self); 2] {
+        [
+            (Role::Canonical, Self::CANONICAL),
+            (Role::Reproduction, Self::REPRODUCTION_PENDING),
+        ]
+    }
+
+    /// Renders the `ambient_profiles` map exactly as `release-tools.json`
+    /// states it, keyed by each role's [`Role::spec_label`].
+    pub(crate) fn tracked_json() -> Value {
+        Value::Object(
+            Self::tracked()
+                .into_iter()
+                .map(|(role, profile)| (role.spec_label().to_owned(), profile.to_json()))
+                .collect(),
+        )
     }
 
     /// Renders the profile exactly as `release-tools.json` states it.
@@ -110,7 +132,8 @@ impl AmbientProfile {
 ///
 /// Returns [`ReleaseError::Recipe`] naming the profile that drifted.
 pub(crate) fn check_profile_drift(settings: &Value) -> Result<(), Report<ReleaseError>> {
-    for (name, compiled) in [("A", AmbientProfile::A), ("B", AmbientProfile::B_PENDING)] {
+    for (role, compiled) in AmbientProfile::tracked() {
+        let name = role.spec_label();
         if settings["ambient_profiles"][name] != compiled.to_json() {
             return Err(recipe_error(format!(
                 "tracked ambient profile {name} differs from the compiled profile"
@@ -152,7 +175,7 @@ impl Dimension {
     ];
 }
 
-/// How one dimension is reported in the A/B pair.
+/// How one dimension is reported in the canonical/reproduction pair.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Treatment {
     Varied,
@@ -284,13 +307,13 @@ fn same<T: PartialEq + std::fmt::Debug>(
 /// Requires the profile to be the runnable one compiled for `role`.
 fn check_profile_role(role: Role, profile: &AmbientProfile) -> Result<(), Report<ReleaseError>> {
     let belongs = match role {
-        Role::A => *profile == AmbientProfile::A,
-        Role::B => {
-            *profile != AmbientProfile::B_PENDING
-                && profile.umask != AmbientProfile::A.umask
-                && profile.jobs != AmbientProfile::A.jobs
-                && profile.locale != AmbientProfile::A.locale
-                && profile.timezone != AmbientProfile::A.timezone
+        Role::Canonical => *profile == AmbientProfile::CANONICAL,
+        Role::Reproduction => {
+            *profile != AmbientProfile::REPRODUCTION_PENDING
+                && profile.umask != AmbientProfile::CANONICAL.umask
+                && profile.jobs != AmbientProfile::CANONICAL.jobs
+                && profile.locale != AmbientProfile::CANONICAL.locale
+                && profile.timezone != AmbientProfile::CANONICAL.timezone
         }
     };
     if belongs {
@@ -350,28 +373,31 @@ fn expected_treatment(dimension: Dimension) -> Treatment {
 
 /// Requires every dimension that must vary to vary, and the user to match.
 fn check_variation(
-    first: &ObservedAmbient,
-    second: &ObservedAmbient,
+    canonical: &ObservedAmbient,
+    reproduction: &ObservedAmbient,
 ) -> Result<(), Report<ReleaseError>> {
     for (dimension, differs) in [
-        (Dimension::Umask, first.umask != second.umask),
-        (Dimension::Jobs, first.jobs != second.jobs),
+        (Dimension::Umask, canonical.umask != reproduction.umask),
+        (Dimension::Jobs, canonical.jobs != reproduction.jobs),
         (
             Dimension::StartTime,
-            first.started_at_seconds != second.started_at_seconds,
+            canonical.started_at_seconds != reproduction.started_at_seconds,
         ),
     ] {
         if !differs {
             return Err(recipe_error(format!(
-                "{dimension} is identical across the A and B builds"
+                "{dimension} is identical across the canonical and reproduction builds"
             )));
         }
     }
     disjoint(&[
-        ("checkout root A", first.checkout_root.as_path()),
-        ("checkout root B", second.checkout_root.as_path()),
+        ("canonical checkout root", canonical.checkout_root.as_path()),
+        (
+            "reproduction checkout root",
+            reproduction.checkout_root.as_path(),
+        ),
     ])?;
-    if first.execution_uid != second.execution_uid {
+    if canonical.execution_uid != reproduction.execution_uid {
         return Err(recipe_error(
             "execution user differs but no alternate user is qualified",
         ));
@@ -393,30 +419,33 @@ fn check_claim(claim: &AmbientClaim) -> Result<(), Report<ReleaseError>> {
     Ok(())
 }
 
-/// A verified A/B ambient pairing.
+/// A verified canonical/reproduction ambient pairing.
 #[derive(Clone, Debug)]
 pub(crate) struct AmbientRecord {
     claim: AmbientClaim,
 }
 
 impl AmbientRecord {
-    /// Verifies that the A and B builds varied exactly what the claim states.
+    /// Verifies that the canonical and reproduction builds varied exactly
+    /// what the claim states.
     ///
     /// # Errors
     ///
-    /// Returns [`ReleaseError::Recipe`] when the roles are not A then B, a
-    /// varied dimension did not vary, checkout roots overlap, the execution
-    /// user differs without qualification, or the claim omits or misplaces a
-    /// dimension.
+    /// Returns [`ReleaseError::Recipe`] when the roles are not canonical then
+    /// reproduction, a varied dimension did not vary, checkout roots overlap,
+    /// the execution user differs without qualification, or the claim omits
+    /// or misplaces a dimension.
     pub(crate) fn pair(
-        first: &CheckedAmbient,
-        second: &CheckedAmbient,
+        canonical: &CheckedAmbient,
+        reproduction: &CheckedAmbient,
         claim: &AmbientClaim,
     ) -> Result<Self, Report<ReleaseError>> {
-        if first.role != Role::A || second.role != Role::B {
-            return Err(recipe_error("ambient pair must be role A then role B"));
+        if canonical.role != Role::Canonical || reproduction.role != Role::Reproduction {
+            return Err(recipe_error(
+                "ambient pair must be the canonical then the reproduction build",
+            ));
         }
-        check_variation(&first.observed, &second.observed)?;
+        check_variation(&canonical.observed, &reproduction.observed)?;
         check_claim(claim)?;
         Ok(Self {
             claim: claim.clone(),

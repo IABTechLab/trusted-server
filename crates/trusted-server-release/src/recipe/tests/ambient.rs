@@ -20,35 +20,51 @@ fn check_error(role: Role, profile: &AmbientProfile, observed: ObservedAmbient) 
 }
 
 #[test]
-fn role_b_with_role_a_umask_is_rejected() {
-    checked_a();
-    checked_b();
-    let b_profile = AmbientProfile::alternate_for_tests();
+fn reproduction_with_canonical_umask_is_rejected() {
+    checked_canonical();
+    checked_reproduction();
+    let reproduction_profile = AmbientProfile::alternate_for_tests();
     let wrong_umask = ObservedAmbient {
         umask: 0o022,
-        ..observed_b()
+        ..observed_reproduction()
     };
     assert!(
-        check_error(Role::B, &b_profile, wrong_umask).contains("umask"),
-        "should reject role B observed under the role A umask"
+        check_error(Role::Reproduction, &reproduction_profile, wrong_umask).contains("umask"),
+        "should reject the reproduction build observed under the canonical umask"
     );
-    let a_with_b_umask = ObservedAmbient {
+    let canonical_with_reproduction_umask = ObservedAmbient {
         umask: 0o027,
-        ..observed_a()
+        ..observed_canonical()
     };
     assert!(
-        check_error(Role::A, &AmbientProfile::A, a_with_b_umask).contains("umask"),
-        "should reject role A observed under the role B umask"
+        check_error(
+            Role::Canonical,
+            &AmbientProfile::CANONICAL,
+            canonical_with_reproduction_umask
+        )
+        .contains("umask"),
+        "should reject the canonical build observed under the reproduction umask"
     );
     assert!(
-        check_error(Role::B, &AmbientProfile::A, observed_a()).contains("runnable profile"),
-        "should reject role B bound to the role A profile"
+        check_error(
+            Role::Reproduction,
+            &AmbientProfile::CANONICAL,
+            observed_canonical()
+        )
+        .contains("runnable profile"),
+        "should reject the reproduction build bound to the canonical profile"
     );
     assert!(
-        check_error(Role::A, &b_profile, observed_b()).contains("runnable profile"),
-        "should reject role A bound to an alternate profile"
+        check_error(
+            Role::Canonical,
+            &reproduction_profile,
+            observed_reproduction()
+        )
+        .contains("runnable profile"),
+        "should reject the canonical build bound to an alternate profile"
     );
-    let closed = AmbientProfile::for_role(Role::B).expect_err("should keep B closed");
+    let closed = AmbientProfile::for_role(Role::Reproduction)
+        .expect_err("should keep the reproduction build closed");
     assert!(
         format!("{closed:?}").contains("not qualified"),
         "should name the missing qualification"
@@ -57,26 +73,35 @@ fn role_b_with_role_a_umask_is_rejected() {
 
 #[test]
 fn observed_jobs_mismatch_is_rejected() {
-    let a_wrong = ObservedAmbient {
+    let canonical_wrong = ObservedAmbient {
         jobs: 2,
-        ..observed_a()
+        ..observed_canonical()
     };
     assert!(
-        check_error(Role::A, &AmbientProfile::A, a_wrong).contains("jobs"),
-        "should reject A observed with B jobs"
+        check_error(Role::Canonical, &AmbientProfile::CANONICAL, canonical_wrong).contains("jobs"),
+        "should reject the canonical build observed with reproduction jobs"
     );
-    let b_wrong = ObservedAmbient {
+    let reproduction_wrong = ObservedAmbient {
         jobs: 8,
-        ..observed_b()
+        ..observed_reproduction()
     };
     assert!(
-        check_error(Role::B, &AmbientProfile::alternate_for_tests(), b_wrong).contains("jobs"),
-        "should reject B observed with unrelated jobs"
+        check_error(
+            Role::Reproduction,
+            &AmbientProfile::alternate_for_tests(),
+            reproduction_wrong
+        )
+        .contains("jobs"),
+        "should reject the reproduction build observed with unrelated jobs"
     );
 }
 
-fn claim_error(first: &CheckedAmbient, second: &CheckedAmbient, claim: &AmbientClaim) -> String {
-    match AmbientRecord::pair(first, second, claim) {
+fn claim_error(
+    canonical: &CheckedAmbient,
+    reproduction: &CheckedAmbient,
+    claim: &AmbientClaim,
+) -> String {
+    match AmbientRecord::pair(canonical, reproduction, claim) {
         Ok(_) => panic!("should reject the pairing"),
         Err(error) => format!("{error:?}"),
     }
@@ -84,8 +109,12 @@ fn claim_error(first: &CheckedAmbient, second: &CheckedAmbient, claim: &AmbientC
 
 #[test]
 fn normalized_locale_reported_as_varied_is_rejected() {
-    let record = AmbientRecord::pair(&checked_a(), &checked_b(), &AmbientClaim::standard())
-        .expect("should accept the standard claim");
+    let record = AmbientRecord::pair(
+        &checked_canonical(),
+        &checked_reproduction(),
+        &AmbientClaim::standard(),
+    )
+    .expect("should accept the standard claim");
     assert_eq!(
         record.claim(),
         &AmbientClaim::standard(),
@@ -96,17 +125,18 @@ fn normalized_locale_reported_as_varied_is_rejected() {
         claim.normalized.remove(&dimension);
         claim.varied.insert(dimension);
         assert!(
-            claim_error(&checked_a(), &checked_b(), &claim).contains("misreports"),
+            claim_error(&checked_canonical(), &checked_reproduction(), &claim)
+                .contains("misreports"),
             "should reject {dimension} claimed as varied"
         );
     }
     let leaking_child = ObservedAmbient {
         child_locale: "en_US.UTF-8".to_owned(),
-        ..observed_b()
+        ..observed_reproduction()
     };
     assert!(
         check_error(
-            Role::B,
+            Role::Reproduction,
             &AmbientProfile::alternate_for_tests(),
             leaking_child
         )
@@ -121,20 +151,20 @@ fn unsupported_execution_user_claimed_as_varied_is_rejected() {
     claim.unsupported.remove(&Dimension::ExecutionUser);
     claim.varied.insert(Dimension::ExecutionUser);
     assert!(
-        claim_error(&checked_a(), &checked_b(), &claim).contains("misreports"),
+        claim_error(&checked_canonical(), &checked_reproduction(), &claim).contains("misreports"),
         "should reject an unqualified user claimed as varied"
     );
     let other_user = CheckedAmbient::check(
-        Role::B,
+        Role::Reproduction,
         &AmbientProfile::alternate_for_tests(),
         ObservedAmbient {
             execution_uid: 502,
-            ..observed_b()
+            ..observed_reproduction()
         },
     )
     .expect("should check the alternate user in isolation");
     assert!(
-        claim_error(&checked_a(), &other_user, &AmbientClaim::standard())
+        claim_error(&checked_canonical(), &other_user, &AmbientClaim::standard())
             .contains("execution user"),
         "should reject an actually different unqualified user"
     );
@@ -148,50 +178,57 @@ fn omitted_ambient_dimension_is_rejected() {
         claim.normalized.remove(&dimension);
         claim.unsupported.remove(&dimension);
         assert!(
-            claim_error(&checked_a(), &checked_b(), &claim).contains("omits"),
+            claim_error(&checked_canonical(), &checked_reproduction(), &claim).contains("omits"),
             "should reject a claim omitting {dimension}"
         );
     }
     let mut duplicated = AmbientClaim::standard();
     duplicated.normalized.insert(Dimension::Jobs);
     assert!(
-        claim_error(&checked_a(), &checked_b(), &duplicated).contains("misreports"),
+        claim_error(&checked_canonical(), &checked_reproduction(), &duplicated)
+            .contains("misreports"),
         "should reject a dimension placed twice"
     );
 }
 
 #[test]
-fn identical_checkout_roots_for_a_and_b_are_rejected() {
+fn identical_canonical_and_reproduction_checkout_roots_are_rejected() {
     for root in [
-        "/example/release-a",
-        "/example/release-a/nested",
+        "/example/release-canonical",
+        "/example/release-canonical/nested",
         "/example",
     ] {
         let overlapping = CheckedAmbient::check(
-            Role::B,
+            Role::Reproduction,
             &AmbientProfile::alternate_for_tests(),
             ObservedAmbient {
                 checkout_root: PathBuf::from(root),
-                ..observed_b()
+                ..observed_reproduction()
             },
         )
         .expect("should check the alternate root in isolation");
         assert!(
-            claim_error(&checked_a(), &overlapping, &AmbientClaim::standard()).contains("overlap"),
-            "should reject checkout root {root} overlapping A"
+            claim_error(
+                &checked_canonical(),
+                &overlapping,
+                &AmbientClaim::standard()
+            )
+            .contains("overlap"),
+            "should reject checkout root {root} overlapping the canonical build"
         );
     }
     let same_start = CheckedAmbient::check(
-        Role::B,
+        Role::Reproduction,
         &AmbientProfile::alternate_for_tests(),
         ObservedAmbient {
-            started_at_seconds: observed_a().started_at_seconds,
-            ..observed_b()
+            started_at_seconds: observed_canonical().started_at_seconds,
+            ..observed_reproduction()
         },
     )
     .expect("should check the alternate start in isolation");
     assert!(
-        claim_error(&checked_a(), &same_start, &AmbientClaim::standard()).contains("StartTime"),
+        claim_error(&checked_canonical(), &same_start, &AmbientClaim::standard())
+            .contains("StartTime"),
         "should reject builds that did not start at different times"
     );
 }
@@ -209,11 +246,11 @@ fn rust_profile_drift_from_release_tools_json_is_rejected() {
             .expect("should accept the tracked ambient profiles");
         checked += 1;
         for (profile, field, value) in [
-            ("A", "umask", Value::from("027")),
-            ("A", "jobs", Value::from(2)),
-            ("B", "jobs", Value::from(4)),
-            ("B", "umask", Value::from("022")),
-            ("B", "locale", Value::from("C")),
+            (Role::Canonical.spec_label(), "umask", Value::from("027")),
+            (Role::Canonical.spec_label(), "jobs", Value::from(2)),
+            (Role::Reproduction.spec_label(), "jobs", Value::from(4)),
+            (Role::Reproduction.spec_label(), "umask", Value::from("022")),
+            (Role::Reproduction.spec_label(), "locale", Value::from("C")),
         ] {
             let mut drifted = recipe["settings"].clone();
             drifted["ambient_profiles"][profile][field] = value;
@@ -227,34 +264,36 @@ fn rust_profile_drift_from_release_tools_json_is_rejected() {
         missing["ambient_profiles"]
             .as_object_mut()
             .expect("should hold profiles")
-            .remove("B");
+            .remove(Role::Reproduction.spec_label());
         assert!(
-            check_profile_drift(&missing)
-                .is_err_and(|error| format!("{error:?}").contains("profile B")),
-            "should reject a missing B profile"
+            check_profile_drift(&missing).is_err_and(|error| {
+                format!("{error:?}")
+                    .contains(&format!("profile {}", Role::Reproduction.spec_label()))
+            }),
+            "should reject a missing reproduction profile"
         );
     }
     assert_eq!(checked, 4, "should check every artifact recipe");
 }
 
 #[test]
-fn role_b_with_a_locale_or_timezone_is_rejected() {
+fn reproduction_with_canonical_locale_or_timezone_is_rejected() {
     let same_locale = AmbientProfile::alternate_with_host_for_tests("C", "Pacific/Auckland");
     let observed = ObservedAmbient {
         host_locale: "C".to_owned(),
-        ..observed_b()
+        ..observed_reproduction()
     };
     assert!(
-        check_error(Role::B, &same_locale, observed).contains("runnable profile"),
-        "should reject role B that keeps the role A locale"
+        check_error(Role::Reproduction, &same_locale, observed).contains("runnable profile"),
+        "should reject a reproduction build that keeps the canonical locale"
     );
     let same_timezone = AmbientProfile::alternate_with_host_for_tests("en_US.UTF-8", "UTC");
     let observed = ObservedAmbient {
         host_timezone: "UTC".to_owned(),
-        ..observed_b()
+        ..observed_reproduction()
     };
     assert!(
-        check_error(Role::B, &same_timezone, observed).contains("runnable profile"),
-        "should reject role B that keeps the role A timezone"
+        check_error(Role::Reproduction, &same_timezone, observed).contains("runnable profile"),
+        "should reject a reproduction build that keeps the canonical timezone"
     );
 }

@@ -84,7 +84,7 @@ fn nested_or_equal_remapped_roots_are_rejected() {
 fn plan_rejects_remapped_roots_that_overlap_in_the_execution_namespace() {
     let fixture = Fixture::new(COMMIT);
     let prepared = fixture
-        .bind("trusted-server-fastly.wasm", Role::A)
+        .bind("trusted-server-fastly.wasm", Role::Canonical)
         .expect("should bind the recipe");
     let nested = PrefixPaths::new()
         .with(
@@ -93,7 +93,7 @@ fn plan_rejects_remapped_roots_that_overlap_in_the_execution_namespace() {
             false,
         )
         .with(
-            &fixture.base.join("checkout-a"),
+            &fixture.base.join("checkout-canonical"),
             "/boundary/immutable/0",
             false,
         )
@@ -114,27 +114,27 @@ fn plan_rejects_remapped_roots_that_overlap_in_the_execution_namespace() {
 #[test]
 fn remap_is_identical_for_both_roles_in_the_same_mount_layout() {
     let fixture = Fixture::new(COMMIT);
-    let a = fixture
-        .bind("trusted-server-fastly.wasm", Role::A)
-        .expect("should bind role A")
-        .plan(&fixture.paths(Role::A))
-        .expect("should plan A");
+    let canonical = fixture
+        .bind("trusted-server-fastly.wasm", Role::Canonical)
+        .expect("should bind the canonical build")
+        .plan(&fixture.paths(Role::Canonical))
+        .expect("should plan the canonical build");
     let other = Fixture::new(COMMIT);
-    let b = other
-        .bind("trusted-server-fastly.wasm", Role::B)
-        .expect("should bind role B")
-        .plan(&other.paths(Role::B))
-        .expect("should plan B");
+    let reproduction = other
+        .bind("trusted-server-fastly.wasm", Role::Reproduction)
+        .expect("should bind the reproduction build")
+        .plan(&other.paths(Role::Reproduction))
+        .expect("should plan the reproduction build");
     assert_ne!(
-        a.working_directory, b.working_directory,
+        canonical.working_directory, reproduction.working_directory,
         "should run from distinct host checkouts"
     );
     assert_eq!(
-        remap_config(&a),
-        remap_config(&b),
+        remap_config(&canonical),
+        remap_config(&reproduction),
         "should hand both roles the same remap in the same execution layout"
     );
-    for plan in [&a, &b] {
+    for plan in [&canonical, &reproduction] {
         assert_eq!(
             (
                 plan.environment.get("LC_ALL").map(String::as_str),
@@ -150,7 +150,7 @@ fn remap_is_identical_for_both_roles_in_the_same_mount_layout() {
 fn remap_follows_identity_paths_to_the_same_fixed_prefixes() {
     let fixture = Fixture::new(COMMIT);
     let prepared = fixture
-        .bind("trusted-server-fastly.wasm", Role::A)
+        .bind("trusted-server-fastly.wasm", Role::Canonical)
         .expect("should bind the recipe");
     let base = fixture.base.to_str().expect("should be UTF-8");
     let retained = fixture.retained();
@@ -166,7 +166,7 @@ fn remap_follows_identity_paths_to_the_same_fixed_prefixes() {
         remap_config(&plan),
         format!(
             "target.\"wasm32-wasip1\".rustflags=[\
-             \"--remap-path-prefix={base}/checkout-a=/trusted-server\",\
+             \"--remap-path-prefix={base}/checkout-canonical=/trusted-server\",\
              \"--remap-path-prefix={base}/materials/vendor=/cargo-vendor\",\
              \"--remap-path-prefix={base}/cargo-state/cargo-home=/cargo-home\",\
              \"--remap-path-prefix={base}/tools=/rust-tools\",\

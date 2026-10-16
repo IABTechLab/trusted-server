@@ -187,7 +187,7 @@ fn two_fresh_js_builds(
     let completed=prepared.run([&first,&second],[&first_proof,&second_proof]).expect("should complete both actual fresh offline installations, lifecycle observations, negative tool controls, full suites and final-byte equality");
     assert!(
         owned_roots.iter().all(|root| !root.exists()),
-        "should close all six private A/B source, state and metadata roots before completion"
+        "should close all six private source, state and metadata roots of both builds before completion"
     );
     assert_eq!(
         completed.source_commit(),

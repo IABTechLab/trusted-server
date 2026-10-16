@@ -120,7 +120,7 @@ impl JsBuildCompleted {
     pub(crate) fn inventory_sha256(&self) -> &str {
         &self.inventory_sha256
     }
-    /// Returns the independent A/B successful registered test counts.
+    /// Returns the successful registered test counts of both independent JS builds.
     pub(crate) fn test_counts(&self) -> [u64; 2] {
         self.tests
     }
@@ -319,7 +319,7 @@ fn compare_modules(
         || filenames(second, expected.len())? != expected
     {
         return Err(preparation_error(
-            "A/B final bundle sets differ from approved source",
+            "independent JS build bundle sets differ from approved source",
         ));
     }
     for module in modules.values() {
@@ -330,7 +330,9 @@ fn compare_modules(
             || first.sha256 != module.sha256
             || first.bytes.len() as u64 != module.size
         {
-            return Err(preparation_error("full A/B final JS module bytes differ"));
+            return Err(preparation_error(
+                "final JS module bytes differ between the independent builds",
+            ));
         }
     }
     Ok(())
@@ -732,7 +734,7 @@ impl PreparedJsBuild<'_> {
                 .ok_or_else(|| preparation_error("B omitted a tracked module"))?;
             if first.sha256 != last.sha256 || first.size != last.size {
                 return Err(preparation_error(
-                    "A/B inventory module measurements differ",
+                    "independent JS build inventory module measurements differ",
                 ));
             }
         }

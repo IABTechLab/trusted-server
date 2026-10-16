@@ -132,25 +132,41 @@ impl AssetId {
 /// Which independent build of the pair a recipe belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Role {
-    /// The first, reference build.
-    A,
-    /// The second build under varied ambient conditions.
-    B,
+    /// The canonical build whose output is proposed for publication.
+    Canonical,
+    /// The independent reproduction under varied ambient conditions, which
+    /// must match the canonical build.
+    Reproduction,
 }
 
 impl Role {
-    /// Parses exactly `A` or `B`.
+    /// Parses exactly `A` or `B`, the external spelling of the two roles.
+    ///
+    /// The spec (R-REPEAT, "Build A" and "Build B") and the closed
+    /// `build.sh --role A|B` interface of the implementation plan (Task 9)
+    /// name the roles `A` and `B`, as do the tracked `ambient_profiles` keys
+    /// of `release-tools.json`. This and [`Self::spec_label`] are the only
+    /// places that spelling maps to [`Self::Canonical`] and
+    /// [`Self::Reproduction`].
     ///
     /// # Errors
     ///
     /// Returns [`ReleaseError::Recipe`] for any other text.
     pub(crate) fn parse(text: &str) -> Result<Self, Report<ReleaseError>> {
         match text {
-            "A" => Ok(Self::A),
-            "B" => Ok(Self::B),
+            "A" => Ok(Self::Canonical),
+            "B" => Ok(Self::Reproduction),
             _ => Err(recipe_error(format!(
                 "unknown role {text:?}; expected A or B"
             ))),
+        }
+    }
+
+    /// Returns the external spelling [`Self::parse`] accepts for this role.
+    pub(crate) fn spec_label(self) -> &'static str {
+        match self {
+            Self::Canonical => "A",
+            Self::Reproduction => "B",
         }
     }
 }
@@ -175,7 +191,7 @@ pub(crate) struct RecipeInput<'a> {
     pub(crate) asset: &'a str,
     /// Feature variant; only `default` is accepted.
     pub(crate) variant: &'a str,
-    /// `A` or `B`.
+    /// `A` (canonical) or `B` (reproduction); see [`Role::parse`].
     pub(crate) role: &'a str,
     /// Approved 40-digit source commit.
     pub(crate) commit: &'a str,

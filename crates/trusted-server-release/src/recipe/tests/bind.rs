@@ -9,11 +9,11 @@ use crate::boundary::{Boundary, DenialProof};
 #[test]
 fn js_handoff_for_other_source_commit_is_rejected() {
     Fixture::new(COMMIT)
-        .bind("ts-aarch64-apple-darwin", Role::A)
+        .bind("ts-aarch64-apple-darwin", Role::Canonical)
         .expect("should bind the matching handoff");
     let other = Fixture::new(OTHER_COMMIT);
     assert!(
-        bind_error(other.bind("ts-aarch64-apple-darwin", Role::A))
+        bind_error(other.bind("ts-aarch64-apple-darwin", Role::Canonical))
             .contains("another source commit"),
         "should reject a JS handoff built from another commit"
     );
@@ -22,9 +22,14 @@ fn js_handoff_for_other_source_commit_is_rejected() {
         "should not create the target after a rejection"
     );
     let fixture = Fixture::new(COMMIT);
-    let request = fixture.request("ts-aarch64-apple-darwin", "A", OTHER_COMMIT);
+    let request = fixture.request(
+        "ts-aarch64-apple-darwin",
+        Role::Canonical.spec_label(),
+        OTHER_COMMIT,
+    );
     assert!(
-        bind_error(fixture.bind_with(request, Role::A, COMMIT)).contains("another source commit"),
+        bind_error(fixture.bind_with(request, Role::Canonical, COMMIT))
+            .contains("another source commit"),
         "should reject a request naming another commit"
     );
 }
@@ -32,18 +37,28 @@ fn js_handoff_for_other_source_commit_is_rejected() {
 #[test]
 fn js_handoff_mutated_after_completion_is_rejected() {
     let changed = Fixture::new(COMMIT);
-    let request = changed.request("ts-aarch64-apple-darwin", "A", COMMIT);
+    let request = changed.request(
+        "ts-aarch64-apple-darwin",
+        Role::Canonical.spec_label(),
+        COMMIT,
+    );
     fs::write(changed.retained().join("bundles/tsjs-core.js"), b"tampered")
         .expect("should mutate a retained module");
     assert!(
-        bind_error(changed.bind_with(request, Role::A, COMMIT)).contains("no longer rehashes"),
+        bind_error(changed.bind_with(request, Role::Canonical, COMMIT))
+            .contains("no longer rehashes"),
         "should reject a mutated retained module"
     );
     let extra = Fixture::new(COMMIT);
-    let request = extra.request("ts-aarch64-apple-darwin", "A", COMMIT);
+    let request = extra.request(
+        "ts-aarch64-apple-darwin",
+        Role::Canonical.spec_label(),
+        COMMIT,
+    );
     fs::write(extra.retained().join("unrecorded"), b"extra").expect("should add an entry");
     assert!(
-        bind_error(extra.bind_with(request, Role::A, COMMIT)).contains("no longer rehashes"),
+        bind_error(extra.bind_with(request, Role::Canonical, COMMIT))
+            .contains("no longer rehashes"),
         "should reject an unrecorded retained entry"
     );
     assert!(
@@ -56,14 +71,22 @@ fn js_handoff_mutated_after_completion_is_rejected() {
 fn request_for_other_js_directory_or_role_is_rejected() {
     let fixture = Fixture::new(COMMIT);
     let foreign = Fixture::new(COMMIT);
-    let request = foreign.request("ts-aarch64-apple-darwin", "A", COMMIT);
+    let request = foreign.request(
+        "ts-aarch64-apple-darwin",
+        Role::Canonical.spec_label(),
+        COMMIT,
+    );
     assert!(
-        bind_error(fixture.bind_with(request, Role::A, COMMIT)).contains("does not name"),
+        bind_error(fixture.bind_with(request, Role::Canonical, COMMIT)).contains("does not name"),
         "should reject a request naming another JS handoff directory"
     );
-    let request = fixture.request("ts-aarch64-apple-darwin", "B", COMMIT);
+    let request = fixture.request(
+        "ts-aarch64-apple-darwin",
+        Role::Reproduction.spec_label(),
+        COMMIT,
+    );
     assert!(
-        bind_error(fixture.bind_with(request, Role::A, COMMIT)).contains("ambient role"),
+        bind_error(fixture.bind_with(request, Role::Canonical, COMMIT)).contains("ambient role"),
         "should reject an ambient of another role"
     );
 }
@@ -72,7 +95,7 @@ fn request_for_other_js_directory_or_role_is_rejected() {
 fn bind_creates_fresh_target_and_private_cargo_state() {
     let fixture = Fixture::new(COMMIT);
     fixture
-        .bind("ts-aarch64-apple-darwin", Role::A)
+        .bind("ts-aarch64-apple-darwin", Role::Canonical)
         .expect("should bind the recipe");
     for relative in [
         "target",
@@ -99,7 +122,7 @@ fn bind_creates_fresh_target_and_private_cargo_state() {
 fn execute_rejects_boundary_with_other_roots() {
     let fixture = Fixture::new(COMMIT);
     let prepared = fixture
-        .bind("ts-aarch64-apple-darwin", Role::A)
+        .bind("ts-aarch64-apple-darwin", Role::Canonical)
         .expect("should bind the recipe");
     let other = BoundaryRoots::new(
         &[fixture.base.join("other-source")],
@@ -122,7 +145,7 @@ fn execute_rejects_boundary_with_other_roots() {
 fn execute_rejects_boundary_without_owned_descendant_cleanup() {
     let fixture = Fixture::new(COMMIT);
     let prepared = fixture
-        .bind("ts-aarch64-apple-darwin", Role::A)
+        .bind("ts-aarch64-apple-darwin", Role::Canonical)
         .expect("should bind the recipe");
     let roots = prepared
         .boundary_roots()
@@ -148,8 +171,8 @@ fn qualified_rust_tools_constructor_is_uninhabited() {
     let _constructor: fn(&Path, QualifiedRustTools) -> SelectedRustTools =
         SelectedRustTools::qualified;
     let _ = never;
-    let closed =
-        AmbientProfile::for_role(Role::B).expect_err("should keep the alternate ambient closed");
+    let closed = AmbientProfile::for_role(Role::Reproduction)
+        .expect_err("should keep the alternate ambient closed");
     assert!(
         format!("{closed:?}").contains("not qualified"),
         "should name the missing qualification"
@@ -176,13 +199,17 @@ fn ordinary_ci_selection_carries_no_release_authority() {
 fn root_filled_between_parse_and_bind_is_rejected() {
     for (relative, label) in [("cargo-state", "cargo state"), ("output", "output")] {
         let fixture = Fixture::new(COMMIT);
-        let request = fixture.request("ts-aarch64-apple-darwin", "A", COMMIT);
+        let request = fixture.request(
+            "ts-aarch64-apple-darwin",
+            Role::Canonical.spec_label(),
+            COMMIT,
+        );
         fs::write(
             fixture.base.join(relative).join("late"),
             b"written after parse",
         )
         .expect("should fill the root after parsing");
-        let error = bind_error(fixture.bind_with(request, Role::A, COMMIT));
+        let error = bind_error(fixture.bind_with(request, Role::Canonical, COMMIT));
         assert!(
             error.contains(label) && error.contains("cannot be reused"),
             "should reject a {label} root filled after parsing"
@@ -193,10 +220,15 @@ fn root_filled_between_parse_and_bind_is_rejected() {
         );
     }
     let fixture = Fixture::new(COMMIT);
-    let request = fixture.request("ts-aarch64-apple-darwin", "A", COMMIT);
+    let request = fixture.request(
+        "ts-aarch64-apple-darwin",
+        Role::Canonical.spec_label(),
+        COMMIT,
+    );
     fs::create_dir(fixture.base.join("target")).expect("should create the target after parse");
     assert!(
-        bind_error(fixture.bind_with(request, Role::A, COMMIT)).contains("cannot be reused"),
+        bind_error(fixture.bind_with(request, Role::Canonical, COMMIT))
+            .contains("cannot be reused"),
         "should reject a target created after parsing"
     );
 }
@@ -204,7 +236,11 @@ fn root_filled_between_parse_and_bind_is_rejected() {
 #[test]
 fn materials_changed_or_foreign_after_preparation_are_rejected() {
     let fixture = Fixture::new(COMMIT);
-    let request = fixture.request("ts-aarch64-apple-darwin", "A", COMMIT);
+    let request = fixture.request(
+        "ts-aarch64-apple-darwin",
+        Role::Canonical.spec_label(),
+        COMMIT,
+    );
     let materials = fixture.materials(COMMIT);
     fs::write(
         fixture
@@ -215,7 +251,7 @@ fn materials_changed_or_foreign_after_preparation_are_rejected() {
     .expect("should edit a vendored file");
     let tools = fixture.tools_for(ReleaseTarget::Aarch64AppleDarwin);
     assert!(
-        bind_error(fixture.bind_parts(request, Role::A, COMMIT, tools, materials))
+        bind_error(fixture.bind_parts(request, Role::Canonical, COMMIT, tools, materials))
             .contains("no longer rehash"),
         "should reject materials edited after preparation"
     );
@@ -225,11 +261,15 @@ fn materials_changed_or_foreign_after_preparation_are_rejected() {
     );
 
     let fixture = Fixture::new(COMMIT);
-    let request = fixture.request("ts-aarch64-apple-darwin", "A", COMMIT);
+    let request = fixture.request(
+        "ts-aarch64-apple-darwin",
+        Role::Canonical.spec_label(),
+        COMMIT,
+    );
     let foreign = fixture.materials(OTHER_COMMIT);
     let tools = fixture.tools_for(ReleaseTarget::Aarch64AppleDarwin);
     assert!(
-        bind_error(fixture.bind_parts(request, Role::A, COMMIT, tools, foreign))
+        bind_error(fixture.bind_parts(request, Role::Canonical, COMMIT, tools, foreign))
             .contains("another source commit"),
         "should reject materials derived from another commit"
     );
@@ -238,11 +278,15 @@ fn materials_changed_or_foreign_after_preparation_are_rejected() {
 #[test]
 fn tools_selected_for_another_target_are_rejected() {
     let fixture = Fixture::new(COMMIT);
-    let request = fixture.request("ts-aarch64-apple-darwin", "A", COMMIT);
+    let request = fixture.request(
+        "ts-aarch64-apple-darwin",
+        Role::Canonical.spec_label(),
+        COMMIT,
+    );
     let tools = fixture.tools_for(ReleaseTarget::X86_64UnknownLinuxGnu);
     let materials = fixture.materials(COMMIT);
     assert!(
-        bind_error(fixture.bind_parts(request, Role::A, COMMIT, tools, materials))
+        bind_error(fixture.bind_parts(request, Role::Canonical, COMMIT, tools, materials))
             .contains("another target"),
         "should reject tools whose standard library was checked for another target"
     );
@@ -251,18 +295,28 @@ fn tools_selected_for_another_target_are_rejected() {
 #[test]
 fn target_inside_checkout_is_rejected_before_creation() {
     let fixture = Fixture::new(COMMIT);
-    let inside = fixture.base.join("checkout-a/target");
-    let request = fixture.request_at("ts-aarch64-apple-darwin", "A", COMMIT, &inside);
+    let inside = fixture.base.join("checkout-canonical/target");
+    let request = fixture.request_at(
+        "ts-aarch64-apple-darwin",
+        Role::Canonical.spec_label(),
+        COMMIT,
+        &inside,
+    );
     assert!(
-        bind_error(fixture.bind_with(request, Role::A, COMMIT)).contains("overlap"),
+        bind_error(fixture.bind_with(request, Role::Canonical, COMMIT)).contains("overlap"),
         "should reject a target inside the checkout root"
     );
     assert!(!inside.exists(), "should create nothing in the checkout");
     let fixture = Fixture::new(COMMIT);
     let inside_tools = fixture.base.join("tools/target");
-    let request = fixture.request_at("ts-aarch64-apple-darwin", "A", COMMIT, &inside_tools);
+    let request = fixture.request_at(
+        "ts-aarch64-apple-darwin",
+        Role::Canonical.spec_label(),
+        COMMIT,
+        &inside_tools,
+    );
     assert!(
-        bind_error(fixture.bind_with(request, Role::A, COMMIT)).contains("overlap"),
+        bind_error(fixture.bind_with(request, Role::Canonical, COMMIT)).contains("overlap"),
         "should reject a target inside the tools root"
     );
     assert!(!inside_tools.exists(), "should create nothing in the tools");
@@ -272,11 +326,11 @@ fn target_inside_checkout_is_rejected_before_creation() {
 fn boundary_roots_mount_materials_read_only_state_and_target_writable_output_unmounted() {
     let fixture = Fixture::new(COMMIT);
     let prepared = fixture
-        .bind("ts-aarch64-apple-darwin", Role::A)
+        .bind("ts-aarch64-apple-darwin", Role::Canonical)
         .expect("should bind the recipe");
     let expected = BoundaryRoots::new(
         &[
-            fixture.base.join("checkout-a"),
+            fixture.base.join("checkout-canonical"),
             fixture.retained(),
             fixture.base.join("materials"),
         ],

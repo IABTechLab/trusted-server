@@ -54,14 +54,17 @@ fn minimal_environment() -> AuditedEnvironment {
 /// Conditions of an ordinary CI build of `role`.
 ///
 /// The umask and jobs are the profile values the plan enforces on the child.
-/// Role B uses the test-only alternate profile: its host locale and timezone
+/// The reproduction build uses the test-only alternate profile: its host locale and timezone
 /// are profile labels, while the child runs with the normalized `C` locale
 /// and `UTC` timezone either way. This is not an independent qualified
-/// observation, and production role B stays unqualified.
+/// observation, and the production reproduction build stays unqualified.
 fn ordinary_ci_ambient(role: Role, checkout: &Path) -> CheckedAmbient {
     let (profile, base) = match role {
-        Role::A => (AmbientProfile::A, observed_a()),
-        Role::B => (AmbientProfile::alternate_for_tests(), observed_b()),
+        Role::Canonical => (AmbientProfile::CANONICAL, observed_canonical()),
+        Role::Reproduction => (
+            AmbientProfile::alternate_for_tests(),
+            observed_reproduction(),
+        ),
     };
     // Reading the real user ID has no preconditions.
     let execution_uid = unsafe { libc::getuid() };
@@ -173,7 +176,7 @@ fn bind_denial_case(fixture: &CargoFixture, member: &str) -> DenialCase {
         &RecipeInput {
             asset: member,
             variant: "default",
-            role: "A",
+            role: Role::Canonical.spec_label(),
             commit: &fixture.source_commit,
             js_dir: &retained.join("bundles"),
             js_inventory: &retained.join("tsjs-inventory.json"),
@@ -200,7 +203,7 @@ fn bind_denial_case(fixture: &CargoFixture, member: &str) -> DenialCase {
             .expect("should select the ordinary CI Rust tools"),
         materials: PreparedCargoMaterials::for_tests(&base.join("materials"), commit.as_str(), &[])
             .expect("should describe the empty vendor directory"),
-        ambient: ordinary_ci_ambient(Role::A, &checkout),
+        ambient: ordinary_ci_ambient(Role::Canonical, &checkout),
         request,
     })
     .expect("should bind the denial case");
@@ -380,10 +383,7 @@ fn build_fastly(
     let request = RecipeRequest::parse(&RecipeInput {
         asset: FASTLY_ASSET,
         variant: "default",
-        role: match role {
-            Role::A => "A",
-            Role::B => "B",
-        },
+        role: role.spec_label(),
         commit: &fixture.source_commit,
         js_dir: &retained.join("bundles"),
         js_inventory: &retained.join("tsjs-inventory.json"),
@@ -474,7 +474,7 @@ fn scan_final_bytes(fixture: &CargoFixture, builds: [&FastlyBuild; 2]) -> RemapS
 
 #[test]
 #[ignore = "requires explicit JS and Cargo ordinary CI fixtures and Linux Docker; run separately in producer CI"]
-fn fastly_role_a_and_b_builds_are_byte_identical() {
+fn fastly_canonical_and_reproduction_builds_are_byte_identical() {
     let fixture = cargo_fixture();
     let js = run_two_fresh_js_builds();
     assert_eq!(
@@ -488,14 +488,18 @@ fn fastly_role_a_and_b_builds_are_byte_identical() {
     );
     let cancellation = Cancellation::default();
     let deadline = Instant::now() + Duration::from_secs(40 * 60);
-    let a = build_fastly(&js, &fixture, Role::A, deadline, &cancellation);
-    let b = build_fastly(&js, &fixture, Role::B, deadline, &cancellation);
-    let checked = check_fastly_equality(&a.completed, &b.completed).unwrap_or_else(|error| {
-        panic!("should build byte-identical Fastly A/B outputs: {error:?}")
-    });
-    let scan = scan_final_bytes(&fixture, [&a, &b]);
-    let mut measurement = equality_measurement(&a.completed, &b.completed, &checked);
-    for (role, build) in [("A", &a), ("B", &b)] {
+    let canonical = build_fastly(&js, &fixture, Role::Canonical, deadline, &cancellation);
+    let reproduction = build_fastly(&js, &fixture, Role::Reproduction, deadline, &cancellation);
+    let checked = check_fastly_equality(&canonical.completed, &reproduction.completed)
+        .unwrap_or_else(|error| {
+            panic!(
+                "should build byte-identical canonical and reproduction Fastly outputs: {error:?}"
+            )
+        });
+    let scan = scan_final_bytes(&fixture, [&canonical, &reproduction]);
+    let mut measurement =
+        equality_measurement(&canonical.completed, &reproduction.completed, &checked);
+    for (role, build) in [("canonical", &canonical), ("reproduction", &reproduction)] {
         // Container paths are identical, so checkout variation is host-only on Linux.
         measurement["builds"][role]["ambient"]["execution_checkout_root"] =
             serde_json::json!(build.execution_checkout);
@@ -507,8 +511,10 @@ fn fastly_role_a_and_b_builds_are_byte_identical() {
     let text = serde_json::to_string_pretty(&measurement).expect("should encode the measurement");
     println!("{text}");
     fs::write(
-        fixture.root.join("cargo-ab-equality-measurement.json"),
+        fixture
+            .root
+            .join("cargo-canonical-reproduction-equality-measurement.json"),
         text,
     )
-    .expect("should retain the A/B equality measurement");
+    .expect("should retain the canonical/reproduction equality measurement");
 }

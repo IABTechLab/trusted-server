@@ -262,8 +262,8 @@ pub(super) fn cargo_docker_settings(user: (u32, u32), parallelism: u32) -> Docke
 
 fn role_text(role: Role) -> &'static str {
     match role {
-        Role::A => "A",
-        Role::B => "B",
+        Role::Canonical => "canonical",
+        Role::Reproduction => "reproduction",
     }
 }
 
@@ -322,10 +322,11 @@ fn ambient_measurement(completed: &RecipeCompleted) -> Value {
     })
 }
 
-/// The ordinary CI measurement of the Fastly A/B final-byte comparison.
+/// The ordinary CI measurement of the Fastly canonical/reproduction final-byte
+/// comparison.
 pub(super) fn equality_measurement(
-    a: &RecipeCompleted,
-    b: &RecipeCompleted,
+    canonical: &RecipeCompleted,
+    reproduction: &RecipeCompleted,
     checked: &FastlyEqualityChecked,
 ) -> Value {
     let claim = checked.ambient().claim();
@@ -339,17 +340,17 @@ pub(super) fn equality_measurement(
     };
     json!({
         "schema_version": SCHEMA_VERSION,
-        "kind": "ordinary-ci-fastly-ab-equality",
+        "kind": "ordinary-ci-fastly-canonical-reproduction-equality",
         "asset": checked.asset().artifact().name,
-        "source_commit": a.commit().as_str(),
+        "source_commit": canonical.commit().as_str(),
         "equality": true,
         "artifact": {
             "sha256": checked.sha256(),
             "size": checked.size(),
         },
         "builds": {
-            "A": build(a),
-            "B": build(b),
+            "canonical": build(canonical),
+            "reproduction": build(reproduction),
         },
         "ambient_claim": {
             "varied": names(&claim.varied),

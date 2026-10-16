@@ -467,19 +467,20 @@ jobs:
           cargo test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --nocapture
           cat "$TS_RELEASE_CARGO_FIXTURE_ROOT/cargo-denial-measurement.json"
 
-      # Role A and role B build from the same JS handoff in separate fresh
-      # roots and boundaries; the final Fastly files must be byte-identical.
-      - name: Build Fastly roles A and B from one JS handoff and compare final bytes (Linux)
+      # The canonical and reproduction builds use the same JS handoff in
+      # separate fresh roots and boundaries; the final Fastly files must be
+      # byte-identical.
+      - name: Build canonical and reproduction Fastly from one JS handoff and compare final bytes (Linux)
         shell: bash
         run: |
           set -euo pipefail
-          TEST_NAME=recipe::tests::full::fastly_role_a_and_b_builds_are_byte_identical
+          TEST_NAME=recipe::tests::full::fastly_canonical_and_reproduction_builds_are_byte_identical
           TEST_LIST="$(mktemp)"
           trap 'rm -f "$TEST_LIST"' EXIT
           cargo test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --list > "$TEST_LIST"
-          awk '/: test$/ { count++ } END { if (count != 1) { print "Expected exactly one Fastly A/B equality fixture"; exit 1 } }' "$TEST_LIST"
+          awk '/: test$/ { count++ } END { if (count != 1) { print "Expected exactly one Fastly canonical/reproduction equality fixture"; exit 1 } }' "$TEST_LIST"
           cargo test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --nocapture
-          cat "$TS_RELEASE_CARGO_FIXTURE_ROOT/cargo-ab-equality-measurement.json"
+          cat "$TS_RELEASE_CARGO_FIXTURE_ROOT/cargo-canonical-reproduction-equality-measurement.json"
 
   test-typescript:
     name: vitest
