@@ -1,11 +1,11 @@
 # Design Spec: A deployment using 51Degrees gets client hints from one middleware
 
-**Status:** Proposed, 2026-10-14. Raised as draft pull request jwrosewell/trusted-server#39, for Tech Lab review.
+**Status:** Proposed, 2026-10-14. Raised as draft pull request IABTechLab/trusted-server#1386 (from jwrosewell/trusted-server#39), for Tech Lab review.
 **Author:** 51Degrees (contributed), for Tech Lab review
 **Related specs:** `2026-10-12-shared-vendor-tables-design.md` (the `[shared.51degrees]` table), `2026-10-12-loading-cache-design.md` (the `51degrees-answers` cache), `2026-10-12-page-middleware-design.md` (the `[[serve]]` entries) and `2026-10-14-source-modules-design.md` (the source a page is fetched from), all in IABTechLab/trusted-server#1342, which holds every design document of the stack
 **Related PRs:** jwrosewell/trusted-server#39, IABTechLab/trusted-server#1386
 **Issues:** IABTechLab/trusted-server#1333
-**Last updated:** 2026-10-15
+**Last updated:** 2026-10-16
 
 > **Why this spec exists.** A browser sends its high entropy client hints only when the site asks for them and delegates them, and nothing in the stack writes the headers and the tag that do so for a deployment that uses the 51Degrees service, so every first page view of a session is priced on the User-Agent alone.
 

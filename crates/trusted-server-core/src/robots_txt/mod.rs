@@ -14,7 +14,9 @@
 //! contributor says.
 //!
 //! 1. A refusal cannot be loosened. With `refuse_all` selected the file is the
-//!    refusal and nothing else.
+//!    refusal and nothing else, and the origin cannot loosen it either,
+//!    because the file takes the place of whatever the origin answers to a
+//!    `GET` or `HEAD` that names its host.
 //! 2. A path in `always_allow` stays open to every crawler a contribution
 //!    refuses the whole site to, `*` included. A narrower rule is kept as
 //!    given, so `Disallow: /ads` still closes off `/ads.txt`.
@@ -26,7 +28,8 @@
 //! 6. A contributor that fails with no held answer fails the whole file closed
 //!    with `503`, because leaving out a contributor's rules would allow by
 //!    omission whatever those rules refused. A `404` or an empty file reads to
-//!    a crawler as permission to crawl everything.
+//!    a crawler as permission to crawl everything, so a file with no rule
+//!    fails closed too, and permission is only said with `allow_all`.
 //!
 //! # Settings
 //!
@@ -159,7 +162,8 @@ impl RobotsTxtConfig {
     /// The configuration that refuses every crawler with no exception.
     ///
     /// The starting point for a publisher who wants the refusal with
-    /// allowances of their own. Needs no contributor, no key and no network.
+    /// allowances of their own. Needs no contributor and no key. The origin is
+    /// still asked, and the file takes the place of whatever it answers.
     #[must_use]
     pub fn refuse_all() -> Self {
         Self {
@@ -319,7 +323,11 @@ pub(crate) fn select(
 }
 
 /// The file for `config`, from the contributions of `selected` in order,
-/// each asked for `request`.
+/// each asked for `request` and held for the publisher `settings` describe and
+/// the request's host.
+///
+/// Fails, and the file is answered `503`, when a contributor fails with no
+/// answer of its kept, and when the file would hold no rule.
 pub(crate) async fn file_for(
     config: &RobotsTxtConfig,
     selected: &[Selected],
@@ -336,7 +344,17 @@ pub(crate) async fn file_for(
             }
         });
     }
-    Ok(document::assemble(config, &contributions))
+    let file = document::assemble(config, &contributions);
+    // Permission to crawl everything is said with `allow_all`. A file with no
+    // rule says it too, by leaving everything out, so it fails closed.
+    if !document::holds_a_rule(&file) {
+        return Err(Report::new(configuration(
+            "[robots-txt] made a file with no rule, which a crawler reads as permission to \
+             crawl everything. Select `allow_all` to allow every crawler."
+                .to_owned(),
+        )));
+    }
+    Ok(file)
 }
 
 #[cfg(test)]
@@ -763,5 +781,227 @@ mod tests {
         assert!(message.contains("`nobody`"), "{message}");
         assert!(message.contains("refuse_all"), "{message}");
         assert!(message.contains("allow_all"), "{message}");
+    }
+
+    /// A contributor with nothing to add, which answers a comment and no
+    /// group.
+    #[derive(Debug)]
+    struct Silent;
+
+    #[async_trait::async_trait(?Send)]
+    impl RobotsTxtContributor for Silent {
+        fn refresh(&self) -> core::time::Duration {
+            core::time::Duration::from_secs(60)
+        }
+
+        fn fingerprint(&self) -> String {
+            "silent".to_owned()
+        }
+
+        async fn contribute(
+            &self,
+            _call: crate::module_context::ModuleCall<'_>,
+        ) -> Result<Contribution, Report<TrustedServerError>> {
+            Ok(Contribution {
+                preamble: vec![Record::Comment(" nothing to add".to_owned())],
+                groups: Vec::new(),
+            })
+        }
+    }
+
+    /// The id of the builder that registers the silent contributor.
+    const SILENT_BUILDER: &str = "robots-txt-silent";
+
+    /// The module name that builder is selected by.
+    const SILENT_BUILDER_MODULE: &str = "testing.robots-txt-silent";
+
+    fn register_silent(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder(SILENT_BUILDER)
+                .with_robots_txt_contributor("robots-txt.silent", Arc::new(Silent))
+                .build(),
+        ))
+    }
+
+    fn silent_builder() -> IntegrationBuilder {
+        IntegrationBuilder::new(SILENT_BUILDER, SILENT_BUILDER, register_silent, accept)
+            .with_module_name(SILENT_BUILDER_MODULE)
+    }
+
+    /// The test settings with `robots_txt` as the section, the entry that
+    /// places the middleware on the file, and the test builder named
+    /// `module` selected.
+    fn settings_selecting(robots_txt: serde_json::Value, module: &str) -> Settings {
+        let mut settings = settings_placing(parsed(robots_txt));
+        settings
+            .insert_module_config("testing", module, &serde_json::json!({}))
+            .expect("should select the test builder");
+        settings
+    }
+
+    /// A file with no rule reads to a crawler as permission to crawl
+    /// everything, which is only ever said with `allow_all`, so the file
+    /// fails closed when its sources give no rule.
+    #[tokio::test]
+    async fn a_file_with_no_rule_is_service_unavailable() {
+        let settings = settings_selecting(
+            serde_json::json!({
+                "modules": ["silent"],
+                "sitemap": "https://www.publisher.example/sitemap.xml",
+            }),
+            SILENT_BUILDER_MODULE,
+        );
+
+        let refusal = prepared_by(
+            &settings,
+            &[silent_builder()],
+            &services_with(Arc::default(), Arc::default()),
+        )
+        .await
+        .expect_err("a file with no rule should never be served");
+
+        assert_eq!(refusal.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            refusal.retry_after,
+            Some(std::time::Duration::from_secs(u64::from(
+                RETRY_AFTER_SECONDS
+            )))
+        );
+    }
+
+    /// The publisher's own text says what the publisher wants, so a file
+    /// whose only rules are the publisher's is served.
+    #[tokio::test]
+    async fn the_publishers_own_rules_are_served_when_no_contributor_adds_any() {
+        let settings = settings_selecting(
+            serde_json::json!({
+                "modules": ["silent"],
+                "top_text": "User-agent: *\nDisallow: /private/",
+            }),
+            SILENT_BUILDER_MODULE,
+        );
+
+        let file = prepared_by(
+            &settings,
+            &[silent_builder()],
+            &services_with(Arc::default(), Arc::default()),
+        )
+        .await
+        .expect("should answer")
+        .expect("the file is prepared");
+
+        assert_eq!(
+            file,
+            "User-agent: *\nDisallow: /private/\n\n# nothing to add\n"
+        );
+    }
+
+    /// A contributor whose rule says what it could read of the connection
+    /// that asked.
+    #[derive(Debug)]
+    struct ReadsTheConnection;
+
+    impl ReadsTheConnection {
+        fn rules(&self, services: &RuntimeServices) -> Contribution {
+            let client = services.client_info();
+            Contribution::parse(&format!(
+                "User-Agent: ConnectionBot\nDisallow: /ip-{}/tls-{}/ja4-{}/edge-{}/signals-{}",
+                client.client_ip.is_some(),
+                client.tls_protocol.is_some(),
+                client.tls_ja4.is_some(),
+                client.server_hostname.is_some(),
+                services.host_signals().is_some(),
+            ))
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl RobotsTxtContributor for ReadsTheConnection {
+        fn refresh(&self) -> core::time::Duration {
+            core::time::Duration::from_secs(60)
+        }
+
+        fn fingerprint(&self) -> String {
+            "connection".to_owned()
+        }
+
+        async fn contribute(
+            &self,
+            call: crate::module_context::ModuleCall<'_>,
+        ) -> Result<Contribution, Report<TrustedServerError>> {
+            Ok(call.inject(self, Self::rules)?)
+        }
+    }
+
+    /// The signals a host computes from a crawler's connection.
+    #[derive(Debug)]
+    struct CrawlerSignals;
+
+    impl crate::evidence::HostSignals for CrawlerSignals {
+        fn ja4(&self) -> Option<&str> {
+            Some("t13d1516h2_8daaf6152771_02713d6af862")
+        }
+
+        fn h2(&self) -> Option<&str> {
+            Some("1:65536;2:0;4:6291456")
+        }
+    }
+
+    /// The id of the builder that registers the connection reading
+    /// contributor.
+    const CONNECTION_BUILDER: &str = "robots-txt-connection";
+
+    /// The module name that builder is selected by.
+    const CONNECTION_BUILDER_MODULE: &str = "testing.robots-txt-connection";
+
+    fn register_connection(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder(CONNECTION_BUILDER)
+                .with_robots_txt_contributor("robots-txt.connection", Arc::new(ReadsTheConnection))
+                .build(),
+        ))
+    }
+
+    /// The answer is served to every crawler, so the services a contributor
+    /// is handed carry nothing of the connection that asked: no address, no
+    /// TLS details, no edge server and no host signals.
+    #[tokio::test]
+    async fn a_contributor_is_handed_nothing_of_the_connection_that_asked() {
+        let settings = settings_selecting(
+            serde_json::json!({ "modules": ["connection"] }),
+            CONNECTION_BUILDER_MODULE,
+        );
+        let builder = IntegrationBuilder::new(
+            CONNECTION_BUILDER,
+            CONNECTION_BUILDER,
+            register_connection,
+            accept,
+        )
+        .with_module_name(CONNECTION_BUILDER_MODULE);
+        let connection = crate::platform::ClientInfo {
+            client_ip: Some("203.0.113.7".parse().expect("should parse the address")),
+            tls_protocol: Some("TLSv1.3".to_owned()),
+            tls_ja4: Some("t13d1516h2_8daaf6152771_02713d6af862".to_owned()),
+            server_hostname: Some("cache-edge-1".to_owned()),
+            ..crate::platform::ClientInfo::default()
+        };
+        let services = RuntimeServices {
+            host_signals: Some(Arc::new(CrawlerSignals)),
+            ..services_with(Arc::default(), Arc::default()).with_client_info(connection)
+        };
+
+        let file = prepared_by(&settings, &[builder], &services)
+            .await
+            .expect("should answer")
+            .expect("the file is prepared");
+
+        assert!(
+            file.contains("Disallow: /ip-false/tls-false/ja4-false/edge-false/signals-false"),
+            "the contributor should read nothing of the connection: {file}"
+        );
     }
 }

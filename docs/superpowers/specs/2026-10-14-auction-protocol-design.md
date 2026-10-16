@@ -1,11 +1,11 @@
 # Design Spec: OpenRTB is an auction protocol module, and core sends the request a demand source builds
 
-**Status:** Proposed, 2026-10-14. Implemented on a working branch of the fork, with no pull request raised yet.
+**Status:** Proposed, 2026-10-14. Raised as draft pull request IABTechLab/trusted-server#1388 (from jwrosewell/trusted-server#40), for Tech Lab review.
 **Author:** 51Degrees (contributed), for Tech Lab review
-**Related specs:** `2026-03-19-auction-orchestration-flow-design.md` (on the main branch), `2026-10-14-consent-decoders-design.md` (IABTechLab/trusted-server#1383), `2026-10-14-identifier-modules-design.md` (IABTechLab/trusted-server#1382) and `2026-10-14-no-modules-crate-design.md` (IABTechLab/trusted-server#1384), with the earlier design documents of the stack in IABTechLab/trusted-server#1342
-**Related PRs:** none yet
+**Related specs:** `2026-03-19-auction-orchestration-flow-design.md` (on the main branch), `2026-10-14-consent-decoders-design.md` (IABTechLab/trusted-server#1383), `2026-10-14-identifier-modules-design.md` (IABTechLab/trusted-server#1382) and `2026-10-14-no-modules-crate-design.md` (IABTechLab/trusted-server#1384), with every design document of the stack in IABTechLab/trusted-server#1342
+**Related PRs:** IABTechLab/trusted-server#1388, jwrosewell/trusted-server#40
 **Issues:** IABTechLab/trusted-server#1336, one of the removals listed in IABTechLab/trusted-server#777
-**Last updated:** 2026-10-15
+**Last updated:** 2026-10-16
 
 > **Why this spec exists.** Core built every demand source's request as an OpenRTB 2.6 bid request and read every answer as an OpenRTB bid response, so a demand source on another protocol could not be an auction module without translating to OpenRTB first, and a change in what OpenRTB carries was a change in core.
 

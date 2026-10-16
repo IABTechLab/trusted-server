@@ -105,6 +105,7 @@ fn resolve_from_local_git() -> Option<String> {
 
 mod build_time;
 mod key_schedule;
+mod signing_key;
 
 /// Source file that must stay out of the generated list.
 ///

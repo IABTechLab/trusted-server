@@ -34,8 +34,7 @@ use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::evidence::{BorrowedRequestInfo, HostSignals};
 use trusted_server_core::integrations::RequestFilterEffects;
 use trusted_server_core::module_context::{ModuleContext, ModuleRequest};
-use trusted_server_core::platform::build_geo_module;
-use trusted_server_core::platform::{ClientInfo, RuntimeServices, UnavailableKvStore};
+use trusted_server_core::platform::{RuntimeServices, UnavailableKvStore};
 use trusted_server_core::prefix::Prefixes;
 use trusted_server_core::proxy::{AssetProxyCachePolicy, stream_asset_body};
 use trusted_server_core::response_privacy::TerminalPrivateResponse;
@@ -58,15 +57,15 @@ mod template_cache;
 mod value_cache;
 
 use crate::app::{
-    AppState, EcFinalizeState, RuntimeStoreConfig, TrustedServerApp, build_finalize_services,
+    AppState, EcFinalizeState, RuntimeStoreConfig, TrustedServerApp, build_entry_point_services,
     load_settings_from_config_store,
 };
 /// The module builders this adapter links, and the same followed by a
 /// deployment's own, for a deployment composing a build of its own.
 pub use crate::app::{module_builders_with, shipped_module_builders};
 use crate::ec_kv::FastlyEcKvStore;
-use crate::middleware::{HEADER_X_TS_FINALIZED, apply_finalize_headers, geo_allowed_for_response};
-use crate::platform::{FastlyPlatformGeo, client_info_from_request};
+use crate::middleware::{HEADER_X_TS_FINALIZED, apply_finalize_headers};
+use crate::platform::client_info_from_request;
 use crate::rate_limiter::{FastlyRateLimiter, RATE_COUNTER_NAME};
 use crate::sandbox::{RetainedApp, Sandbox, SandboxCounters, ServeMode, StartupDiagnostics};
 /// Re-exported so a deployment names the request addressing it hands over
@@ -772,7 +771,6 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
     // accessors only return real values on the client request, so store them in
     // request extensions for build_per_request_services and EC bot classification.
     let client_info = client_info_from_request(&req, resolved_client_ip);
-    let client_ip = client_info.client_ip;
 
     // Strip and re-inject the TLS JA4 and HTTP/2 signals from the
     // authoritative Fastly SDK values, under the same trust model, so the
@@ -804,7 +802,7 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
         Some(settings) => {
             // The entry point is synchronous host code, so it drives the async
             // module seam at the same boundary it already drives the router.
-            let services = entry_point_finalize_services(settings, &app_state, entry_request(&req));
+            let services = entry_point_services(settings, &app_state, entry_request(&req));
             let registered = app_state
                 .as_deref()
                 .and_then(|state| state.registry.device_module());
@@ -823,9 +821,6 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
     // Dispatch directly through the EdgeZero router without an intermediate
     // fastly::Response conversion. That preserves duplicate header values such
     // as multiple Set-Cookie headers.
-    // Kept for the finishing steps' module calls, which run after the
-    // request has been handed to the router.
-    let kept = EntryRequest::of(&req);
     let mut response = match into_addressed_core_request(req, removed_prefix) {
         Ok(mut core_req) => {
             core_req.extensions_mut().insert(config_store);
@@ -852,24 +847,10 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
 
     if !take_finalize_sentinel(&mut response) {
         if let Some(settings) = settings_snapshot.as_deref() {
-            futures::executor::block_on(apply_entry_point_finalize_headers(
-                settings,
-                &mut response,
-                client_ip,
-                kept.module_request(),
-                entry_point_finalize_services(settings, &app_state, kept.module_request()),
-            ));
+            apply_finalize_headers(settings, &mut response);
         } else {
             match load_settings_from_config_store(&runtime_stores) {
-                Ok(settings) => {
-                    futures::executor::block_on(apply_entry_point_finalize_headers(
-                        &settings,
-                        &mut response,
-                        client_ip,
-                        kept.module_request(),
-                        entry_point_finalize_services(&settings, &app_state, kept.module_request()),
-                    ));
-                }
+                Ok(settings) => apply_finalize_headers(&settings, &mut response),
                 Err(e) => {
                     log::warn!("entry-point finalize skipped: failed to reload settings: {e:?}");
                 }
@@ -974,52 +955,21 @@ fn take_finalize_sentinel(response: &mut HttpResponse) -> bool {
 /// The prefixes come from the selected prefix module where the state was
 /// built. A deployment whose state failed to build has no registry to name
 /// one, so core's own stand.
-fn entry_point_finalize_services(
+fn entry_point_services(
     settings: &Settings,
     app_state: &Option<Arc<AppState>>,
     request: ModuleRequest<'_>,
 ) -> RuntimeServices {
     match app_state {
-        Some(state) => build_finalize_services(
+        Some(state) => build_entry_point_services(
             settings,
             Arc::clone(&state.default_kv_store),
             Arc::clone(&state.loading_caches),
         )
         .with_prefixes(state.registry.prefixes(settings, request)),
-        None => build_finalize_services(settings, Arc::new(UnavailableKvStore), Arc::default())
+        None => build_entry_point_services(settings, Arc::new(UnavailableKvStore), Arc::default())
             .with_prefixes(Prefixes::trusted_server(settings)),
     }
-}
-
-async fn apply_entry_point_finalize_headers(
-    settings: &Settings,
-    response: &mut HttpResponse,
-    client_ip: Option<std::net::IpAddr>,
-    request: ModuleRequest<'_>,
-    services: RuntimeServices,
-) {
-    // Route through the [geo] module selector, so a deployment that opts
-    // out of geolocation makes no host geo call on the entry-point finalize
-    // path either. The module is the host's own lookup or the disabled one,
-    // never one from the registry, and reads the address alone, so the call
-    // carries the request's view and the client and no headers, which do
-    // not survive to here.
-    let geo = build_geo_module(settings, Arc::new(FastlyPlatformGeo));
-    let geo_info = if geo_allowed_for_response(response) {
-        let services = services.with_client_info(ClientInfo {
-            client_ip,
-            ..ClientInfo::default()
-        });
-        geo.locate_request(request, None, Some(settings), &services)
-            .await
-            .unwrap_or_else(|e| {
-                log::warn!("entry-point geo lookup failed: {e}");
-                None
-            })
-    } else {
-        None
-    };
-    apply_finalize_headers(settings, geo_info.as_ref(), response);
 }
 
 async fn apply_edgezero_ec_finalize(
@@ -1344,33 +1294,6 @@ fn entry_scheme(req: &FastlyRequest) -> &'static str {
     }
 }
 
-/// What the client's request resolved to, owned, for the module calls that
-/// run after the request itself has been handed to the router.
-struct EntryRequest {
-    method: fastly::http::Method,
-    host: String,
-    scheme: &'static str,
-    path: String,
-    query: String,
-}
-
-impl EntryRequest {
-    fn of(req: &FastlyRequest) -> Self {
-        Self {
-            method: req.get_method().clone(),
-            host: request_host(req).unwrap_or_default().to_owned(),
-            scheme: entry_scheme(req),
-            path: req.get_path().to_owned(),
-            query: req.get_query_str().unwrap_or_default().to_owned(),
-        }
-    }
-
-    fn module_request(&self) -> ModuleRequest<'_> {
-        ModuleRequest::new(&self.method, &self.host, self.scheme, &self.path)
-            .with_query(&self.query)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1465,7 +1388,7 @@ mod tests {
     fn the_device_module_the_registry_resolved_classifies_the_request() {
         let settings = test_settings();
         let services =
-            build_finalize_services(&settings, Arc::new(UnavailableKvStore), Arc::default());
+            build_entry_point_services(&settings, Arc::new(UnavailableKvStore), Arc::default());
         let registered: Arc<dyn DeviceModule> = Arc::new(MarkedDeviceModule);
 
         let signals = futures::executor::block_on(derive_device_signals(
@@ -1487,7 +1410,7 @@ mod tests {
     fn with_no_registered_module_the_built_in_module_classifies_the_request() {
         let settings = test_settings();
         let services =
-            build_finalize_services(&settings, Arc::new(UnavailableKvStore), Arc::default());
+            build_entry_point_services(&settings, Arc::new(UnavailableKvStore), Arc::default());
         let req = page_request();
 
         let signals =
@@ -1948,21 +1871,6 @@ mod tests {
     }
 
     #[test]
-    fn a_kept_entry_request_reads_a_host_that_is_not_utf8_as_no_host() {
-        let kept = EntryRequest::of(&request_with_host_not_utf8());
-
-        assert_eq!(
-            kept.host, "",
-            "a kept request should carry no host where Host is not UTF-8"
-        );
-        assert_eq!(
-            kept.module_request().host(),
-            "",
-            "the module request a kept request makes should hand on no host"
-        );
-    }
-
-    #[test]
     fn a_malformed_selector_is_answered_500() {
         let response = refusal_response(&config_selection::Refusal::MalformedSelector(
             "selector \"{Host}\" carries a brace".to_owned(),
@@ -2057,11 +1965,6 @@ mod tests {
             entry_request(&req).host(),
             "",
             "the module request should carry no host where Host is not UTF-8"
-        );
-        assert_eq!(
-            EntryRequest::of(&req).host,
-            "",
-            "the kept request should carry no host where Host is not UTF-8"
         );
     }
 
@@ -2285,29 +2188,24 @@ mod tests {
     }
 
     #[test]
-    fn entry_point_finalize_skips_geo_lookup_for_401() {
+    fn entry_point_finalize_writes_no_geo_header() {
         let settings = test_settings();
         let mut response = response_builder()
-            .status(edgezero_core::http::StatusCode::UNAUTHORIZED)
+            .status(edgezero_core::http::StatusCode::METHOD_NOT_ALLOWED)
             .body(EdgeBody::empty())
             .expect("should build response");
 
-        // The predicate is what stops the lookup, so assert on it directly:
-        // a `true` here would send the client IP to the geo module on a
-        // response that never authenticated.
-        assert!(
-            !geo_allowed_for_response(&response),
-            "should skip entry-point geo lookup for 401 responses"
-        );
-        apply_finalize_headers(&settings, None, &mut response);
+        apply_finalize_headers(&settings, &mut response);
 
-        assert_eq!(
-            response
-                .headers()
-                .get(trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE)
-                .and_then(|v| v.to_str().ok()),
-            Some("false"),
-            "401 responses should still carry geo-unavailable headers"
+        let geo_headers: Vec<&str> = response
+            .headers()
+            .keys()
+            .map(edgezero_core::http::HeaderName::as_str)
+            .filter(|name| name.starts_with("x-geo-"))
+            .collect();
+        assert!(
+            geo_headers.is_empty(),
+            "a response the router did not finish should carry no x-geo-* header: {geo_headers:?}"
         );
     }
 

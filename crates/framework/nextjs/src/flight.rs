@@ -72,17 +72,14 @@ enum RowState {
 /// Rewrites the addresses inside a Flight stream row by row, writing a `T`
 /// row's length again after its content changes.
 ///
-/// The replacement is the plain one core makes in any other text: the
-/// origin's `https://` and `http://` addresses to the publisher's, then
-/// protocol relative ones, then the bare host at hostname boundaries. It does
+/// The origin's `https://` and `http://` addresses move to the publisher's,
+/// and a protocol relative one and a bare host at hostname boundaries to the
+/// publisher's host, in one pass that never reads what it wrote. It does
 /// not read JSON escapes, so `\/\/origin.example.com` is left alone, which a
 /// navigation response does not carry. The escaped form inside a page's
 /// `__next_f` scripts is handled by the HTML middleware.
 pub(crate) struct RscFlightUrlRewriter {
-    origin_url: String,
-    origin_http_url: String,
     origin_host: String,
-    origin_protocol_relative: String,
     request_url: String,
     request_host: String,
     request_protocol_relative: String,
@@ -100,10 +97,7 @@ impl RscFlightUrlRewriter {
     #[must_use]
     pub(crate) fn new(origin_host: &str, request_host: &str, request_scheme: &str) -> Self {
         Self {
-            origin_url: format!("https://{origin_host}"),
-            origin_http_url: format!("http://{origin_host}"),
             origin_host: origin_host.to_owned(),
-            origin_protocol_relative: format!("//{origin_host}"),
             request_url: format!("{request_scheme}://{request_host}"),
             request_host: request_host.to_owned(),
             request_protocol_relative: format!("//{request_host}"),
@@ -127,26 +121,55 @@ impl RscFlightUrlRewriter {
         self.raw_header.clear();
     }
 
+    /// The row's text with each of the origin's addresses moved once, in one
+    /// pass from the start, so nothing written is read again.
+    ///
+    /// An occurrence of the origin host after `https://`, `http://` or `//`
+    /// is moved with what comes before it, and the text between those
+    /// addresses is searched for a bare host at hostname boundaries.
     fn rewrite_utf8_bytes(&self, bytes: &[u8]) -> Vec<u8> {
         let Ok(text) = std::str::from_utf8(bytes) else {
             return bytes.to_vec();
         };
 
-        if !text.contains(&self.origin_host) {
+        if self.origin_host.is_empty() || !text.contains(&self.origin_host) {
             return bytes.to_vec();
         }
 
-        let mut rewritten = text.replace(&self.origin_url, &self.request_url);
-        rewritten = rewritten.replace(&self.origin_http_url, &self.request_url);
-        rewritten = rewritten.replace(
-            &self.origin_protocol_relative,
-            &self.request_protocol_relative,
-        );
-        rewritten =
-            rewrite_bare_host_at_boundaries(&rewritten, &self.origin_host, &self.request_host)
-                .unwrap_or(rewritten);
+        let mut out = String::with_capacity(text.len());
+        // The end of the last address moved, and where the next search starts.
+        let mut done = 0;
+        let mut search = 0;
+        while let Some(found) = text[search..].find(self.origin_host.as_str()) {
+            let host = search + found;
+            search = host + self.origin_host.len();
+            let before = &text[done..host];
+            let Some((gap, replacement)) = [
+                ("https://", &self.request_url),
+                ("http://", &self.request_url),
+                ("//", &self.request_protocol_relative),
+            ]
+            .into_iter()
+            .find_map(|(prefix, replacement)| {
+                before.strip_suffix(prefix).map(|gap| (gap, replacement))
+            }) else {
+                continue;
+            };
+            self.push_bare_hosts(&mut out, gap);
+            out.push_str(replacement);
+            done = search;
+        }
+        self.push_bare_hosts(&mut out, &text[done..]);
+        out.into_bytes()
+    }
 
-        rewritten.into_bytes()
+    /// Appends `text` to `out` with a bare origin host at hostname boundaries
+    /// moved to the publisher's host.
+    fn push_bare_hosts(&self, out: &mut String, text: &str) {
+        match rewrite_bare_host_at_boundaries(text, &self.origin_host, &self.request_host) {
+            Some(rewritten) => out.push_str(&rewritten),
+            None => out.push_str(text),
+        }
     }
 
     fn finalize_newline_row(&mut self, out: &mut Vec<u8>) {
@@ -408,6 +431,91 @@ mod tests {
             output_str,
             "0:[\"cdn.origin.example.com\",\"notorigin.example.com\",\"origin.example.com.uk\",\"proxy.example.com/news\",\"proxy.example.com\"]\n",
             "Output should only rewrite bare host occurrences"
+        );
+    }
+
+    /// A request host that begins with the origin host, as a local host named
+    /// after the publisher or the origin host with a port does, is written
+    /// once in every address over either scheme, in a `T` row whose length
+    /// follows it and in a newline row, rather than matched again inside its
+    /// own replacement.
+    #[test]
+    fn a_request_host_that_begins_with_the_origin_host_is_written_once() {
+        let t_content =
+            r#"{"a":"https://publisher.example/news","b":"http://publisher.example/old"}"#;
+        let json = r#"["//publisher.example/c.png","publisher.example/bare"]"#;
+        let input = format!("1:T{:x},{t_content}2:{json}\n", t_content.len());
+
+        for request in ["publisher.example.localhost", "publisher.example:8443"] {
+            for scheme in ["http", "https"] {
+                let mut rewriter = RscFlightUrlRewriter::new("publisher.example", request, scheme);
+
+                let output = run_rewriter(&mut rewriter, input.as_bytes(), 5);
+
+                let t_rewritten = format!(
+                    r#"{{"a":"{scheme}://{request}/news","b":"{scheme}://{request}/old"}}"#
+                );
+                let json_rewritten = format!(r#"["//{request}/c.png","{request}/bare"]"#);
+                assert_eq!(
+                    String::from_utf8(output).expect("should be valid UTF-8"),
+                    format!(
+                        "1:T{:x},{t_rewritten}2:{json_rewritten}\n",
+                        t_rewritten.len()
+                    ),
+                    "should write {request} once over {scheme}"
+                );
+            }
+        }
+    }
+
+    /// Hosts that do not begin with the origin host are written as before,
+    /// both one with no part of the origin host in it and a `www.` host in
+    /// front of an apex origin, and a longer name that holds the origin host
+    /// is left alone.
+    #[test]
+    fn a_request_host_that_does_not_begin_with_the_origin_host_is_written_as_before() {
+        for (origin, request) in [
+            ("publisher.example", "publisher-example.localhost"),
+            ("example.com", "www.example.com"),
+        ] {
+            let mut rewriter = RscFlightUrlRewriter::new(origin, request, "https");
+            let row = format!(
+                r#"0:["https://{origin}/a","http://{origin}/b","//{origin}/c.png","{origin}/d","cdn.{origin}/e"]"#
+            );
+
+            let output = run_rewriter(&mut rewriter, format!("{row}\n").as_bytes(), 8192);
+
+            let expected = format!(
+                r#"0:["https://{request}/a","https://{request}/b","//{request}/c.png","{request}/d","cdn.{origin}/e"]"#
+            );
+            assert_eq!(
+                String::from_utf8(output).expect("should be valid UTF-8"),
+                format!("{expected}\n"),
+                "should write {request} once for {origin}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_address_is_moved_once_from_the_start() {
+        let rewriter = RscFlightUrlRewriter::new("a.example", "a.example.localhost", "http");
+        let rewrite = |text: &str| {
+            String::from_utf8(rewriter.rewrite_utf8_bytes(text.as_bytes()))
+                .expect("should be valid UTF-8")
+        };
+
+        assert_eq!(
+            rewrite("https://a.example/1 http://a.example/2 //a.example/3 a.example/4"),
+            "http://a.example.localhost/1 http://a.example.localhost/2 //a.example.localhost/3 a.example.localhost/4"
+        );
+        assert_eq!(rewrite("nothing here"), "nothing here");
+        assert_eq!(rewrite(""), "");
+
+        let no_origin = RscFlightUrlRewriter::new("", "a.example.localhost", "http");
+        assert_eq!(
+            no_origin.rewrite_utf8_bytes(b"https://a.example/1"),
+            b"https://a.example/1".to_vec(),
+            "should leave the text alone with no origin host"
         );
     }
 
