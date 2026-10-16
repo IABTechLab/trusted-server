@@ -2,20 +2,20 @@
 
 **Status:** Proposed, 2026-10-16
 **Author:** 51Degrees (contributed), for Tech Lab review
-**Related specs:** `2026-10-12-page-middleware-design.md` (row 10, entries that name middleware), `2026-10-12-shared-vendor-tables-design.md` (row 26), `2026-10-13-middleware-settings-design.md` (row 38), `2026-10-14-no-modules-crate-design.md` (row 43, each adapter lists the modules it links) and `2026-10-15-module-cache-declarations-design.md` (row 32), all in IABTechLab/trusted-server#1342, which holds every design document of the stack
+**Related specs:** `2026-10-12-page-middleware-design.md` (row 10, entries that name middleware), `2026-10-12-analytics-module-design.md` (row 16, telemetry as a module `[analytics]` selects), `2026-10-12-inmobi-choice-module-design.md` (row 18, the InMobi consent prompt), `2026-10-12-ads-txt-sellers-design.md` (row 20, the ads.txt sellers), `2026-10-12-robots-txt-middleware-design.md` (row 25, robots.txt as a middleware), `2026-10-12-shared-vendor-tables-design.md` (row 26), `2026-10-15-module-cache-declarations-design.md` (row 32), `2026-10-13-middleware-settings-design.md` (row 38), `2026-10-14-no-modules-crate-design.md` (row 43, each adapter lists the modules it links) and `2026-10-14-51degrees-client-hints-design.md` (row 44, the 51Degrees client hints), all in the pull request that holds every design document of the stack (IABTechLab/trusted-server#1342)
 **Related PRs:** none yet
-**Issues:** IABTechLab/trusted-server#1403 (settings without a consumer and consumers without settings), with the related IABTechLab/trusted-server#1125, #1132, #1201, #1097, #1142, #1148, #1134, #1102, #1140, #1141 and #1139
+**Issues:** Settings without a consumer and consumers without settings (IABTechLab/trusted-server#1403), whose body lists the related issues of the same shape
 **Last updated:** 2026-10-16
 
 > **Why this spec exists.** A settings section and the consumer that acts on it are checked against each other by a dozen separate checks that run at different times and stop at the first gap, and several pairs are not checked at all, so this spec proposes one declaration model in core and one check that reports every gap at startup and at push.
 
-Line references are at `3aaf720c0`, the head of `split/50-cookies-by-path`, which is the head of IABTechLab/trusted-server#1400 and the top of the stack. A file named without a folder is in `crates/trusted-server-core/src`, and `registry.rs` and `mod.rs` are `integrations/registry.rs` and `integrations/mod.rs`.
+Line references are at `3aaf720c0`, the head of `split/50-cookies-by-path`, which is the head of the cookies by path change (IABTechLab/trusted-server#1400) and the top of the stack. A file named without a folder is in `crates/trusted-server-core/src`, and `registry.rs` and `mod.rs` are `integrations/registry.rs` and `integrations/mod.rs`. A file named with an adapter is in that adapter's `src` folder, so Fastly `app.rs` is `crates/trusted-server-adapter-fastly/src/app.rs`. Every other file is named in full.
 
 ## 1. Problem
 
 Four words are used as the code uses them. A builder (`IntegrationBuilder`, `mod.rs` line 452) is what a crate hands to core to say what the crate offers. The registry is what core builds at startup from every builder (`IntegrationRegistry::with_plan_and_registrations`, `registry.rs` lines 2033 to 2400). Startup is an adapter loading the settings and building its state, which each adapter does through that function (Fastly `app.rs` line 360, Axum `app.rs` line 240, Cloudflare `app.rs` line 295, Spin `app.rs` line 219). Push is `ts config validate`, `ts config diff` and `ts config push`, which validate through `validate_settings_for_deploy_with` (`config.rs` lines 311 to 341).
 
-A consumer is whatever acts on a settings section, being a middleware an entry names, a module a section selects, a request filter, a page request preparer or a part of the adapter. Many features need both halves, and today the two halves are matched in four different ways.
+A consumer is whatever acts on a settings section, being a middleware an entry names, a module a section selects, a request filter, a page request preparer, code in core or a part of the adapter. Many features need both halves, and today the two halves are matched in four different ways.
 
 **Checks in the registry, at startup only.** Push builds no registry. `validate_phase_entries` checks the shape of each entry and says that whether a name is supplied "is only knowable where the registry is built" (`settings.rs` lines 4776 to 4791), and the section selection check is left out of push deliberately, "because a vendor crate the CLI never links may supply the name" (`registry.rs` lines 2163 to 2168). The registry's checks are these.
 
@@ -24,20 +24,20 @@ A consumer is whatever acts on a settings section, being a middleware an entry n
 - A middleware no entry names is a warning, that it "changes no page" (lines 1724 to 1731).
 - A `[shared.<vendor>]` table no builder reads is refused (lines 2044 to 2069).
 - A section selecting a module no builder supplies is refused, with a note naming absent shared tables (lines 1774 to 1825 and 1162 to 1178).
-- A geo, Edge Cookie, device or analytics module that runs and is not selected is a warning (lines 1199 to 1212).
+- A geo, Edge Cookie, device, prefix or analytics module on offer that its section does not select is a warning (lines 1199 to 1212, which the prefix selection calls at line 1400 as the other four do).
 
-**Checks a feature wrote for itself.** The InMobi prompt refuses `[cmp]` selecting it with no `text/html` entry naming it, whatever the entry's `path` (`crates/cmp/inmobi/src/lib.rs` lines 141 to 158). The ads.txt sellers do the same for `text/plain` (`crates/ads-txt/iabtl/src/lib.rs` lines 152 to 167). Core's robots.txt check requires `path = "/robots.txt"` exactly (`settings.rs` lines 4414 to 4462). Each of the three runs at push and at startup, because a builder's validate function runs at both (`config.rs` lines 394 to 406) and `prepare_runtime` runs at both (`config.rs` line 323 and `settings.rs` lines 4357 to 4406). The cache table check is the one core check that runs at push as well (`mod.rs` lines 1008 to 1025, called from `config.rs` line 330).
+**Checks a feature wrote for itself.** The InMobi prompt refuses `[cmp]` selecting it with no `text/html` entry naming it, whatever the entry's `path` (`crates/cmp/inmobi/src/lib.rs` lines 141 to 158). The ads.txt sellers do the same for `text/plain` (`crates/ads-txt/iabtl/src/lib.rs` lines 152 to 167). Core's robots.txt check requires `path = "/robots.txt"` exactly (`settings.rs` lines 4414 to 4462). Each of the three runs at push and at startup, because a builder's validate function runs at both (`config.rs` lines 394 to 406) and `prepare_runtime` runs at both (`config.rs` line 323 at push, and `settings.rs` line 4290 as the settings load). Core's cache table check runs at both as well (`mod.rs` lines 1008 to 1025, called from `config.rs` line 330 at push and from `mod.rs` line 1041 as an adapter builds its state).
 
 **No check.** These pairs are not matched at all.
 
-- The 51Degrees client hints crate registers a request filter and a middleware whenever `[shared.51degrees]` is present (`crates/middleware/51degrees/src/lib.rs` lines 110 to 132). Core runs every registered filter (`registry.rs` lines 2640 to 2674), so with no entry naming the middleware the filter still asks the service on every page request (`lib.rs` lines 352 to 381), and a request carrying the filter's state skips the shared page template and is sent `no-store, private` (`publisher.rs` lines 5536 to 5540 and 6396 to 6402).
+- The 51Degrees client hints crate registers a request filter and a middleware whenever `[shared.51degrees]` is present (`crates/middleware/51degrees/src/lib.rs` lines 110 to 132). Core runs every registered filter (`registry.rs` lines 2640 to 2674), so on Fastly, with no entry naming the middleware, the filter still asks the service on every page request (`crates/middleware/51degrees/src/lib.rs` lines 352 to 381).
 - The DataDome page tag writes nothing when `client_side_key` is blank (`crates/bot-protection/datadome/src/lib.rs` lines 1016 to 1026), and the startup checks look only at the tag's URL (lines 509 to 511), so an entry naming `bot-protection.datadome.tag` with no key is accepted silently.
-- Only the Fastly adapter runs request filters (Fastly `app.rs` lines 836 to 867), dispatches asset routes (lines 1191 to 1194 and 1310 to 1313), reads the analytics sink (lines 389 to 392) and configures origin certificates from `certificate_check` (Fastly `backend.rs` lines 492 to 496). The Axum adapter's origin client takes no certificate setting (Axum `platform.rs` lines 321 to 333), and the Cloudflare and Spin adapters use the setting only in a backend's name (Cloudflare `platform.rs` lines 70 to 78, Spin `platform.rs` lines 92 to 100). With `[geo] module = "platform"` the registry leaves the adapter's own lookup in place (`registry.rs` lines 1480 to 1482), and the Axum and Spin lookups answer no location for every request (Axum `platform.rs` lines 210 to 218, Spin `platform.rs` lines 809 to 817). Each of these is accepted on the adapters without the part, with no log.
-- `cluster_trust_threshold` and `cluster_recheck_secs` in `[ec]` are read into the settings (`settings.rs` lines 783 to 795) and read by no crate, which IABTechLab/trusted-server#1097 records.
+- Only the Fastly adapter runs request filters (Fastly `app.rs` lines 836 to 867), dispatches asset routes (lines 1191 to 1194 and 1310 to 1313), reads the analytics sink (lines 389 to 392) and configures origin certificates from `certificate_check` (Fastly `backend.rs` lines 492 to 496). The Axum adapter's origin client takes no certificate setting (Axum `platform.rs` lines 321 to 333), and the Cloudflare and Spin adapters use the setting only in a backend's name (Cloudflare `platform.rs` lines 70 to 78, Spin `platform.rs` lines 92 to 100). With `[geo] module = "platform"` the registry leaves the adapter's own lookup in place (`registry.rs` lines 1480 to 1482), and the Axum and Spin lookups answer no location for every request (Axum `platform.rs` lines 210 to 218, Spin `platform.rs` lines 809 to 817). With `[device] module = "platform"` the registry supplies no module either (`registry.rs` line 1323), and only the Fastly adapter builds a host device module (Fastly `lib.rs` lines 1256 to 1263), from the one host device crate, which only the Fastly adapter links (`crates/trusted-server-adapter-fastly/Cargo.toml` line 65, `crates/device/fastly/src/lib.rs` line 69). Each of these is accepted on the adapters without the part, with no log.
+- `cluster_trust_threshold` and `cluster_recheck_secs` in `[ec]` are read into the settings (`settings.rs` lines 783 to 795) and read by no crate, which the issue on the two unread Edge Cookie settings records (IABTechLab/trusted-server#1097).
 
-**One gap at a time.** Every check returns its first error (for example `registry.rs` lines 1679, 1716, 1815 and 2063), so a document with two gaps fails twice before it starts.
+**One gap at a time.** The first check that fails stops the start. Most checks also stop at their first gap (for example `registry.rs` lines 1679, 1716 and 1815), and the shared table check, which names every unread table in one error (`registry.rs` lines 2046 to 2066), still stops the start before any later check runs. So a document with two gaps of different kinds fails twice before it starts.
 
-**One-off notices.** Where a setting is known to do nothing, the code that knows says so in its own way, being the Fastly warning when `certificate_check` is off (Fastly `app.rs` lines 484 to 490) and the DataDome warning for its reserved GraphQL flag (`lib.rs` lines 513 to 515).
+**One-off notices.** Where a setting is known to do nothing, the code that knows says so in its own way, as the DataDome warning for its reserved GraphQL flag does (`crates/bot-protection/datadome/src/lib.rs` lines 513 to 515). The Fastly warning when `certificate_check` is off (Fastly `app.rs` lines 484 to 490) is not one of these, because Fastly honors the setting (Fastly `backend.rs` lines 492 to 496) and the warning says that certificate checks are off.
 
 ## 2. Design
 
@@ -50,13 +50,14 @@ One model in core, in four points.
 
 ### 2.1 The declaration types in core
 
-Core already holds one declaration a builder makes about a consumer, `SuppliedMiddleware`, which names a middleware, its phase and its media type (`mod.rs` lines 376 to 385), and the registry already checks that declaration against the middleware the builder really supplies (`check_described_middleware`, `registry.rs` lines 1591 to 1630). The new types extend that. They name no vendor, standard or platform, and every name in them is a string the declaring crate supplies.
+Core already holds one declaration a builder makes about a consumer, `SuppliedMiddleware`, which names a middleware, its phase and its media type (`mod.rs` lines 376 to 385), and the registry already checks that declaration against the middleware the builder really supplies (`check_described_middleware`, `registry.rs` lines 1591 to 1630). The new types extend that. They name no vendor, standard or platform. Every name in them is a string the declaring crate supplies, apart from the adapter parts, which core names by what each part does.
 
 ```rust
-/// What one consumer a builder supplies needs before it acts.
+/// One consumer a builder or core supplies, and what it needs before it acts.
 pub struct ConsumerNeeds {
     pub consumer: Consumer,
-    /// The settings the consumer reads, each required or optional.
+    /// The settings the consumer reads, besides the selection or the shared
+    /// table that runs its builder.
     pub settings: &'static [SettingsNeed],
     /// What places the consumer in a deployment.
     pub placed_by: Placement,
@@ -67,101 +68,198 @@ pub struct ConsumerNeeds {
 pub enum Consumer {
     /// A middleware, by the name an entry writes.
     Middleware(&'static str),
-    /// A module a section selects, by its full name.
+    /// A module, by the name a section selects it by.
     Module(&'static str),
-    /// A request filter or a page request preparer that only feeds the
-    /// named middleware, so it runs only where that middleware is placed.
-    Feeds(&'static str),
+    /// A request filter, by the name it is registered with.
+    RequestFilter(&'static str),
+    /// A page request preparer, by the name it is registered with.
+    Preparer(&'static str),
+    /// Code in core that acts on a section of core's own, by the section.
+    Core(&'static str),
+    /// A part of the adapter that acts on a setting core reads.
+    AdapterPart(AdapterPart),
+    /// Nothing. The setting is read into the settings and acted on by no
+    /// code, and is kept so that documents carrying it still load.
+    Nothing,
 }
 
 pub struct SettingsNeed {
-    /// The table, written as in the document, such as `shared.<vendor>`.
+    /// The table, written as in the document, such as `shared.51degrees`,
+    /// `proxy` or `bot-protection.datadome`.
     pub table: &'static str,
-    /// Keys inside the table the consumer cannot act without.
-    pub keys: &'static [&'static str],
+    /// What the table, as written, has to say.
+    pub condition: Condition,
+    /// Whether the consumer cannot act without it. A setting that is not
+    /// required only adjusts the consumer, so leaving it out is not a gap.
     pub required: bool,
 }
 
-pub enum Placement {
-    /// An entry in the phase, for the media type, and on the path when one
-    /// is given.
-    Entry {
-        phase: MiddlewarePhase,
-        media_type: &'static str,
-        path: Option<&'static str>,
-    },
-    /// The section's `module` or `modules` naming the consumer.
-    Section(&'static str),
-    /// Present whenever its settings are, such as an adapter part.
-    WithSettings,
+pub enum Condition {
+    /// The table is written, or for an array of tables, at least one is.
+    TableWritten,
+    /// The key is written, whatever its value.
+    KeyWritten(&'static str),
+    /// The key is written with this value.
+    KeyIs(&'static str, Literal),
+    /// The key is written and is not blank.
+    KeyNotBlank(&'static str),
 }
 
-/// A capability an adapter may have, named by core in neutral terms.
-pub struct AdapterPart(pub &'static str);
+pub enum Literal {
+    Bool(bool),
+    Str(&'static str),
+}
+
+pub enum Placement {
+    /// An entry naming the middleware, for the media type its
+    /// `SuppliedMiddleware` gives, in `phase` when one is given or else in
+    /// any phase the middleware runs in, and with this `path` when one is
+    /// given. An entry naming it for another media type or path is refused.
+    Entry {
+        phase: Option<MiddlewarePhase>,
+        path: Option<&'static str>,
+    },
+    /// The section that selects the module.
+    Section,
+    /// Wherever the named middleware is placed, for a request filter or a
+    /// preparer that only feeds it.
+    Feeds(&'static str),
+    /// Wherever the consumer runs, for one nothing else places, such as a
+    /// request filter that feeds no middleware, code in core or an adapter
+    /// part.
+    WhenRunning,
+    /// Wherever its crate is linked, whatever the settings select, for a
+    /// preparer that strips its module's reserved query or cookie.
+    WhenLinked,
+}
+
+/// A part an adapter may have, named by what it does and never by a
+/// platform.
+pub enum AdapterPart {
+    /// Runs the registered request filters before routing.
+    RequestFilters,
+    /// Dispatches `[[proxy.asset_routes]]`.
+    AssetRoutes,
+    /// Hands an auction's rows to the sink `[analytics]` selects.
+    TelemetrySink,
+    /// Sets its origin client's certificate checks from `certificate_check`.
+    OriginCertificateSetting,
+    /// Answers `[geo] module = "platform"` with a host geo lookup.
+    HostGeoLookup,
+    /// Answers `[device] module = "platform"` with a host device module.
+    HostDeviceModule,
+}
 ```
 
-Core names the parts it knows of as constants, for example running request filters, dispatching asset routes, reading the telemetry sink, setting origin certificate checks and a host geo lookup. A part is a capability and never a platform.
+An `Entry` placement takes the media type from the middleware's `SuppliedMiddleware`, so the two declarations cannot disagree. Its own phase is needed because a middleware that runs in both phases may still have to be placed in one, as robots.txt has to be placed in `[[fetch]]` (`settings.rs` lines 4408 to 4413).
+
+A condition is data rather than a function such as `ModuleSecretSetting::in_use` (`mod.rs` lines 359 to 367), so a line of the report can say what the setting has to be. Like `in_use`, it is judged on the table as written (2.3).
+
+A consumer is matched to what a builder registers by its name. A request filter and a preparer have no name today, because a filter carries only its integration id (`registry.rs` lines 532 to 541), which every filter of one builder shares, and a preparer is a bare function (`mod.rs` lines 323 to 324). So `with_request_filter` (`registry.rs` lines 753 to 756) and `with_request_preparer` (`mod.rs` lines 597 to 600) each take the name the declaration uses, beside the filter or the function.
 
 ### 2.2 How each crate and each adapter declares
 
-**A vendor crate** declares on its builder, next to the declarations a builder already makes (`with_shared_settings`, `with_secret_settings`, `with_middleware` and `with_cache_features`, `mod.rs` lines 655 to 741). A new `with_needs(&'static [ConsumerNeeds])` takes one entry for each consumer the builder supplies. The 51Degrees client hints builder (`crates/middleware/51degrees/src/lib.rs` lines 94 to 100) would declare its middleware as needing `[shared.51degrees]` with `endpoint` and `license_key`, placed by a `[[serve]]` entry for `text/html`, and its request filter as `Feeds("51degrees.client_hints")` needing the part that runs request filters. Each vendor declares in its own folder, so core gains no vendor name.
+**A vendor crate** declares on its builder, next to the declarations a builder already makes (`with_shared_settings`, `with_secret_settings`, `with_middleware` and `with_cache_features`, `mod.rs` lines 655 to 741). A new `with_needs(&'static [ConsumerNeeds])` takes one entry for each middleware, request filter and preparer the builder supplies. A module gets an entry only when it needs a setting of its own or a part, because `with_module_name` already declares the module and the section that selects it (`mod.rs` lines 684 to 698 and 772 to 789). Each vendor declares in its own folder, so core gains no vendor name.
 
-**A middleware or module core supplies** declares in core in the same types. The robots.txt middleware would declare `[robots-txt]` as required and a `[[fetch]]` entry for `text/plain` on `/robots.txt` as its placement, which is what `require_robots_txt_placed` checks by hand today (`settings.rs` lines 4414 to 4462).
+**Core** declares its own consumers in the same types. Its robots.txt middleware is one. A section that core reads and the adapter acts on is declared too. Its consumer is code in core where core acts on the section as well. Core checks the asset routes as the settings load and matches a request's path to one (`settings.rs` line 2803), and the adapter then dispatches the request. Its consumer is an adapter part where core only carries the value, as for `certificate_check`. A setting that nothing reads, kept so that old documents still load, is declared with `Nothing`, and so is a vendor's reserved setting.
 
-**A section core reads directly** declares its consumer as a part. `[[proxy.asset_routes]]` would need the part that dispatches asset routes, `certificate_check = false` the part that sets origin certificate checks, and `[geo] module = "platform"` the host geo lookup. A field kept only so that old documents still load, as IABTechLab/trusted-server#1097 may decide for `cluster_recheck_secs`, is declared as having no consumer, and the report names it as accepted and unused.
+The declarations for the cases in the issue this design answers (IABTechLab/trusted-server#1403), with the host device case added, would be these.
 
-**An adapter** declares the parts it has as one constant list in its own crate, which it hands to the registry build beside its builders. The registry build takes builders alone today (`registry.rs` lines 2033 to 2037), and each adapter already passes its own list of builders (for example Axum `app.rs` lines 109 to 145, from row 43), so the parts travel the same way.
+| Case                         | Declared in                      | Consumer                                      | Settings                                                                                                                                | Placement                               | Parts            |
+| ---------------------------- | -------------------------------- | --------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------- | ---------------- |
+| 51Degrees client hints       | `crates/middleware/51degrees`    | `Middleware("51degrees.client_hints")`        | `endpoint` and `license_key` in `shared.51degrees` not blank, required, and `middleware.51degrees.client_hints` written, optional (2.5) | `Entry`                                 | none             |
+| 51Degrees client hints       | `crates/middleware/51degrees`    | `RequestFilter("51degrees.client_hints")`     | none of its own                                                                                                                         | `Feeds("51degrees.client_hints")`       | `RequestFilters` |
+| DataDome protection          | `crates/bot-protection/datadome` | `RequestFilter("bot-protection.datadome")`    | `enable_protection = true` in `bot-protection.datadome`, required                                                                       | `WhenRunning`                           | `RequestFilters` |
+| DataDome page tag            | `crates/bot-protection/datadome` | `Middleware("bot-protection.datadome.tag")`   | `client_side_key` in `bot-protection.datadome` not blank, required                                                                      | `Entry`                                 | none             |
+| DataDome GraphQL flag        | `crates/bot-protection/datadome` | `Nothing`                                     | `enable_graphql_support = true` in `bot-protection.datadome`                                                                            | not used                                | none             |
+| InMobi consent prompt        | `crates/cmp/inmobi`              | `Middleware("cmp.inmobi")`                    | `script_url` in `cmp.inmobi` not blank, required                                                                                        | `Entry`                                 | none             |
+| ads.txt sellers              | `crates/ads-txt/iabtl`           | `Middleware("ads-txt.iabtl")`                 | `lines` in `ads-txt.iabtl` written, required                                                                                            | `Entry` (open question 3)               | none             |
+| robots.txt                   | core                             | `Middleware("robots_txt")`                    | `robots-txt` written, required                                                                                                          | `Entry` in `[[fetch]]` on `/robots.txt` | none             |
+| Middleware settings          | the middleware's crate           | that middleware                               | `middleware.<name>` written, optional                                                                                                   | that middleware's                       | none             |
+| Shared vendor tables         | the vendor's crate               | each consumer the vendor's builder supplies   | what each consumer needs in `shared.<vendor>`                                                                                           | that consumer's                         | that consumer's  |
+| Section selections           | the module's crate               | the module, declared by `with_module_name`    | none of its own                                                                                                                         | `Section`                               | none             |
+| Loading cache tables         | the module's crate               | the module, declared by `with_cache_features` | `cache.<name>` written, optional (2.5)                                                                                                  | the module's                            | none             |
+| Auction analytics            | `crates/analytics/tinybird`      | `Module("analytics.tinybird")`                | none of its own                                                                                                                         | `Section`                               | `TelemetrySink`  |
+| Asset routes                 | core                             | `Core("proxy.asset_routes")`                  | `proxy.asset_routes` written, required                                                                                                  | `WhenRunning`                           | `AssetRoutes`    |
+| Origin certificate check     | core                             | `AdapterPart(OriginCertificateSetting)`       | `certificate_check = false` in `proxy`, required                                                                                        | `WhenRunning`                           | its own          |
+| Host geo lookup              | core                             | `AdapterPart(HostGeoLookup)`                  | `module = "platform"` in `geo`, required                                                                                                | `WhenRunning`                           | its own          |
+| Host device module           | core                             | `AdapterPart(HostDeviceModule)`               | `module = "platform"` in `device`, required                                                                                             | `WhenRunning`                           | its own          |
+| Edge Cookie cluster settings | core                             | `Nothing`                                     | each of `cluster_trust_threshold` and `cluster_recheck_secs` in `ec` written                                                            | not used                                | none             |
+
+A builder declares every middleware, request filter and preparer it supplies, not only those in the table. The Google ad tag diagnostics builder, for example, declares its preparer as `Preparer("ad-tag.google.diagnostics")` placed by `WhenLinked` (`crates/ad-tag/google/src/diagnostics.rs` lines 46 to 58), because the preparer removes the reserved `ts_console` query and cookie whether or not the module runs (lines 317 to 320).
+
+**An adapter** declares the parts it has in `parts.toml` in its own crate, by the names core gives them in lower case with hyphens, for example `parts = ["host-geo-lookup"]`. The adapter reads the file as it is built (`include_str!`) and hands the parts to the check with its builders, before it builds the registry. The `ts` tool reads the same file at push (2.4), so startup and push cannot disagree about an adapter. The list cannot go in the adapter's block in `edgezero.toml`, because EdgeZero refuses a table it does not know in that block and a key it does not know in the block's `adapter` table (`crates/edgezero-core/src/manifest.rs` lines 814 to 861 in EdgeZero at `683202c66`, the revision the workspace `Cargo.toml` pins at lines 94 to 99), and the block's other tables hold EdgeZero's own build, command and logging settings. A list of adapters and their parts kept in core or in the tool would name every platform and repeat what each adapter declares. At `3aaf720c0` the four files would hold these parts.
+
+| Part                       | Fastly                                            | Axum                               | Cloudflare                          | Spin                               |
+| -------------------------- | ------------------------------------------------- | ---------------------------------- | ----------------------------------- | ---------------------------------- |
+| `RequestFilters`           | yes, `app.rs` lines 836 to 867                    | no                                 | no                                  | no                                 |
+| `AssetRoutes`              | yes, `app.rs` lines 1191 to 1194 and 1310 to 1313 | no                                 | no                                  | no                                 |
+| `TelemetrySink`            | yes, `app.rs` lines 389 to 392                    | no                                 | no                                  | no                                 |
+| `OriginCertificateSetting` | yes, `backend.rs` lines 492 to 496                | no, `platform.rs` lines 321 to 333 | no, `platform.rs` lines 70 to 78    | no, `platform.rs` lines 92 to 100  |
+| `HostGeoLookup`            | yes, `app.rs` line 621                            | no, `platform.rs` lines 210 to 218 | yes, `platform.rs` lines 724 to 733 | no, `platform.rs` lines 809 to 817 |
+| `HostDeviceModule`         | yes, `lib.rs` lines 1256 to 1263                  | no                                 | no                                  | no                                 |
 
 ### 2.3 The one check and the one report
 
-After every builder has registered, and before any check above returns, core goes through the declarations once. A gap is one of four kinds.
+The check runs once, before any builder builds. Every declaration is static and the check reads the document as written, so it needs nothing a build makes. Run after the builds, it would come too late, because the shared table refusal runs before any builder (`registry.rs` lines 2044 to 2069, ahead of the loop at line 2077) and a build can refuse first (line 2152, as the InMobi build does at `crates/cmp/inmobi/src/lib.rs` line 190).
 
-1. A settings section that no linked and running consumer declares, or that only consumers nothing places declare.
-2. A placed consumer whose required settings are absent, with the table and keys named.
-3. A consumer whose settings are present and which nothing places. Its feeding request filters and preparers do not run.
-4. A section or a consumer that needs a part the adapter lacks, with the adapter and the part named.
+The check reads each table as the document writes it, before serde fills a default, so a default can neither hide a missing key nor make an unwritten one look written. Module, shared and middleware tables are kept as written already, which is how `Settings::module_config` reads a module's table (`settings.rs` lines 4653 to 4680). Core's typed sections and a vendor's typed table fill defaults, for example for the two Edge Cookie cluster settings (`settings.rs` lines 786 and 794) and for DataDome's `client_side_key` (`crates/bot-protection/datadome/src/lib.rs` lines 342 to 343 and 456), so the load keeps the document's own tables beside the typed settings for the check to read.
 
-Every gap is collected, and startup refuses with one report in which each line names the section, the consumer, the missing half and what to add. A document with two gaps gets both lines. The existing refusals in section 1 become lines of this report, with their wording kept where it already names what to add.
+A consumer runs when its builder runs, which is when a section selects its module, when its shared table is written, or always for core's own, and when every setting it requires holds. It is placed as its placement says, in the deployment as a whole, so a middleware is placed when any entry of the document names it, whatever the path of a given request. A gap is one of five kinds, and each line names the setting, the consumer, the missing half and what to add.
 
-A request filter or preparer declared with `Feeds` is run only when its middleware is placed. Preparers that sanitize a reserved query or cookie in a deployment that does not run their module are collected for every builder on purpose (`registry.rs` lines 2103 to 2108), so those declare no `Feeds` and keep running.
+1. A written table or key that no linked consumer declares, or that only consumers which do not run declare, and an entry or a selection that names nothing a linked crate declares. A module's table that its section does not select is one, which core refuses today (`provider_table.rs` lines 564 to 567).
+2. A placed consumer that does not run, naming the selection, shared table or required setting it lacks.
+3. A consumer that runs and that nothing places.
+4. A placed consumer that runs and needs a part the adapter lacks, naming the adapter and the part. An `AdapterPart` consumer needs its own part.
+5. A written setting whose consumer is `Nothing`, which the line names as accepted and unused.
+
+A request filter or preparer placed by `Feeds` gets no line of kind 2 or 3 of its own, because the line for its middleware covers it, so one state gives one line.
+
+Each line has a level. Kinds 1, 2 and 4 refuse. Kind 3 refuses when a setting the consumer declares holds, because that setting then does nothing, as the InMobi, ads.txt and robots.txt checks refuse today. It warns when only its builder's selection or shared table runs it, as the warnings for a middleware no entry names and for a module on offer that its section does not select do today. Kind 5 warns, and so do the lines in 2.4 for a name or for parts that the tool cannot check at push. Startup and push refuse when any line refuses, and give every line either way, so a document with two gaps gets both lines. The existing refusals and warnings in section 1 become lines of this report, with their wording kept where it already names what to add. The registry's checks after the build stay only to catch a registration that contradicts its builder's declarations, as `check_described_middleware` does today.
+
+A request filter or preparer placed by `Feeds` is kept only where its middleware is placed, which the registry decides once as it is built, so it runs on every request wherever its middleware is placed, as filters run today. A preparer placed by `WhenLinked` is kept for every linked builder, as every preparer is collected today (`registry.rs` lines 2103 to 2108).
 
 ### 2.4 The same check at validate and at push
 
-`TrustedServerAppConfig` validates through a trait that takes no arguments, so the tool registers the builders it validates against once, before validating (`config.rs` lines 87 to 106). The `ts` tool registers the builders it links (`crates/trusted-server-cli/src/app_config.rs` lines 35 to 81) at the start of every command (`run.rs` line 126). Push would run the check in 2.3 over those builders' declarations, so every gap a stock builder can cause is caught before the document is written to the config store. A selection that names a module the tool does not link is reported as a line saying that the name is not one this tool can check, rather than passed in silence. Adapter parts reach push the same way as the builders, registered once for the adapter the document is pushed for (open question 2).
+`TrustedServerAppConfig` validates through a trait that takes no arguments, so the tool registers the builders it validates against once, before validating (`config.rs` lines 87 to 106). The `ts` tool registers the builders it links (`crates/trusted-server-cli/src/app_config.rs` lines 35 to 81) at the start of every command (`crates/trusted-server-cli/src/run.rs` line 126). Push would run the check in 2.3 over those builders' declarations, so every gap a linked builder can cause is caught before the document is written to the config store. A kind 1 line for a name that no crate the tool links declares, being a selection, an entry, a shared table, a middleware table or a cache table, warns at push and says that the tool cannot check the name, because a vendor crate the tool never links may supply it. That is why push leaves a selection unchecked on purpose today (`registry.rs` lines 2163 to 2168). The cache table check refuses such a name at push today (`config.rs` line 330), so this would change it (open question 2).
+
+The parts reach push from the adapter's own `parts.toml` (2.2). `ts config push` and `ts config diff` already take `--adapter` (the tool's tests parse it at `crates/trusted-server-cli/src/run.rs` lines 626 to 647), and `ts config validate` takes none (lines 785 to 799), so the tool adds an optional `--adapter` to `ts config validate`, beside the arguments it takes from EdgeZero (lines 4 to 7 and 75 to 76). Given an adapter, the tool finds the adapter's block in `edgezero.toml` through the manifest loader it already uses (`crates/trusted-server-cli/src/app_config.rs` line 12), reads `parts.toml` in the folder the block's `crate` key names (for example `edgezero.toml` line 56 for Axum), and registers the parts as it registers the builders, before EdgeZero validates. Neither core nor the tool names a platform, because the adapter's name comes from the command line and its folder from the manifest. With no adapter given, `ts config validate` checks everything but the parts, and a line that warns says so. A block with no `crate` key, or a folder with no `parts.toml`, gets the same warning, so the parts are never passed over in silence.
 
 ### 2.5 A consumer that runs on defaults
 
-A consumer whose settings are optional declares `required: false`, and leaving its table out is then not a gap. The 51Degrees client hints middleware reads `[middleware.51degrees.client_hints]` and writes `Critical-CH` unless the table turns it off (`crates/middleware/51degrees/src/lib.rs` lines 191 to 202), so it declares that table optional. A loading cache with no `[cache.<name>]` table loads through no cache at all (`platform/loading_cache.rs` lines 240 to 242 and 269 to 272), so a module that declares a cache says in its declaration whether running with no cache is intended, and the report names a missing cache table only where it is not.
+A consumer whose setting is optional declares it with `required: false`, and leaving it out is then not a gap. The 51Degrees client hints middleware reads `[middleware.51degrees.client_hints]` and writes `Critical-CH` unless the table turns it off (`crates/middleware/51degrees/src/lib.rs` lines 191 to 202), so it declares that table optional. A module's `[cache.<name>]` table is optional in the same way, because a declared cache with no table takes the one loading cache module the build links (`mod.rs` lines 1083 to 1104), and every adapter's stock list links one (for example Axum `app.rs` line 140). Only a build that links no loading cache module, or several, loads a cache with no table through no cache at all (`platform/loading_cache.rs` lines 240 to 242 and 269 to 272). Neither is a stock build, and this model leaves the case as it is.
 
 ## 3. What is not in this change
 
-- **Unknown keys and integration IDs.** IABTechLab/trusted-server#1201 covers keys a table does not know, which serde refuses or drops before any consumer sees them. This model starts from tables that read correctly.
-- **The health route and the startup failure response.** IABTechLab/trusted-server#1142 decides what an adapter answers once startup refuses, and this model only decides what startup refuses.
-- **Adding the missing adapter parts.** Dispatching asset routes on every adapter (IABTechLab/trusted-server#1125) or honoring `certificate_check` on Axum (IABTechLab/trusted-server#1132) remain separate changes. This model makes their absence a named gap until then.
-- **Deciding the Edge Cookie cluster settings.** IABTechLab/trusted-server#1097 decides whether they gain a reader or leave.
+- **Unknown keys and integration IDs.** The issue on unknown integration IDs and fields (IABTechLab/trusted-server#1201) covers keys a table does not know, which serde refuses or drops before any consumer sees them. This model starts from tables that read correctly.
+- **The health route and the startup failure response.** The issue on one health and startup failure contract across the adapters (IABTechLab/trusted-server#1142) decides what an adapter answers once startup refuses, and this model only decides what startup refuses.
+- **Adding the missing adapter parts.** Dispatching asset routes on every adapter (IABTechLab/trusted-server#1125) or honoring `certificate_check` on Axum (IABTechLab/trusted-server#1132) remain separate changes. This model makes their absence a named gap until then, and an adapter that gains a part adds it to its `parts.toml`.
+- **Deciding the Edge Cookie cluster settings.** This model declares them read by nothing, which is true today, and the issue on the two unread settings (IABTechLab/trusted-server#1097) decides whether they gain a reader, which then replaces the declaration, or leave with it.
+- **Running a request filter only on the paths its middleware covers.** A filter that feeds a middleware runs on every request wherever the middleware is placed, as filters run today.
+- **The Fastly warning when `certificate_check` is off.** It warns that certificate checks are off on an adapter that honors the setting (section 1), so it is not a notice that the setting does nothing, and it stays.
 
 ## 4. Acceptance
 
-1. For each row of the cases table in IABTechLab/trusted-server#1403, one test with the settings and no consumer and, where the consumer cannot act without its settings, one test with the consumer and no settings. Each runs through the real settings load and state build of each adapter, as the Axum adapter's seam probe tests already build the adapter's routes from settings (`crates/trusted-server-adapter-axum/tests/seam_probe.rs` line 94), and through the Fastly, Cloudflare and Spin builds, not through the check called directly.
+1. For each row of the cases table in the issue this design answers (IABTechLab/trusted-server#1403), and for the host device case in section 1, one test with the settings and no consumer and, where the consumer cannot act without its settings, one test with the consumer and no settings. Each runs through the real settings load and state build of each adapter, as the Axum adapter's tests already build the adapter's routes from settings (`crates/trusted-server-adapter-axum/tests/seam_probe.rs` line 94), and through the Fastly, Cloudflare and Spin builds, not through the check called directly.
 2. Each of those tests is seen to fail with its declaration removed before the test is relied on.
-3. A document with two gaps of different kinds gets both lines in one report.
-4. `ts config validate`, given the builders the tool links, reports the same lines as startup for every gap a linked builder can cause.
-5. A test over every builder each adapter links (for example Axum `app.rs` lines 109 to 145) finds a declaration for each middleware, module, request filter and page request preparer the builder registers, so a new consumer cannot leave one out. `check_described_middleware` (`registry.rs` lines 1591 to 1630) is the model for matching a declaration to what is registered.
+3. A document with two gaps of different kinds gets both lines in one report, and a document whose only lines warn starts and is pushed.
+4. `ts config validate --adapter <name>` and `ts config push --adapter <name>`, given the builders the tool links and the parts in that adapter's `parts.toml`, report the same lines as that adapter's startup for every gap a linked builder or the adapter's parts can cause. `ts config validate` with no adapter reports every other gap, with one line that warns that the parts were not checked.
+5. A test over every builder each adapter links (for example Axum `app.rs` lines 109 to 145) checks both ways. Every middleware, module, request filter and page request preparer a builder registers has a declaration of the same name, and every declaration is registered by its builder when the declaration's settings hold, so a declaration cannot outlive its consumer. `check_described_middleware` (`registry.rs` lines 1591 to 1630) is the model only for matching by name, because it checks a registered middleware against its description and skips a described one that the registration leaves out (lines 1596 to 1603).
+6. On each adapter, for each part its `parts.toml` names, a test sees the part act, and for each part the file does not name, a test sees a document that needs the part refused, so the file cannot claim a part the adapter lacks.
 
 ## 5. Open questions
 
-1. Should every gap refuse at once, or should the two kinds that only warn today, a middleware no entry names (`registry.rs` lines 1724 to 1731) and a module that runs and is not selected (lines 1199 to 1212), warn for one release first? A deployment that carries `[shared.51degrees]` with no entry starts today and would stop.
-2. How does push learn which adapter a document is for, and where does push read that adapter's parts from, when the `ts` tool does not link the adapter crates?
-3. Should a selection naming a module the tool does not link fail push, or be reported and allowed, as section 2.4 proposes?
-4. Should the InMobi and ads.txt sellers placements carry a path, as robots.txt does, or should all three count any entry for the media type?
-5. Should the Edge Cookie cluster settings be declared as having no consumer, or wait for the decision in IABTechLab/trusted-server#1097?
+1. Should the lines that refuse under this model, where today there is only a warning or nothing at all, warn for one release first? They are the kind 3 lines where a setting the consumer declares holds, which today get the warning for a middleware no entry names (`registry.rs` lines 1724 to 1731), and the kind 2 and kind 4 lines for gaps that are accepted today with no log. A deployment that carries `[shared.51degrees]` with no entry starts today and would stop, and so would one on Axum with `[geo] module = "platform"`.
+2. Should a name that no crate the tool links declares refuse at push, as the cache table check does today (`config.rs` line 330), or warn, as section 2.4 proposes and as push leaves a selection unchecked on purpose today (`registry.rs` lines 2163 to 2168)? Refusing catches a misspelt name before the document is written, and warning lets a deployment push, with the stock tool, names that its own crates supply.
+3. Should the ads.txt sellers' placement require `path = "/ads.txt"`, as the robots.txt placement requires its path? An entry with no path appends the lines to every `text/plain` file it covers (`crates/ads-txt/iabtl/src/lib.rs` lines 254 to 262), and the module's check counts any `text/plain` entry today (lines 152 to 167), so the declaration keeps that placement until this is decided.
 
 ## Review log
 
-No review rounds yet.
+1. **Round 1, 2026-10-16.** A review in a fresh session, against `split/50-cookies-by-path` at `3aaf720c0`. Issues found, two of them blocking. The declaration types could not say that a consumer is code in core, an adapter part, a request filter that feeds no middleware or a preparer that runs without its module, nor that a setting must have a given value or must not be blank, and push and validate had no way to see the parts of the adapter a document is for. This revision gives the types those consumers and conditions, has each adapter declare its parts in a `parts.toml` in its own crate that the tool reads for the adapter `--adapter` names, and applies the other findings.
 
 ## Revision record
 
-| Date       | Change                                                                                                            |
-| ---------- | ----------------------------------------------------------------------------------------------------------------- |
-| 2026-10-16 | First draft, from the code at `3aaf720c0` and the issue that states the problem (IABTechLab/trusted-server#1403). |
+| Date       | Change                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 2026-10-16 | First draft, from the code at `3aaf720c0` and the issue that states the problem (IABTechLab/trusted-server#1403).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| 2026-10-16 | Round 1 fixes. The types gain consumers for code in core, adapter parts and settings nothing reads, conditions on a key's value, named filters and preparers, and placements for a consumer nothing else places and for a preparer that runs whenever its crate is linked. Each adapter declares its parts in `parts.toml`, which push, diff and a new `ts config validate --adapter` read. Lines have levels, the check runs before any build on the settings as written, the host device case is added, and the claims on the push-time checks, the loading cache default and the one-off notices are corrected. |
