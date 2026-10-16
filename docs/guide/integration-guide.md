@@ -334,12 +334,13 @@ that supply a module of one type under one name.
 
 A robots.txt contributor implements `RobotsTxtContributor`. It returns groups
 of records and never bytes, so it cannot produce a malformed file. Trusted
-Server asks it for the request without its query, holds the answer until the
-contributor's `refresh` is due, and writes the file from every contributor
-`[robots-txt] modules` names, in that order. `fingerprint` names the settings
-an answer was given for, so an answer held for other settings is never
-served. Trusted Server hashes it into the key the answer is held under, so
-nothing of it is written to the store.
+Server asks it for the request without its query, on the host the request was
+addressed to and with no client information or host signals in its services,
+holds the answer for that host until the contributor's `refresh` is due, and
+writes the file from every contributor `[robots-txt] modules` names, in that
+order. `fingerprint` names the settings an answer was given for, so an answer
+held for other settings is never served. Trusted Server hashes it into the key
+the answer is held under, so nothing of it is written to the store.
 
 The Fastly adapter is the one adapter that classifies a request, so a device
 module is asked there and on no other adapter. It is shown the User-Agent and
