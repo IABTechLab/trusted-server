@@ -649,4 +649,28 @@ mod tests {
             "should refuse rather than fall back to the logical key"
         );
     }
+
+    #[test]
+    fn an_addressed_value_whose_key_is_too_long_is_passed_over() {
+        let label = "a".repeat(63);
+        let longest_host = format!("{label}.{label}.{label}.{}", "a".repeat(61));
+        let asked = RefCell::new(Vec::new());
+
+        let resolved = resolve_addressed_key(
+            "{host}_v2",
+            &values(&[longest_host.as_str(), "a.example"]),
+            recording(&["a.example_v2"], &asked),
+        );
+
+        assert_eq!(
+            resolved,
+            Ok("a.example_v2".to_owned()),
+            "should go on to the next value"
+        );
+        assert_eq!(
+            *asked.borrow(),
+            ["a.example_v2"],
+            "should never look up a key longer than the store takes"
+        );
+    }
 }

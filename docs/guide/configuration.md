@@ -3522,9 +3522,10 @@ by its host, as in the section above, or three things, being the selector
 values, the path the request continues with, and the path prefix it removed.
 Which part of a path names a publisher is the deployment's decision.
 
-- Each selector value takes the place of `{host}` in the `__KEY` selector in
-  turn and is keyed as a host is, and the first whose blob exists is read. Push
-  a blob, in lower case, under each value the hook can name.
+- Each selector value takes the place of `{host}` in the selector in turn and
+  is keyed as a host is, and the first whose blob exists is read. A value whose
+  key would be over 255 characters is passed over without a lookup. Push a
+  blob, in lower case, under each value the hook can name.
 - A miss on every value is answered `421`, as a host with no blob is. The
   request is never served from the logical store ID, from the blob of the host
   it arrived on, or from any other key the hook did not name.
