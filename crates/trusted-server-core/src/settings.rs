@@ -3183,6 +3183,7 @@ impl CacheSettings {
     /// invalid policy/matcher or cannot compile its regex/glob.
     pub fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
         self.robots_txt.check("cache.robots-txt")?;
+        self.assets.check("cache.assets")?;
         for (name, config) in &self.declared {
             config.check(&format!("cache.{name}"))?;
         }
@@ -7031,28 +7032,30 @@ module = \"none\"",
 
     #[test]
     fn a_loading_cache_lifetime_out_of_range_is_refused_naming_it() {
-        for (field, value, least) in [
-            ("store_seconds", "0", 1),
-            ("store_idle_seconds", "0", 1),
-            ("memory_seconds", "31536001", 0),
-        ] {
-            let toml_str = format!(
-                "{}
+        for table in ["robots-txt", "assets"] {
+            for (field, value, least) in [
+                ("store_seconds", "0", 1),
+                ("store_idle_seconds", "0", 1),
+                ("memory_seconds", "31536001", 0),
+            ] {
+                let toml_str = format!(
+                    "{}
 
-[cache.robots-txt]
+[cache.{table}]
 {field} = {value}
 ",
-                crate_test_settings_str()
-            );
-            let error = Settings::from_toml(&toml_str)
-                .expect_err("a lifetime out of range should not load");
-            let message = format!("{error:?}");
-            assert!(
-                message.contains(&format!(
-                    "[cache.robots-txt] {field} is {value}, and must be from {least} to 31536000"
-                )),
-                "{field}: {message}"
-            );
+                    crate_test_settings_str()
+                );
+                let error = Settings::from_toml(&toml_str)
+                    .expect_err("a lifetime out of range should not load");
+                let message = format!("{error:?}");
+                assert!(
+                    message.contains(&format!(
+                        "[cache.{table}] {field} is {value}, and must be from {least} to 31536000"
+                    )),
+                    "{table} {field}: {message}"
+                );
+            }
         }
     }
 
