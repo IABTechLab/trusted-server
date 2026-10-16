@@ -1,0 +1,2 @@
+# Regional nonsecret override. The shared external URL remains the Route 53 hostname.
+datacenter: us-east-1

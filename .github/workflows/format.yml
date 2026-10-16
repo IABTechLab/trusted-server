@@ -73,6 +73,9 @@ jobs:
       - name: Run cargo clippy (Cloudflare — wasm32-unknown-unknown)
         run: cargo clippy-cloudflare-wasm
 
+      - name: Check wasm-safe clock usage in the Cloudflare build (wasm32-unknown-unknown)
+        run: scripts/lint-wasm-clock.sh
+
       - name: Run cargo clippy (Spin — native)
         run: cargo clippy-spin-native
 
@@ -86,6 +89,11 @@ jobs:
       # is not covered by any adapter-scoped alias, so lint it explicitly.
       - name: Run host-target OpenRTB codegen clippy
         run: cargo clippy --package trusted-server-openrtb-codegen --target x86_64-unknown-linux-gnu --all-targets -- -D warnings
+
+      # The build-digest tests are native-only, so clippy-fastly compiles them
+      # to an empty crate. Lint them on the host.
+      - name: Run host-target core build-digest test clippy
+        run: cargo clippy --package trusted-server-core --target x86_64-unknown-linux-gnu --test template_build_digest -- -D warnings
 
   format-typescript:
     runs-on: ubuntu-latest

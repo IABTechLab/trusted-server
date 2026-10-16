@@ -1023,7 +1023,28 @@ pub struct ImageOptimizerSettings {
 }
 
 impl ImageOptimizerSettings {
-    fn normalize(&mut self) {
+    /// Trim image configuration keys and values, rejecting keys that collide after trimming.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if retained profile-set or profile keys
+    /// collide after trimming.
+    fn normalize(&mut self) -> Result<(), Report<TrustedServerError>> {
+        validate_trimmed_image_optimizer_keys(
+            self.profile_sets.keys(),
+            "image_optimizer.profile_sets",
+        )?;
+        let mut profile_sets: Vec<_> = self.profile_sets.iter().collect();
+        profile_sets.sort_unstable_by_key(|(name, _)| *name);
+        for (name, profile_set) in profile_sets {
+            if !name.trim().is_empty() {
+                validate_trimmed_image_optimizer_keys(
+                    profile_set.profiles.keys(),
+                    &format!("image_optimizer.profile_sets.{name:?}.profiles"),
+                )?;
+            }
+        }
+
         self.profile_sets = self
             .profile_sets
             .drain()
@@ -1033,6 +1054,7 @@ impl ImageOptimizerSettings {
             })
             .filter(|(key, _)| !key.is_empty())
             .collect();
+        Ok(())
     }
 
     /// Eagerly validate configured image profile sets.
@@ -1042,6 +1064,36 @@ impl ImageOptimizerSettings {
         }
         Ok(())
     }
+}
+
+/// Check retained image configuration keys before normalization discards originals.
+///
+/// # Errors
+///
+/// Returns a configuration error naming both original keys when they trim to
+/// the same non-empty name.
+fn validate_trimmed_image_optimizer_keys<'a>(
+    keys: impl Iterator<Item = &'a String>,
+    path: &str,
+) -> Result<(), Report<TrustedServerError>> {
+    let mut names: Vec<_> = keys
+        .map(|key| (key.trim(), key.as_str()))
+        .filter(|(trimmed, _)| !trimmed.is_empty())
+        .collect();
+    names.sort_unstable();
+
+    for pair in names.windows(2) {
+        let (trimmed, first) = pair[0];
+        let (next_trimmed, second) = pair[1];
+        if trimmed == next_trimmed {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "{path} keys {first:?} and {second:?} collide after trimming to {trimmed:?}"
+                ),
+            }));
+        }
+    }
+    Ok(())
 }
 
 /// Named set of profile-table Image Optimizer mappings.
@@ -2549,6 +2601,33 @@ pub struct DebugConfig {
     /// un-sanitized creative for diagnostics, so never enable in production.
     #[serde(default)]
     pub inject_adm_for_testing: bool,
+
+    /// Expose the reusable-sandbox counters endpoint at `GET /_ts/debug/sandbox`
+    /// and attach the same counters to private, no-store workload responses.
+    ///
+    /// The counters are the guest-instance identifier, the request ordinal
+    /// within that instance, the application build count, and the request
+    /// correlation id. They carry no settings, secrets, or request content.
+    /// Cacheable responses omit counters without changing their cache policy;
+    /// probes of those routes cannot establish sandbox reuse.
+    ///
+    /// Independent of the adapter's `reusable-sandbox` Cargo feature by design:
+    /// the feature decides whether a `Serve` loop exists, this flag decides
+    /// whether counters are emitted. Keeping them separate is what lets the
+    /// feature-off baseline be measured on the same channel as the reuse arms.
+    ///
+    /// Skipped from serialization while false: [`DebugConfig`] denies unknown
+    /// fields, so a default blob must stay readable by a binary built before
+    /// this field existed. A blob with it enabled requires restoring a
+    /// compatible blob before rolling back, the same trade
+    /// [`DebugConfig::auction_html_comment_options`] makes.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sandbox_metrics_enabled: bool,
+}
+
+/// Serde predicate for omitting `false` flags from serialized config blobs.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Metadata keys safe to surface in the `ts-debug` auction comment.
@@ -2725,11 +2804,46 @@ pub enum AuctionDebugCommentFormat {
 }
 
 /// Tester-cookie endpoint configuration.
-#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 pub struct TesterCookieConfig {
     /// Enable tester-cookie endpoints that set and clear `ts-tester`.
     #[serde(default)]
     pub enabled: bool,
+    /// Lifetime of the `ts-tester` cookie in seconds. Defaults to 30 days.
+    ///
+    /// Without an explicit lifetime the cookie is session-scoped, and Safari
+    /// deletes session cookies when the browser quits, so testers silently
+    /// fall back to the baseline arm on their next visit. Safari's ITP may
+    /// still cap the effective lifetime (for example to 7 days when the
+    /// serving host is a CNAME to a third-party edge), which remains far
+    /// better than session scope.
+    #[validate(range(
+        min = 1,
+        max = 31_536_000,
+        message = "must be between 1 second and 1 year"
+    ))]
+    #[serde(default = "TesterCookieConfig::default_max_age_seconds")]
+    pub max_age_seconds: u32,
+}
+
+impl TesterCookieConfig {
+    /// Default tester-cookie lifetime: 30 days.
+    #[must_use]
+    pub const fn default_max_age_seconds() -> u32 {
+        30 * 24 * 60 * 60
+    }
+}
+
+// A manual impl rather than derive: derive(Default) would zero
+// `max_age_seconds` whenever the whole `[tester_cookie]` section is absent,
+// because `Settings.tester_cookie` uses `#[serde(default)]`.
+impl Default for TesterCookieConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_age_seconds: Self::default_max_age_seconds(),
+        }
+    }
 }
 
 /// Authenticated forwarding configuration for a trusted client IP header.
@@ -2846,6 +2960,7 @@ pub struct Settings {
     #[validate(nested)]
     pub publisher: Publisher,
     #[serde(default)]
+    #[validate(nested)]
     pub tester_cookie: TesterCookieConfig,
     /// Optional authenticated trusted client IP forwarding configuration.
     ///
@@ -2936,9 +3051,16 @@ impl Settings {
     /// - [`TrustedServerError::Configuration`] if the TOML is invalid or missing required fields
     #[cfg(test)]
     pub fn from_toml_and_env(toml_str: &str) -> Result<Self, Report<TrustedServerError>> {
+        // Cargo also exposes rustc-env build metadata while running tests.
+        // The git version is not a Settings field; keep rejecting all other
+        // unknown keys rather than admitting build metadata into the schema.
+        let settings_environment = std::env::vars()
+            .filter(|(key, _)| !key.eq_ignore_ascii_case("TRUSTED_SERVER__GIT_VERSION"))
+            .collect();
         let environment = Environment::default()
             .prefix(ENVIRONMENT_VARIABLE_PREFIX)
-            .separator(ENVIRONMENT_VARIABLE_SEPARATOR);
+            .separator(ENVIRONMENT_VARIABLE_SEPARATOR)
+            .source(Some(settings_environment));
 
         let toml = File::from_str(toml_str, FileFormat::Toml);
         let config = Config::builder()
@@ -2958,22 +3080,28 @@ impl Settings {
         Self::finalize_deserialized(settings, "Build-time configuration")
     }
 
-    pub(crate) fn normalize_deserialized(&mut self) {
+    /// Normalize settings after deserialization.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if image optimizer keys collide after trimming.
+    pub(crate) fn normalize_deserialized(&mut self) -> Result<(), Report<TrustedServerError>> {
         self.cache.normalize();
         self.proxy.normalize();
-        self.image_optimizer.normalize();
+        self.image_optimizer.normalize()?;
         self.debug.auction_html_comment_options.normalize();
         self.tinybird.normalize();
         self.integrations
             .remove_legacy_static_secret_store_selectors();
         self.consent.validate();
+        Ok(())
     }
 
     pub(crate) fn finalize_deserialized(
         mut settings: Self,
         validation_label: &str,
     ) -> Result<Self, Report<TrustedServerError>> {
-        settings.normalize_deserialized();
+        settings.normalize_deserialized()?;
         settings.prepare_runtime()?;
 
         settings.validate().map_err(|err| {
@@ -3696,6 +3824,57 @@ mod tests {
     use serde_json::json;
     use std::collections::BTreeSet;
     use std::sync::Arc;
+
+    /// `DebugConfig` denies unknown fields, so a binary built before
+    /// `sandbox_metrics_enabled` existed must still accept a default blob.
+    /// That only holds while the flag is skipped during serialization.
+    #[test]
+    fn default_debug_config_omits_sandbox_metrics_for_rollback() {
+        let serialized =
+            serde_json::to_value(DebugConfig::default()).expect("should serialize debug config");
+
+        assert!(
+            serialized.get("sandbox_metrics_enabled").is_none(),
+            "a default blob must not carry the field, or an older binary rejects it: {serialized}"
+        );
+    }
+
+    #[test]
+    fn enabled_sandbox_metrics_serializes_and_round_trips() {
+        let config = DebugConfig {
+            sandbox_metrics_enabled: true,
+            ..DebugConfig::default()
+        };
+
+        let serialized = serde_json::to_value(&config).expect("should serialize debug config");
+        assert_eq!(
+            serialized.get("sandbox_metrics_enabled"),
+            Some(&json!(true)),
+            "an enabled flag must be written so the setting survives a round trip"
+        );
+
+        let restored: DebugConfig =
+            serde_json::from_value(serialized).expect("should deserialize debug config");
+        assert!(
+            restored.sandbox_metrics_enabled,
+            "the flag should survive a round trip"
+        );
+    }
+
+    #[test]
+    fn debug_config_accepts_a_blob_without_the_sandbox_field() {
+        let restored: DebugConfig = serde_json::from_value(json!({"ja4_endpoint_enabled": true}))
+            .expect("should deserialize a blob written before the field existed");
+
+        assert!(
+            restored.ja4_endpoint_enabled,
+            "existing fields should still load"
+        );
+        assert!(
+            !restored.sandbox_metrics_enabled,
+            "an absent flag should default to off"
+        );
+    }
 
     use crate::auction::build_orchestrator;
     use crate::integrations::{
@@ -4743,6 +4922,65 @@ mod tests {
         assert!(
             settings.tester_cookie.enabled,
             "tester-cookie config should enable the route"
+        );
+        assert_eq!(
+            settings.tester_cookie.max_age_seconds,
+            TesterCookieConfig::default_max_age_seconds(),
+            "omitted max_age_seconds should fall back to the 30-day default"
+        );
+    }
+
+    #[test]
+    fn tester_cookie_max_age_parses_from_toml() {
+        let toml_str = format!(
+            r#"{}
+
+            [tester_cookie]
+            enabled = true
+            max_age_seconds = 3600
+        "#,
+            crate_test_settings_str()
+        );
+
+        let settings =
+            Settings::from_toml(&toml_str).expect("should parse tester-cookie max age config");
+
+        assert_eq!(
+            settings.tester_cookie.max_age_seconds, 3_600,
+            "tester-cookie config should use the configured max age"
+        );
+    }
+
+    #[test]
+    fn tester_cookie_absent_section_defaults_max_age() {
+        let settings = Settings::from_toml(&crate_test_settings_str())
+            .expect("should parse settings without a tester-cookie section");
+
+        assert_eq!(
+            settings.tester_cookie.max_age_seconds,
+            TesterCookieConfig::default_max_age_seconds(),
+            "absent tester-cookie section should default max_age_seconds to 30 days"
+        );
+    }
+
+    #[test]
+    fn tester_cookie_zero_max_age_fails_validation() {
+        let toml_str = format!(
+            r#"{}
+
+            [tester_cookie]
+            enabled = true
+            max_age_seconds = 0
+        "#,
+            crate_test_settings_str()
+        );
+
+        let error =
+            Settings::from_toml(&toml_str).expect_err("should reject a zero tester-cookie max age");
+
+        assert!(
+            error.to_string().contains("validation failed"),
+            "zero max_age_seconds should fail settings validation, got: {error}"
         );
     }
 
@@ -6050,6 +6288,27 @@ source_domain = "partner.example.com"
     }
 
     #[test]
+    fn legacy_settings_loader_ignores_build_git_version() {
+        temp_env::with_vars(
+            [
+                ("TRUSTED_SERVER__GIT_VERSION", Some("v1.2.3")),
+                (
+                    "TRUSTED_SERVER__PUBLISHER__ORIGIN_URL",
+                    Some("https://origin.example.com"),
+                ),
+            ],
+            || {
+                let settings = Settings::from_toml_and_env(&crate_test_settings_str())
+                    .expect("should ignore build metadata while applying settings overrides");
+                assert_eq!(
+                    settings.publisher.origin_url, "https://origin.example.com",
+                    "should still apply runtime settings overrides"
+                );
+            },
+        );
+    }
+
+    #[test]
     fn test_override_env() {
         let toml_str = crate_test_settings_str();
 
@@ -6867,6 +7126,251 @@ source_domain = "partner.example.com"
             format!("{err:?}").contains("image_optimizer region `us-east-2` is not supported"),
             "should mention the unsupported Image Optimizer region: {err:?}"
         );
+    }
+
+    fn assert_image_optimizer_key_collision(toml: &str, expected_fragments: &[&str]) {
+        let raw: Settings = toml::from_str(toml).expect("should deserialize unnormalized settings");
+        let value = serde_json::to_value(raw).expect("should serialize unnormalized settings");
+        let mut messages = Vec::new();
+
+        for result in [Settings::from_toml(toml), Settings::from_json_value(value)] {
+            let error = result.expect_err("should reject colliding image optimizer keys");
+            assert!(
+                matches!(
+                    error.current_context(),
+                    TrustedServerError::Configuration { .. }
+                ),
+                "should return a configuration error"
+            );
+            let message = error.to_string();
+            for expected in expected_fragments {
+                assert!(
+                    message.contains(expected),
+                    "should identify the collision with {expected:?}: {message}"
+                );
+            }
+            messages.push(message);
+        }
+        assert_eq!(messages[0], messages[1], "should report a stable collision");
+    }
+
+    #[test]
+    fn image_optimizer_rejects_profile_keys_that_collide_after_trimming() {
+        for (first, second, second_params) in [
+            ("medium", " medium", "width=200"),
+            ("medium ", "\tmedium", "width=200"),
+            (" medium ", "medium", "width=100"),
+        ] {
+            let toml = format!(
+                "{}\n[image_optimizer.profile_sets.default_images]\n\
+                 default_profile = \"medium\"\n\
+                 [image_optimizer.profile_sets.default_images.profiles]\n\
+                 {first:?} = \"width=100\"\n{second:?} = {second_params:?}\n",
+                crate_test_settings_str()
+            );
+            assert_image_optimizer_key_collision(
+                &toml,
+                &[
+                    "image_optimizer.profile_sets",
+                    "default_images",
+                    "profiles",
+                    "collide after trimming",
+                    &format!("{first:?}"),
+                    &format!("{second:?}"),
+                    "\"medium\"",
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn image_optimizer_rejects_profile_set_keys_that_collide_after_trimming() {
+        for (first, second, second_params) in [
+            ("default_images", " default_images", "width=200"),
+            ("default_images ", "\tdefault_images", "width=200"),
+            (" default_images ", "default_images", "width=100"),
+        ] {
+            let toml = format!(
+                "{}\n[image_optimizer.profile_sets.{first:?}.profiles]\n\
+                 default = \"width=100\"\n\
+                 [image_optimizer.profile_sets.{second:?}.profiles]\n\
+                 default = {second_params:?}\n",
+                crate_test_settings_str()
+            );
+            assert_image_optimizer_key_collision(
+                &toml,
+                &[
+                    "image_optimizer.profile_sets",
+                    "collide after trimming",
+                    &format!("{first:?}"),
+                    &format!("{second:?}"),
+                    "\"default_images\"",
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn image_optimizer_reports_first_profile_key_collision_in_stable_set_order() {
+        let toml = crate_test_settings_str()
+            + r#"
+            [image_optimizer.profile_sets." alpha_images ".profiles]
+            medium = "width=100"
+            " medium" = "width=200"
+
+            [image_optimizer.profile_sets.zeta_images.profiles]
+            medium = "width=300"
+            " medium" = "width=400"
+            "#;
+
+        for _ in 0..32 {
+            assert_image_optimizer_key_collision(
+                &toml,
+                &[
+                    r#"image_optimizer.profile_sets." alpha_images ".profiles keys " medium" and "medium" collide after trimming to "medium""#,
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn image_optimizer_normalization_preserves_non_colliding_configuration() {
+        let toml = crate_test_settings_str()
+            + r#"
+            [image_optimizer.profile_sets." default_images "]
+            base_params = " quality=70 "
+            default_profile = " medium "
+            profile_param = " profile "
+            aspect_ratio_param = " ratio "
+            debug_param = " debug "
+
+            [image_optimizer.profile_sets." default_images ".profiles]
+            " medium " = " width=100 "
+            large = "width=200"
+            "" = "ignored"
+            " " = "also ignored"
+
+            [image_optimizer.profile_sets." default_images ".aspect_ratios]
+            allowed = [" 1-1 ", ""]
+            profiles = [" medium ", ""]
+
+            [image_optimizer.profile_sets." default_images ".crop_offsets]
+            x_param = " x "
+            y_param = " y "
+            buckets = [90, 10, 10]
+
+            [image_optimizer.profile_sets.other_images.profiles]
+            medium = "width=300"
+            default = "width=400"
+
+            [image_optimizer.profile_sets."".profiles]
+            default = "ignored"
+            " default " = "also ignored"
+
+            [image_optimizer.profile_sets." "]
+
+            [[proxy.asset_routes]]
+            prefix = "/images/"
+            origin_url = "https://assets.example.com"
+
+            [proxy.asset_routes.image_optimizer]
+            region = " us_east "
+            profile_set = " default_images "
+            "#;
+        let raw: Settings =
+            toml::from_str(&toml).expect("should deserialize unnormalized settings");
+        let value = serde_json::to_value(raw).expect("should serialize unnormalized settings");
+
+        for result in [Settings::from_toml(&toml), Settings::from_json_value(value)] {
+            let settings = result.expect("should accept non-colliding keys");
+            assert_eq!(
+                settings.image_optimizer.profile_sets.len(),
+                2,
+                "should discard empty profile-set names"
+            );
+            let profile_set = &settings.image_optimizer.profile_sets["default_images"];
+            assert_eq!(
+                profile_set.base_params, "quality=70",
+                "should trim base parameters"
+            );
+            assert_eq!(
+                profile_set.default_profile, "medium",
+                "should trim the default profile reference"
+            );
+            assert_eq!(
+                profile_set.profile_param, "profile",
+                "should trim the profile query parameter name"
+            );
+            assert_eq!(
+                profile_set.aspect_ratio_param, "ratio",
+                "should trim the aspect ratio query parameter name"
+            );
+            assert_eq!(
+                profile_set.debug_param, "debug",
+                "should trim the debug query parameter name"
+            );
+            assert_eq!(
+                profile_set.profiles.len(),
+                2,
+                "should discard empty profile names"
+            );
+            assert_eq!(
+                profile_set.profiles["medium"], "width=100",
+                "should trim profile keys and values"
+            );
+            assert_eq!(
+                profile_set.profiles["large"], "width=200",
+                "should preserve unpadded profile keys and values"
+            );
+            assert_eq!(
+                settings.image_optimizer.profile_sets["other_images"].profiles["medium"],
+                "width=300",
+                "should allow the same profile name in distinct sets"
+            );
+            let ratios = profile_set
+                .aspect_ratios
+                .as_ref()
+                .expect("should retain ratios");
+            assert_eq!(
+                ratios.allowed,
+                ["1-1"],
+                "should trim allowed aspect ratios and discard empty entries"
+            );
+            assert_eq!(
+                ratios.profiles,
+                ["medium"],
+                "should trim aspect ratio profile references and discard empty entries"
+            );
+            let offsets = profile_set
+                .crop_offsets
+                .as_ref()
+                .expect("should retain offsets");
+            assert_eq!(
+                offsets.x_param, "x",
+                "should trim the horizontal crop offset parameter name"
+            );
+            assert_eq!(
+                offsets.y_param, "y",
+                "should trim the vertical crop offset parameter name"
+            );
+            assert_eq!(
+                offsets.buckets,
+                [10, 90],
+                "should sort and deduplicate crop offset buckets"
+            );
+            let route = settings.proxy.asset_routes[0]
+                .image_optimizer
+                .as_ref()
+                .expect("should retain the route's image optimizer");
+            assert_eq!(
+                route.region, "us_east",
+                "should trim the image optimizer region"
+            );
+            assert_eq!(
+                route.profile_set, "default_images",
+                "should trim the route's profile-set reference"
+            );
+        }
     }
 
     #[test]
