@@ -2048,10 +2048,10 @@ pub(crate) fn classify_response_route(
 /// The `[[fetch]]` entry whose middleware make the document at
 /// `request_path` on an empty one, in place of the origin's `response`, see
 /// [`PhaseEntries::making`](crate::middleware::PhaseEntries::making). That is
-/// where the origin answers `404`, and where a middleware the entry names
-/// writes the whole document and would not be handed the answer as a `200`
-/// of the entry's media type, so that no other answer of the origin's is
-/// served in place of the document.
+/// where a middleware the entry names works on the path and the origin
+/// answers `404`, and where such a middleware writes the whole document and
+/// would not be handed the answer as a `200` of the entry's media type, so
+/// that no other answer of the origin's is served in place of the document.
 fn entry_making_the_document<'s>(
     settings: &'s Settings,
     integration_registry: &IntegrationRegistry,
@@ -2060,20 +2060,21 @@ fn entry_making_the_document<'s>(
     response: &Response<EdgeBody>,
 ) -> Option<&'s crate::middleware::PhaseEntry> {
     let entry = settings.fetch.making(request_path)?;
+    let chain = integration_registry.middleware_chain(
+        &settings.fetch,
+        MiddlewarePhase::Fetch,
+        &entry.media_type,
+        request_path,
+    );
+    if chain.is_empty() {
+        return None;
+    }
     if response.status() == StatusCode::NOT_FOUND {
         return Some(entry);
     }
-    let writes_whole_document = integration_registry
-        .middleware_chain(
-            &settings.fetch,
-            MiddlewarePhase::Fetch,
-            &entry.media_type,
-            request_path,
-        )
-        .writes_whole_document();
     // Core runs no middleware for a request that names no host, so a document
     // made for one would go out empty.
-    (writes_whole_document
+    (chain.writes_whole_document()
         && !request_host.is_empty()
         && !is_handed_over_whole(response, &entry.media_type, request_host))
     .then_some(entry)
@@ -21896,23 +21897,16 @@ mod tests {
         settings
     }
 
-    /// The file a proxied robots.txt request streams, with its status and
-    /// content type checked.
-    async fn streamed_robots_txt(proxied: Proxied) -> String {
+    /// The response a proxied request streams, and the body streamed.
+    async fn streamed(proxied: Proxied) -> (Response<EdgeBody>, String) {
         let PublisherResponse::Stream {
             response,
             body,
             params,
         } = proxied.response
         else {
-            panic!("the file should stream through the entry's middleware");
+            panic!("the answer should stream through the entries' middleware");
         };
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            content_type_of(&response),
-            Some("text/plain; charset=utf-8"),
-            "should be a document of the entry's media type"
-        );
         let mut params = *params;
         let mut output = Vec::new();
         stream_publisher_body_async(
@@ -21925,8 +21919,24 @@ mod tests {
             &proxied.services,
         )
         .await
-        .expect("should stream the file");
-        String::from_utf8(output).expect("the file is text")
+        .expect("should stream the body");
+        (
+            response,
+            String::from_utf8(output).expect("the body is text"),
+        )
+    }
+
+    /// The file a proxied robots.txt request streams, with its status and
+    /// content type checked.
+    async fn streamed_robots_txt(proxied: Proxied) -> String {
+        let (response, file) = streamed(proxied).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            content_type_of(&response),
+            Some("text/plain; charset=utf-8"),
+            "should be a document of the entry's media type"
+        );
+        file
     }
 
     /// The file the middleware makes replaces the origin's own.
@@ -22066,6 +22076,60 @@ mod tests {
         assert_eq!(
             response_of(proxied.response).status(),
             StatusCode::FORBIDDEN
+        );
+    }
+
+    /// An entry's `path` is a prefix, and the robots.txt middleware works on
+    /// the file's own path alone, so a longer path the entry covers keeps the
+    /// origin's answer, as it did when a route answered the file. A query is
+    /// no part of the path.
+    #[tokio::test]
+    async fn a_longer_path_the_robots_txt_entry_covers_keeps_the_origins_answer() {
+        for path in ["/robots.txt.bak", "/robots.txtx", "/robots.txt/rules"] {
+            let (response, body) = streamed(
+                proxy_origin(
+                    settings_refusing_every_crawler(),
+                    Method::GET,
+                    path,
+                    200,
+                    b"the origin's own text\n",
+                    "text/plain; charset=utf-8",
+                )
+                .await,
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(body, "the origin's own text\n", "{path} keeps its text");
+
+            for status in [404, 403] {
+                let proxied = proxy_origin(
+                    settings_refusing_every_crawler(),
+                    Method::GET,
+                    path,
+                    status,
+                    b"",
+                    "text/plain",
+                )
+                .await;
+                assert_eq!(
+                    response_of(proxied.response).status().as_u16(),
+                    status,
+                    "{path} keeps the origin's {status}"
+                );
+            }
+        }
+
+        let with_a_query = proxy_with(
+            settings_refusing_every_crawler(),
+            Method::GET,
+            "/robots.txt?crawler=one",
+            404,
+        )
+        .await;
+        assert_eq!(
+            streamed_robots_txt(with_a_query).await,
+            "User-agent: *\nAllow: /ads.txt\nDisallow: /\n",
+            "the file's path with a query is the file"
         );
     }
 

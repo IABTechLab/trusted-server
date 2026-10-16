@@ -489,6 +489,15 @@ pub trait Middleware: Send + Sync {
         media_type == HTML_MEDIA_TYPE
     }
 
+    /// Whether this middleware works on a response to a request for `path`,
+    /// every path by default. An entry's `path` is a prefix, so a middleware
+    /// made for one file says which path is that file, and is left out of
+    /// the chain for any other path the entry covers.
+    fn handles_path(&self, path: &str) -> bool {
+        let _ = path;
+        true
+    }
+
     /// Whether this middleware writes the whole document, whatever the origin
     /// sent. Where a `[[fetch]]` entry with a `path` names it, core makes the
     /// document on an empty one in place of any answer it would not hand the

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use error_stack::Report;
 
-use super::{RETRY_AFTER_SECONDS, RobotsTxtConfig, Selected, document, file_for};
+use super::{RETRY_AFTER_SECONDS, ROBOTS_TXT_PATH, RobotsTxtConfig, Selected, document, file_for};
 use crate::error::TrustedServerError;
 use crate::middleware::{
     Middleware, MiddlewareAction, MiddlewareContext, MiddlewarePhase, Preparation, Refusal,
@@ -72,6 +72,12 @@ impl Middleware for RobotsTxt {
 
     fn handles_media_type(&self, media_type: &str) -> bool {
         media_type == MEDIA_TYPE
+    }
+
+    // The file is the one path, as RFC 9309 section 2.3 gives it, so a longer
+    // path the entry's prefix covers keeps the origin's answer.
+    fn handles_path(&self, path: &str) -> bool {
+        path == ROBOTS_TXT_PATH
     }
 
     // A crawler takes an error, a redirect, an empty answer, or an origin
