@@ -29,7 +29,7 @@ pub const HEADER_CDN_CACHE_CONTROL: HeaderName =
     HeaderName::from_static(HEADER_CDN_CACHE_CONTROL_NAME);
 
 /// Every header that carries a shared cache policy: the two core reads for
-/// every platform, then the ones the adapter declared through
+/// every platform, then the ones the running platform declared through
 /// [`crate::platform::declare_platform_cache_headers`].
 #[must_use]
 pub fn edge_cache_header_names() -> Vec<&'static str> {

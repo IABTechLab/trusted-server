@@ -271,21 +271,15 @@ fn build_state_with_services(
 }
 
 /// The header Workers reads a shared cache policy from, which core writes
-/// the policy in.
+/// the policy in and strips from every response it makes private.
 pub const CDN_CACHE_CONTROL_HEADER: &str = "cloudflare-cdn-cache-control";
-
-/// The headers beyond the two core reads for every platform that carry a
-/// shared cache policy, the one Workers reads and Fastly's. Core strips each
-/// from every response it makes private, so a policy in either cannot let a
-/// shared cache in front of the Worker keep a personalized response.
-const SHARED_CACHE_HEADERS: &[&str] = &[CDN_CACHE_CONTROL_HEADER, "fastly-surrogate-control"];
 
 fn build_state_with_registrations_and_services(
     settings: Settings,
     integrations: &[IntegrationBuilder],
     services: Option<RuntimeServices>,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
-    trusted_server_core::platform::declare_platform_cache_headers(SHARED_CACHE_HEADERS);
+    trusted_server_core::platform::declare_platform_cache_headers(&[CDN_CACHE_CONTROL_HEADER]);
     // The modules this adapter links come first and the deployment's own
     // follow, which is the order their hooks run in.
     let integrations = module_builders_with(integrations);
@@ -1193,45 +1187,6 @@ mod tests {
             "ts.publisher.example"
         );
         assert_eq!(services.public_prefix().as_str(), "ts");
-    }
-
-    /// Once the state is built, a response core makes private loses the
-    /// shared cache headers of both platforms, not only the two core reads.
-    #[test]
-    fn a_private_response_loses_both_platforms_cache_headers() {
-        let settings = Settings::from_toml(
-            r#"
-                [source]
-                module = "origin"
-
-                [source.origin]
-                url = "https://origin.publisher.example"
-
-                [publisher]
-                domain = "www.publisher.example"
-                cookie_domain = ".publisher.example"
-                proxy_secret = "fictional-proxy-secret-32-bytes-ok"
-
-                [geo]
-                assume_single_jurisdiction = true
-            "#,
-        )
-        .expect("should parse the settings");
-        build_state_with_settings(settings).expect("should build the state");
-        let mut response = edgezero_core::http::response_builder()
-            .header("fastly-surrogate-control", "max-age=600")
-            .header("cloudflare-cdn-cache-control", "max-age=600")
-            .body(edgezero_core::body::Body::empty())
-            .expect("should build the response");
-
-        trusted_server_core::response_privacy::enforce_private_no_store(&mut response);
-
-        for name in ["fastly-surrogate-control", "cloudflare-cdn-cache-control"] {
-            assert!(
-                !response.headers().contains_key(name),
-                "should strip {name} from a response core makes private"
-            );
-        }
     }
 
     #[test]
