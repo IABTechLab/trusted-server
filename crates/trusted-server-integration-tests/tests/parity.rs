@@ -2,7 +2,7 @@
 //!
 //! Sends identical requests to all host-runnable adapters and asserts that:
 //! - Response status codes match
-//! - Critical headers (X-Geo-Info-Available) match
+//! - No adapter writes an `x-geo-*` header on its own routes
 //!
 //! Fastly parity is verified via cargo test-fastly + Viceroy in CI.
 
