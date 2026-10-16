@@ -6573,6 +6573,7 @@ dependencies = [
  "async-trait",
  "edgezero-core",
  "error-stack",
+ "futures",
  "http",
  "log",
  "serde",

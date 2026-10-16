@@ -372,7 +372,13 @@ pull_sync_concurrency = 3
 
 # [[serve]]
 # media_type = "text/html"
-# middleware = ["tag.google-tag", "bot-protection.datadome.tag", "ad-tag.google.diagnostics", "service_version"]
+# middleware = [
+#   "tag.google-tag",
+#   "bot-protection.datadome.tag",
+#   "ad-tag.google.loader",
+#   "ad-tag.google.diagnostics",
+#   "service_version",
+# ]
 
 # First-party proxying of named third-party scripts. Uncomment the
 # `modules` line under [proxy] below to switch it on.
