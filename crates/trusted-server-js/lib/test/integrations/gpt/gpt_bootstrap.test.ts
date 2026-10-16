@@ -903,6 +903,73 @@ describe('gpt_bootstrap.js fallback', () => {
     }
   );
 
+  it('fallback adInit leaves a slot alone where its viewport band asks for no size', () => {
+    const originalInnerWidth = window.innerWidth;
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 700 });
+    try {
+      const mockSlot = {
+        addService: vi.fn().mockReturnThis(),
+        setTargeting: vi.fn().mockReturnThis(),
+        getSlotElementId: vi.fn().mockReturnValue('div-billboard'),
+        defineSizeMapping: vi.fn().mockReturnThis(),
+      };
+      const nativeRefresh = vi.fn();
+      const mockPubads = {
+        enableSingleRequest: vi.fn(),
+        getSlots: vi.fn().mockReturnValue([]),
+        refresh: nativeRefresh,
+      };
+      const defineSlot = vi.fn().mockReturnValue(mockSlot);
+      const display = vi.fn();
+      (window as TestWindow).googletag = {
+        cmd: { push: vi.fn((fn: () => void) => fn()) },
+        defineSlot,
+        pubads: vi.fn().mockReturnValue(mockPubads),
+        enableServices: vi.fn(),
+        display,
+        sizeMapping: vi.fn().mockReturnValue({
+          addSize: vi.fn().mockReturnThis(),
+          build: vi.fn().mockReturnValue('built mapping'),
+        }),
+      };
+      document.body.innerHTML = '<div id="div-billboard"></div>';
+      runBootstrap();
+      const ts = (window as TestWindow).tsjs!;
+      ts.adSlots = [
+        {
+          id: 'billboard',
+          gam_unit_path: '/123/billboard',
+          div_id: 'div-billboard',
+          formats: [
+            [970, 250],
+            [320, 50],
+          ],
+          viewport_sizes: [
+            [[1040, 0], [[970, 250]]],
+            [[600, 0], []],
+            [[0, 0], [[320, 50]]],
+          ],
+          targeting: {},
+        },
+      ];
+      ts.bids = { billboard: { hb_pb: '1.00' } };
+
+      ts.adInit!();
+
+      // No ad can serve at this width, so any GPT call could only size or
+      // collapse the container after the page has painted.
+      expect(defineSlot).not.toHaveBeenCalled();
+      expect(display).not.toHaveBeenCalled();
+      expect(nativeRefresh).not.toHaveBeenCalled();
+      expect(ts.firstImpression?.slots['div-billboard']).toBeUndefined();
+    } finally {
+      Object.defineProperty(window, 'innerWidth', {
+        configurable: true,
+        value: originalInnerWidth,
+      });
+    }
+  });
+
   it('fallback adInit leaves a publisher-rendered slot untouched', () => {
     const mockSlot = {
       addService: vi.fn().mockReturnThis(),

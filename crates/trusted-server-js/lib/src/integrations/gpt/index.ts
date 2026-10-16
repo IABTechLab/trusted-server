@@ -16,6 +16,7 @@ import type {
   GptSlotHandoff,
   TsjsApi,
 } from '../../core/types';
+import { viewportBandSizes } from '../../core/viewport_sizes';
 import {
   APS_UNIVERSAL_CREATIVE_RENDERER,
   APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
@@ -855,7 +856,13 @@ function displayTargetElementId(target: GoogleTagDisplayTarget): string | undefi
   return (target as Element).id || undefined;
 }
 
-/** Defines the slot and applies its viewport bands as a size mapping. */
+/**
+ * Defines the slot and applies its viewport bands as a size mapping.
+ *
+ * Defines nothing where the band at the current viewport width asks for no
+ * size, as no ad can serve there and GPT would otherwise size or collapse the
+ * slot's container after the page has painted.
+ */
 function defineWithViewportSizes<S extends { defineSizeMapping?(mapping: unknown): unknown }>(
   api: {
     defineSlot?(adUnitPath: string, size: Array<number | number[]>, elementId?: string): S | null;
@@ -864,6 +871,10 @@ function defineWithViewportSizes<S extends { defineSizeMapping?(mapping: unknown
   slot: AuctionSlot,
   elementId: string
 ): S | null | undefined {
+  if (viewportBandSizes(slot)?.length === 0) {
+    log.debug('GPT slot asks for no size at this viewport width', { divId: slot.div_id });
+    return null;
+  }
   const definedSlot = api.defineSlot?.(slot.gam_unit_path, slot.formats, elementId);
   const bands = slot.viewport_sizes;
   if (definedSlot && bands?.length && api.sizeMapping && definedSlot.defineSizeMapping) {

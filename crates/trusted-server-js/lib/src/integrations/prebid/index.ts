@@ -28,6 +28,7 @@ import { buildAdRequest, parseAuctionResponse } from '../../core/auction';
 import { registerApsPrebidRenderer, validateApsRenderer } from '../aps/render';
 import type { AuctionBid, AuctionEid } from '../../core/auction';
 import type { AuctionSlot, TsjsApi } from '../../core/types';
+import { viewportBandSizes } from '../../core/viewport_sizes';
 
 import {
   PREBID_USER_ID_MODULE_REGISTRY,
@@ -1134,26 +1135,15 @@ function bannerSizesFromGptSlot(slot: RefreshGptSlot): BannerSize[] | undefined 
   return parsedSizes.length > 0 ? parsedSizes : undefined;
 }
 
-/**
- * The sizes the slot's viewport band asks for at the current viewport width,
- * or `undefined` when the slot names no band. See `AuctionSlot.viewport_sizes`.
- */
-function injectedSlotBandSizes(slot: AuctionSlot | undefined): Array<[number, number]> | undefined {
-  const bands = slot?.viewport_sizes;
-  if (!bands?.length) return undefined;
-  const width = window.innerWidth;
-  return bands.find(([[minimumWidth]]) => width >= minimumWidth)?.[1] ?? [];
-}
-
 function bannerSizesFromInjectedSlot(slot: AuctionSlot | undefined): BannerSize[] | undefined {
-  const sizes = injectedSlotBandSizes(slot) ?? slot?.formats;
+  const sizes = viewportBandSizes(slot) ?? slot?.formats;
   const parsedSizes = sizes?.map(parseBannerSize).filter(isDefined) ?? [];
   return parsedSizes.length > 0 ? parsedSizes : undefined;
 }
 
 /** Whether the slot's viewport band asks for no size at the current width. */
 function asksForNoSizeAtThisWidth(slot: RefreshGptSlot): boolean {
-  return injectedSlotBandSizes(findInjectedSlotForRefresh(slot))?.length === 0;
+  return viewportBandSizes(findInjectedSlotForRefresh(slot))?.length === 0;
 }
 
 function refreshSlotElementId(slot: RefreshGptSlot): string | undefined {

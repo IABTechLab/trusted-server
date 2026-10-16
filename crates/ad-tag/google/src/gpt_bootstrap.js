@@ -358,8 +358,33 @@
     );
   }
 
-  // Defines the slot and applies its viewport bands as a size mapping.
+  // The sizes the slot's viewport band asks for at the current viewport width,
+  // an empty list where that band asks for none, or null when the slot names
+  // no band. Bands come widest first, so the first one the width reaches holds.
+  function viewportBandSizes(slot) {
+    var bands = slot.viewport_sizes;
+    if (!bands || !bands.length) return null;
+    var width = window.innerWidth;
+    var band = bands.find(function (candidate) {
+      return width >= candidate[0][0];
+    });
+    return band ? band[1] : [];
+  }
+
+  // Defines the slot and applies its viewport bands as a size mapping. Defines
+  // nothing where the band at the current viewport width asks for no size, as
+  // no ad can serve there and GPT would otherwise size or collapse the slot's
+  // container after the page has painted.
   function defineWithViewportSizes(api, slot, elementId) {
+    var bandSizes = viewportBandSizes(slot);
+    if (bandSizes && !bandSizes.length) {
+      if (ts.log && typeof ts.log.debug === "function") {
+        ts.log.debug("GPT slot asks for no size at this viewport width", {
+          divId: slot.div_id,
+        });
+      }
+      return null;
+    }
     var definedSlot = api.defineSlot(
       slot.gam_unit_path,
       slot.formats,
