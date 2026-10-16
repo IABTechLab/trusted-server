@@ -297,7 +297,7 @@ relying party checks it.
 - **Configuration gate:** served only where the settings carry `[attestation]`. The address is `[attestation] endpoint`, which defaults to `/_ts/attestation`. Where the endpoint is not the default, a read of the default address answers `301` to the endpoint with the query kept.
 - **Auth:** none.
 - **Request:** `GET` or `HEAD`. An optional `nonce` query parameter of 1 to 64 characters from `A` to `Z`, `a` to `z`, `0` to `9`, `_` and `-` is signed back in the evidence.
-- **Response:** `200` with the page, or with the envelope as `application/json` at the `.json` address. `400` for a malformed nonce. `503` where the build carries no signing key in force or the key cannot be read. The `400` and `503` bodies are JSON with an `error` field.
+- **Response:** `200` with the page, or with the envelope as `application/json` at the `.json` address. `400` for a malformed nonce. `503` where the build carries no signing key in force, the key cannot be read or the clock cannot be read. The `400` and `503` bodies are JSON with an `error` field.
 - **Cache and CORS:** `Cache-Control: no-store` and `Access-Control-Allow-Origin: *` on every answer.
 - **Rate limiting:** none.
 - **Other methods:** reach the publisher's origin under the shared `/_ts` prefix. Under a prefix the endpoint has to itself, every other method and address beneath that prefix answers `404` from the deployment.
@@ -1046,8 +1046,8 @@ a publisher keeps their own file. `HEAD` is answered with the headers of the
   `Cache-Control: public, max-age=3600`
 - `503 Service Unavailable` with `Retry-After: 600` and
   `Cache-Control: no-store` when a selected module cannot answer and no earlier
-  answer of its is held, because an empty file or a `404` reads to a crawler as
-  permission to crawl everything
+  answer of its is held, or when the file would hold no rule, because an empty
+  file or a `404` reads to a crawler as permission to crawl everything
 
 With `refuse_all` selected the file refuses every crawler, and every response
 the deployment finalizes also carries `X-Robots-Tag: noindex, nofollow`.
