@@ -1773,16 +1773,20 @@ says `private`, `no-store` or `no-cache` or gives no lifetime, one that varies
 on `*` or on `Cookie`, one larger than a megabyte, an answer the platform's
 image optimizer makes, and the answer to a request carrying `Authorization`, a
 conditional header, a range, or a `Cache-Control` of `no-cache`, `no-store`,
-`min-fresh` or a nonzero `max-age`. A response that may not be shared is served to
-the request whose load fetched it from that one fetch.
+`min-fresh` or a nonzero `max-age`. A response that may not be shared is served
+to the request whose load fetched it from that one fetch. A request that sends
+the publisher's origin a cookie always goes to the origin, and its answer is not
+kept, because the cache cannot see whether the cookie shaped it. An asset route
+sends its origin no cookie. `[cache.assets] module = "none"` keeps no asset, so
+every asset is fetched from its origin for each request.
 
 | Table                | Field                | Default            | Range         | Description                                                                     |
 | -------------------- | -------------------- | ------------------ | ------------- | ------------------------------------------------------------------------------- |
-| `[cache.robots-txt]` | `module`             | none               |               | The module whose loading cache holds each robots.txt module's answer.           |
+| `[cache.robots-txt]` | `module`             | the linked module  |               | The module whose loading cache holds each robots.txt module's answer.           |
 | `[cache.robots-txt]` | `memory_seconds`     | `60`               | 0 to 31536000 | How long the copy in memory is used. Zero keeps none.                           |
 | `[cache.robots-txt]` | `store_seconds`      | `604800`, a week   | 1 to 31536000 | The longest a module's answer is used. The module's own refresh ends it sooner. |
 | `[cache.robots-txt]` | `store_idle_seconds` | `2592000`, 30 days | 1 to 31536000 | How long an answer in the shared store lasts unused.                            |
-| `[cache.assets]`     | `module`             | none               |               | The module whose loading cache holds the publisher's assets and route answers.  |
+| `[cache.assets]`     | `module`             | the linked module  |               | The loading cache module for assets and route answers. `none` keeps none.       |
 | `[cache.assets]`     | `memory_seconds`     | `5`                | 0 to 31536000 | How long the copy in memory is used. Zero keeps none.                           |
 | `[cache.assets]`     | `store_seconds`      | `3600`, an hour    | 1 to 31536000 | The longest a copy is used. The origin's own lifetime ends it sooner.           |
 | `[cache.assets]`     | `store_idle_seconds` | `86400`, a day     | 1 to 31536000 | How long a copy in the shared store lasts unused.                               |
