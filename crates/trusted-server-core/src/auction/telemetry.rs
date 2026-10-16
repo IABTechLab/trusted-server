@@ -1,7 +1,8 @@
 //! Auction telemetry row construction and sink abstraction.
 //!
 //! Core owns the auction observation model and pure row builder. Platform
-//! adapters provide the concrete sink implementation.
+//! adapters provide the concrete sink implementation. Rows are built only for
+//! a reader who permits measuring ad performance.
 
 use std::collections::HashSet;
 
@@ -15,6 +16,7 @@ use crate::auction::orchestrator::OrchestrationResult;
 use crate::auction::types::{AuctionRequest, AuctionResponse, Bid, BidStatus, MediaType};
 use crate::ec::EcContext;
 use crate::error::TrustedServerError;
+use crate::permissions::Permission;
 use crate::platform::RuntimeServices;
 
 const MAX_PAGE_PATH_BYTES: usize = 256;
@@ -131,6 +133,9 @@ pub struct AuctionObservationContext {
     /// `Some(false)` — a dashboard that reads absence as "not shareable" will be wrong for
     /// every `/auction` row.
     pub origin_cache_shareable: Option<bool>,
+    /// Whether the reader permits measuring ad performance, which is what
+    /// every row does. See [`build_auction_events`].
+    ad_measurement_permitted: bool,
     started_at: Instant,
 }
 
@@ -198,6 +203,9 @@ impl AuctionObservationContext {
             consent_present: !consent.is_empty(),
             slot_count,
             origin_cache_shareable: None,
+            ad_measurement_permitted: ec_context
+                .permissions()
+                .is_set(Permission::MeasureAdPerformance),
             started_at: Instant::now(),
         }
     }
@@ -237,6 +245,7 @@ impl AuctionObservationContext {
             consent_present: false,
             slot_count,
             origin_cache_shareable: None,
+            ad_measurement_permitted: true,
             started_at: Instant::now(),
         }
     }
@@ -542,6 +551,10 @@ pub async fn emit_auction_events_best_effort_lazy(
 }
 
 /// Build auction telemetry rows for one terminal observation.
+///
+/// Every row measures ad performance and describes the reader, so there is no
+/// row at all for a reader whose permissions do not include
+/// [`Permission::MeasureAdPerformance`], whatever the outcome.
 #[allow(
     clippy::needless_pass_by_value,
     reason = "call sites hand off terminal observations by value to keep ownership explicit"
@@ -551,6 +564,9 @@ pub fn build_auction_events(
     observation: AuctionObservationContext,
     terminal: AuctionTerminalOutcome<'_>,
 ) -> AuctionEventBatch {
+    if !observation.ad_measurement_permitted {
+        return AuctionEventBatch::default();
+    }
     let event_ts = current_event_timestamp();
     let mut rows = Vec::new();
 
@@ -1163,6 +1179,62 @@ mod tests {
         assert_eq!(
             without_user_agent.user_agent, None,
             "should omit a missing user agent"
+        );
+    }
+
+    #[test]
+    fn no_row_is_built_for_a_reader_who_has_not_permitted_ad_measurement() {
+        use crate::consent::types::ConsentContext;
+        use crate::permissions::{PermissionSet, PermissionState};
+
+        let refused = EcContext::new_for_test_gated(None, ConsentContext::default(), false);
+        let permitted = EcContext::new_for_test_gated(None, ConsentContext::default(), false)
+            .with_permissions_for_test(PermissionState::new(
+                PermissionSet::none().with(Permission::MeasureAdPerformance),
+            ));
+        let observation = |ec_context: &EcContext| {
+            AuctionObservationContext::from_parts(
+                AuctionSource::InitialNavigation,
+                "test-publisher.example",
+                "/article",
+                1,
+                Some(TEST_USER_AGENT),
+                ec_context,
+            )
+        };
+        let request = test_request("request-id");
+        let result = OrchestrationResult {
+            provider_responses: vec![AuctionResponse::no_bid("provider", 10)],
+            adserver_response: None,
+            winning_bids: HashMap::new(),
+            total_time_ms: 10,
+            metadata: HashMap::new(),
+        };
+        let skipped = || AuctionTerminalOutcome::Skipped {
+            reason: "consent_denied",
+            elapsed_ms: 0,
+        };
+
+        assert!(
+            build_auction_events(observation(&refused), skipped()).is_empty(),
+            "a skipped auction should give no row without the permission"
+        );
+        assert!(
+            build_auction_events(
+                observation(&refused),
+                AuctionTerminalOutcome::Completed {
+                    request: &request,
+                    result: &result,
+                    delivered_winner_slots: None,
+                },
+            )
+            .is_empty(),
+            "a completed auction should give no row without the permission"
+        );
+        assert_eq!(
+            build_auction_events(observation(&permitted), skipped()).row_count(),
+            1,
+            "the permission alone should let the summary row through"
         );
     }
 
