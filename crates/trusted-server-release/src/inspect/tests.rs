@@ -3,7 +3,7 @@
 //! Real-binary observations (dev `ts` builds and the Fastly Wasm) are manual
 //! evidence, not tests, because they depend on host build outputs.
 
-mod builders;
+pub(crate) mod builders;
 mod elf;
 mod macho;
 mod wasm;

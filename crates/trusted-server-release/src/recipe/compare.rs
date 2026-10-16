@@ -118,7 +118,7 @@ fn check_pair(
 }
 
 /// Reads the retained artifact and requires its recorded size and digest.
-fn read_artifact(completed: &RecipeCompleted) -> Result<Vec<u8>, Report<ReleaseError>> {
+pub(super) fn read_artifact(completed: &RecipeCompleted) -> Result<Vec<u8>, Report<ReleaseError>> {
     completed.rehash_for_handoff()?;
     let artifact = completed.artifact();
     if artifact.size() > EXECUTABLE_LIMIT {

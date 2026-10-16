@@ -30,6 +30,8 @@ pub(crate) enum ReleaseError {
     Boundary,
     #[display("Release recipe inputs or execution plan are rejected")]
     Recipe,
+    #[display("Final Fastly runtime acceptance rejected the executable")]
+    Runtime,
 }
 
 impl core::error::Error for ReleaseError {}

@@ -12,9 +12,14 @@ use std::time::{Duration, Instant};
 
 use super::super::ambient::ObservedAmbient;
 use super::super::compare::{FASTLY_ASSET, check_fastly_equality};
+use super::super::compare::{FastlyEqualityChecked, read_artifact};
 use super::super::remap::{RemapScan, scan_remapped_bytes};
+use super::super::runtime::{
+    FastlyRuntimeAccepted, HealthOnlySuccess, OriginPresence, RuntimeRejection, SelectedViceroy,
+    accept_fastly_runtime, run_gate,
+};
 use super::candidate::{
-    CargoFixture, cargo_docker_settings, cargo_measurement, denial_measurement,
+    CargoFixture, SCHEMA_VERSION, cargo_docker_settings, cargo_measurement, denial_measurement,
     equality_measurement, reported_errno,
 };
 use super::*;
@@ -473,7 +478,7 @@ fn scan_final_bytes(fixture: &CargoFixture, builds: [&FastlyBuild; 2]) -> RemapS
 }
 
 #[test]
-#[ignore = "requires explicit JS and Cargo ordinary CI fixtures and Linux Docker; run separately in producer CI"]
+#[ignore = "requires explicit JS and Cargo ordinary CI fixtures, Linux Docker and the pinned Viceroy; run separately in producer CI"]
 fn fastly_canonical_and_reproduction_builds_are_byte_identical() {
     let fixture = cargo_fixture();
     let js = run_two_fresh_js_builds();
@@ -517,4 +522,118 @@ fn fastly_canonical_and_reproduction_builds_are_byte_identical() {
         text,
     )
     .expect("should retain the canonical/reproduction equality measurement");
+    run_runtime_gate(&RuntimeGateInputs {
+        fixture: &fixture,
+        source: &js.source,
+        canonical: &canonical,
+        reproduction: &reproduction,
+        checked: &checked,
+    });
+}
+
+/// Everything the chained runtime gate needs from the equality run.
+struct RuntimeGateInputs<'a> {
+    fixture: &'a CargoFixture,
+    source: &'a ApprovedSource,
+    canonical: &'a FastlyBuild,
+    reproduction: &'a FastlyBuild,
+    checked: &'a FastlyEqualityChecked,
+}
+
+/// Selects the pinned Viceroy named by `TS_RELEASE_VICEROY`.
+fn pinned_viceroy() -> SelectedViceroy {
+    let path = std::env::var_os("TS_RELEASE_VICEROY")
+        .map(PathBuf::from)
+        .expect("should explicitly supply the pinned Viceroy executable");
+    SelectedViceroy::select(&path).expect("should select the pinned Viceroy 0.17.0")
+}
+
+/// The ordinary CI measurement of one accepted runtime gate run.
+fn accepted_measurement(accepted: &FastlyRuntimeAccepted) -> serde_json::Value {
+    let source_commit = accepted.source_commit().as_str();
+    let accepted = accepted.observed();
+    let publisher = accepted.publisher();
+    let output = accepted.viceroy_output();
+    serde_json::json!({
+        "source_commit": source_commit,
+        "viceroy_output": {
+            "stdout_sha256": output.stdout_sha256,
+            "stderr_sha256": output.stderr_sha256,
+            "stderr_tail": output.stderr_tail,
+        },
+        "artifact": {
+            "sha256": accepted.artifact_sha256(),
+            "size": accepted.artifact_size(),
+        },
+        "fixture_sha256": accepted.fixture_sha256(),
+        "config_sha256": accepted.config_sha256(),
+        "health_status": accepted.health_status(),
+        "publisher": {
+            "status": publisher.status,
+            "body_size": publisher.body_size,
+            "body_sha256": publisher.body_sha256,
+            "script_src": publisher.script_src,
+        },
+        "origin_requests": accepted.origin_requests(),
+        "startup_seconds": accepted.startup().as_secs_f64(),
+        "viceroy_outcome": accepted.viceroy_outcome().to_string(),
+    })
+}
+
+/// Runs the final-byte runtime gate on both equal outputs, then proves that
+/// a run with a closed origin is rejected although its health check passes.
+fn run_runtime_gate(inputs: &RuntimeGateInputs<'_>) {
+    let RuntimeGateInputs {
+        fixture,
+        source,
+        canonical,
+        reproduction,
+        checked,
+    } = *inputs;
+    let viceroy = pinned_viceroy();
+    let mut builds = serde_json::Map::new();
+    for (role, build) in [("canonical", canonical), ("reproduction", reproduction)] {
+        let accepted = accept_fastly_runtime(source, &build.completed, checked, &viceroy)
+            .unwrap_or_else(|error| {
+                panic!("should accept the {role} final bytes through Viceroy: {error:?}")
+            });
+        assert_eq!(
+            accepted.observed().artifact_sha256(),
+            checked.sha256(),
+            "should execute the exact accepted {role} bytes"
+        );
+        builds.insert(role.to_owned(), accepted_measurement(&accepted));
+    }
+    let bytes = read_artifact(&canonical.completed).expect("should reread the canonical bytes");
+    let rejected = run_gate(&bytes, &viceroy, OriginPresence::Closed)
+        .expect_err("should reject a run whose origin is unreachable");
+    assert!(
+        rejected.downcast_ref::<HealthOnlySuccess>().is_some(),
+        "should reject a health-only success: {rejected:?}"
+    );
+    canonical
+        .completed
+        .rehash_for_handoff()
+        .expect("should leave the canonical artifact unchanged");
+    let measurement = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "kind": "ordinary-ci-fastly-runtime-gate",
+        "asset": checked.asset().artifact().name,
+        "viceroy": {
+            "version": viceroy.version(),
+            "sha256": viceroy.sha256(),
+        },
+        "builds": builds,
+        "health_only_rejection": rejected
+            .downcast_ref::<RuntimeRejection>()
+            .map(ToString::to_string),
+        "release_qualification": false,
+    });
+    let text = serde_json::to_string_pretty(&measurement).expect("should encode the measurement");
+    println!("{text}");
+    fs::write(
+        fixture.root.join("fastly-runtime-gate-measurement.json"),
+        text,
+    )
+    .expect("should retain the runtime gate measurement");
 }

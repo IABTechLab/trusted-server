@@ -18,7 +18,7 @@ use crate::boundary::DockerSettings;
 use crate::process::ProcessLimits;
 
 /// Schema version of `fixture.json` and of every measurement.
-const SCHEMA_VERSION: u64 = 1;
+pub(super) const SCHEMA_VERSION: u64 = 1;
 /// Kind of the Cargo fixture description.
 const FIXTURE_KIND: &str = "ordinary-ci-cargo-fixture";
 /// How the fixture inputs were acquired.

@@ -110,6 +110,10 @@ pub(crate) enum Violation {
     /// was stripped.
     #[display("WebAssembly module lacks a required nonempty debug section")]
     WasmDebugInfo,
+    /// The module is not a Fastly Compute WASI command: `_start` or `memory`
+    /// is missing or mistyped, or the downstream request ABI is not imported.
+    #[display("WebAssembly module lacks the Fastly Compute entry ABI")]
+    WasmAbi,
 }
 
 /// Builds the inspection rejection carrying `violation` and a detail line.
@@ -372,6 +376,36 @@ impl WasmCustomSection {
     }
 }
 
+/// The kind of one core Wasm export, with a function's arity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WasmExportKind {
+    /// A function taking `params` values and returning `results` values.
+    Function { params: usize, results: usize },
+    /// A linear memory.
+    Memory,
+    /// A table, global or tag.
+    Other,
+}
+
+/// One export observed in a core Wasm module.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WasmExport {
+    name: String,
+    kind: WasmExportKind,
+}
+
+impl WasmExport {
+    /// Export name as encoded in the module.
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Kind of the exported item.
+    pub(crate) fn kind(&self) -> WasmExportKind {
+        self.kind
+    }
+}
+
 /// Facts observed in an accepted core Wasm module.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WasmFacts {
@@ -379,12 +413,70 @@ pub(crate) struct WasmFacts {
     import_modules: Vec<String>,
     function_imports: usize,
     custom_sections: Vec<WasmCustomSection>,
+    exports: Vec<WasmExport>,
 }
 
 /// DWARF sections whose presence proves the module was not stripped.
 const REQUIRED_DEBUG_SECTIONS: [&str; 2] = [".debug_info", ".debug_line"];
 
+/// Hostcall modules a Fastly program must import to receive the downstream
+/// request and send its response.
+const REQUIRED_FASTLY_IMPORT_MODULES: [&str; 2] = ["fastly_http_req", "fastly_http_resp"];
+
 impl WasmFacts {
+    /// Exports in module order.
+    pub(crate) fn exports(&self) -> &[WasmExport] {
+        &self.exports
+    }
+
+    /// Requires the Fastly Compute WASI command entry ABI.
+    ///
+    /// The module must export a `_start` function taking and returning
+    /// nothing and a `memory`, and import the downstream request and response
+    /// hostcall modules. Import modules outside the reviewed host ABI were
+    /// already rejected by [`inspect_wasm`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Violation::WasmAbi`] naming the first missing or mistyped
+    /// requirement.
+    pub(crate) fn require_fastly_entry_abi(&self) -> Result<(), Report<ReleaseError>> {
+        let kind = |name: &str| {
+            self.exports
+                .iter()
+                .find(|export| export.name == name)
+                .map(|export| export.kind)
+        };
+        match kind("_start") {
+            Some(WasmExportKind::Function {
+                params: 0,
+                results: 0,
+            }) => {}
+            other => {
+                return Err(rejected(
+                    Violation::WasmAbi,
+                    format!("export _start must be a nullary function, found {other:?}"),
+                ));
+            }
+        }
+        if kind("memory") != Some(WasmExportKind::Memory) {
+            return Err(rejected(
+                Violation::WasmAbi,
+                "export memory must be a linear memory",
+            ));
+        }
+        if let Some(missing) = REQUIRED_FASTLY_IMPORT_MODULES
+            .iter()
+            .find(|module| !self.import_modules.iter().any(|seen| seen == *module))
+        {
+            return Err(rejected(
+                Violation::WasmAbi,
+                format!("missing required import module {missing}"),
+            ));
+        }
+        Ok(())
+    }
+
     /// Custom sections in file order.
     pub(crate) fn custom_sections(&self) -> &[WasmCustomSection] {
         &self.custom_sections
@@ -429,4 +521,4 @@ impl WasmFacts {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

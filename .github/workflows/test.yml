@@ -397,8 +397,9 @@ jobs:
     runs-on: ubuntu-24.04
     # Fixture preparation, two fresh JS builds (~12 min), then two confined
     # Fastly builds each with its own vendoring (~3-4 min each) and the
-    # final-byte comparison: 45 minutes left too little headroom.
-    timeout-minutes: 60
+    # final-byte comparison: 45 minutes left too little headroom. The
+    # uncached Viceroy install (~5-8 min) and three gate runs add to that.
+    timeout-minutes: 75
     env:
       # Optimize repeated whole-input hashes with test safety checks retained.
       CARGO_PROFILE_TEST_OPT_LEVEL: '2'
@@ -417,8 +418,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo "rust=$(awk '$1 == "rust" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
-          echo "node=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+          {
+            echo "rust=$(awk '$1 == "rust" { print $2 }' .tool-versions)"
+            echo "node=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)"
+            echo "viceroy=$(awk '$1 == "viceroy" { print $2 }' .tool-versions)"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Use pinned Node.js
         uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0 (Node 24)
@@ -440,6 +444,21 @@ jobs:
           HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
           test -n "$HOST_TARGET"
           echo "HOST_TARGET=$HOST_TARGET" >> "$GITHUB_ENV"
+
+      # Same pinned source install as the other Viceroy jobs, but uncached and
+      # into a private root: the runtime gate selects this exact absolute path,
+      # checks its reported version and records its digest.
+      - name: Install pinned Viceroy for the final-byte runtime gate
+        env:
+          VICEROY_VERSION: ${{ steps.tools.outputs.viceroy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$VICEROY_VERSION"
+          VICEROY_ROOT="$RUNNER_TEMP/release-viceroy"
+          cargo install viceroy --version "$VICEROY_VERSION" --locked --root "$VICEROY_ROOT"
+          test "$("$VICEROY_ROOT/bin/viceroy" --version)" = "viceroy $VICEROY_VERSION"
+          echo "TS_RELEASE_VICEROY=$VICEROY_ROOT/bin/viceroy" >> "$GITHUB_ENV"
 
       - name: Prepare ordinary CI JS and Cargo fixtures
         shell: bash
@@ -469,8 +488,9 @@ jobs:
 
       # The canonical and reproduction builds use the same JS handoff in
       # separate fresh roots and boundaries; the final Fastly files must be
-      # byte-identical.
-      - name: Build canonical and reproduction Fastly from one JS handoff and compare final bytes (Linux)
+      # byte-identical. Both outputs then pass the final-byte Viceroy runtime
+      # gate, and a closed-origin run must be rejected despite a healthy probe.
+      - name: Build canonical and reproduction Fastly from one JS handoff, compare final bytes and run the Viceroy gate (Linux)
         shell: bash
         run: |
           set -euo pipefail
@@ -481,6 +501,7 @@ jobs:
           awk '/: test$/ { count++ } END { if (count != 1) { print "Expected exactly one Fastly canonical/reproduction equality fixture"; exit 1 } }' "$TEST_LIST"
           cargo test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --nocapture
           cat "$TS_RELEASE_CARGO_FIXTURE_ROOT/cargo-canonical-reproduction-equality-measurement.json"
+          cat "$TS_RELEASE_CARGO_FIXTURE_ROOT/fastly-runtime-gate-measurement.json"
 
   test-typescript:
     name: vitest

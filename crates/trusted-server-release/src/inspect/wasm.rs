@@ -3,9 +3,12 @@
 use std::collections::BTreeSet;
 
 use error_stack::Report;
-use wasmparser::{Parser, Payload, TypeRef, Validator, WasmFeatures};
+use wasmparser::types::{EntityType, Types};
+use wasmparser::{CompositeInnerType, Parser, Payload, TypeRef, Validator, WasmFeatures};
 
-use super::{Violation, WasmCustomSection, WasmFacts, rejected, sha256_hex};
+use super::{
+    Violation, WasmCustomSection, WasmExport, WasmExportKind, WasmFacts, rejected, sha256_hex,
+};
 use crate::error::ReleaseError;
 
 /// Reviewed import modules of the Fastly Compute host ABI.
@@ -57,9 +60,10 @@ pub(crate) fn inspect_wasm(bytes: &[u8]) -> Result<WasmFacts, Report<ReleaseErro
             "missing core module header",
         ));
     }
-    Validator::new_with_features(FEATURES)
+    let types = Validator::new_with_features(FEATURES)
         .validate_all(bytes)
         .map_err(|error| rejected(Violation::WasmValidation, error))?;
+    let exports = exports(&types)?;
     let (import_modules, function_imports) = imports(bytes)?;
     if let Some(module) = import_modules
         .iter()
@@ -75,7 +79,42 @@ pub(crate) fn inspect_wasm(bytes: &[u8]) -> Result<WasmFacts, Report<ReleaseErro
         import_modules: import_modules.into_iter().collect(),
         function_imports,
         custom_sections: custom_sections(bytes)?,
+        exports,
     })
+}
+
+/// Returns every export of the validated module in module order.
+fn exports(types: &Types) -> Result<Vec<WasmExport>, Report<ReleaseError>> {
+    let types = types.as_ref();
+    let Some(exports) = types.core_exports() else {
+        return Err(rejected(
+            Violation::WasmEncoding,
+            "validated types describe a component",
+        ));
+    };
+    Ok(exports
+        .map(|(name, entity)| {
+            let kind = match entity {
+                EntityType::Func(id) | EntityType::FuncExact(id) => {
+                    match &types[id].composite_type.inner {
+                        CompositeInnerType::Func(function) => WasmExportKind::Function {
+                            params: function.params().len(),
+                            results: function.results().len(),
+                        },
+                        _ => WasmExportKind::Other,
+                    }
+                }
+                EntityType::Memory(_) => WasmExportKind::Memory,
+                EntityType::Table(_) | EntityType::Global(_) | EntityType::Tag(_) => {
+                    WasmExportKind::Other
+                }
+            };
+            WasmExport {
+                name: name.to_owned(),
+                kind,
+            }
+        })
+        .collect())
 }
 
 /// Returns every custom section in file order.

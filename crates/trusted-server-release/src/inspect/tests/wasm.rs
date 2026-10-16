@@ -1,6 +1,6 @@
 //! Core Wasm inspection tests.
 
-use super::builders::{section, wasm_module, wasm_module_with_customs};
+use super::builders::{Entry, command_module, section, wasm_module, wasm_module_with_customs};
 use super::*;
 
 #[test]
@@ -192,4 +192,106 @@ fn debug_sections_are_required_and_nonempty() {
             "should reject a {label} module for the no-strip check"
         );
     }
+}
+
+/// Imports of a minimal Fastly command: WASI plus both downstream hostcalls.
+const FASTLY_COMMAND_IMPORTS: [(&str, &str); 3] = [
+    ("wasi_snapshot_preview1", "fd_write"),
+    ("fastly_http_req", "body_downstream_get"),
+    ("fastly_http_resp", "send_downstream"),
+];
+
+#[test]
+fn fastly_command_entry_abi_is_accepted_and_exports_are_recorded() {
+    let facts = inspect_wasm(&command_module(
+        &FASTLY_COMMAND_IMPORTS,
+        Entry::Nullary,
+        true,
+    ))
+    .expect("should accept a Fastly command module");
+
+    facts
+        .require_fastly_entry_abi()
+        .expect("should accept the Fastly entry ABI");
+    let observed: Vec<(&str, WasmExportKind)> = facts
+        .exports()
+        .iter()
+        .map(|export| (export.name(), export.kind()))
+        .collect();
+    assert_eq!(
+        observed,
+        [
+            (
+                "_start",
+                WasmExportKind::Function {
+                    params: 0,
+                    results: 0
+                }
+            ),
+            ("memory", WasmExportKind::Memory),
+        ],
+        "should record every export with its kind in module order"
+    );
+}
+
+#[test]
+fn wrong_fastly_entry_abi_is_rejected() {
+    let only_wasi = [("wasi_snapshot_preview1", "fd_write")];
+    let without_response = [
+        ("wasi_snapshot_preview1", "fd_write"),
+        ("fastly_http_req", "body_downstream_get"),
+    ];
+    let cases: [(&str, Vec<u8>); 6] = [
+        (
+            "missing _start",
+            command_module(&FASTLY_COMMAND_IMPORTS, Entry::Renamed, true),
+        ),
+        (
+            "_start taking an argument",
+            command_module(&FASTLY_COMMAND_IMPORTS, Entry::TakesI32, true),
+        ),
+        (
+            "unexported memory",
+            command_module(&FASTLY_COMMAND_IMPORTS, Entry::Nullary, false),
+        ),
+        (
+            "plain WASI command",
+            command_module(&only_wasi, Entry::Nullary, true),
+        ),
+        (
+            "missing response hostcalls",
+            command_module(&without_response, Entry::Nullary, true),
+        ),
+        (
+            "library without exports",
+            wasm_module(&FASTLY_COMMAND_IMPORTS),
+        ),
+    ];
+    for (label, bytes) in cases {
+        let facts = inspect_wasm(&bytes).expect("should accept the module itself");
+        assert_eq!(
+            violation(facts.require_fastly_entry_abi()),
+            Violation::WasmAbi,
+            "should reject a {label} as the Fastly entry ABI"
+        );
+    }
+}
+
+#[test]
+fn foreign_host_abi_command_is_rejected_before_the_entry_check() {
+    let bytes = command_module(
+        &[
+            ("fastly_http_req", "body_downstream_get"),
+            ("fastly_http_resp", "send_downstream"),
+            ("wasi:http/types@0.3.0", "handle"),
+        ],
+        Entry::Nullary,
+        true,
+    );
+
+    assert_eq!(
+        violation(inspect_wasm(&bytes)),
+        Violation::WasmImport,
+        "should reject a command importing a foreign host ABI"
+    );
 }

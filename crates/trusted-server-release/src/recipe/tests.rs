@@ -340,6 +340,7 @@ mod fixture;
 mod full;
 mod plan;
 mod remap;
+mod runtime;
 mod sources;
 mod tools;
 
