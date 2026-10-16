@@ -1,15 +1,16 @@
 //! `/robots.txt` as a middleware of core's own, named `robots_txt` in a
 //! `[[fetch]]` entry on the file's path. Its preparation makes the file from
 //! the selected contributors, through their holding, and its action replaces
-//! the origin's file with it. Where the origin has no file, or answers with a
-//! page, the creating rule runs it on an empty one.
+//! the origin's file with it. Where the origin answers with anything else,
+//! being no file, a page, an error or a redirect among them, the creating rule
+//! runs it on an empty one.
 
 use std::any::Any;
 use std::time::Duration;
 
 use error_stack::Report;
 
-use super::{RETRY_AFTER_SECONDS, RobotsTxtConfig, Selected, document, file_for};
+use super::{RETRY_AFTER_SECONDS, ROBOTS_TXT_PATH, RobotsTxtConfig, Selected, document, file_for};
 use crate::error::TrustedServerError;
 use crate::middleware::{
     Middleware, MiddlewareAction, MiddlewareContext, MiddlewarePhase, Preparation, Refusal,
@@ -73,6 +74,25 @@ impl Middleware for RobotsTxt {
         media_type == MEDIA_TYPE
     }
 
+    // The file is the one path, as RFC 9309 section 2.3 gives it, so a longer
+    // path the entry's prefix covers keeps the origin's answer.
+    fn handles_path(&self, path: &str) -> bool {
+        path == ROBOTS_TXT_PATH
+    }
+
+    // A crawler takes an error, a redirect, an empty answer, or an origin
+    // file the action cannot replace, as permission or as the origin's own
+    // rules, so the file is made in place of each.
+    fn writes_whole_document(&self) -> bool {
+        true
+    }
+
+    // The origin is asked for its whole file, so a crawler's validators or
+    // range never bring a `304` or a `206` in place of the file.
+    fn needs_whole_body(&self) -> bool {
+        true
+    }
+
     fn phases(&self) -> &[MiddlewarePhase] {
         &MiddlewarePhase::ALL
     }
@@ -103,16 +123,16 @@ impl Middleware for RobotsTxt {
     }
 
     fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction {
-        match context.take_prepared::<String>(MODULE) {
-            Some(file) => MiddlewareAction {
-                stream: Some(Box::new(ReplaceBody { file: Some(file) })),
-                ..MiddlewareAction::pass()
-            },
-            // Nothing prepared means the preparation did not run, which no request can cause.
-            None => {
-                log::error!("robots.txt was not prepared, so the origin's file is served as it is");
-                MiddlewareAction::pass()
-            }
+        let file = context.take_prepared::<String>(MODULE).unwrap_or_else(|| {
+            // Nothing prepared means the preparation did not run. The file
+            // then refuses every crawler, because the origin's file, or no
+            // file, could allow what the selected rules refuse.
+            log::error!("robots.txt was not prepared, so the file refuses every crawler");
+            document::refusal(&self.config.always_allow)
+        });
+        MiddlewareAction {
+            stream: Some(Box::new(ReplaceBody { file: Some(file) })),
+            ..MiddlewareAction::pass()
         }
     }
 }
@@ -193,26 +213,48 @@ mod tests {
         assert_eq!(output, b"User-agent: *\nDisallow: /\n");
     }
 
-    #[test]
-    fn with_nothing_prepared_the_origins_file_is_left_as_it_is() {
+    /// What `middleware` writes in place of an origin's file in `phase`, with
+    /// `prepared` as what its preparation left.
+    fn written(middleware: &RobotsTxt, phase: MiddlewarePhase, prepared: &Prepared) -> String {
         let state = IntegrationDocumentState::default();
-        let prepared = Prepared::default();
-        let context = context_with(MiddlewarePhase::Fetch, &state, &prepared);
+        let mut processor = middleware
+            .create(&context_with(phase, &state, prepared))
+            .stream
+            .expect("the middleware should write a file whatever was prepared");
+        let output = processor
+            .process_chunk(b"User-agent: *\nAllow: /\n", true)
+            .expect("should write the file");
+        String::from_utf8(output).expect("the file is text")
+    }
 
-        let action = middleware().create(&context);
+    /// Nothing prepared means the preparation did not run, so the file
+    /// refuses every crawler, whatever `modules` selects, rather than letting
+    /// the origin's file through.
+    #[test]
+    fn with_nothing_prepared_the_file_refuses_every_crawler() {
+        let allowing: RobotsTxtConfig = serde_json::from_value(serde_json::json!({
+            "modules": "allow_all",
+            "always_allow": ["/ads.txt"],
+        }))
+        .expect("should read the robots.txt settings");
+        let middleware = RobotsTxt::new(allowing, vec![(crate::robots_txt::ALLOW_ALL, None)]);
 
-        assert!(action.stream.is_none(), "should pass the body through");
-        assert!(action.head_inserts.is_empty());
+        assert_eq!(
+            written(&middleware, MiddlewarePhase::Fetch, &Prepared::default()),
+            "User-agent: *\nAllow: /ads.txt\nDisallow: /\n"
+        );
     }
 
     #[test]
     fn a_value_of_another_type_under_the_name_is_not_a_file() {
-        let state = IntegrationDocumentState::default();
         let prepared = Prepared::default();
         prepared.insert(MiddlewarePhase::Serve, MODULE, Box::new(7_u32));
-        let context = context_with(MiddlewarePhase::Serve, &state, &prepared);
 
-        assert!(middleware().create(&context).stream.is_none());
+        assert_eq!(
+            written(&middleware(), MiddlewarePhase::Serve, &prepared),
+            "User-agent: *\nDisallow: /\n",
+            "the file refuses every crawler, as with nothing prepared"
+        );
     }
 
     #[test]
