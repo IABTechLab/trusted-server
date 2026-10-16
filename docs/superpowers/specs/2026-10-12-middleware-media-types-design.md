@@ -5,7 +5,7 @@
 **Related specs:** `2026-08-27-integration-provider-seam-design.md`, `2026-10-12-page-middleware-design.md`, `2026-10-12-ads-txt-sellers-design.md`, `2026-10-12-middleware-creates-a-missing-file-design.md`, `2026-10-12-robots-txt-middleware-design.md` and `2026-10-14-rsc-flight-middleware-design.md`, all in IABTechLab/trusted-server#1342, which holds every design document of the stack
 **Related PRs:** IABTechLab/trusted-server#1360, IABTechLab/trusted-server#1306 (closed), jwrosewell/trusted-server#14 (closed)
 **Issues:** IABTechLab/trusted-server#1277
-**Last updated:** 2026-10-15
+**Last updated:** 2026-10-16
 
 > **Why this spec exists.** Before this change the `[[fetch]]` and `[[serve]]` entries covered HTML alone, so a module could not change a publisher's `ads.txt`, a script or a stylesheet. This change lets an entry cover those text files, and this spec says which media types, what runs on a body, and what stays unchanged.
 
@@ -45,8 +45,8 @@ Nothing else is accepted. Every image is refused, `image/svg+xml` among them, be
 
 1. A response of a type outside the list above, such as an image. Core does not read its body.
 2. A `text/x-component` stream, which goes to core's own rewriter.
-3. A response with a `Content-Encoding` other than gzip, deflate or br, which core cannot decode.
-4. A response that declares a charset other than UTF-8, because a processor that adds UTF-8 text to a body in another charset would corrupt the body. A response that declares no charset is handed on as UTF-8. Core still moves the origin's addresses in the body of a response that declares another charset, as it does in every text response.
+3. A response with a `Content-Encoding` other than `identity`, gzip, deflate or br, which core cannot decode. A response with no `Content-Encoding` is read as it is.
+4. A response that declares a charset other than UTF-8, because a processor that adds UTF-8 text to a body in another charset would corrupt the body. A response that declares no charset is handed on as UTF-8. Core still moves the origin's addresses in the body of a response that declares another charset, as it does in every text response, and that replacement reads every text body as UTF-8 and drops everything from the first byte that is not valid UTF-8 (`streaming_replacer.rs`, lines 114 to 141). A body in another charset therefore does not reach the reader intact either. That fault is in core already and this change leaves it as it was.
 5. A response with no body, being the reply to a `HEAD` request, a `204`, a `205` or a `304`.
 
 ```rust
@@ -90,7 +90,7 @@ pub trait Middleware: Send + Sync {
 
 ## 3. What is not in this change
 
-- A middleware that uses the change. The ads.txt sellers module, which adds a publisher's sellers to the origin's file, is the first, in row 20 (IABTechLab/trusted-server#1361, `2026-10-12-ads-txt-sellers-design.md`). At this row no module changes a body that is not HTML, and only two fixtures in core's tests do.
+- A middleware that uses the change. The ads.txt sellers module, which adds a publisher's sellers to the origin's file, is the first, in row 20 (IABTechLab/trusted-server#1361, `2026-10-12-ads-txt-sellers-design.md`). At this row no module changes a body that is not HTML. Of the fixture middleware core's tests register, one changes such a body through the publisher path, and a second writes a header on such a response and leaves its body alone.
 - A file the origin does not have. An origin `404` is not turned into a file here. Row 22 (IABTechLab/trusted-server#1363, `2026-10-12-middleware-creates-a-missing-file-design.md`) makes the file from the middleware an entry names.
 - An entry for `text/x-component`, which row 40 adds.
 - A rule for the status, the cache headers or the validators of a text response a middleware changed, which the open questions raise.
@@ -126,11 +126,11 @@ The tests are in `crates/trusted-server-core/src`.
 
 Eight things have no test.
 
-1. Fastly's streaming conversion of a text body, which is where the headers are written for Fastly and where a failure ends the response part way. The async test reaches the processor constructor, `PublisherBodyProcessor::new`, that the conversion also uses, and no test runs the conversion.
+1. Fastly's streaming conversion of a text body, which is where the headers are written for Fastly and where a failure ends the response part way. The async test reaches the processor constructor, `PublisherBodyProcessor::new`, that the conversion also uses. Tests run the conversion on `text/css` with no entry, and none runs it on a body an entry covers.
 2. A stream processor in the serve phase. The serve fixture writes a header and no processor.
 3. A fetch entry and a serve entry on one body, to show the fetch entry's processors run first.
 4. A plan refusal through the publisher path. The chain test refuses head markup alone, so markup for after the script bundle, an element handler and a text handler on a body that is not HTML have no test.
-5. `application/json` and `application/javascript` through the publisher path. Both appear only in the test of which types an entry may cover.
+5. `application/json` and `application/javascript` through the publisher path. Both appear only in the test of which types an entry may cover, and `application/json` also in the test of the media type a content type gives.
 6. A compressed text body with an entry. The text tests send identity encoding.
 7. A response whose status is not `200`, a request with `Range` or a conditional header, and a serve middleware that reads the request's state on a text body.
 8. An adapter. No adapter test sends a text body through an entry.
@@ -142,6 +142,7 @@ The fork's CI passed on the series head, `149280a65`, all nineteen checks, as th
 ## Review log
 
 1. **Round 1, 2026-10-15.** A review in a fresh session, against `split/19-media-types` at `149280a65`. Issues found, four of them blocking. The design listed `image/svg+xml` as a type an entry may cover when the code refuses it, described stored copies that a body that is not HTML never has, said a middleware changes the body alone when a serve middleware's headers also reach the response, and left out that a response declaring a charset other than UTF-8 gets no middleware. This revision states what the code does at that head for the types, the match, the charset, the status codes, caching, the headers, the adapters, failure and compatibility, replaces the acceptance claims with what the pull request description records, and lists five questions that wait for code changes.
+2. **Round 2, 2026-10-16.** A lighter review in a fresh session, checking the round 1 fixes against `split/19-media-types` at `149280a65`. Approved, none blocking. This revision qualifies the identity encoding, the one fixture that changes a body, the tests that run Fastly's conversion and the tests that name `application/json`, and says that core's address replacement drops a body's bytes from the first one that is not valid UTF-8.
 
 ## Revision record
 
@@ -149,3 +150,4 @@ The fork's CI passed on the series head, `149280a65`, all nineteen checks, as th
 | ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 2026-10-12 | First draft, from the pull request and its issue as they stand.                                                                                                                                                                                                                                                                                                                                                                                                  |
 | 2026-10-15 | Fixes from review round 1. The types an entry may cover and the refusals, the match, what no entry can change, the charset, the headers, what a processor is handed, status codes, caching and validators, consent and privacy, the adapters, failure, compatibility, the rows that hold what this change leaves out, the tests and the cases with none, the open questions, the header and the acceptance lines brought to the series head, and the review log. |
+| 2026-10-16 | Fixes from review round 2. The identity encoding, the one fixture that changes a body, the tests that run Fastly's conversion and the tests that name `application/json` are stated as the code has them, and core's address replacement is said to drop a body's bytes from the first one that is not valid UTF-8.                                                                                                                                              |
