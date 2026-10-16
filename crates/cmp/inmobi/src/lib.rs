@@ -707,7 +707,7 @@ mod tests {
 
     /// A CMP id is a whole number the IAB assigned, which a TC string holds
     /// in 12 bits, so any other value is refused when the settings load, with
-    /// a message naming the setting.
+    /// a message naming the setting and never its value.
     #[test]
     fn a_cmp_id_outside_1_to_4095_is_refused_naming_the_setting() {
         // The test settings name the template's placeholder origin, which the
@@ -727,28 +727,16 @@ mod tests {
             )
         };
 
-        // (case, the value as written, what the refusal must say)
+        // (case, the value as written)
         let cases = [
-            (
-                "zero, which a stub reports before it has an id",
-                "0",
-                "`cmp_id` is 0,",
-            ),
-            (
-                "past the 12 bits a TC string holds",
-                "4096",
-                "`cmp_id` is 4096,",
-            ),
-            (
-                "past what the field could hold",
-                "70000",
-                "`cmp_id` is 70000,",
-            ),
-            ("below zero", "-1", "`cmp_id` is -1,"),
-            ("a string", "\"10\"", "`cmp_id` is not a whole number"),
-            ("a fraction", "10.5", "`cmp_id` is not a whole number"),
+            ("zero, which a stub reports before it has an id", "0"),
+            ("past the 12 bits a TC string holds", "4096"),
+            ("past what the field could hold", "70000"),
+            ("below zero", "-1"),
+            ("a string", "\"10\""),
+            ("a fraction", "10.5"),
         ];
-        for (case, value, reason) in cases {
+        for (case, value) in cases {
             let settings = with_cmp_id(value);
             for (call, refusal) in [
                 ("loading the settings", load(&settings).err()),
@@ -760,8 +748,12 @@ mod tests {
                     .current_context()
                     .to_string();
                 assert!(
-                    message.contains("[cmp.inmobi]") && message.contains(reason),
-                    "{case}: {call} should say {reason:?}, and said {message:?}"
+                    message.contains("[cmp.inmobi]") && message.contains("`cmp_id`"),
+                    "{case}: {call} should name the table and the setting, and said {message:?}"
+                );
+                assert!(
+                    !message.contains(value),
+                    "{case}: {call} should not quote the value, and said {message:?}"
                 );
             }
         }
