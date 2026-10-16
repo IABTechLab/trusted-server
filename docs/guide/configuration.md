@@ -1073,9 +1073,10 @@ A module with settings of its own reads them from its own block, `[robots-txt.<n
 1. With `refuse_all` selected the file is the refusal and nothing else, whatever else is selected, and every response the deployment finalizes carries `X-Robots-Tag: noindex, nofollow`.
 2. A path in `always_allow` stays open to every crawler a module's rules refuse the whole site to, `*` included. A narrower rule is kept as the module gave it, so `Disallow: /ads` still closes off `/ads.txt`.
 3. The rules appear in the order `modules` names them, between `top_text` above and the `Sitemap` line and `bottom_text` below.
-4. A module's answer is held in the key-value store and served until the module's own refresh is due. A module that cannot answer has its last answer served past its age, for as long as the store keeps it, which is 30 days where the store can give an entry a lifetime. With no answer held at all the file is `503` with `Retry-After`, never an empty file, which a crawler would read as permission to crawl everything.
+4. A module is asked for the host the request was addressed to, never one that `Forwarded` or `X-Forwarded-Host` names, and is given nothing of the crawler's connection. Its answer is held for that host in the key-value store and served until the module's own refresh is due. A module that cannot answer has its last answer served past its age, for as long as the store keeps it, which is 30 days where the store can give an entry a lifetime. With no answer held at all, or with no rule anywhere in the file, the file is `503` with `Retry-After: 600`, never an empty file, which a crawler would read as permission to crawl everything. Select `allow_all` to allow every crawler.
 5. Spin's key-value store gives an entry no lifetime, so there an answer is kept until it is replaced, and an answer held for settings that have since changed stays until it is deleted from the store.
-6. A deployment whose key-value store cannot be opened holds nothing, so there every request for the file asks each module.
+6. Fastly and Axum hold nothing, because neither hands the file a key-value store, and neither does a deployment whose store cannot be opened. There every request for the file asks each module, and a module that cannot answer makes the file `503`.
+7. On Fastly the file is answered once the modules have prepared the request, before the Edge Cookie steps and the request filters, so a filter's answer never stands in for it.
 
 **Which responses carry the header.** An adapter writes `X-Robots-Tag` last when it finalizes a response, replacing any tag already there, so neither an origin page nor `[response_headers]` can loosen it. That covers every route, the publisher fallback and the error path. A response sent before that step does not carry it. On every adapter but Fastly that is the `404` or `405` the router gives a request it does not route. On Fastly it is the two debug endpoints under `/_ts/debug` and a failure before the settings are read.
 
@@ -1754,11 +1755,11 @@ startup.
 
 An entry of either list has the same three fields.
 
-| Field        | Type             | Required | Description                                                                            |
-| ------------ | ---------------- | -------- | -------------------------------------------------------------------------------------- |
-| `media_type` | String           | Yes      | The media type the entry covers, a bare `type/subtype` in lower case, see below        |
-| `path`       | String           | No       | A prefix of the request path, compared as written. Absent, the entry covers every path |
-| `middleware` | Array of strings | Yes      | The middleware to run, in order, each handed the page as the one before it left it     |
+| Field        | Type             | Required | Description                                                                                    |
+| ------------ | ---------------- | -------- | ---------------------------------------------------------------------------------------------- |
+| `media_type` | String           | Yes      | The media type the entry covers, a bare `type/subtype` in lower case, see below                |
+| `path`       | String           | No       | A prefix of the request path, compared as written. Absent, or `/`, the entry covers every path |
+| `middleware` | Array of strings | Yes      | The middleware to run, in order, each handed the page as the one before it left it             |
 
 A page takes the first entry that covers it and runs that entry's middleware
 alone. Entries are therefore written from the longest path to the entry with
@@ -1804,7 +1805,8 @@ matched by the type and subtype of its `Content-Type`, without the
 parameters, so `text/plain; charset=utf-8` takes the entry for
 `text/plain`. Anything else, an image or a length prefixed stream among
 them, passes through untouched and no entry can cover it. So does a
-response that declares a charset other than UTF-8.
+response that declares a charset other than UTF-8 or whose status is not
+`200`, such as a partial `206` or an error page.
 
 A middleware says which media types it works on, HTML alone unless it says
 otherwise, and an entry naming one under a media type it does not handle is
@@ -1814,7 +1816,10 @@ after core has moved the origin's addresses in it, in the order the entry
 names them. Head markup and the element and text handlers are decisions
 about HTML, and a middleware that makes one there is refused by name. The
 template cache stores HTML alone, so the fetch entry's middleware and then
-the serve entry's run on each response as it is fetched.
+the serve entry's run on each response as it is fetched. A response an entry
+covers loses the origin's `ETag` and `Last-Modified`, because a middleware
+may change its body, and when a module left state on the request, one a
+`[[serve]]` entry covers is sent `private, no-store`, as a page is.
 
 ```toml
 [[fetch]]

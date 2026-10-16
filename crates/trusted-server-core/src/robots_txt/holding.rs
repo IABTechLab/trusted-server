@@ -8,6 +8,10 @@
 //! age when the contributor fails, because yesterday's rules are a better
 //! answer than none.
 //!
+//! An answer is held for the host the contributor was asked for, as well as
+//! for the publisher and the contributor's settings, so one host's answer is
+//! never served for another.
+//!
 //! A store that cannot give an entry a lifetime is written without one. An
 //! answer held for settings that have since changed then stays in that store,
 //! one small entry for each change, until it is deleted there.
@@ -45,8 +49,8 @@ struct Held {
     contribution: Contribution,
 }
 
-/// Who an answer is for and who gave it, which together name where it is
-/// held.
+/// Who an answer is for and who gave it, which with the host the contributor
+/// is asked for name where it is held.
 pub(crate) struct Holder<'a> {
     /// The publisher the file is for. One store may serve several, and one
     /// publisher's rules are never another's.
@@ -71,14 +75,17 @@ pub(crate) async fn contribution_for(
     services: &RuntimeServices,
     now: u64,
 ) -> Result<Contribution, Report<TrustedServerError>> {
-    let key = held_key(holder, &contributor.fingerprint());
+    let key = held_key(holder, request.view().host(), &contributor.fingerprint());
     let held = held_answer(services, &key).await;
     if let Some(held) = &held
         && now.saturating_sub(held.given_at) < contributor.refresh().as_secs()
     {
         return Ok(held.contribution.clone());
     }
-    let context = ModuleContext::new(request.view()).with_services(services);
+    // The answer is served to every crawler, so the contributor's services
+    // carry nothing of the connection that asked.
+    let services_handed = services.clone().without_connection();
+    let context = ModuleContext::new(request.view()).with_services(&services_handed);
     let asked = contributor
         .contribute(context.call(holder.id, contributor.required_permissions()))
         .await;
@@ -109,14 +116,14 @@ pub(crate) async fn contribution_for(
     }
 }
 
-/// The key one contributor's answer for one publisher and one fingerprint is
-/// held under. A hash, so that the fingerprint's contents, whatever they are,
-/// never appear in the store.
-fn held_key(holder: &Holder<'_>, fingerprint: &str) -> String {
+/// The key one contributor's answer for one publisher, one host and one
+/// fingerprint is held under. A hash, so that the fingerprint's contents,
+/// whatever they are, never appear in the store.
+fn held_key(holder: &Holder<'_>, host: &str, fingerprint: &str) -> String {
     let mut hasher = Sha256::new();
-    for part in [holder.publisher, holder.id, fingerprint] {
-        // Each part with its length, so that no two different triples run
-        // together into the same bytes.
+    for part in [holder.publisher, host, holder.id, fingerprint] {
+        // Each part with its length, so that no two different sets of parts
+        // run together into the same bytes.
         hasher.update((part.len() as u64).to_be_bytes());
         hasher.update(part.as_bytes());
     }
@@ -548,33 +555,57 @@ pub(crate) mod tests {
 
     #[test]
     fn a_key_holds_nothing_of_what_it_was_made_from() {
-        let key = held_key(&holder("a_contributor"), "a secret an implementer left in");
+        let key = held_key(
+            &holder("a_contributor"),
+            "crawled.example",
+            "a secret an implementer left in",
+        );
 
         assert!(key.starts_with(KEY_PREFIX), "{key}");
         assert_eq!(key.len(), KEY_PREFIX.len() + 64, "{key}");
-        for part in [PUBLISHER, "a_contributor", "secret"] {
+        for part in [PUBLISHER, "crawled.example", "a_contributor", "secret"] {
             assert!(!key.contains(part), "{key} should not hold {part}");
         }
     }
 
     #[test]
     fn parts_that_run_together_do_not_share_a_key() {
-        let one = held_key(
-            &Holder {
-                publisher: "ab",
-                id: "c",
-            },
-            "d",
-        );
-        let other = held_key(
-            &Holder {
-                publisher: "a",
-                id: "bc",
-            },
-            "d",
-        );
+        let key = |publisher, host, id| held_key(&Holder { publisher, id }, host, "d");
 
-        assert_ne!(one, other);
+        assert_ne!(key("ab", "h", "c"), key("a", "bh", "c"));
+        assert_ne!(key("p", "ab", "c"), key("p", "a", "bc"));
+        assert_ne!(key("p", "h", "c"), key("p", "other.example", "c"));
+    }
+
+    /// One deployment may serve several hosts, and each is answered for
+    /// itself.
+    #[tokio::test]
+    async fn an_answer_is_held_for_the_host_it_was_asked_for() {
+        let scripted = Arc::new(Scripted::new(vec![
+            Ok(rules("User-Agent: OneBot\nDisallow: /")),
+            Ok(rules("User-Agent: TwoBot\nDisallow: /")),
+        ]));
+        let services = services_with(Arc::default());
+        let other_host = http::Request::builder()
+            .uri("/robots.txt")
+            .header(http::header::HOST, "other.publisher.example")
+            .body(EdgeBody::empty())
+            .expect("should build the request");
+
+        ask(&scripted, &services, NOW)
+            .await
+            .expect("should ask the contributor");
+        let for_other_host = contribution_for(
+            &holder("a"),
+            &contributor(&scripted),
+            &ResolvedRequest::of(&other_host, &ClientInfo::default()),
+            &services,
+            NOW + 1,
+        )
+        .await
+        .expect("should ask for the other host");
+
+        assert_eq!(for_other_host, rules("User-Agent: TwoBot\nDisallow: /"));
     }
 
     #[tokio::test]
