@@ -18,6 +18,27 @@ const PUC_BANNER = readFileSync(
     "utf8",
 );
 
+/**
+ * Read the renderer version from its declaration rather than restating it.
+ *
+ * The constant is bumped whenever the Universal Creative source changes, so a
+ * literal here turns every such change into an unrelated-looking failure in
+ * this spec.
+ */
+function universalCreativeRendererVersion(): number {
+    const source = readFileSync(
+        resolve(TSJS_CRATE, "lib/src/integrations/aps/render.ts"),
+        "utf8",
+    );
+    const match = /APS_UNIVERSAL_CREATIVE_RENDERER_VERSION = (\d+)/.exec(source);
+    if (!match) {
+        throw new Error(
+            "could not read APS_UNIVERSAL_CREATIVE_RENDERER_VERSION from render.ts",
+        );
+    }
+    return Number(match[1]);
+}
+
 function clientAuctionBundlePaths() {
     const manifestPath = resolve(TSJS_CRATE, "dist/prebid/manifest.json");
     const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as {
@@ -566,7 +587,7 @@ parent.postMessage(JSON.stringify({
             expect.objectContaining({
                 message: "Prebid Response",
                 adId: result.acceptedAdId,
-                rendererVersion: 4,
+                rendererVersion: universalCreativeRendererVersion(),
                 apsRenderer,
             }),
         );
@@ -902,6 +923,51 @@ parent.postMessage(JSON.stringify({
         await page.waitForTimeout(100);
         expect(runnerRequests).toBe(requestsBeforeInvalid);
         await expect(page.locator("#malformed-slot .existing")).toHaveCount(1);
+
+        // The three rejections above are the only place the renderer document's
+        // wire names are checked by executing it, rather than by matching
+        // substrings in the Rust source. `nonce_mismatch` in particular is only
+        // useful if the frame echoes the nonce its parent expects, so assert the
+        // nonce as well as the reason.
+        const reportedFailures = await page.evaluate(() =>
+            (
+                window as unknown as {
+                    apsMessages: Array<{
+                        slotId: string;
+                        data: Record<string, unknown>;
+                    }>;
+                }
+            ).apsMessages
+                .filter(
+                    ({ data }) =>
+                        data["message"] ===
+                        "trusted-server/aps/renderer-failed",
+                )
+                .map(({ slotId, data }) => ({
+                    slotId,
+                    reason: data["reason"],
+                    nonce: data["nonce"],
+                })),
+        );
+        expect(reportedFailures).toEqual(
+            expect.arrayContaining([
+                {
+                    slotId: "mismatch-slot",
+                    reason: "nonce_mismatch",
+                    nonce: validNonce,
+                },
+                {
+                    slotId: "missing-fragment-slot",
+                    reason: "bad_hash",
+                    nonce: undefined,
+                },
+                {
+                    slotId: "malformed-slot",
+                    reason: "descriptor_keys",
+                    nonce: wrongNonce,
+                },
+            ]),
+        );
 
         const scriptNonce = "0123456789abcdefghijkl";
         await page.evaluate(

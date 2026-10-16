@@ -13,7 +13,10 @@ import type { AuctionBidData, TsjsApi } from '../../../src/core/types';
 import {
   APS_PREBID_CREATIVE_RUNNER_URL,
   APS_RENDERING_MODE_ATTRIBUTE_NAME,
+  APS_RENDER_FAILED_MESSAGE,
+  APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
 } from '../../../src/integrations/aps/render';
+import { GptDiagnosticsStore } from '../../../src/integrations/gpt_diagnostics/store';
 
 let publisherNativeScript: HTMLScriptElement | undefined;
 
@@ -3486,7 +3489,7 @@ describe('installTsRenderBridge', () => {
       message: 'Prebid Response',
       adId: renderer.bidId,
       renderer: expect.stringContaining('window.render=function'),
-      rendererVersion: 4,
+      rendererVersion: APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
       rendererUrl: new URL('/integrations/aps/renderer', window.location.origin).href,
       apsRenderer: renderer,
       width: 300,
@@ -3661,6 +3664,219 @@ describe('installTsRenderBridge', () => {
     expect(collapsed.wrapper.style.height).toBe('250px');
     expect(fetchStub).not.toHaveBeenCalled();
     foreignIframe.remove();
+  });
+
+  it('records a relayed APS render failure against a real diagnostics store', async () => {
+    const renderer = apsRenderer();
+    const prebidAdId = 'prebid-relay-ad-id';
+    const store = new GptDiagnosticsStore({ defer: () => undefined });
+    (window as TestWindow).tsjs.gptDiagnosticsRecorder = store as never;
+    (window as TestWindow).tsjs.apsPrebidRenderers = {
+      [prebidAdId]: {
+        adUnitCode: 'div-header',
+        renderer,
+        registeredAt: Date.now(),
+        expiresAt: Date.now() + 60_000,
+        markUsed: vi.fn(),
+      },
+    };
+
+    try {
+      const bridgeListener = await captureBridgeListener();
+      const source = createTrustedSlotIframe();
+      const slot = {
+        getSlotElementId: () => 'div-header',
+        getAdUnitPath: () => '/example/div-header',
+      };
+      // Production associates under the configured slot id and maps the div to
+      // it, so the ids differ here the way they do on a real page.
+      (window as TestWindow).tsjs.divToSlotId = { 'div-header': 'homepage_header' };
+      store.recordTrustedServerOpportunity(slot, 'homepage_header', 'renderable_candidate');
+      store.recordSlotRequested(slot);
+
+      // Serve the capability so the ad ID is tombstoned with its ad unit.
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
+          ports: [{ postMessage: () => {} }],
+          source,
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent
+      );
+
+      // The creative frame then relays a render failure to the top window.
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: {
+            message: APS_RENDER_FAILED_MESSAGE,
+            adId: prebidAdId,
+            reason: 'frame_timeout',
+          },
+          source,
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent
+      );
+
+      expect(store.snapshot().slots[0].requests[0].trustedServerCreativeFailures).toEqual([
+        'aps_frame_timeout',
+      ]);
+    } finally {
+      delete (window as TestWindow).tsjs.gptDiagnosticsRecorder;
+    }
+  });
+
+  it('records a relayed APS render failure for a server-side APS winner', async () => {
+    const renderer = apsRenderer();
+    const store = new GptDiagnosticsStore({ defer: () => undefined });
+    (window as TestWindow).tsjs.gptDiagnosticsRecorder = store as never;
+    (window as TestWindow).tsjs.bids.homepage_header = {
+      hb_adid: renderer.bidId,
+      hb_bidder: 'aps',
+      hb_pb: '1.23',
+      renderer,
+    };
+
+    try {
+      const bridgeListener = await captureBridgeListener();
+      const source = createTrustedSlotIframe();
+      const slot = {
+        getSlotElementId: () => 'div-header',
+        getAdUnitPath: () => '/example/div-header',
+      };
+      (window as TestWindow).tsjs.divToSlotId = { 'div-header': 'homepage_header' };
+      store.recordTrustedServerOpportunity(slot, 'homepage_header', 'renderable_candidate');
+      store.recordSlotRequested(slot);
+
+      // Serve the server-side capability, which is tracked per slot rather than
+      // through the Prebid renderer tombstone.
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: renderer.bidId }),
+          ports: [{ postMessage: () => {} }],
+          source,
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent
+      );
+
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: {
+            message: APS_RENDER_FAILED_MESSAGE,
+            adId: renderer.bidId,
+            reason: 'amazon_script_error',
+          },
+          source,
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent
+      );
+
+      expect(store.snapshot().slots[0].requests[0].trustedServerCreativeFailures).toEqual([
+        'aps_runner_script_error',
+      ]);
+    } finally {
+      delete (window as TestWindow).tsjs.gptDiagnosticsRecorder;
+    }
+  });
+
+  it('drops a relayed APS failure from a frame outside the served ad unit', async () => {
+    const renderer = apsRenderer();
+    const prebidAdId = 'prebid-foreign-relay-ad-id';
+    const recordTrustedServerCreativeFailure = vi.fn();
+    (window as TestWindow).tsjs.gptDiagnosticsRecorder = {
+      recordTrustedServerOpportunity: vi.fn(),
+      recordTrustedServerCreativeRequest: vi.fn(() => 3),
+      recordTrustedServerCreativeResponse: vi.fn(),
+      recordTrustedServerCreativeFailure,
+    } as never;
+    (window as TestWindow).tsjs.apsPrebidRenderers = {
+      [prebidAdId]: {
+        adUnitCode: 'div-header',
+        renderer,
+        registeredAt: Date.now(),
+        expiresAt: Date.now() + 60_000,
+        markUsed: vi.fn(),
+      },
+    };
+
+    try {
+      const bridgeListener = await captureBridgeListener();
+      const source = createTrustedSlotIframe();
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
+          ports: [{ postMessage: () => {} }],
+          source,
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent
+      );
+      recordTrustedServerCreativeFailure.mockClear();
+
+      // A frame that is not inside the served ad unit cannot forge a failure,
+      // even though it names a live ad ID and an allowlisted reason.
+      const foreignIframe = document.createElement('iframe');
+      document.body.appendChild(foreignIframe);
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: { message: APS_RENDER_FAILED_MESSAGE, adId: prebidAdId, reason: 'frame_timeout' },
+          source: foreignIframe.contentWindow,
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent
+      );
+
+      expect(recordTrustedServerCreativeFailure).not.toHaveBeenCalled();
+      foreignIframe.remove();
+    } finally {
+      delete (window as TestWindow).tsjs.gptDiagnosticsRecorder;
+    }
+  });
+
+  it('drops a relayed APS failure whose reason is not on the allowlist', async () => {
+    const renderer = apsRenderer();
+    const prebidAdId = 'prebid-hostile-reason-ad-id';
+    const recordTrustedServerCreativeFailure = vi.fn();
+    (window as TestWindow).tsjs.gptDiagnosticsRecorder = {
+      recordTrustedServerOpportunity: vi.fn(),
+      recordTrustedServerCreativeRequest: vi.fn(() => 4),
+      recordTrustedServerCreativeResponse: vi.fn(),
+      recordTrustedServerCreativeFailure,
+    } as never;
+    (window as TestWindow).tsjs.apsPrebidRenderers = {
+      [prebidAdId]: {
+        adUnitCode: 'div-header',
+        renderer,
+        registeredAt: Date.now(),
+        expiresAt: Date.now() + 60_000,
+        markUsed: vi.fn(),
+      },
+    };
+
+    try {
+      const bridgeListener = await captureBridgeListener();
+      const source = createTrustedSlotIframe();
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
+          ports: [{ postMessage: () => {} }],
+          source,
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent
+      );
+      recordTrustedServerCreativeFailure.mockClear();
+
+      for (const reason of ['__proto__', 'constructor', 'not_a_reason', 7]) {
+        bridgeListener(
+          Object.assign(new Event('message'), {
+            data: { message: APS_RENDER_FAILED_MESSAGE, adId: prebidAdId, reason },
+            source,
+            stopImmediatePropagation: vi.fn(),
+          }) as unknown as MessageEvent
+        );
+      }
+
+      expect(recordTrustedServerCreativeFailure).not.toHaveBeenCalled();
+    } finally {
+      delete (window as TestWindow).tsjs.gptDiagnosticsRecorder;
+    }
   });
 
   it('contract test: fails a registered APS runner without a Universal Creative response or markUsed', async () => {
