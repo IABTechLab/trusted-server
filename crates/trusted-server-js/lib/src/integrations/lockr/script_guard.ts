@@ -17,28 +17,24 @@ import { createScriptGuard } from '../../shared/script_guard';
 
 /**
  * Check if a URL is a Lockr SDK URL.
- * Matches the logic from lockr.rs:79-86
+ * Browser/Rust ownership cases live in test/fixtures/sdk-url-ownership.json.
  */
 function isLockrSdkUrl(url: string): boolean {
-  if (!url) return false;
+  // Use the same ASCII whitespace and explicit-authority rules as Rust.
+  const value = url.replace(/^[ \t\n\r\f\v]+|[ \t\n\r\f\v]+$/g, '');
+  if (!/^(?:https?:)?\/\//i.test(value)) return false;
 
-  const lower = url.toLowerCase();
-
-  // Check for aim.loc.kr domain
-  if (lower.includes('aim.loc.kr')) {
-    return true;
+  try {
+    const parsed = new URL(value.startsWith('//') ? `https:${value}` : value);
+    const path = parsed.pathname.toLowerCase();
+    return (
+      (parsed.hostname === 'aim.loc.kr' || parsed.hostname === 'identity.loc.kr') &&
+      path.includes('identity-lockr') &&
+      path.endsWith('.js')
+    );
+  } catch {
+    return false;
   }
-
-  // Check for identity.loc.kr with identity-lockr and .js extension
-  if (
-    lower.includes('identity.loc.kr') &&
-    lower.includes('identity-lockr') &&
-    lower.endsWith('.js')
-  ) {
-    return true;
-  }
-
-  return false;
 }
 
 const guard = createScriptGuard({

@@ -98,10 +98,26 @@ impl LockrIntegration {
 
     /// Check if a URL is a Lockr SDK URL.
     fn is_lockr_sdk_url(&self, url: &str) -> bool {
-        let lower = url.to_ascii_lowercase();
-        (lower.contains("aim.loc.kr") || lower.contains("identity.loc.kr"))
-            && lower.contains("identity-lockr")
-            && lower.ends_with(".js")
+        // Keep browser/Rust cases in test/fixtures/sdk-url-ownership.json aligned.
+        let value = url.trim_matches([' ', '\t', '\n', '\r', '\x0c', '\x0b']);
+        let parsed = if value.starts_with("//") {
+            url::Url::parse(&format!("https:{value}"))
+        } else {
+            if !value.split_once("://").is_some_and(|(scheme, _)| {
+                scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+            }) {
+                return false;
+            }
+            url::Url::parse(value)
+        };
+        let Ok(parsed) = parsed else {
+            return false;
+        };
+        let host = parsed.host_str().unwrap_or_default();
+        let path = parsed.path().to_ascii_lowercase();
+        matches!(host, "aim.loc.kr" | "identity.loc.kr")
+            && path.contains("identity-lockr")
+            && path.ends_with(".js")
     }
 
     /// Handle SDK serving — fetch from Lockr CDN and serve through first-party domain.
@@ -440,6 +456,13 @@ mod tests {
     use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
     use crate::test_support::tests::create_test_settings;
 
+    #[derive(Deserialize)]
+    struct SdkUrlCase {
+        name: String,
+        url: String,
+        owner: Option<String>,
+    }
+
     fn test_config() -> LockrConfig {
         LockrConfig {
             enabled: true,
@@ -460,6 +483,48 @@ mod tests {
             request_host: "edge.example.com",
             request_scheme: "https",
             origin_host: "origin.example.com",
+        }
+    }
+
+    #[test]
+    fn sdk_url_ownership_matches_shared_corpus() {
+        let cases: Vec<SdkUrlCase> = serde_json::from_str(include_str!(
+            "../../../trusted-server-js/lib/test/fixtures/sdk-url-ownership.json"
+        ))
+        .expect("should parse shared SDK URL ownership corpus");
+        let integration = LockrIntegration::new(test_config());
+
+        for case in cases {
+            let matches = case.owner.as_deref() == Some(LOCKR_INTEGRATION_ID);
+            assert_eq!(
+                integration.is_lockr_sdk_url(&case.url),
+                matches,
+                "should match expected lockr ownership for {}: {}",
+                case.name,
+                case.url
+            );
+
+            let expected = if matches {
+                AttributeRewriteAction::Replace("/integrations/lockr/sdk".to_string())
+            } else {
+                AttributeRewriteAction::Keep
+            };
+            for (attribute, element) in [("src", "script"), ("href", "link")] {
+                let context = IntegrationAttributeContext {
+                    attribute_name: attribute,
+                    element_name: element,
+                    request_host: "edge.example.com",
+                    request_scheme: "https",
+                    origin_host: "origin.example.com",
+                };
+                assert_eq!(
+                    integration.rewrite(attribute, &case.url, &context),
+                    expected,
+                    "should apply expected {attribute} rewrite for {}: {}",
+                    case.name,
+                    case.url
+                );
+            }
         }
     }
 
