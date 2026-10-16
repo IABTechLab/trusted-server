@@ -374,7 +374,7 @@ Use fictional values in source-controlled configuration and fixtures. Supply con
 ```bash
 cargo test -p trusted-server-auction-aps --target wasm32-wasip1
 cargo test-fastly auction::orchestrator
-cargo test -p trusted-server-ad-server-mock --target wasm32-wasip1
+cargo test -p trusted-server-ad-server-iabtl --target wasm32-wasip1
 
 cd crates/trusted-server-js/lib
 npx vitest run test/integrations/aps/render.test.ts test/core/auction.test.ts
