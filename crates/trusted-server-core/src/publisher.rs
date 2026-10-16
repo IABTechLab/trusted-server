@@ -22134,7 +22134,7 @@ mod tests {
         use crate::integrations::registry_test_support::middleware_fixture as fixture;
         use crate::middleware::HTML_MEDIA_TYPE;
 
-        let proxied = proxy(
+        let (proxied, logged) = crate::test_support::logs::logged_by(proxy(
             vec![PhaseEntry {
                 media_type: HTML_MEDIA_TYPE.to_owned(),
                 path: None,
@@ -22143,11 +22143,19 @@ mod tests {
             Method::GET,
             "/article",
             200,
-        )
+        ))
         .await;
         let PublisherResponse::Buffered(response) = proxied.response else {
             panic!("a refusal is answered whole, with no document to stream");
         };
+        let refusals: Vec<&String> = logged
+            .iter()
+            .filter(|line| line.contains(fixture::REFUSING))
+            .collect();
+        assert!(
+            refusals.len() == 1 && refusals[0].starts_with("WARN "),
+            "should warn of the refusal once, naming the middleware: {logged:?}"
+        );
         let header_value = |name: header::HeaderName| {
             response
                 .headers()

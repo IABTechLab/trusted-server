@@ -1933,6 +1933,109 @@ async fn the_first_refusal_ends_the_preparation() {
     );
 }
 
+/// Refuses every request with the status it holds.
+struct RefusesWith(StatusCode);
+
+impl Middleware for RefusesWith {
+    fn middleware_id(&self) -> &'static str {
+        "example.refuses-with"
+    }
+
+    fn phases(&self) -> &[MiddlewarePhase] {
+        &[MiddlewarePhase::Fetch]
+    }
+
+    fn prepare<'a>(
+        &'a self,
+        _call: ModuleCall<'a>,
+        _context: &'a MiddlewareContext<'a>,
+    ) -> Option<Preparation<'a>> {
+        let status = self.0;
+        Some(Box::pin(async move {
+            Err(Refusal {
+                status,
+                retry_after: None,
+                message: "refused".to_owned(),
+            })
+        }))
+    }
+
+    fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+        MiddlewareAction::pass()
+    }
+}
+
+/// The refusal a fetch chain of `first` and then [`Prepares`] answers, and
+/// what it logs at warning level or above.
+async fn refusal_and_log(first: Arc<dyn Middleware>) -> (Refusal, Vec<String>) {
+    let chain = MiddlewareChain::new(
+        MiddlewarePhase::Fetch,
+        HTML_MEDIA_TYPE,
+        vec![first, Arc::new(Prepares)],
+    );
+    let document_state = IntegrationDocumentState::default();
+    let prepared = Prepared::default();
+    let context = MiddlewareContext {
+        prepared: &prepared,
+        ..test_support::context(MiddlewarePhase::Fetch, &document_state)
+    };
+
+    let (refused, logged) =
+        crate::test_support::logs::logged_by(chain.prepare(ModuleContext::empty(), &context)).await;
+    (refused.expect_err("should refuse"), logged)
+}
+
+#[tokio::test]
+async fn a_refusal_is_logged_once_as_a_warning_naming_the_middleware() {
+    let (refusal, logged) = refusal_and_log(Arc::new(Refuses)).await;
+
+    assert_eq!(refusal.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(logged.len(), 1, "should log the refusal once: {logged:?}");
+    assert!(
+        logged[0].starts_with("WARN ")
+            && logged[0].contains("`example.refuses`")
+            && logged[0].contains("fetch phase")
+            && logged[0].contains("503 Service Unavailable"),
+        "should warn, naming the middleware, the phase and the status: {}",
+        logged[0]
+    );
+}
+
+#[tokio::test]
+async fn a_refusal_answers_with_a_client_or_server_error_alone() {
+    let fault = StatusCode::INTERNAL_SERVER_ERROR;
+    for (given, answered) in [
+        (StatusCode::CONTINUE, fault),
+        (StatusCode::OK, fault),
+        (StatusCode::NO_CONTENT, fault),
+        (StatusCode::MOVED_PERMANENTLY, fault),
+        (StatusCode::NOT_MODIFIED, fault),
+        (StatusCode::NOT_FOUND, StatusCode::NOT_FOUND),
+        (StatusCode::TOO_MANY_REQUESTS, StatusCode::TOO_MANY_REQUESTS),
+        (StatusCode::BAD_GATEWAY, StatusCode::BAD_GATEWAY),
+    ] {
+        let (refusal, logged) = refusal_and_log(Arc::new(RefusesWith(given))).await;
+
+        assert_eq!(
+            refusal.status, answered,
+            "should answer a refusal with {given} as {answered}"
+        );
+        assert_eq!(
+            logged.len(),
+            1,
+            "should log the refusal with {given} once: {logged:?}"
+        );
+        assert!(
+            logged[0].starts_with("WARN ")
+                && logged[0].contains("`example.refuses-with`")
+                && logged[0].contains(&given.to_string())
+                && logged[0].contains(&answered.to_string()),
+            "should warn, naming the middleware, the status given and the status answered: {}",
+            logged[0]
+        );
+    }
+}
+
 #[test]
 fn an_html_entry_with_a_path_makes_nothing() {
     let entries = PhaseEntries::new(vec![PhaseEntry {
