@@ -145,6 +145,7 @@ pub fn middleware() -> Vec<StockMiddleware> {
         row(datadome::builder().id(), Fetch, datadome::MODULE),
         row(datadome::builder().id(), Serve, datadome::TAG_MIDDLEWARE),
         row(google::builder().id(), Fetch, google::MODULE),
+        row(google::builder().id(), Serve, google::LOADER_MIDDLEWARE),
         row(
             google::diagnostics::builder().id(),
             Serve,
