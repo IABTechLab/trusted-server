@@ -1876,7 +1876,7 @@ fn deploy_validation_refuses_a_misshapen_entry() {
 }
 
 #[test]
-fn the_making_entry_has_a_path_covering_the_request_and_names_a_middleware() {
+fn the_making_entry_is_for_the_request_path_and_names_a_middleware() {
     let entries = PhaseEntries::new(vec![
         PhaseEntry {
             media_type: "text/plain".to_owned(),
@@ -1885,7 +1885,7 @@ fn the_making_entry_has_a_path_covering_the_request_and_names_a_middleware() {
         },
         PhaseEntry {
             media_type: "text/plain".to_owned(),
-            path: Some("/ads".to_owned()),
+            path: Some("/ads.txt".to_owned()),
             middleware: vec!["example.sellers".to_owned()],
         },
         PhaseEntry {
@@ -1904,7 +1904,7 @@ fn the_making_entry_has_a_path_covering_the_request_and_names_a_middleware() {
     );
     assert!(
         entries.making("/robots.txt").is_none(),
-        "should make nothing where no entry with a path covers the request, whatever covers every path"
+        "should make nothing where no entry is for the request path, whatever covers every path"
     );
 }
 
@@ -1912,7 +1912,7 @@ fn the_making_entry_has_a_path_covering_the_request_and_names_a_middleware() {
 fn an_html_entry_with_a_path_makes_nothing() {
     let entries = PhaseEntries::new(vec![PhaseEntry {
         media_type: HTML_MEDIA_TYPE.to_owned(),
-        path: Some("/news/".to_owned()),
+        path: Some("/news/missing".to_owned()),
         middleware: vec!["example.page".to_owned()],
     }]);
 
@@ -1923,11 +1923,57 @@ fn an_html_entry_with_a_path_makes_nothing() {
 }
 
 #[test]
-fn the_entry_with_the_longest_covering_path_makes_the_file() {
+fn a_file_is_made_at_the_entry_path_alone() {
     let entries = PhaseEntries::new(vec![
         PhaseEntry {
             media_type: "text/css".to_owned(),
             path: Some("/".to_owned()),
+            middleware: vec!["example.styles".to_owned()],
+        },
+        PhaseEntry {
+            media_type: "text/plain".to_owned(),
+            path: Some("/ads.txt".to_owned()),
+            middleware: vec!["example.sellers".to_owned()],
+        },
+        PhaseEntry {
+            media_type: "text/plain".to_owned(),
+            path: Some("/feeds/".to_owned()),
+            middleware: vec!["example.feeds".to_owned()],
+        },
+    ]);
+
+    assert_eq!(
+        entries
+            .making("/ads.txt")
+            .map(|entry| entry.media_type.as_str()),
+        Some("text/plain"),
+        "should make the file from the entry for its own path"
+    );
+    for path in [
+        "/site.css",
+        "/missing-page",
+        "/ads.txt.bak",
+        "/feeds/latest",
+    ] {
+        assert!(
+            entries.making(path).is_none(),
+            "should make nothing at {path}, which an entry's path only begins"
+        );
+    }
+    for folder in ["/", "/feeds/"] {
+        assert!(
+            entries.making(folder).is_none(),
+            "should make nothing for the folder {folder}"
+        );
+    }
+}
+
+#[test]
+fn the_first_entry_written_for_the_path_makes_the_file() {
+    let entries = PhaseEntries::new(vec![
+        PhaseEntry {
+            media_type: "text/css".to_owned(),
+            path: Some("/ads.txt".to_owned()),
             middleware: vec!["example.styles".to_owned()],
         },
         PhaseEntry {
@@ -1941,15 +1987,8 @@ fn the_entry_with_the_longest_covering_path_makes_the_file() {
         entries
             .making("/ads.txt")
             .map(|entry| entry.media_type.as_str()),
-        Some("text/plain"),
-        "should make the file from the entry for its own path, not one written ahead for every path"
-    );
-    assert_eq!(
-        entries
-            .making("/site.css")
-            .map(|entry| entry.media_type.as_str()),
         Some("text/css"),
-        "should still make a file only the shorter path covers"
+        "should take the entry written first among those for the path"
     );
 }
 

@@ -5686,8 +5686,11 @@ pub async fn handle_publisher_request(
     );
 
     // A file the origin does not have is made, see `PhaseEntries::making`.
+    // Core runs no middleware for a request that names no host, so there the
+    // made file would go out empty and the origin's answer stands instead.
     if response.status() == StatusCode::NOT_FOUND
         && (request_method == Method::GET || request_method == Method::HEAD)
+        && !request_host.is_empty()
         && let Some(entry) = settings.fetch.making(&request_path)
     {
         log::debug!(
@@ -22053,6 +22056,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_missing_page_under_an_entry_path_keeps_the_origin_answer() {
+        for (entry_path, path) in [("/", "/missing-page"), ("/ads.txt", "/ads.txt.bak")] {
+            let proxied = proxy(text_entry_for(Some(entry_path)), Method::GET, path, 404).await;
+
+            assert_eq!(
+                response_of(proxied.response).status(),
+                StatusCode::NOT_FOUND,
+                "should keep the origin's answer for {path}, which the entry for {entry_path} \
+                 covers but does not name"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_entry_for_a_folder_makes_no_missing_page() {
+        for folder in ["/", "/feeds/"] {
+            let proxied = proxy(text_entry_for(Some(folder)), Method::GET, folder, 404).await;
+
+            assert_eq!(
+                response_of(proxied.response).status(),
+                StatusCode::NOT_FOUND,
+                "should keep the origin's answer for the folder {folder}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn a_missing_file_outside_the_entry_path_keeps_the_origin_answer() {
         let proxied = proxy(
             text_entry_for(Some("/ads.txt")),
@@ -22065,6 +22095,138 @@ mod tests {
         assert_eq!(
             response_of(proxied.response).status(),
             StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_that_names_no_host_keeps_the_origin_answer() {
+        let settings = settings_running_the_middleware_fixture(text_entry_for(Some("/ads.txt")));
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            404,
+            b"<html><body>the origin's page</body></html>".to_vec(),
+            vec![("content-type", "text/html; charset=utf-8")],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let request = build_request(Method::GET, "/ads.txt");
+
+        let response = run_publisher_proxy(&settings, &services, request).await;
+
+        assert_eq!(
+            response_of(response).status(),
+            StatusCode::NOT_FOUND,
+            "should keep the origin's answer, because core runs no middleware for a request \
+             that names no host and the made file would go out empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_method_other_than_get_or_head_keeps_the_origin_answer() {
+        for method in [
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ] {
+            let proxied = proxy(
+                text_entry_for(Some("/ads.txt")),
+                method.clone(),
+                "/ads.txt",
+                404,
+            )
+            .await;
+
+            assert_eq!(
+                response_of(proxied.response).status(),
+                StatusCode::NOT_FOUND,
+                "should keep the origin's answer to a {method}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_made_file_carries_none_of_the_headers_of_the_origin_s_404() {
+        let settings = settings_running_the_middleware_fixture(text_entry_for(Some("/ads.txt")));
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            404,
+            b"<html><body>the origin's page</body></html>".to_vec(),
+            vec![
+                ("content-type", "text/html; charset=utf-8"),
+                ("set-cookie", "session=origin; Path=/"),
+                ("cache-control", "public, max-age=600"),
+                ("etag", "\"origin-404\""),
+                ("x-origin", "not found"),
+            ],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let request = HttpRequest::builder()
+            .method(Method::GET)
+            .uri("https://publisher.example/ads.txt")
+            .header(header::HOST, "publisher.example")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        let response = response_of(run_publisher_proxy(&settings, &services, request).await);
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let names: Vec<&str> = response
+            .headers()
+            .keys()
+            .map(http::HeaderName::as_str)
+            .collect();
+        assert_eq!(
+            names,
+            [header::CONTENT_TYPE.as_str()],
+            "should carry the Content-Type the file is made with and nothing the origin sent"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_made_file_streams_through_the_finalizer_fastly_uses() {
+        use crate::integrations::registry_test_support::middleware_fixture as fixture;
+
+        let proxied = proxy(
+            text_entry_for(Some("/ads.txt")),
+            Method::GET,
+            "/ads.txt",
+            404,
+        )
+        .await;
+        let response = publisher_response_into_streaming_response(
+            proxied.response,
+            &Method::GET,
+            Arc::new(proxied.settings),
+            &proxied.registry,
+            Arc::new(proxied.orchestrator),
+            proxied.services,
+        )
+        .await
+        .expect("should finalize the made file");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            content_type_of(&response),
+            Some("text/plain; charset=utf-8")
+        );
+        let mut body = Vec::new();
+        match response.into_body() {
+            EdgeBody::Stream(mut stream) => {
+                while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+                    body.extend_from_slice(&chunk.expect("should read the made file"));
+                }
+            }
+            other => body.extend_from_slice(&other.into_bytes().expect("should hold the file")),
+        }
+        assert_eq!(
+            String::from_utf8(body).expect("text"),
+            fixture::TEXT_LINE,
+            "should be what the middleware writes on an empty document"
         );
     }
 
