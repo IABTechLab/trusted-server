@@ -336,6 +336,21 @@ mod tests {
         }
     }
 
+    /// Every string the platform writes names the cookie this module reads, so
+    /// a change to either name fails here rather than leaving every visitor's
+    /// answer unread.
+    #[test]
+    fn the_platforms_own_set_cookie_strings_name_the_cookie_the_module_reads() {
+        for (_, set_cookie) in PMP_SET_COOKIE {
+            let pair = set_cookie.split(';').next().unwrap_or_default().trim();
+            let (name, _) = pair.split_once('=').expect("a cookie is name=value");
+            assert_eq!(
+                name, COOKIE_MTM_PREF,
+                "the module must read the name the platform writes: {set_cookie}",
+            );
+        }
+    }
+
     /// The cookie has to stay readable by the script that owns the question.
     ///
     /// A browser lets a script neither read nor replace a cookie carrying
