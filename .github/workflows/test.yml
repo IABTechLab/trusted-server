@@ -571,9 +571,45 @@ jobs:
           JS_FIXTURE_ROOT="$RUNNER_TEMP/release-js-original-fixture"
           CARGO_FIXTURE_ROOT="$RUNNER_TEMP/release-cargo-fixture"
           CLI_FIXTURE_ROOT="$RUNNER_TEMP/release-cli-fixture"
+          node scripts/release/tests/prepare-cli-fixture.mjs "$CLI_FIXTURE_ROOT"
+          # Rebuild the same producer inside the GNU baseline. The Ubuntu
+          # host binary requires a newer libc and cannot serve as its probe.
+          # These cached downloads remain unauthenticated candidate inputs.
+          BOOTSTRAP_ROOT="$(mktemp -d "$RUNNER_TEMP/cli-producer.XXXXXX")"
+          BOOTSTRAP_NAME="ts-cli-producer-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir "$BOOTSTRAP_ROOT/cargo-home" "$BOOTSTRAP_ROOT/target" "$BOOTSTRAP_ROOT/docker-config"
+          cleanup_cli_bootstrap() {
+            local build_status=$?
+            trap - EXIT
+            timeout --kill-after=5s 30s docker --config "$BOOTSTRAP_ROOT/docker-config" --host unix:///var/run/docker.sock rm --force "$BOOTSTRAP_NAME" >/dev/null 2>&1 || true
+            local survivors
+            survivors="$(timeout --kill-after=5s 30s docker --config "$BOOTSTRAP_ROOT/docker-config" --host unix:///var/run/docker.sock ps --all --quiet --filter "name=^/$BOOTSTRAP_NAME$")" || exit 1
+            [[ -z "$survivors" ]] || exit 1
+            exit "$build_status"
+          }
+          trap cleanup_cli_bootstrap EXIT
+          cp -R "$HOME/.cargo/registry" "$BOOTSTRAP_ROOT/cargo-home/registry"
+          if [[ -d "$HOME/.cargo/git" ]]; then
+            cp -R "$HOME/.cargo/git" "$BOOTSTRAP_ROOT/cargo-home/git"
+          fi
+          BUILDER_IMAGE="$(node -p 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).builder_image_id' "$CLI_FIXTURE_ROOT/cli-fixture.json")"
+          TOOLCHAIN_ROOT="$(rustc --print sysroot)"
+          timeout --kill-after=10s 15m docker --config "$BOOTSTRAP_ROOT/docker-config" --host unix:///var/run/docker.sock run \
+            --rm --init --name "$BOOTSTRAP_NAME" --pull=never --network=none --read-only \
+            --user "$(id -u):$(id -g)" --cap-drop=ALL --security-opt=no-new-privileges \
+            --pids-limit=256 --memory=4g --cpus=2 --tmpfs /tmp:rw,nosuid,nodev,size=256m \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/source,readonly" \
+            --mount "type=bind,src=$TOOLCHAIN_ROOT,dst=/tools,readonly" \
+            --mount "type=bind,src=$BOOTSTRAP_ROOT/cargo-home,dst=/cargo-home" \
+            --mount "type=bind,src=$BOOTSTRAP_ROOT/target,dst=/target" \
+            --workdir /source --env PATH=/tools/bin:/usr/bin:/bin --env HOME=/tmp \
+            --env CARGO_HOME=/cargo-home --env CARGO_TARGET_DIR=/target --env RUSTC=/tools/bin/rustc \
+            --env GIT_CONFIG_NOSYSTEM=1 --env GIT_CONFIG_GLOBAL=/dev/null \
+            --entrypoint /tools/bin/cargo "$BUILDER_IMAGE" \
+            build -p trusted-server-release --target "$HOST_TARGET" --locked --offline
+          PRODUCER="$BOOTSTRAP_ROOT/target/$HOST_TARGET/debug/trusted-server-release"
           node scripts/release/tests/prepare-js-fixture.mjs "$JS_FIXTURE_ROOT" "$PRODUCER"
           node scripts/release/tests/prepare-cargo-fixture.mjs "$CARGO_FIXTURE_ROOT" "$PRODUCER"
-          node scripts/release/tests/prepare-cli-fixture.mjs "$CLI_FIXTURE_ROOT"
           {
             echo "TS_RELEASE_JS_FIXTURE_ROOT=$JS_FIXTURE_ROOT"
             echo "TS_RELEASE_CARGO_FIXTURE_ROOT=$CARGO_FIXTURE_ROOT"
