@@ -364,7 +364,7 @@ impl SharedTables {
     /// # Errors
     ///
     /// When the table cannot be read as `T` or fails its validation, naming
-    /// the table and the underlying error.
+    /// the table and the setting at fault but never the setting's value.
     pub fn get_typed<T>(&self, vendor: &str) -> Result<Option<T>, Report<TrustedServerError>>
     where
         T: DeserializeOwned + Validate,
@@ -372,18 +372,7 @@ impl SharedTables {
         let Some(table) = self.0.get(vendor) else {
             return Ok(None);
         };
-        let config: T =
-            serde_json::from_value(JsonValue::Object(table.clone())).map_err(|error| {
-                Report::new(TrustedServerError::Configuration {
-                    message: format!("[{SHARED_TYPE}.{vendor}] could not be read: {error}"),
-                })
-            })?;
-        config.validate().map_err(|error| {
-            Report::new(TrustedServerError::Configuration {
-                message: format!("[{SHARED_TYPE}.{vendor}] failed validation: {error}"),
-            })
-        })?;
-        Ok(Some(config))
+        read_table(&format!("{SHARED_TYPE}.{vendor}"), table.clone()).map(Some)
     }
 
     /// Refuses a table whose name is not a vendor's name, being lower case
@@ -406,6 +395,57 @@ impl SharedTables {
             })),
             None => Ok(()),
         }
+    }
+}
+
+/// Reads and validates a table as `T`, where `place` is the table's name as
+/// written, such as `shared.example`.
+///
+/// A message names the setting at fault and the rule it broke, and never
+/// quotes the setting's value, because at startup a table holds each of its
+/// secrets resolved from the secret store.
+fn read_table<T>(
+    place: &str,
+    table: serde_json::Map<String, JsonValue>,
+) -> Result<T, Report<TrustedServerError>>
+where
+    T: DeserializeOwned + Validate,
+{
+    let config: T =
+        serde_path_to_error::deserialize(JsonValue::Object(table)).map_err(|error| {
+            Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "[{place}] could not be read: {}",
+                    read_error_summary(&error)
+                ),
+            })
+        })?;
+    config.validate().map_err(|errors| {
+        Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "[{place}] failed validation: {}",
+                validation_error_summary(&errors)
+            ),
+        })
+    })?;
+    Ok(config)
+}
+
+/// Why a table could not be read, by the path of the setting at fault.
+///
+/// `serde` quotes the value it could not read, so its message is kept only
+/// when it names keys alone: a key missing, unknown or written twice.
+fn read_error_summary(error: &serde_path_to_error::Error<serde_json::Error>) -> String {
+    let message = error.inner().to_string();
+    let names_keys_only = ["missing field `", "unknown field `", "duplicate field `"]
+        .iter()
+        .any(|start| message.starts_with(start));
+    let path = error.path().to_string();
+    match (path.as_str(), names_keys_only) {
+        (".", true) => message,
+        (".", false) => "a setting holds a value of the wrong type or form".to_owned(),
+        (path, true) => format!("{path}: {message}"),
+        (path, false) => format!("`{path}` holds a value of the wrong type or form"),
     }
 }
 
@@ -11118,6 +11158,49 @@ mod permission_signal_config_tests {
                     .expect("an absent table reads as nothing")
                     .is_none()
             );
+        }
+
+        /// A vendor's settings with a secret in them, as the table holds them
+        /// at startup, once the secret is resolved from the store.
+        #[derive(Debug, Deserialize, Validate)]
+        #[serde(deny_unknown_fields)]
+        struct SecretShared {
+            #[validate(length(max = 8))]
+            license_key: String,
+            #[validate(range(max = 10))]
+            retries: Option<u32>,
+        }
+
+        const SECRET: &str = "resolved-secret-value-4f7a";
+
+        #[test]
+        fn a_shared_table_that_is_refused_names_the_setting_and_never_its_value() {
+            for (table, setting) in [
+                // Fails a rule, whose parameters carry the value checked.
+                (format!("license_key = '{SECRET}'"), "license_key"),
+                // Cannot be read, where `serde` quotes the value it found.
+                (
+                    format!("license_key = 'short'\nretries = '{SECRET}'"),
+                    "retries",
+                ),
+            ] {
+                let settings = with(&format!("[shared.example]\n{table}"))
+                    .expect("core reads none of the table, so it loads");
+
+                let refused = settings
+                    .shared_config::<SecretShared>("example")
+                    .expect_err("the table breaks the vendor's rules");
+
+                let shown = format!("{refused}\n{refused:?}");
+                assert!(
+                    !shown.contains(SECRET),
+                    "printed a setting's value: {shown}"
+                );
+                assert!(
+                    shown.contains("[shared.example]") && shown.contains(setting),
+                    "should name the table and the setting: {shown}"
+                );
+            }
         }
 
         #[test]
