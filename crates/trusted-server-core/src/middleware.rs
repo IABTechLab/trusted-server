@@ -33,8 +33,9 @@
 //! A middleware whose decision needs the request's services, or has to wait
 //! on a store or the network, prepares. Before the document is processed it
 //! is called in the request's handler, and what it answers is kept for its
-//! `create` under its name. It may refuse the request instead, which is then
-//! answered with the status it gives and no document, and nothing is stored.
+//! `create` under its phase and name. It may refuse the request instead,
+//! which is then logged and answered with the status it gives and no
+//! document, and nothing is stored.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -390,7 +391,8 @@ fn selectors_of_text(handlers: &[Box<dyn TextHandler>]) -> Vec<String> {
 /// [`Middleware::prepare`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refusal {
-    /// The status the request is answered with.
+    /// The status the request is answered with, a client or server error.
+    /// Any other is answered as `500 Internal Server Error`.
     pub status: StatusCode,
     /// What `Retry-After` says, for a status that asks the caller back.
     pub retry_after: Option<Duration>,
@@ -408,6 +410,28 @@ impl Refusal {
             retry_after: Some(retry_after),
             message: message.into(),
         }
+    }
+
+    /// The refusal as the request is answered with it, logged once as a
+    /// warning naming `middleware`. A status that is not a client or server
+    /// error becomes `500 Internal Server Error`, because a refusal gives no
+    /// document.
+    fn checked(mut self, middleware: &str, phase: MiddlewarePhase) -> Self {
+        if self.status.is_client_error() || self.status.is_server_error() {
+            log::warn!(
+                "The middleware `{middleware}` refused the request in the {phase} phase with {}",
+                self.status
+            );
+        } else {
+            log::warn!(
+                "The middleware `{middleware}` refused the request in the {phase} phase with {}, \
+                 which a refusal may not use, so it is answered with {}",
+                self.status,
+                StatusCode::INTERNAL_SERVER_ERROR
+            );
+            self.status = StatusCode::INTERNAL_SERVER_ERROR;
+        }
+        self
     }
 }
 
@@ -552,6 +576,13 @@ impl PhaseEntry {
                 .as_deref()
                 .is_none_or(|prefix| path.starts_with(prefix))
     }
+
+    /// The prefix the paths the entry covers begin with. The path of a
+    /// request for a page begins with `/`, so `/` covers the same pages as
+    /// no path at all.
+    fn prefix(&self) -> &str {
+        self.path.as_deref().unwrap_or("/")
+    }
 }
 
 /// One phase's entries, in the order written.
@@ -606,29 +637,22 @@ impl PhaseEntries {
     }
 
     /// The entry that makes the document the origin does not have at
-    /// `path`, being the one with the longest path prefix covering it that
-    /// names a middleware, for a media type core streams other than HTML. The
-    /// first written wins between two of the same length.
+    /// `path`, being the first written, for a media type core streams other
+    /// than HTML, whose `path` is `path` itself and that names a middleware.
+    /// A longer path the entry's `path` begins, and a folder, written with its
+    /// closing slash, get nothing made, so a page the origin does not have
+    /// keeps the origin's answer.
     #[must_use]
     pub fn making(&self, path: &str) -> Option<&PhaseEntry> {
-        self.0
-            .iter()
-            .filter(|entry| {
-                entry.media_type != HTML_MEDIA_TYPE
-                    && is_dispatched_media_type(&entry.media_type)
-                    && entry
-                        .path
-                        .as_deref()
-                        .is_some_and(|prefix| path.starts_with(prefix))
-                    && !entry.middleware.is_empty()
-            })
-            .fold(None, |best: Option<&PhaseEntry>, entry| {
-                let length = |entry: &PhaseEntry| entry.path.as_deref().map_or(0, str::len);
-                match best {
-                    Some(best) if length(best) >= length(entry) => Some(best),
-                    _ => Some(entry),
-                }
-            })
+        if path.ends_with('/') {
+            return None;
+        }
+        self.0.iter().find(|entry| {
+            entry.media_type != HTML_MEDIA_TYPE
+                && is_dispatched_media_type(&entry.media_type)
+                && entry.path.as_deref() == Some(path)
+                && !entry.middleware.is_empty()
+        })
     }
 
     /// Checks each entry's media type, path and names, and that no entry is
@@ -692,13 +716,9 @@ impl PhaseEntries {
             }
             if let Some(earlier) = self.0[..index].iter().position(|earlier| {
                 earlier.media_type == entry.media_type
-                    && match (&earlier.path, &entry.path) {
-                        (None, _) => true,
-                        (Some(covering), Some(path)) => path.starts_with(covering.as_str()),
-                        (Some(_), None) => false,
-                    }
+                    && entry.prefix().starts_with(earlier.prefix())
             }) {
-                return Err(if self.0[earlier].path == entry.path {
+                return Err(if self.0[earlier].prefix() == entry.prefix() {
                     format!(
                         "{at} covers the same pages as [[{phase}]] entry {}, and a response \
                          takes the first entry that covers it, so this one is never reached. \
@@ -813,7 +833,9 @@ impl MiddlewareChain {
     ///
     /// # Errors
     ///
-    /// The first refusal, which ends the request.
+    /// The first refusal, which ends the request. It is logged once, as a
+    /// warning naming the middleware, and one whose status is not a client
+    /// or server error is answered as `500 Internal Server Error`.
     pub async fn prepare(
         &self,
         module_context: &ModuleContext<'_>,
@@ -823,7 +845,9 @@ impl MiddlewareChain {
             let id = middleware.middleware_id();
             let call = module_context.call(id, middleware.required_permissions());
             if let Some(preparation) = middleware.prepare(call, context) {
-                let value = preparation.await?;
+                let value = preparation
+                    .await
+                    .map_err(|refusal| refusal.checked(id, context.phase))?;
                 context.prepared.insert(context.phase, id, value);
             }
         }

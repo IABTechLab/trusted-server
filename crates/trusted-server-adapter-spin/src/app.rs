@@ -1,5 +1,6 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use edgezero_adapter_spin::config_store::SpinConfigStore;
@@ -14,6 +15,7 @@ use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::attestation::{PlatformIdentity, handle_prefix, prefix_routes};
 use trusted_server_core::auction::endpoints::handle_auction;
+use trusted_server_core::auction::telemetry::warn_once_when_analytics_is_unsent;
 use trusted_server_core::auction::{
     AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan_with,
 };
@@ -244,6 +246,14 @@ fn build_state_with_registrations_and_services(
         )?;
     let loading_caches =
         trusted_server_core::integrations::loading_caches_from(&settings, integrations)?;
+    // This adapter builds no telemetry sink, so a module `[analytics]` selects
+    // sends nothing unless the caller's services carry a sink.
+    warn_once_when_analytics_is_unsent(
+        &settings,
+        services.as_ref(),
+        "Spin",
+        &UNSENT_ANALYTICS_LOGGED,
+    );
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
@@ -255,6 +265,11 @@ fn build_state_with_registrations_and_services(
         loading_caches,
     }))
 }
+
+/// Set once startup has logged that this adapter sends no auction telemetry.
+/// The state is built for every request, so the flag keeps the warning to
+/// one for each instance.
+static UNSENT_ANALYTICS_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// The permission signal modules this adapter links, in the order they run
 /// when configuration names none. Global Privacy Control is first because it
@@ -1664,6 +1679,25 @@ mod tests {
             &body[..],
             b"ok",
             "startup-fallback health body should be `ok`"
+        );
+    }
+
+    /// `[analytics]` selecting a module still loads on this adapter, which
+    /// sends no auction telemetry, and startup says so.
+    #[test]
+    fn startup_logs_that_this_adapter_sends_no_auction_telemetry() {
+        let settings = Settings::from_toml(&format!(
+            "{}\n{}",
+            trusted_server_core::test_support::tests::crate_test_settings_str(),
+            trusted_server_core::test_support::template::documented_block("[analytics]")
+        ))
+        .expect("should load settings selecting the documented analytics module");
+
+        build_state_with_settings(settings).expect("should accept a selected analytics module");
+
+        assert!(
+            UNSENT_ANALYTICS_LOGGED.load(std::sync::atomic::Ordering::Relaxed),
+            "startup should log that this adapter sends no auction telemetry"
         );
     }
 }

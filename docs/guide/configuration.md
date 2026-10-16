@@ -1073,9 +1073,10 @@ A module with settings of its own reads them from its own block, `[robots-txt.<n
 1. With `refuse_all` selected the file is the refusal and nothing else, whatever else is selected, and every response the deployment finalizes carries `X-Robots-Tag: noindex, nofollow`.
 2. A path in `always_allow` stays open to every crawler a module's rules refuse the whole site to, `*` included. A narrower rule is kept as the module gave it, so `Disallow: /ads` still closes off `/ads.txt`.
 3. The rules appear in the order `modules` names them, between `top_text` above and the `Sitemap` line and `bottom_text` below.
-4. Holding is the normal case. A module's answer is held in the loading cache of the one loading cache module the build links, or of the module `[cache.robots-txt]` names, briefly in the process and in the shared store outside it, so a module is asked once per refresh however many instances and requests want its rules, and `[cache.robots-txt]` sets how long the copies last, as described under [Loading caches](#loading-caches). The last answer is also kept apart for 30 days, in the value cache on Fastly and in the key-value store on the other adapters. A value cache can drop an entry early, so on Fastly an answer past its age is likely, rather than certain, to be there when a module cannot answer.
-5. A module that cannot answer has its last answer served past its age. With no answer kept at all the file is `503` with `Retry-After`, never an empty file, which a crawler would read as permission to crawl everything.
+4. A module is asked for the host the request was addressed to, never one that `Forwarded` or `X-Forwarded-Host` names, and is given nothing of the crawler's connection. Holding is the normal case. A module's answer is held for that host in the loading cache of the one loading cache module the build links, or of the module `[cache.robots-txt]` names, briefly in the process and in the shared store outside it, so a module is asked once per refresh however many instances and requests want its rules, and `[cache.robots-txt]` sets how long the copies last, as described under [Loading caches](#loading-caches). The last answer is also kept apart for 30 days, in the value cache on Fastly and in the key-value store on the other adapters. A value cache can drop an entry early, so on Fastly an answer past its age is likely, rather than certain, to be there when a module cannot answer.
+5. A module that cannot answer has its last answer served past its age. With no answer kept at all, or with no rule anywhere in the file, the file is `503` with `Retry-After: 600`, never an empty file, which a crawler would read as permission to crawl everything. Select `allow_all` to allow every crawler.
 6. Spin's key-value store gives an entry no lifetime, so there a kept answer stays until it is replaced, and one kept for settings that have since changed stays until it is deleted from the store. With no loading cache module linked, or several linked and none named in `[cache.robots-txt]`, no copy is held, so every request for the file asks each module, and a deployment whose key-value store cannot be opened keeps no last answer either.
+7. On Fastly the file is answered once the modules have prepared the request, before the Edge Cookie steps and the request filters, so a filter's answer never stands in for it.
 
 **Which responses carry the header.** An adapter writes `X-Robots-Tag` last when it finalizes a response, replacing any tag already there, so neither an origin page nor `[response_headers]` can loosen it. That covers every route, the publisher fallback and the error path. A response sent before that step does not carry it. On every adapter but Fastly that is the `404` or `405` the router gives a request it does not route. On Fastly it is the two debug endpoints under `/_ts/debug` and a failure before the settings are read.
 
@@ -1113,12 +1114,14 @@ it passes through untouched.
 the module, it writes the lines after the origin's last one, and where the
 origin has no file the file is made of the lines alone, see A file the origin
 does not have below. The entry's `path` is a prefix, so `/ads.txt` also
-covers `/ads.txt.bak`.
+covers `/ads.txt.bak`, but only `/ads.txt` itself is made where the origin
+has none.
 
 **Refused when the settings load**: a line that is not a data record or a
 variable, naming which part is wrong, a comment, an empty list, and a
 document that selects the module but names it in no `[[fetch]]` entry for
-`text/plain`, where the lines would never be written.
+`text/plain` with `path = "/ads.txt"`, where the lines would never be
+written into the file or make it.
 
 **Example**:
 
@@ -1802,11 +1805,11 @@ startup.
 
 An entry of either list has the same three fields.
 
-| Field        | Type             | Required | Description                                                                            |
-| ------------ | ---------------- | -------- | -------------------------------------------------------------------------------------- |
-| `media_type` | String           | Yes      | The media type the entry covers, a bare `type/subtype` in lower case, see below        |
-| `path`       | String           | No       | A prefix of the request path, compared as written. Absent, the entry covers every path |
-| `middleware` | Array of strings | Yes      | The middleware to run, in order, each handed the page as the one before it left it     |
+| Field        | Type             | Required | Description                                                                                    |
+| ------------ | ---------------- | -------- | ---------------------------------------------------------------------------------------------- |
+| `media_type` | String           | Yes      | The media type the entry covers, a bare `type/subtype` in lower case, see below                |
+| `path`       | String           | No       | A prefix of the request path, compared as written. Absent, or `/`, the entry covers every path |
+| `middleware` | Array of strings | Yes      | The middleware to run, in order, each handed the page as the one before it left it             |
 
 A page takes the first entry that covers it and runs that entry's middleware
 alone. Entries are therefore written from the longest path to the entry with
@@ -1852,7 +1855,8 @@ matched by the type and subtype of its `Content-Type`, without the
 parameters, so `text/plain; charset=utf-8` takes the entry for
 `text/plain`. Anything else, an image or a length prefixed stream among
 them, passes through untouched and no entry can cover it. So does a
-response that declares a charset other than UTF-8.
+response that declares a charset other than UTF-8 or whose status is not
+`200`, such as a partial `206` or an error page.
 
 A middleware says which media types it works on, HTML alone unless it says
 otherwise, and an entry naming one under a media type it does not handle is
@@ -1862,17 +1866,21 @@ after core has moved the origin's addresses in it, in the order the entry
 names them. Head markup and the element and text handlers are decisions
 about HTML, and a middleware that makes one there is refused by name. The
 template cache stores HTML alone, so the fetch entry's middleware and then
-the serve entry's run on each response as it is fetched.
+the serve entry's run on each response as it is fetched. A response an entry
+covers loses the origin's `ETag` and `Last-Modified`, because a middleware
+may change its body, and when a module left state on the request, one a
+`[[serve]]` entry covers is sent `private, no-store`, as a page is.
 
 **A file the origin does not have.** When the origin answers `404 Not Found`
-for a path under the `path` of a `[[fetch]]` entry for a media type other
-than HTML, that entry's middleware runs on an empty document of its media
-type and its output is the file, so `ads.txt` is made from the sellers lines
-alone where the publisher has none. Where several such entries cover the
-path, the one with the longest `path` makes the file. With no such entry, or
-on any other answer from the origin, the origin's answer stands, and an
-entry for HTML or without a path makes nothing, because a page the origin
-does not have is the origin's answer.
+for the `path` of a `[[fetch]]` entry for a media type other than HTML,
+that entry's middleware runs on an empty document of its media type and its
+output is the file, so `ads.txt` is made from the sellers lines alone where
+the publisher has none. The file is made at that path itself and never at a
+longer path the entry covers, and where two such entries name the path the
+first written makes it. With no such entry, on any other answer from the
+origin, or for a request that names no host, the origin's answer stands, and
+an entry for HTML, without a path or for a folder makes nothing, because a
+page the origin does not have is the origin's answer.
 
 ```toml
 [[fetch]]
