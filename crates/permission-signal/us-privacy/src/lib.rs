@@ -518,6 +518,32 @@ mod tests {
     }
 
     #[test]
+    fn a_us_privacy_string_that_cannot_be_read_gives_no_consent_to_what_an_opt_out_covers() {
+        let read = read_with(
+            Some("us_privacy=bogus"),
+            false,
+            &Settings::default(),
+            Jurisdiction::UsState("CA".to_owned()),
+        )
+        .expect("should read");
+        assert_eq!(read.status(), SignalStatus::Unreadable);
+        let consent = ConsentContext::default().with_record(read);
+        let policy = shipped_policy();
+        let covered: Vec<Permission> = Permission::all()
+            .filter(|permission| policy.opt_out_revokes(*permission))
+            .collect();
+        assert!(!covered.is_empty(), "the shipped opt-out covers something");
+        for permission in covered {
+            assert_eq!(
+                answer(&consent, policy, permission),
+                ConsentSignal::Revoke,
+                "{} is refused, as an opt-out would refuse it",
+                permission.as_str()
+            );
+        }
+    }
+
+    #[test]
     fn vouches_for_the_us_privacy_string_only_when_it_decoded() {
         assert_eq!(
             UsPrivacyModule::new().read_signal(&with_sale_flag(PrivacyFlag::No)),
