@@ -1148,7 +1148,7 @@ middleware = ["ads-txt.sellers"]
 
 What every module of one vendor shares, in one `[shared.<vendor>]` table per vendor. Core reads none of a table. The vendor's modules read their own through `Settings::shared_config`, and the table's presence is what runs the builder that registers them, so settings without it run none of that vendor's modules and a selection naming one is refused with the table to add. A builder a table runs is selected by no section. A table that no module in the deployment reads is refused at startup, and so is a table whose name is not lower case letters, digits, `_` or `-`.
 
-A secret in a shared table is written as the name of its entry in the secret store, declared by the vendor's builder as a module's own secret settings are, and resolved when the table is present.
+A secret in a shared table is written as the name of its entry in the secret store, declared by the vendor's builder as a module's own secret settings are, checked at push to name a key, and resolved when the table is present.
 
 ```toml
 [shared.example]
