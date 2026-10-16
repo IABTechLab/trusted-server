@@ -70,9 +70,10 @@ pub trait RobotsTxtContributor: Send + Sync + core::fmt::Debug {
     /// same for every request for that host, because it is served for all of
     /// them.
     ///
-    /// A contribution with no groups is an answer, and is served as one. An
-    /// error is a failure, and core serves this contributor's held copy
-    /// instead. With no held copy the whole file fails closed with `503`.
+    /// A contribution with no groups is an answer, and is held as one, but a
+    /// file in which nothing holds a rule fails closed with `503`. An error
+    /// is a failure, and core serves this contributor's held copy instead.
+    /// With no held copy the whole file fails closed with `503`.
     ///
     /// # Errors
     ///

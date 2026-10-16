@@ -26,7 +26,8 @@
 //! 6. A contributor that fails with no held answer fails the whole file closed
 //!    with `503`, because leaving out a contributor's rules would allow by
 //!    omission whatever those rules refused. A `404` or an empty file reads to
-//!    a crawler as permission to crawl everything.
+//!    a crawler as permission to crawl everything, so a file with no rule
+//!    fails closed too, and permission is only said with `allow_all`.
 //!
 //! # Settings
 //!
@@ -362,6 +363,9 @@ type Selected = Option<(&'static str, Arc<dyn RobotsTxtContributor>)>;
 
 /// The file for `config`, from the contributions of `selected` in order,
 /// each asked for `request` and held for `publisher` and the request's host.
+///
+/// Fails, and the file is answered `503`, when a contributor fails with
+/// nothing of its held, and when the file would hold no rule.
 async fn file_for(
     config: &RobotsTxtConfig,
     selected: &[Selected],
@@ -380,7 +384,17 @@ async fn file_for(
             }
         });
     }
-    Ok(document::assemble(config, &contributions))
+    let file = document::assemble(config, &contributions);
+    // Permission to crawl everything is said with `allow_all`. A file with no
+    // rule says it too, by leaving everything out, so it fails closed.
+    if !document::holds_a_rule(&file) {
+        return Err(Report::new(configuration(
+            "[robots-txt] made a file with no rule, which a crawler reads as permission to \
+             crawl everything. Select `allow_all` to allow every crawler."
+                .to_owned(),
+        )));
+    }
+    Ok(file)
 }
 
 fn respond(file: Result<String, Report<TrustedServerError>>) -> Response<EdgeBody> {
@@ -904,5 +918,132 @@ mod tests {
                 "the file should be made for the host addressed: {file}"
             );
         }
+    }
+
+    /// A contributor with nothing to add, which answers a comment and no
+    /// group.
+    #[derive(Debug)]
+    struct Silent;
+
+    #[async_trait::async_trait(?Send)]
+    impl RobotsTxtContributor for Silent {
+        fn refresh(&self) -> core::time::Duration {
+            core::time::Duration::from_secs(60)
+        }
+
+        fn fingerprint(&self) -> String {
+            "silent".to_owned()
+        }
+
+        async fn contribute(
+            &self,
+            _call: crate::module_context::ModuleCall<'_>,
+        ) -> Result<Contribution, Report<TrustedServerError>> {
+            Ok(Contribution {
+                preamble: vec![Record::Comment(" nothing to add".to_owned())],
+                groups: Vec::new(),
+            })
+        }
+    }
+
+    /// The id of the builder that registers the silent contributor.
+    const SILENT_BUILDER: &str = "robots-txt-silent";
+
+    /// The module name that builder is selected by.
+    const SILENT_BUILDER_MODULE: &str = "testing.robots-txt-silent";
+
+    fn register_silent(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder(SILENT_BUILDER)
+                .with_robots_txt_contributor("robots-txt.silent", Arc::new(Silent))
+                .build(),
+        ))
+    }
+
+    fn silent_builder() -> IntegrationBuilder {
+        IntegrationBuilder::new(SILENT_BUILDER, SILENT_BUILDER, register_silent, accept)
+            .with_module_name(SILENT_BUILDER_MODULE)
+    }
+
+    /// The test settings with `robots_txt` as the section and the test
+    /// builder named `module` selected.
+    fn settings_selecting(robots_txt: serde_json::Value, module: &str) -> Settings {
+        let mut settings = settings();
+        settings.robots_txt = Some(parsed(robots_txt));
+        settings
+            .insert_module_config("testing", module, &serde_json::json!({}))
+            .expect("should select the test builder");
+        settings
+    }
+
+    /// A file with no rule reads to a crawler as permission to crawl
+    /// everything, which is only ever said with `allow_all`, so the file
+    /// fails closed when its sources give no rule.
+    #[tokio::test]
+    async fn a_file_with_no_rule_is_service_unavailable() {
+        let settings = settings_selecting(
+            serde_json::json!({
+                "modules": ["silent"],
+                "sitemap": "https://www.publisher.example/sitemap.xml",
+            }),
+            SILENT_BUILDER_MODULE,
+        );
+        let registry = IntegrationRegistry::with_registrations(&settings, &[silent_builder()])
+            .expect("should build the registry");
+
+        let response = handle_robots_txt(
+            &settings,
+            &services_with(Arc::default()),
+            &registry,
+            robots_request(),
+        )
+        .await
+        .expect("should answer");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a file with no rule should never be served"
+        );
+        assert_eq!(
+            response.headers().get(header::RETRY_AFTER),
+            Some(&HeaderValue::from_static("600"))
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("no-store"))
+        );
+    }
+
+    /// The publisher's own text says what the publisher wants, so a file
+    /// whose only rules are the publisher's is served.
+    #[tokio::test]
+    async fn the_publishers_own_rules_are_served_when_no_contributor_adds_any() {
+        let settings = settings_selecting(
+            serde_json::json!({
+                "modules": ["silent"],
+                "top_text": "User-agent: *\nDisallow: /private/",
+            }),
+            SILENT_BUILDER_MODULE,
+        );
+        let registry = IntegrationRegistry::with_registrations(&settings, &[silent_builder()])
+            .expect("should build the registry");
+
+        let response = handle_robots_txt(
+            &settings,
+            &services_with(Arc::default()),
+            &registry,
+            robots_request(),
+        )
+        .await
+        .expect("should answer");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            text_of(response).await,
+            "User-agent: *\nDisallow: /private/\n\n# nothing to add\n"
+        );
     }
 }
