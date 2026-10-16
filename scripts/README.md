@@ -20,6 +20,7 @@ their documented orchestration handles a probe deliberately.
 | `config-by-host-local-test.sh`            | Viceroy, `curl`, Python; optional mode, ports and artifacts        | Builds local artifacts, runs four stub origins and Viceroy from a temporary directory, stops owned servers, and removes the directory.                                    |
 | `template-cache-local-test.sh`            | Viceroy, Node, OpenSSL, `curl`, `lsof`; optional ports and mode    | Builds local artifacts, generates certificates and fixtures in a temporary directory, stops owned servers, and removes the directory.                                     |
 | `test-cli.sh`                             | Rustup and the host toolchain; optional host triple                | May install the selected Rust target, then runs native CLI and browser-audit tests. Cargo artifacts persist.                                                              |
+| `lint-core-platform-names.py`             | Python 3 and `git`                                                 | Reads every file under `crates/trusted-server-core` and fails on a hosting platform's name or domain. Writes nothing.                                                     |
 
 The four adapter smoke contracts are documented in the
 [deployment guides](../docs/guide/integrations-overview.md#adapter-support).

@@ -2,7 +2,9 @@
 
 Portable application core shared by every Trusted Server adapter. It targets
 both supported WASM environments and native adapter tests, so it must not depend
-on an edge SDK, Tokio runtime, filesystem, socket, or host-only process API.
+on an edge SDK, Tokio runtime, filesystem, socket, or host-only process API. It
+names no hosting platform either, in code, comments, tests or documents, and
+`scripts/lint-core-platform-names.py` fails CI when a file here names one.
 
 ## Responsibilities
 
