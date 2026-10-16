@@ -35,7 +35,7 @@ Use an isolated git worktree when possible. This keeps the stacked branch clean,
 - The EdgeZero dependency rev update is required, not optional. The current workspace rev does not include `edgezero-adapter-spin`; adding the Spin adapter without bumping the shared EdgeZero rev will not resolve.
 - The separate `crates/integration-tests` manifest also pins EdgeZero. Update it in the same dependency task to avoid duplicate/mismatched `edgezero_core` types in parity tests.
 - The current EdgeZero rev in root `Cargo.toml` is outdated. Local EdgeZero checkout verified at:
-  `/Users/prk-jr/Desktop/opensource/rust/work/kodejams/edgezero`
+  `<path-to-edgezero-checkout>`
   rev `ce6bcf74b529d9066d08ba87b2971af8379eb29e`.
 - EdgeZero Spin has two different manifest concepts:
   - EdgeZero application manifest: used by `edgezero_adapter_spin::run_app`.
@@ -293,14 +293,14 @@ Expected: current EdgeZero dependencies all use the same old rev.
 Run:
 
 ```bash
-git -C /Users/prk-jr/Desktop/opensource/rust/work/kodejams/edgezero rev-parse HEAD
-sed -n '1,220p' /Users/prk-jr/Desktop/opensource/rust/work/kodejams/edgezero/crates/edgezero-adapter-spin/src/lib.rs
-sed -n '1,260p' /Users/prk-jr/Desktop/opensource/rust/work/kodejams/edgezero/crates/edgezero-adapter-spin/src/request.rs
-sed -n '1,180p' /Users/prk-jr/Desktop/opensource/rust/work/kodejams/edgezero/crates/edgezero-adapter-spin/src/context.rs
-sed -n '1,220p' /Users/prk-jr/Desktop/opensource/rust/work/kodejams/edgezero/crates/edgezero-adapter-spin/src/key_value_store.rs
-sed -n '1,180p' /Users/prk-jr/Desktop/opensource/rust/work/kodejams/edgezero/crates/edgezero-adapter-spin/src/secret_store.rs
-sed -n '1,180p' /Users/prk-jr/Desktop/opensource/rust/work/kodejams/edgezero/crates/edgezero-adapter-spin/src/proxy.rs
-sed -n '1,120p' /Users/prk-jr/Desktop/opensource/rust/work/kodejams/edgezero/Cargo.toml
+git -C <path-to-edgezero-checkout> rev-parse HEAD
+sed -n '1,220p' <path-to-edgezero-checkout>/crates/edgezero-adapter-spin/src/lib.rs
+sed -n '1,260p' <path-to-edgezero-checkout>/crates/edgezero-adapter-spin/src/request.rs
+sed -n '1,180p' <path-to-edgezero-checkout>/crates/edgezero-adapter-spin/src/context.rs
+sed -n '1,220p' <path-to-edgezero-checkout>/crates/edgezero-adapter-spin/src/key_value_store.rs
+sed -n '1,180p' <path-to-edgezero-checkout>/crates/edgezero-adapter-spin/src/secret_store.rs
+sed -n '1,180p' <path-to-edgezero-checkout>/crates/edgezero-adapter-spin/src/proxy.rs
+sed -n '1,120p' <path-to-edgezero-checkout>/Cargo.toml
 ```
 
 Expected:
@@ -318,8 +318,8 @@ Expected:
 Run:
 
 ```bash
-git -C /Users/prk-jr/Desktop/opensource/rust/work/kodejams/edgezero remote -v
-git -C /Users/prk-jr/Desktop/opensource/rust/work/kodejams/edgezero branch --contains ce6bcf74b529d9066d08ba87b2971af8379eb29e
+git -C <path-to-edgezero-checkout> remote -v
+git -C <path-to-edgezero-checkout> branch --contains ce6bcf74b529d9066d08ba87b2971af8379eb29e
 git ls-remote https://github.com/IABTechLab/edgezero ce6bcf74b529d9066d08ba87b2971af8379eb29e
 ```
 
