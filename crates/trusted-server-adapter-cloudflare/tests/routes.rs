@@ -822,3 +822,238 @@ async fn a_response_carries_no_blanket_rule_without_the_section() {
 
     assert_eq!(robots_tag(&response), None);
 }
+
+/// A module's rules served through this adapter's router, held in the
+/// key-value store the runtime hands the application.
+mod robots_txt_from_a_module {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use bytes::Bytes;
+    use edgezero_core::http::Request;
+    use edgezero_core::key_value_store::{KvError, KvHandle, KvPage, KvStore};
+    use edgezero_core::router::RouterService;
+    use edgezero_core::store_registry::KvRegistry;
+    use error_stack::Report;
+    use trusted_server_adapter_cloudflare::app::TrustedServerApp;
+    use trusted_server_core::error::TrustedServerError;
+    use trusted_server_core::integrations::{IntegrationBuilder, IntegrationRegistration};
+    use trusted_server_core::module_context::ModuleCall;
+    use trusted_server_core::robots_txt::{Contribution, RobotsTxtContributor};
+    use trusted_server_core::settings::Settings;
+
+    use super::robots_request;
+
+    /// The id of the module that answers once.
+    const ANSWERS_ONCE_ID: &str = "robots-txt-answers-once";
+
+    /// A robots.txt contributor that answers the first time it is asked and
+    /// fails every time after, whose answer is due for a refresh at once.
+    #[derive(Debug, Default)]
+    struct AnswersOnce {
+        asked: AtomicUsize,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl RobotsTxtContributor for AnswersOnce {
+        fn refresh(&self) -> Duration {
+            Duration::ZERO
+        }
+
+        fn fingerprint(&self) -> String {
+            "answers-once".to_owned()
+        }
+
+        async fn contribute(
+            &self,
+            _call: ModuleCall<'_>,
+        ) -> Result<Contribution, Report<TrustedServerError>> {
+            if self.asked.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(Contribution::parse("User-Agent: OnceBot\nDisallow: /"))
+            } else {
+                Err(Report::new(TrustedServerError::Proxy {
+                    message: "the rules service is down".to_owned(),
+                }))
+            }
+        }
+    }
+
+    fn register_answers_once(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder(ANSWERS_ONCE_ID)
+                .with_robots_txt_contributor(
+                    "robots-txt.answers-once",
+                    Arc::new(AnswersOnce::default()),
+                )
+                .build(),
+        ))
+    }
+
+    fn accept_answers_once(_settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+        Ok(true)
+    }
+
+    /// The route test settings with a file made by the module that answers
+    /// once.
+    fn router_with_a_module_that_answers_once() -> RouterService {
+        let settings = Settings::from_toml(
+            r#"
+                [publisher]
+                domain = "test-publisher.example.com"
+                cookie_domain = ".test-publisher.example.com"
+                origin_url = "https://origin.test-publisher.example.com"
+                proxy_secret = "route-test-proxy-secret"
+
+                [ec]
+                module = "hmac"
+
+                [ec.hmac]
+                passphrase = "test-secret-key-32-bytes-minimum"
+
+                [geo]
+                assume_single_jurisdiction = true
+
+                [robots-txt]
+                modules = ["answers-once"]
+
+                [testing]
+                modules = ["robots-txt-answers-once"]
+            "#,
+        )
+        .expect("should parse route test settings");
+        let builder = IntegrationBuilder::new(
+            ANSWERS_ONCE_ID,
+            ANSWERS_ONCE_ID,
+            register_answers_once,
+            accept_answers_once,
+        )
+        .with_module_name("testing.robots-txt-answers-once");
+
+        TrustedServerApp::routes_with_registrations(settings, &[builder])
+            .expect("should build router from test settings")
+    }
+
+    /// A key-value store kept in memory for one test, so what one request
+    /// writes is what the next one reads.
+    #[derive(Default)]
+    struct MemoryStore {
+        entries: Mutex<HashMap<String, Bytes>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl KvStore for MemoryStore {
+        async fn delete(&self, key: &str) -> Result<(), KvError> {
+            self.entries
+                .lock()
+                .expect("should lock the store")
+                .remove(key);
+            Ok(())
+        }
+
+        async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, KvError> {
+            Ok(self
+                .entries
+                .lock()
+                .expect("should lock the store")
+                .get(key)
+                .cloned())
+        }
+
+        async fn list_keys_page(
+            &self,
+            _prefix: &str,
+            _cursor: Option<&str>,
+            _limit: usize,
+        ) -> Result<KvPage, KvError> {
+            Ok(KvPage::default())
+        }
+
+        async fn put_bytes(&self, key: &str, value: Bytes) -> Result<(), KvError> {
+            self.entries
+                .lock()
+                .expect("should lock the store")
+                .insert(key.to_owned(), value);
+            Ok(())
+        }
+
+        async fn put_bytes_with_ttl(
+            &self,
+            key: &str,
+            value: Bytes,
+            _ttl: Duration,
+        ) -> Result<(), KvError> {
+            self.put_bytes(key, value).await
+        }
+    }
+
+    /// A crawler's `GET` for the file, carrying `store` as the key-value store
+    /// the runtime hands the application, when there is one.
+    fn robots_get(store: Option<&Arc<MemoryStore>>) -> Request {
+        let mut request = robots_request("GET", "/robots.txt");
+        if let Some(store) = store {
+            let handle = KvHandle::new(Arc::clone(store) as Arc<dyn KvStore>);
+            request.extensions_mut().insert(KvRegistry::single_id(
+                "trusted_server_kv".to_owned(),
+                handle,
+            ));
+        }
+        request
+    }
+
+    /// With the store the runtime hands the application, a module's answer
+    /// is held, so when the module next fails the file is made from the
+    /// answer it gave before.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_answer_is_served_when_its_module_fails() {
+        let router = router_with_a_module_that_answers_once();
+        let store = Arc::new(MemoryStore::default());
+
+        for asked in ["answers", "fails"] {
+            let response = router
+                .oneshot(robots_get(Some(&store)))
+                .await
+                .expect("should route request");
+
+            assert_eq!(response.status().as_u16(), 200, "the module {asked}");
+            let body = response.into_body().into_bytes().unwrap_or_default();
+            assert_eq!(
+                &body[..],
+                b"User-Agent: OnceBot\nDisallow: /\n",
+                "the module {asked}"
+            );
+        }
+    }
+
+    /// With no store from the runtime nothing is held, so a module that fails
+    /// makes the file a `503` that tells a crawler to come back in ten
+    /// minutes and is not stored.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn with_nothing_held_a_module_that_fails_makes_the_file_unavailable() {
+        let router = router_with_a_module_that_answers_once();
+
+        let first = router
+            .oneshot(robots_get(None))
+            .await
+            .expect("should route request");
+        assert_eq!(first.status().as_u16(), 200);
+
+        let second = router
+            .oneshot(robots_get(None))
+            .await
+            .expect("should route request");
+        assert_eq!(second.status().as_u16(), 503);
+        let header = |name: &str| {
+            second
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+        assert_eq!(header("retry-after").as_deref(), Some("600"));
+        assert_eq!(header("cache-control").as_deref(), Some("no-store"));
+    }
+}

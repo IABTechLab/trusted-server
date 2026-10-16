@@ -1046,8 +1046,8 @@ a publisher keeps their own file. `HEAD` is answered with the headers of the
   `Cache-Control: public, max-age=3600`
 - `503 Service Unavailable` with `Retry-After: 600` and
   `Cache-Control: no-store` when a selected module cannot answer and no earlier
-  answer of its is held, because an empty file or a `404` reads to a crawler as
-  permission to crawl everything
+  answer of its is held, or when the file would hold no rule, because an empty
+  file or a `404` reads to a crawler as permission to crawl everything
 
 With `refuse_all` selected the file refuses every crawler, and every response
 the deployment finalizes also carries `X-Robots-Tag: noindex, nofollow`.
