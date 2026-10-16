@@ -1783,11 +1783,11 @@ startup.
 
 An entry of either list has the same three fields.
 
-| Field        | Type             | Required | Description                                                                            |
-| ------------ | ---------------- | -------- | -------------------------------------------------------------------------------------- |
-| `media_type` | String           | Yes      | The media type the entry covers. Only `text/html` is accepted                          |
-| `path`       | String           | No       | A prefix of the request path, compared as written. Absent, the entry covers every path |
-| `middleware` | Array of strings | Yes      | The middleware to run, in order, each handed the page as the one before it left it     |
+| Field        | Type             | Required | Description                                                                                    |
+| ------------ | ---------------- | -------- | ---------------------------------------------------------------------------------------------- |
+| `media_type` | String           | Yes      | The media type the entry covers. Only `text/html` is accepted                                  |
+| `path`       | String           | No       | A prefix of the request path, compared as written. Absent, or `/`, the entry covers every path |
+| `middleware` | Array of strings | Yes      | The middleware to run, in order, each handed the page as the one before it left it             |
 
 A page takes the first entry that covers it and runs that entry's middleware
 alone. Entries are therefore written from the longest path to the entry with
