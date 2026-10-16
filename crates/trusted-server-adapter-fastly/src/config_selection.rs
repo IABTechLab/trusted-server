@@ -16,6 +16,9 @@ pub(crate) const HOST_PLACEHOLDER: &str = "{host}";
 /// The longest name DNS carries.
 const MAX_HOST_LEN: usize = 253;
 
+/// The longest key a Fastly config store entry takes, in characters.
+const MAX_KEY_LEN: usize = 255;
+
 /// Why a request is not served.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Refusal {
@@ -57,11 +60,12 @@ pub(crate) fn normalized_host(host: &str) -> Option<String> {
 /// and nothing is looked up, which is every service that serves one
 /// publisher. Otherwise the key is the selector with the request's host in
 /// the placeholder's place, and `exists` is asked whether the store holds it.
+/// A key longer than the store takes is never looked up.
 ///
 /// # Errors
 ///
-/// Returns [`Refusal::NoConfigForHost`] when the request names no host name
-/// or the store holds no blob at the host's key. Returns
+/// Returns [`Refusal::NoConfigForHost`] when the request names no host name,
+/// the host's key is too long, or the store holds no blob at it. Returns
 /// [`Refusal::StoreUnavailable`] when `exists` fails, because a request is
 /// not served while it is unknown which blob is its own.
 pub(crate) fn resolve_key<E: Display>(
@@ -75,6 +79,7 @@ pub(crate) fn resolve_key<E: Display>(
     let key = host
         .and_then(normalized_host)
         .map(|host| selector.replace(HOST_PLACEHOLDER, &host))
+        .filter(|key| key.chars().count() <= MAX_KEY_LEN)
         .ok_or(Refusal::NoConfigForHost)?;
     match exists(&key) {
         Ok(true) => Ok(key),
@@ -294,6 +299,25 @@ mod tests {
             refused,
             Err(Refusal::StoreUnavailable("lookup failed".to_owned())),
             "should not serve while the host's blob is unknown"
+        );
+    }
+
+    #[test]
+    fn a_host_key_over_255_characters_is_not_looked_up() {
+        let label = "a".repeat(63);
+        let host = format!("{label}.{label}.{label}.{}", "a".repeat(61));
+        assert_eq!(host.len(), MAX_HOST_LEN, "should build the longest name");
+
+        assert_eq!(
+            resolve_key("{host}_v2", Some(&host), no_lookup),
+            Err(Refusal::NoConfigForHost),
+            "a key of 256 characters should count as no blob, with no lookup"
+        );
+        let longest_key = format!("{host}_v");
+        assert_eq!(
+            resolve_key("{host}_v", Some(&host), holding(&[longest_key.as_str()])),
+            Ok(longest_key.clone()),
+            "a key of 255 characters should still be looked up"
         );
     }
 }
