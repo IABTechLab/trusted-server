@@ -892,7 +892,9 @@ auction_timeout_ms = 500
 # overlay can only replace a leaf the document already has, and it names a
 # section as written, so the variable for this leaf is
 # TRUSTED_SERVER__AD-TAG__GOOGLE__GAM_ATTRIBUTION_ENABLED, which a shell's
-# `export` cannot set.
+# `export` cannot set. `write_loader` writes the loader tag, for a page that
+# carries none, where a [[serve]] entry names "ad-tag.google.loader", and
+# only for a reader whose permissions allow storage on the device.
 # [ad-tag]
 # modules = ["google"]
 

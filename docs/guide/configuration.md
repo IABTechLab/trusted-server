@@ -2091,6 +2091,8 @@ See [Google Tag Manager](/guide/integrations/google_tag_manager).
 | `slim_prebid_url`         | String or null | `null`                  | Optional tsjs-prebid bundle loaded after `window.load` |
 | `write_loader`            | Boolean        | `false`                 | Write the loader tag, for a page that carries none     |
 
+`write_loader` takes effect where a `[[serve]]` entry names `ad-tag.google.loader`, which writes the loader tag after the bootstrap and only for a reader whose permissions allow storage on the device (`necessary.operations.storage`), because GPT loaded from Google's standard address may use the device's storage at any time.
+
 See [GPT](/guide/integrations/gpt).
 
 ### GPT Diagnostics Integration
