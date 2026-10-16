@@ -22,7 +22,7 @@ use fastly::http::Method as FastlyMethod;
 use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
 use trusted_server_core::addressing::{ByHostAddressing, RemovedPathPrefix};
-use trusted_server_core::cache_policy::{EdgeCacheHeader, cache_control_headers_have_directive};
+use trusted_server_core::cache_policy::cache_control_headers_have_directive;
 use trusted_server_core::ec::device::{DeviceModule, DeviceSignals, build_device_module};
 use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::kv::KvIdentityGraph;
@@ -878,7 +878,7 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
     }
 
     if let Some(policy) = asset_cache_policy {
-        policy.apply_after_route_finalization(&mut response, EdgeCacheHeader::SurrogateControl);
+        policy.apply_after_route_finalization(&mut response, crate::app::EDGE_CACHE_HEADER);
     }
 
     if let Some(mut ec_state) = ec_state {
