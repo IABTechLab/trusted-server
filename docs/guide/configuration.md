@@ -1825,10 +1825,10 @@ that entry's middleware runs on an empty document of its media type and its
 output is the file, so `ads.txt` is made from the sellers lines alone where
 the publisher has none. The file is made at that path itself and never at a
 longer path the entry covers, and where two such entries name the path the
-first written makes it. With no such entry, or on any other answer from the
-origin, the origin's answer stands, and an entry for HTML, without a path or
-for a folder makes nothing, because a page the origin does not have is the
-origin's answer.
+first written makes it. With no such entry, on any other answer from the
+origin, or for a request that names no host, the origin's answer stands, and
+an entry for HTML, without a path or for a folder makes nothing, because a
+page the origin does not have is the origin's answer.
 
 ```toml
 [[fetch]]

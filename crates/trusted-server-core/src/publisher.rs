@@ -5608,8 +5608,11 @@ pub async fn handle_publisher_request(
     );
 
     // A file the origin does not have is made, see `PhaseEntries::making`.
+    // Core runs no middleware for a request that names no host, so there the
+    // made file would go out empty and the origin's answer stands instead.
     if response.status() == StatusCode::NOT_FOUND
         && (request_method == Method::GET || request_method == Method::HEAD)
+        && !request_host.is_empty()
         && let Some(entry) = settings.fetch.making(&request_path)
     {
         log::debug!(
@@ -21702,6 +21705,30 @@ mod tests {
         assert_eq!(
             response_of(proxied.response).status(),
             StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_that_names_no_host_keeps_the_origin_answer() {
+        let settings = settings_running_the_middleware_fixture(text_entry_for(Some("/ads.txt")));
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            404,
+            b"<html><body>the origin's page</body></html>".to_vec(),
+            vec![("content-type", "text/html; charset=utf-8")],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let request = build_request(Method::GET, "/ads.txt");
+
+        let response = run_publisher_proxy(&settings, &services, request).await;
+
+        assert_eq!(
+            response_of(response).status(),
+            StatusCode::NOT_FOUND,
+            "should keep the origin's answer, because core runs no middleware for a request \
+             that names no host and the made file would go out empty"
         );
     }
 
