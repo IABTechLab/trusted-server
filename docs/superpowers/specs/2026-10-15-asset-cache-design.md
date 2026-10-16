@@ -3,7 +3,7 @@
 **Status:** Proposed, 2026-10-15. Written after the code, for draft pull request IABTechLab/trusted-server#1375
 **Author:** 51Degrees (contributed), for Tech Lab review
 **Related specs:** `2026-10-12-loading-cache-design.md`, `2026-09-15-852-template-and-origin-caching-design.md`, `2026-04-28-multi-backend-asset-proxy-design.md`, `2026-05-19-asset-s3-auth-fastly-io-design.md`, `2026-09-08-1138-per-cookie-template-cache-policy-design.md`
-**Related PRs:** IABTechLab/trusted-server#1375, reviewed on jwrosewell/trusted-server#29
+**Related PRs:** IABTechLab/trusted-server#1375, reviewed on jwrosewell/trusted-server#29 (closed)
 **Issues:** IABTechLab/trusted-server#1324
 **Last updated:** 2026-10-16
 
@@ -76,7 +76,7 @@ A stored copy is the origin's response, headers and body, as the origin sent it,
 
 **Asset rules.** The `[[cache.asset_rules]]` entries rewrite the `Cache-Control` and edge cache headers of the response a reader is sent, after a copy is read or the origin is asked (`apply_publisher_asset_cache_policy` on the publisher path and the end of `handle_asset_proxy_request` on a route). The asset gate and the copy's lifetime do not read the rules, so the lifetime comes from the origin's response alone, and a rule that gives a reader a longer lifetime does not lengthen the copy's.
 
-**One fetch for many requests.** `get_or_fetch` loads the address's record through `assets-vary`. The request that leads that load fetches the origin and writes its own copy under its own values before the record is published, so a waiting request with the same values finds the copy. A waiting request with other values loads its own copy, and the requests waiting on those values share that load. Both caches are built with `detachable: false`, so a load runs in the request that started it.
+**One fetch for many requests.** `get_or_fetch` loads the address's record through `assets-vary`. The request that leads that load fetches the origin and writes its own copy under its own values before the record is published, so a waiting request with the same values finds the copy. A waiting request with other values loads its own copy, and the requests waiting on those values share that load. A load runs in the request that started it, as every load of the loading cache does.
 
 **How far one fetch reaches.** The memory layer shares a load among the requests that share the layer. The stock module's layer lives as long as the application state, or on Cloudflare as long as the isolate. Fastly serves one request per instance unless the opt-in reusable sandbox is on, and Spin runs a fresh instance per request (see `AppState` in the Fastly and Spin adapters' `app.rs`), so on those two the memory layer is not shared between requests. Across instances only Fastly makes requests share a load. Only the Fastly adapter registers a value cache, and a lookup in that cache makes every other instance at the same location wait for the instance that fills the key (`crates/trusted-server-adapter-fastly/src/value_cache.rs`), so a missing key is loaded once for each location and not once for the service. Cloudflare and Spin share copies only through a key-value store, which makes no instance wait, so each instance that misses at the same moment fetches the origin itself, and Axum has no shared store at all.
 

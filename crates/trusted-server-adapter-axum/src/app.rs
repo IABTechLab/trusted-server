@@ -1,5 +1,6 @@
 use core::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use edgezero_core::app::Hooks;
 use edgezero_core::context::RequestContext;
@@ -12,6 +13,7 @@ use error_stack::Report;
 use trusted_server_core::addressing::{RequestAddressing, addressed_router};
 use trusted_server_core::attestation::{PlatformIdentity, handle_prefix, prefix_routes};
 use trusted_server_core::auction::endpoints::handle_auction;
+use trusted_server_core::auction::telemetry::warn_once_when_analytics_is_unsent;
 use trusted_server_core::auction::{
     AuctionOrchestrator, build_orchestrator_with_plan, compile_auction_plan_with,
 };
@@ -78,6 +80,9 @@ pub struct AppState {
     loading_caches: Arc<trusted_server_core::platform::LoadingCaches>,
 }
 
+/// Set once startup has logged that this adapter sends no auction telemetry.
+static UNSENT_ANALYTICS_LOGGED: AtomicBool = AtomicBool::new(false);
+
 /// The permission signal modules this adapter links, in the order they run
 /// when configuration names none. Global Privacy Control is first because it
 /// is a browser setting with no interface of its own, and the three that
@@ -125,6 +130,7 @@ pub fn shipped_module_builders() -> Vec<IntegrationBuilder> {
         trusted_server_ad_tag_google::builder(),
         trusted_server_ad_tag_google::diagnostics::builder(),
         trusted_server_ads_txt_iabtl::builder(),
+        trusted_server_headers_geo::builder(),
         // Run by `[shared.51degrees]` rather than selected by a section.
         trusted_server_middleware_51degrees::builder(),
         // Implementations `[demand]` and `[ad-server]` can name, which no
@@ -264,6 +270,14 @@ fn build_state_with_registrations_and_services(
         )?;
     let loading_caches =
         trusted_server_core::integrations::loading_caches_from(&settings, integrations)?;
+    // This adapter builds no telemetry sink, so a module `[analytics]` selects
+    // sends nothing unless the caller's services carry a sink.
+    warn_once_when_analytics_is_unsent(
+        &settings,
+        services.as_ref(),
+        "Axum",
+        &UNSENT_ANALYTICS_LOGGED,
+    );
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
@@ -404,8 +418,9 @@ async fn build_ec_context(
 /// Dispatches the fallback routes: tsjs assets, integration proxy routes, and
 /// the publisher origin.
 ///
-/// The request arrives already prepared. Every route that reaches here is
-/// registered to [`fallback_handler`], which runs the request through
+/// The request arrives already prepared, and is not to a closed path. Every
+/// route that reaches here is registered to [`fallback_handler`], which
+/// answers a closed path itself and runs any other request through
 /// [`execute_handler`], and [`execute_handler`] calls
 /// `registry.prepare_request` before it calls this function, so there is
 /// nothing left to prepare here.
@@ -414,10 +429,6 @@ async fn dispatch_fallback(
     services: &RuntimeServices,
     req: Request,
 ) -> Result<Response, Report<TrustedServerError>> {
-    if let Some(response) = closed_path_response(&req) {
-        return Ok(response);
-    }
-
     let path = req.uri().path().to_string();
     let method = req.method().clone();
 
@@ -485,7 +496,12 @@ async fn dispatch_fallback(
 fn fallback_handler(
     state: Arc<AppState>,
 ) -> impl Fn(RequestContext) -> HandlerFuture + Clone + Send + Sync + 'static {
-    move |ctx: RequestContext| {
+    move |ctx: RequestContext| -> HandlerFuture {
+        // A closed path is answered before the modules' preparers run, as the
+        // other adapters answer it, so no preparer sees or answers it.
+        if let Some(response) = closed_path_response(ctx.request()) {
+            return Box::pin(async move { Ok::<_, EdgeError>(response) });
+        }
         let state = Arc::clone(&state);
         Box::pin(execute_handler(
             state,
@@ -1055,6 +1071,25 @@ mod tests {
         );
     }
 
+    /// `[analytics]` selecting a module still loads on this adapter, which
+    /// sends no auction telemetry, and startup says so.
+    #[test]
+    fn startup_logs_that_this_adapter_sends_no_auction_telemetry() {
+        let settings = Settings::from_toml(&format!(
+            "{}\n{}",
+            trusted_server_core::test_support::tests::crate_test_settings_str(),
+            trusted_server_core::test_support::template::documented_block("[analytics]")
+        ))
+        .expect("should load settings selecting the documented analytics module");
+
+        build_state_with_settings(settings).expect("should accept a selected analytics module");
+
+        assert!(
+            UNSENT_ANALYTICS_LOGGED.load(std::sync::atomic::Ordering::Relaxed),
+            "startup should log that this adapter sends no auction telemetry"
+        );
+    }
+
     /// The modules this adapter links are offered in the order their hooks
     /// run. A module is named by what its section selects, and an
     /// implementation by what `[demand]` or `[ad-server]` names.
@@ -1089,6 +1124,7 @@ mod tests {
                 "ad-tag.google",
                 "ad-tag.google.diagnostics",
                 "ads-txt.iabtl",
+                "headers.geo",
                 "51degrees",
                 "auction-protocol.openrtb",
                 "auction.prebid-server",

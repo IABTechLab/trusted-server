@@ -17,8 +17,8 @@
 //!   [`crate::platform::PlatformConfigStore::put`] /
 //!   [`crate::platform::PlatformConfigStore::delete`] and
 //!   [`crate::platform::PlatformSecretStore::create`] /
-//!   [`crate::platform::PlatformSecretStore::delete`]. These identifiers come
-//!   from the request-signing settings in `trusted-server.toml`.
+//!   [`crate::platform::PlatformSecretStore::delete`]. `ts keys` takes these
+//!   identifiers as `--config-store-id` and `--secret-store-id`.
 
 use std::sync::LazyLock;
 
