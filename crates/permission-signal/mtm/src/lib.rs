@@ -237,7 +237,7 @@ impl PermissionSignalModule for MtmModule {
     }
 
     /// The word, when one is present. There is nothing else to validate,
-    /// because a value that is not one of the two words is not an answer.
+    /// because a value that is not one of the three words is not an answer.
     fn valid_signal(&self, call: ModuleCall<'_>) -> Option<ValidSignal> {
         call.inject(self, Self::read_signal).ok().flatten()
     }
