@@ -358,6 +358,13 @@ impl SharedTables {
         self.0.contains_key(vendor)
     }
 
+    /// `[shared.<vendor>]` as written, for a check that reads a setting by its
+    /// path, such as that a secret setting names a key.
+    #[must_use]
+    pub(crate) fn table(&self, vendor: &str) -> Option<&serde_json::Map<String, JsonValue>> {
+        self.0.get(vendor)
+    }
+
     /// Reads and validates `[shared.<vendor>]` as `T`, or `None` when the table
     /// is absent.
     ///
