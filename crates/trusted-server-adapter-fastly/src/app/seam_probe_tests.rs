@@ -369,6 +369,145 @@ fn no_blanket_rule_is_placed_on_responses_without_the_section() {
     );
 }
 
+/// A module whose request filter answers every request with a challenge, as
+/// bot protection does.
+mod challenge {
+    use std::sync::Arc;
+
+    use edgezero_core::body::Body;
+    use edgezero_core::http::{Response, StatusCode};
+    use error_stack::Report;
+    use trusted_server_core::error::TrustedServerError;
+    use trusted_server_core::integrations::{
+        IntegrationBuilder, IntegrationRegistration, IntegrationRequestFilter,
+        RequestFilterDecision, RequestFilterEffects, RequestFilterInput,
+    };
+    use trusted_server_core::settings::Settings;
+
+    /// The module's id.
+    const ID: &str = "robots-txt-challenge";
+
+    /// Answers every request with a `403` challenge.
+    struct Challenging;
+
+    #[async_trait::async_trait(?Send)]
+    impl IntegrationRequestFilter for Challenging {
+        fn integration_id(&self) -> &'static str {
+            ID
+        }
+
+        async fn filter_request(
+            &self,
+            _input: RequestFilterInput<'_>,
+        ) -> Result<RequestFilterDecision, Report<TrustedServerError>> {
+            let mut response = Response::new(Body::from("a challenge"));
+            *response.status_mut() = StatusCode::FORBIDDEN;
+            Ok(RequestFilterDecision::Respond {
+                response: Box::new(response),
+                effects: RequestFilterEffects::default(),
+            })
+        }
+    }
+
+    fn register(
+        _settings: &Settings,
+    ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+        Ok(Some(
+            IntegrationRegistration::builder(ID)
+                .with_request_filter(Arc::new(Challenging))
+                .build(),
+        ))
+    }
+
+    fn accept(_settings: &Settings) -> Result<bool, Report<TrustedServerError>> {
+        Ok(true)
+    }
+
+    /// The module, selected by `[testing] modules = ["robots-txt-challenge"]`.
+    pub(super) fn builder() -> IntegrationBuilder {
+        IntegrationBuilder::new(ID, ID, register, accept)
+            .with_module_name("testing.robots-txt-challenge")
+    }
+}
+
+/// A crawler asking for robots.txt is answered before the Edge Cookie steps
+/// and the request filters, so a filter that answers every other request
+/// with a challenge never stands in for the file, and no Edge Cookie state
+/// rides on the answer. Another method on the path is no crawler's request
+/// for the file, so the filter answers it.
+#[test]
+fn robots_txt_is_answered_before_the_edge_cookie_steps_and_the_filters() {
+    use trusted_server_core::platform::PlatformHttpClient;
+    use trusted_server_core::platform::test_support::{
+        StubHttpClient, build_services_with_http_client,
+    };
+
+    let state = state_with(
+        settings_with(&format!(
+            r#"
+            [robots-txt]
+            modules = "refuse_all"
+
+            [[fetch]]
+            media_type = "text/plain"
+            path = "/robots.txt"
+            middleware = ["robots_txt"]
+            {HMAC_BLOCK}
+
+            [testing]
+            modules = ["robots-txt-challenge"]
+            "#
+        )),
+        &[challenge::builder()],
+    );
+    let origin = Arc::new(StubHttpClient::new());
+    origin.push_response_with_headers(
+        200,
+        b"User-agent: *\nAllow: /\n".to_vec(),
+        vec![("content-type", "text/plain")],
+    );
+    let services =
+        build_services_with_http_client(Arc::clone(&origin) as Arc<dyn PlatformHttpClient>);
+    let dispatch = |method: Method, path: &str| {
+        let request = request_builder()
+            .method(method)
+            .uri(format!("https://test-publisher.com{path}"))
+            .body(Body::empty())
+            .expect("should build request");
+        block_on(super::dispatch_fallback(&state, &services, request))
+    };
+
+    let page = dispatch(Method::GET, "/page");
+    assert_eq!(
+        page.status().as_u16(),
+        403,
+        "the filter should answer another request"
+    );
+    let post = dispatch(Method::POST, "/robots.txt");
+    assert_eq!(
+        post.status().as_u16(),
+        403,
+        "the filter should answer a method other than GET and HEAD"
+    );
+
+    let file = dispatch(Method::GET, "/robots.txt");
+    assert_eq!(
+        file.status().as_u16(),
+        200,
+        "the file should be served, not the filter's challenge"
+    );
+    assert!(
+        file.extensions().get::<super::EcFinalizeState>().is_none(),
+        "no Edge Cookie state should ride on the file"
+    );
+    assert_eq!(body_text(file), "User-agent: *\nDisallow: /\n");
+    assert_eq!(
+        origin.recorded_request_methods(),
+        ["GET"],
+        "only the crawler's request for the file should reach the origin"
+    );
+}
+
 /// A request prepares exactly once whether a named route or the fallback
 /// serves it.
 #[test]
