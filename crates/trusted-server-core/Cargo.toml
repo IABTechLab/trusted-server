@@ -42,6 +42,7 @@ rand = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_path_to_error = { workspace = true }
 serde_yaml_ng = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }
