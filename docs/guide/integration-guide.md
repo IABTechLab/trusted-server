@@ -810,8 +810,9 @@ supplies nothing else starts from `IntegrationBuilder::implementations(...)`
 and is named by its id. An adapter takes the selections from the settings and
 the builders it is given with `loading_caches_from` when it builds its state,
 which refuses a name no builder offers a cache from, and hands them to every
-request's services as `LoadingCaches`. A feature that selects nothing loads
-through `NoLoadingCache`. The stock list carries
+request's services as `LoadingCaches`. A feature whose table names no module
+takes the one loading cache module the build links, and loads through
+`NoLoadingCache` when the build links none or several. The stock list carries
 `crates/loading-cache/51degrees`.
 
 ```rust
@@ -832,13 +833,14 @@ caller made, so a copy is shared by every instance that reads the same store.
 
 Code in core, or in a module, loads through the cache with
 `RuntimeServices::load_cached`. It names its cache with a `CacheSpec`, being
-the cache's name, the lifetimes of the memory and store copies, how many
-values the memory copy holds and whether a load may run apart from the request
-that started it, which only a load that never blocks its thread may. Its key
-is a `StoreKey`, which starts with the publisher's `ServerKeyPrefix` from the
+the cache's name, the lifetimes of the memory and store copies and how many
+values the memory copy holds. Its key is a `StoreKey`, which starts with the publisher's `ServerKeyPrefix` from the
 loaded settings, so two publishers sharing a store never share a copy. The
 `Loader` it hands over owns everything it uses, and answers a `LoadedValue`,
-with a lifetime of its own where the source gives one.
+with a lifetime of its own where the source gives one. Its value serves every
+reader, so any services it needs come from
+`services.clone().without_connection()`, never
+the request's own, and `load_cached` hands the cache the same.
 
 ```rust
 let key = StoreKey::new(&ServerKeyPrefix::for_settings(settings), CACHE, digest);
