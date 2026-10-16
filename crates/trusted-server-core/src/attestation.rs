@@ -679,14 +679,15 @@ fn escape_attribute(value: &str) -> String {
 /// case letters, digits, `_` and `-`, the first beginning with an underscore
 /// so the pages sit apart from the publisher's own, and without `.json`,
 /// which names the JSON form. Neither the page nor the JSON form may be one
-/// of the [`RESERVED_PATHS`], and the prefix may not be one of the
+/// of the [`RESERVED_PATHS`] or a path every adapter closes (see
+/// [`crate::closed_paths`]), and the prefix may not be one of the
 /// [`ORIGIN_ASSET_PREFIXES`].
 ///
 /// # Errors
 ///
 /// Returns `invalid_endpoint` for any other shape, `reserved_endpoint`,
-/// naming the address, when the page or the JSON form is reserved, and
-/// `origin_prefix`, naming the prefix, when the prefix is one a framework
+/// naming the address, when the page or the JSON form is reserved or closed,
+/// and `origin_prefix`, naming the prefix, when the prefix is one a framework
 /// serves its assets from.
 pub fn validate_endpoint(value: &str) -> Result<(), ValidationError> {
     let segment_ok = |segment: &str| {
@@ -711,6 +712,14 @@ pub fn validate_endpoint(value: &str) -> Result<(), ValidationError> {
     if let Some(reserved) = reserved_path_taken(value, RESERVED_PATHS) {
         let mut error = ValidationError::new("reserved_endpoint");
         error.message = Some(format!("{reserved} is answered by the deployment itself").into());
+        return Err(error);
+    }
+    if let Some(closed) = paths_of(value)
+        .into_iter()
+        .find(|path| crate::closed_paths::is_closed(path))
+    {
+        let mut error = ValidationError::new("reserved_endpoint");
+        error.message = Some(format!("{closed} is closed on every adapter").into());
         return Err(error);
     }
     let prefix = prefix_of(value);
@@ -1393,6 +1402,29 @@ mod tests {
                 error.message.as_deref(),
                 Some(format!("/{prefix} is where a web framework serves its assets").as_str()),
                 "{endpoint} should name its prefix"
+            );
+        }
+    }
+
+    /// Every adapter closes the administration prefix before the publisher
+    /// fallback, so an endpoint beneath it would be the one route served there.
+    #[test]
+    fn an_endpoint_beneath_the_closed_administration_prefix_is_refused() {
+        for endpoint in [
+            "/_ts/admin",
+            "/_ts/admin/attestation",
+            "/_ts/adminx/attestation",
+        ] {
+            let error = validate_endpoint(endpoint).expect_err("should refuse the endpoint");
+
+            assert_eq!(
+                error.code, "reserved_endpoint",
+                "{endpoint} should be refused"
+            );
+            assert_eq!(
+                error.message.as_deref(),
+                Some(format!("{endpoint} is closed on every adapter").as_str()),
+                "{endpoint} should be named"
             );
         }
     }

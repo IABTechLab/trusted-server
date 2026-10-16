@@ -2073,6 +2073,7 @@ mod tests {
         for path in [
             "/_ts/admin/keys/rotate",
             "/_ts/admin/keys/deactivate",
+            "/_ts/admin/cache/purge",
             "/admin/keys/rotate",
             "/admin/keys/deactivate",
         ] {
@@ -2121,6 +2122,10 @@ mod tests {
             "/admin/keys/rotate/extra".to_owned(),
             "/admin/keys%2Frotate".to_owned(),
             "/admin%2fkeys/rotate".to_owned(),
+            // Multi-encoded separators survive a single decode, so the reservation
+            // decodes to a fixed point before the publisher fallback runs.
+            "/admin%252Fkeys/rotate".to_owned(),
+            "/_ts%252Fadmin/ec".to_owned(),
         ] {
             for method in [Method::GET, Method::POST] {
                 let request = request_builder()
