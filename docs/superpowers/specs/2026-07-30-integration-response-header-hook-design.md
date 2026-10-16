@@ -14,14 +14,14 @@ consumer, which is this spec's own §-rule for speculative surface. The spec is
 retained as the design bar for the hook when its first consumer arrives (an
 integration that must set response headers such as Accept-CH or detection
 results). Revised 2026-08-25, on 2026-10-06 for the module wording, and on
-2026-10-15 after its round 1 review (Review log).
+2026-10-15 and 2026-10-16 after its round 1 and round 2 reviews (Review log).
 **Author:** Engineering
 **Issue references:** #782
 **Related specs:** `2026-07-30-pluggable-providers-design.md`,
 `2026-07-30-permission-model-design.md`,
 `2026-07-30-provider-migration-rollout-design.md` and the baseline DataDome
 design `2026-06-11-datadome-server-side-protection-design.md`
-**Last updated:** 2026-10-15
+**Last updated:** 2026-10-16
 
 > **Context.** Issue #782 already specifies this feature well; its done-when
 > is the contract. PR #838 shipped the trait and registry wiring with **no
@@ -88,11 +88,13 @@ revision tuple in §3, `SecurityUse`, `DataDomeSecurityRequestFilter`,
   `[cache] vary_digest_key_secret_name` does not exist. `CacheSettings` in
   `settings.rs` holds `asset_rules` only and refuses an unknown key, and no
   setting turns on the "response caching" that makes the key mandatory.
-- **The redacted request view and the egress type (§3 and §4a).**
-  `2026-07-30-pluggable-providers-design.md` lists `AuthorizedIdentity<Scope>`
-  and `RedactedRequestView` among draft positions and says "None of that is
-  implemented in these PRs". No spec defines `PartnerEgress` or lists what the
-  view strips.
+- **The redacted request view and the egress type (§3 and §4a).** Section 11
+  of `2026-07-30-pluggable-providers-design.md` names `AuthorizedIdentity` and
+  `RedactedRequestView` as "a typed boundary for identity that leaves the
+  edge", in the list that opens "No row of the stack builds the following".
+  That spec writes `AuthorizedIdentity` with nothing in angle brackets, so the
+  `<PartnerEgress>` in `AuthorizedIdentity<PartnerEgress>` (§3) belongs to this
+  spec alone. No spec defines `PartnerEgress` or lists what the view strips.
 - **The security channel (§4a).** At this commit DataDome is core code, in
   `integrations/datadome.rs` and the `integrations/datadome/` directory, and
   its table is `[integrations.datadome]`. From `split/7-integration-seam-impl`
@@ -139,7 +141,11 @@ revision tuple in §3, `SecurityUse`, `DataDomeSecurityRequestFilter`,
   carries the `TerminalPrivateResponse` marker, and runs the cookie rule and
   the uncacheable rule once more. Axum, Cloudflare and Spin call neither
   `filter_request` nor `ec_finalize_response`, so on them
-  `apply_finalize_headers` is the only response-header step.
+  `apply_finalize_headers` is the only response-header step. On every adapter
+  `apply_finalize_headers` calls core's `apply_git_version_header`
+  (`version_header.rs`) ahead of `apply_response_headers_with_cache_privacy`.
+  `apply_git_version_header` sets `x-ts-version` to the compiled-in git version
+  and removes an inherited `x-ts-version` when no valid version is known.
 - **The marker.** `enforce_terminal_private_cache_privacy` sets
   `TerminalPrivateResponse` (`response_privacy.rs`) on a response whose
   `no-store, private` policy belongs to Trusted Server, and only the Fastly
@@ -224,10 +230,11 @@ Nothing in this section is built. The names `with_response_mutator`,
   writes it never sees. An API that cannot express a violation beats one
   that promises to catch it.
 - **Every adapter calls the apply point** on its outbound-response path for
-  processed documents. The only response-finalization code the adapters share
-  today is `apply_response_headers_with_cache_privacy`, which each adapter's own
-  `apply_finalize_headers` calls (§1a). Only the Fastly adapter runs request
-  filters and applies their late response effects, in
+  processed documents. The response-finalization code the adapters share today
+  is two core functions, `apply_git_version_header` and
+  `apply_response_headers_with_cache_privacy`, and each adapter's own
+  `apply_finalize_headers` calls both (§1a). Only the Fastly adapter runs
+  request filters and applies their late response effects, in
   `apply_terminal_response_effects`, after `ec_finalize_response`. Which
   function is the apply point on each adapter is an open question (§8). Each
   adapter gains the call and a test proving it.
@@ -1510,10 +1517,12 @@ first consumer, §7) merges:
 
 - The earlier draft of PR #1047 carried an `IntegrationResponseMutator`
   response-header hook. The hook was removed from that PR before the series
-  was presented, so PR #1047 ships the documentation set only and no hook
+  was presented, so PR #1047 carried the documentation set only, and no hook
   trait, registration builder, or adapter call site exists in the series'
-  tree. This is exactly the outcome §4 item 3 and §5 require for a feature
-  with no consumer, applied to the feature's own spec.
+  tree (§1a). PR #1047 was closed without merging on 2026-10-15, and draft
+  PR #1347 carries the same set at the same commit (see the Status). This is
+  exactly the outcome §4 item 3 and §5 require for a feature with no
+  consumer, applied to the feature's own spec.
 - The hook returns together with its first consumer, meaning an integration
   that must set response headers, for example `Accept-CH` client-hint
   requests or detection results such as §4a's security channel. The
@@ -1606,6 +1615,13 @@ changes no code and decides none of them.
    the stack, and puts the questions the code raises under Open questions, so
    the hook, the cache fields, the id rule and the CDN field list wait for
    those decisions and for code changes.
+2. **Round 2, 2026-10-16.** A lighter review in a fresh session, checking the
+   round 1 fixes against `split/5-response-hook-docs` at `61b1399c6`. Issues
+   found, none blocking. This revision corrects three statements, being the
+   wording of the providers design quoted in section 1a, the claim in section 2
+   that one function is the only response-finalization code the adapters
+   share, and the claim in section 7 that a pull request now closed (#1047)
+   ships the documentation set.
 
 ## Revision record
 
@@ -1615,3 +1631,4 @@ changes no code and decides none of them.
 | 2026-09-01 | Repeated lines of an admitted request header pass through as received in §4a.2 (§7).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | 2026-10-06 | Module wording.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | 2026-10-15 | Fixes from review round 1. The status and the closed pull request, a new section 1a on what the code does today, the cookie rule, the shared finalization code and the DataDome section name stated as the code has them, the reserved CDN cache fields taken from `EDGE_CACHE_HEADER_NAMES`, the three ids the id rule refuses, the template cache and the cache revision tuple marked as unreconciled or not built, the changes to shipped DataDome behavior in section 4a.4, the order of sections 4 and 4a, the sign-off rows, `must-revalidate` precedence, the duplicate-ID test in the done-when, the existing tests, the open questions and the review log. |
+| 2026-10-16 | Fixes from review round 2. What the providers design now says (section 1a), the two core functions that every adapter's `apply_finalize_headers` calls (sections 1a and 2), the closed pull request that carried the documentation set (#1047, section 7), the revision dates and the review log.                                                                                                                                                                                                                                                                                                                                                                   |
