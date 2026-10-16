@@ -16,8 +16,37 @@ their documented orchestration handles a probe deliberately.
 | `smoke-cloudflare.sh`                     | Pinned Wrangler, `cargo`, `curl`, `jq`, and Python                 | Uses isolated Wrangler manifests, KV state, ports, and logs; stops owned processes and removes its workspace.                                                             |
 | `smoke-spin.sh`                           | Spin CLI, `cargo`, `curl`, and Python                              | Uses an isolated Spin manifest and SQLite KV store; stops owned processes and removes its workspace.                                                                      |
 | `smoke-common.sh`                         | Sourced by the four smoke scripts                                  | Defines bounded port, process, config, secret, and response assertions. Do not invoke it as a standalone smoke.                                                           |
+| `async-html-finalization-local-test.sh`   | Rust, pinned Node and selected runtime; Fastly Viceroy 0.19+       | Builds feature-gated fixtures, preserves compiler settings, retains diagnostics, and stops owned process groups on failure or SIGTERM.                                    |
 | `template-cache-local-test.sh`            | Viceroy, Node, OpenSSL, `curl`, `lsof`; optional ports and mode    | Builds local artifacts, generates certificates and fixtures in a temporary directory, stops owned servers, and removes the directory.                                     |
 | `test-cli.sh`                             | Rustup and the host toolchain; optional host triple                | May install the selected Rust target, then runs native CLI and browser-audit tests. Cargo artifacts persist.                                                              |
+
+## HTML EOF runtime checks
+
+Requires Rust, pinned Node and the selected runtime CLI. Run from the
+repository root:
+
+```bash
+cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --features html-eof-runtime --test html_eof_runtime
+./scripts/async-html-finalization-local-test.sh axum --auction
+./scripts/async-html-finalization-local-test.sh cloudflare --release --auction
+./scripts/async-html-finalization-local-test.sh spin --release --auction
+```
+
+**Fastly requires isolated Viceroy 0.19 or newer** for the hung-backend fixture;
+ordinary tests retain the repository's 0.17 pin:
+
+```bash
+cargo install viceroy --version 0.19.0 --locked --root /tmp/example-eof-viceroy
+PATH="/tmp/example-eof-viceroy/bin:$PATH" ./scripts/async-html-finalization-local-test.sh fastly --release --auction
+```
+
+Workers requires matching `worker-build`/`wasm-bindgen` versions and Wrangler.
+The harness builds fresh feature-gated artifacts, checks generated timeout,
+permission and loopback configuration, preserves explicit compiler/profile settings
+and `CARGO_TARGET_DIR`, selects build targets itself, and stops owned process groups on failure or SIGTERM.
+Artifacts and diagnostics persist in the printed temporary directory for inspection.
+CI runs native Rust helper tests and lint, Axum and isolated Fastly EOF controls. See the
+[testing guide](../docs/guide/testing.md#html-eof-runtime-checks) for coverage details.
 
 The four adapter smoke contracts are documented in the
 [deployment guides](../docs/guide/integrations-overview.md#adapter-support).

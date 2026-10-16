@@ -552,6 +552,7 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
     static GEO: std::sync::OnceLock<Arc<dyn PlatformGeo>> = std::sync::OnceLock::new();
 
     RuntimeServices::builder()
+        .timer(Arc::new(AxumTimer))
         .config_store(Arc::clone(CONFIG_STORE.get_or_init(|| {
             Arc::new(AxumPlatformConfigStore) as Arc<dyn PlatformConfigStore>
         })))
@@ -581,6 +582,16 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
         .build()
 }
 
+struct AxumTimer;
+
+impl trusted_server_core::platform::PlatformTimer for AxumTimer {
+    fn delay(&self, duration: std::time::Duration) -> futures::future::LocalBoxFuture<'static, ()> {
+        Box::pin(async move {
+            tokio::time::sleep(duration).await;
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -591,6 +602,19 @@ mod tests {
     use edgezero_core::body::Body as EdgeBody;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    #[test]
+    fn html_finalization_timer_is_request_scoped() {
+        let request = edgezero_core::http::request_builder()
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build a request");
+        let context = edgezero_core::context::RequestContext::new(request, Default::default());
+        let services = build_runtime_services(&context);
+        assert!(
+            services.timer().is_some(),
+            "should install a cooperative timer without polling it"
+        );
+    }
 
     #[test]
     fn auction_http_capabilities_are_explicit() {

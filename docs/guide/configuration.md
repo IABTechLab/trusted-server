@@ -309,14 +309,16 @@ Core publisher settings for domain, origin, and proxy configuration.
 
 ### `[publisher]`
 
-| Field                         | Type    | Required | Description                                                                 |
-| ----------------------------- | ------- | -------- | --------------------------------------------------------------------------- |
-| `domain`                      | String  | Yes      | Publisher's apex domain name                                                |
-| `cookie_domain`               | String  | Yes      | Domain for non-EC cookies (typically with leading dot)                      |
-| `origin_url`                  | String  | Yes      | Full URL of publisher origin server                                         |
-| `origin_host_header_override` | String  | No       | Outbound Host header to send while connecting to `origin_url`               |
-| `proxy_secret`                | String  | Yes      | Secret-store key name for the proxy URL secret                              |
-| `max_buffered_body_bytes`     | Integer | No       | Buffered-body cap / Fastly stream raw+decoded byte ceiling (default 16 MiB) |
+| Field                          | Type    | Required | Description                                                                          |
+| ------------------------------ | ------- | -------- | ------------------------------------------------------------------------------------ |
+| `domain`                       | String  | Yes      | Publisher's apex domain name                                                         |
+| `cookie_domain`                | String  | Yes      | Domain for non-EC cookies (typically with leading dot)                               |
+| `origin_url`                   | String  | Yes      | Full URL of publisher origin server                                                  |
+| `origin_host_header_override`  | String  | No       | Outbound Host header to send while connecting to `origin_url`                        |
+| `proxy_secret`                 | String  | Yes      | Secret-store key name for the proxy URL secret                                       |
+| `max_buffered_body_bytes`      | Integer | No       | Buffered-body cap / Fastly stream raw+decoded byte ceiling (default 16 MiB)          |
+| `allow_async_html_finish`      | Boolean | No       | Explicit permission for async HTML EOF work and its delivery cost (default false)    |
+| `html_finalization_timeout_ms` | Integer | No       | Shared optional EOF budget after decoder/parser EOF (default 5000 ms; range 1–60000) |
 
 > **Note:** EC cookies (`ts-ec`) derive their domain automatically as `.{domain}` and
 > do not use `cookie_domain`. The `cookie_domain` field is used by other cookie helpers.
@@ -342,6 +344,8 @@ TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://origin.publisher.com
 TRUSTED_SERVER__PUBLISHER__ORIGIN_HOST_HEADER_OVERRIDE=www.publisher.com
 TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=publisher_proxy_secret
 TRUSTED_SERVER__PUBLISHER__MAX_BUFFERED_BODY_BYTES=16777216
+TRUSTED_SERVER__PUBLISHER__ALLOW_ASYNC_HTML_FINISH=false
+TRUSTED_SERVER__PUBLISHER__HTML_FINALIZATION_TIMEOUT_MS=5000
 ```
 
 ### Field Details
@@ -437,11 +441,51 @@ intentionally, and never put it in the TOML file or pushed app-config blob.
 Changing `proxy_secret` invalidates all existing signed URLs. Plan rotations carefully and use graceful transition periods.
 :::
 
+#### `allow_async_html_finish`
+
+Explicit permission for integrations declaring asynchronous HTML processor completion.
+Defaults to `false`. An enabled integration requiring EOF I/O without permission is
+rejected with a configuration error; its requested work is not silently skipped.
+Permission alone does not change processing when no async factories are registered.
+
+Non-retaining processors can release ready HTML before EOF I/O on Fastly. A factory
+requesting output retention delays initial delivery until EOF or overflow. Axum,
+Workers and Spin currently buffer publisher responses, so enabled EOF I/O can add to
+TTFB there even without stage retention. Enable only when accepting that delivery cost.
+
+::: warning Template caching is disabled
+Once an integration requiring async completion is enabled, processed HTML bypasses
+shared-template caching for every page, including pages where the stage leaves the
+output unchanged. Responses use `Cache-Control: no-store, private`. Caching
+document-deterministic async output is tracked in
+[#1397](https://github.com/IABTechLab/trusted-server/issues/1397).
+:::
+
+#### `html_finalization_timeout_ms`
+
+Shared budget for optional asynchronous processor EOF work in milliseconds. The default
+is `5000`; accepted values are `1` through `60000`. It begins after decoder/parser EOF
+and does not change the auction deadline. The initial 5-second default follows the
+issue example; 60 seconds is a configuration ceiling, not a recommended delivery
+latency or a measured optimum. Timer expiry skips later optional I/O while
+still completing downstream synchronous EOF. Timeout retains the current un-emitted
+stage output; it cannot undo bytes already delivered or remote side effects.
+
+The setting is inert without async processors. Axum, Workers and Spin can cancel
+yielding callbacks. Fastly consumers must independently bound blocking host calls.
+Opted-in processed HTML bypasses shared-template caching and uses private/no-store
+policy; raw-origin readthrough remains separate. Opted-in HTML with 206 or any
+`Content-Range` bypasses rewriting and EOF work while preserving encoded bytes and
+range/framing metadata. Full error HTML remains eligible and exposes actual status.
+See [Asynchronous HTML processor completion](/guide/integration-guide#asynchronous-html-processor-completion).
+
 #### `max_buffered_body_bytes`
 
-**Purpose**: Upper bound on how much of a publisher origin body the rewrite
-pipeline holds in memory — the post-rewrite output buffer on buffered adapters,
-and the per-stream raw/decoded byte ceiling on the Fastly streaming path.
+**Purpose**: Limit individual publisher buffers and per-stream raw/decoded byte
+totals. This is not an aggregate request-memory budget. Async retention collectors,
+replacement candidates, auction suffixes, codec state and adapter response buffers
+can coexist; total memory may exceed this setting. Integration-owned allocations
+are outside the framework's bound.
 
 **Usage**:
 

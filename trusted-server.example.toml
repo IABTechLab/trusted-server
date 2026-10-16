@@ -67,6 +67,11 @@ proxy_secret = "publisher_proxy_secret"
 # rewriting/injection) instead of streamed. Default 16 MiB; larger responses
 # return 502. Raise for deployments serving very large publisher pages.
 # max_buffered_body_bytes = 16777216  # 16 MiB
+# Explicit permission for integration EOF I/O that can delay HTML delivery.
+# Defaults to false; enabled async processors require true.
+# allow_async_html_finish = false
+# Optional asynchronous HTML processors share this budget after decoder/parser EOF.
+# html_finalization_timeout_ms = 5000  # Valid range: 1..60000 ms
 
 
 # -----------------------------------------------------------------------------
