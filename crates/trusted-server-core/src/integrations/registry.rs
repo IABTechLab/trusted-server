@@ -3201,7 +3201,7 @@ pub(crate) mod test_support {
         /// The marker the preparing middleware writes after
         /// [`prepared_marker`], saying what its preparation could read of the
         /// reader.
-        pub(crate) fn reader_marker(seen: &str) -> String {
+        pub(crate) fn prepared_reader_marker(seen: &str) -> String {
             format!("<meta name=\"middleware-fixture-reader\" content=\"{seen}\">")
         }
 
@@ -3288,7 +3288,7 @@ pub(crate) mod test_support {
             ) -> Option<Preparation<'a>> {
                 Some(Box::pin(async move {
                     let marker = prepared_marker(call.module(), context.request_host)
-                        + &reader_marker(&reader_seen(&call));
+                        + &prepared_reader_marker(&reader_seen(&call));
                     Ok(Box::new(marker) as Box<dyn std::any::Any + Send>)
                 }))
             }
