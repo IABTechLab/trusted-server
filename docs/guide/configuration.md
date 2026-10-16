@@ -2775,7 +2775,8 @@ A format may name the viewport widths at which the page asks for it, so a slot
 asks for a large size only where the page has room for one. `min_viewport_width`
 is the narrowest viewport, in CSS pixels, and `max_viewport_width` the widest.
 Either may be left out, meaning no bound on that side, and `min_viewport_width`
-may not exceed `max_viewport_width`.
+may not exceed `max_viewport_width`. Where no format fits the viewport, the slot
+is not defined, so its container keeps the space the page's own style gives it.
 
 ```toml
 [[creative_opportunities.slot]]
