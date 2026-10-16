@@ -2187,10 +2187,11 @@ export function installTsRenderBridge(): void {
     const attemptId = safelyRecordCreativeRequest(slotId);
 
     const slot = window.tsjs?.adSlots?.find((s) => s.id === slotId);
-    // Prefer the winning creative's own dimensions; the first configured slot
-    // format is only a fallback and mis-sizes a multi-size slot whose winner is
-    // not the first format.
-    const [fallbackWidth, fallbackHeight] = slot?.formats?.[0] ?? [728, 90];
+    // Prefer the winning creative's own dimensions. Without them, use the first
+    // size of the slot's viewport band at this width, then the first configured
+    // format, which mis-sizes a multi-size slot whose winner is another format.
+    const [fallbackWidth, fallbackHeight] = viewportBandSizes(slot)?.[0] ??
+      slot?.formats?.[0] ?? [728, 90];
     const width = matchedBid.w ?? fallbackWidth;
     const height = matchedBid.h ?? fallbackHeight;
     const inlineAdm = isNonEmptyString(matchedBid.adm) ? matchedBid.adm : undefined;

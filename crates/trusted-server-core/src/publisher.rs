@@ -6467,9 +6467,10 @@ pub(crate) fn build_bid_map_with_auction_id(
                         serde_json::Value::String(auction_id.to_owned()),
                     );
                 }
-                // Winning creative dimensions — the bridge sizes the inline
-                // render from these, falling back to the first configured slot
-                // format only when absent, which mis-sizes a multi-size slot.
+                // Winning creative dimensions. The bridge sizes the inline
+                // render from these. When they are absent it falls back to the
+                // first size of the slot's viewport band, then to the first
+                // configured format, which mis-sizes a multi-size slot.
                 // Omit a zero dimension (missing OpenRTB w/h parse to 0) so the
                 // bridge falls back rather than sizing the frame to 0.
                 if bid.width > 0 {

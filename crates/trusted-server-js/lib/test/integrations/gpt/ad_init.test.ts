@@ -5262,6 +5262,68 @@ describe('installTsRenderBridge', () => {
     }
   });
 
+  it('sizes a winning bid that carries no size from the viewport band', async () => {
+    const originalInnerWidth = window.innerWidth;
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 375 });
+    const beaconSpy = vi.spyOn(navigator, 'sendBeacon').mockReturnValue(true);
+    (window as TestWindow).tsjs = {
+      bids: {
+        homepage_header: {
+          hb_adid: 'sizeless-adid',
+          hb_bidder: 'ix',
+          hb_pb: '1.00',
+          adm: '<div>Sizeless</div>',
+        },
+      },
+      adSlots: [
+        {
+          id: 'homepage_header',
+          formats: [
+            [970, 250],
+            [320, 50],
+          ] as [number, number][],
+          viewport_sizes: [
+            [[1040, 0], [[970, 250]]],
+            [[0, 0], [[320, 50]]],
+          ],
+          gam_unit_path: '/a/b/c',
+          div_id: 'div-header',
+          targeting: {},
+        },
+      ],
+      divToSlotId: { 'div-header': 'homepage_header' },
+    };
+
+    const bridgeListener = await captureBridgeListener();
+    const portMessages: string[] = [];
+    const source = createTrustedSlotIframe();
+
+    try {
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: 'sizeless-adid' }),
+          ports: [{ postMessage: (s: string) => portMessages.push(s) }],
+          source,
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent
+      );
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+
+      expect(portMessages).toHaveLength(1);
+
+      // A 375 pixel viewport is in the band that asks for 320x50, so the first
+      // configured format, 970x250, would not fit.
+      const parsed = JSON.parse(portMessages[0]) as PrebidResponseMessage;
+      expect([parsed.width, parsed.height]).toEqual([320, 50]);
+    } finally {
+      beaconSpy.mockRestore();
+      Object.defineProperty(window, 'innerWidth', {
+        configurable: true,
+        value: originalInnerWidth,
+      });
+    }
+  });
+
   it('resolves the requesting slot bid when two slots share one hb_adid', async () => {
     // Duplicate hb_adid across slots: PBS Cache is absent, so hb_adid falls back
     // to a creative id that a bidder reuses across slots. The bridge must resolve
