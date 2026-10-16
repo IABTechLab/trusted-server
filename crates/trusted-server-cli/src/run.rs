@@ -72,7 +72,7 @@ enum ConfigCommand {
     /// Reclaim orphaned chunk entries leaked from prior oversized pushes.
     Gc(ConfigGcArgs),
     /// Push `trusted-server.toml` as a blob envelope through `EdgeZero`, or
-    /// under a Fastly `--key` of its own with `--local`.
+    /// under a Fastly `--key` of its own.
     Push(ConfigPushArgs),
     /// Validate `edgezero.toml` and the typed Trusted Server config.
     Validate(ConfigValidateArgs),

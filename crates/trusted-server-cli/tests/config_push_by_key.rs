@@ -305,21 +305,26 @@ fn a_key_whose_chunk_keys_are_too_long_is_refused_before_writing() {
 }
 
 #[test]
-fn a_remote_push_of_a_host_key_is_refused_without_local() {
+fn a_remote_dry_run_names_the_live_store_and_writes_nothing() {
     let project = project();
     let before = fs::read_to_string(fastly_toml(&project)).expect("should read the manifest");
 
-    let output = push(&project, &["--key", HOST]);
+    // The runner's environment is cleared, so no `fastly` CLI can be found
+    // and a dry run that asked it anything would fail.
+    let output = push(&project, &["--key", HOST, "--dry-run"]);
 
-    assert!(!output.status.success(), "the push should be refused");
+    assert_success(&output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("only with `--local`"),
-        "should say the key can be pushed only with --local: {}",
-        String::from_utf8_lossy(&output.stderr)
+        stdout.contains(&format!("would write `{HOST}` ("))
+            && stdout.contains(&format!(
+                "the Fastly config store `{DEFAULT_CONFIG_STORE_ID}`"
+            )),
+        "should list the key for the store the selector names: {stdout}"
     );
     assert_eq!(
         fs::read_to_string(fastly_toml(&project)).expect("should read the manifest"),
         before,
-        "a refused push should write nothing"
+        "a push without --local should not write the local store"
     );
 }

@@ -6,8 +6,11 @@
 //! validates the blob as `ts config validate` does, wraps it in `EdgeZero`'s
 //! envelope and splits a long one into `EdgeZero`'s chunk format, so the
 //! runtime reads it as it reads any pushed blob. `EdgeZero` keeps that format
-//! private to its crate, so the constants below copy it. The writer writes
-//! only the local server's store, in the `fastly.toml` the manifest names.
+//! private to its crate, so the constants below copy it. With `--local` the
+//! writer writes the local server's store, in the `fastly.toml` the manifest
+//! names. Otherwise it writes the live store that
+//! `EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME` selects, through
+//! the `fastly` CLI, as `ts keys` writes signing keys.
 
 use std::fs;
 use std::io::Write;
@@ -16,6 +19,7 @@ use std::path::{Path, PathBuf};
 use edgezero_cli::args::{ConfigPushArgs, ConfigValidateArgs};
 use edgezero_core::app_config::{self, AppConfigLoadOptions};
 use edgezero_core::blob_envelope::BlobEnvelope;
+use edgezero_core::env_config::EnvConfig;
 use edgezero_core::manifest::{Manifest, ManifestLoader};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
@@ -24,6 +28,7 @@ use trusted_server_core::config::TrustedServerAppConfig;
 use trusted_server_core::config_payload::DEFAULT_CONFIG_STORE_ID;
 
 use crate::app_config::resolve_app_config_path;
+use crate::fastly_cli::{self, FastlyProcess, FastlyRunner};
 
 /// The adapter whose keys this writer writes.
 const ADAPTER: &str = "fastly";
@@ -77,24 +82,19 @@ pub(crate) fn own_key(args: &ConfigPushArgs) -> Option<&str> {
         .filter(|key| *key != DEFAULT_CONFIG_STORE_ID)
 }
 
-/// Pushes the blob `args` names under `key`, into the local server's store.
+/// Pushes the blob `args` names under `key`, into the local server's store
+/// with `--local` and into the live store otherwise.
 ///
 /// Every key is checked before anything is written, and a long blob's
-/// chunks are written before the pointer to them. `--dry-run` lists the keys
-/// and writes nothing.
+/// chunks are written before the pointer to them. `--dry-run` lists the keys,
+/// writes nothing and asks the `fastly` CLI nothing.
 ///
 /// # Errors
 ///
-/// Returns a message when the push is not `--local`, the blob fails
-/// validation, a key is refused, or the local manifest cannot be read or
-/// written.
+/// Returns a message when the blob fails validation, a key is refused, the
+/// local manifest cannot be read or written, or the live store cannot be
+/// found or written.
 pub(crate) fn run(args: &ConfigPushArgs, key: &str, out: &mut dyn Write) -> Result<(), String> {
-    if !args.local {
-        return Err(format!(
-            "`--key {key}` can be pushed only with `--local` on Fastly. Write a live \
-             store's entries with `fastly config-store-entry update`."
-        ));
-    }
     let loader = ManifestLoader::from_path(&args.manifest)
         .map_err(|error| format!("failed to load {}: {error}", args.manifest.display()))?;
     let manifest = loader.manifest();
@@ -102,19 +102,31 @@ pub(crate) fn run(args: &ConfigPushArgs, key: &str, out: &mut dyn Write) -> Resu
     let envelope_json = serde_json::to_string(&envelope)
         .map_err(|error| format!("failed to serialize the envelope: {error}"))?;
     let entries = entries(key, &envelope_json, &envelope.sha256)?;
-    let fastly_toml = local_manifest(&args.manifest, manifest)?;
+
+    let destination = if args.local {
+        let fastly_toml = local_manifest(&args.manifest, manifest)?;
+        if !args.dry_run {
+            write_local(&fastly_toml, &entries)?;
+        }
+        format!(
+            "[local_server.config_stores.{DEFAULT_CONFIG_STORE_ID}.contents] in {}",
+            fastly_toml.display()
+        )
+    } else {
+        let store = remote_store_name(&EnvConfig::from_env())?;
+        if !args.dry_run {
+            let runner = FastlyProcess::from_environment()?;
+            write_remote(&runner, &store, &entries)?;
+        }
+        format!("the Fastly config store `{store}`")
+    };
 
     let verb = if args.dry_run { "would write" } else { "wrote" };
-    if !args.dry_run {
-        write_local(&fastly_toml, &entries)?;
-    }
     for (entry_key, value) in &entries {
         writeln!(
             out,
-            "{verb} `{entry_key}` ({} bytes) to \
-             [local_server.config_stores.{DEFAULT_CONFIG_STORE_ID}.contents] in {}",
-            value.len(),
-            fastly_toml.display()
+            "{verb} `{entry_key}` ({} bytes) to {destination}",
+            value.len()
         )
         .map_err(|error| format!("failed to write command output: {error}"))?;
     }
@@ -246,6 +258,89 @@ fn sha256_hex(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))
 }
 
+/// The live store a push without `--local` writes, being the one
+/// `EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME` selects, or the
+/// store named by the logical store ID when that is unset, as a deploy links
+/// it.
+///
+/// # Errors
+///
+/// Returns `EdgeZero`'s message when the selector is set but blank or holds
+/// a control character.
+fn remote_store_name(env: &EnvConfig) -> Result<String, String> {
+    env.store_name_checked("config", DEFAULT_CONFIG_STORE_ID)
+}
+
+/// Writes `entries` in order to the live config store named `store`, through
+/// the `fastly` CLI, and returns the store's id.
+///
+/// `fastly` writes an entry by store id, so the id is found by the store's
+/// name first. Each value reaches `fastly` on its standard input. A failed
+/// write stops the push, and its message leaves out what `fastly` printed,
+/// because that can quote the value.
+///
+/// # Errors
+///
+/// Returns a message when the stores cannot be listed, no store or more than
+/// one carries the name, or a write fails.
+fn write_remote(
+    runner: &dyn FastlyRunner,
+    store: &str,
+    entries: &[(String, String)],
+) -> Result<String, String> {
+    let listing = runner.run(
+        &fastly_cli::args(&["config-store", "list", "--json", "--non-interactive"]),
+        None,
+    )?;
+    let store_id = store_id_by_name(&listing, store)?;
+    for (written, (key, value)) in entries.iter().enumerate() {
+        let arguments = [
+            "config-store-entry".to_owned(),
+            "update".to_owned(),
+            format!("--store-id={store_id}"),
+            format!("--key={key}"),
+            "--stdin".to_owned(),
+            "--upsert".to_owned(),
+            "--non-interactive".to_owned(),
+        ];
+        runner.run(&arguments, Some(value)).map_err(|_error| {
+            format!(
+                "`fastly config-store-entry update` failed for `{key}` after {written} of {} \
+                 entries were written to the config store `{store}`. What `fastly` printed is \
+                 left out, because it can quote the value.",
+                entries.len()
+            )
+        })?;
+    }
+    Ok(store_id)
+}
+
+/// The id of the one store named `name` in what `fastly config-store list
+/// --json` printed, a bare list or an `items` envelope, as `EdgeZero` reads
+/// it.
+fn store_id_by_name(listing: &str, name: &str) -> Result<String, String> {
+    let parsed: serde_json::Value = serde_json::from_str(listing).map_err(|error| {
+        format!("`fastly config-store list --json` did not answer JSON: {error}")
+    })?;
+    let stores = parsed
+        .as_array()
+        .or_else(|| parsed.get("items").and_then(serde_json::Value::as_array))
+        .ok_or_else(|| "`fastly config-store list --json` did not answer a list".to_owned())?;
+    let ids: Vec<&str> = stores
+        .iter()
+        .filter(|store| store.get("name").and_then(serde_json::Value::as_str) == Some(name))
+        .filter_map(|store| store.get("id").and_then(serde_json::Value::as_str))
+        .collect();
+    match ids.as_slice() {
+        [id] => Ok((*id).to_owned()),
+        [] => Err(format!("no Fastly config store is named `{name}`")),
+        _ => Err(format!(
+            "{} Fastly config stores are named `{name}`, so the push cannot tell which to write",
+            ids.len()
+        )),
+    }
+}
+
 /// The `fastly.toml` the manifest names for the Fastly adapter, beside the
 /// manifest.
 fn local_manifest(manifest_path: &Path, manifest: &Manifest) -> Result<PathBuf, String> {
@@ -316,7 +411,110 @@ fn local_contents(document: &mut DocumentMut) -> Option<&mut Table> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+
+    /// Plays the `fastly` CLI for one store listing and the entry writes,
+    /// recording each invocation with what it was handed on its standard
+    /// input.
+    struct RecordingFastly {
+        listing: &'static str,
+        calls: Mutex<Vec<(Vec<String>, Option<String>)>>,
+    }
+
+    impl FastlyRunner for RecordingFastly {
+        fn run(&self, args: &[String], stdin: Option<&str>) -> Result<String, String> {
+            self.calls
+                .lock()
+                .expect("should lock")
+                .push((args.to_vec(), stdin.map(str::to_owned)));
+            match (args[0].as_str(), args[1].as_str()) {
+                ("config-store", "list") => Ok(self.listing.to_owned()),
+                ("config-store-entry", "update") => Ok(String::new()),
+                _ => Err(format!("unexpected fastly {args:?}")),
+            }
+        }
+    }
+
+    #[test]
+    fn a_remote_push_writes_chunks_then_the_pointer() {
+        let envelope_json = format!("x{}", "y".repeat(2 * ENTRY_LIMIT));
+        let written = entries("a.example", &envelope_json, "data-sha").expect("should split");
+        let store = remote_store_name(&EnvConfig::from_vars([(
+            "EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME",
+            "publisher_config",
+        )]))
+        .expect("should read the store selector");
+        let fastly = RecordingFastly {
+            listing: r#"[{"id":"logical-id","name":"trusted_server_config"},{"id":"publisher-id","name":"publisher_config"}]"#,
+            calls: Mutex::default(),
+        };
+
+        let store_id = write_remote(&fastly, &store, &written).expect("should write every entry");
+
+        assert_eq!(
+            store_id, "publisher-id",
+            "should write the store the selector names"
+        );
+        let calls = fastly.calls.into_inner().expect("should unlock");
+        assert_eq!(calls[0].0[0], "config-store", "should find the store first");
+        assert_eq!(calls[0].0[1], "list", "should find the store by its name");
+        assert!(written.len() > 2, "the blob should be written as chunks");
+        assert_eq!(
+            written.last().map(|(key, _)| key.as_str()),
+            Some("a.example"),
+            "the pointer should be the last entry"
+        );
+        assert_eq!(
+            calls.len(),
+            written.len() + 1,
+            "should write each entry once"
+        );
+        for ((arguments, stdin), (key, value)) in calls[1..].iter().zip(&written) {
+            assert_eq!(arguments[0], "config-store-entry", "should write an entry");
+            assert_eq!(arguments[1], "update", "should write an entry");
+            assert!(
+                arguments.contains(&"--store-id=publisher-id".to_owned()),
+                "should write `{key}` to the selected store: {arguments:?}"
+            );
+            assert!(
+                arguments.contains(&format!("--key={key}")),
+                "should write `{key}` in its place: {arguments:?}"
+            );
+            assert_eq!(
+                stdin.as_deref(),
+                Some(value.as_str()),
+                "should hand `{key}`'s value on standard input"
+            );
+        }
+    }
+
+    #[test]
+    fn a_remote_push_without_a_selector_writes_the_store_named_by_the_logical_id() {
+        assert_eq!(
+            remote_store_name(&EnvConfig::default()).expect("should need no selector"),
+            DEFAULT_CONFIG_STORE_ID
+        );
+    }
+
+    #[test]
+    fn a_remote_push_refuses_a_store_name_that_is_absent_or_ambiguous() {
+        let listing = r#"{"items":[{"id":"a","name":"twice"},{"id":"b","name":"twice"},{"id":"c","name":"once"}]}"#;
+
+        assert_eq!(
+            store_id_by_name(listing, "once").expect("should find one store"),
+            "c"
+        );
+        assert!(
+            store_id_by_name(listing, "twice").is_err(),
+            "should refuse a name two stores carry"
+        );
+        assert!(
+            store_id_by_name(listing, "none").is_err(),
+            "should refuse a name no store carries"
+        );
+    }
 
     #[test]
     fn a_long_envelope_is_split_at_character_boundaries_with_the_pointer_last() {
