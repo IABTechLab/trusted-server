@@ -508,6 +508,15 @@ pub trait Middleware: Send + Sync {
         false
     }
 
+    /// Whether this middleware needs the origin's whole body. Where an entry
+    /// names it for a request's path, core asks the origin without the
+    /// reader's conditional and range headers, as it does for a page the ad
+    /// stack answers, because a `304` carries no body and a `206` only part of
+    /// one. `false` by default.
+    fn needs_whole_body(&self) -> bool {
+        false
+    }
+
     /// The phases an entry may name this middleware in.
     fn phases(&self) -> &[MiddlewarePhase];
 
@@ -556,11 +565,16 @@ impl PhaseEntry {
     /// `path`.
     #[must_use]
     pub fn covers(&self, media_type: &str, path: &str) -> bool {
-        self.media_type == media_type
-            && self
-                .path
-                .as_deref()
-                .is_none_or(|prefix| path.starts_with(prefix))
+        self.media_type == media_type && self.covers_path(path)
+    }
+
+    /// Whether the entry covers a request for `path`, whatever the media type
+    /// of the response.
+    #[must_use]
+    pub fn covers_path(&self, path: &str) -> bool {
+        self.path
+            .as_deref()
+            .is_none_or(|prefix| path.starts_with(prefix))
     }
 }
 

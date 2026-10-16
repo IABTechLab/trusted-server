@@ -87,6 +87,12 @@ impl Middleware for RobotsTxt {
         true
     }
 
+    // The origin is asked for its whole file, so a crawler's validators or
+    // range never bring a `304` or a `206` in place of the file.
+    fn needs_whole_body(&self) -> bool {
+        true
+    }
+
     fn phases(&self) -> &[MiddlewarePhase] {
         &MiddlewarePhase::ALL
     }

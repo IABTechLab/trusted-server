@@ -5281,10 +5281,13 @@ pub async fn handle_publisher_request(
     // a panic-prone invariant in the public request handler.
     let reader_compression = reader_compression.unwrap_or(Compression::None);
 
-    if should_run_ad_stack || personalization_requires_full_body {
-        // HTML document contexts whose output may be synthesized must not
-        // receive a cached 304 or partial 206. Non-document subresources contain
-        // no executable injected tag, so retain their validators and ranges.
+    let middleware_needs_whole_body =
+        integration_registry.middleware_needs_whole_body(settings, &request_path);
+    if should_run_ad_stack || personalization_requires_full_body || middleware_needs_whole_body {
+        // HTML document contexts whose output may be synthesized, and a
+        // middleware that needs the whole body, must not receive a cached 304
+        // or partial 206. Other non-document subresources contain no executable
+        // injected tag, so retain their validators and ranges.
         strip_conditional_and_range_headers(&mut req);
     }
 
@@ -21736,6 +21739,8 @@ mod tests {
         services: crate::platform::RuntimeServices,
         orchestrator: AuctionOrchestrator,
         response: PublisherResponse,
+        /// The origin, which keeps what it was asked.
+        origin: Arc<StubHttpClient>,
     }
 
     /// A request through the publisher path, the origin answering `status`.
@@ -21847,6 +21852,7 @@ mod tests {
             services,
             orchestrator,
             response,
+            origin: stub,
         }
     }
 
@@ -22131,6 +22137,61 @@ mod tests {
             "User-agent: *\nAllow: /ads.txt\nDisallow: /\n",
             "the file's path with a query is the file"
         );
+    }
+
+    /// A reader's validators and range, as a crawler revalidating its copy
+    /// sends them.
+    const VALIDATORS_AND_RANGE: [(&str, &str); 4] = [
+        ("if-none-match", "\"origin-etag\""),
+        ("if-modified-since", "Wed, 21 Oct 2015 07:28:00 GMT"),
+        ("range", "bytes=0-9"),
+        ("if-range", "\"origin-etag\""),
+    ];
+
+    /// The names of the headers the origin is asked with, for a `GET` of
+    /// `path` carrying [`VALIDATORS_AND_RANGE`], under settings refusing every
+    /// crawler.
+    async fn headers_the_origin_is_asked_with(path: &str) -> Vec<String> {
+        let proxied = proxy_answered(
+            settings_refusing_every_crawler(),
+            publisher_request(Method::GET, path, &VALIDATORS_AND_RANGE),
+            200,
+            b"User-agent: *\nAllow: /\n",
+            vec![("content-type", "text/plain")],
+        )
+        .await;
+        proxied
+            .origin
+            .recorded_request_headers()
+            .concat()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    /// The robots.txt middleware needs the origin's whole file, so the origin
+    /// is asked for it without the reader's validators and range, as for a
+    /// page the ad stack answers. A path no such middleware works on, the
+    /// longer path the entry covers among them, keeps them.
+    #[tokio::test]
+    async fn the_origin_is_asked_for_the_whole_robots_txt() {
+        let asked = headers_the_origin_is_asked_with(crate::robots_txt::ROBOTS_TXT_PATH).await;
+        for (name, _) in VALIDATORS_AND_RANGE {
+            assert!(
+                !asked.iter().any(|header| header == name),
+                "{name} should not reach the origin: {asked:?}"
+            );
+        }
+
+        for path in ["/humans.txt", "/robots.txt.bak"] {
+            let asked = headers_the_origin_is_asked_with(path).await;
+            for (name, _) in VALIDATORS_AND_RANGE {
+                assert!(
+                    asked.iter().any(|header| header == name),
+                    "{name} should reach the origin for {path}: {asked:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
