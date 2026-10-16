@@ -762,12 +762,16 @@ describe('installTsAdInit', () => {
       // that was never displayed).
       expect(nativeRefresh).not.toHaveBeenCalled();
 
+      // The refresh auction narrows only a slot recorded as carrying the mapping.
+      const mapped = (window as TestWindow).tsjs!.viewportMappedSlots?.has(mockSlot) ?? false;
       if (bands) {
         expect(builder.addSize.mock.calls).toEqual(bands);
         expect(mockSlot.defineSizeMapping).toHaveBeenCalledWith('built mapping');
+        expect(mapped).toBe(true);
       } else {
         expect(sizeMapping).not.toHaveBeenCalled();
         expect(mockSlot.defineSizeMapping).not.toHaveBeenCalled();
+        expect(mapped).toBe(false);
       }
     }
   );

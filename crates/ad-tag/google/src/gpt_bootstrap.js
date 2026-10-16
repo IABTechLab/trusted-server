@@ -371,7 +371,8 @@
     return band ? band[1] : [];
   }
 
-  // Defines the slot and applies its viewport bands as a size mapping. Defines
+  // Defines the slot and applies its viewport bands as a size mapping, recording
+  // the slot in ts.viewportMappedSlots once the mapping is applied. Defines
   // nothing where the band at the current viewport width asks for no size, as
   // no ad can serve there and GPT would otherwise size or collapse the slot's
   // container after the page has painted.
@@ -403,6 +404,8 @@
         builder.addSize(band[0], band[1]);
       });
       definedSlot.defineSizeMapping(builder.build());
+      ts.viewportMappedSlots = ts.viewportMappedSlots || new WeakSet();
+      ts.viewportMappedSlots.add(definedSlot);
     }
     return definedSlot;
   }

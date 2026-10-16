@@ -857,13 +857,17 @@ function displayTargetElementId(target: GoogleTagDisplayTarget): string | undefi
 }
 
 /**
- * Defines the slot and applies its viewport bands as a size mapping.
+ * Defines the slot and applies its viewport bands as a size mapping, recording
+ * the slot in `viewportMappedSlots` once the mapping is applied.
  *
  * Defines nothing where the band at the current viewport width asks for no
  * size, as no ad can serve there and GPT would otherwise size or collapse the
  * slot's container after the page has painted.
  */
-function defineWithViewportSizes<S extends { defineSizeMapping?(mapping: unknown): unknown }>(
+function defineWithViewportSizes<
+  S extends object & { defineSizeMapping?(mapping: unknown): unknown },
+>(
+  ts: TsjsApi,
   api: {
     defineSlot?(adUnitPath: string, size: Array<number | number[]>, elementId?: string): S | null;
     sizeMapping?(): ViewportSizeBuilder;
@@ -883,6 +887,7 @@ function defineWithViewportSizes<S extends { defineSizeMapping?(mapping: unknown
       builder.addSize(viewport, sizes);
     }
     definedSlot.defineSizeMapping(builder.build());
+    (ts.viewportMappedSlots ??= new WeakSet()).add(definedSlot);
   }
   return definedSlot;
 }
@@ -1194,7 +1199,7 @@ function schedulePublisherFirstImpressionFallback(
       let tsOwned = false;
       if (!gptSlot) {
         gptSlot =
-          withGptSlotHandoffInternal(ts, () => defineWithViewportSizes(g, slot, element.id)) ??
+          withGptSlotHandoffInternal(ts, () => defineWithViewportSizes(ts, g, slot, element.id)) ??
           undefined;
         if (!gptSlot) {
           releaseTrustedServerFirstImpressionClaim(ts, element, claim);
@@ -1390,7 +1395,7 @@ export function installTsAdInit(): void {
           // defineSlot() for this div is handed the same slot by the scoped GPT
           // wrapper, preventing a competing container-slot request.
           const defined = withGptSlotHandoffInternal(ts, () =>
-            defineWithViewportSizes(g, slot, actualDivId)
+            defineWithViewportSizes(ts, g, slot, actualDivId)
           );
           if (!defined) {
             releaseTrustedServerFirstImpressionClaim(ts, el, firstImpression);
