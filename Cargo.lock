@@ -6770,6 +6770,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "trusted-server-core",
+ "trusted-server-permission-signal-mtm",
  "url",
  "validator",
  "web-time",
