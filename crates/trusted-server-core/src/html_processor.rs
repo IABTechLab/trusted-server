@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use lol_html::{
     EndTagHandler, Settings as RewriterSettings, element, end,
-    html_content::{ContentType, EndTag, TextChunk},
+    html_content::{ContentType, EndTag, TextChunk, TextType},
     text,
 };
 
@@ -25,6 +25,10 @@ use crate::publisher::build_empty_bids_script;
 use crate::settings::Settings;
 use crate::streaming_processor::{HtmlRewriterAdapter, StreamProcessor};
 use crate::tsjs;
+
+mod script_text;
+
+use script_text::ScriptTextGuard;
 
 struct HtmlWithStreamingProcessors {
     inner: Box<dyn StreamProcessor>,
@@ -354,7 +358,10 @@ type ContentHandler = (
 /// The handlers that carry out a plan's element and text handlers.
 ///
 /// The text handlers share `edits` with every text handler registered before
-/// them, so each is handed a chunk as the one before it left it.
+/// them, so each is handed a chunk as the one before it left it. A
+/// [`ScriptTextGuard`] registered after them writes what they left in a
+/// script, so that their text cannot end the script or keep its end tag from
+/// closing it.
 ///
 /// A selector that does not parse panics here, which
 /// [`MiddlewareChain::plan`] rules out by refusing to plan one.
@@ -391,6 +398,7 @@ fn middleware_content_handlers(
             Ok(())
         }));
     }
+    let guarded = !text_handlers.is_empty();
     for mut handler in text_handlers {
         let selector = handler.selector().to_owned();
         let edits = Rc::clone(edits);
@@ -400,6 +408,20 @@ fn middleware_content_handlers(
                 ScriptRewriteAction::Keep => {}
                 ScriptRewriteAction::Replace(rewritten) => edits.replace(text, &rewritten),
                 ScriptRewriteAction::RemoveNode => edits.remove(text),
+            }
+            Ok(())
+        }));
+    }
+    if guarded {
+        let edits = Rc::clone(edits);
+        let mut guard = ScriptTextGuard::default();
+        handlers.push(text!("script", move |text| {
+            if text.text_type() == TextType::ScriptData {
+                let written = edits.current(text);
+                if let Some(safe) = guard.write(&written, text.removed(), text.last_in_text_node())
+                {
+                    edits.replace(text, &safe);
+                }
             }
             Ok(())
         }));
