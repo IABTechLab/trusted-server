@@ -79,7 +79,7 @@ fn macos_versions_decode_nibbles() {
 #[test]
 fn denied_path_scan_reports_offsets() {
     let bytes = b"ok /usr/lib x /home/runner/work y /tmp/abc /tmpfoo";
-    let hits = find_denied_paths(bytes, RUNNER_PATH_PREFIXES);
+    let hits: Vec<_> = find_denied_paths(bytes, RUNNER_PATH_PREFIXES).collect();
     assert_eq!(
         hits,
         vec![
@@ -99,7 +99,8 @@ fn denied_path_scan_reports_offsets() {
             b"serde/src/private/de.rs /rust/deps/x/src/lib.rs",
             RUNNER_PATH_PREFIXES
         )
-        .is_empty(),
+        .next()
+        .is_none(),
         "should not match crate-relative or remapped paths"
     );
     let report = reject_denied_paths(bytes, RUNNER_PATH_PREFIXES)
@@ -107,5 +108,37 @@ fn denied_path_scan_reports_offsets() {
     assert!(
         format!("{report:?}").contains("/home/@0xe"),
         "should report the hit offset: {report:?}"
+    );
+}
+
+#[test]
+fn denied_path_contexts_are_bounded_and_capped_without_weakening_rejection() {
+    let mut bytes = vec![b'x'; 4096];
+    for offset in (128..4096).step_by(128) {
+        bytes[offset..offset + 6].copy_from_slice(b"/tmp/\n");
+    }
+    let report = reject_denied_paths(&bytes, RUNNER_PATH_PREFIXES)
+        .expect_err("should still reject every denied path");
+    let diagnostic = format!("{report:?}");
+    assert!(
+        diagnostic.contains("31 runner-only path occurrence(s)"),
+        "should count all occurrences: {diagnostic}"
+    );
+    assert_eq!(
+        diagnostic.matches("context[").count(),
+        REPORTED_PATH_HITS,
+        "should report at most sixteen contexts"
+    );
+    assert!(
+        diagnostic.contains("context[0x70..0xd0]"),
+        "should bound each context to sixteen bytes before and eighty after the hit"
+    );
+    assert!(
+        diagnostic.contains("/tmp/\\n"),
+        "should escape raw control bytes"
+    );
+    assert!(
+        diagnostic.len() < 10_000,
+        "should bound output even for many hits"
     );
 }

@@ -63,6 +63,12 @@ pub(crate) const RUNNER_PATH_PREFIXES: &[&str] = &[
 
 /// Maximum number of embedded-path offsets reported in a rejection.
 const REPORTED_PATH_HITS: usize = 16;
+/// Source bytes before each denied-path match in diagnostic context.
+const PATH_CONTEXT_BEFORE: usize = 16;
+/// Source bytes from each denied-path match onward in diagnostic context.
+const PATH_CONTEXT_AFTER: usize = 80;
+/// Maximum section-name bytes included in a diagnostic.
+const SECTION_NAME_BYTES: usize = 32;
 
 /// The inspection rule an artifact violated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display)]
@@ -155,18 +161,20 @@ struct PathHit {
 ///
 /// Candidates are found by scanning for `/` only, so the cost is one pass
 /// plus a short comparison per slash rather than one window per prefix.
-fn find_denied_paths(bytes: &[u8], prefixes: &[&'static str]) -> Vec<PathHit> {
+fn find_denied_paths<'a>(
+    bytes: &'a [u8],
+    prefixes: &'a [&'static str],
+) -> impl Iterator<Item = PathHit> + 'a {
     bytes
         .iter()
         .enumerate()
         .filter(|(_, byte)| **byte == b'/')
-        .filter_map(|(offset, _)| {
+        .filter_map(move |(offset, _)| {
             prefixes
                 .iter()
                 .find(|prefix| bytes[offset..].starts_with(prefix.as_bytes()))
                 .map(|prefix| PathHit { prefix, offset })
         })
-        .collect()
 }
 
 /// Rejects `bytes` if they embed any denied path prefix.
@@ -174,24 +182,58 @@ fn find_denied_paths(bytes: &[u8], prefixes: &[&'static str]) -> Vec<PathHit> {
 /// # Errors
 ///
 /// Returns [`Violation::EmbeddedPath`] listing the match count and the first
-/// [`REPORTED_PATH_HITS`] prefix/offset pairs.
+/// [`REPORTED_PATH_HITS`] prefix/offset pairs with bounded escaped context and
+/// the exact artifact identity.
 fn reject_denied_paths(
     bytes: &[u8],
     prefixes: &[&'static str],
 ) -> Result<(), Report<ReleaseError>> {
-    let hits = find_denied_paths(bytes, prefixes);
-    if hits.is_empty() {
+    reject_denied_paths_with_sections(bytes, prefixes, |_| None)
+}
+
+/// Rejects the same denied paths, adding bounded section and byte diagnostics.
+fn reject_denied_paths_with_sections<'a>(
+    bytes: &[u8],
+    prefixes: &[&'static str],
+    section_at: impl Fn(usize) -> Option<&'a [u8]>,
+) -> Result<(), Report<ReleaseError>> {
+    let mut count = 0_usize;
+    let mut shown = Vec::new();
+    for hit in find_denied_paths(bytes, prefixes) {
+        count += 1;
+        if shown.len() == REPORTED_PATH_HITS {
+            continue;
+        }
+        let start = hit.offset.saturating_sub(PATH_CONTEXT_BEFORE);
+        let end = hit
+            .offset
+            .saturating_add(PATH_CONTEXT_AFTER)
+            .min(bytes.len());
+        let context = bytes[start..end].escape_ascii();
+        let section = section_at(hit.offset).map_or_else(
+            || "unknown".to_owned(),
+            |name| {
+                name[..name.len().min(SECTION_NAME_BYTES)]
+                    .escape_ascii()
+                    .to_string()
+            },
+        );
+        shown.push(format!(
+            "{}@{:#x} section=\"{section}\" context[{start:#x}..{end:#x}]=\"{context}\"",
+            hit.prefix, hit.offset,
+        ));
+    }
+    if count == 0 {
         return Ok(());
     }
-    let shown = hits
-        .iter()
-        .take(REPORTED_PATH_HITS)
-        .map(|hit| format!("{}@{:#x}", hit.prefix, hit.offset))
-        .collect::<Vec<_>>()
-        .join(", ");
     Err(rejected(
         Violation::EmbeddedPath,
-        format!("{} runner-only path occurrence(s): {shown}", hits.len()),
+        format!(
+            "artifact sha256={} size={}; {count} runner-only path occurrence(s): {}",
+            sha256_hex(bytes),
+            bytes.len(),
+            shown.join(", "),
+        ),
     ))
 }
 

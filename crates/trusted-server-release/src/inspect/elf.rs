@@ -15,7 +15,8 @@ use object::read::{SectionIndex, StringTable};
 
 use super::{
     ElfDebugSection, ElfFacts, GlibcVersion, REQUIRED_DEBUG_SECTIONS, RUNNER_PATH_PREFIXES,
-    VersionRequirement, Violation, malformed, reject_denied_paths, rejected, sha256_hex, utf8,
+    VersionRequirement, Violation, malformed, reject_denied_paths_with_sections, rejected,
+    sha256_hex, utf8,
 };
 use crate::error::ReleaseError;
 
@@ -112,7 +113,9 @@ pub(crate) fn inspect_elf(
     let version_requirements = version_requirements(endian, bytes, &sections)?;
     let max_glibc = check_versions(&version_requirements, &needed, policy.glibc_maximum)?;
     let debug_sections = debug_sections(endian, bytes, &sections)?;
-    reject_denied_paths(bytes, policy.denied_path_prefixes)?;
+    reject_denied_paths_with_sections(bytes, policy.denied_path_prefixes, |offset| {
+        section_at(endian, &sections, offset)
+    })?;
     Ok(ElfFacts {
         sha256: sha256_hex(bytes),
         interpreter: interpreter.to_owned(),
@@ -120,6 +123,22 @@ pub(crate) fn inspect_elf(
         version_requirements,
         max_glibc,
         debug_sections,
+    })
+}
+
+/// Names the file-backed section containing one denied-path offset.
+fn section_at<'a>(endian: Endianness, sections: &Sections<'a>, offset: usize) -> Option<&'a [u8]> {
+    let offset = u64::try_from(offset).ok()?;
+    sections.iter().find_map(|section| {
+        if section.sh_type(endian) == format::SHT_NOBITS {
+            return None;
+        }
+        let start = section.sh_offset(endian);
+        let end = start.checked_add(section.sh_size(endian))?;
+        (start..end)
+            .contains(&offset)
+            .then(|| sections.section_name(endian, section).ok())
+            .flatten()
     })
 }
 
