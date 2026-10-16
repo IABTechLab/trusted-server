@@ -493,7 +493,8 @@ mod tests {
         let module_context =
             ModuleContext::new(request_view(&method)).with_geo(&geo, PermissionSet::none());
 
-        let written = as_text(&written_for(&module_context));
+        let headers = written_for(&module_context);
+        let written = as_text(&headers);
 
         assert!(
             written
@@ -517,7 +518,8 @@ mod tests {
         let module_context =
             ModuleContext::new(request_view(&method)).with_geo(&geo, PermissionSet::none());
 
-        let written = as_text(&written_for(&module_context));
+        let headers = written_for(&module_context);
+        let written = as_text(&headers);
 
         assert!(
             written.iter().all(|(name, _)| *name != "x-geo-city"),
