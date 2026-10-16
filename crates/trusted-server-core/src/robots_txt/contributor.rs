@@ -60,17 +60,19 @@ pub trait RobotsTxtContributor: Send + Sync + core::fmt::Debug {
 
     /// This contributor's rules.
     ///
-    /// Core holds the answer for the publisher and serves it to every
-    /// crawler. So the call carries the request the answer was asked for,
-    /// being its method, path, host and scheme without its query, and the
-    /// request's services, and nothing about who asked. An implementation
-    /// hands its own function to [`ModuleCall::inject`], naming what it
-    /// needs. Its answer must be the same for every request the publisher
-    /// receives, because it is served for all of them.
+    /// Core holds the answer for the publisher and the host the request was
+    /// addressed to, and serves it to every crawler of that host. So the call
+    /// carries the request the answer was asked for, being its method, path,
+    /// host and scheme without its query, and the request's services with no
+    /// client information and no host signals, and nothing about who asked.
+    /// An implementation hands its own function to [`ModuleCall::inject`],
+    /// naming what it needs. Its answer must be the same for every request
+    /// for that host, because it is served for all of them.
     ///
-    /// A contribution with no groups is an answer, and is served as one. An
-    /// error is a failure, and core serves this contributor's held copy
-    /// instead. With no held copy the whole file fails closed with `503`.
+    /// A contribution with no groups is an answer, and is held as one, but a
+    /// file in which nothing holds a rule fails closed with `503`. An error
+    /// is a failure, and core serves this contributor's held copy instead.
+    /// With no held copy the whole file fails closed with `503`.
     ///
     /// # Errors
     ///

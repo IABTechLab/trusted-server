@@ -147,10 +147,12 @@ field. Any other value answers 400. Without a nonce the evidence carries no
 | 404    | Any other address or method beneath a prefix the deployment owns            | A page pointing to the list at the prefix                                             |
 | 503    | No key in the build has come into force, or the build carries no key at all | `{"error":"No signing key is built in for this time, so no evidence can be signed."}` |
 | 503    | The key in force is not a P-256 private key in SEC1 or PKCS #8 form         | `{"error":"The signing key could not be read, so no evidence can be signed."}`        |
+| 503    | The platform's clock cannot be read                                         | `{"error":"The clock could not be read, so no evidence can be signed."}`              |
 
 The 400 and 503 answers are JSON at both addresses. The tests are
-`a_malformed_nonce_is_refused` and
-`no_usable_key_in_force_answers_service_unavailable`.
+`a_malformed_nonce_is_refused`,
+`no_usable_key_in_force_answers_service_unavailable` and
+`a_clock_that_cannot_be_read_signs_nothing`.
 
 ### What each adapter reports
 
@@ -167,12 +169,12 @@ request and reads no store.
 
 ### `[attestation]` {#attestation-section}
 
-| Field        | Type   | Rule                                                                                                                                                                                                                                                             | Meaning                                                                             |
-| ------------ | ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
-| `endpoint`   | String | An absolute path of two or more segments, 64 characters at most, of lower case letters, digits, `_` and `-`, the first segment starting with `_`, not under a prefix a framework serves its assets from, and not ending `.json`. Defaults to `/_ts/attestation`. | Where the page answers. The JSON is at the same path plus `.json`.                  |
-| `operator`   | String | 1 to 64 characters                                                                                                                                                                                                                                               | Who the evidence says operates the deployment                                       |
-| `context`    | String | 1 to 64 characters with no control characters                                                                                                                                                                                                                    | The text signed ahead of the payload. A verifier must use exactly the same text.    |
-| `verify_url` | String | An `https` address with a host                                                                                                                                                                                                                                   | Where the page sends a reader to check the claim, and the envelope's `verify` field |
+| Field        | Type   | Rule                                                                                                                                                                                                                                                                                       | Meaning                                                                             |
+| ------------ | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------- |
+| `endpoint`   | String | An absolute path of two or more segments, 64 characters at most, of lower case letters, digits, `_` and `-`, the first segment starting with `_`, not under a prefix a framework serves its assets from, not beneath `/_ts/admin`, and not ending `.json`. Defaults to `/_ts/attestation`. | Where the page answers. The JSON is at the same path plus `.json`.                  |
+| `operator`   | String | 1 to 64 characters                                                                                                                                                                                                                                                                         | Who the evidence says operates the deployment                                       |
+| `context`    | String | 1 to 64 characters with no control characters                                                                                                                                                                                                                                              | The text signed ahead of the payload. A verifier must use exactly the same text.    |
+| `verify_url` | String | An `https` address with a host                                                                                                                                                                                                                                                             | Where the page sends a reader to check the claim, and the envelope's `verify` field |
 
 The section refuses any other field, so a document naming a signing key is
 refused, because keys are compiled into the build and never configured. A
@@ -211,6 +213,11 @@ Key ids and keys may hold only letters, digits and `-_.:+/=`, and a line of any
 other shape fails the build. No two lines may share a key id or a start, so a
 key id names one key and the key in force never depends on the order of the
 lines. The test is `a_schedule_repeating_a_key_id_or_a_start_is_refused`.
+
+The build also reads each key the way the signer does, so a key that is not a
+P-256 private key fails the build, however late it starts. The message names
+the line and the key id but never the key. The test is
+`a_schedule_key_that_cannot_sign_is_refused_without_showing_it`.
 
 The key in force is the latest to have started, and it stays in force until the
 next one starts. While the key in force is the last one in the build, the

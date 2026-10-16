@@ -254,6 +254,20 @@ pub fn assemble(config: &RobotsTxtConfig, contributions: &[Contribution]) -> Str
     file
 }
 
+/// Whether `file` holds a rule, being an `Allow` or `Disallow` line in a group
+/// that names a crawler, read as a crawler reads the file. A file with none
+/// reads to a crawler as permission to crawl everything.
+#[must_use]
+pub(crate) fn holds_a_rule(file: &str) -> bool {
+    Contribution::parse(file).groups.iter().any(|group| {
+        group.user_agents.iter().any(|name| !name.is_empty())
+            && group
+                .records
+                .iter()
+                .any(|record| matches!(record, Record::Allow(_) | Record::Disallow(_)))
+    })
+}
+
 /// Every crawler the contributions refuse the whole site to, by the name on
 /// its `User-Agent` line, in order and without repeats. `*` is included, so
 /// the paths stay open to the crawlers no group names. A group with no name
@@ -523,6 +537,29 @@ mod tests {
             assemble(&config(), &[Contribution::default(), allow_all()]),
             "User-Agent: *\nAllow: /\n"
         );
+    }
+
+    /// Only an `Allow` or `Disallow` in a group that names a crawler is a
+    /// rule. Anything else leaves a crawler free to crawl everything.
+    #[test]
+    fn a_file_holds_a_rule_only_when_a_group_allows_or_disallows() {
+        for file in [
+            "\n",
+            "# nothing to add\n\nSitemap: https://publisher.example/sitemap.xml\n",
+            "Disallow: /\n",
+            "User-Agent: *\nCrawl-delay: 10\n",
+            "User-Agent: \nDisallow: /\n",
+        ] {
+            assert!(!holds_a_rule(file), "{file:?} holds no rule");
+        }
+        for file in [
+            "User-Agent: *\nAllow: /\n",
+            "User-Agent: ExampleBot\nDisallow:\n",
+            "# the publisher's own\nUser-agent: *\nDisallow: /private/\n",
+            refusal(&[]).as_str(),
+        ] {
+            assert!(holds_a_rule(file), "{file:?} holds a rule");
+        }
     }
 
     #[test]
