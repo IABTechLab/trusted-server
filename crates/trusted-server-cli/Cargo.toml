@@ -78,6 +78,7 @@ trusted-server-framework-nextjs = { workspace = true }
 trusted-server-headers-geo = { workspace = true }
 trusted-server-identity-lockr = { workspace = true }
 trusted-server-loading-cache-51degrees = { workspace = true }
+trusted-server-shared-aws = { workspace = true }
 trusted-server-tag-google-tag = { workspace = true }
 trusted-server-tag-google-tag-manager = { workspace = true }
 trusted-server-testing-testlight = { workspace = true }

@@ -18,7 +18,7 @@ use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
 
 use crate::integrations::IntegrationBuilder;
-use crate::settings::{AssetOriginAuth, Ec, MODULE_IMPLEMENTATION_KEY, Settings};
+use crate::settings::{Ec, MODULE_IMPLEMENTATION_KEY, Settings};
 
 const DEPLOY_VALIDATION_FIELD: &str = "trusted_server";
 
@@ -272,36 +272,9 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
                 false,
             ),
         ];
-        // An asset route's source and the publisher's take the same signing
-        // table, so each holds the same three key references.
-        let origin_auth_keys = ["access_key_id", "secret_access_key", "session_token"];
-        fields.extend(origin_auth_keys.map(|key| {
-            field(
-                vec![
-                    optional_object("proxy"),
-                    optional_object("asset_routes"),
-                    SecretPathSegment::ArrayEach,
-                    optional_object("source"),
-                    optional_object("origin"),
-                    optional_object("auth"),
-                    object(key),
-                ],
-                true,
-            )
-        }));
-        fields.extend(origin_auth_keys.map(|key| {
-            field(
-                vec![
-                    optional_object("source"),
-                    optional_object("origin"),
-                    optional_object("auth"),
-                    object(key),
-                ],
-                true,
-            )
-        }));
-        // The settings a module declares in its own table, for core's
-        // modules and the ones a tool registered for deploy validation.
+        // The settings a module declares in its own table, and the ones an
+        // origin signer declares in its `auth` table, for core's modules and
+        // the ones a tool registered for deploy validation.
         let builders = crate::integrations::all_builders(deploy_integrations()).collect::<Vec<_>>();
         fields.extend(crate::module_secrets::secret_fields(&builders));
         fields
@@ -547,38 +520,15 @@ fn validate_secret_key_references(
         }
     }
 
-    for (index, route) in settings.proxy.asset_routes.iter().enumerate() {
-        if let Some(auth) = route.origin_source().and_then(|origin| origin.auth) {
-            validate_origin_auth_key_references(
-                &format!("proxy.asset_routes[{index}].source.origin.auth"),
-                &auth,
-            )?;
-        }
-    }
-    if let Some(auth) = settings.origin_source().and_then(|origin| origin.auth) {
-        validate_origin_auth_key_references("source.origin.auth", &auth)?;
-    }
+    // An origin signer's secret settings, and the tables it can use, are
+    // known through the builders that offer the signer, as they are when the
+    // settings load.
+    let builders: Vec<IntegrationBuilder> =
+        crate::integrations::all_builders(extra_integrations).collect();
+    let signers = crate::origin_auth::OriginSigners::offered_by(&builders)?;
+    crate::origin_auth::check_key_references(settings, &signers)?;
+    crate::origin_auth::check_tables(settings, &signers)?;
 
-    Ok(())
-}
-
-/// Refuses an empty secret key reference in an origin auth table at `path`.
-fn validate_origin_auth_key_references(
-    path: &str,
-    auth: &AssetOriginAuth,
-) -> Result<(), Report<TrustedServerError>> {
-    let AssetOriginAuth::S3SigV4(auth) = auth;
-    validate_secret_key_reference(
-        &format!("{path}.access_key_id"),
-        auth.access_key_id.expose(),
-    )?;
-    validate_secret_key_reference(
-        &format!("{path}.secret_access_key"),
-        auth.secret_access_key.expose(),
-    )?;
-    if let Some(token) = &auth.session_token {
-        validate_secret_key_reference(&format!("{path}.session_token"), token.expose())?;
-    }
     Ok(())
 }
 
@@ -614,12 +564,13 @@ mod tests {
     use super::*;
     use crate::integrations::IntegrationRegistration;
     use crate::integrations::js_asset_proxy::JS_ASSET_PROXY_INTEGRATION_ID;
+    use crate::origin_auth::fixture;
     use crate::redacted::Redacted;
-    use crate::settings::{ProxyAssetRoute, S3SigV4AuthConfig, TrustedClientIpConfig};
+    use crate::settings::TrustedClientIpConfig;
     use crate::test_support::template::{template_with_resolved_required_secrets, uncomment_block};
     use crate::test_support::tests::{
         crate_test_settings_str, crate_test_settings_str_with_ec_section, edit_origin,
-        select_hmac_module, set_route_auth,
+        select_hmac_module,
     };
     use edgezero_core::app_config::AppConfigMeta;
     use edgezero_core::blob_envelope::BlobEnvelope;
@@ -1031,21 +982,6 @@ formats = [{ width = 300, height = 250 }]
                 ("ec.partners[*].api_token".to_owned(), true),
                 ("ec.partners[*].ts_pull_token".to_owned(), true),
                 ("trusted_client_ip.shared_secret".to_owned(), false),
-                (
-                    "proxy.asset_routes[*].source.origin.auth.access_key_id".to_owned(),
-                    true
-                ),
-                (
-                    "proxy.asset_routes[*].source.origin.auth.secret_access_key".to_owned(),
-                    true,
-                ),
-                (
-                    "proxy.asset_routes[*].source.origin.auth.session_token".to_owned(),
-                    true
-                ),
-                ("source.origin.auth.access_key_id".to_owned(), true),
-                ("source.origin.auth.secret_access_key".to_owned(), true),
-                ("source.origin.auth.session_token".to_owned(), true),
             ],
             "should expose the native EdgeZero secret metadata contract"
         );
@@ -1073,50 +1009,6 @@ formats = [{ width = 300, height = 250 }]
                 SecretPathSegment::OptionalField(name) if name == "partners"
             ));
         }
-    }
-
-    #[test]
-    fn omitted_s3_secret_references_materialize_as_defaults() {
-        let auth: S3SigV4AuthConfig =
-            toml::from_str("region = \"us-east-1\"").expect("should apply S3 secret defaults");
-
-        assert_eq!(auth.access_key_id.expose(), "access_key_id");
-        assert_eq!(auth.secret_access_key.expose(), "secret_access_key");
-
-        let serialized = serde_json::to_value(auth).expect("should serialize S3 auth");
-        assert_eq!(serialized["access_key_id"], "access_key_id");
-        assert_eq!(serialized["secret_access_key"], "secret_access_key");
-    }
-
-    #[test]
-    fn legacy_static_secret_store_selectors_are_accepted_but_not_serialized() {
-        let mut settings = valid_settings();
-        let mut route = ProxyAssetRoute::new(
-            "/assets/",
-            "https://examplebucket.s3.us-east-1.amazonaws.com",
-        );
-        set_route_auth(
-            &mut route,
-            Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
-                region: "us-east-1".to_string(),
-                secret_store: Some("legacy-s3-store".to_string()),
-                access_key_id: Redacted::new("s3-access-key".to_string()),
-                secret_access_key: Redacted::new("s3-secret-key".to_string()),
-                session_token: None,
-                origin_query: None,
-            })),
-        );
-        settings.proxy.asset_routes.push(route);
-
-        settings
-            .normalize_deserialized()
-            .expect("should normalize settings without key collisions");
-        let serialized = serde_json::to_string(&settings).expect("should serialize settings");
-
-        assert!(
-            !serialized.contains("legacy-s3-store"),
-            "serialized config should omit the deprecated selector"
-        );
     }
 
     #[test]
@@ -1347,36 +1239,27 @@ passphrase = "production-secret-key-32-bytes-min"
         );
     }
 
-    /// Valid settings whose `[source.origin]` signs its requests.
-    fn settings_signing_the_publisher_origin(
-        access_key_id: &str,
-        secret_access_key: &str,
-        session_token: Option<&str>,
-    ) -> Settings {
+    /// Valid settings whose `[source.origin]` signs its requests through the
+    /// fixture signer, naming `key_name` and, when given, `token_name`.
+    fn settings_signing_the_publisher_origin(key_name: &str, token_name: Option<&str>) -> Settings {
         let mut settings = valid_settings();
         edit_origin(&mut settings, |origin| {
-            origin.url = "https://storage.example.com/bucket/site".to_string()
-        });
-        edit_origin(&mut settings, |origin| {
-            origin.auth = Some(AssetOriginAuth::S3SigV4(S3SigV4AuthConfig {
-                region: "test-region-1".to_string(),
-                secret_store: None,
-                access_key_id: Redacted::new(access_key_id.to_string()),
-                secret_access_key: Redacted::new(secret_access_key.to_string()),
-                session_token: session_token.map(|token| Redacted::new(token.to_string())),
-                origin_query: None,
-            }))
+            origin.url = "https://storage.example.com/bucket/site".to_string();
+            let mut auth = fixture::auth("site").with_setting("key_name", key_name);
+            if let Some(token_name) = token_name {
+                auth = auth.with_setting("token_name", token_name);
+            }
+            origin.auth = Some(auth);
         });
         settings
     }
 
     #[test]
     fn deploy_validation_accepts_a_source_origin_auth_naming_its_keys() {
-        validate_settings_for_deploy(&settings_signing_the_publisher_origin(
-            "origin_access_key_id",
-            "origin_secret_access_key",
-            Some("origin_session_token"),
-        ))
+        validate_settings_for_deploy_with(
+            &settings_signing_the_publisher_origin("origin_key", Some("origin_token")),
+            &[fixture::builder()],
+        )
         .expect("should accept an auth whose key references are named");
     }
 
@@ -1384,15 +1267,15 @@ passphrase = "production-secret-key-32-bytes-min"
     fn deploy_validation_refuses_an_empty_source_origin_auth_key_reference() {
         for (settings, path) in [
             (
-                settings_signing_the_publisher_origin(" ", "origin_secret_access_key", None),
-                "source.origin.auth.access_key_id",
+                settings_signing_the_publisher_origin(" ", None),
+                "source.origin.auth.key_name",
             ),
             (
-                settings_signing_the_publisher_origin("origin_access_key_id", "", None),
-                "source.origin.auth.secret_access_key",
+                settings_signing_the_publisher_origin("origin_key", Some("")),
+                "source.origin.auth.token_name",
             ),
         ] {
-            let err = validate_settings_for_deploy(&settings)
+            let err = validate_settings_for_deploy_with(&settings, &[fixture::builder()])
                 .expect_err("should refuse an empty auth key reference");
             assert!(
                 format!("{err:?}").contains(&format!(
@@ -1404,20 +1287,38 @@ passphrase = "production-secret-key-32-bytes-min"
     }
 
     #[test]
-    fn a_blank_source_origin_session_token_is_read_as_none() {
-        let settings = settings_signing_the_publisher_origin(
-            "origin_access_key_id",
-            "origin_secret_access_key",
-            Some(" "),
-        );
-        validate_settings_for_deploy(&settings)
-            .expect("a blank session token is no token, as a document's is");
-        let Some(AssetOriginAuth::S3SigV4(auth)) =
-            settings.origin_source().and_then(|origin| origin.auth)
-        else {
-            panic!("should keep the origin auth");
-        };
-        assert!(auth.session_token.is_none());
+    fn deploy_validation_leaves_a_signer_s_settings_alone_without_its_builder() {
+        validate_settings_for_deploy(&settings_signing_the_publisher_origin(" ", None))
+            .expect("the key name is the signer's business, and no builder offers it here");
+    }
+
+    #[test]
+    fn deploy_validation_refuses_an_auth_table_its_signer_cannot_use() {
+        let mut publisher = valid_settings();
+        edit_origin(&mut publisher, |origin| {
+            origin.url = "https://storage.example.com/bucket/site".to_string();
+            origin.auth = Some(fixture::auth(" "));
+        });
+        let mut route =
+            crate::settings::ProxyAssetRoute::new("/assets/", "https://assets.example.com");
+        crate::test_support::tests::set_route_auth(&mut route, Some(fixture::auth(" ")));
+        let mut routed = valid_settings();
+        routed.proxy.asset_routes.push(route);
+
+        for (settings, table) in [
+            (publisher, "source.origin.auth"),
+            (routed, "proxy.asset_routes /assets/ source.origin.auth"),
+        ] {
+            let err = validate_settings_for_deploy_with(&settings, &[fixture::builder()])
+                .expect_err("should refuse a table the signer cannot use");
+            assert!(
+                format!("{err:?}").contains(&format!(
+                    "[{table}] {} realm must not be empty",
+                    fixture::SIGNER
+                )),
+                "should name `{table}`: {err:?}"
+            );
+        }
     }
 
     #[test]
@@ -1437,10 +1338,7 @@ passphrase = "production-secret-key-32-bytes-min"
             .origin_source()
             .expect("the template should select the origin source");
 
-        assert!(
-            matches!(origin.auth, Some(AssetOriginAuth::S3SigV4(_))),
-            "the documented auth should be read"
-        );
+        assert!(origin.auth.is_some(), "the documented auth should be read");
         assert_eq!(
             origin.directory_index.as_deref(),
             Some("index.html"),

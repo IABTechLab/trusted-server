@@ -21,6 +21,8 @@
 //! Core supplies one source, `origin`, an HTTP origin named in its table. A
 //! module offers another through
 //! [`IntegrationRegistrationBuilder::with_source_module`](crate::integrations::IntegrationRegistrationBuilder::with_source_module).
+//! An origin that answers only signed reads is signed through the signer its
+//! `auth` table names, see [`crate::origin_auth`].
 
 use std::fmt;
 use std::sync::Arc;
@@ -32,9 +34,10 @@ use serde_json::{Map, Value};
 use url::Url;
 
 use crate::error::TrustedServerError;
+use crate::origin_auth::{OriginAuth, OriginSigners, OriginSigning};
 use crate::provider_table::SectionModules;
 use crate::redacted::{Redacted, SENSITIVE_MARKER};
-use crate::settings::{AssetOriginAuth, OriginQueryPolicy};
+use crate::settings::OriginQueryPolicy;
 
 /// The section that selects the publisher's source.
 pub const SOURCE_SECTION: &str = "source";
@@ -66,7 +69,7 @@ pub struct SourceLocation {
     url: String,
     parsed: Url,
     host_header: Option<String>,
-    auth: Option<AssetOriginAuth>,
+    auth: Option<OriginSigning>,
     directory_index: Option<String>,
 }
 
@@ -110,7 +113,7 @@ impl SourceLocation {
 
     /// The same location signing each request with `auth`.
     #[must_use]
-    pub fn with_auth(mut self, auth: Option<AssetOriginAuth>) -> Self {
+    pub fn with_auth(mut self, auth: Option<OriginSigning>) -> Self {
         self.auth = auth;
         self
     }
@@ -159,7 +162,7 @@ impl SourceLocation {
 
     /// The signing applied to each request, if any.
     #[must_use]
-    pub fn auth(&self) -> Option<&AssetOriginAuth> {
+    pub fn auth(&self) -> Option<&OriginSigning> {
         self.auth.as_ref()
     }
 
@@ -175,7 +178,7 @@ impl SourceLocation {
     pub fn query_is_stripped(&self) -> bool {
         self.auth
             .as_ref()
-            .and_then(AssetOriginAuth::origin_query_policy)
+            .and_then(OriginSigning::origin_query_policy)
             == Some(OriginQueryPolicy::Strip)
     }
 
@@ -237,9 +240,10 @@ pub struct OriginSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub directory_index: Option<String>,
     /// Signing of every request, for an origin that answers only signed
-    /// reads.
+    /// reads: the signer's name as `type` and its settings beside it, see
+    /// [`crate::origin_auth`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth: Option<AssetOriginAuth>,
+    pub auth: Option<OriginAuth>,
 }
 
 impl fmt::Debug for OriginSettings {
@@ -300,12 +304,14 @@ impl OriginSettings {
         Ok(origin)
     }
 
-    /// Reads and checks the table at `setting`.
+    /// Reads and checks the table at `setting`. The signer `auth` names is
+    /// checked where the source is built, because only the deployment's
+    /// builders know the signers on offer.
     ///
     /// # Errors
     ///
     /// When the table cannot be read, or names an address, a `Host`, an index
-    /// file or signing core cannot use, naming `setting`.
+    /// file or an `auth` core cannot use, naming `setting`.
     pub fn read(
         settings: &Map<String, Value>,
         setting: &str,
@@ -334,7 +340,7 @@ impl OriginSettings {
             if parsed.scheme() != "https" {
                 return Err(refuse("signs with auth, so url must use https".to_owned()));
             }
-            auth.prepare_runtime(&format!("{setting}.auth"))?;
+            auth.check(&format!("{setting}.auth"))?;
         }
         Ok(())
     }
@@ -345,16 +351,28 @@ impl OriginSettings {
         crate::settings::Publisher::is_placeholder_origin_url(&self.url)
     }
 
-    /// The location these settings name.
+    /// The location these settings name, signing through the signer
+    /// `signers` offers under `auth`'s type, where `setting` names the table
+    /// in a refusal.
     ///
     /// # Errors
     ///
     /// When the address cannot be read, which [`Self::read`] has already
-    /// refused for settings it returned.
-    pub fn location(&self) -> Result<SourceLocation, Report<TrustedServerError>> {
+    /// refused for settings it returned, when `auth` names a signer nothing
+    /// offers, or when the signer cannot use its table.
+    pub fn location(
+        &self,
+        signers: &OriginSigners,
+        setting: &str,
+    ) -> Result<SourceLocation, Report<TrustedServerError>> {
+        let auth = self
+            .auth
+            .as_ref()
+            .map(|auth| signers.build(auth, &format!("{setting}.auth")))
+            .transpose()?;
         Ok(SourceLocation::new(self.url.clone())?
             .with_host_header(self.host_header.clone())
-            .with_auth(self.auth.clone())
+            .with_auth(auth)
             .with_directory_index(self.directory_index.clone()))
     }
 }
@@ -367,14 +385,19 @@ pub struct OriginSource {
 }
 
 impl OriginSource {
-    /// The source `settings` name.
+    /// The source `settings` name, signing through `signers`, where `setting`
+    /// names the table in a refusal.
     ///
     /// # Errors
     ///
-    /// When the settings' address cannot be read.
-    pub fn new(settings: &OriginSettings) -> Result<Self, Report<TrustedServerError>> {
+    /// As [`OriginSettings::location`].
+    pub fn new(
+        settings: &OriginSettings,
+        signers: &OriginSigners,
+        setting: &str,
+    ) -> Result<Self, Report<TrustedServerError>> {
         Ok(Self {
-            location: settings.location()?,
+            location: settings.location(signers, setting)?,
         })
     }
 }
@@ -388,9 +411,20 @@ impl Source for OriginSource {
     }
 }
 
-/// Builds [`OriginSource`] from an `origin` table.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct OriginFactory;
+/// Builds [`OriginSource`] from an `origin` table, signing through the
+/// signers it was given.
+#[derive(Debug, Clone, Default)]
+pub struct OriginFactory {
+    signers: OriginSigners,
+}
+
+impl OriginFactory {
+    /// A factory whose sources sign through `signers`.
+    #[must_use]
+    pub fn new(signers: OriginSigners) -> Self {
+        Self { signers }
+    }
+}
 
 impl SourceFactory for OriginFactory {
     fn build(
@@ -399,7 +433,11 @@ impl SourceFactory for OriginFactory {
         setting: &str,
     ) -> Result<Arc<dyn Source>, Report<TrustedServerError>> {
         let origin = OriginSettings::read(settings, setting)?;
-        Ok(Arc::new(OriginSource::new(&origin)?))
+        Ok(Arc::new(OriginSource::new(
+            &origin,
+            &self.signers,
+            setting,
+        )?))
     }
 }
 
@@ -610,8 +648,16 @@ mod tests {
                 "[source.origin] directory_index",
             ),
             (
-                json!({ "url": "http://origin.example.com", "auth": { "type": "s3_sigv4", "region": "test-region-1" } }),
+                json!({ "url": "http://origin.example.com", "auth": { "type": "fixture_scheme", "realm": "site" } }),
                 "[source.origin] signs with auth, so url must use https",
+            ),
+            (
+                json!({ "url": "https://origin.example.com", "auth": { "realm": "site" } }),
+                "[source.origin] could not be read",
+            ),
+            (
+                json!({ "url": "https://origin.example.com", "auth": { "type": " " } }),
+                "[source.origin.auth] names no signer",
             ),
         ] {
             let err = OriginSettings::read(&table(value.clone()), "source.origin")
@@ -650,7 +696,7 @@ mod tests {
 
     #[test]
     fn the_origin_source_answers_the_same_location_for_every_request() {
-        let source = OriginFactory
+        let source = OriginFactory::default()
             .build(
                 &table(json!({ "url": "https://origin.example.com" })),
                 "source.origin",
@@ -667,5 +713,70 @@ mod tests {
             })
             .expect("should locate");
         assert_eq!(location.url(), "https://origin.example.com");
+    }
+
+    #[test]
+    fn the_origin_source_signs_through_the_signer_its_auth_names() {
+        use crate::origin_auth::fixture;
+
+        let settings = table(json!({
+            "url": "https://storage.example.com/site",
+            "auth": { "type": fixture::SIGNER, "realm": "site", "origin_query": "strip" },
+        }));
+
+        let err = OriginFactory::default()
+            .build(&settings, "source.origin")
+            .expect_err("should refuse the signer with none on offer");
+        assert!(
+            format!("{err:?}").contains(
+                "[source.origin.auth] type `fixture_scheme` names an origin signer this \
+                 deployment does not offer"
+            ),
+            "{err:?}"
+        );
+
+        let source = OriginFactory::new(fixture::signers())
+            .build(&settings, "source.origin")
+            .expect("should build with the fixture on offer");
+        let headers = HeaderMap::new();
+        let location = source
+            .locate(&SourceRequest {
+                method: &Method::GET,
+                path: "/page",
+                query: "",
+                headers: &headers,
+                removed_prefix: None,
+            })
+            .expect("should locate");
+        assert!(
+            location.query_is_stripped(),
+            "the auth table strips the query"
+        );
+        let mut sent = HeaderMap::new();
+        sent.insert(
+            http::header::HOST,
+            http::HeaderValue::from_static("storage.example.com"),
+        );
+        location
+            .auth()
+            .expect("should sign")
+            .sign(&Method::GET, location.parsed(), &mut sent)
+            .expect("should sign the request");
+        assert!(sent.contains_key(http::header::AUTHORIZATION));
+
+        let err = OriginFactory::new(fixture::signers())
+            .build(
+                &table(json!({
+                    "url": "https://storage.example.com/site",
+                    "auth": { "type": fixture::SIGNER, "realm": "" },
+                })),
+                "source.origin",
+            )
+            .expect_err("should refuse a table the signer cannot use");
+        assert!(
+            format!("{err:?}")
+                .contains("[source.origin.auth] fixture_scheme realm must not be empty"),
+            "{err:?}"
+        );
     }
 }

@@ -66,6 +66,9 @@ pub fn linked_builders() -> Vec<IntegrationBuilder> {
         // The loading cache a stock build caches with, offered whatever the
         // settings say, which no section selects either.
         trusted_server_loading_cache_51degrees::builder(),
+        // The origin signer a source's auth table can name, offered the same
+        // way.
+        trusted_server_shared_aws::builder(),
     ]
 }
 
