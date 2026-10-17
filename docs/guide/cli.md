@@ -256,8 +256,10 @@ EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=<staging-config-store> \
   ts config diff --adapter fastly --staging
 ```
 
-The config key is fixed on Fastly: production, staging, and local Viceroy all
-read `<logical-store-id>`. `--staging` does not choose a different store or
+On Fastly, production, staging, and local Viceroy all read
+`<logical-store-id>` unless the store's `TS__CONFIG__KEY` entry names another
+key ([One blob for each host](/guide/configuration#one-blob-for-each-host)).
+`--staging` does not choose a different store or
 key: the physical store is whatever `EDGEZERO__STORES__CONFIG__<ID>__NAME`
 resolves to in the shell or deploy job that runs the push, falling back to the
 logical ID when it is unset. If production and staging select the same
@@ -268,8 +270,8 @@ commands above do.
 
 `--staging` on `config push` / `config diff` writes and compares the
 `<logical-store-id>` key in the physical store selected by the current
-environment. It is mutually exclusive with `--key`, and on Fastly any `--key`
-other than the logical store ID is rejected for every target, staged or not.
+environment. It is mutually exclusive with `--key`. On Fastly, `ts` pushes a
+`--key` other than the logical store ID itself, and only with `--local`.
 
 Inspect and verify deployments with the deploy lifecycle commands. All three are
 Fastly-only — the axum, cloudflare, and spin adapters reject them:

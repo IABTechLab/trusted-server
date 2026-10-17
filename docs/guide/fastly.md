@@ -323,6 +323,10 @@ The app-config store is selected the same way, through
 `EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME` in the deployment
 environment. No runtime mapping is stored in a Config Store.
 
+One service can serve several publishers, each from an app-config blob of its
+own that the request's host chooses. See
+[One blob for each host](/guide/configuration#one-blob-for-each-host).
+
 Create the separate request-signing store when that feature is enabled:
 
 ```bash

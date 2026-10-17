@@ -71,6 +71,12 @@ jobs:
       - name: Run cache purge harness
         run: BID_DELAY=3 ./scripts/template-cache-local-test.sh purge
 
+      - name: Run config by host harness
+        run: ./scripts/config-by-host-local-test.sh
+
+      - name: Run config by host harness (reusable-sandbox feature)
+        run: ./scripts/config-by-host-local-test.sh reuse
+
   test-axum:
     name: cargo test (axum native, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
