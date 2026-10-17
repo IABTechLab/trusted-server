@@ -43,6 +43,7 @@ pub(crate) fn canonical_parity_auction_request() -> AuctionRequest {
     AuctionRequest {
         id: "fictional-auction".to_string(),
         slots: vec![AdSlot {
+            video: None,
             id: "fictional-slot".to_string(),
             formats: vec![
                 AdFormat {

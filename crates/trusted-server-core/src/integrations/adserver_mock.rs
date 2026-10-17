@@ -325,6 +325,7 @@ impl AdServerMockProvider {
                 };
 
                 all_bids.push(Bid {
+                    video: None,
                     slot_id,
                     price: bid["price"].as_f64(),
                     currency: "USD".to_string(),
@@ -639,6 +640,7 @@ mod tests {
         AuctionRequest {
             id: "test-auction-123".to_string(),
             slots: vec![AdSlot {
+                video: None,
                 id: "header-banner".to_string(),
                 formats: vec![AdFormat {
                     media_type: MediaType::Banner,
@@ -670,6 +672,7 @@ mod tests {
 
     fn aps_bid(bid_id: &str, price: f64) -> Bid {
         Bid {
+            video: None,
             slot_id: "header-banner".to_string(),
             price: Some(price),
             currency: "USD".to_string(),
@@ -720,6 +723,7 @@ mod tests {
                 provider: "aps".to_string(),
                 status: BidStatus::Success,
                 bids: vec![Bid {
+                    video: None,
                     slot_id: "header-banner".to_string(),
                     price: Some(3.00),
                     currency: "USD".to_string(),
@@ -747,6 +751,7 @@ mod tests {
                 provider: "test-bidder".to_string(),
                 status: BidStatus::Success,
                 bids: vec![Bid {
+                    video: None,
                     slot_id: "header-banner".to_string(),
                     price: Some(3.50),
                     currency: "USD".to_string(),
@@ -914,6 +919,7 @@ mod tests {
                 "mocktioneer".to_string(),
             ),
             Bid {
+                video: None,
                 slot_id: "header-banner".to_string(),
                 price: Some(0.20),
                 currency: "USD".to_string(),
@@ -1028,6 +1034,7 @@ mod tests {
                 "example-bidder".to_string(),
             ),
             Bid {
+                video: None,
                 slot_id: "header-banner".to_string(),
                 price: Some(0.20),
                 currency: "USD".to_string(),
@@ -1162,6 +1169,7 @@ mod tests {
         let auction_request = AuctionRequest {
             id: "test-auction".to_string(),
             slots: vec![AdSlot {
+                video: None,
                 id: "slot-1".to_string(),
                 formats: vec![AdFormat {
                     media_type: MediaType::Banner,
@@ -1190,6 +1198,7 @@ mod tests {
             provider: "aps".to_string(),
             status: BidStatus::Success,
             bids: vec![Bid {
+                video: None,
                 slot_id: "slot-1".to_string(),
                 price: Some(1.75),
                 currency: "USD".to_string(),

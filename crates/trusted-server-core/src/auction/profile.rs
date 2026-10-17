@@ -85,6 +85,11 @@ impl CompiledOpenRtbProfile {
     pub(crate) fn is_prebid_server(&self) -> bool {
         matches!(self, Self::PrebidServer(_))
     }
+
+    /// Return whether the profile supports the direct API video contract.
+    pub(crate) fn supports_video(&self) -> bool {
+        !matches!(self, Self::Aps(_))
+    }
 }
 
 /// Validated static extension object.
