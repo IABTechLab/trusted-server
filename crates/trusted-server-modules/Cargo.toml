@@ -1,0 +1,46 @@
+[package]
+name = "trusted-server-modules"
+description = "The modules a stock build of Trusted Server ships from crates of their own, in the order their hooks run."
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+version = { workspace = true }
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+trusted-server-ad-server-mock = { workspace = true }
+trusted-server-ad-tag-google = { workspace = true }
+trusted-server-auction-aps = { workspace = true }
+trusted-server-auction-prebid = { workspace = true }
+trusted-server-auction-prebid-server = { workspace = true }
+trusted-server-auction-protocol-openrtb = { workspace = true }
+trusted-server-audience-permutive = { workspace = true }
+trusted-server-bot-protection-datadome = { workspace = true }
+trusted-server-cmp-didomi = { workspace = true }
+trusted-server-cmp-osano = { workspace = true }
+trusted-server-cmp-sourcepoint = { workspace = true }
+trusted-server-core = { workspace = true }
+trusted-server-framework-nextjs = { workspace = true }
+trusted-server-identity-lockr = { workspace = true }
+trusted-server-tag-google-tag-manager = { workspace = true }
+trusted-server-testing-testlight = { workspace = true }
+
+[dev-dependencies]
+edgezero-core = { workspace = true }
+http = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+trusted-server-core = { workspace = true, features = ["test-utils"] }
+
+# The visible owner of this crate, the way Prebid.js requires a named
+# maintainer of every adapter. Which modules a stock build ships is the
+# project's own decision, so the Trusted Server maintainers own it.
+[package.metadata.maintainers]
+owner = "Trusted Server maintainers"
+status = "project owned"

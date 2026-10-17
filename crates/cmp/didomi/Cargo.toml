@@ -1,0 +1,37 @@
+[package]
+name = "trusted-server-cmp-didomi"
+description = "Didomi consent notice delivery through a first-party proxy as a consent management platform module."
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+version = { workspace = true }
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+edgezero-core = { workspace = true }
+error-stack = { workspace = true }
+http = { workspace = true }
+log = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+trusted-server-core = { workspace = true }
+url = { workspace = true }
+validator = { workspace = true }
+
+[dev-dependencies]
+futures = { workspace = true }
+trusted-server-core = { workspace = true, features = ["test-utils"] }
+
+# The visible owner of this vendor crate, the way Prebid.js requires a named
+# maintainer of every adapter. Didomi has not yet adopted this crate, so the
+# Trusted Server maintainers own it until a vendor owner steps up.
+[package.metadata.maintainers]
+owner = "Trusted Server maintainers"
+status = "seeking vendor owner"

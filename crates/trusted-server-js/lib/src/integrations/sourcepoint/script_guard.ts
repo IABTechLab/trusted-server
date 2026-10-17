@@ -12,7 +12,7 @@ function normalizeSourcepointUrl(url: string): string | null {
   if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) return trimmed;
 
   // Keep in sync with Rust `parse_sourcepoint_url()` in:
-  // crates/trusted-server-core/src/integrations/sourcepoint.rs
+  // crates/cmp/sourcepoint/src/lib.rs
   // (protocol-relative + bare-host handling + hostname-only host checks).
   // Bare domain or path — attempt to parse as https URL.
   // The hostname === check in isSourcepointUrl rejects non-matching domains.

@@ -15,8 +15,10 @@ Permutive is a real-time data platform that helps publishers build and activate 
 ## Configuration
 
 ```toml
-[integrations.permutive]
-enabled = true
+[audience]
+module = "permutive"
+
+[audience.permutive]
 organization_id = "your-org-id"
 workspace_id = "your-workspace-id"
 project_id = "your-project-id"
@@ -59,7 +61,7 @@ Aggregate audience data across your property portfolio.
 
 ## Implementation
 
-See [crates/trusted-server-core/src/integrations/permutive.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/trusted-server-core/src/integrations/permutive.rs) for implementation details.
+See [crates/audience/permutive/src/lib.rs](https://github.com/IABTechLab/trusted-server/blob/main/crates/audience/permutive/src/lib.rs) for implementation details.
 
 ## Next Steps
 

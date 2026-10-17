@@ -27,6 +27,15 @@ pub struct AppConfigArgs {
     pub no_env: bool,
 }
 
+/// Registers the modules a stock build ships with deploy validation.
+///
+/// [`TrustedServerAppConfig`] validates through a trait that takes no
+/// arguments, so every path that validates settings calls this first. The
+/// first call wins and a later one changes nothing.
+pub(crate) fn register_stock_modules() {
+    trusted_server_core::config::register_deploy_integrations(trusted_server_modules::builders());
+}
+
 /// Effective settings plus the resolved app-config path they were loaded from.
 #[derive(Debug)]
 pub struct LoadedSettings {
@@ -108,6 +117,7 @@ fn load_settings_with_env_overlay(
 
     let mut opts = AppConfigLoadOptions::default();
     opts.env_overlay = env_overlay;
+    register_stock_modules();
     let app_config = app_config::deserialize_app_config_with_options::<TrustedServerAppConfig>(
         &app_config_path,
         &app_name,

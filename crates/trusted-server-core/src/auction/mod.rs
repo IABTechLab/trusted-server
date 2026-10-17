@@ -1,38 +1,42 @@
-//! Auction orchestration module for managing multi-provider bidding.
+//! Auction orchestration across the demand sources and the ad server a
+//! deployment selects.
 //!
-//! This module provides an extensible framework for running auctions across
-//! multiple providers (Prebid, Amazon APS, Google GAM, etc.) with support for
-//! parallel execution and mediation strategies.
-//!
-//! Note: Individual auction providers are located in the `integrations` module
-//! (e.g., `crate::integrations::aps`, `crate::integrations::prebid`).
+//! `[demand] modules` selects the demand sources and `[ad-server] module`
+//! the optional ad server. Their implementations are registered by
+//! integrations through [`demand`], so this module names no vendor.
 
 use error_stack::Report;
 
 use crate::error::TrustedServerError;
+use crate::integrations::IntegrationBuilder;
 use crate::settings::Settings;
 use std::sync::Arc;
 
 pub mod config;
 pub mod context;
+pub mod demand;
 pub mod endpoints;
 pub mod formats;
-pub(crate) mod openrtb;
+pub mod openrtb;
 pub mod orchestrator;
 pub mod plan;
-pub(crate) mod profile;
 pub mod provider;
 pub(crate) mod routing;
 pub mod telemetry;
-#[cfg(test)]
-pub(crate) mod test_support;
+#[cfg(any(test, feature = "test-utils"))]
+#[allow(
+    clippy::must_use_candidate,
+    clippy::missing_panics_doc,
+    reason = "test helpers, offered to other crates' tests under the test-utils feature"
+)]
+pub mod test_support;
 pub mod types;
 
 pub use config::AuctionConfig;
 pub use context::{ContextQueryParams, ContextValue, build_url_with_context_params};
 pub use orchestrator::AuctionOrchestrator;
 pub use plan::{
-    AuctionPlan, BidderId, BidderRouteConfig, NotificationConfig, ProviderConfig, ProviderId,
+    AdServerPlan, AuctionPlan, BidderId, BidderRouteConfig, NotificationConfig, ProviderId,
     RoutingMode,
 };
 pub use provider::AuctionProvider;
@@ -45,66 +49,86 @@ pub use types::{
     AdFormat, AuctionContext, AuctionRequest, AuctionResponse, Bid, BidStatus, MediaType,
 };
 
-/// Compile the canonical target-independent auction plan for [`Settings`].
+/// Compile the canonical target-independent auction plan for [`Settings`] with
+/// the implementations the built-in integrations register.
 ///
-/// This is the single settings-to-plan boundary used by deploy validation,
-/// adapter startup, and operator tooling. Global request signing remains owned
-/// by [`Settings`] and is copied into compiler input only at this boundary.
+/// This is the settings-to-plan boundary used by deploy validation, adapter
+/// startup and operator tooling. Global request signing remains owned by
+/// [`Settings`] and is copied into compiler input only at this boundary.
 ///
 /// # Errors
 ///
-/// Returns an error when auction provider, bidder route, signing, or mediator
+/// Returns an error when the `[demand]`, `[ad-server]`, bidder route or signing
 /// configuration is invalid.
 pub fn compile_auction_plan(
     settings: &Settings,
 ) -> Result<AuctionPlan, Report<TrustedServerError>> {
+    compile_auction_plan_with(settings, &[])
+}
+
+/// Compile the auction plan with the implementations the built-in integrations
+/// register followed by those the `extra` builders register, the builders an
+/// adapter or a vendor crate supplies.
+///
+/// # Errors
+///
+/// Returns an error when the `[demand]`, `[ad-server]`, bidder route or signing
+/// configuration is invalid, including a selected name whose implementation no
+/// builder registers.
+pub fn compile_auction_plan_with(
+    settings: &Settings,
+    extra: &[IntegrationBuilder],
+) -> Result<AuctionPlan, Report<TrustedServerError>> {
+    let builders = crate::integrations::all_builders(extra).collect::<Vec<_>>();
     AuctionPlan::compile(plan::AuctionPlanConfig {
         timeout_ms: settings.auction.timeout_ms,
-        providers: settings.auction.providers.clone(),
+        demand: settings.demand.clone(),
+        adserver: settings.adserver.clone(),
         bidders: settings.auction.bidders.clone(),
-        mediator: settings.auction.mediator.clone(),
         request_signing: settings.request_signing.clone(),
+        demand_implementations: builders
+            .iter()
+            .filter_map(IntegrationBuilder::demand)
+            .collect(),
+        adserver_implementations: builders
+            .iter()
+            .filter_map(IntegrationBuilder::adserver)
+            .collect(),
     })
-    .map(|plan| plan.with_enabled(settings.auction.enabled))
+    .map(|plan| {
+        plan.with_enabled(settings.auction.enabled)
+            .with_auction_token(builders.iter().any(|builder| {
+                builder.reads_auction_token()
+                    && builder
+                        .module_name()
+                        .is_some_and(|name| settings.selects_module(name))
+            }))
+    })
 }
 
 /// Build a new auction orchestrator from one shared compiled plan.
 ///
-/// This constructor registers all auction providers discovered from the provided settings.
-/// Callers can reuse the returned [`AuctionOrchestrator`] across requests.
-///
-/// # Arguments
-/// * `plan` - Shared immutable compiled plan
-/// * `settings` - Application settings used only for the separately registered mediator
+/// The demand sources come from the plan, and so does the ad server, which is
+/// built here from its implementation and settings. Callers can reuse the
+/// returned [`AuctionOrchestrator`] across requests.
 ///
 /// # Errors
 ///
-/// Returns an error when an enabled auction provider has invalid configuration.
+/// Returns an error when the selected ad server cannot be built from its
+/// settings.
 pub fn build_orchestrator_with_plan(
     plan: Arc<AuctionPlan>,
-    settings: &Settings,
 ) -> Result<AuctionOrchestrator, Report<TrustedServerError>> {
     log::info!("Building plan-backed auction orchestrator");
 
-    let mediator = if let Some(expected_id) = plan.mediator() {
-        let provider = crate::integrations::adserver_mock::register_providers(settings)?
-            .into_iter()
-            .find(|provider| provider.provider_name() == expected_id)
-            .ok_or_else(|| {
-                Report::new(TrustedServerError::Configuration {
-                    message: format!(
-                        "auction mediator `{expected_id}` must reference a separately registered enabled integration with the exact same ID"
-                    ),
-                })
-            })?;
-        Some(provider)
-    } else {
-        None
-    };
-    let orchestrator = AuctionOrchestrator::from_plan(plan, mediator);
+    let adserver = plan
+        .adserver()
+        .map(|adserver| (adserver.implementation.build)(adserver.id.as_str(), &adserver.settings))
+        .transpose()?;
+    let orchestrator = AuctionOrchestrator::from_plan(plan, adserver);
 
     log::info!(
-        "Auction orchestrator built with {} bidder providers",
+        "Auction orchestrator built with {} demand sources",
         orchestrator.provider_count()
     );
 
@@ -115,27 +139,97 @@ pub fn build_orchestrator_with_plan(
 ///
 /// # Errors
 ///
-/// Returns an error when plan compilation or mediator construction fails.
+/// Returns an error when plan compilation or ad server construction fails.
 #[cfg(test)]
 pub fn build_orchestrator(
     settings: &Settings,
 ) -> Result<AuctionOrchestrator, Report<TrustedServerError>> {
     let plan = Arc::new(compile_auction_plan(settings)?);
-    build_orchestrator_with_plan(plan, settings)
+    build_orchestrator_with_plan(plan)
+}
+
+#[cfg(test)]
+mod auction_token_tests {
+    use super::*;
+    use crate::integrations::registry_test_support::{
+        probe_registration, request_fixture, validate_nothing,
+    };
+    use crate::test_support::tests::create_test_settings;
+
+    #[test]
+    fn the_plan_publishes_a_token_only_where_a_selected_module_reads_one() {
+        let mut settings = create_test_settings();
+        assert!(
+            !compile_auction_plan(&settings)
+                .expect("should compile the plan")
+                .publishes_auction_token(),
+            "should publish no token where no module is selected"
+        );
+
+        settings.select_module("testing", request_fixture::MODULE);
+        assert!(
+            compile_auction_plan(&settings)
+                .expect("should compile the plan")
+                .publishes_auction_token(),
+            "should publish a token once a module that reads one is selected"
+        );
+    }
+
+    #[test]
+    fn a_selected_module_that_reads_no_token_does_not_turn_one_on() {
+        let mut settings = create_test_settings();
+        settings.select_module("testing", "testing.probe");
+        let reads_nothing =
+            [
+                IntegrationBuilder::new(
+                    "probe",
+                    "seam-probe",
+                    probe_registration,
+                    validate_nothing,
+                )
+                .with_module_name("testing.probe"),
+            ];
+        assert!(
+            !compile_auction_plan_with(&settings, &reads_nothing)
+                .expect("should compile the plan")
+                .publishes_auction_token(),
+            "should publish no token for a selected module that reads none"
+        );
+
+        let reads_one = [reads_nothing[0].with_auction_token()];
+        assert!(
+            compile_auction_plan_with(&settings, &reads_one)
+                .expect("should compile the plan")
+                .publishes_auction_token(),
+            "should publish a token for a module a vendor crate supplies that reads one"
+        );
+    }
 }
 
 #[cfg(test)]
 mod plan_sharing_tests {
     use super::*;
+    use crate::auction::test_support::demand_named;
     use crate::integrations::IntegrationRegistry;
+    use crate::provider_table::ProviderChoice;
     use crate::test_support::tests::create_test_settings;
+    use serde_json::{Map, json};
+    use std::collections::BTreeMap;
+
+    /// An `[ad-server]` table selecting one name with the settings given.
+    fn adserver(name: &str, settings: Map<String, serde_json::Value>) -> ProviderChoice {
+        ProviderChoice::new(
+            Some(name.to_string()),
+            BTreeMap::from([(name.to_string(), settings)]),
+        )
+    }
 
     #[test]
     fn orchestrator_and_registry_share_the_compiled_plan_allocation() {
         let settings = create_test_settings();
         let plan = Arc::new(compile_auction_plan(&settings).expect("should compile auction plan"));
-        let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)
-            .expect("should build orchestrator");
+        let orchestrator =
+            build_orchestrator_with_plan(Arc::clone(&plan)).expect("should build orchestrator");
         let registry = IntegrationRegistry::with_plan(&settings, Arc::clone(&plan))
             .expect("should build integration registry");
 
@@ -144,54 +238,99 @@ mod plan_sharing_tests {
     }
 
     #[test]
-    fn configured_mediator_requires_enabled_exact_registration() {
-        for mediator_config in [None, Some(serde_json::json!({"enabled": false}))] {
-            let mut settings = create_test_settings();
-            settings.auction.mediator = Some("adserver_mock".to_string());
-            if let Some(config) = mediator_config {
-                settings
-                    .integrations
-                    .insert_config("adserver_mock", &config)
-                    .expect("should insert mediator config");
-            } else {
-                settings.integrations.remove("adserver_mock");
-            }
-            let plan = Arc::new(compile_auction_plan(&settings).expect("should compile plan"));
+    fn an_ad_server_this_build_does_not_have_fails_the_plan() {
+        let mut settings = create_test_settings();
+        settings.adserver =
+            ProviderChoice::new(Some("fictional_adserver".to_string()), BTreeMap::new());
+        let error = compile_auction_plan(&settings)
+            .expect_err("should refuse an ad server no builder registers");
+        assert!(
+            error.to_string().contains("fictional_adserver"),
+            "should name the ad server: {error:?}"
+        );
+    }
 
-            let error = match build_orchestrator_with_plan(plan, &settings) {
-                Ok(_) => panic!("should require enabled mediator registration"),
-                Err(error) => error,
-            };
-            assert!(error.to_string().contains("adserver_mock"));
-        }
+    /// The ad server implementation a crate outside core supplies.
+    static EXTERNAL_ADSERVER: crate::auction::demand::AdServerImplementation =
+        crate::auction::demand::AdServerImplementation {
+            id: "ad-server.example",
+            build: build_external_adserver,
+        };
+
+    fn build_external_adserver(
+        name: &str,
+        _settings: &Map<String, serde_json::Value>,
+    ) -> Result<Arc<dyn AuctionProvider>, Report<TrustedServerError>> {
+        Ok(Arc::new(
+            crate::auction::test_support::adserver_fixture::FixtureAdServer::new(name, 500),
+        ))
+    }
+
+    /// An ad server a builder outside core supplies resolves in the plan when
+    /// that builder is passed, and is a name no builder registers when it is
+    /// not. Both halves are asserted, so the test fails if either stops
+    /// holding.
+    #[test]
+    fn an_ad_server_an_external_builder_supplies_compiles_only_when_it_is_passed() {
+        let mut settings = create_test_settings();
+        settings.adserver = adserver("example", Map::new());
+        let extra = [crate::integrations::IntegrationBuilder::implementations(
+            "example-adserver",
+            "example-crate",
+        )
+        .with_adserver(&EXTERNAL_ADSERVER)];
+
+        let error = compile_auction_plan(&settings)
+            .expect_err("built-ins alone should not know this ad server");
+        assert!(
+            error.to_string().contains("example"),
+            "should name the ad server: {error:?}"
+        );
+
+        let plan = compile_auction_plan_with(&settings, &extra)
+            .expect("the external builder's ad server should compile");
+        assert_eq!(
+            plan.adserver().map(|adserver| adserver.implementation.id),
+            Some("ad-server.example"),
+            "the plan should carry the external ad server"
+        );
     }
 
     #[test]
-    fn configured_mediator_builds_when_exact_registration_is_enabled() {
+    fn the_selected_ad_server_is_built_from_its_own_table() {
         let mut settings = create_test_settings();
-        settings.auction.mediator = Some("adserver_mock".to_string());
-        settings
-            .integrations
-            .insert_config(
-                "adserver_mock",
-                &serde_json::json!({
-                    "enabled": true,
-                    "endpoint": "https://mediator.example/mediate"
-                }),
-            )
-            .expect("should insert mediator config");
+        settings.adserver = adserver(
+            "fixture",
+            Map::from_iter([(
+                "endpoint".to_string(),
+                json!("https://adserver.example/mediate"),
+            )]),
+        );
         let plan = Arc::new(compile_auction_plan(&settings).expect("should compile plan"));
 
-        build_orchestrator_with_plan(plan, &settings)
-            .expect("should build with enabled exact mediator registration");
+        build_orchestrator_with_plan(plan).expect("should build the selected ad server");
+    }
+
+    #[test]
+    fn an_ad_server_table_with_no_endpoint_fails_the_plan() {
+        let mut settings = create_test_settings();
+        settings.adserver = adserver("fixture", Map::new());
+        let error = compile_auction_plan(&settings)
+            .expect_err("should refuse an ad server with no endpoint");
+        assert!(
+            format!("{error:?}").contains("endpoint"),
+            "should say an endpoint is needed: {error:?}"
+        );
     }
 
     #[test]
     fn cloudflare_and_spin_reject_multi_provider_plans_before_runtime_construction() {
         let mut settings = create_test_settings();
         settings.auction.enabled = true;
-        settings.auction.providers =
-            AuctionConfig::legacy_provider_map(&["provider-a", "provider-b"]);
+        settings.demand = demand_named(
+            crate::auction::test_support::plain_fixture::MODULE,
+            &["provider_a", "provider_b"],
+        );
         let plan = compile_auction_plan(&settings).expect("should compile target-independent plan");
 
         for target in [
@@ -207,27 +346,5 @@ mod plan_sharing_tests {
                     .contains("does not support concurrent provider fanout")
             );
         }
-    }
-
-    #[test]
-    fn aps_profile_registers_renderer_without_browser_aps_config() {
-        let mut settings = create_test_settings();
-        settings.auction.providers = std::collections::BTreeMap::from([(
-            "aps-main".parse().expect("should parse APS provider ID"),
-            ProviderConfig {
-                protocol: "openrtb-2.6".to_string(),
-                profile: "aps".to_string(),
-                endpoint: "https://aps.example/e/pb/bid".to_string(),
-                timeout_ms: None,
-                routing: RoutingMode::AllEligible,
-                notifications: NotificationConfig::default(),
-                profile_config: serde_json::json!({"account_id":"example-account"}),
-            },
-        )]);
-        let plan = Arc::new(compile_auction_plan(&settings).expect("should compile APS plan"));
-        let registry = IntegrationRegistry::with_plan(&settings, plan)
-            .expect("should build APS renderer registry");
-
-        assert!(registry.has_route(&http::Method::GET, "/integrations/aps/renderer"));
     }
 }

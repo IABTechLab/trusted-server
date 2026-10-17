@@ -10,7 +10,7 @@ import { GPT_BOOTSTRAP_PATH } from '../../fixtures/paths';
  * Executable coverage for the edge-injected `gpt_bootstrap.js` — the
  * head-inline fallback that keeps initial server-side ads working when the
  * main TSJS bundle fails to load. The file ships from
- * `crates/trusted-server-core/src/integrations/gpt_bootstrap.js` and is
+ * `crates/ad-tag/google/src/gpt_bootstrap.js` and is
  * evaluated here verbatim, so the degradation path (fallback `adInit` and
  * fallback `scheduleInitialAdInit`) is executed, not string-matched.
  */

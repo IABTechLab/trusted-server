@@ -29,7 +29,7 @@ enum RowState {
 /// URLs like `\/\/origin.example.com` (JSON-escaped slashes) will not be rewritten. This is
 /// acceptable because Flight responses from client-side navigation typically contain plain URLs,
 /// not doubly-escaped JSON-in-JS content. For inlined `__next_f` data in HTML (which can have
-/// escape sequences), the HTML post-processor in `integrations/nextjs/` handles those cases.
+/// escape sequences), the HTML post-processor in `crates/framework/nextjs` handles those cases.
 pub struct RscFlightUrlRewriter {
     origin_url: String,
     origin_http_url: Option<String>,

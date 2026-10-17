@@ -11,8 +11,9 @@ documents are the source for committed future work.
 - Publisher-origin proxying and shared HTML/creative processing.
 - Edge Cookie generation, consent evaluation, partner identity sync, and
   administrative EC routes.
-- Server-side auctions with generic OpenRTB, Prebid Server, and APS profiles;
-  optional `adserver_mock` mediation; and first-party creative delivery.
+- Server-side auctions with generic OpenRTB, Prebid Server, and APS demand
+  implementations; an optional mock ad server; and first-party creative
+  delivery.
 - Request signing, JWKS discovery, key-management routes, and signature
   verification.
 - TSJS core and integration modules selected from the checked Rust and JS

@@ -374,7 +374,9 @@ async fn tsjs_route_is_routed_not_5xx() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tsjs_route_matching_hash_uses_s_maxage_fallback() {
     let router = test_router();
-    let src = trusted_server_core::tsjs::tsjs_script_src(&["creative"]);
+    let src = trusted_server_core::tsjs::tsjs_script_src(
+        &trusted_server_core::tsjs_bundle::compile_time_parts(&["creative"]),
+    );
     let req = request_builder()
         .method("GET")
         .uri(src)

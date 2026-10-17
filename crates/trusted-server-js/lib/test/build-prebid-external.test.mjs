@@ -134,7 +134,7 @@ describe('build-prebid-external request parsing', () => {
     'ats\nAnalyticsAdapter',
   ])('rejects invalid analytics stem %j', (stem) => {
     expect(() => parseRequest(completeRequest({ analytics: [stem] }))).toThrow(
-      'integrations.prebid.bundle.modules.analytics'
+      'auction.prebid.bundle.modules.analytics'
     );
   });
 
@@ -146,7 +146,7 @@ describe('build-prebid-external request parsing', () => {
 
   it('rejects a stem repeated across kinds', () => {
     expect(() => parseRequest({ bidder: ['exampleModule'], analytics: ['exampleModule'] })).toThrow(
-      'already selected by integrations.prebid.bundle.modules.bidder'
+      'already selected by auction.prebid.bundle.modules.bidder'
     );
   });
 
@@ -413,7 +413,7 @@ describe('build-prebid-external module resolution', () => {
             resolveSpecifier: () => fixture.target,
           })
         )
-      ).toThrow('Prebid metadata for integrations.prebid.bundle.modules.analytics');
+      ).toThrow('Prebid metadata for auction.prebid.bundle.modules.analytics');
     } finally {
       fs.rmSync(fixture.temp, { recursive: true, force: true });
     }
@@ -667,7 +667,7 @@ describe('build-prebid-external rendering and orchestration', () => {
         error = String(cause);
       }
       expect(error).toContain(
-        'integrations.prebid.bundle.modules.analytics requested "mavenDistributionAnalyticsAdapter"'
+        'auction.prebid.bundle.modules.analytics requested "mavenDistributionAnalyticsAdapter"'
       );
       expect(error).toContain(`prebid.js ${prebidVersion}`);
       expect(error).toContain('modules/mavenDistributionAnalyticsAdapter.js');

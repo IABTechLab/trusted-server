@@ -66,7 +66,7 @@ pub(super) async fn execute_standard_fixture(
         return Ok(
             AuctionResponse::no_bid(provider.id.as_str(), 0).with_metadata(
                 "routing",
-                json!({"unused_bidder_params_count": unused_bidder_params_count(&provider.profile, input)}),
+                json!({"unused_bidder_params_count": unused_bidder_params_count(provider.demand.as_ref(), input)}),
             ),
         );
     }
@@ -76,7 +76,7 @@ pub(super) async fn execute_standard_fixture(
             .with_metadata("http_status", json!(status.as_u16()))
             .with_metadata(
                 "routing",
-                json!({"unused_bidder_params_count": unused_bidder_params_count(&provider.profile, input)}),
+                json!({"unused_bidder_params_count": unused_bidder_params_count(provider.demand.as_ref(), input)}),
             ));
     }
     let body = response
@@ -93,7 +93,7 @@ pub(super) async fn execute_standard_fixture(
                 .with_metadata("error_type", json!("parse_response"))
                 .with_metadata(
                     "routing",
-                    json!({"unused_bidder_params_count": unused_bidder_params_count(&provider.profile, input)}),
+                    json!({"unused_bidder_params_count": unused_bidder_params_count(provider.demand.as_ref(), input)}),
                 ));
         }
     };
@@ -101,7 +101,7 @@ pub(super) async fn execute_standard_fixture(
     apply_notification_policy(&mut parsed.bids, &provider.notifications);
     parsed.metadata.insert(
         "routing".to_string(),
-        json!({"unused_bidder_params_count": unused_bidder_params_count(&provider.profile, input)}),
+        json!({"unused_bidder_params_count": unused_bidder_params_count(provider.demand.as_ref(), input)}),
     );
     Ok(parsed)
 }
