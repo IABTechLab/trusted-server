@@ -25,8 +25,11 @@ The `replace-with-*` values below are intentionally rejected placeholders:
 
 ```toml
 [ec]
-passphrase = "ec_passphrase"
+module = "hmac"
 ec_store = "ec_identity_store"
+
+[ec.hmac]
+passphrase = "ec_passphrase"
 
 [[ec.partners]]
 name = "Mocktioneer SSP"
@@ -44,6 +47,7 @@ do not call either API may omit it. Provision high-entropy values under
 
 Required behavior assumptions:
 
+- `module = "hmac"` selects the built-in HMAC module, and its `passphrase` lives under `[ec.hmac]`
 - The value stored under `ec_passphrase` is long-lived HMAC-SHA256 keying material for EC ID derivation; use a high-entropy random value of at least 32 characters
 - `ec_store` is linked to the active Fastly service version
 - `ec_store` is the only KV-backed EC lifecycle store; it contains identity graph state, minimal consent metadata, source-domain keyed partner UIDs, and withdrawal tombstones
@@ -99,13 +103,13 @@ curl -si "${TS_BASE_URL}/" \
 
 Look for:
 
-- `Set-Cookie: ts-ec=<64hex.6chars>`
+- `Set-Cookie: ts-ec=hmac~<64hex.6chars>` (the `hmac~` prefix is the module code, and a bare value with no prefix, as a browser may already hold, still resolves)
 
 ## 5) Batch Sync (S2S)
 
 Endpoint: `POST /_ts/api/v1/batch-sync`
 
-Important: request field is `ec_id` (full `{64hex}.{6alnum}` value). The `timestamp` field remains required for API compatibility, but it no longer orders writes because EC identity entries do not store per-partner sync timestamps. Within one request, valid mappings are grouped by normalized EC ID and the last valid UID for each group is applied once; unchanged UIDs are accepted without a write. Group outcomes are reported for every original mapping, and infrastructure failures abort the remaining groups. See the [API Reference](/guide/api-reference) for the complete accounting and failure contract.
+Important: request field is `ec_id` (the full value as issued, `hmac~{64hex}.{6alnum}`, with the bare form that has no prefix also accepted). The `timestamp` field remains required for API compatibility, but it no longer orders writes because EC identity entries do not store per-partner sync timestamps. Within one request, valid mappings are grouped by normalized EC ID and the last valid UID for each group is applied once; unchanged UIDs are accepted without a write. Group outcomes are reported for every original mapping, and infrastructure failures abort the remaining groups. See the [API Reference](/guide/api-reference) for the complete accounting and failure contract.
 
 ```bash
 BATCH_UID="${PARTNER_UID}-batch"
