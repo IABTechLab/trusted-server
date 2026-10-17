@@ -59,7 +59,7 @@ pub struct TemplateCacheKey {
     /// mutate first.
     pub url: String,
     /// Host and scheme. The post-processed output is host-dependent by construction:
-    /// both reach `IntegrationHtmlContext` and drive URL rewriting.
+    /// both are handed to every middleware and drive URL rewriting.
     pub request_host: String,
     /// See [`Self::request_host`].
     pub request_scheme: String,

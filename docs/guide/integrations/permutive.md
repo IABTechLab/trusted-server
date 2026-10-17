@@ -26,7 +26,15 @@ api_endpoint = "https://api.permutive.com"
 secure_signals_endpoint = "https://secure-signals.permutive.app"
 cache_ttl_seconds = 3600
 rewrite_sdk = true
+
+[[fetch]]
+media_type = "text/html"
+middleware = ["audience.permutive"]
 ```
+
+The SDK rewrite is the middleware `audience.permutive`, which runs on the
+pages a `[[fetch]]` entry names it for. See
+[Placing page changes](/guide/configuration#placing-page-changes).
 
 ## Endpoints
 

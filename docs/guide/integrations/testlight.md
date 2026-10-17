@@ -23,6 +23,10 @@ When `rewrite_scripts = true`, `src` and `href` values containing
 are unchanged. The default shim source is the registry-free unified `tsjs`
 path because Testlight is an immediate bundled module.
 
+The rewrite is the middleware `testing.testlight`, which runs on the pages a
+`[[fetch]]` entry names it for. See
+[Placing page changes](/guide/configuration#placing-page-changes).
+
 This integration is for controlled development validation, not a production
 auction provider. See [Configuration](/guide/configuration#testlight-integration)
 for exact fields and [Integration Guide](/guide/integration-guide) for the

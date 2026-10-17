@@ -5,6 +5,10 @@
 //! hooks run. Offering a module does not run it, because the registry builds a
 //! module only when a section of the settings selects it.
 //!
+//! It also says which middleware those modules supply, so a tool that writes
+//! a configuration can place a module's page changes without naming one
+//! itself.
+//!
 //! A deployment that ships a module of its own hands that module's builder to
 //! its adapter, which runs it after these.
 
@@ -14,6 +18,7 @@
 )]
 
 use trusted_server_core::integrations::IntegrationBuilder;
+use trusted_server_core::middleware::MiddlewarePhase;
 
 /// The builders of the modules a stock build ships from crates of their own,
 /// in hook order.
@@ -68,11 +73,276 @@ pub fn selection_of(id: &str) -> Option<(&'static str, &'static str)> {
     ))
 }
 
+/// A middleware a stock module supplies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StockMiddleware {
+    /// The id of the integration that supplies it.
+    pub integration: &'static str,
+    /// The phase it runs in.
+    pub phase: MiddlewarePhase,
+    /// The name an entry writes.
+    pub name: &'static str,
+}
+
+/// The middleware a stock build's modules supply, core's script proxy among
+/// them, in the order a deployment that runs them all names them in an
+/// entry.
+///
+/// That is the order the registry registers the modules in. Prebid registers
+/// from the auction plan and so comes first, core's script proxy is the first
+/// module a section selects, and the rest follow [`builders`].
+#[must_use]
+pub fn middleware() -> Vec<StockMiddleware> {
+    use MiddlewarePhase::{Fetch, Serve};
+    use trusted_server_ad_tag_google as google;
+    use trusted_server_auction_prebid as prebid;
+    use trusted_server_audience_permutive as permutive;
+    use trusted_server_bot_protection_datadome as datadome;
+    use trusted_server_cmp_didomi as didomi;
+    use trusted_server_cmp_sourcepoint as sourcepoint;
+    use trusted_server_core::integrations::js_asset_proxy;
+    use trusted_server_framework_nextjs as nextjs;
+    use trusted_server_identity_lockr as lockr;
+    use trusted_server_tag_google_tag_manager as google_tag_manager;
+    use trusted_server_testing_testlight as testlight;
+
+    let row = |integration, phase, name| StockMiddleware {
+        integration,
+        phase,
+        name,
+    };
+    vec![
+        row(prebid::builder().id(), Fetch, prebid::MODULE),
+        // Core registers its script proxy under the module's own name.
+        row(js_asset_proxy::MODULE, Fetch, js_asset_proxy::MODULE),
+        row(testlight::builder().id(), Fetch, testlight::MODULE),
+        row(nextjs::builder().id(), Fetch, nextjs::MODULE),
+        row(permutive::builder().id(), Fetch, permutive::MODULE),
+        row(lockr::builder().id(), Fetch, lockr::MODULE),
+        row(didomi::builder().id(), Fetch, didomi::MODULE),
+        row(sourcepoint::builder().id(), Fetch, sourcepoint::MODULE),
+        row(
+            google_tag_manager::builder().id(),
+            Fetch,
+            google_tag_manager::MODULE,
+        ),
+        row(datadome::builder().id(), Fetch, datadome::MODULE),
+        row(datadome::builder().id(), Serve, datadome::TAG_MIDDLEWARE),
+        row(google::builder().id(), Fetch, google::MODULE),
+        row(
+            google::diagnostics::builder().id(),
+            Serve,
+            google::diagnostics::MODULE,
+        ),
+    ]
+}
+
+/// The names of the middleware that the stock modules with the integration
+/// ids `ids` supply for `phase`, in the order an entry names them.
+///
+/// A tool that knows a module by its integration id, as the `ts` audit does
+/// from what it finds on a page, writes the entry that places the module's
+/// page changes with this and names no middleware itself.
+#[must_use]
+pub fn middleware_for(ids: &[&str], phase: MiddlewarePhase) -> Vec<&'static str> {
+    middleware()
+        .into_iter()
+        .filter(|row| row.phase == phase && ids.contains(&row.integration))
+        .map(|row| row.name)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use trusted_server_core::integrations::IntegrationBuilder;
+    use trusted_server_core::integrations::{IntegrationBuilder, IntegrationRegistry};
+    use trusted_server_core::middleware::MiddlewarePhase;
 
-    use super::{builders, builders_with, selection_of};
+    use super::{builders, builders_with, middleware, middleware_for, selection_of};
+
+    /// The settings each stock module's recorded page is made with, which
+    /// select the module and place every middleware it supplies.
+    const PAGE_SETTINGS: &[&str] = &[
+        include_str!("../../auction/prebid/src/fixtures/page-change.settings.toml"),
+        include_str!(
+            "../../trusted-server-core/src/integrations/fixtures/js-asset-proxy.settings.toml"
+        ),
+        include_str!("../../testing/testlight/src/fixtures/page-change.settings.toml"),
+        include_str!("../../framework/nextjs/src/fixtures/page-change.settings.toml"),
+        include_str!("../../audience/permutive/src/fixtures/page-change.settings.toml"),
+        include_str!("../../identity/lockr/src/fixtures/page-change.settings.toml"),
+        include_str!("../../cmp/didomi/src/fixtures/page-change.settings.toml"),
+        include_str!("../../cmp/sourcepoint/src/fixtures/page-change.settings.toml"),
+        include_str!("../../tag/google-tag-manager/src/fixtures/page-change.settings.toml"),
+        include_str!("../../bot-protection/datadome/src/fixtures/page-change.settings.toml"),
+        include_str!("../../ad-tag/google/src/fixtures/page-change.settings.toml"),
+    ];
+
+    #[test]
+    fn the_listed_middleware_are_the_ones_the_modules_register() {
+        let listed = middleware();
+        let mut checked: Vec<&str> = Vec::new();
+
+        for module_settings in PAGE_SETTINGS {
+            let settings =
+                trusted_server_core::html_processor::test_support::page_settings(module_settings);
+            let registry = IntegrationRegistry::with_registrations(&settings, &builders())
+                .expect("should build a registry from a recorded page's settings");
+            let running: Vec<&str> = registry
+                .registered_integrations()
+                .iter()
+                .map(|integration| integration.id)
+                .collect();
+
+            for phase in MiddlewarePhase::ALL {
+                let expected: Vec<&str> = listed
+                    .iter()
+                    .filter(|row| row.phase == phase && running.contains(&row.integration))
+                    .map(|row| row.name)
+                    .collect();
+                assert_eq!(
+                    registry.middleware_in(phase),
+                    expected,
+                    "should list for {phase} what the modules {running:?} register for it"
+                );
+            }
+            checked.extend(running);
+        }
+
+        for row in &listed {
+            assert!(
+                checked.contains(&row.integration),
+                "should check `{}` against a module that registers it, and none of the \
+                 recorded pages runs `{}`",
+                row.name,
+                row.integration
+            );
+        }
+    }
+
+    #[test]
+    fn the_listed_middleware_follow_the_order_the_modules_register_in() {
+        // What registers from the auction plan goes first, core's own module
+        // is the first a section selects, and the stock modules follow.
+        let mut order = vec![
+            trusted_server_auction_prebid::builder().id(),
+            trusted_server_core::integrations::js_asset_proxy::MODULE,
+        ];
+        for builder in builders() {
+            if !order.contains(&builder.id()) {
+                order.push(builder.id());
+            }
+        }
+        let place = |integration: &str| {
+            order
+                .iter()
+                .position(|id| *id == integration)
+                .unwrap_or_else(|| panic!("`{integration}` should be a stock module"))
+        };
+
+        for phase in MiddlewarePhase::ALL {
+            let places: Vec<usize> = middleware()
+                .iter()
+                .filter(|row| row.phase == phase)
+                .map(|row| place(row.integration))
+                .collect();
+            assert!(
+                places.is_sorted(),
+                "should list the {phase} middleware in the order their modules register: \
+                 {places:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_template_s_entries_name_the_listed_middleware() {
+        use trusted_server_core::settings::Settings;
+        use trusted_server_core::test_support::template::{
+            template_with_resolved_required_secrets, uncomment_block,
+        };
+
+        let template = uncomment_block(
+            &uncomment_block(&template_with_resolved_required_secrets(), "[[fetch]]"),
+            "[[serve]]",
+        );
+        let settings =
+            Settings::from_toml(&template).expect("should load the template with its entries");
+
+        for phase in MiddlewarePhase::ALL {
+            let listed: Vec<&str> = middleware()
+                .iter()
+                .filter(|row| row.phase == phase)
+                .map(|row| row.name)
+                .collect();
+            let entries = settings.phase_entries(phase).entries();
+            assert_eq!(
+                entries.len(),
+                1,
+                "should document one [[{phase}]] entry for every page"
+            );
+            assert!(
+                entries[0].path.is_none(),
+                "should document the [[{phase}]] entry that covers every page"
+            );
+            assert_eq!(
+                entries[0].middleware, listed,
+                "should document every {phase} middleware the stock modules supply, in the \
+                 listed order"
+            );
+        }
+    }
+
+    #[test]
+    fn the_guide_s_table_lists_the_same_middleware() {
+        const GUIDE: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/guide/configuration.md"
+        ));
+
+        // A row of the table is a name and then the list it is written in.
+        let documented: Vec<(String, String)> = GUIDE
+            .lines()
+            .filter_map(|line| {
+                let mut cells = line.split('|').map(str::trim).skip(1);
+                let name = cells.next()?.strip_prefix('`')?.strip_suffix('`')?;
+                let list = cells.next()?.strip_prefix("`[[")?.strip_suffix("]]`")?;
+                Some((name.to_owned(), list.to_owned()))
+            })
+            .collect();
+        let listed: Vec<(String, String)> = middleware()
+            .iter()
+            .map(|row| (row.name.to_owned(), row.phase.to_string()))
+            .collect();
+
+        assert_eq!(
+            documented, listed,
+            "should document the middleware the stock modules supply, each with its phase, \
+             in the listed order"
+        );
+    }
+
+    #[test]
+    fn a_tool_is_handed_a_module_s_middleware_by_its_integration_id() {
+        use trusted_server_bot_protection_datadome as datadome;
+        use trusted_server_cmp_didomi as didomi;
+
+        let ids = [datadome::builder().id(), didomi::builder().id()];
+
+        assert_eq!(
+            middleware_for(&ids, MiddlewarePhase::Fetch),
+            [didomi::MODULE, datadome::MODULE],
+            "should name the modules' fetch middleware in the order an entry runs them, \
+             whatever order the ids came in"
+        );
+        assert_eq!(
+            middleware_for(&ids, MiddlewarePhase::Serve),
+            [datadome::TAG_MIDDLEWARE],
+            "should name the one serve middleware the two supply"
+        );
+        assert!(
+            middleware_for(&["no_such_module"], MiddlewarePhase::Fetch).is_empty(),
+            "should name nothing for an id no stock module has"
+        );
+    }
 
     #[test]
     fn stock_modules_are_offered_in_hook_order() {

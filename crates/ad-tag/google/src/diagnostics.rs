@@ -16,8 +16,10 @@ use validator::Validate;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::http_util::is_navigation_request;
 use trusted_server_core::integrations::{
-    IntegrationBuilder, IntegrationHeadInjector, IntegrationHtmlContext, IntegrationRegistration,
-    IntegrationRequestState,
+    IntegrationBuilder, IntegrationDocumentState, IntegrationRegistration, IntegrationRequestState,
+};
+use trusted_server_core::middleware::{
+    Middleware, MiddlewareAction, MiddlewareContext, MiddlewarePhase,
 };
 use trusted_server_core::response_privacy::enforce_terminal_private_cache_privacy;
 use trusted_server_core::settings::{IntegrationConfig, Settings};
@@ -255,44 +257,51 @@ pub fn register(
     Ok(Some(
         IntegrationRegistration::builder(GPT_DIAGNOSTICS_INTEGRATION_ID)
             .with_standalone_js()
-            .with_head_injector(Arc::new(DiagnosticsHead))
+            .with_middleware(Arc::new(DiagnosticsHead))
             .build(),
     ))
 }
 
-/// Writes what an active decision adds to a document's head.
+/// Writes what an active decision adds to a reader's copy of a document, on
+/// the pages a `[[serve]]` entry names [`MODULE`] for.
+///
+/// It runs for each reader, and not once for a stored page, because the
+/// decision is made for one request.
 struct DiagnosticsHead;
 
 impl DiagnosticsHead {
     /// The decision the preparer left for this document, when it left one.
-    fn decision(ctx: &IntegrationHtmlContext<'_>) -> Option<Arc<GptDiagnosticsRequestDecision>> {
-        ctx.document_state
-            .get::<GptDiagnosticsRequestDecision>(GPT_DIAGNOSTICS_INTEGRATION_ID)
+    fn decision(
+        document_state: &IntegrationDocumentState,
+    ) -> Option<Arc<GptDiagnosticsRequestDecision>> {
+        document_state.get::<GptDiagnosticsRequestDecision>(GPT_DIAGNOSTICS_INTEGRATION_ID)
     }
 }
 
-impl IntegrationHeadInjector for DiagnosticsHead {
-    fn integration_id(&self) -> &'static str {
-        GPT_DIAGNOSTICS_INTEGRATION_ID
+impl Middleware for DiagnosticsHead {
+    fn middleware_id(&self) -> &'static str {
+        MODULE
     }
 
-    fn head_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-        Self::decision(ctx)
-            .and_then(|decision| decision.bootstrap_script())
-            .into_iter()
-            .collect()
+    fn phases(&self) -> &[MiddlewarePhase] {
+        &[MiddlewarePhase::Serve]
     }
 
-    /// The module loads synchronously after the bundle, so its listeners are
-    /// in place before the publisher's scripts in the origin head run.
-    fn after_bundle_inserts(&self, ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
-        Self::decision(ctx)
-            .and_then(|decision| {
-                JsModulePart::compile_time(GPT_DIAGNOSTICS_INTEGRATION_ID)
-                    .and_then(|module| decision.module_script_tag(&module))
-            })
-            .into_iter()
-            .collect()
+    /// The bootstrap goes ahead of the bundle. The module loads synchronously
+    /// after the bundle, so its listeners are in place before the publisher's
+    /// scripts in the origin head run.
+    fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction {
+        let Some(decision) = Self::decision(context.document_state) else {
+            return MiddlewareAction::pass();
+        };
+        MiddlewareAction {
+            head_inserts: decision.bootstrap_script().into_iter().collect(),
+            after_bundle_inserts: JsModulePart::compile_time(GPT_DIAGNOSTICS_INTEGRATION_ID)
+                .and_then(|module| decision.module_script_tag(&module))
+                .into_iter()
+                .collect(),
+            ..MiddlewareAction::pass()
+        }
     }
 }
 
@@ -511,9 +520,16 @@ mod tests {
     use trusted_server_core::integrations::IntegrationRegistry;
     use trusted_server_core::test_support::tests::create_test_settings;
 
+    /// Settings that select the module and run its middleware on every
+    /// reader's copy of a page.
     fn settings() -> Settings {
         let mut settings = create_test_settings();
         settings.select_module("ad-tag", "ad-tag.google.diagnostics");
+        trusted_server_core::html_processor::test_support::place_on_every_page(
+            &mut settings,
+            MiddlewarePhase::Serve,
+            &[MODULE],
+        );
         settings
     }
 
@@ -826,7 +842,8 @@ mod tests {
 
     #[test]
     fn an_active_document_loads_the_module_after_the_unified_bundle_once() {
-        use trusted_server_core::html_processor::{HtmlProcessorConfig, create_html_processor};
+        use trusted_server_core::html_processor::HtmlProcessorConfig;
+        use trusted_server_core::html_processor::test_support::create_page_processor;
         use trusted_server_core::streaming_processor::StreamProcessor as _;
 
         let settings = settings();
@@ -846,7 +863,7 @@ mod tests {
             "https",
         )
         .with_request_state(IntegrationRequestState::of(&request));
-        let mut processor = create_html_processor(config);
+        let mut processor = create_page_processor(&settings, &registry, config);
 
         let output = processor
             .process_chunk(
@@ -895,7 +912,8 @@ mod tests {
 
     #[test]
     fn an_inactive_document_gets_neither_script() {
-        use trusted_server_core::html_processor::{HtmlProcessorConfig, create_html_processor};
+        use trusted_server_core::html_processor::HtmlProcessorConfig;
+        use trusted_server_core::html_processor::test_support::create_page_processor;
         use trusted_server_core::streaming_processor::StreamProcessor as _;
 
         let settings = settings();
@@ -911,7 +929,7 @@ mod tests {
             "https",
         )
         .with_request_state(IntegrationRequestState::of(&request));
-        let mut processor = create_html_processor(config);
+        let mut processor = create_page_processor(&settings, &registry, config);
 
         let output = processor
             .process_chunk(

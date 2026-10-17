@@ -1,0 +1,9 @@
+[demand]
+modules = ["aps_main"]
+
+[demand.aps_main]
+implementation = "auction.aps"
+endpoint = "https://aps.example.com/e/pb/bid"
+routing = "all_eligible"
+account_id = "example-aps-account-id"
+rendering_mode = "publisher_native"

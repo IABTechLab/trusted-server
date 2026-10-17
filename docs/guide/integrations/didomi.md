@@ -79,7 +79,10 @@ This serves Didomi at `/my-custom-consent/*`. The path:
 - may start with `/`; Trusted Server normalizes the leading slash.
 
 Trusted Server passes the resolved path to its browser bundle through
-`window.__tsjs_didomi.proxyPath`.
+`window.__tsjs_didomi.proxyPath`. The script that sets it is the middleware
+`cmp.didomi`, which runs on the pages a `[[fetch]]` entry names it for, so
+name it for every page that loads Didomi. See
+[Placing page changes](/guide/configuration#placing-page-changes).
 
 ## Notice-loader geo flow
 

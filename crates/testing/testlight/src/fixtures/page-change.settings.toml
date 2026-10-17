@@ -1,0 +1,11 @@
+[auction]
+modules = ["testing.testlight"]
+
+[auction.testing.testlight]
+endpoint = "https://example.com/openrtb2/auction"
+rewrite_scripts = true
+shim_src = "https://edge.example.com/static/testlight.js"
+
+[[fetch]]
+media_type = "text/html"
+middleware = ["testing.testlight"]

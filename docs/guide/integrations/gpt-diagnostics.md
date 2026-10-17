@@ -36,6 +36,17 @@ The module is unavailable unless the deployment names it:
 modules = ["google.diagnostics"]
 ```
 
+What the module writes into a page is the serve middleware `ad-tag.google.diagnostics`,
+which runs on each reader's copy of the pages a `[[serve]]` entry names it for:
+
+```toml
+[[serve]]
+media_type = "text/html"
+middleware = ["ad-tag.google.diagnostics"]
+```
+
+See [Placing page changes](/guide/configuration#placing-page-changes).
+
 Deployment configuration makes the module available; it does not activate any browser
 session. Inactive browser sessions receive no diagnostics module. When activated, the
 standalone content-hashed module loads synchronously after the core bundle so it can

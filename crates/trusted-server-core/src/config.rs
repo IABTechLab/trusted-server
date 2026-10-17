@@ -356,6 +356,7 @@ pub fn validate_settings_for_deploy_with(
     // The selection is checked first, so a block nothing runs is reported as
     // that rather than as whatever its unread settings fail next.
     settings.validate_module_sections()?;
+    settings.validate_phase_entries()?;
     validate_secret_key_references(settings, extra_integrations)?;
     validate_non_secret_deploy_placeholders(settings)?;
 

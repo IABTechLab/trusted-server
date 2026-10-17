@@ -1,0 +1,9 @@
+# The recording is compared byte for byte with the page made from the input
+# beside it, so both must arrive with the line endings they were committed
+# with on every platform.
+src/fixtures/page-change.*.html text eol=lf
+
+# The bootstrap script is embedded as it is on disk and written into the head
+# of every page, so it must arrive with the line endings it was committed
+# with on every platform.
+src/gpt_bootstrap.js text eol=lf

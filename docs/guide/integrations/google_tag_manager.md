@@ -130,7 +130,7 @@ flowchart TD
 
 ### 1. Script Rewriting
 
-When Trusted Server processes an HTML response, it automatically rewrites GTM script tags to point to the local proxy:
+On the pages a `[[fetch]]` entry names the middleware `tag.google-tag-manager` for, Trusted Server rewrites GTM script tags to point to the local proxy. See [Placing page changes](/guide/configuration#placing-page-changes).
 
 **Before:**
 

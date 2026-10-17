@@ -1,0 +1,13 @@
+[proxy]
+modules = ["js_asset_proxy"]
+
+[proxy.js_asset_proxy]
+
+[[proxy.js_asset_proxy.assets]]
+path = "/assets/example-vendor-loader.js"
+origin_url = "https://cdn.example.com/vendor-loader.js"
+proxy = "enabled"
+
+[[fetch]]
+media_type = "text/html"
+middleware = ["js_asset_proxy"]

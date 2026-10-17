@@ -46,6 +46,12 @@ secret_store_id = "secrets"
 [ad-tag]
 modules = ["google.diagnostics"]
 
+# What the overlay writes into a page is a serve middleware, which runs on
+# each reader's copy of the pages an entry names it for.
+[[serve]]
+media_type = "text/html"
+middleware = ["ad-tag.google.diagnostics"]
+
 [proxy]
 certificate_check = false
 

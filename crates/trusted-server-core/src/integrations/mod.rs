@@ -20,15 +20,12 @@ mod registry;
 #[cfg(test)]
 pub(crate) use registry::test_support as registry_test_support;
 pub use registry::{
-    AttributeRewriteAction, AttributeRewriteOutcome, CarriedJsModule, HeaderMutation,
-    HeaderMutationMode, IntegrationAttributeContext, IntegrationAttributeRewriter,
-    IntegrationDocumentState, IntegrationEndpoint, IntegrationHeadInjector, IntegrationHtmlContext,
-    IntegrationHtmlStreamContext, IntegrationHtmlStreamProcessorFactory, IntegrationMetadata,
-    IntegrationProxy, IntegrationRegistration, IntegrationRegistrationBuilder, IntegrationRegistry,
-    IntegrationRequestFilter, IntegrationRequestState, IntegrationScriptContext,
-    IntegrationScriptRewriter, ProxyDispatchInput, RequestFilterDecision, RequestFilterEffects,
-    RequestFilterInput, RequestFilterRegistryInput, RequestFilterRegistryOutcome,
-    ScriptRewriteAction, ScriptTextAccumulator,
+    AttributeRewriteAction, CarriedJsModule, HeaderMutation, HeaderMutationMode,
+    IntegrationDocumentState, IntegrationEndpoint, IntegrationMetadata, IntegrationProxy,
+    IntegrationRegistration, IntegrationRegistrationBuilder, IntegrationRegistry,
+    IntegrationRequestFilter, IntegrationRequestState, ProxyDispatchInput, RequestFilterDecision,
+    RequestFilterEffects, RequestFilterInput, RequestFilterRegistryInput,
+    RequestFilterRegistryOutcome, ScriptRewriteAction,
 };
 
 /// Registers or retrieves a platform backend for the given URL.
@@ -697,10 +694,10 @@ impl IntegrationBuilder {
     }
 }
 
-/// The built-in integrations, in hook order.
+/// The built-in integrations, in the order `trusted-server-modules` lists them.
 const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
-    // This must remain the first module a section selects: attribute
-    // rewriters chain replacements and short-circuit removals.
+    // This stays the first module a section selects, so its middleware is
+    // the first of theirs in the order the registry lists them.
     js_asset_proxy::BUILDER,
     // A stand-in for an integration that streams, which core's own tests
     // select where they need one.
@@ -717,6 +714,10 @@ const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
     // the same tests.
     #[cfg(test)]
     registry_test_support::deferred_fixture::BUILDER,
+    // A stand-in for a module that changes a page through middleware, for
+    // the same tests.
+    #[cfg(test)]
+    registry_test_support::middleware_fixture::BUILDER,
     // A stand-in for the plainest demand implementation there can be, which
     // core's own tests name where they need a source.
     #[cfg(test)]
@@ -743,13 +744,14 @@ const BUILT_IN_BUILDERS: &[IntegrationBuilder] = &[
     .with_adserver(&crate::auction::test_support::adserver_fixture::ADSERVER),
 ];
 
-/// The built-in integration builders, in hook order.
+/// The built-in integration builders, in the order `trusted-server-modules`
+/// lists them.
 pub(crate) fn builders() -> &'static [IntegrationBuilder] {
     BUILT_IN_BUILDERS
 }
 
 /// Every builder the registry will consider: the built-in set followed by
-/// `extra`, in that order, so hook order for the built-ins never changes.
+/// `extra`, in that order, so the built-ins keep their order.
 pub(crate) fn all_builders(
     extra: &[IntegrationBuilder],
 ) -> impl Iterator<Item = IntegrationBuilder> + '_ {
