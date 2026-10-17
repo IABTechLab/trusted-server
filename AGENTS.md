@@ -23,6 +23,7 @@ crates/
   trusted-server-cli/                   # Host-target `ts` operator CLI
   trusted-server-modules/               # the modules a stock build ships, in the order their hooks run
   ad-server/                            # ad server implementation crates (mock)
+  ads-txt/                              # ads.txt line module crates (sellers)
   ad-tag/                               # ad tag module crates (google, which holds its diagnostics module too)
   auction/                              # auction module crates (aps, prebid, prebid-server)
   audience/                             # audience module crates (permutive)

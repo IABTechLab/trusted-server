@@ -18,7 +18,7 @@
 )]
 
 use trusted_server_core::integrations::IntegrationBuilder;
-use trusted_server_core::middleware::MiddlewarePhase;
+use trusted_server_core::middleware::{HTML_MEDIA_TYPE, MiddlewarePhase};
 
 /// The builders of the modules a stock build ships from crates of their own,
 /// in hook order.
@@ -40,6 +40,7 @@ pub fn builders() -> Vec<IntegrationBuilder> {
         trusted_server_bot_protection_datadome::builder(),
         trusted_server_ad_tag_google::builder(),
         trusted_server_ad_tag_google::diagnostics::builder(),
+        trusted_server_ads_txt_sellers::builder(),
         // Implementations `[demand]` and `[ad-server]` can name, which no
         // section selects.
         trusted_server_auction_protocol_openrtb::builder(),
@@ -81,6 +82,8 @@ pub struct StockMiddleware {
     pub integration: &'static str,
     /// The phase it runs in.
     pub phase: MiddlewarePhase,
+    /// The media type it works on, which an entry naming it covers.
+    pub media_type: &'static str,
     /// The name an entry writes.
     pub name: &'static str,
 }
@@ -96,6 +99,7 @@ pub struct StockMiddleware {
 pub fn middleware() -> Vec<StockMiddleware> {
     use MiddlewarePhase::{Fetch, Serve};
     use trusted_server_ad_tag_google as google;
+    use trusted_server_ads_txt_sellers as ads_txt_sellers;
     use trusted_server_auction_prebid as prebid;
     use trusted_server_audience_permutive as permutive;
     use trusted_server_bot_protection_datadome as datadome;
@@ -112,6 +116,7 @@ pub fn middleware() -> Vec<StockMiddleware> {
     let row = |integration, phase, name| StockMiddleware {
         integration,
         phase,
+        media_type: HTML_MEDIA_TYPE,
         name,
     };
     vec![
@@ -138,14 +143,22 @@ pub fn middleware() -> Vec<StockMiddleware> {
             Serve,
             google::diagnostics::MODULE,
         ),
+        StockMiddleware {
+            integration: ads_txt_sellers::builder().id(),
+            phase: Fetch,
+            media_type: ads_txt_sellers::MEDIA_TYPE,
+            name: ads_txt_sellers::MODULE,
+        },
         // Core writes the platform's service version where a serve entry
         // names it.
         row(service_version::MODULE, Serve, service_version::MODULE),
     ]
 }
 
-/// The names of the middleware that the stock modules with the integration
-/// ids `ids` supply for `phase`, in the order an entry names them.
+/// The names of the page middleware that the stock modules with the
+/// integration ids `ids` supply for `phase`, in the order an entry names
+/// them. A middleware for a media type other than HTML is left out, because
+/// the entry a tool writes covers every page.
 ///
 /// A tool that knows a module by its integration id, as the `ts` audit does
 /// from what it finds on a page, writes the entry that places the module's
@@ -154,7 +167,11 @@ pub fn middleware() -> Vec<StockMiddleware> {
 pub fn middleware_for(ids: &[&str], phase: MiddlewarePhase) -> Vec<&'static str> {
     middleware()
         .into_iter()
-        .filter(|row| row.phase == phase && ids.contains(&row.integration))
+        .filter(|row| {
+            row.phase == phase
+                && row.media_type == HTML_MEDIA_TYPE
+                && ids.contains(&row.integration)
+        })
         .map(|row| row.name)
         .collect()
 }
@@ -162,7 +179,7 @@ pub fn middleware_for(ids: &[&str], phase: MiddlewarePhase) -> Vec<&'static str>
 #[cfg(test)]
 mod tests {
     use trusted_server_core::integrations::{IntegrationBuilder, IntegrationRegistry};
-    use trusted_server_core::middleware::MiddlewarePhase;
+    use trusted_server_core::middleware::{HTML_MEDIA_TYPE, MiddlewarePhase};
 
     use super::{builders, builders_with, middleware, middleware_for, selection_of};
 
@@ -183,6 +200,7 @@ mod tests {
         include_str!("../../tag/google-tag-manager/src/fixtures/page-change.settings.toml"),
         include_str!("../../bot-protection/datadome/src/fixtures/page-change.settings.toml"),
         include_str!("../../ad-tag/google/src/fixtures/page-change.settings.toml"),
+        include_str!("../../ads-txt/sellers/src/fixtures/sellers.settings.toml"),
     ];
 
     #[test]
@@ -278,26 +296,40 @@ mod tests {
             Settings::from_toml(&template).expect("should load the template with its entries");
 
         for phase in MiddlewarePhase::ALL {
-            let listed: Vec<&str> = middleware()
-                .iter()
-                .filter(|row| row.phase == phase)
-                .map(|row| row.name)
-                .collect();
             let entries = settings.phase_entries(phase).entries();
-            assert_eq!(
-                entries.len(),
-                1,
-                "should document one [[{phase}]] entry for every page"
-            );
-            assert!(
-                entries[0].path.is_none(),
-                "should document the [[{phase}]] entry that covers every page"
-            );
-            assert_eq!(
-                entries[0].middleware, listed,
-                "should document every {phase} middleware the stock modules supply, in the \
-                 listed order"
-            );
+            let mut media_types: Vec<&str> = Vec::new();
+            for row in middleware().iter().filter(|row| row.phase == phase) {
+                if !media_types.contains(&row.media_type) {
+                    media_types.push(row.media_type);
+                }
+            }
+            for media_type in media_types {
+                let listed: Vec<&str> = middleware()
+                    .iter()
+                    .filter(|row| row.phase == phase && row.media_type == media_type)
+                    .map(|row| row.name)
+                    .collect();
+                let covering: Vec<_> = entries
+                    .iter()
+                    .filter(|entry| entry.media_type == media_type)
+                    .collect();
+                assert_eq!(
+                    covering.len(),
+                    1,
+                    "should document one [[{phase}]] entry for {media_type}"
+                );
+                if media_type == HTML_MEDIA_TYPE {
+                    assert!(
+                        covering[0].path.is_none(),
+                        "should document the [[{phase}]] entry that covers every page"
+                    );
+                }
+                assert_eq!(
+                    covering[0].middleware, listed,
+                    "should document every {phase} middleware the stock modules supply for \
+                     {media_type}, in the listed order"
+                );
+            }
         }
     }
 
@@ -385,6 +417,7 @@ mod tests {
                 "bot-protection.datadome",
                 "ad-tag.google",
                 "ad-tag.google.diagnostics",
+                "ads-txt.sellers",
                 "auction-protocol.openrtb",
                 "auction.prebid-server",
                 "auction.aps",
