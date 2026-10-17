@@ -611,7 +611,7 @@ fn a_visitor_in_the_eu_with_no_record_is_awaiting_what_tcf_could_grant() {
 
 #[test]
 fn a_pmp_answer_in_the_eu_settles_what_the_model_terms_cover_and_declares_them() {
-    use trusted_server_core::constants::COOKIE_MTM_PREF;
+    use trusted_server_permission_signal_mtm::COOKIE_MTM_PREF;
 
     let geo = GeoInfo {
         city: String::new(),
