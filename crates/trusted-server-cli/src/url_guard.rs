@@ -1,8 +1,8 @@
-//! Transport checks shared by the commands that send an operator's credentials to a URL.
+//! Transport checks for any command that sends an operator's credentials to a URL.
 //!
 //! One implementation rather than one per command: a second copy is a second place for the
 //! loopback exemption to drift, and every command that gets this wrong sends a session
-//! cookie or an admin password over the wire in the clear.
+//! cookie over the wire in the clear.
 
 use crate::error::{CliResult, cli_error};
 

@@ -90,7 +90,6 @@ write_runtime_config() {
     fi
     CLOUDFLARE_SMOKE_CONFIG_LINE="$config_line" awk \
         -v missing_key="$missing_key" \
-        -v handler="$SMOKE_HANDLER_VALUE" \
         -v proxy="$SMOKE_PROXY_VALUE" \
         -v ec="$SMOKE_EC_VALUE" '
         BEGIN {
@@ -108,9 +107,6 @@ write_runtime_config() {
             if (placeholders != 1) {
                 print "Cloudflare smoke template must contain one config placeholder" > "/dev/stderr"
                 exit 1
-            }
-            if (missing_key != "handler_password") {
-                print "handler_password = \"" handler "\""
             }
             if (missing_key != "publisher_proxy_secret") {
                 print "publisher_proxy_secret = \"" proxy "\""
@@ -160,7 +156,7 @@ run_case() {
             smoke_die "negative case unexpectedly exposed $missing_binding"
         fi
         if [ "$missing_binding" = "env.TRUSTED_SERVER_CONFIG" ]; then
-            grep --fixed-strings --quiet 'env.handler_password' "$log_path" ||
+            grep --fixed-strings --quiet 'env.publisher_proxy_secret' "$log_path" ||
                 smoke_die "missing-config case did not retain the secret control binding"
         else
             grep --fixed-strings --quiet 'env.TRUSTED_SERVER_CONFIG' "$log_path" ||
@@ -178,15 +174,12 @@ run_case() {
 run_case missing-config "$BASE_PORT" "" "" 500 \
     'env.TRUSTED_SERVER_CONFIG' \
     'Cloudflare TRUSTED_SERVER_CONFIG is required'
-run_case missing-handler "$((BASE_PORT + 1))" "$CONFIG_JSON" handler_password 500 \
-    'env.handler_password' \
-    "failed to resolve secret reference at \`handlers[0].password\` from secret store \`trusted_server_secrets\`"
-run_case missing-proxy "$((BASE_PORT + 2))" "$CONFIG_JSON" publisher_proxy_secret 500 \
+run_case missing-proxy "$((BASE_PORT + 1))" "$CONFIG_JSON" publisher_proxy_secret 500 \
     'env.publisher_proxy_secret' \
     "failed to resolve secret reference at \`publisher.proxy_secret\` from secret store \`trusted_server_secrets\`"
-run_case missing-ec "$((BASE_PORT + 3))" "$CONFIG_JSON" ec_passphrase 500 \
+run_case missing-ec "$((BASE_PORT + 2))" "$CONFIG_JSON" ec_passphrase 500 \
     'env.ec_passphrase' \
     "failed to resolve secret reference at \`ec.passphrase\` from secret store \`trusted_server_secrets\`"
-run_case positive "$((BASE_PORT + 4))" "$CONFIG_JSON" "" 200 "" ""
+run_case positive "$((BASE_PORT + 3))" "$CONFIG_JSON" "" 200 "" ""
 
 echo "Cloudflare first-success smoke passed"

@@ -43,7 +43,8 @@ pub const CONFIG_PATHS: [&str; 2] = [CONFIG_PAGE_PATH, CONFIG_JSON_PATH];
 const NOT_PUBLISHED: &str = "This publisher does not publish its configuration.";
 
 const PATTERN_FORM: &str = "A pattern is keys joined by `.`, with `[]` for every element of a \
-                            list or `[N]` for one, such as `handlers[0].path`";
+                            list or `[N]` for one, such as \
+                            `proxy.asset_routes[0].origin_url`";
 
 /// The `[inspect]` section, which says what the configuration page shows.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -91,7 +92,8 @@ pub enum PathStep {
     Index(usize),
 }
 
-/// A concrete path written the way a pattern is, such as `handlers[0].path`.
+/// A concrete path written the way a pattern is, such as
+/// `proxy.asset_routes[0].origin_url`.
 #[must_use]
 pub fn render_path(steps: &[PathStep]) -> String {
     let mut out = String::new();
@@ -120,7 +122,7 @@ enum PatternStep {
 
 /// Values in the view named by keys joined by `.`, with `[]` for every
 /// element of a list and `[N]` for one, such as
-/// `proxy.asset_routes[].origin_url` or `handlers[0].path`.
+/// `proxy.asset_routes[].origin_url` or `proxy.asset_routes[0].prefix`.
 ///
 /// A pattern names the values at exactly its own depth. A key holding `.`,
 /// `[` or `]` cannot be named.

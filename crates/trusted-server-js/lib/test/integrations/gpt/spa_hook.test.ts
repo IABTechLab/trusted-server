@@ -782,9 +782,9 @@ describe('installSpaAuctionHook', () => {
   });
 
   it('falls back to the deprecated alias when the canonical path is behind Basic Auth', async () => {
-    // An operator `[[handlers]]` regex broad enough to cover `/_ts` answers the
-    // canonical path with 401 that no anonymous browser fetch can satisfy.
-    // Without the fallback, every SPA navigation on that deployment loses ads.
+    // A gate in front of the service that covers `/_ts` answers the canonical
+    // path with 401 that no anonymous browser fetch can satisfy. Without the
+    // fallback, every SPA navigation on that deployment loses ads.
     document.body.innerHTML = '<div id="div-s1"></div>';
     fetchStub.mockResolvedValueOnce({ ok: false, status: 401 }).mockResolvedValueOnce({
       ok: true,

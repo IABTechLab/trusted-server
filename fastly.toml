@@ -45,11 +45,7 @@ build = """
             key = "ts-2025-10-A"
             data = "NVnTYrw5xoyTJDOwoUWoPJO3A6UCCXOJJUzgGTxxx7k="
 
-        [[local_server.secret_stores.api-keys]]
-            key = "api_key"
-            env = "FASTLY_KEY"
-
-        # Local-only values for the three secret references in
+        # Local-only values for the two secret references in
         # trusted-server.example.toml. These are public development fixtures.
         # App-config references use logical `trusted_server_secrets`. Viceroy
         # exposes the store under that ID, matching the resource link a
@@ -61,10 +57,6 @@ build = """
         [[local_server.secret_stores.trusted_server_secrets]]
             key = "ec_passphrase"
             data = "local-only-ec-passphrase-32-bytes"
-
-        [[local_server.secret_stores.trusted_server_secrets]]
-            key = "handler_password"
-            data = "local-only-handler-password"
 
         [[local_server.secret_stores.trusted_server_secrets]]
             key = "tinybird_auction_append_token"

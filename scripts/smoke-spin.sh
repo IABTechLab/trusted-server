@@ -54,7 +54,6 @@ sed \
     -e "s|manifest = \"$REPO_ROOT/crates/trusted-server-adapter-spin/spin.toml\"|manifest = \"$SPIN_WORK/spin.toml\"|" \
     "$REPO_ROOT/edgezero.toml" >"$WORKSPACE/edgezero.toml"
 
-SPIN_HANDLER_VAR=v_trusted_x5fserver_x5fsecrets_v_handler_x5fpassword
 SPIN_PROXY_VAR=v_trusted_x5fserver_x5fsecrets_v_publisher_x5fproxy_x5fsecret
 SPIN_EC_VAR=v_trusted_x5fserver_x5fsecrets_v_ec_x5fpassphrase
 
@@ -76,9 +75,6 @@ run_case() {
         --truncate-logs
     )
     smoke_assert_process_alive "$ORIGIN_PID" "stub origin" "$WORKSPACE/origin.log"
-    if [ "$missing_variable" != "$SPIN_HANDLER_VAR" ]; then
-        spin_args+=(--variable "$SPIN_HANDLER_VAR=$SMOKE_HANDLER_VALUE")
-    fi
     if [ "$missing_variable" != "$SPIN_PROXY_VAR" ]; then
         spin_args+=(--variable "$SPIN_PROXY_VAR=$SMOKE_PROXY_VALUE")
     fi
@@ -127,12 +123,10 @@ EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=default \
     --no-diff
 CONFIG_PUSHED=true
 
-run_case missing-handler "$((BASE_PORT + 1))" "$SPIN_HANDLER_VAR" 503 \
-    "resolved secret at \`handlers[0].password\` must not be empty"
-run_case missing-proxy "$((BASE_PORT + 2))" "$SPIN_PROXY_VAR" 503 \
+run_case missing-proxy "$((BASE_PORT + 1))" "$SPIN_PROXY_VAR" 503 \
     "resolved secret at \`publisher.proxy_secret\` must not be empty"
-run_case missing-ec "$((BASE_PORT + 3))" "$SPIN_EC_VAR" 503 \
+run_case missing-ec "$((BASE_PORT + 2))" "$SPIN_EC_VAR" 503 \
     "resolved secret at \`ec.passphrase\` must not be empty"
-run_case positive "$((BASE_PORT + 4))" "" 200
+run_case positive "$((BASE_PORT + 3))" "" 200
 
 echo "Spin first-success smoke passed"

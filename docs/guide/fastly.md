@@ -447,11 +447,10 @@ Run the repository smoke from a clean shell:
 
 The script creates an isolated application config, applies its publisher-origin
 overrides, and runs strict validation. It then executes `ts config push
---adapter fastly --local`, adds all three required entries to
+--adapter fastly --local`, adds both required entries to
 `[local_server.secret_stores.trusted_server_secrets]`, and starts
-`fastly compute serve`
-through Viceroy. The required keys are `handler_password`,
-`publisher_proxy_secret`, and `ec_passphrase`.
+`fastly compute serve` through Viceroy. The required keys are
+`publisher_proxy_secret` and `ec_passphrase`.
 
 The check deliberately proves both halves of startup. With no config entry, it
 requires `/health` to return 200 while the publisher route returns 500 with the

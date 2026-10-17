@@ -6,9 +6,8 @@ use super::*;
 use crate::config_payload::settings_from_config_blob_with;
 use crate::integrations::{IntegrationBuilder, ModuleSecretSetting};
 use crate::platform::{PlatformError, PlatformSecretStore, StoreId, StoreName};
-use crate::redacted::Redacted;
 use crate::secret_resolution::ResolvedSecrets;
-use crate::settings::{ProxyAssetRoute, RequestSigning};
+use crate::settings::ProxyAssetRoute;
 use crate::test_support::tests::crate_test_settings_str;
 
 /// Every value this store hands back starts with this, so a view can be
@@ -106,7 +105,7 @@ fn served(settings: &Settings) -> (String, String) {
     )
 }
 
-/// The value at a concrete path, such as `handlers[0].path`.
+/// The value at a concrete path, such as `proxy.asset_routes[0].origin_url`.
 fn at<'v>(value: &'v Value, path: &str) -> Option<&'v Value> {
     let pattern = PathPattern::parse(path).expect("a concrete path");
     let mut node = value;
@@ -143,7 +142,7 @@ fn unmarked(value: &Value) -> Value {
 #[test]
 fn a_pattern_names_keys_every_element_or_one_element() {
     let every = PathPattern::parse("proxy.asset_routes[].origin_url").expect("well formed");
-    let one = PathPattern::parse("handlers[1].path").expect("well formed");
+    let one = PathPattern::parse("proxy.asset_routes[1].origin_url").expect("well formed");
     let route = |index| {
         vec![
             PathStep::Key("proxy".to_owned()),
@@ -152,22 +151,15 @@ fn a_pattern_names_keys_every_element_or_one_element() {
             PathStep::Key("origin_url".to_owned()),
         ]
     };
-    let handler = |index| {
-        vec![
-            PathStep::Key("handlers".to_owned()),
-            PathStep::Index(index),
-            PathStep::Key("path".to_owned()),
-        ]
-    };
 
     assert!(every.matches(&route(0)) && every.matches(&route(7)));
-    assert!(one.matches(&handler(1)));
-    assert!(!one.matches(&handler(0)), "should name only its own index");
+    assert!(one.matches(&route(1)));
+    assert!(!one.matches(&route(0)), "should name only its own index");
     assert!(
         !every.matches(&route(0)[..3]),
         "should name only values at its own depth"
     );
-    assert_eq!(render_path(&handler(1)), "handlers[1].path");
+    assert_eq!(render_path(&route(1)), "proxy.asset_routes[1].origin_url");
 }
 
 #[test]
@@ -217,8 +209,6 @@ fn documents_holding_every_declared_secret() -> Vec<(&'static str, Value)> {
     let mut main = document("");
     main["publisher"]["proxy_secret"] = json!("proxy");
     main["ec"]["hmac"]["passphrase"] = json!("hmac");
-    main["handlers"][0]["password"] = json!("handler-0");
-    main["handlers"][1]["password"] = json!("handler-1");
     main["ec"]["partners"] = json!([{
         "name": "Example Partner",
         "source_domain": "partner.example.com",
@@ -356,11 +346,7 @@ fn settings_with_every_sensitive_field() -> (Settings, Vec<(&'static str, &'stat
             "proxy.asset_routes[0].origin_url",
             "https://bucket-canary.example.com",
         ),
-        ("handlers[0].path", "^/path-canary"),
-        ("handlers[0].username", "username-canary"),
         ("ec.ec_store", "identity-store-canary"),
-        ("request_signing.config_store_id", "config-store-canary"),
-        ("request_signing.secret_store_id", "secret-store-canary"),
         ("auction.creative_store", "creative-store-canary"),
     ];
     let value = |path: &str| {
@@ -378,14 +364,7 @@ fn settings_with_every_sensitive_field() -> (Settings, Vec<(&'static str, &'stat
         "/assets/",
         value("proxy.asset_routes[0].origin_url"),
     )];
-    settings.handlers[0].path = value("handlers[0].path");
-    settings.handlers[0].username = Redacted::new(value("handlers[0].username"));
     settings.ec.ec_store = Some(value("ec.ec_store"));
-    settings.request_signing = Some(RequestSigning {
-        enabled: false,
-        config_store_id: value("request_signing.config_store_id"),
-        secret_store_id: value("request_signing.secret_store_id"),
-    });
     settings.auction.creative_store = value("auction.creative_store");
     (settings, expected)
 }
@@ -404,7 +383,7 @@ fn every_value_sensitive_by_default_is_masked() {
         assert!(!page.contains(value), "the page carries {path}");
     }
     assert!(
-        is_masked(&view, "handlers[0].password"),
+        is_masked(&view, "publisher.proxy_secret"),
         "a Redacted value is masked too: {:?}",
         view.masked
     );
@@ -426,7 +405,10 @@ fn an_ordinary_serialization_is_unchanged() {
     for (path, value) in expected {
         assert_eq!(at(&normal, path), Some(&json!(value)), "{path}");
     }
-    assert_eq!(at(&normal, "handlers[0].password"), Some(&json!("pass")));
+    assert_eq!(
+        at(&normal, "publisher.proxy_secret"),
+        Some(&json!("unit-test-proxy-secret"))
+    );
 }
 
 #[test]
@@ -588,11 +570,30 @@ fn a_path_masked_beneath_a_key_holding_a_secret_lists_the_renamed_key() {
     }
 }
 
+/// Two asset routes, for a list holding values masked by default and a
+/// secret.
+const ASSET_ROUTES: &str = r#"
+    [[proxy.asset_routes]]
+    prefix = "/assets/"
+    origin_url = "https://assets.example.com"
+
+    [proxy.asset_routes.auth]
+    type = "s3_sigv4"
+    region = "us-east-1"
+    access_key_id = "route-access"
+    secret_access_key = "route-secret"
+
+    [[proxy.asset_routes]]
+    prefix = "/media/"
+    origin_url = "https://media.example.com"
+"#;
+
 #[test]
 fn show_reveals_a_value_masked_by_default() {
-    let settings = load(document(
-        "[inspect]\nshow = [\"publisher.origin_url\", \"handlers[].path\"]",
-    ))
+    let settings = load(document(&format!(
+        "{ASSET_ROUTES}\n[inspect]\nshow = [\"publisher.origin_url\", \
+         \"proxy.asset_routes[].origin_url\"]"
+    )))
     .expect("should load");
 
     let view = view(&settings);
@@ -602,10 +603,10 @@ fn show_reveals_a_value_masked_by_default() {
         Some(&json!("https://origin.test-publisher.com"))
     );
     assert_eq!(
-        at(&view.settings, "handlers[1].path"),
-        Some(&json!("^/_ts/admin"))
+        at(&view.settings, "proxy.asset_routes[1].origin_url"),
+        Some(&json!("https://media.example.com"))
     );
-    assert!(!view.masked.iter().any(|path| path.ends_with(".path")));
+    assert!(!view.masked.iter().any(|path| path.ends_with(".origin_url")));
     assert!(!is_masked(&view, "publisher.origin_url"));
 }
 
@@ -630,16 +631,16 @@ fn a_pattern_not_honored_as_written_is_refused_saying_why() {
             "show names `publisher.proxy_secret`, which is a secret",
         ),
         (
-            r#"show = ["handlers[].password"]"#,
-            "show names `handlers[].password`, which is a secret",
+            r#"show = ["proxy.asset_routes[].auth.secret_access_key"]"#,
+            "show names `proxy.asset_routes[].auth.secret_access_key`, which is a secret",
         ),
         (
             r#"hide = ["publisher.no_such_setting"]"#,
             "hide names `publisher.no_such_setting`, which matches no value",
         ),
         (
-            r#"show = ["handlers[9].path"]"#,
-            "show names `handlers[9].path`, which matches no value",
+            r#"show = ["proxy.asset_routes[9].origin_url"]"#,
+            "show names `proxy.asset_routes[9].origin_url`, which matches no value",
         ),
         (
             r#"show = ["publisher.domain"]"#,
@@ -662,9 +663,10 @@ fn a_pattern_not_honored_as_written_is_refused_saying_why() {
              `publisher.origin_url` in the same list already names everything it does",
         ),
         (
-            r#"show = ["handlers[].path", "handlers[0].path"]"#,
-            "show names `handlers[0].path`, which changes nothing, because \
-             `handlers[].path` in the same list already names everything it does",
+            r#"show = ["proxy.asset_routes[].origin_url", "proxy.asset_routes[0].origin_url"]"#,
+            "show names `proxy.asset_routes[0].origin_url`, which changes nothing, because \
+             `proxy.asset_routes[].origin_url` in the same list already names everything \
+             it does",
         ),
         (
             "show = [\"publisher.origin_url\"]\nhide = [\"publisher.origin_url\"]",
@@ -678,7 +680,7 @@ fn a_pattern_not_honored_as_written_is_refused_saying_why() {
     ] {
         let message = format!(
             "{:?}",
-            load(document(&format!("[inspect]\n{section}")))
+            load(document(&format!("{ASSET_ROUTES}\n[inspect]\n{section}")))
                 .expect_err("the document should be refused")
         );
 

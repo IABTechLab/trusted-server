@@ -18,8 +18,7 @@ use fastly::cache::core::{CacheKey, Found, Transaction};
 use std::io::Write as _;
 use std::time::Duration;
 use trusted_server_core::platform::{
-    PlatformTemplateCache, PlatformTemplateCacheReservation,
-    TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY, TemplateCacheError, TemplateCacheKey,
+    PlatformTemplateCache, PlatformTemplateCacheReservation, TemplateCacheError, TemplateCacheKey,
     TemplateCacheLookup, TemplateCacheMiss, TemplateCacheReservation, TemplateEntry,
     TemplateMetadata,
 };
@@ -279,16 +278,6 @@ impl PlatformTemplateCache for FastlyTemplateCache {
         fastly::http::purge::purge_surrogate_key(&key.url_surrogate_key())
             .map_err(|e| backend_error(format!("purging invalid template failed: {e:?}")))
     }
-
-    async fn purge_url_surrogate_key(&self, key: &str) -> Result<(), TemplateCacheError> {
-        fastly::http::purge::purge_surrogate_key(key)
-            .map_err(|e| backend_error(format!("purging surrogate key {key} failed: {e:?}")))
-    }
-
-    async fn purge_all(&self) -> Result<(), TemplateCacheError> {
-        fastly::http::purge::purge_surrogate_key(TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY)
-            .map_err(|e| backend_error(format!("purging templates failed: {e:?}")))
-    }
 }
 
 #[cfg(test)]
@@ -296,7 +285,9 @@ mod tests {
     use super::*;
     use std::io;
     use trusted_server_core::creative_opportunities::AssemblyMode;
-    use trusted_server_core::platform::TEMPLATE_SCHEMA_VERSION;
+    use trusted_server_core::platform::{
+        TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY, TEMPLATE_SCHEMA_VERSION,
+    };
 
     struct FailingReader {
         returned_prefix: bool,
@@ -552,9 +543,9 @@ mod tests {
     }
 
     #[test]
-    fn purge_all_clears_stored_templates() {
-        // The rollback lever. Without this, backing out a bad template means waiting
-        // for the TTL.
+    fn purging_the_key_every_template_carries_clears_stored_templates() {
+        // The rollback lever, which `ts cache purge --all` asks the platform to pull.
+        // Without it, backing out a bad template means waiting for the TTL.
         let cache = cache();
         let key = key("https://example.com/purge");
         let body = b"template".to_vec();
@@ -562,12 +553,43 @@ mod tests {
             .expect("should store");
         run(cache.get(&key)).expect("should be present before purge");
 
-        run(cache.purge_all()).expect("should purge");
+        fastly::http::purge::purge_surrogate_key(TEMPLATE_CACHE_PURGE_ALL_SURROGATE_KEY)
+            .expect("should purge");
 
         assert!(
             run(cache.get(&key)).is_err(),
             "purge must clear the template, or rollback is TTL-bound"
         );
+    }
+
+    #[test]
+    fn purging_a_pages_reader_key_clears_that_pages_template() {
+        // The key `ts cache purge --page` asks the platform to purge. The
+        // helper gives every key one reader page, so each gets its own here.
+        let cache = cache();
+        let mut purged = key("https://origin.example.com/purge-one");
+        purged.request_path = "/purge-one".to_string();
+        let mut kept = key("https://origin.example.com/keep-one");
+        kept.request_path = "/keep-one".to_string();
+        assert_ne!(
+            purged.reader_url_surrogate_key(),
+            kept.reader_url_surrogate_key(),
+            "the two pages should have reader keys of their own"
+        );
+        for stored in [&purged, &kept] {
+            let body = b"template".to_vec();
+            run(cache.put(stored, &metadata_for(&body), body, Duration::from_secs(60)))
+                .expect("should store");
+        }
+
+        fastly::http::purge::purge_surrogate_key(&purged.reader_url_surrogate_key())
+            .expect("should purge");
+
+        assert!(
+            run(cache.get(&purged)).is_err(),
+            "should clear the page whose key was purged"
+        );
+        run(cache.get(&kept)).expect("should leave another page's template in place");
     }
 
     #[test]

@@ -2,7 +2,6 @@ use std::time::Duration;
 
 use error_stack::{Report, ResultExt as _};
 use fastly::backend::Backend;
-use url::Url;
 
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::platform::{BackendNamingPolicy, PlatformBackendSpec, PredictedBackend};
@@ -273,93 +272,6 @@ impl<'a> BackendConfig<'a> {
             }
         }
     }
-
-    /// Parse an origin URL into its (scheme, host, port) components.
-    ///
-    /// Centralises URL parsing so that [`from_url`](Self::from_url) and
-    /// [`from_url_with_first_byte_timeout`](Self::from_url_with_first_byte_timeout)
-    /// share one code-path.
-    fn parse_origin(
-        origin_url: &str,
-    ) -> Result<(String, String, Option<u16>), Report<TrustedServerError>> {
-        let parsed_url = Url::parse(origin_url).change_context(TrustedServerError::Proxy {
-            message: format!("Invalid origin_url: {origin_url}"),
-        })?;
-
-        let scheme = parsed_url.scheme().to_owned();
-        let host = parsed_url
-            .host_str()
-            .ok_or_else(|| {
-                Report::new(TrustedServerError::Proxy {
-                    message: "Missing host in origin_url".to_owned(),
-                })
-            })?
-            .to_owned();
-        let port = parsed_url.port();
-
-        Ok((scheme, host, port))
-    }
-
-    /// Parse an origin URL and ensure a dynamic backend exists for it.
-    ///
-    /// This is a convenience constructor that parses the URL, extracts scheme,
-    /// host, and port, then calls [`ensure`](Self::ensure) with the default
-    /// 15 s first-byte timeout.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the URL cannot be parsed or lacks a host, or if
-    /// backend creation fails.
-    pub fn from_url(
-        origin_url: &str,
-        certificate_check: bool,
-    ) -> Result<String, Report<TrustedServerError>> {
-        Self::from_url_with_first_byte_timeout(
-            origin_url,
-            certificate_check,
-            DEFAULT_FIRST_BYTE_TIMEOUT,
-        )
-    }
-
-    /// Parse an origin URL and ensure a dynamic backend with a custom
-    /// first-byte timeout.
-    ///
-    /// For latency-sensitive paths (e.g. auction bid requests) callers should
-    /// pass the remaining auction budget so that individual requests don't hang
-    /// longer than the overall deadline allows.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the URL cannot be parsed or lacks a host, or if
-    /// backend creation fails.
-    pub fn from_url_with_first_byte_timeout(
-        origin_url: &str,
-        certificate_check: bool,
-        first_byte_timeout: Duration,
-    ) -> Result<String, Report<TrustedServerError>> {
-        Self::from_url_with_first_byte_timeout_and_host_header_override(
-            origin_url,
-            certificate_check,
-            first_byte_timeout,
-            None,
-        )
-    }
-
-    fn from_url_with_first_byte_timeout_and_host_header_override(
-        origin_url: &str,
-        certificate_check: bool,
-        first_byte_timeout: Duration,
-        host_header_override: Option<&str>,
-    ) -> Result<String, Report<TrustedServerError>> {
-        let (scheme, host, port) = Self::parse_origin(origin_url)?;
-
-        BackendConfig::new(&scheme, &host)
-            .port(port)
-            .certificate_check(certificate_check)
-            .first_byte_timeout(first_byte_timeout)
-            .host_header_override(host_header_override)
-            .ensure()
-    }
 }
 
 #[cfg(test)]
@@ -426,14 +338,10 @@ mod tests {
 
     #[test]
     fn url_derived_ipv6_host_uses_bare_tls_identity_without_sni() {
-        let (scheme, url_host, port) =
-            BackendConfig::parse_origin("https://[2001:db8::7]:8443/openrtb")
-                .expect("should parse IPv6 provider URL");
-        assert_eq!(scheme, "https");
-        assert_eq!(url_host, "[2001:db8::7]");
-        assert_eq!(port, Some(8443));
+        // The bracketed form `url::Url::host_str` gives for an IPv6 literal.
+        let (scheme, url_host, port) = ("https", "[2001:db8::7]", Some(8443));
 
-        let normalized = normalize_backend_host(&url_host);
+        let normalized = normalize_backend_host(url_host);
         assert_eq!(normalized.identity, "2001:db8::7");
         assert_eq!(normalized.authority, "[2001:db8::7]");
         assert!(
@@ -441,11 +349,11 @@ mod tests {
             "IP literals must omit TLS SNI while retaining a bare certificate identity"
         );
 
-        let from_url_name = BackendConfig::new(&scheme, &url_host)
+        let from_url_name = BackendConfig::new(scheme, url_host)
             .port(port)
             .predict_name()
             .expect("should predict URL-derived IPv6 backend name");
-        let from_bare_name = BackendConfig::new(&scheme, "2001:db8::7")
+        let from_bare_name = BackendConfig::new(scheme, "2001:db8::7")
             .port(port)
             .predict_name()
             .expect("should predict bare IPv6 backend name");

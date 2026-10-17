@@ -89,7 +89,7 @@ pub fn run(command: OriginCommand, out: &mut impl std::io::Write) -> CliResult<(
 /// value: `name=value; name=value`.
 ///
 /// Read from the environment and never accepted as a flag, for the same reason as the
-/// admin password in `ts cache purge`: an argument is visible to every other process on
+/// Fastly token in `ts cache purge`: an argument is visible to every other process on
 /// the host through `ps`, and lands in shell history. The report asks operators to probe
 /// with a genuine session's cookies, so these values are credentials.
 pub const PROBE_COOKIES_ENVIRONMENT_VARIABLE: &str = "TRUSTED_SERVER_PROBE_COOKIES";

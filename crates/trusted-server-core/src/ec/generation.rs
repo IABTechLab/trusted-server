@@ -198,7 +198,7 @@ pub fn is_valid_ec_hash(value: &str) -> bool {
 /// not an HMAC identifier and is rejected.
 ///
 /// This is the built-in module's grammar, not the deployment's. The
-/// partner-facing paths (pull sync, batch sync, the admin lookup) dispatch by
+/// partner-facing paths (pull sync and batch sync) dispatch by
 /// module code through
 /// [`AcceptedModules`](super::module::AcceptedModules), which reaches
 /// this only for an identifier the built-in module owns, or as the fallback

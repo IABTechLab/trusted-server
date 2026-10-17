@@ -1499,10 +1499,10 @@ const PAGE_BIDS_PATH = '/_ts/page-bids';
  * Deprecated alias of {@link PAGE_BIDS_PATH}, kept registered server-side so
  * pre-rename bundles keep working. This bundle falls back to it when the
  * canonical path does not serve page-bids: a server rolled back to before the
- * rename does not register the canonical path, and an operator `[[handlers]]`
- * auth regex broad enough to cover `/_ts` answers it with `401` that no
- * anonymous browser fetch can satisfy. Without the fallback either case
- * silently drops ads on every SPA navigation.
+ * rename does not register the canonical path, and a gate in front of the
+ * service that covers `/_ts` answers it with `401` that no anonymous browser
+ * fetch can satisfy. Without the fallback either case silently drops ads on
+ * every SPA navigation.
  *
  * Removed together with the server-side alias in IABTechLab/trusted-server#970.
  */
@@ -1547,7 +1547,7 @@ async function fetchPageBids(
     signal,
   });
   if (!res.ok) {
-    // 401: an operator auth handler regex covers this path. 404: this server
+    // 401: a gate in front of the service covers this path. 404: this server
     // does not know the route. Either way the other path may still answer.
     // 403 (cross-site gate) and 5xx would repeat on both, so they do not.
     return { data: null, wrongEndpoint: res.status === 401 || res.status === 404 };

@@ -208,10 +208,6 @@ mod tests {
         IntegrationSecretStore {
             values: HashMap::from([
                 (
-                    "integration_admin_password".to_owned(),
-                    b"integration-admin-password-32-bytes-ok".to_vec(),
-                ),
-                (
                     "integration_proxy_secret".to_owned(),
                     b"integration-test-proxy-secret-32-bytes-ok".to_vec(),
                 ),

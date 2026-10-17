@@ -58,23 +58,20 @@ run_case() {
     local case_name="$1"
     local port="$2"
     local config_value="$3"
-    local handler_value="$4"
-    local proxy_value="$5"
-    local ec_value="$6"
-    local expected_status="$7"
-    local expected_diagnostic="${8:-}"
+    local proxy_value="$4"
+    local ec_value="$5"
+    local expected_status="$6"
+    local expected_diagnostic="${7:-}"
     local log_path="$WORKSPACE/$case_name.log"
     local body_path="$WORKSPACE/$case_name.body"
     local headers_path="$WORKSPACE/$case_name.headers"
     local env_args=(
         env
         -u "$SMOKE_CONFIG_ENV"
-        -u "$SMOKE_HANDLER_ENV"
         -u "$SMOKE_PROXY_ENV"
         -u "$SMOKE_EC_ENV"
     )
     [ -z "$config_value" ] || env_args+=("$SMOKE_CONFIG_ENV=$config_value")
-    [ -z "$handler_value" ] || env_args+=("$SMOKE_HANDLER_ENV=$handler_value")
     [ -z "$proxy_value" ] || env_args+=("$SMOKE_PROXY_ENV=$proxy_value")
     [ -z "$ec_value" ] || env_args+=("$SMOKE_EC_ENV=$ec_value")
 
@@ -99,18 +96,15 @@ run_case() {
 }
 
 run_case missing-config "$BASE_PORT" "" \
-    "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" 500 \
+    "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" 500 \
     "env var '$SMOKE_CONFIG_ENV' not set"
-run_case missing-handler "$((BASE_PORT + 1))" "$ENVELOPE" \
-    "" "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" 500 \
-    "failed to resolve secret reference at \`handlers[0].password\`"
-run_case missing-proxy "$((BASE_PORT + 2))" "$ENVELOPE" \
-    "$SMOKE_HANDLER_VALUE" "" "$SMOKE_EC_VALUE" 500 \
+run_case missing-proxy "$((BASE_PORT + 1))" "$ENVELOPE" \
+    "" "$SMOKE_EC_VALUE" 500 \
     "failed to resolve secret reference at \`publisher.proxy_secret\`"
-run_case missing-ec "$((BASE_PORT + 3))" "$ENVELOPE" \
-    "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "" 500 \
+run_case missing-ec "$((BASE_PORT + 2))" "$ENVELOPE" \
+    "$SMOKE_PROXY_VALUE" "" 500 \
     "failed to resolve secret reference at \`ec.passphrase\`"
-run_case positive "$((BASE_PORT + 4))" "$ENVELOPE" \
-    "$SMOKE_HANDLER_VALUE" "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" 200
+run_case positive "$((BASE_PORT + 3))" "$ENVELOPE" \
+    "$SMOKE_PROXY_VALUE" "$SMOKE_EC_VALUE" 200
 
 echo "Axum first-success smoke passed"

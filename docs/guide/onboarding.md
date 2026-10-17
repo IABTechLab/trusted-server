@@ -19,8 +19,8 @@ publisher-page request, it can:
 4. expose configured integrations and third-party assets through first-party
    routes.
 
-Not every request enters the publisher pipeline. Health, administrative,
-integration, TSJS, and configured asset routes can terminate earlier.
+Not every request enters the publisher pipeline. Health, integration, TSJS,
+and configured asset routes can terminate earlier.
 
 ## Trace a Fastly publisher request
 
@@ -81,7 +81,7 @@ See [Architecture](/guide/architecture) for component boundaries and
 | `crates/trusted-server-core/`                  | Runtime-neutral request, identity, consent, proxy, and ad logic  |
 | `crates/trusted-server-core/src/publisher.rs`  | Publisher fallback, auction dispatch, and response processing    |
 | `crates/trusted-server-core/src/auction/`      | Auction orchestration and provider implementations               |
-| `crates/trusted-server-core/src/ec/`           | EC identity graph and administrative operations                  |
+| `crates/trusted-server-core/src/ec/`           | EC identity graph                                                |
 | `crates/trusted-server-core/src/consent/`      | Consent extraction, decoding, and enforcement                    |
 | `crates/trusted-server-core/src/integrations/` | Integration registry and the builder a module registers with     |
 | `crates/<type>/<vendor>/`                      | One module each: a page integration or an auction implementation |

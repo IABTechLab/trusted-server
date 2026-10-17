@@ -2659,11 +2659,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut config = plan_config(tables);
         config.timeout_ms = 777;
-        config.request_signing = signing.then(|| crate::settings::RequestSigning {
-            enabled: true,
-            config_store_id: "fictional-config-store".to_string(),
-            secret_store_id: "fictional-secret-store".to_string(),
-        });
+        config.request_signing = signing.then(|| crate::settings::RequestSigning::new(true));
         config
     }
 

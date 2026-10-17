@@ -419,12 +419,8 @@ Signing key not found: ts-2025-01-A
 
 1. Check Config Store `current-kid` value
 2. Verify corresponding key exists in Secret Store
-3. Run key rotation to generate new key:
-
-```bash
-curl -X POST https://edge.example.com/_ts/admin/keys/rotate \
-  -u admin:password
-```
+3. Rotate to a new key with `ts keys rotate`, as
+   [Key Rotation](./key-rotation.md) describes.
 
 ---
 
@@ -442,13 +438,8 @@ curl -X POST https://edge.example.com/_ts/admin/keys/rotate \
 
 **Solution:**
 
-1. Initialize keys using rotation endpoint:
-
-```bash
-curl -X POST https://edge.example.com/_ts/admin/keys/rotate \
-  -u admin:password
-```
-
+1. Create the first key with `ts keys rotate`, as
+   [Key Rotation](./key-rotation.md) describes.
 2. Verify Config Store has `active-kids` entry
 3. Check Secret Store contains the key
 
@@ -508,13 +499,11 @@ Config store not found: jwks_store
    - Service → Configuration → Config Stores
    - Add store with exact name from configuration
 
-3. Update `trusted-server.toml`:
+3. Switch request signing on in `trusted-server.toml`:
 
 ```toml
 [request_signing]
 enabled = true
-config_store_id = "your-config-store-id"  # From Fastly dashboard
-secret_store_id = "your-secret-store-id"
 ```
 
 ---
