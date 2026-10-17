@@ -3539,6 +3539,137 @@ describe('prebid/installRefreshHandler', () => {
     );
   });
 
+  describe('a slot with viewport bands', () => {
+    const originalInnerWidth = window.innerWidth;
+
+    afterEach(() => {
+      Object.defineProperty(window, 'innerWidth', {
+        configurable: true,
+        value: originalInnerWidth,
+      });
+    });
+
+    // A slot Trusted Server defined carries its bands as a size mapping, and a
+    // slot the publisher defined first carries none.
+    function installBandedSlot(viewportWidth: number, { definedWithMapping = true } = {}) {
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: viewportWidth });
+      const originalRefresh = vi.fn();
+      const gptSlot = {
+        getSlotElementId: vi.fn(() => 'div-ad-billboard'),
+        getTargeting: vi.fn(() => []),
+      };
+      const pubads = {
+        refresh: originalRefresh,
+        getSlots: vi.fn(() => [gptSlot]),
+      };
+      testWindow.googletag = {
+        cmd: { push: (fn: () => void) => fn() },
+        pubads: () => pubads,
+      };
+      testWindow.tsjs = {
+        ...(definedWithMapping ? { viewportMappedSlots: new WeakSet([gptSlot]) } : {}),
+        adSlots: [
+          {
+            id: 'billboard',
+            gam_unit_path: '/123/billboard',
+            div_id: 'div-ad-billboard',
+            formats: [
+              [970, 250],
+              [300, 250],
+              [320, 50],
+            ],
+            viewport_sizes: [
+              [[1040, 0], [[970, 250]]],
+              [[600, 0], []],
+              [[0, 0], [[320, 50]]],
+            ],
+          },
+        ],
+      };
+      installRefreshHandler(750);
+      return { pubads, originalRefresh, gptSlot };
+    }
+
+    it('offers the refresh auction only the sizes of the band the viewport is in', () => {
+      const { pubads } = installBandedSlot(375);
+
+      pubads.refresh();
+
+      expect(mockRequestBids).toHaveBeenCalledWith(
+        expect.objectContaining({
+          adUnits: [
+            expect.objectContaining({
+              code: 'div-ad-billboard',
+              mediaTypes: { banner: { sizes: [[320, 50]] } },
+            }),
+          ],
+        })
+      );
+    });
+
+    it('offers the widest band its sizes on a wide viewport', () => {
+      const { pubads } = installBandedSlot(1280);
+
+      pubads.refresh();
+
+      expect(mockRequestBids).toHaveBeenCalledWith(
+        expect.objectContaining({
+          adUnits: [
+            expect.objectContaining({
+              mediaTypes: { banner: { sizes: [[970, 250]] } },
+            }),
+          ],
+        })
+      );
+    });
+
+    it('leaves a slot out of the refresh auction where its band asks for no size', () => {
+      const { pubads, originalRefresh } = installBandedSlot(700);
+
+      pubads.refresh();
+
+      expect(mockRequestBids).not.toHaveBeenCalled();
+      expect(originalRefresh).toHaveBeenCalled();
+    });
+
+    it('offers a slot the publisher defined its formats, as its ad request has no band', () => {
+      const { pubads } = installBandedSlot(375, { definedWithMapping: false });
+
+      pubads.refresh();
+
+      expect(mockRequestBids).toHaveBeenCalledWith(
+        expect.objectContaining({
+          adUnits: [
+            expect.objectContaining({
+              code: 'div-ad-billboard',
+              mediaTypes: {
+                banner: {
+                  sizes: [
+                    [970, 250],
+                    [300, 250],
+                    [320, 50],
+                  ],
+                },
+              },
+            }),
+          ],
+        })
+      );
+    });
+
+    it('auctions a slot the publisher defined where its band asks for no size', () => {
+      const { pubads } = installBandedSlot(700, { definedWithMapping: false });
+
+      pubads.refresh();
+
+      expect(mockRequestBids).toHaveBeenCalledWith(
+        expect.objectContaining({
+          adUnits: [expect.objectContaining({ code: 'div-ad-billboard' })],
+        })
+      );
+    });
+  });
+
   it('resolves the exact slot when div_ids share a prefix', () => {
     // Regression: a single find() with a startsWith() clause returned the
     // first slot whose div_id is a prefix of the element id. With div_ids

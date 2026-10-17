@@ -1375,7 +1375,7 @@ mod tests {
             "bootstrap should install idempotent GPT handoff wrappers"
         );
         assert!(
-            combined.contains("return googletag.defineSlot") && combined.contains("actualDivId"),
+            combined.contains("return defineWithViewportSizes(googletag, slot, actualDivId)"),
             "bootstrap should define the TS fallback on the actual inner div"
         );
         assert!(

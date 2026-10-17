@@ -942,6 +942,45 @@ impl CreativeOpportunitySlot {
         self.div_id.as_deref().unwrap_or(&self.id)
     }
 
+    /// The sizes this slot asks for at each viewport width.
+    ///
+    /// Each band is the narrowest viewport width of the band and the
+    /// `[width, height]` sizes asked for from that width up to the next band's,
+    /// widest first. A band starts at zero and at every width where the formats
+    /// on offer change, and a band may be empty, meaning the slot asks for
+    /// nothing at those widths. [`None`] when no format names a viewport bound,
+    /// so the slot asks for every format at every width.
+    #[must_use]
+    pub fn viewport_sizes(&self) -> Option<ViewportSizes> {
+        if self.formats.iter().all(|format| {
+            format.min_viewport_width.is_none() && format.max_viewport_width.is_none()
+        }) {
+            return None;
+        }
+        let mut edges = vec![0_u32];
+        for format in &self.formats {
+            edges.extend(format.min_viewport_width);
+            edges.extend(format.max_viewport_width.and_then(|max| max.checked_add(1)));
+        }
+        edges.sort_unstable();
+        edges.dedup();
+        let mut bands: ViewportSizes = edges
+            .into_iter()
+            .map(|edge| {
+                let sizes = self
+                    .formats
+                    .iter()
+                    .filter(|format| format.offered_at(edge))
+                    .map(|format| [format.width, format.height])
+                    .collect();
+                (edge, sizes)
+            })
+            .collect();
+        bands.dedup_by(|later, earlier| later.1 == earlier.1);
+        bands.reverse();
+        Some(bands)
+    }
+
     /// Converts this slot into an [`AdSlot`] ready for use in an auction request.
     ///
     /// Prebid Server bidder params are wired into the `bidders` map keyed by
@@ -995,7 +1034,16 @@ pub struct CreativeOpportunityFormat {
     /// Media type for this format. Defaults to `Banner`.
     #[serde(default)]
     pub media_type: MediaType,
+    /// Narrowest viewport width, in CSS pixels, at which the page asks for this format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_viewport_width: Option<u32>,
+    /// Widest viewport width, in CSS pixels, at which the page asks for this format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_viewport_width: Option<u32>,
 }
+
+/// The bands [`CreativeOpportunitySlot::viewport_sizes`] gives.
+pub type ViewportSizes = Vec<(u32, Vec<[u32; 2]>)>;
 
 impl CreativeOpportunityFormat {
     fn validate_runtime(&self, slot_id: &str) -> Result<(), String> {
@@ -1004,8 +1052,26 @@ impl CreativeOpportunityFormat {
                 "slot `{slot_id}` format must have positive width and height"
             ));
         }
+        if let (Some(min), Some(max)) = (self.min_viewport_width, self.max_viewport_width)
+            && min > max
+        {
+            return Err(format!(
+                "slot `{slot_id}` format {}x{} has min_viewport_width {min} above \
+                 max_viewport_width {max}",
+                self.width, self.height
+            ));
+        }
 
         Ok(())
+    }
+
+    /// Whether the page asks for this format at a viewport this wide.
+    fn offered_at(&self, viewport_width: u32) -> bool {
+        self.min_viewport_width
+            .is_none_or(|min| viewport_width >= min)
+            && self
+                .max_viewport_width
+                .is_none_or(|max| viewport_width <= max)
     }
 
     fn to_ad_format(&self) -> AdFormat {
@@ -1455,6 +1521,8 @@ mod tests {
                 width: 300,
                 height: 250,
                 media_type: crate::auction::types::MediaType::Banner,
+                min_viewport_width: None,
+                max_viewport_width: None,
             }],
             floor_price: Some(0.50),
             targeting: Default::default(),
@@ -1462,6 +1530,146 @@ mod tests {
             compiled_patterns: Vec::new(),
             compiled_unit: None,
         }
+    }
+
+    fn banded(
+        width: u32,
+        height: u32,
+        min_viewport_width: Option<u32>,
+        max_viewport_width: Option<u32>,
+    ) -> CreativeOpportunityFormat {
+        CreativeOpportunityFormat {
+            width,
+            height,
+            media_type: crate::auction::types::MediaType::Banner,
+            min_viewport_width,
+            max_viewport_width,
+        }
+    }
+
+    #[test]
+    fn viewport_sizes_is_none_when_no_format_names_a_bound() {
+        let slot = make_slot("atf", vec!["/**"]);
+
+        assert!(
+            slot.viewport_sizes().is_none(),
+            "a slot without bounds should ask for every format at every width"
+        );
+    }
+
+    #[test]
+    fn viewport_sizes_gives_each_band_only_the_formats_that_fit_it() {
+        let mut slot = make_slot("billboard", vec!["/**"]);
+        slot.formats = vec![
+            banded(970, 250, Some(1040), None),
+            banded(728, 90, Some(800), Some(1039)),
+            banded(300, 250, Some(600), Some(799)),
+            banded(320, 50, None, Some(599)),
+        ];
+
+        assert_eq!(
+            slot.viewport_sizes(),
+            Some(vec![
+                (1040, vec![[970, 250]]),
+                (800, vec![[728, 90]]),
+                (600, vec![[300, 250]]),
+                (0, vec![[320, 50]]),
+            ]),
+            "should band the formats widest first"
+        );
+    }
+
+    #[test]
+    fn viewport_sizes_keeps_an_unbounded_format_in_every_band() {
+        let mut slot = make_slot("rail", vec!["/**"]);
+        slot.formats = vec![
+            banded(300, 600, Some(1040), None),
+            banded(300, 250, None, None),
+        ];
+
+        assert_eq!(
+            slot.viewport_sizes(),
+            Some(vec![
+                (1040, vec![[300, 600], [300, 250]]),
+                (0, vec![[300, 250]]),
+            ]),
+            "should offer the unbounded format at every width"
+        );
+    }
+
+    #[test]
+    fn viewport_sizes_leaves_a_band_empty_when_no_format_fits() {
+        let mut slot = make_slot("leaderboard", vec!["/**"]);
+        slot.formats = vec![banded(728, 90, Some(800), None)];
+
+        assert_eq!(
+            slot.viewport_sizes(),
+            Some(vec![(800, vec![[728, 90]]), (0, vec![])]),
+            "should ask for nothing below the narrowest bound"
+        );
+    }
+
+    #[test]
+    fn viewport_sizes_merges_neighbouring_bands_that_offer_the_same_formats() {
+        let mut slot = make_slot("footer", vec!["/**"]);
+        slot.formats = vec![
+            banded(728, 90, Some(800), None),
+            banded(300, 250, None, Some(799)),
+            banded(320, 50, None, Some(799)),
+        ];
+
+        assert_eq!(
+            slot.viewport_sizes(),
+            Some(vec![
+                (800, vec![[728, 90]]),
+                (0, vec![[300, 250], [320, 50]]),
+            ]),
+            "two bounds at the same width should make one band"
+        );
+    }
+
+    #[test]
+    fn validate_runtime_refuses_a_format_whose_min_viewport_exceeds_its_max() {
+        let mut slot = make_slot("atf", vec!["/**"]);
+        slot.formats = vec![banded(300, 250, Some(800), Some(600))];
+        slot.compile_patterns();
+
+        let error = slot
+            .validate_runtime()
+            .expect_err("should refuse an inverted viewport range");
+
+        assert!(
+            error.contains("min_viewport_width 800 above max_viewport_width 600"),
+            "should name both bounds: {error}"
+        );
+    }
+
+    #[test]
+    fn a_format_without_bounds_serializes_without_them() {
+        let value =
+            serde_json::to_value(banded(300, 250, None, None)).expect("should serialize a format");
+
+        assert!(
+            value.get("min_viewport_width").is_none() && value.get("max_viewport_width").is_none(),
+            "an unbounded format should serialize as it did before: {value}"
+        );
+    }
+
+    #[test]
+    fn a_format_reads_its_viewport_bounds() {
+        let format: CreativeOpportunityFormat = serde_json::from_value(serde_json::json!({
+            "width": 728,
+            "height": 90,
+            "min_viewport_width": 800,
+            "max_viewport_width": 1039,
+        }))
+        .expect("should read both bounds");
+
+        assert_eq!(
+            (format.min_viewport_width, format.max_viewport_width),
+            (Some(800), Some(1039)),
+            "should keep the bounds as written"
+        );
     }
 
     #[test]
