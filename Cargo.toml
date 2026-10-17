@@ -45,7 +45,7 @@ base64 = "0.22"
 brotli = "8.0"
 build-print = "1.0.1"
 bytes = "1.11"
-chacha20poly1305 = "0.11"
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
 chrono = "0.4.44"
 chromiumoxide = "0.9.1"
 clap = { version = "4", features = ["derive"] }
@@ -75,11 +75,6 @@ futures = "0.3"
 gix = { version = "0.83", default-features = false }
 glob = "0.3"
 getrandom = "0.2"
-# `sha2` 0.11 pulls `crypto-common` 0.2, which depends on getrandom 0.4.
-# Both lines coexist in the graph; 0.4 renamed the browser RNG feature
-# from `js` to `wasm_js`, so it needs its own pin to enable it on
-# `wasm32-unknown-unknown`.
-getrandom_04 = { package = "getrandom", version = "0.4" }
 hex = "0.4.3"
 hmac = "0.13"
 http = "1.4.0"
@@ -142,7 +137,7 @@ x509-parser = "0.16"
 # and no source change (stackpop/esi@chore/fastly-0.13); drop this patch
 # once the fix is released upstream. See issue #1122.
 [patch.crates-io]
-esi = { git = "https://github.com/stackpop/esi", rev = "75bfbb396" }
+esi = { git = "https://github.com/stackpop/esi", rev = "75bfbb396d4cb7792610f1287cbec61675f13f38" }
 
 [workspace.lints.clippy]
 # Correctness - Force explicit error handling in production code
