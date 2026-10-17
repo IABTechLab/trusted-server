@@ -6707,6 +6707,7 @@ dependencies = [
  "log-fastly",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "toml",
  "trusted-server-ad-server-iabtl",
  "trusted-server-ad-tag-google",

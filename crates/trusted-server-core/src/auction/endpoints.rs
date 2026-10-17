@@ -656,8 +656,7 @@ mod tests {
         build_services_with_backend_and_http_client, noop_services,
     };
     use crate::platform::{
-        BackendNamingPolicy, ClientInfo, PlatformBackend, PlatformHttpClient, PlatformHttpRequest,
-        PlatformResponse,
+        ClientInfo, PlatformBackend, PlatformHttpClient, PlatformHttpRequest, PlatformResponse,
     };
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
     use serde_json::json;
@@ -2245,7 +2244,7 @@ mod tests {
 
     #[tokio::test]
     async fn auction_caps_the_transport_timers_of_the_device_modules_backend() {
-        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
+        let backend = Arc::new(NamingBackend::new());
         let services = build_services_with_backend_and_http_client(
             Arc::clone(&backend) as Arc<dyn PlatformBackend>,
             Arc::new(NoopHttpClient),

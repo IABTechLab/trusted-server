@@ -1,15 +1,262 @@
+//! Fastly dynamic backends: how one is named and how it is registered.
+//!
+//! The naming policy calls no SDK, so startup validation predicts the same
+//! names registration makes, and the transport timer a name carries is
+//! rounded to a bounded ladder so budget-derived timers cannot register a
+//! backend per request.
+
+use core::fmt::Write as _;
 use std::time::Duration;
 
 use error_stack::{Report, ResultExt as _};
 use fastly::backend::Backend;
+use sha2::{Digest as _, Sha256};
 
 use trusted_server_core::error::TrustedServerError;
-use trusted_server_core::platform::{BackendNamingPolicy, PlatformBackendSpec, PredictedBackend};
+use trusted_server_core::host_header::validate_host_header_override_value;
+use trusted_server_core::platform::PlatformBackendSpec;
 
-#[cfg(test)]
+/// Fastly's documented limit on a dynamic backend name.
 const MAX_BACKEND_NAME_LEN: usize = 255;
-#[cfg(test)]
+/// The readable prefix is cut here so the name stays under the limit.
+const MAX_READABLE_PREFIX_LEN: usize = 200;
 const SPEC_DIGEST_HEX_LEN: usize = 32;
+pub(crate) const TRANSPORT_TIMEOUT_QUANTUM_MS: u32 = 250;
+const TRANSPORT_TIMEOUT_QUANTUM_CEILING_MS: u32 = 2000;
+pub(crate) const SUB_QUANTUM_LADDER_MS: [u32; 4] = [200, 150, 100, 50];
+const TRANSPORT_TIMEOUT_COARSE_LADDER_MS: [u32; 8] =
+    [2000, 3000, 5000, 10000, 20000, 30000, 45000, 60000];
+/// Fastly's documented per-service limit on dynamic backends.
+const DYNAMIC_BACKEND_LIMIT: usize = 200;
+/// Backend names kept for traffic that is not the auction.
+const NON_AUCTION_BACKEND_RESERVE: usize = 40;
+/// Backend names the auction may register on this service.
+pub(crate) const AUCTION_BACKEND_BUDGET: usize =
+    DYNAMIC_BACKEND_LIMIT - NON_AUCTION_BACKEND_RESERVE;
+
+/// A backend name and port predicted without platform I/O.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct PredictedBackend {
+    /// The dynamic backend name.
+    pub(crate) name: String,
+    /// Explicit or scheme-derived target port.
+    pub(crate) port: u16,
+}
+
+/// Why a backend specification cannot be named.
+#[derive(Debug, Clone, Eq, PartialEq, derive_more::Display)]
+pub(crate) enum BackendNamingError {
+    /// The backend host is empty.
+    #[display("missing host")]
+    MissingHost,
+    /// A field contains a control character.
+    #[display("{field} contains control characters")]
+    ControlCharacters { field: &'static str },
+    /// An outbound Host override is invalid.
+    #[display("host header override {reason}")]
+    InvalidHostHeaderOverride { reason: &'static str },
+    /// A generated backend name exceeded the documented limit.
+    #[display("backend name exceeds {limit}-char limit ({actual} chars)")]
+    NameTooLong { limit: usize, actual: usize },
+}
+
+impl core::error::Error for BackendNamingError {}
+
+fn sanitize_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// A bracketed IPv6 literal and its bare form name the same backend.
+fn canonical_host(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .filter(|value| value.parse::<std::net::Ipv6Addr>().is_ok())
+        .unwrap_or(host)
+}
+
+/// Every field of the specification, length-prefixed, so two specifications
+/// that sanitize alike still digest apart.
+fn canonical_spec(spec: &PlatformBackendSpec, target_port: u16) -> String {
+    fn push_field(buffer: &mut String, field: &str) {
+        buffer.push_str(&field.len().to_string());
+        buffer.push(':');
+        buffer.push_str(field);
+    }
+
+    let mut buffer = String::new();
+    push_field(&mut buffer, &spec.scheme);
+    push_field(&mut buffer, canonical_host(&spec.host));
+    push_field(&mut buffer, &target_port.to_string());
+    push_field(&mut buffer, if spec.certificate_check { "1" } else { "0" });
+    match spec.host_header_override.as_deref() {
+        Some(value) => {
+            buffer.push('s');
+            push_field(&mut buffer, value);
+        }
+        None => buffer.push('n'),
+    }
+    match spec.discriminator.as_deref() {
+        Some(value) => {
+            buffer.push('s');
+            push_field(&mut buffer, value);
+        }
+        None => buffer.push('n'),
+    }
+    push_field(
+        &mut buffer,
+        &spec.first_byte_timeout.as_millis().to_string(),
+    );
+    push_field(
+        &mut buffer,
+        &spec.between_bytes_timeout.as_millis().to_string(),
+    );
+    buffer
+}
+
+fn spec_digest(canonical: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(SPEC_DIGEST_HEX_LEN);
+    for byte in digest.iter().take(SPEC_DIGEST_HEX_LEN / 2) {
+        write!(hex, "{byte:02x}").expect("should write hex digit to string");
+    }
+    hex
+}
+
+/// Predict the dynamic backend name and resolved port for a specification
+/// without registering anything.
+///
+/// The name is a readable prefix of the specification, cut to a bound, and a
+/// digest of the whole specification, so it stays within Fastly's limit and
+/// two specifications never share a name.
+pub(crate) fn predict_backend(
+    spec: &PlatformBackendSpec,
+) -> Result<PredictedBackend, Report<BackendNamingError>> {
+    if spec.host.is_empty() {
+        return Err(Report::new(BackendNamingError::MissingHost));
+    }
+    if spec.host.chars().any(char::is_control) {
+        return Err(Report::new(BackendNamingError::ControlCharacters {
+            field: "host",
+        }));
+    }
+    if spec.scheme.chars().any(char::is_control) {
+        return Err(Report::new(BackendNamingError::ControlCharacters {
+            field: "scheme",
+        }));
+    }
+    if let Some(host_header_override) = spec.host_header_override.as_deref() {
+        validate_host_header_override_value(host_header_override).map_err(|reason| {
+            Report::new(BackendNamingError::InvalidHostHeaderOverride { reason })
+        })?;
+    }
+
+    let port = spec
+        .port
+        .unwrap_or_else(|| default_port_for_scheme(&spec.scheme));
+    let name_base = format!("{}_{}_{}", spec.scheme, canonical_host(&spec.host), port);
+    let host_override_suffix = spec
+        .host_header_override
+        .as_deref()
+        .map(|host| format!("_oh_{}", sanitize_component(host)))
+        .unwrap_or_default();
+    let cert_suffix = if spec.certificate_check {
+        ""
+    } else {
+        "_nocert"
+    };
+    let discriminator_suffix = spec
+        .discriminator
+        .as_deref()
+        .map(|value| format!("_p_{}", sanitize_component(value)))
+        .unwrap_or_default();
+    let readable_full = format!(
+        "{}{}{}{}_fb{}_bb{}",
+        sanitize_component(&name_base),
+        host_override_suffix,
+        cert_suffix,
+        discriminator_suffix,
+        spec.first_byte_timeout.as_millis(),
+        spec.between_bytes_timeout.as_millis()
+    );
+    let readable = readable_full
+        .chars()
+        .take(MAX_READABLE_PREFIX_LEN)
+        .collect::<String>();
+    let digest = spec_digest(&canonical_spec(spec, port));
+    let name = format!("backend_{readable}_{digest}");
+    if name.len() > MAX_BACKEND_NAME_LEN {
+        return Err(Report::new(BackendNamingError::NameTooLong {
+            limit: MAX_BACKEND_NAME_LEN,
+            actual: name.len(),
+        }));
+    }
+
+    Ok(PredictedBackend { name, port })
+}
+
+/// Round a budget-bound transport timer to a bounded ladder without
+/// extending it past the remaining budget.
+///
+/// The timer is part of the backend name, so every distinct value is a
+/// distinct registration. A configured timer the budget allows passes
+/// through unchanged, a budget below it floors to a quantum, a budget under
+/// one quantum snaps down to a short ladder, and a budget above the quantum
+/// ceiling snaps down to a coarse ladder.
+pub(crate) fn canonicalize_transport_timeout_ms(remaining_ms: u32, configured_ms: u32) -> u32 {
+    if remaining_ms >= configured_ms {
+        return configured_ms;
+    }
+    if remaining_ms >= TRANSPORT_TIMEOUT_QUANTUM_CEILING_MS {
+        return TRANSPORT_TIMEOUT_COARSE_LADDER_MS
+            .into_iter()
+            .rev()
+            .find(|&rung| rung <= remaining_ms)
+            .unwrap_or(TRANSPORT_TIMEOUT_QUANTUM_CEILING_MS);
+    }
+    let floored = (remaining_ms / TRANSPORT_TIMEOUT_QUANTUM_MS) * TRANSPORT_TIMEOUT_QUANTUM_MS;
+    if floored > 0 {
+        return floored;
+    }
+    SUB_QUANTUM_LADDER_MS
+        .into_iter()
+        .find(|&rung| rung <= remaining_ms)
+        .unwrap_or(0)
+}
+
+/// Count every transport timer, and so every backend name, one provider
+/// with this configured timer can reach through canonicalization.
+pub(crate) fn transport_timeout_bucket_count(configured_ms: u32) -> usize {
+    if configured_ms == 0 {
+        return 1;
+    }
+    let mut buckets = std::collections::BTreeSet::new();
+    buckets.insert(configured_ms);
+    let reachable = SUB_QUANTUM_LADDER_MS
+        .into_iter()
+        .chain(
+            (TRANSPORT_TIMEOUT_QUANTUM_MS..TRANSPORT_TIMEOUT_QUANTUM_CEILING_MS)
+                .step_by(TRANSPORT_TIMEOUT_QUANTUM_MS as usize),
+        )
+        .chain(TRANSPORT_TIMEOUT_COARSE_LADDER_MS);
+    for remaining_ms in reachable {
+        let timeout = canonicalize_transport_timeout_ms(remaining_ms, configured_ms);
+        if timeout > 0 {
+            buckets.insert(timeout);
+        }
+    }
+    buckets.len()
+}
 
 /// Returns the default port for the given scheme (443 for HTTPS, 80 for HTTP).
 #[inline]
@@ -189,11 +436,9 @@ impl<'a> BackendConfig<'a> {
     /// Compute the deterministic backend name and resolved port without
     /// registering anything.
     fn predict_backend(&self) -> Result<PredictedBackend, Report<TrustedServerError>> {
-        BackendNamingPolicy::Fastly
-            .predict(&self.platform_spec())
-            .change_context(TrustedServerError::Proxy {
-                message: "backend name prediction failed".to_owned(),
-            })
+        predict_backend(&self.platform_spec()).change_context(TrustedServerError::Proxy {
+            message: "backend name prediction failed".to_owned(),
+        })
     }
 
     /// Return the deterministic backend name without registering anything.
@@ -276,12 +521,101 @@ impl<'a> BackendConfig<'a> {
 
 #[cfg(test)]
 mod tests {
-    use trusted_server_core::platform::BackendNamingError;
+    use std::time::Duration;
+
+    use trusted_server_core::platform::PlatformBackendSpec;
 
     use super::{
-        BackendConfig, MAX_BACKEND_NAME_LEN, SPEC_DIGEST_HEX_LEN, compute_host_header,
-        normalize_backend_host,
+        AUCTION_BACKEND_BUDGET, BackendConfig, BackendNamingError, MAX_BACKEND_NAME_LEN,
+        PredictedBackend, SPEC_DIGEST_HEX_LEN, canonical_host, canonicalize_transport_timeout_ms,
+        compute_host_header, normalize_backend_host, predict_backend,
+        transport_timeout_bucket_count,
     };
+
+    fn spec() -> PlatformBackendSpec {
+        PlatformBackendSpec {
+            scheme: "https".to_owned(),
+            host: "origin.example.com".to_owned(),
+            port: None,
+            host_header_override: None,
+            certificate_check: true,
+            first_byte_timeout: Duration::from_millis(1500),
+            between_bytes_timeout: Duration::from_millis(1500),
+            discriminator: Some("provider-one".to_owned()),
+        }
+    }
+
+    #[test]
+    fn the_predicted_name_is_pinned() {
+        assert_eq!(
+            predict_backend(&spec()).expect("should predict the backend"),
+            PredictedBackend {
+                name: "backend_https_origin_example_com_443_p_provider-one_fb1500_bb1500_51fb8dba14db39e759e2c1c5d204a6eb".to_owned(),
+                port: 443,
+            }
+        );
+    }
+
+    #[test]
+    fn prediction_canonicalizes_only_bracketed_ipv6_hosts() {
+        let mut bare = spec();
+        bare.host = "2001:db8::1".to_string();
+        bare.port = Some(8443);
+        let mut bracketed = bare.clone();
+        bracketed.host = "[2001:db8::1]".to_string();
+
+        let bare_prediction = predict_backend(&bare).expect("should predict bare IPv6 backend");
+        let bracketed_prediction =
+            predict_backend(&bracketed).expect("should predict bracketed IPv6 backend");
+        assert_eq!(bare_prediction, bracketed_prediction);
+
+        assert_eq!(canonical_host("origin.example.com"), "origin.example.com");
+        assert_eq!(canonical_host("192.0.2.1"), "192.0.2.1");
+        assert_eq!(canonical_host("[not-ipv6]"), "[not-ipv6]");
+    }
+
+    #[test]
+    fn prediction_refuses_a_control_character_in_the_scheme() {
+        let mut spec = spec();
+        spec.scheme = "ht\ntps".to_owned();
+        let err = predict_backend(&spec).expect_err("should refuse a scheme with a newline");
+        assert_eq!(
+            err.current_context(),
+            &BackendNamingError::ControlCharacters { field: "scheme" }
+        );
+    }
+
+    #[test]
+    fn the_transport_timer_keeps_the_logical_distinction() {
+        assert_eq!(canonicalize_transport_timeout_ms(999, 2000), 750);
+        assert_eq!(canonicalize_transport_timeout_ms(2000, 100), 100);
+    }
+
+    #[test]
+    fn the_bucket_count_covers_every_reachable_timer() {
+        assert_eq!(
+            transport_timeout_bucket_count(0),
+            1,
+            "a zero timer reaches one name"
+        );
+        let configured = 2000;
+        let mut reachable = std::collections::BTreeSet::new();
+        for remaining in 0..=configured {
+            let value = canonicalize_transport_timeout_ms(remaining, configured);
+            if value > 0 {
+                reachable.insert(value);
+            }
+        }
+        assert_eq!(
+            transport_timeout_bucket_count(configured),
+            reachable.len(),
+            "the count should equal the distinct timers a 2000ms ceiling can reach"
+        );
+        assert!(
+            transport_timeout_bucket_count(60_000) * 2 <= AUCTION_BACKEND_BUDGET,
+            "two providers with a 60s ceiling should fit the auction budget"
+        );
+    }
 
     /// Assert a computed name is `backend_<body>_<hex digest>` and stays within
     /// Fastly's length limit. The digest is what makes the name injective, so
@@ -535,8 +869,6 @@ mod tests {
 
     #[test]
     fn different_timeouts_produce_different_names() {
-        use std::time::Duration;
-
         let name_a = BackendConfig::new("https", "origin.example.com")
             .first_byte_timeout(Duration::from_secs(2))
             .predict_name()
@@ -561,8 +893,6 @@ mod tests {
 
     #[test]
     fn different_between_bytes_timeouts_produce_different_names() {
-        use std::time::Duration;
-
         let name_a = BackendConfig::new("https", "origin.example.com")
             .between_bytes_timeout(Duration::from_secs(2))
             .predict_name()
