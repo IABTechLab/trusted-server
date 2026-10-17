@@ -27,7 +27,7 @@ their operational procedures.
 
 | Integration                                                    | Operational status | Selected by                                               | Registration       | Browser loading |
 | -------------------------------------------------------------- | ------------------ | --------------------------------------------------------- | ------------------ | --------------- |
-| [`adserver_mock`](/guide/integrations/adserver_mock)           | development        | `[ad-server] module = "mock"`                             | ad server          | none            |
+| [`adserver_mock`](/guide/integrations/adserver_mock)           | development        | `[ad-server] module = "iabtl"`                            | ad server          | none            |
 | [`aps`](/guide/integrations/aps)                               | development        | a `[demand]` source with `implementation = "auction.aps"` | auction plan       | none            |
 | [`creative`](/guide/creative-processing)                       | development        | nothing, it always runs                                   | browser capability | bundled         |
 | [`datadome`](/guide/integrations/datadome)                     | development        | `[bot-protection] module = "datadome"`                    | settings builder   | bundled         |

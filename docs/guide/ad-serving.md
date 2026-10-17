@@ -28,9 +28,9 @@ implementation it runs. The shipped implementations are:
 - `auction.aps` for the APS OpenRTB contract and typed renderer response.
 
 Browser-visible bidder codes are mapped separately under
-`[auction.bidders.<id>]`. `ad-server.mock` is the only shipped ad server; it
-is optional, selected by `[ad-server] module = "mock"` and configured under
-`[ad-server.mock]`.
+`[auction.bidders.<id>]`. `ad-server.iabtl` is the only shipped ad server; it
+is optional, selected by `[ad-server] module = "iabtl"` and configured under
+`[ad-server.iabtl]`.
 
 ```toml
 [auction]

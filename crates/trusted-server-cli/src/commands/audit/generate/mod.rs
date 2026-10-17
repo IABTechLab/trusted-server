@@ -667,11 +667,25 @@ fn build_google_tag_manager_section(container_id: &str) -> String {
 ///
 /// A module changes a page only where an entry names its middleware, so a
 /// draft that selected a module and wrote no entry would leave the module
-/// changing nothing. The names and their order come from the stock list.
+/// changing nothing. The names and their order come from what the linked
+/// builders describe, in the order the registry registers them. A middleware
+/// for a media type other than HTML is left out, because the entry written
+/// covers every page.
 fn build_page_entries(integration_ids: &[&str]) -> Option<String> {
+    let supplied = trusted_server_core::integrations::supplied_middleware(
+        &crate::app_config::linked_builders(),
+    );
     let mut entries = String::new();
     for phase in MiddlewarePhase::ALL {
-        let names = trusted_server_modules::middleware_for(integration_ids, phase);
+        let names: Vec<&str> = supplied
+            .iter()
+            .filter(|(integration, middleware)| {
+                middleware.phase == phase
+                    && middleware.media_type == trusted_server_core::middleware::HTML_MEDIA_TYPE
+                    && integration_ids.contains(integration)
+            })
+            .map(|(_, middleware)| middleware.name)
+            .collect();
         if names.is_empty() {
             continue;
         }
@@ -709,10 +723,17 @@ fn select_js_asset_proxy(draft: &str) -> CliResult<String> {
 }
 
 /// The section a detected integration's module is selected in, and the name it
-/// is written under there, or `None` for one no module in this build
-/// configures.
+/// is written under there, from the builders the tool links, or `None` for
+/// one no module in this build configures.
 fn module_section(id: &str) -> Option<(&'static str, &'static str)> {
-    trusted_server_modules::selection_of(id)
+    let builder = crate::app_config::linked_builders()
+        .into_iter()
+        .find(|builder| builder.id() == id)?;
+    let section = builder.section()?;
+    Some((
+        section,
+        trusted_server_core::module_name::short_form(section, builder.module_name()?),
+    ))
 }
 
 fn select_js_asset_proxy_candidates(
@@ -4599,6 +4620,36 @@ url = \"https://www.publisher.example:8443\""
             fs::read_to_string(&config_path).expect("should re-read config"),
             replacement,
             "the concurrent edit must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn a_module_s_selection_is_found_by_its_integration_id() {
+        for (id, section, written) in [
+            ("prebid", "auction", "prebid"),
+            ("datadome", "bot-protection", "datadome"),
+            ("didomi", "cmp", "didomi"),
+            ("sourcepoint", "cmp", "sourcepoint"),
+            ("osano", "cmp", "osano"),
+            ("lockr", "identity", "lockr"),
+            ("permutive", "audience", "permutive"),
+            ("nextjs", "framework", "nextjs"),
+            ("gpt", "ad-tag", "google"),
+            ("google_tag_manager", "tag", "google-tag-manager"),
+            // Testlight says `[auction]` selects it, where its full name is
+            // written.
+            ("testlight", "auction", "testing.testlight"),
+        ] {
+            assert_eq!(
+                module_section(id),
+                Some((section, written)),
+                "should find where `{id}` is selected"
+            );
+        }
+        assert_eq!(
+            module_section("no-such-integration"),
+            None,
+            "should find nothing for an id no linked module has"
         );
     }
 }

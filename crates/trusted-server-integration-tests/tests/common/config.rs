@@ -38,9 +38,11 @@ fn app_config_envelope(
     })?;
     origin.url = origin_url;
     settings.set_origin_source(&origin);
-    // The fixture selects modules a stock build ships, so validation needs
-    // the stock list as the adapters and the `ts` tool have it.
-    trusted_server_core::config::register_deploy_integrations(trusted_server_modules::builders());
+    // The fixture selects modules the adapters link, so validation needs the
+    // list as the adapters and the `ts` tool have it.
+    trusted_server_core::config::register_deploy_integrations(
+        trusted_server_adapter_axum::app::shipped_module_builders(),
+    );
     let app_config = TrustedServerAppConfig::new(settings).map_err(|report| {
         Report::new(TestError::ConfigGeneration)
             .attach(format!("invalid generated integration config: {report:?}"))

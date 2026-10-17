@@ -181,7 +181,7 @@ fn read_back(
         &StoreName::from(DEFAULT_CONFIG_STORE_ID),
         key,
         &StoreName::from("trusted_server_secrets"),
-        &trusted_server_modules::builders(),
+        &trusted_server_cli::linked_builders(),
     )
 }
 
