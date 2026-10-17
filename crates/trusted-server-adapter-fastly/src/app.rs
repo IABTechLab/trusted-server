@@ -115,7 +115,7 @@ use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::module::request_module;
-use trusted_server_core::ec::module::{EdgeCookieModule, build_shared_module};
+use trusted_server_core::ec::module::{EdgeCookieModule, build_reusable_module};
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::ec::{EcContext, EidSyncSource};
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
@@ -125,8 +125,10 @@ use trusted_server_core::integrations::{
     RequestFilterRegistryOutcome,
 };
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices, StoreName,
+    ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices, StoreName, build_geo_module,
 };
+use trusted_server_device_fastly::FastlyHostSignals;
+
 use trusted_server_core::proxy::{
     AssetProxyCachePolicy, handle_asset_proxy_request, handle_first_party_click,
     handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
@@ -240,11 +242,22 @@ pub(crate) fn build_state_from_settings(
 
     // Composition root: resolve the module selection once, before any request
     // is served, so a selection this adapter can never supply fails here rather
-    // than on the first request. Keeping what the resolution produced is what
-    // stops the request path resolving the same settings again. This adapter
+    // than on the first request, and keep what the resolution produced so the
+    // request path does not resolve the same settings again. This adapter
     // injects no vendor Edge Cookie module, so `None` is the injected
     // argument, and one is passed here once this adapter supplies it.
-    let ec_module = build_shared_module(&settings.ec, None)?;
+    //
+    // This adapter injects host signals on every request, so a startup instance
+    // with no captured signals answers the only question the check asks,
+    // which is whether the service exists at all. That same emptiness is why
+    // `build_reusable_module` hands back nothing for a module built from
+    // those signals, leaving it to be resolved per request against the
+    // signals that request actually carried.
+    let ec_module = build_reusable_module(
+        &settings.ec,
+        Some(Arc::new(FastlyHostSignals::default())),
+        None,
+    )?;
 
     let plan = Arc::new(compile_auction_plan(&settings)?);
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Fastly)?;
@@ -298,6 +311,23 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
             ..ClientInfo::default()
         });
 
+    // The TLS JA4 and HTTP/2 signals arrive as trusted internal headers
+    // injected by the entry point. They build the host-signal service a
+    // host-signal module reads. Fastly always supplies the capability, so the
+    // service is always set even when a request carried no signal.
+    let tls_ja4 = ctx
+        .request()
+        .headers()
+        .get("x-ts-tls-ja4")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let h2_fingerprint = ctx
+        .request()
+        .headers()
+        .get("x-ts-h2-fingerprint")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
     let builder = RuntimeServices::builder()
         .config_store(Arc::new(FastlyPlatformConfigStore))
         .secret_store(Arc::new(FastlyPlatformSecretStore))
@@ -309,14 +339,19 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
         .template_assembler(Arc::new(crate::esi_assembly::FastlyTemplateAssembler))
         .backend(Arc::new(FastlyPlatformBackend))
         .http_client(Arc::new(FastlyPlatformHttpClient))
-        .geo(Arc::new(FastlyPlatformGeo))
+        .geo(build_geo_module(
+            &state.settings,
+            Arc::new(FastlyPlatformGeo),
+        ))
         .auction_telemetry_sink(Arc::clone(&state.auction_telemetry_sink))
-        .client_info(client_info);
+        .client_info(client_info)
+        .host_signals(Arc::new(FastlyHostSignals::new(tls_ja4, h2_fingerprint)));
 
     // Hand every request the module resolved at the composition root, so the
     // request path reuses that instance instead of resolving `[ec] module`
-    // again. Nothing is set for a deployment that selects no module, which
-    // resolves to nothing either way.
+    // again. Nothing is set for a deployment that selects no module, or one
+    // whose module is built from this request's own host signals, and both
+    // are resolved on the request path instead.
     match state.ec_module.clone() {
         Some(module) => builder.resolved_ec_module(module).build(),
         None => builder.build(),
@@ -442,7 +477,7 @@ fn build_ec_request_state(
     req: &Request,
 ) -> EcRequestState {
     let device_signals = device_signals_for(req);
-    let is_real_browser = device_signals.looks_like_browser();
+    let is_real_browser = device_signals.looks_like_browser;
     if !is_real_browser {
         log::info!(
             "Bot gate: blocking EC operations (ja4={:?}, platform={:?}, is_mobile={})",
@@ -776,7 +811,7 @@ async fn run_named_route(
 /// response finalization.
 fn run_batch_sync(state: &AppState, services: &RuntimeServices, req: Request) -> Response {
     let device_signals = device_signals_for(&req);
-    let is_real_browser = device_signals.looks_like_browser();
+    let is_real_browser = device_signals.looks_like_browser;
     let eids_cookie = crate::extract_cookie_value(&req, COOKIE_TS_EIDS);
     let sharedid_cookie = crate::extract_cookie_value(&req, COOKIE_SHAREDID);
 
@@ -1625,8 +1660,9 @@ mod tests {
             Arc::new(crate::platform::UnavailableKvStore) as Arc<dyn super::PlatformKvStore>;
         // Resolved the same way the composition root resolves it, so this
         // router behaves like a served one.
-        let ec_module = trusted_server_core::ec::module::build_shared_module(&settings.ec, None)
-            .expect("should resolve the Edge Cookie module selection");
+        let ec_module =
+            trusted_server_core::ec::module::build_reusable_module(&settings.ec, None, None)
+                .expect("should resolve the Edge Cookie module selection");
         let state = Arc::new(super::AppState {
             auction_telemetry_sink: Arc::new(
                 trusted_server_core::auction::NoopAuctionTelemetrySink,
