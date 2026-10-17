@@ -81,7 +81,7 @@ p.lede{{color:#bbb}}pre{{background:#1a1c1d}}}}\n\
 }
 
 /// Escapes `value` for HTML text content.
-fn html_escape(value: &str) -> String {
+pub(crate) fn html_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
         .replace('<', "&lt;")

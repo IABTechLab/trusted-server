@@ -1325,3 +1325,176 @@ async fn adapter_buffers_nextjs_auction_output() {
         }
     }
 }
+
+/// The shared settings with an `[attestation]` section whose endpoint sits
+/// under a prefix of its own, so the deployment owns the prefix.
+fn attestation_settings() -> Settings {
+    let mut settings = test_settings();
+    settings.attestation = Some(trusted_server_core::attestation::AttestationConfig {
+        endpoint: "/_ex/attestation".to_owned(),
+        operator: "Example Operator".to_owned(),
+        context: "example-attestation:v1".to_owned(),
+        verify_url: "https://verifier.example/verify".to_owned(),
+    });
+    settings
+}
+
+/// The value of header `name`, or an empty string when it is absent.
+fn header_text(headers: &HeaderMap, name: &str) -> String {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// One adapter's answer to a request.
+struct Answer {
+    adapter: &'static str,
+    status: u16,
+    headers: HeaderMap,
+}
+
+/// What each host-runnable adapter answers to `method` at `uri` under
+/// `settings`.
+async fn answers(settings: &Settings, method: &str, uri: &str) -> Vec<Answer> {
+    let mut axum = EdgeZeroAxumService::new(
+        AxumApp::routes_with_settings(settings.clone()).expect("should build Axum router"),
+    );
+    let request = AxumRequest::builder()
+        .method(method)
+        .uri(uri)
+        .body(AxumBody::empty())
+        .expect("should build request");
+    let response = axum
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(request)
+        .await
+        .expect("should respond");
+    let mut answers = vec![Answer {
+        adapter: "axum",
+        status: response.status().as_u16(),
+        headers: response.headers().clone(),
+    }];
+
+    for (adapter, router) in [
+        (
+            "cloudflare",
+            CloudflareApp::routes_with_settings(settings.clone())
+                .expect("should build Cloudflare router"),
+        ),
+        (
+            "spin",
+            SpinApp::routes_with_settings(settings.clone()).expect("should build Spin router"),
+        ),
+    ] {
+        let request = request_builder()
+            .method(method)
+            .uri(uri)
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build request");
+        let response = router.oneshot(request).await.expect("should respond");
+        answers.push(Answer {
+            adapter,
+            status: response.status().as_u16(),
+            headers: response.headers().clone(),
+        });
+    }
+    answers
+}
+
+/// A deployment whose endpoint sits under a prefix of its own answers
+/// everything beneath that prefix the same way on every adapter. Reads of the
+/// two attestation addresses reach the handler, the prefix lists its pages,
+/// and anything else is not found rather than sent to the publisher's origin.
+/// Test builds carry no signing key, so the handler answers 503 in JSON.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attestation_prefix_parity() {
+    let cases = [
+        ("GET", "/_ex", 200, "text/html"),
+        ("GET", "/_ex/", 200, "text/html"),
+        ("GET", "/_ex/attestation.json", 503, "application/json"),
+        ("HEAD", "/_ex/attestation.json", 503, "application/json"),
+        ("GET", "/_ex/attestation", 503, "application/json"),
+        ("POST", "/_ex/attestation", 404, "text/html"),
+        ("PUT", "/_ex/attestation.json", 404, "text/html"),
+        ("DELETE", "/_ex", 404, "text/html"),
+        ("GET", "/_ex/unknown/page", 404, "text/html"),
+    ];
+    let settings = attestation_settings();
+    for (method, uri, status, content_type) in cases {
+        for answer in answers(&settings, method, uri).await {
+            let case = format!("{} {method} {uri}", answer.adapter);
+            let got_type = header_text(&answer.headers, "content-type");
+            assert_eq!(answer.status, status, "should answer {case} alike");
+            assert!(
+                got_type.starts_with(content_type),
+                "should answer {case} as {content_type}, got {got_type}"
+            );
+            assert_eq!(
+                header_text(&answer.headers, "cache-control"),
+                "no-store",
+                "should keep the answer to {case} out of every cache"
+            );
+        }
+    }
+}
+
+/// When the endpoint is not the default, every adapter sends a read of the
+/// default address to the endpoint, page to page and JSON to JSON, keeping
+/// the nonce.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attestation_default_address_redirect_parity() {
+    let cases = [
+        ("GET", "/_ts/attestation", "/_ex/attestation"),
+        ("HEAD", "/_ts/attestation", "/_ex/attestation"),
+        (
+            "GET",
+            "/_ts/attestation.json?nonce=abc123",
+            "/_ex/attestation.json?nonce=abc123",
+        ),
+    ];
+    let settings = attestation_settings();
+    for (method, uri, location) in cases {
+        for answer in answers(&settings, method, uri).await {
+            let case = format!("{} {method} {uri}", answer.adapter);
+            assert_eq!(answer.status, 301, "should redirect {case}");
+            assert_eq!(
+                header_text(&answer.headers, "location"),
+                location,
+                "should send {case} to the endpoint with its query kept"
+            );
+            assert_eq!(
+                header_text(&answer.headers, "cache-control"),
+                "no-store",
+                "should keep the redirect of {case} out of every cache"
+            );
+        }
+    }
+}
+
+/// Without the section no adapter takes the default address, so a read of it
+/// reaches the publisher's origin as any other path does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn attestation_is_not_served_without_its_section_parity() {
+    let settings = test_settings();
+    let unknown = answers(&settings, "GET", "/a-path-no-route-names").await;
+    let attestation = answers(&settings, "GET", "/_ts/attestation.json").await;
+
+    for (unknown, attestation) in unknown.iter().zip(&attestation) {
+        assert_eq!(
+            attestation.status, unknown.status,
+            "{} should answer the attestation address as it answers any path of the origin",
+            attestation.adapter
+        );
+        // The handler answers 404 where there is no section, so a 404 here
+        // would say a route had been registered for it.
+        assert_ne!(
+            attestation.status, 404,
+            "{} should not answer from the attestation handler",
+            attestation.adapter
+        );
+    }
+}

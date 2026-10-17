@@ -119,6 +119,7 @@ log-fastly = "0.12"
 lol_html = "2.7.2"
 matchit = "0.9"
 mime = "0.3"
+p256 = { version = "0.13", default-features = false, features = ["alloc", "ecdsa", "pkcs8"] }
 predicates = "3"
 prost-build = "0.13"
 rand = "0.8"

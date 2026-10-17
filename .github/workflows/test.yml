@@ -77,6 +77,10 @@ jobs:
       - name: Run config by host harness (reusable-sandbox feature)
         run: ./scripts/config-by-host-local-test.sh reuse
 
+      # Last, because it builds core with a key schedule compiled in.
+      - name: Run attestation harness
+        run: ./scripts/attestation-local-test.sh
+
   test-axum:
     name: cargo test (axum native, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
