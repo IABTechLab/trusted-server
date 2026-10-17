@@ -1,77 +1,570 @@
-//! EC-specific consent gating.
+//! EC-specific permission gating, resolved through the permission model.
 //!
-//! This module provides the public consent-check API for the EC subsystem.
-//! The underlying logic lives in [`crate::consent::allows_ec_creation`]; this
-//! wrapper exists so that EC callers can import from `ec::consent` and the
-//! eventual migration path (renaming, adding EC-specific conditions) is
-//! contained here.
+//! The Edge Cookie module advertises the [`Permission`]s its data use
+//! requires. [`assemble_permissions`] resolves which permissions are set for a
+//! request, from the country it maps to and what the signal modules say,
+//! and the context construction gates the module on that state. The EC
+//! permission decision lives here, in the EC subsystem, and nowhere else, so
+//! callers route every EC permission check through this module rather than
+//! re-deriving one.
+//!
+//! No scheme is decoded here. Which signals count, and what each says about
+//! a permission, is answered by the [`PermissionSignalModule`]s the adapter
+//! hands in, every one of which is a crate outside core. This module asks
+//! them in order and applies the country and region rules to what they
+//! settle on.
+
+use std::sync::Arc;
 
 use crate::consent::ConsentContext;
+use crate::consent::jurisdiction::Jurisdiction;
+use crate::evidence::RequestInfo;
+use crate::permission_signal::{self, PermissionSignalModule};
+use crate::permissions::{
+    Acquisition, ConsentSignal, Permission, PermissionMaps, PermissionState, SignalPolicy,
+};
+use crate::platform::GeoInfo;
 
-/// Determines whether Edge Cookie creation is permitted based on the
-/// user's consent and detected jurisdiction.
+/// The outcome of the geo lookup for a request, separating "no location
+/// resolved" from "the lookup failed".
 ///
-/// This is the canonical entry point for EC consent checks. It delegates
-/// to [`crate::consent::allows_ec_creation`] today but may diverge as
-/// EC-specific consent rules evolve.
-///
-/// See [`crate::consent::allows_ec_creation`] for the full decision matrix.
-#[must_use]
-pub fn ec_consent_granted(consent_context: &ConsentContext) -> bool {
-    crate::consent::allows_ec_creation(consent_context)
+/// The two must not collapse: with no location (the module is disabled, or
+/// had no data for the address) the permission policy's top node applies, but
+/// when the lookup errored the request's place is unknown in a way that top
+/// node must not paper over, so every permission resolves to the
+/// requires-signal floor instead.
+#[derive(Debug, Clone, Copy)]
+pub enum GeoStatus<'a> {
+    /// The module resolved a location.
+    Located(&'a GeoInfo),
+    /// The module resolved no location, so the policy's top node applies.
+    NoLocation,
+    /// The lookup errored, so the requires-signal floor applies.
+    Failed,
 }
 
-/// Returns `true` when the request carries an explicit EC withdrawal signal.
+impl<'a> GeoStatus<'a> {
+    /// The resolved location, when one exists.
+    #[must_use]
+    pub fn info(self) -> Option<&'a GeoInfo> {
+        match self {
+            GeoStatus::Located(info) => Some(info),
+            GeoStatus::NoLocation | GeoStatus::Failed => None,
+        }
+    }
+}
+
+impl<'a> From<Option<&'a GeoInfo>> for GeoStatus<'a> {
+    fn from(geo: Option<&'a GeoInfo>) -> Self {
+        match geo {
+            Some(info) => GeoStatus::Located(info),
+            None => GeoStatus::NoLocation,
+        }
+    }
+}
+
+/// The jurisdiction the consent gates apply to a request, from its resolved
+/// location or, with none, from the permission policy's top node.
 ///
-/// This is intentionally stricter than [`ec_consent_granted`]. A fail-closed
-/// result such as unknown jurisdiction or missing consent data must not be
-/// treated as an authoritative withdrawal of an already-issued EC.
+/// The consent gates (for example the server-side auction gate) detect a
+/// jurisdiction from geolocation. With no location they would resolve
+/// `Unknown` and fail closed even where the policy declares what to do, so the
+/// same fallback the permission model applies is offered here: the top node's
+/// `jurisdiction` stands in for the missing location. A failed lookup stays
+/// unknown, so the consent gates fail closed alongside the requires-signal
+/// floor.
 #[must_use]
-pub fn ec_consent_withdrawn(consent_context: &ConsentContext) -> bool {
-    crate::consent::has_explicit_ec_withdrawal(consent_context)
+pub fn default_jurisdiction(geo: GeoStatus<'_>) -> Jurisdiction {
+    match geo {
+        GeoStatus::NoLocation => PermissionMaps::standard().default_jurisdiction(),
+        GeoStatus::Located(_) | GeoStatus::Failed => Jurisdiction::Unknown,
+    }
+}
+
+/// Assembles the permission state for a request: the place baseline from the
+/// tree in `permissions.yaml`, amended by what the signal modules say.
+///
+/// Permissions exist without a consent model. With no module having an
+/// opinion the result is simply the baseline for the request's country and
+/// region. When the geo module resolves no location, or a country/region
+/// that has no rule, the policy's top node applies, and the top node's `group`
+/// is required so one is always available. A failed lookup
+/// ([`GeoStatus::Failed`]) instead resolves every permission to the
+/// requires-signal floor, so an outage is handled protectively rather than as
+/// the policy's declared default.
+///
+/// `modules` are the signal modules the adapter selected, in the order
+/// they run. A scheme missing from the list does not run, so a publisher
+/// removes one by leaving it out rather than by configuring it off, and an
+/// empty slice runs none of them, which leaves every permission at its
+/// country and region baseline. The same modules answer whether storage
+/// was explicitly withdrawn, recorded on the state and read through
+/// [`PermissionState::storage_withdrawn`], and declare the terms documents the
+/// request's data is available under, read through
+/// [`PermissionState::tdls`].
+#[must_use]
+pub fn assemble_permissions(
+    consent: &ConsentContext,
+    evidence: &dyn RequestInfo,
+    geo: GeoStatus<'_>,
+    modules: &[Arc<dyn PermissionSignalModule>],
+) -> PermissionState {
+    let maps = PermissionMaps::standard();
+    let signal = permission_signal(consent, evidence, maps.signals(), modules);
+    let state = match geo {
+        GeoStatus::Failed => PermissionMaps::floor_with(signal),
+        GeoStatus::Located(_) | GeoStatus::NoLocation => {
+            let info = geo.info();
+            maps.resolve_with(
+                info.map(|info| info.country.as_str()),
+                info.and_then(|info| info.region.as_deref()),
+                signal,
+            )
+        }
+    };
+    let withdrawn = permission_signal::withdrawn(
+        modules,
+        Permission::StoreOnDevice,
+        consent,
+        evidence,
+        maps.signals(),
+        storage_acquisition(geo),
+    );
+    state
+        // Only a permission some configured module could still grant is
+        // worth a page waiting for. The rest are unset, not pending.
+        .awaiting_only(permission_signal::answerable(modules, maps.signals()))
+        .with_storage_withdrawn(withdrawn)
+        .with_tdls(permission_signal::tdls(modules, consent, evidence))
+        .with_signals(permission_signal::signals(modules, consent, evidence))
+}
+
+/// The acquisition rule for Edge Cookie storage in the request's resolved
+/// jurisdiction, used to scope destructive withdrawal.
+///
+/// Resolves the same rules as [`assemble_permissions`] (the request's
+/// country/region, the policy's top node when unmatched, and the
+/// requires-signal floor when the lookup failed) and returns the rule for
+/// [`Permission::StoreOnDevice`].
+#[must_use]
+pub fn storage_acquisition(geo: GeoStatus<'_>) -> Acquisition {
+    match geo {
+        GeoStatus::Failed => Acquisition::RequiresSignal,
+        GeoStatus::Located(_) | GeoStatus::NoLocation => {
+            let info = geo.info();
+            PermissionMaps::standard()
+                .rules_or_default(
+                    info.map(|info| info.country.as_str()),
+                    info.and_then(|info| info.region.as_deref()),
+                )
+                .map_or(Acquisition::RequiresSignal, |rules| {
+                    rules.rule_for(Permission::StoreOnDevice)
+                })
+        }
+    }
+}
+
+/// Maps a request to a [`ConsentSignal`] for each permission, applying the
+/// [`SignalPolicy`] the permission model parsed from `permissions.yaml`.
+///
+/// This is the only place the EC subsystem consults the signal modules. The
+/// policy, not this function, decides which schemes are authoritative and what
+/// a US-style opt-out revokes, and each module decides what its own scheme
+/// says. This function only hands each module the request, in order, so no
+/// signal-to-permission rule lives in core.
+///
+/// Each module amends what the ones before it settled on. The order is the
+/// policy, and [`combine`] documents why. A record that arrived and could
+/// not be read is its own scheme's module's to answer, in the same order,
+/// and nothing here answers ahead of the modules.
+///
+/// Whether an amendment changes anything is then decided by the country/region
+/// map, which drops a `granted` baseline on a `Revoke` and has nothing to drop
+/// where the permission is `requires_signal` or `denied`.
+///
+/// [`combine`]: crate::permission_signal::combine
+fn permission_signal<'a>(
+    consent: &'a ConsentContext,
+    evidence: &'a dyn RequestInfo,
+    signals: &'a SignalPolicy,
+    modules: &'a [Arc<dyn PermissionSignalModule>],
+) -> impl Fn(Permission, Acquisition) -> ConsentSignal + 'a {
+    move |permission, baseline| {
+        permission_signal::combine(modules, permission, consent, evidence, signals, baseline)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use http::HeaderMap;
+
     use super::*;
-    use crate::consent::jurisdiction::Jurisdiction;
+    use crate::evidence::OwnedRequestInfo;
+    use crate::permission_signal::SignalInput;
+    use crate::permissions::{PermissionSet, ValidSignal};
+    use crate::test_support::tests::create_test_settings;
+
+    /// A module that grants every permission, standing in for a scheme that
+    /// answered a prompt, so the assembly rules can be exercised without any
+    /// real scheme in core.
+    struct Granting;
+
+    impl PermissionSignalModule for Granting {
+        fn id(&self) -> &'static str {
+            "granting"
+        }
+
+        fn signal(&self, _permission: Permission, _input: &SignalInput<'_>) -> ConsentSignal {
+            ConsentSignal::Grant
+        }
+    }
+
+    /// A module that declares a terms document, standing in for a terms
+    /// scheme such as Model Terms for Marketing, which is the next module
+    /// and is not one of the four that ship here.
+    struct DeclaringTerms;
+
+    impl PermissionSignalModule for DeclaringTerms {
+        fn id(&self) -> &'static str {
+            "declaring-terms"
+        }
+
+        fn signal(&self, _permission: Permission, _input: &SignalInput<'_>) -> ConsentSignal {
+            ConsentSignal::Neutral
+        }
+
+        fn tdls(
+            &self,
+            _consent: &ConsentContext,
+            _evidence: &dyn crate::evidence::RequestInfo,
+        ) -> Vec<crate::tdl::Tdl> {
+            vec![
+                crate::tdl::Tdl::new("https://terms.example.com/marketing/2.txt")
+                    .expect("should accept the test locator"),
+            ]
+        }
+    }
+
+    fn no_evidence() -> OwnedRequestInfo {
+        OwnedRequestInfo::new(String::new(), HeaderMap::new())
+    }
+
+    fn granting() -> Vec<Arc<dyn PermissionSignalModule>> {
+        vec![Arc::new(Granting)]
+    }
+
+    fn assembled(
+        consent: &ConsentContext,
+        geo: GeoStatus<'_>,
+        modules: &[Arc<dyn PermissionSignalModule>],
+    ) -> PermissionState {
+        assemble_permissions(consent, &no_evidence(), geo, modules)
+    }
+
+    fn us_ca_geo() -> GeoInfo {
+        GeoInfo {
+            city: String::new(),
+            country: "US".to_owned(),
+            continent: String::new(),
+            latitude: 0.0,
+            longitude: 0.0,
+            metro_code: 0,
+            region: Some("CA".to_owned()),
+            asn: None,
+        }
+    }
+
+    /// A module that could grant storage and has not, standing in for a
+    /// prompt that has not been answered yet.
+    struct Undecided;
+
+    impl PermissionSignalModule for Undecided {
+        fn id(&self) -> &'static str {
+            "undecided"
+        }
+
+        fn signal(&self, _permission: Permission, _input: &SignalInput<'_>) -> ConsentSignal {
+            ConsentSignal::Neutral
+        }
+
+        fn grants(&self, _policy: &SignalPolicy) -> PermissionSet {
+            PermissionSet::none().with(Permission::StoreOnDevice)
+        }
+    }
 
     #[test]
-    fn ec_consent_granted_allows_non_regulated_requests() {
-        let ctx = ConsentContext {
-            jurisdiction: Jurisdiction::NonRegulated,
-            ..ConsentContext::default()
-        };
+    fn only_a_permission_a_module_could_still_grant_is_awaited() {
+        // Arrange: the top node requires a signal for storage and for the
+        // marketing channels, and the one module could grant storage only.
+        let modules: Vec<Arc<dyn PermissionSignalModule>> = vec![Arc::new(Undecided)];
+        let state = assembled(&ConsentContext::default(), GeoStatus::NoLocation, &modules);
 
+        // Assert: storage is awaited, and a channel nothing here could grant
+        // is neither set nor awaited.
         assert!(
-            ec_consent_granted(&ctx),
-            "non-regulated requests should be allowed"
+            state.is_awaited(Permission::StoreOnDevice),
+            "should await the permission the module has yet to answer"
+        );
+        let email = Permission::all()
+            .find(|permission| permission.as_str() == "advertising_marketing.communications.email")
+            .expect("the taxonomy should carry the email channel");
+        assert!(
+            !state.is_awaited(email) && !state.is_set(email),
+            "should not tell a page to wait for a permission no module can grant"
         );
     }
 
     #[test]
-    fn ec_consent_granted_blocks_unknown_jurisdiction() {
-        let ctx = ConsentContext {
-            jurisdiction: Jurisdiction::Unknown,
-            ..ConsentContext::default()
-        };
-
+    fn nothing_is_awaited_when_no_module_runs() {
+        // A publisher acting on no signal at all has nothing to wait for.
+        let state = assembled(&ConsentContext::default(), GeoStatus::NoLocation, &[]);
         assert!(
-            !ec_consent_granted(&ctx),
-            "unknown jurisdiction should fail closed"
+            state.awaiting().is_empty(),
+            "with no module nothing can arrive, so nothing is awaited"
         );
     }
 
     #[test]
-    fn ec_consent_withdrawn_does_not_treat_unknown_jurisdiction_as_revocation() {
-        let ctx = ConsentContext {
-            jurisdiction: Jurisdiction::Unknown,
+    fn a_module_declaring_terms_reaches_the_assembled_state() {
+        let consent = ConsentContext::default();
+        let modules: Vec<Arc<dyn PermissionSignalModule>> = vec![Arc::new(DeclaringTerms)];
+        let state = assemble_permissions(&consent, &no_evidence(), GeoStatus::NoLocation, &modules);
+        let addresses: Vec<&str> = state.tdls().iter().map(crate::tdl::Tdl::as_str).collect();
+        assert_eq!(
+            addresses,
+            vec!["https://terms.example.com/marketing/2.txt"],
+            "should carry the terms the module declared through to whatever reads the state"
+        );
+    }
+
+    #[test]
+    fn a_state_assembled_from_the_shipped_kind_of_module_declares_no_terms() {
+        let consent = ConsentContext::default();
+        let state =
+            assemble_permissions(&consent, &no_evidence(), GeoStatus::NoLocation, &granting());
+        assert!(
+            state.tdls().is_empty(),
+            "should declare nothing, because a scheme carrying no terms says nothing about them"
+        );
+    }
+
+    #[test]
+    fn hmac_module_is_blocked_without_a_storage_signal() {
+        let settings = create_test_settings();
+        // The test settings select the HMAC module, which requires
+        // necessary.operations.storage. The policy's top node resolves storage
+        // as requires-signal, so with no module granting it the permission is
+        // not set and the module's requirement is not met.
+        let module = crate::ec::module::build_module(&settings.ec, None, None)
+            .expect("should build the configured module")
+            .expect("should select the hmac module");
+        let state = assembled(&ConsentContext::default(), GeoStatus::NoLocation, &[]);
+        assert!(
+            !state.all_set(module.required_permissions()),
+            "the requires-signal default should not satisfy the HMAC module without a signal"
+        );
+    }
+
+    #[test]
+    fn no_signal_uses_the_us_opt_out_baseline() {
+        // US/CA maps to the us-opt-out group, where every purpose is granted
+        // without a signal, so EC identity and bidstream EIDs are both permitted.
+        let geo = us_ca_geo();
+        let state = assembled(&ConsentContext::default(), GeoStatus::Located(&geo), &[]);
+        assert!(
+            state.is_set(Permission::StoreOnDevice)
+                && state.is_set(Permission::SelectPersonalisedAds),
+            "a US opt-out state should grant necessary.operations.storage and advertising_marketing.first_party.targeted"
+        );
+    }
+
+    #[test]
+    fn a_grant_sets_a_requires_signal_permission() {
+        // The top node requires a signal for storage, and a module granting
+        // it is what a signal arriving looks like from here.
+        let state = assembled(
+            &ConsentContext::default(),
+            GeoStatus::NoLocation,
+            &granting(),
+        );
+        assert!(
+            state.is_set(Permission::StoreOnDevice),
+            "a module granting storage should set it under a requires-signal baseline"
+        );
+        assert!(
+            !state.storage_withdrawn(),
+            "and a grant is the opposite of a withdrawal"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // An unreadable record is its own scheme's module's to answer. Core
+    // answers nothing ahead of the modules, so with none configured the
+    // baseline stands whatever the request carries.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn core_answers_nothing_ahead_of_the_modules() {
+        let consent = ConsentContext {
+            raw_tc_string: Some("this is not a TC string".to_owned()),
             ..ConsentContext::default()
         };
-
+        let geo = us_ca_geo();
+        let state = assembled(&consent, GeoStatus::Located(&geo), &[]);
         assert!(
-            !ec_consent_withdrawn(&ctx),
-            "unknown jurisdiction should block creation without revoking existing EC"
+            state.is_set(Permission::StoreOnDevice),
+            "with no module configured, what a TC string says or fails to say is nobody's \
+             to answer, so the baseline stands"
+        );
+        assert!(
+            state.signals().is_empty(),
+            "and nothing vouches for the string, so it is not a valid signal"
+        );
+    }
+
+    /// A module that vouches for whatever TC string the request carries,
+    /// standing in for a scheme that decoded it.
+    struct VouchingForTcf;
+
+    impl PermissionSignalModule for VouchingForTcf {
+        fn id(&self) -> &'static str {
+            "vouching"
+        }
+
+        fn signal(&self, _permission: Permission, _input: &SignalInput<'_>) -> ConsentSignal {
+            ConsentSignal::Neutral
+        }
+
+        fn valid_signal(
+            &self,
+            consent: &ConsentContext,
+            _evidence: &dyn crate::evidence::RequestInfo,
+        ) -> Option<ValidSignal> {
+            consent
+                .raw_tc_string
+                .as_deref()
+                .map(|raw| ValidSignal::new("vouching", "tcf", raw))
+        }
+    }
+
+    #[test]
+    fn the_assembled_state_carries_the_signals_the_modules_vouched_for() {
+        let consent = ConsentContext {
+            raw_tc_string: Some("CPxyz".to_owned()),
+            ..ConsentContext::default()
+        };
+        let modules: Vec<Arc<dyn PermissionSignalModule>> = vec![Arc::new(VouchingForTcf)];
+        let state = assembled(&consent, GeoStatus::NoLocation, &modules);
+        assert_eq!(
+            state.signals(),
+            &[ValidSignal::new("vouching", "tcf", "CPxyz")],
+            "should carry the signal as received, attributed to the module that read it"
+        );
+    }
+
+    #[test]
+    fn the_context_keeps_only_what_was_vouched_for() {
+        let mut consent = ConsentContext {
+            raw_tc_string: Some("CPxyz".to_owned()),
+            raw_gpp_string: Some("not a GPP string".to_owned()),
+            gpp_section_ids: Some(vec![7]),
+            raw_us_privacy: Some("1YNN".to_owned()),
+            ..ConsentContext::default()
+        };
+        consent.keep_only(&[ValidSignal::new("vouching", "tcf", "CPxyz")]);
+        assert_eq!(consent.raw_tc_string.as_deref(), Some("CPxyz"));
+        assert!(
+            consent.raw_gpp_string.is_none() && consent.gpp_section_ids.is_none(),
+            "a GPP string nobody vouched for goes no further, with its section ids"
+        );
+        assert!(
+            consent.raw_us_privacy.is_none(),
+            "a US Privacy string nobody vouched for goes no further"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_record_is_not_a_withdrawal() {
+        let consent = ConsentContext {
+            raw_tc_string: Some("not-a-tc-string".to_owned()),
+            ..ConsentContext::default()
+        };
+        let state = assembled(&consent, GeoStatus::NoLocation, &granting());
+        assert!(
+            !state.storage_withdrawn(),
+            "an unreadable record fails closed by suppression, never destructively"
+        );
+    }
+
+    #[test]
+    fn running_no_modules_leaves_the_place_baseline() {
+        let geo = us_ca_geo();
+        let state = assembled(&ConsentContext::default(), GeoStatus::Located(&geo), &[]);
+        assert!(
+            state.is_set(Permission::StoreOnDevice),
+            "an empty list is a publisher acting on no signal at all, so only the country \
+             and region rules apply"
+        );
+        assert!(!state.storage_withdrawn(), "and nothing can have withdrawn");
+    }
+
+    // ------------------------------------------------------------------
+    // Geo status: a failed lookup resolves at the requires-signal floor and
+    // never consults the tree, while no location resolves at the policy's top
+    // node.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn a_failed_geo_lookup_resolves_to_the_requires_signal_floor() {
+        // The same request, located in a US opt-out state, grants storage
+        // without a signal. A failed lookup must not reach that rule, or any
+        // other, so nothing is set without a signal.
+        let geo = us_ca_geo();
+        assert!(
+            assembled(&ConsentContext::default(), GeoStatus::Located(&geo), &[])
+                .is_set(Permission::StoreOnDevice),
+            "the located baseline must grant storage, or this test proves nothing"
+        );
+        let state = assembled(&ConsentContext::default(), GeoStatus::Failed, &[]);
+        assert!(
+            !state.is_set(Permission::StoreOnDevice),
+            "a lookup failure must not fall back to any node of the policy tree"
+        );
+        assert_eq!(
+            storage_acquisition(GeoStatus::Failed),
+            Acquisition::RequiresSignal,
+            "the storage baseline follows the same floor on failure"
+        );
+    }
+
+    #[test]
+    fn no_location_falls_back_to_the_policy_top_node() {
+        // The shipped policy's top node is the gdpr-eu group, which requires a
+        // signal for storage, so an unplaced visitor gets no identifier until
+        // one arrives.
+        let state = assembled(&ConsentContext::default(), GeoStatus::NoLocation, &[]);
+        assert!(
+            !state.is_set(Permission::StoreOnDevice),
+            "the top node requires a signal for storage"
+        );
+        assert_eq!(
+            storage_acquisition(GeoStatus::NoLocation),
+            Acquisition::RequiresSignal,
+            "the storage baseline follows the top node on no location"
+        );
+    }
+
+    #[test]
+    fn no_location_takes_the_jurisdiction_from_the_policy_top_node() {
+        assert_eq!(
+            default_jurisdiction(GeoStatus::NoLocation),
+            Jurisdiction::Gdpr,
+            "no location should resolve the top node's declared jurisdiction"
+        );
+        assert_eq!(
+            default_jurisdiction(GeoStatus::Failed),
+            Jurisdiction::Unknown,
+            "a failed lookup must not adopt the policy's declared jurisdiction"
         );
     }
 }

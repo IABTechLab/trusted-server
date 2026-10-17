@@ -140,6 +140,14 @@ pub trait DeviceModule: Send + Sync {
     /// so this is infallible: a module that cannot determine a signal returns
     /// the unknown variant rather than failing the request.
     fn detect(&self, request_info: &dyn RequestInfo) -> DeviceSignals;
+
+    /// The permissions this module's data use requires.
+    ///
+    /// The default is empty, so the built-in User-Agent-only module requires
+    /// no permission.
+    fn required_permissions(&self) -> crate::permissions::PermissionSet {
+        crate::permissions::PermissionSet::none()
+    }
 }
 
 /// The built-in device module, the default.
@@ -809,6 +817,14 @@ mod tests {
         fn detect(&self, _request_info: &dyn RequestInfo) -> DeviceSignals {
             DeviceSignals::derive_ua_only("")
         }
+    }
+
+    #[test]
+    fn builtin_device_module_requires_no_permissions() {
+        assert!(
+            BuiltinDeviceModule::new().required_permissions().is_empty(),
+            "the built-in User-Agent-only device module requires no permissions"
+        );
     }
 
     #[test]

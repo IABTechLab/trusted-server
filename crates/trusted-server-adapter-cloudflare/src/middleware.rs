@@ -215,6 +215,9 @@ mod tests {
 
                 [ec.hmac]
                 passphrase = "test-secret-key-32-bytes-minimum"
+
+                [geo]
+                assume_single_jurisdiction = true
             "#,
         )
         .expect("should load test settings");

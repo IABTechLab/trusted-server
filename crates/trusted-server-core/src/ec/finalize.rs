@@ -8,12 +8,10 @@ use std::collections::HashSet;
 use edgezero_core::body::Body as EdgeBody;
 use http::Response;
 
-use crate::consent::{ConsentContext, allows_eid_persistence};
 use crate::constants::EC_RESPONSE_HEADERS;
 use crate::settings::Settings;
 
 use super::EcContext;
-use super::consent::ec_consent_withdrawn;
 use super::cookies::{expire_ec_cookie, set_ec_cookie};
 use super::kv::{
     CreateIfAbsentOutcome, EidCookieSyncOutcome, KvIdentityGraph, PartnerIdUpdate,
@@ -28,7 +26,7 @@ use super::{EcKvSnapshot, EidSyncSource, current_timestamp, log_id};
 
 /// Finalizes EC response behavior for all routes.
 ///
-/// Applies the resolved consent gate, cookie reconciliation, Prebid EID
+/// Applies the resolved permission state, cookie reconciliation, Prebid EID
 /// ingestion, and cookie writes for new EC generation.
 ///
 /// When the request carries an explicit withdrawal signal (a storage opt-out or
@@ -66,12 +64,14 @@ pub fn ec_finalize_response(
 
     ec_context.validate_pull_sync_marker(settings, registry);
     let ec_permitted = ec_context.ec_allowed();
-    let consent_withdrawn = ec_consent_withdrawn(ec_context.consent());
 
     if !ec_permitted {
+        // The modules answer withdrawal when the permissions are assembled, so
+        // the answer is read here rather than decoded again from the consent record.
+        let storage_withdrawn = ec_context.storage_withdrawn();
         // Expire the request-local marker independently of the EC cookie: a
         // withdrawal must stop any pending pull-sync disclosure window.
-        if consent_withdrawn && ec_context.pull_sync_marker().was_present() {
+        if storage_withdrawn && ec_context.pull_sync_marker().was_present() {
             expire_marker(ec_context.pull_sync_marker_mut(), response);
         }
 
@@ -80,7 +80,7 @@ pub fn ec_finalize_response(
             ec_context,
             kv,
             registry,
-            consent_withdrawn,
+            storage_withdrawn,
             response,
         );
         return;
@@ -105,7 +105,7 @@ pub fn ec_finalize_response(
                 })
                 .unwrap_or_default();
             let had_eid_updates = !collected.is_empty();
-            let updates = gate_eid_updates_by_consent(collected, ec_context.consent());
+            let updates = gate_eid_updates_by_permissions(collected, ec_context);
             // `sync_eid_cookie_updates` early-returns without refreshing the
             // snapshot when `updates` is empty, which is correct when there
             // was never anything to write (an unconfigured registry, no sync
@@ -156,14 +156,14 @@ pub fn ec_finalize_response(
             return;
         };
 
-        let updates = gate_eid_updates_by_consent(
+        let updates = gate_eid_updates_by_permissions(
             collect_eid_updates(
                 eids_cookie,
                 sharedid_cookie,
                 ec_context.client_eids(),
                 registry,
             ),
-            ec_context.consent(),
+            ec_context,
         );
         sync_eid_cookie_updates(graph, ec_context, &kv_key, &updates, EidSyncSource::NewEc);
         if ec_context.kv_snapshot().entry_for(&kv_key).is_some() {
@@ -260,27 +260,27 @@ fn reconcile_pull_sync_marker(
     );
 }
 
-/// Withholds EID-derived KV updates when consent does not allow EID
-/// persistence, on top of the Purpose 1 (EC) gate `ec_finalize_response`
-/// already enforces before reaching this point.
+/// Withholds EID-derived KV updates unless the request's permissions allow
+/// sharing, on top of the storage gate `ec_finalize_response` already enforces
+/// before reaching this point.
 ///
-/// `consent_allows_ec` only requires Purpose 1 (device storage), but EIDs
-/// additionally require Purpose 4 (personalized ads) — the same rule
-/// [`gate_eids_by_consent`](crate::consent::gate_eids_by_consent) applies to
-/// the outbound `/auction` bid request, evaluated here through
-/// [`allows_eid_persistence`]. Without this, a user who denies Purpose 4
-/// would have their EIDs correctly stripped from the bid request but still
-/// written to the identity graph from the `ts-eids`/`sharedId` cookies or the
-/// `/auction` request body.
-fn gate_eid_updates_by_consent(
+/// The storage permission alone lets the identifier exist. Partner UIDs also
+/// need the personalised-ad permission, the pair
+/// [`gate_eids_by_permissions`](crate::consent::gate_eids_by_permissions)
+/// applies to the outbound `/auction` bid request, answered here by
+/// [`EcContext::ec_sharing_allowed`]. Without this, a reader who withheld the
+/// personalised-ad permission would have partner UIDs stripped from the bid
+/// request but still written to the identity graph from the `ts-eids` and
+/// `sharedId` cookies or the `/auction` request body.
+fn gate_eid_updates_by_permissions(
     updates: Vec<super::kv::PartnerIdUpdate>,
-    consent: &ConsentContext,
+    ec_context: &EcContext,
 ) -> Vec<super::kv::PartnerIdUpdate> {
-    if updates.is_empty() || allows_eid_persistence(consent) {
+    if updates.is_empty() || ec_context.ec_sharing_allowed() {
         return updates;
     }
     log::debug!(
-        "EC KV: withholding {} EID updates, EID consent (TCF Purpose 1 + 4) missing",
+        "EC KV: withholding {} EID updates, the storage and personalised-ad permissions are not both set",
         updates.len()
     );
     Vec::new()
@@ -814,14 +814,18 @@ mod tests {
         // identity this deployment never issued must not put a row in the
         // identity graph.
         let ec_id = sample_ec_id("zz9999");
+        // A TCF record refusing storage under the requires-signal floor is
+        // the withdrawal trigger. The TCF module answers that at assembly,
+        // and core links no module, so the answer is stated here.
         let consent = ConsentContext {
-            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
-            gpc: true,
+            jurisdiction: Jurisdiction::Gdpr,
+            tcf: Some(refusing_tcf()),
             source: ConsentSource::Cookie,
             ..Default::default()
         };
         let mut ec_context =
-            make_context_with_consent(Some(&ec_id), Some(&ec_id), true, false, consent, false);
+            make_context_with_consent(Some(&ec_id), Some(&ec_id), true, false, consent, false)
+                .with_storage_withdrawn_for_test(true);
         let kv = KvIdentityGraph::in_memory("test-store");
         let mut response = empty_response();
         let registry = PartnerRegistry::from_config(&[]).expect("should build registry");
@@ -855,14 +859,18 @@ mod tests {
     fn finalize_withdrawal_tombstones_a_held_identity() {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("held01");
+        // A TCF record refusing storage under the requires-signal floor is
+        // the withdrawal trigger. The TCF module answers that at assembly,
+        // and core links no module, so the answer is stated here.
         let consent = ConsentContext {
-            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
-            gpc: true,
+            jurisdiction: Jurisdiction::Gdpr,
+            tcf: Some(refusing_tcf()),
             source: ConsentSource::Cookie,
             ..Default::default()
         };
         let mut ec_context =
-            make_context_with_consent(Some(&ec_id), Some(&ec_id), true, false, consent, false);
+            make_context_with_consent(Some(&ec_id), Some(&ec_id), true, false, consent, false)
+                .with_storage_withdrawn_for_test(true);
         let kv = KvIdentityGraph::stale_lookup("test-store", 1);
         kv.create(
             &ec_id,
@@ -911,14 +919,18 @@ mod tests {
         // marker is exactly what goes missing.
         let settings = create_test_settings();
         let ec_id = sample_ec_id("dead01");
+        // A TCF record refusing storage under the requires-signal floor is
+        // the withdrawal trigger. The TCF module answers that at assembly,
+        // and core links no module, so the answer is stated here.
         let consent = ConsentContext {
-            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
-            gpc: true,
+            jurisdiction: Jurisdiction::Gdpr,
+            tcf: Some(refusing_tcf()),
             source: ConsentSource::Cookie,
             ..Default::default()
         };
         let mut ec_context =
-            make_context_with_consent(Some(&ec_id), Some(&ec_id), true, false, consent, false);
+            make_context_with_consent(Some(&ec_id), Some(&ec_id), true, false, consent, false)
+                .with_storage_withdrawn_for_test(true);
         ec_context.set_kv_snapshot(EcKvSnapshot::Present {
             ec_id: ec_id.clone(),
             entry: Box::new(live_entry()),
@@ -958,14 +970,20 @@ mod tests {
     fn finalize_withdrawal_clears_cookie_and_headers() {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("aBc123");
+        // A TCF record refusing storage is the withdrawal trigger, under a
+        // storage baseline at the requires-signal floor, where refusing the
+        // signal storage depends on is destructive. The TCF module answers
+        // that at assembly, and core links no module, so the answer is
+        // stated here and what finalization does with it is what is tested.
         let consent = ConsentContext {
-            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
-            gpc: true,
+            jurisdiction: Jurisdiction::Gdpr,
+            tcf: Some(refusing_tcf()),
             source: ConsentSource::Cookie,
             ..Default::default()
         };
         let mut ec_context =
-            make_context_with_consent(Some(&ec_id), Some(&ec_id), true, false, consent, false);
+            make_context_with_consent(Some(&ec_id), Some(&ec_id), true, false, consent, false)
+                .with_storage_withdrawn_for_test(true);
         let mut response = empty_response();
         set_header(&mut response, "x-ts-ec", "stale");
         set_header(&mut response, "x-ts-eids", "[]");
@@ -1008,6 +1026,65 @@ mod tests {
         assert!(
             set_cookie.contains("Max-Age=0"),
             "withdrawal should set Max-Age=0"
+        );
+    }
+
+    /// A decoded TCF record refusing every purpose, storage included.
+    fn refusing_tcf() -> crate::consent::TcfConsent {
+        crate::consent::TcfConsent {
+            version: 2,
+            cmp_id: 0,
+            cmp_version: 0,
+            consent_screen: 0,
+            consent_language: "EN".to_owned(),
+            vendor_list_version: 0,
+            tcf_policy_version: 2,
+            created_ds: 0,
+            last_updated_ds: 0,
+            purpose_consents: vec![false; 24],
+            purpose_legitimate_interests: vec![false; 24],
+            vendor_consents: Vec::new(),
+            vendor_legitimate_interests: Vec::new(),
+            special_feature_opt_ins: vec![false; 12],
+        }
+    }
+
+    #[test]
+    fn finalize_gpc_suppresses_headers_but_keeps_the_cookie() {
+        // A US-style opt-out suppresses use (headers cleared, nothing egressed)
+        // but is never destructive: the browser cookie is not expired, so a
+        // visitor who later withdraws the opt-out keeps their identity.
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("aBc123");
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
+            gpc: true,
+            source: ConsentSource::Cookie,
+            ..Default::default()
+        };
+        let mut ec_context =
+            make_context_with_consent(Some(&ec_id), Some(&ec_id), true, false, consent, false);
+        let mut response = empty_response();
+        set_header(&mut response, "x-ts-ec", "stale");
+
+        let test_registry = PartnerRegistry::empty();
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            None,
+            &test_registry,
+            None,
+            None,
+            &mut response,
+        );
+
+        assert!(
+            get_header(&response, "x-ts-ec").is_none(),
+            "the opt-out should clear the EC header"
+        );
+        assert!(
+            get_header(&response, "set-cookie").is_none(),
+            "the opt-out should not expire the browser cookie"
         );
     }
 
@@ -1185,7 +1262,8 @@ mod tests {
             purpose1_only_consent,
             Some("192.0.2.11".to_owned()),
         )
-        .with_module_for_test(crate::ec::tests::hmac_module());
+        .with_module_for_test(crate::ec::tests::hmac_module())
+        .with_permissions_for_test(crate::test_support::tests::storage_only_permissions());
         ec_context.set_recovery_eligible(true);
         ec_context.set_eid_sync_source(EidSyncSource::Navigation);
         ec_context.set_client_eids(vec![Eid {
@@ -1670,7 +1748,8 @@ mod tests {
             false,
             purpose1_only_consent,
             true,
-        );
+        )
+        .with_permissions_for_test(crate::test_support::tests::storage_only_permissions());
         ec_context.set_kv_snapshot(EcKvSnapshot::Missing {
             ec_id: ec_id.clone(),
         });
@@ -2280,10 +2359,10 @@ mod tests {
     }
 
     #[test]
-    fn the_consent_gate_decides_whether_a_generated_ec_cookie_is_written() {
+    fn the_permission_gate_decides_whether_a_generated_ec_cookie_is_written() {
         // The generated identifier has a backing row and a snapshot bound to
         // it, so the backing-row guard would let the cookie through and the
-        // consent gate is the only thing that can withhold it.
+        // permission gate is the only thing that can withhold it.
         let settings = create_test_settings();
         for (case, gate_open) in [("an open gate", true), ("a closed gate", false)] {
             let ec_id = sample_ec_id("gated1");
@@ -2324,7 +2403,7 @@ mod tests {
                 .any(|cookie| cookie.starts_with("ts-ec=") && cookie.contains(&ec_id));
             assert_eq!(
                 wrote_ec_cookie, gate_open,
-                "{case}: the ts-ec cookie should be written only when the consent gate is open"
+                "{case}: the ts-ec cookie should be written only when the permission gate is open"
             );
         }
     }
@@ -2335,15 +2414,24 @@ mod tests {
         // land on the key the live row uses. Written under the raw cookie
         // value it creates a second row nothing reads, and the revocation
         // never takes effect for a module whose canonical form differs.
+        //
+        // Destructive withdrawal is narrow, so the trigger here is a TCF record
+        // refusing storage, the same one
+        // `finalize_withdrawal_clears_cookie_and_headers` uses. An opt-out such
+        // as GPC suppresses use without destroying an issued identifier, so it
+        // would write no tombstone for this test to place.
         let settings = create_test_settings();
         let graph = graph_with_live_canonical_row();
         let consent = ConsentContext {
-            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
-            gpc: true,
+            jurisdiction: Jurisdiction::Gdpr,
+            tcf: Some(refusing_tcf()),
             source: ConsentSource::Cookie,
             ..Default::default()
         };
-        let mut ec_context = canonicalizing_context(true, false, consent, false);
+        // The TCF module answers the withdrawal at assembly, and core links
+        // no module, so the answer is stated here.
+        let mut ec_context = canonicalizing_context(true, false, consent, false)
+            .with_storage_withdrawn_for_test(true);
         let mut response = empty_response();
 
         ec_finalize_response(
@@ -2613,6 +2701,8 @@ mod tests {
         // created, but the deployment now runs a module with a different
         // code, so read-back treats the cookie as absent and the active
         // identifier is empty.
+        // The TCF module answers the withdrawal at assembly, and core links
+        // no module, so the answer is stated here.
         let mut ec_context = make_context_with_consent(
             None,
             Some(CANONICAL_COOKIE_VALUE),
@@ -2621,7 +2711,8 @@ mod tests {
             consent,
             false,
         )
-        .with_module_for_test(std::sync::Arc::new(SwitchedModule));
+        .with_module_for_test(std::sync::Arc::new(SwitchedModule))
+        .with_storage_withdrawn_for_test(true);
         let mut response = empty_response();
 
         ec_finalize_response(
@@ -2814,9 +2905,12 @@ mod tests {
         let settings = create_test_settings();
         let active_ec = sample_ec_id("activ2");
         let cookie_ec = sample_ec_id("cook2e");
+        // A TCF record refusing storage under the requires-signal floor is
+        // the withdrawal trigger. The TCF module answers that at assembly,
+        // and core links no module, so the answer is stated here.
         let consent = ConsentContext {
-            jurisdiction: Jurisdiction::UsState("CA".to_owned()),
-            gpc: true,
+            jurisdiction: Jurisdiction::Gdpr,
+            tcf: Some(refusing_tcf()),
             source: ConsentSource::Cookie,
             ..Default::default()
         };
@@ -2827,7 +2921,8 @@ mod tests {
             false,
             consent,
             false,
-        );
+        )
+        .with_storage_withdrawn_for_test(true);
         // Carry a snapshot only for the active ID; the other ID must be looked up
         // independently and never created if absent.
         let graph = KvIdentityGraph::in_memory("test_store");
@@ -2879,7 +2974,8 @@ mod tests {
             false,
             consent,
             false,
-        );
+        )
+        .with_storage_withdrawn_for_test(true);
         let graph = KvIdentityGraph::in_memory("test_store");
         graph
             .create(
@@ -2973,7 +3069,8 @@ mod tests {
             ..Default::default()
         };
         let mut ec_context =
-            make_context_with_consent(Some(&ec_id), Some(&ec_id), true, false, consent, false);
+            make_context_with_consent(Some(&ec_id), Some(&ec_id), true, false, consent, false)
+                .with_storage_withdrawn_for_test(true);
         ec_context.set_pull_sync_marker_for_test(
             crate::ec::pull_sync_marker::PullSyncMarkerState::Invalid,
         );
@@ -3108,7 +3205,8 @@ mod tests {
             source: ConsentSource::Cookie,
             ..Default::default()
         };
-        let mut ec_context = make_context_with_consent(None, None, false, false, consent, false);
+        let mut ec_context = make_context_with_consent(None, None, false, false, consent, false)
+            .with_storage_withdrawn_for_test(true);
         ec_context.set_pull_sync_marker_for_test(
             crate::ec::pull_sync_marker::PullSyncMarkerState::Invalid,
         );

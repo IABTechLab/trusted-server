@@ -37,6 +37,9 @@ fn test_settings() -> trusted_server_core::settings::Settings {
 
             [ec.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
+
+            [geo]
+            assume_single_jurisdiction = true
         "#,
     )
     .expect("should parse route test settings")
@@ -895,6 +898,11 @@ const UNINJECTED_MODULE_TOML: &str = r#"
 
     [ec.acme]
     endpoint = "https://ec.acme.example.com"
+
+    # An Edge Cookie module is configured, so single-jurisdiction operation
+    # is acknowledged because no geo module is selected.
+    [geo]
+    assume_single_jurisdiction = true
 "#;
 
 /// A module selection this adapter can never supply must fail while the

@@ -1,0 +1,27 @@
+[package]
+name = "trusted-server-permission-signal-mtm"
+description = "Model Terms for Marketing, the Preference Management Platform answer, as a permission signal module."
+authors = { workspace = true }
+edition = { workspace = true }
+license = { workspace = true }
+publish = { workspace = true }
+version = { workspace = true }
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true
+
+[dependencies]
+trusted-server-core = { workspace = true }
+
+[dev-dependencies]
+http = { workspace = true }
+
+# The visible owner of this crate, the way Prebid.js requires a named
+# maintainer of every adapter. The scheme is 51Degrees' own, so 51Degrees
+# holds the crate.
+[package.metadata.maintainers]
+owner = "51Degrees"
+status = "vendor owned"

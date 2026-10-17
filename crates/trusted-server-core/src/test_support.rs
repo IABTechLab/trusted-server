@@ -25,6 +25,14 @@ pub mod tests {
             origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
 
+            [geo]
+            # A gdpr-eu country, where every permission requires a signal. This
+            # reproduces the prior no-default floor, so existing tests are
+            # unaffected by the now-required default.
+            # Tests run with no geo module, so single-jurisdiction operation
+            # is acknowledged the same way a deployment would.
+            assume_single_jurisdiction = true
+
             [integrations.prebid]
             enabled = true
             external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
@@ -133,6 +141,18 @@ pub mod tests {
     pub const VALID_SYNTHETIC_ID: &str =
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.Ab1234";
 
+    /// The permissions of a reader who allowed storage and withheld
+    /// personalised-ad selection: the Edge Cookie stands, partner sharing does
+    /// not.
+    #[must_use]
+    pub fn storage_only_permissions() -> crate::permissions::PermissionState {
+        crate::permissions::PermissionState::new(
+            [crate::permissions::Permission::StoreOnDevice]
+                .into_iter()
+                .collect(),
+        )
+    }
+
     /// GDPR consent granting TCF Purpose 1 (storage/EC) but denying Purpose 4
     /// (personalized ads), so EC is allowed while EID persistence is not.
     #[must_use]
@@ -218,6 +238,11 @@ pub mod nextjs_auction {
 
             [ec]
             passphrase = "test-secret-key-32-bytes-minimum"
+
+            # The fixture serves one publisher in one place, so it says so
+            # rather than selecting a geo module it has no use for.
+            [geo]
+            assume_single_jurisdiction = true
             "#,
         )
         .expect("should parse Next.js auction fixture settings");
