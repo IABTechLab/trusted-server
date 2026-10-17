@@ -482,12 +482,32 @@ fn middleware_content_handlers(
     handlers
 }
 
+/// The handler that writes `inserts` immediately after the opening `<body>`
+/// tag, once, or `None` when there is nothing to write, so a document whose
+/// middleware write nothing there gets no handler.
+fn body_open_handler(inserts: &[String]) -> Option<ContentHandler> {
+    if inserts.is_empty() {
+        return None;
+    }
+    let markup = inserts.concat();
+    let written = Cell::new(false);
+    Some(element!("body", move |el| {
+        // Once per document, because a template fragment can carry a second
+        // `<body>`.
+        if !written.replace(true) {
+            el.prepend(&markup, ContentType::Html);
+        }
+        Ok(())
+    }))
+}
+
 /// The processor behind [`create_serve_processor`], carrying out `plan` and
 /// nothing else.
 fn build_serve_processor(plan: MiddlewarePlan) -> HtmlWithStreamingProcessors {
     let MiddlewarePlan {
         head_inserts,
         after_bundle_inserts,
+        body_open_inserts,
         element_handlers,
         text_handlers,
         processors,
@@ -495,6 +515,9 @@ fn build_serve_processor(plan: MiddlewarePlan) -> HtmlWithStreamingProcessors {
         response_headers: _,
     } = plan;
     let mut element_content_handlers: Vec<ContentHandler> = Vec::new();
+    if let Some(handler) = body_open_handler(&body_open_inserts) {
+        element_content_handlers.push(handler);
+    }
     if !head_inserts.is_empty() || !after_bundle_inserts.is_empty() {
         let before = head_inserts.concat();
         let after = after_bundle_inserts.concat();
@@ -568,6 +591,7 @@ fn build_html_processor(
     let MiddlewarePlan {
         head_inserts: middleware_head_inserts,
         after_bundle_inserts: middleware_after_bundle_inserts,
+        body_open_inserts: middleware_body_open_inserts,
         element_handlers: middleware_element_handlers,
         text_handlers: middleware_text_handlers,
         processors: middleware_processors,
@@ -891,6 +915,9 @@ fn build_html_processor(
 
     // Registered after core's own handlers, so an element handler judges an
     // address as it will be served.
+    if let Some(handler) = body_open_handler(&middleware_body_open_inserts) {
+        element_content_handlers.push(handler);
+    }
     element_content_handlers.extend(middleware_content_handlers(
         middleware_element_handlers,
         middleware_text_handlers,
@@ -1248,6 +1275,35 @@ mod tests {
         );
         let untold = process(None);
         assert!(!untold.contains(PUBLIC_PREFIX_ATTRIBUTE), "{untold}");
+    }
+
+    /// A body-open insert is written immediately after the opening body tag,
+    /// once, however many body tags a fragment carries. The fetch processor's
+    /// handler is the same function, and the seam probe's page test drives it.
+    #[test]
+    fn a_body_open_insert_is_written_once_after_the_opening_body_tag() {
+        let plan = MiddlewarePlan {
+            body_open_inserts: vec!["<p>first</p>".to_owned(), "<p>second</p>".to_owned()],
+            ..MiddlewarePlan::default()
+        };
+
+        let output = build_serve_processor(plan)
+            .process_chunk(
+                b"<html><head></head><body><p>page</p></body><body></body></html>",
+                true,
+            )
+            .expect("should process HTML");
+
+        let out = String::from_utf8(output).expect("should be UTF-8");
+        assert!(
+            out.contains("<body><p>first</p><p>second</p><p>page</p>"),
+            "the inserts follow the opening body tag in order: {out}"
+        );
+        assert_eq!(
+            out.matches("<p>first</p>").count(),
+            1,
+            "once per document: {out}"
+        );
     }
 
     #[test]
