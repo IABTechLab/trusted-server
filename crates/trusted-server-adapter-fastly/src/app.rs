@@ -77,9 +77,9 @@
 //! When [`build_state`] fails, [`startup_error_router`] returns a minimal router
 //! that responds to all routes with the startup error. This router does **not**
 //! attach middleware. Startup-error responses may still receive entry-point
-//! finalization (geo and TS headers) when settings can be reloaded via
+//! finalization (TS headers) when settings can be reloaded via
 //! [`load_settings_from_config_store`]; if settings loading itself fails, they
-//! are returned without geo or TS headers.
+//! are returned without TS headers.
 
 use std::sync::Arc;
 
@@ -498,16 +498,10 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
     services.with_prefixes(prefixes)
 }
 
-/// Builds the services graph handed to a module on a response-side finalize
-/// path.
-///
-/// The finalize paths run after the handler, where the per-request services
-/// built by [`build_per_request_services`] are already out of scope, but a geo
-/// module still needs real platform services to resolve a location. The
-/// middleware builds this once and clones it per request with
-/// [`RuntimeServices::with_client_info`], and the entry point rebuilds it per
-/// call.
-pub(crate) fn build_finalize_services(
+/// Builds the services graph handed to a module the entry point calls outside
+/// the router, which is the device module, before the per-request services
+/// built by [`build_per_request_services`] exist.
+pub(crate) fn build_entry_point_services(
     settings: &Settings,
     kv_store: Arc<dyn PlatformKvStore>,
     loading_caches: Arc<LoadingCaches>,
@@ -1594,18 +1588,8 @@ impl TrustedServerApp {
     }
 
     fn routes_for_state(state: &Arc<AppState>) -> RouterService {
-        let mut router = RouterService::builder().middleware(
-            FinalizeResponseMiddleware::new(
-                Arc::clone(&state.settings),
-                build_geo_module(&state.settings, Arc::new(FastlyPlatformGeo)),
-                build_finalize_services(
-                    &state.settings,
-                    Arc::clone(&state.default_kv_store),
-                    Arc::clone(&state.loading_caches),
-                ),
-            )
-            .with_registry(Arc::clone(&state.registry)),
-        );
+        let mut router = RouterService::builder()
+            .middleware(FinalizeResponseMiddleware::new(Arc::clone(&state.settings)));
 
         let fallback_handler = fallback_route_handler(Arc::clone(state));
 
@@ -1710,7 +1694,6 @@ mod tests {
 
     use error_stack::Report;
     use futures::executor::block_on;
-    use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
     use trusted_server_core::ec::device::DeviceSignals;
     use trusted_server_core::error::TrustedServerError;
     use trusted_server_core::integrations::{
@@ -3065,7 +3048,7 @@ mod tests {
         assert!(
             response
                 .headers()
-                .get(HEADER_X_GEO_INFO_AVAILABLE)
+                .get(crate::middleware::HEADER_X_TS_FINALIZED)
                 .is_none(),
             "router-level 405 bypasses FinalizeResponseMiddleware; lib.rs entry-point covers this"
         );
@@ -3195,7 +3178,12 @@ mod tests {
             .kv_store(Arc::new(NoopKvStore) as Arc<dyn PlatformKvStore>)
             .backend(Arc::new(FixedBackend))
             .http_client(Arc::new(StreamingHttpClient))
-            .geo(Arc::new(crate::platform::FastlyPlatformGeo))
+            .geo(Arc::new(
+                trusted_server_core::platform::PlatformGeoModule::new(
+                    "platform",
+                    Arc::new(crate::platform::FastlyPlatformGeo),
+                ),
+            ))
             .client_info(ClientInfo::default())
             .build()
     }
@@ -3361,7 +3349,7 @@ mod tests {
                 .body(Body::empty())
                 .expect("should build request");
             let mut response = block_on(super::dispatch_fallback(&state, &services, request));
-            crate::middleware::apply_finalize_headers(&state.settings, None, &mut response);
+            crate::middleware::apply_finalize_headers(&state.settings, &mut response);
             response
         };
         let tag = |response: &Response| {
