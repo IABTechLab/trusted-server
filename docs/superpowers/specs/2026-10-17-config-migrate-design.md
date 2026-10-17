@@ -30,7 +30,7 @@ Each line on stderr starts with one of three words.
 
 - `changed:` a rewrite the command made.
 - `to do:` an item the document cannot load without. It needs a decision or a value the document does not hold, so the command leaves the setting where it is and says what to do.
-- `check:` a behavior change no setting expresses, printed when the command migrates a document written for main. Nothing in the document has to change.
+- `check:` a behavior change no setting expresses, printed with the rewrite it follows from, or for a document written for main. Nothing in the document has to change.
 
 The exit status is 0 when nothing is left to do and the migrated document passes validation, 1 when an item is left to do or the result does not pass, and 2 when the file cannot be read or is not TOML. With `--check` it is 0 when the document needs no migrating and 1 otherwise.
 
@@ -80,7 +80,7 @@ The table lists every breaking entry in `CHANGELOG.md` under Unreleased that con
 | Main's own breaking entries the stack keeps: the auction maps, APS OpenRTB, `site.page`, `bid_param_zone_overrides`, string scalars, Sourcepoint and creative sanitization                                                                                                 | Nothing to do. A document written for main already meets them, and the maps move again under the second row.                                                                                                                                                                                                                                       |
 | Earlier shapes of the stack the changelog does not name, such as `[ec] provider`                                                                                                                                                                                           | Out of scope. They never reached a release.                                                                                                                                                                                                                                                                                                        |
 
-A document is taken as written for main when it has `[publisher]` and every table at its top level is one main read, which are `publisher`, `tester_cookie`, `trusted_client_ip`, `ec`, `integrations`, `handlers`, `response_headers`, `request_signing`, `rewrite`, `auction`, `consent`, `cache`, `proxy`, `creative_opportunities`, `image_optimizer`, `tinybird` and `debug`. Main refused any other table, and every migrated document has `[source]`, so a second run never takes it as written for main. The geo rows and the checks apply to such a document alone, so a document already in the stack's shape that leaves `[geo]` out keeps running with no location.
+A document is taken as written for main when it has `[publisher]` and every table at its top level is one main read, which are `publisher`, `tester_cookie`, `trusted_client_ip`, `ec`, `integrations`, `handlers`, `response_headers`, `request_signing`, `rewrite`, `auction`, `consent`, `cache`, `proxy`, `creative_opportunities`, `image_optimizer`, `tinybird` and `debug`. Main refused any other table, and every migrated document has `[source]`, so a second run never takes it as written for main. The geo rows, and the checks about `x-ts-version`, Flight responses and the `x-geo-*` headers, apply to such a document alone, so a document already in the stack's shape that leaves `[geo]` out keeps running with no location.
 
 ### 2.3 How the rewrite keeps what the operator wrote
 
@@ -102,7 +102,7 @@ Migrating a migrated document changes nothing, because each rule matches only a 
 
 - It never prints a value from the document. Every line names the setting. The validation result gives the byte offset where reading failed or the phase that refused, as `ts audit generate` does, because a refusal can quote a value, and `ts config validate` prints the refusal whole.
 - It never removes a setting the operator still has to decide on, such as a handler that guards a path of the publisher's own.
-- It never names `service_version` or selects the Next.js module. It changes a value the document holds only where the stack renamed what the value names, which is a module, a signer, an implementation or a demand source.
+- It never names `service_version` or selects the Next.js module. It changes a value the document holds only where the stack renamed what the value names, which is a module, a middleware, a signer, an implementation or a demand source.
 - It never writes the file without `--write`, and never writes it when nothing changes.
 
 ## 3. What is not in this change
