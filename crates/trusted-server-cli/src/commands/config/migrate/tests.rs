@@ -427,6 +427,139 @@ endpoint = "https://ssp.example.com/bid"
 }
 
 #[test]
+fn a_profile_setting_named_as_one_of_the_providers_own_is_left_to_do() {
+    let input = main_document(
+        r#"[auction.providers.pbs-main]
+protocol = "openrtb-2.6"
+profile = "prebid-server"
+endpoint = "https://prebid.example.com/openrtb2/auction"
+
+[auction.providers.pbs-main.profile_config]
+endpoint = "https://other.example.com/openrtb2/auction"
+"#,
+    );
+    let migration = migrated(&input);
+    let value = parsed(&migration.text);
+
+    assert!(value["auction"]["providers"].get("pbs-main").is_some());
+    assert!(value.get("demand").is_none());
+    assert!(reported(
+        &migration.report.to_do,
+        "`[auction.providers.pbs-main.profile_config]` holds a setting named as one of the \
+         provider's own"
+    ));
+}
+
+#[test]
+fn both_forms_of_a_setting_are_left_to_do_as_written() {
+    let input = r#"[publisher]
+domain = "publisher.example.com"
+cookie_domain = ".publisher.example.com"
+origin_url = "https://origin.publisher.example.com"
+proxy_secret = "publisher_proxy_secret"
+
+[source]
+module = "origin"
+
+[source.origin]
+url = "https://origin.publisher.example.com"
+
+[ec]
+module = "hmac"
+passphrase = "ec_passphrase"
+
+[ec.hmac]
+passphrase = "ec_passphrase"
+
+[ec.providers.hmac]
+passphrase = "ec_passphrase"
+
+[permission_signal]
+sources = ["gpc"]
+
+[permission-signal]
+modules = ["gpc"]
+
+[auction]
+mediator = "adserver_mock"
+
+[auction.providers.pbs-main]
+protocol = "openrtb-2.6"
+profile = "prebid-server"
+endpoint = "https://prebid.example.com/openrtb2/auction"
+
+[demand]
+modules = []
+
+[integrations.adserver_mock]
+enabled = true
+endpoint = "https://adserver.example.com/mediate"
+
+[adserver]
+module = "iabtl"
+
+[ad-server]
+module = "iabtl"
+
+[tinybird]
+enabled = true
+api_host = "api.us-east.tinybird.example"
+
+[analytics]
+module = "tinybird"
+
+[proxy]
+
+[[proxy.asset_routes]]
+prefix = "/.image/"
+origin_url = "https://assets.publisher.example.com"
+
+[proxy.asset_routes.source]
+module = "origin"
+"#;
+    let migration = migrated(input);
+    let to_do = &migration.report.to_do;
+
+    for fragment in [
+        "`[publisher]` holds origin settings and `[source]` is written too",
+        "`[ec] passphrase` sits beside an Edge Cookie module of the new form",
+        "`[ec.providers.hmac]` and `[ec.hmac]` are both written",
+        "`[permission_signal]` and `[permission-signal]` are both written",
+        "`[auction.providers]` and `[demand]` are both written",
+        "`[auction] mediator` and `[ad-server]` are both written",
+        "`[adserver]` and `[ad-server]` are both written",
+        "`[tinybird]` and `[analytics]` are both written",
+        "`[[proxy.asset_routes]]` entry 1 holds origin settings and a `source` table too",
+    ] {
+        assert!(
+            reported(to_do, fragment),
+            "should leave `{fragment}`: {to_do:?}"
+        );
+    }
+    assert!(
+        !reported(to_do, "names an ad server whose settings"),
+        "should report the mediator once, beside the ad server it names: {to_do:?}"
+    );
+    assert!(
+        migration.report.changed.is_empty(),
+        "should change nothing it left: {:?}",
+        migration.report.changed
+    );
+    assert_eq!(migration.text, input);
+}
+
+#[test]
+fn the_integration_table_is_left_to_do() {
+    let migration = migrated("[integration]\nprovider = [\"didomi\"]\n");
+
+    assert!(reported(
+        &migration.report.to_do,
+        "`[integration]` is not read"
+    ));
+    assert_eq!(migration.text, "[integration]\nprovider = [\"didomi\"]\n");
+}
+
+#[test]
 fn an_enabled_integration_moves_to_the_section_of_its_type() {
     let input = main_document(
         r#"# Google's ad tag.

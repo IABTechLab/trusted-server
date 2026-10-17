@@ -815,8 +815,14 @@ impl Migrator {
     }
 
     /// Every `[integrations.<id>]` table, each into the module that replaced
-    /// it.
+    /// it, and `[integration]`, which is left for the operator.
     fn integrations(&mut self) {
+        if self.root().contains_key("integration") {
+            self.push_to_do(
+                "`[integration]` is not read. Select each module in the section of its type, \
+                 with its settings in `[<section>.<name>]`",
+            );
+        }
         let Some(integrations) = self.root().get("integrations") else {
             return;
         };
@@ -851,12 +857,6 @@ impl Migrator {
             .is_some_and(Table::is_empty)
         {
             self.layout.remove(&path(&["integrations"]));
-        }
-        if self.root().contains_key("integration") {
-            self.push_to_do(
-                "`[integration]` is not read. Select each module in the section of its type, \
-                 with its settings in `[<section>.<name>]`",
-            );
         }
     }
 
@@ -1071,11 +1071,17 @@ impl Migrator {
     }
 
     /// An `[auction] mediator` the mock ad server's table did not come with.
+    /// A mediator left beside that table is reported where the table is.
     fn mediator_left(&mut self) {
-        if self
+        let mock_table = self
             .root()
-            .get("auction")
-            .is_some_and(|auction| auction.get("mediator").is_some())
+            .get("integrations")
+            .is_some_and(|integrations| integrations.get("adserver_mock").is_some());
+        if !mock_table
+            && self
+                .root()
+                .get("auction")
+                .is_some_and(|auction| auction.get("mediator").is_some())
         {
             self.push_to_do(
                 "`[auction] mediator` names an ad server whose settings the document does not \
