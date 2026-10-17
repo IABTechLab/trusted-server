@@ -61,8 +61,7 @@ resolved. The modules' request filters and the device module `[device]`
 selects run as on Fastly, and `[device] module = "platform"` classifies from
 the `User-Agent`, because the Worker supplies no TLS or HTTP/2 signals. An
 Edge Cookie module creates and writes its cookie with no identity graph
-behind it, and `POST /_ts/api/v1/ec/resolve` creates none, answering `204`
-where it would answer `200`.
+behind it, and `POST /_ts/api/v1/ec/resolve` sets one the same way.
 See the [API reference](./api-reference) for route-level behavior.
 
 Compare the [Fastly](./fastly), [Spin](./spin), and [Axum](./axum-dev)

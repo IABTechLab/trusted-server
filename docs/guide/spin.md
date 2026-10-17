@@ -57,8 +57,7 @@ normalization layer. The modules' request filters and the device module
 `[device]` selects run as on Fastly, and `[device] module = "platform"`
 classifies from the `User-Agent`, because Spin supplies no TLS or HTTP/2
 signals. An Edge Cookie module creates and writes its cookie with no identity
-graph behind it, and `POST /_ts/api/v1/ec/resolve` creates none, answering
-`204` where it would answer `200`.
+graph behind it, and `POST /_ts/api/v1/ec/resolve` sets one the same way.
 
 Spin is not installed in the integration CI environment. The recurring manual
 smoke therefore needs a named owner, tested commit, exact tool versions, and an

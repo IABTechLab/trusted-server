@@ -388,7 +388,7 @@ When upgrading an existing service:
 
 ## Create EC KV Store
 
-Edge Cookie flows require one KV store:
+The data kept with the Edge Cookie needs one KV store. Without it the Edge Cookie is still created and written, and that data is not kept:
 
 - Identity graph store (`ec_store`) - EC identity graph, source-domain keyed partner UIDs, minimal consent metadata, and withdrawal tombstones
 

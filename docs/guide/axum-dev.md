@@ -68,8 +68,7 @@ request filters and the device module `[device]` selects run as on Fastly,
 and `[device] module = "platform"` classifies from the `User-Agent`, because
 the dev server supplies no TLS or HTTP/2 signals. An Edge Cookie module
 creates and writes its cookie with no identity graph behind it, and
-`POST /_ts/api/v1/ec/resolve` creates none, answering `204` where it would
-answer `200`.
+`POST /_ts/api/v1/ec/resolve` sets one the same way.
 
 For an edge deployment, use the [Fastly](./fastly),
 [Cloudflare](./cloudflare), or [Spin](./spin) guide.
