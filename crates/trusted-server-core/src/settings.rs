@@ -3079,6 +3079,10 @@ pub struct CacheSettings {
         skip_serializing_if = "LoadingCacheConfig::is_default"
     )]
     pub robots_txt: LoadingCacheConfig,
+    /// How long the copies of the assets the publisher's origin sends last,
+    /// `[cache.assets]`. A `module` of [`ASSETS_CACHE_OFF`] keeps none.
+    #[serde(default, skip_serializing_if = "LoadingCacheConfig::is_default")]
+    pub assets: LoadingCacheConfig,
     /// The caches modules declare and load through, each in its own
     /// `[cache.<name>]` table with the same settings as `[cache.robots-txt]`.
     /// A name no linked module declares is refused when the deployment's
@@ -3093,6 +3097,19 @@ pub const MAX_LOADING_CACHE_SECONDS: u32 = 365 * 24 * 60 * 60;
 /// The name of the cache that holds each robots.txt module's answer, whose
 /// settings are `[cache.robots-txt]`.
 pub const ROBOTS_TXT_CACHE: &str = "robots-txt";
+
+/// The name of the cache that holds the copies of the assets the publisher's
+/// origin sends, whose settings are `[cache.assets]`.
+pub const ASSETS_CACHE: &str = "assets";
+
+/// The name of the cache that holds each asset's record of what its
+/// responses vary on, selected by the same `[cache.assets]` table as the
+/// copies, so one line selects both.
+pub const ASSETS_VARY_CACHE: &str = "assets-vary";
+
+/// The `module` that turns both asset caches off in `[cache.assets]`, so
+/// every asset is fetched from its origin for each request.
+pub const ASSETS_CACHE_OFF: &str = "none";
 
 /// How long one loading cache's copies last, each field defaulting to the
 /// cache's own default when absent.
@@ -3184,13 +3201,18 @@ impl CacheSettings {
     /// modules declare, in name order.
     #[must_use]
     pub fn loading_caches(&self) -> Vec<(&str, &LoadingCacheConfig)> {
-        std::iter::once((ROBOTS_TXT_CACHE, &self.robots_txt))
-            .chain(
-                self.declared
-                    .iter()
-                    .map(|(name, config)| (name.as_str(), config)),
-            )
-            .collect()
+        [
+            (ROBOTS_TXT_CACHE, &self.robots_txt),
+            (ASSETS_CACHE, &self.assets),
+            (ASSETS_VARY_CACHE, &self.assets),
+        ]
+        .into_iter()
+        .chain(
+            self.declared
+                .iter()
+                .map(|(name, config)| (name.as_str(), config)),
+        )
+        .collect()
     }
 
     fn normalize(&mut self) {
@@ -3208,6 +3230,7 @@ impl CacheSettings {
     /// invalid policy/matcher or cannot compile its regex/glob.
     pub fn prepare_runtime(&self) -> Result<(), Report<TrustedServerError>> {
         self.robots_txt.check("cache.robots-txt")?;
+        self.assets.check("cache.assets")?;
         for (name, config) in &self.declared {
             config.check(&format!("cache.{name}"))?;
         }
@@ -7046,28 +7069,30 @@ module = \"none\"",
 
     #[test]
     fn a_loading_cache_lifetime_out_of_range_is_refused_naming_it() {
-        for (field, value, least) in [
-            ("store_seconds", "0", 1),
-            ("store_idle_seconds", "0", 1),
-            ("memory_seconds", "31536001", 0),
-        ] {
-            let toml_str = format!(
-                "{}
+        for table in ["robots-txt", "assets"] {
+            for (field, value, least) in [
+                ("store_seconds", "0", 1),
+                ("store_idle_seconds", "0", 1),
+                ("memory_seconds", "31536001", 0),
+            ] {
+                let toml_str = format!(
+                    "{}
 
-[cache.robots-txt]
+[cache.{table}]
 {field} = {value}
 ",
-                crate_test_settings_str()
-            );
-            let error = Settings::from_toml(&toml_str)
-                .expect_err("a lifetime out of range should not load");
-            let message = format!("{error:?}");
-            assert!(
-                message.contains(&format!(
-                    "[cache.robots-txt] {field} is {value}, and must be from {least} to 31536000"
-                )),
-                "{field}: {message}"
-            );
+                    crate_test_settings_str()
+                );
+                let error = Settings::from_toml(&toml_str)
+                    .expect_err("a lifetime out of range should not load");
+                let message = format!("{error:?}");
+                assert!(
+                    message.contains(&format!(
+                        "[cache.{table}] {field} is {value}, and must be from {least} to 31536000"
+                    )),
+                    "{table} {field}: {message}"
+                );
+            }
         }
     }
 
@@ -7090,10 +7115,10 @@ module = \"none\"",
 
         let caches = settings.cache.loading_caches();
 
-        assert_eq!(caches.len(), 2);
-        assert_eq!(caches[1].0, "answers");
-        assert_eq!(caches[1].1.module.as_deref(), Some("51degrees"));
-        assert_eq!(caches[1].1.store_seconds, Some(3600));
+        assert_eq!(caches.len(), 4);
+        assert_eq!(caches[3].0, "answers");
+        assert_eq!(caches[3].1.module.as_deref(), Some("51degrees"));
+        assert_eq!(caches[3].1.store_seconds, Some(3600));
         let written = serde_json::to_value(&settings.cache).expect("should serialize");
         assert_eq!(written["answers"]["module"], "51degrees");
     }
@@ -7117,8 +7142,12 @@ module = \"none\"",
         assert!(!settings.cache.robots_txt.is_default());
         assert_eq!(
             settings.cache.loading_caches(),
-            vec![(super::ROBOTS_TXT_CACHE, &settings.cache.robots_txt)],
-            "should list the robots.txt cache by its name"
+            vec![
+                (super::ROBOTS_TXT_CACHE, &settings.cache.robots_txt),
+                (super::ASSETS_CACHE, &settings.cache.assets),
+                (super::ASSETS_VARY_CACHE, &settings.cache.assets),
+            ],
+            "should list core's own caches by name, robots.txt then the two of assets"
         );
         let written = serde_json::to_value(&settings.cache).expect("should serialize");
         assert_eq!(

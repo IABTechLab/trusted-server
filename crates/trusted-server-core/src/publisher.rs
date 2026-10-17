@@ -94,6 +94,7 @@ use crate::settings::{
     AUCTION_DEBUG_METADATA_ALLOWLIST, AUCTION_DEBUG_UPSTREAM_METADATA_KEYS,
     AuctionDebugCommentFormat, AuctionDebugCommentOptions, AuctionDebugCommentVerbosity, Settings,
 };
+use crate::source_cache::{Found, Lookup, SourceAddress, SourceCache, SourceVary};
 use crate::streaming_processor::{
     BodyStreamDecoder, BodyStreamEncoder, Compression, GzipDecodeReader, PipelineConfig,
     STREAM_CHUNK_SIZE, StreamProcessor, StreamingPipeline,
@@ -5536,6 +5537,27 @@ pub async fn handle_publisher_request(
             ),
             schema_version: crate::platform::TEMPLATE_SCHEMA_VERSION,
         });
+    // Every other response the origin sends may be kept as it sent it, in
+    // every assembly mode, keyed the way a page is and kept for as long as
+    // the origin allows, see `asset_cache`. A request that sends the origin a
+    // cookie is fetched for itself, because nothing shows whether the cookie
+    // shaped the answer.
+    let request_can_use_asset_copy = method_is_cacheable
+        && !request_is_document
+        && !request_host.is_empty()
+        && !authorization_disqualifies
+        && !req.headers().contains_key(header::COOKIE)
+        && !request_requires_origin
+        && services
+            .loading_cache_for(crate::settings::ASSETS_CACHE)
+            .keeps_values();
+    let asset_cache_key = request_can_use_asset_copy.then(|| crate::asset_cache::AssetCacheKey {
+        url: target_uri.to_string(),
+        request_host: request_host.to_string(),
+        request_scheme: request_scheme.to_string(),
+        origin_identity: format!("{}\0{}", settings.publisher.origin_url, origin_host_header),
+        fingerprint: template_fingerprint(settings, integration_registry, services.public_prefix()),
+    });
     let mut template_cache_response_state = matches!(assembly_mode, AssemblyMode::Esi)
         .then_some(TemplateCacheResponseState::BypassRequest);
     rewrite_origin_request(&mut req, target_uri, &origin_host_header)?;
@@ -5572,6 +5594,7 @@ pub async fn handle_publisher_request(
     // every request in the default `Inline` assembly mode — keep the overlap.
     if should_preload_ec
         && template_cache_key.is_none()
+        && asset_cache_key.is_none()
         && services.http_client().supports_concurrent_fanout()
         && services
             .http_client()
@@ -5943,7 +5966,29 @@ pub async fn handle_publisher_request(
 
     // SSP requests are already racing through the platform HTTP client, so
     // origin TTFB tracks origin latency rather than the auction timeout.
-    let origin_result = if let Some(pending) = pending_origin {
+    // Any other response is looked for the same way, before the origin is
+    // fetched, and a copy found is served as the origin's response would be.
+    let mut from_asset_cache = None;
+    if let Some(key) = asset_cache_key.as_ref() {
+        let prepared = origin_request.as_ref().ok_or_else(|| {
+            Report::new(TrustedServerError::Proxy {
+                message: "publisher origin request was already consumed".to_owned(),
+            })
+        })?;
+        from_asset_cache = asset_from_cache(&AssetRequest {
+            settings,
+            services,
+            key,
+            uri: prepared.uri(),
+            headers: prepared.headers(),
+            backend_name: &backend_name,
+            stream_response: services.http_client().supports_streaming_responses(),
+        })
+        .await;
+    }
+    let origin_result = if let Some(response) = from_asset_cache {
+        Ok(crate::platform::PlatformResponse::new(response))
+    } else if let Some(pending) = pending_origin {
         services.http_client().wait(pending).await
     } else {
         let origin_req = origin_request.take().ok_or_else(|| {
@@ -7120,7 +7165,7 @@ pub(crate) enum TemplateCacheBypassReason {
     MalformedPolicyHeader,
 }
 
-fn request_bypasses_template_cache(headers: &edgezero_core::http::HeaderMap) -> bool {
+pub(crate) fn request_bypasses_template_cache(headers: &edgezero_core::http::HeaderMap) -> bool {
     const CONDITIONAL_OR_PARTIAL: &[&str] = &[
         "range",
         "if-range",
@@ -7498,6 +7543,32 @@ fn replayable_policy_headers(
     Ok(captured)
 }
 
+/// Whether an origin response may be kept for other readers at all. A status
+/// other than `200`, a cookie it sets, or an edge cache header this layer does
+/// not read keeps it from them, whatever it holds.
+fn origin_response_may_be_kept(
+    status: StatusCode,
+    headers: &edgezero_core::http::HeaderMap,
+) -> Result<(), TemplateCacheBypassReason> {
+    if status != StatusCode::OK {
+        return Err(TemplateCacheBypassReason::NonOkStatus);
+    }
+    if headers.contains_key(header::SET_COOKIE) {
+        return Err(TemplateCacheBypassReason::OriginSetCookie);
+    }
+    // Core Cache has no HTTP semantics. Fastly's documented Surrogate-Control subset
+    // is parsed by `origin_shared_ttl`; every other vendor-specific policy remains a
+    // bypass rather than guessing that unrelated CDNs share its grammar or precedence.
+    if crate::cache_policy::EDGE_CACHE_HEADER_NAMES
+        .iter()
+        .filter(|name| **name != "surrogate-control")
+        .any(|name| headers.contains_key(*name))
+    {
+        return Err(TemplateCacheBypassReason::OriginNotShareable);
+    }
+    Ok(())
+}
+
 fn template_cache_ttl(
     mode: AssemblyMode,
     authorization_disqualifies: bool,
@@ -7516,19 +7587,7 @@ fn template_cache_ttl(
     if cookie_disqualifies {
         return Err(TemplateCacheBypassReason::CookiePolicy);
     }
-    if response_headers.contains_key(header::SET_COOKIE) {
-        return Err(TemplateCacheBypassReason::OriginSetCookie);
-    }
-    // Core Cache has no HTTP semantics. Fastly's documented Surrogate-Control subset
-    // is parsed by `origin_shared_ttl`; every other vendor-specific policy remains a
-    // bypass rather than guessing that unrelated CDNs share its grammar or precedence.
-    if crate::cache_policy::EDGE_CACHE_HEADER_NAMES
-        .iter()
-        .filter(|name| **name != "surrogate-control")
-        .any(|name| response_headers.contains_key(*name))
-    {
-        return Err(TemplateCacheBypassReason::OriginNotShareable);
-    }
+    origin_response_may_be_kept(status, response_headers)?;
     // Checked here, among the leak vectors, because storing under a key that does not
     // cover the origin's Vary is cross-serving rather than mere ineligibility: a request
     // differing only in the uncovered header would read this template.
@@ -7558,9 +7617,6 @@ fn template_cache_ttl(
         return Err(TemplateCacheBypassReason::VaryNotCovered(VaryGap(
             uncovered,
         )));
-    }
-    if status != StatusCode::OK {
-        return Err(TemplateCacheBypassReason::NonOkStatus);
     }
     let declared_content_type =
         single_representation_header_value(response_headers, header::CONTENT_TYPE)?;
@@ -8246,8 +8302,942 @@ fn mark_deprecated_alias(response: &mut Response<EdgeBody>, is_legacy_alias: boo
     );
 }
 
+/// The lifetimes `[cache.assets]` leaves unset. An asset's own lifetime ends
+/// each copy sooner than the store lifetime.
+const ASSET_DEFAULT_LIFETIMES: crate::platform::CacheLifetimes = crate::platform::CacheLifetimes {
+    memory: Duration::from_secs(5),
+    store: Duration::from_secs(60 * 60),
+    store_idle: Duration::from_secs(24 * 60 * 60),
+};
+
+/// How long an asset the origin says may not be shared is held as such, so
+/// the requests that follow fetch their own rather than waiting on a load.
+const ASSET_NOT_SHAREABLE_LIFETIME: Duration = Duration::from_secs(60);
+
+/// The asset caches, being one holding each address's record of what its
+/// response varies on and one holding the kept copies, both with the
+/// lifetimes `[cache.assets]` sets. A load runs in the request that started
+/// it, which is served the response that load fetched, see [`HandBack`].
+fn asset_cache(settings: &Settings) -> SourceCache {
+    let lifetimes = settings.cache.assets.lifetimes(ASSET_DEFAULT_LIFETIMES);
+    let spec = |name, memory_entries| crate::platform::CacheSpec {
+        name,
+        lifetimes,
+        memory_entries,
+    };
+    SourceCache {
+        records: spec(crate::settings::ASSETS_VARY_CACHE, 256),
+        copies: spec(crate::settings::ASSETS_CACHE, 32),
+    }
+}
+
+/// The address one asset's copies are held under, made of the publisher's
+/// prefix the request's services carry, so two publishers never share one,
+/// and the asset's own key.
+fn asset_address(
+    services: &RuntimeServices,
+    key: &crate::asset_cache::AssetCacheKey,
+) -> SourceAddress {
+    SourceAddress::new(services.server_key_prefix().clone(), key.to_cache_key())
+}
+
+/// One request the asset cache may answer, already prepared for the origin.
+pub(crate) struct AssetRequest<'a> {
+    pub(crate) settings: &'a Settings,
+    pub(crate) services: &'a RuntimeServices,
+    /// The address the request's answer is kept under.
+    pub(crate) key: &'a crate::asset_cache::AssetCacheKey,
+    pub(crate) uri: &'a http::Uri,
+    pub(crate) headers: &'a http::HeaderMap,
+    pub(crate) backend_name: &'a str,
+    pub(crate) stream_response: bool,
+}
+
+/// The asset cache's answer for `request`, being a kept copy served as the
+/// origin's response would be, or the response this request's own load
+/// fetched and may not share, or `None` when the origin is to be asked.
+pub(crate) async fn asset_from_cache(request: &AssetRequest<'_>) -> Option<Response<EdgeBody>> {
+    let services = request.services;
+    let cache = asset_cache(request.settings);
+    let address = asset_address(services, request.key);
+    let hand_back = HandBack::new();
+    let fetch = asset_fetch(
+        Arc::new(AssetLoad {
+            services: services.clone(),
+            uri: request.uri.clone(),
+            headers: request.headers.clone(),
+            backend_name: request.backend_name.to_owned(),
+            stream_response: request.stream_response,
+            max_lifetime: cache.copies.lifetimes.store,
+        }),
+        hand_back.id,
+    );
+    let not_shareable = bytes::Bytes::from(crate::asset_cache::AssetEntry::NotShareable.encode());
+    let found = crate::source_cache::get_or_fetch(
+        &Lookup {
+            services,
+            cache: &cache,
+            address: &address,
+            headers: request.headers,
+            declared: None,
+            not_shareable: &not_shareable,
+        },
+        fetch,
+    )
+    .await;
+    match found {
+        Ok(Found::Copy { value, key }) => match crate::asset_cache::AssetEntry::decode(&value) {
+            Ok(crate::asset_cache::AssetEntry::Copy(copy)) => {
+                Some(copy.into_response(unix_seconds()))
+            }
+            // This request's own load fetched the asset, so it is served from
+            // that fetch rather than a second one.
+            Ok(crate::asset_cache::AssetEntry::NotShareable) => hand_back.take(),
+            Err(miss) => {
+                log::warn!("asset_cache invalid entry: {miss}; removing it");
+                services
+                    .loading_cache_for(cache.copies.name)
+                    .remove(services, &cache.copies, &key)
+                    .await;
+                None
+            }
+        },
+        Ok(Found::NoCopies) => hand_back.take(),
+        Err(error) => {
+            log::warn!("asset_cache load failed: {error}; fetching the origin");
+            None
+        }
+    }
+}
+
+/// Why an asset's response is not kept.
+#[derive(Debug, derive_more::Display)]
+enum AssetCacheBypassReason {
+    /// A page is kept as a template, by the template cache, or not at all.
+    #[display("the response is HTML, which is not kept as an asset")]
+    Html,
+    /// The body is larger than a copy holds.
+    #[display("the response is larger than a kept asset holds")]
+    TooLarge,
+    /// The body outgrew a copy, or failed, while it was read.
+    #[display("the response could not be read whole")]
+    NotReadWhole,
+    /// A header cannot be written down to be served again.
+    #[display("a response header cannot be kept")]
+    UnkeptHeader,
+    /// The response varies on every request header.
+    #[display("origin response varies on *")]
+    VaryWildcard,
+    /// The response varies on the reader's cookies.
+    #[display("origin response varies on Cookie")]
+    VaryCookie,
+    /// The response's `Vary` cannot be read.
+    #[display("origin response Vary cannot be read")]
+    VaryUnreadable,
+    /// The origin's status, cookies or cache policy do not allow a shared
+    /// copy, or the policy cannot be read.
+    #[display("{_0}")]
+    Policy(TemplateCacheBypassReason),
+}
+
+/// Why a response that varies this way is served to no other request.
+fn vary_bypass_reason(vary: &SourceVary) -> Option<AssetCacheBypassReason> {
+    match vary {
+        SourceVary::Headers(_) => None,
+        SourceVary::Any => Some(AssetCacheBypassReason::VaryWildcard),
+        SourceVary::Cookie => Some(AssetCacheBypassReason::VaryCookie),
+        SourceVary::Unreadable => Some(AssetCacheBypassReason::VaryUnreadable),
+    }
+}
+
+/// How long an asset's response may be kept, from its own cache policy and
+/// capped at `max_lifetime`, or why it is not kept at all.
+fn asset_cache_ttl(
+    status: StatusCode,
+    content_type: &str,
+    headers: &edgezero_core::http::HeaderMap,
+    max_lifetime: Duration,
+) -> Result<Duration, AssetCacheBypassReason> {
+    origin_response_may_be_kept(status, headers).map_err(AssetCacheBypassReason::Policy)?;
+    if is_html_content_type(content_type) {
+        return Err(AssetCacheBypassReason::Html);
+    }
+    origin_shared_ttl(headers, max_lifetime).map_err(AssetCacheBypassReason::Policy)
+}
+
+/// Seconds since the Unix epoch, from the wasm-safe clock.
+pub(crate) fn unix_seconds() -> u64 {
+    crate::ec::std_system_time_now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
+type HandBackSlot = std::cell::RefCell<Option<Response<EdgeBody>>>;
+
+thread_local! {
+    static HANDED_BACK: std::cell::RefCell<std::collections::HashMap<u64, std::rc::Weak<HandBackSlot>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+static NEXT_LOAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Where a load leaves a response the request that started it is served,
+/// because the origin answered with something no other request may be
+/// served, so that request is served from the one fetch rather than a
+/// second one. The slot lives as long as the request's `HandBack`, on the
+/// thread that runs the request.
+struct HandBack {
+    id: u64,
+    slot: std::rc::Rc<HandBackSlot>,
+}
+
+impl HandBack {
+    fn new() -> Self {
+        let id = NEXT_LOAD.fetch_add(1, Ordering::Relaxed);
+        let slot = std::rc::Rc::new(std::cell::RefCell::new(None));
+        HANDED_BACK.with(|handed| {
+            handed
+                .borrow_mut()
+                .insert(id, std::rc::Rc::downgrade(&slot));
+        });
+        Self { id, slot }
+    }
+
+    fn take(&self) -> Option<Response<EdgeBody>> {
+        self.slot.borrow_mut().take()
+    }
+}
+
+impl Drop for HandBack {
+    fn drop(&mut self) {
+        HANDED_BACK.with(|handed| {
+            handed.borrow_mut().remove(&self.id);
+        });
+    }
+}
+
+fn hand_back(id: u64, response: Response<EdgeBody>) {
+    let slot = HANDED_BACK.with(|handed| handed.borrow().get(&id).and_then(std::rc::Weak::upgrade));
+    if let Some(slot) = slot {
+        *slot.borrow_mut() = Some(response);
+    }
+}
+
+/// What a load owns to fetch one asset, because a loader owns everything it
+/// uses.
+struct AssetLoad {
+    services: RuntimeServices,
+    /// The origin request, already prepared for the origin. Only a `GET` is
+    /// kept, which carries no body.
+    uri: http::Uri,
+    headers: http::HeaderMap,
+    backend_name: String,
+    stream_response: bool,
+    /// The longest a copy may be kept, whatever the origin asks.
+    max_lifetime: Duration,
+}
+
+/// What one fetch of an asset made.
+struct AssetLoaded {
+    /// What the origin's response varies on.
+    vary: SourceVary,
+    /// The copy with the time it may be used for, or `None` when the response
+    /// may not be shared.
+    copy: Option<(crate::asset_cache::AssetCopy, Duration)>,
+}
+
+/// The asset cache's fetch for one request, which fetches the asset and, when
+/// it may be shared, keeps it as the origin sent it.
+///
+/// An asset that may not be shared is held as
+/// [`AssetEntry::NotShareable`](crate::asset_cache::AssetEntry::NotShareable)
+/// for [`ASSET_NOT_SHAREABLE_LIFETIME`], and handed back to the request whose
+/// load fetched it through `hand_back_id`, see [`HandBack`].
+fn asset_fetch(load: Arc<AssetLoad>, hand_back_id: u64) -> crate::source_cache::Fetch {
+    Arc::new(move || {
+        let load = Arc::clone(&load);
+        Box::pin(async move {
+            let AssetLoaded { vary, copy } = load_asset(&load, hand_back_id).await?;
+            let (entry, lifetime) = match copy {
+                Some((copy, lifetime)) => (crate::asset_cache::AssetEntry::Copy(copy), lifetime),
+                None => (
+                    crate::asset_cache::AssetEntry::NotShareable,
+                    ASSET_NOT_SHAREABLE_LIFETIME,
+                ),
+            };
+            Ok(crate::source_cache::Fetched {
+                vary,
+                copy: entry.encode().into(),
+                lifetime,
+            })
+        })
+    })
+}
+
+/// `body` read whole when it holds at most `limit` bytes, or else the body to
+/// serve in its place, being what was read so far and then the rest.
+async fn read_whole_or_hand_back(body: EdgeBody, limit: usize) -> Result<bytes::Bytes, EdgeBody> {
+    let mut stream = match body {
+        EdgeBody::Once(bytes) if bytes.len() > limit => return Err(EdgeBody::Once(bytes)),
+        EdgeBody::Once(bytes) => return Ok(bytes),
+        EdgeBody::Stream(stream) => stream,
+    };
+    let mut read = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let failed = match chunk {
+            Ok(chunk) => {
+                read.extend_from_slice(&chunk);
+                if read.len() <= limit {
+                    continue;
+                }
+                None
+            }
+            Err(error) => Some(Err(error)),
+        };
+        let head = std::iter::once(Ok(bytes::Bytes::from(read))).chain(failed);
+        return Err(EdgeBody::Stream(
+            futures::stream::iter(head).chain(stream).boxed_local(),
+        ));
+    }
+    Ok(read.into())
+}
+
+/// Fetches an asset and keeps it as the origin sent it, with the time it may
+/// be used for, or no copy when it may not be shared.
+///
+/// # Errors
+///
+/// When the origin cannot be reached.
+async fn load_asset(
+    load: &AssetLoad,
+    hand_back_id: u64,
+) -> Result<AssetLoaded, crate::platform::LoadError> {
+    let load_error = |what: &str, report: &dyn core::fmt::Debug| {
+        crate::platform::LoadError::new(format!("{what}: {report:?}"))
+    };
+    let mut request = http::Request::builder()
+        .method(Method::GET)
+        .uri(load.uri.clone())
+        .body(EdgeBody::empty())
+        .map_err(|error| load_error("the origin request could not be built", &error))?;
+    *request.headers_mut() = load.headers.clone();
+    let mut platform_request = PlatformHttpRequest::new(request, load.backend_name.clone());
+    if load.stream_response {
+        platform_request = platform_request.with_stream_response();
+    }
+    let response = load
+        .services
+        .http_client()
+        .send(platform_request)
+        .await
+        .map_err(|report| load_error("the origin could not be reached", &report))?
+        .response;
+    let made = Instant::now();
+    let (parts, body) = response.into_parts();
+    let content_type = parts
+        .headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let vary = SourceVary::of(&parts.headers);
+    let not_shareable = |vary, parts, body| {
+        hand_back(hand_back_id, Response::from_parts(parts, body));
+        Ok(AssetLoaded { vary, copy: None })
+    };
+    if let Some(reason) = vary_bypass_reason(&vary) {
+        log::debug!("asset_cache bypass: {reason}");
+        return not_shareable(vary, parts, body);
+    }
+    let ttl = match asset_cache_ttl(
+        parts.status,
+        &content_type,
+        &parts.headers,
+        load.max_lifetime,
+    ) {
+        Ok(ttl) => ttl,
+        Err(reason) => {
+            log::debug!("asset_cache bypass: {reason}");
+            return not_shareable(vary, parts, body);
+        }
+    };
+    let declared_length = parts
+        .headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok());
+    if declared_length
+        .is_some_and(|length| length > crate::asset_cache::MAX_ASSET_COPY_BYTES as u64)
+    {
+        log::debug!("asset_cache bypass: {}", AssetCacheBypassReason::TooLarge);
+        return not_shareable(vary, parts, body);
+    }
+    let Some(headers) = crate::asset_cache::AssetCopy::kept_headers(&parts.headers, false) else {
+        log::debug!(
+            "asset_cache bypass: {}",
+            AssetCacheBypassReason::UnkeptHeader
+        );
+        return not_shareable(vary, parts, body);
+    };
+    let age_at_made = single_header_value(&parts.headers, header::AGE)
+        .ok()
+        .flatten()
+        .and_then(|value| parse_delta_seconds(value).ok())
+        .unwrap_or(0);
+    let raw = match read_whole_or_hand_back(body, crate::asset_cache::MAX_ASSET_COPY_BYTES).await {
+        Ok(raw) => raw,
+        Err(body) => {
+            log::debug!(
+                "asset_cache bypass: {}",
+                AssetCacheBypassReason::NotReadWhole
+            );
+            return not_shareable(vary, parts, body);
+        }
+    };
+    let lifetime = ttl.saturating_sub(made.elapsed());
+    if !lifetime.is_zero() {
+        log::debug!("asset_cache stored {} bytes", raw.len());
+    }
+    Ok(AssetLoaded {
+        vary,
+        copy: Some((
+            crate::asset_cache::AssetCopy {
+                headers,
+                decoded: false,
+                made_at: unix_seconds(),
+                age_at_made,
+                body: raw.to_vec(),
+            },
+            lifetime,
+        )),
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    mod asset_cache_tests {
+        use super::*;
+        use crate::platform::test_support::{
+            MemoryLoadingCache, StubHttpClient, asset_copy_lifetimes,
+            build_services_with_http_client,
+        };
+
+        fn services(
+            stub: &Arc<StubHttpClient>,
+            cache: &Arc<MemoryLoadingCache>,
+        ) -> RuntimeServices {
+            build_services_with_http_client(Arc::clone(stub) as _)
+                .with_loading_cache(Arc::clone(cache) as _)
+        }
+
+        fn settings() -> Arc<Settings> {
+            Arc::new(crate::test_support::tests::create_test_settings())
+        }
+
+        fn asset_request(path_and_query: &str, destination: &str) -> Request<EdgeBody> {
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("https://ts.example.com{path_and_query}"))
+                .header(header::HOST, "ts.example.com")
+                .header("sec-fetch-dest", destination)
+                .body(EdgeBody::empty())
+                .expect("should build the asset request")
+        }
+
+        fn queue(stub: &StubHttpClient, content_type: &str, body: &[u8], extra: &[(&str, &str)]) {
+            let mut headers = vec![("content-type", content_type)];
+            headers.extend_from_slice(extra);
+            stub.push_response_with_headers(200, body.to_vec(), headers);
+        }
+
+        async fn run(
+            settings: &Arc<Settings>,
+            services: &RuntimeServices,
+            request: Request<EdgeBody>,
+        ) -> Response<EdgeBody> {
+            let registry =
+                IntegrationRegistry::new(settings).expect("should create integration registry");
+            let orchestrator = AuctionOrchestrator::new(
+                crate::auction::test_support::legacy_auction_config(settings),
+            );
+            let consent = crate::consent::ConsentContext {
+                jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                ..Default::default()
+            };
+            let mut ec_context = EcContext::new_for_test(None, consent);
+            let publisher_response = handle_publisher_request(
+                AppContext {
+                    settings,
+                    integration_registry: &registry,
+                },
+                services,
+                None,
+                &mut ec_context,
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &[],
+                    registry: None,
+                },
+                request,
+                EdgeCacheHeader::SMaxageFallback,
+            )
+            .await
+            .expect("should proxy the asset request");
+            buffer_publisher_response_async(
+                publisher_response,
+                &Method::GET,
+                settings,
+                &registry,
+                &orchestrator,
+                services,
+            )
+            .await
+            .expect("should finalize the asset response")
+        }
+
+        async fn body_of(response: Response<EdgeBody>) -> Vec<u8> {
+            response
+                .into_body()
+                .into_bytes_bounded(4 * 1024 * 1024)
+                .await
+                .expect("should read the body")
+                .to_vec()
+        }
+
+        #[tokio::test]
+        async fn an_image_is_kept_as_the_origin_sent_it() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryLoadingCache::default());
+            let services = services(&stub, &cache);
+            let settings = settings();
+            let image = [0x89_u8, b'P', b'N', b'G', 0, 1, 2, 3];
+            queue(
+                &stub,
+                "image/png",
+                &image,
+                &[("cache-control", "public, max-age=300")],
+            );
+
+            for _ in 0..3 {
+                let response = run(&settings, &services, asset_request("/a.png", "image")).await;
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(body_of(response).await, image);
+            }
+
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                1,
+                "one fetch serves all three"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_stylesheet_is_served_from_one_fetch_with_its_age() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryLoadingCache::default());
+            let services = services(&stub, &cache);
+            let settings = settings();
+            queue(
+                &stub,
+                "text/css",
+                b"body{color:red}",
+                &[("cache-control", "public, max-age=300")],
+            );
+
+            let first =
+                body_of(run(&settings, &services, asset_request("/site.css", "style")).await).await;
+            let second = run(&settings, &services, asset_request("/site.css", "style")).await;
+            assert!(
+                second.headers().contains_key(header::AGE),
+                "a kept copy says how long it has been kept"
+            );
+            let second = body_of(second).await;
+
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                1,
+                "one fetch serves both"
+            );
+            assert_eq!(
+                second, first,
+                "the kept copy is what the first reader was served"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_wildcard_vary_a_private_or_a_no_store_response_is_never_kept() {
+            for (cache_control, vary, kept) in [
+                ("public, max-age=300", None, true),
+                ("public, max-age=300", Some("*"), false),
+                ("public, max-age=300", Some("Cookie"), false),
+                ("private, max-age=300", None, false),
+                ("no-store", None, false),
+                ("public, max-age=300, no-store", None, false),
+            ] {
+                let stub = Arc::new(StubHttpClient::new());
+                let cache = Arc::new(MemoryLoadingCache::default());
+                let services = services(&stub, &cache);
+                let settings = settings();
+                for _ in 0..2 {
+                    let mut extra = vec![("cache-control", cache_control)];
+                    extra.extend(vary.map(|vary| ("vary", vary)));
+                    queue(&stub, "text/css", b"body{}", &extra);
+                    let response =
+                        run(&settings, &services, asset_request("/site.css", "style")).await;
+                    assert_eq!(body_of(response).await, b"body{}");
+                }
+                assert_eq!(
+                    stub.recorded_request_uris().len(),
+                    if kept { 1 } else { 2 },
+                    "Cache-Control {cache_control} and Vary {vary:?}"
+                );
+                assert_eq!(
+                    asset_copy_lifetimes(&cache).is_empty(),
+                    !kept,
+                    "Cache-Control {cache_control} and Vary {vary:?}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn s_maxage_then_max_age_set_how_long_a_copy_is_kept() {
+            for (cache_control, seconds) in [
+                ("public, max-age=300", 300),
+                ("public, max-age=300, s-maxage=60", 60),
+                ("public, s-maxage=600, max-age=30", 600),
+            ] {
+                let stub = Arc::new(StubHttpClient::new());
+                let cache = Arc::new(MemoryLoadingCache::default());
+                let services = services(&stub, &cache);
+                queue(
+                    &stub,
+                    "text/css",
+                    b"body{}",
+                    &[("cache-control", cache_control)],
+                );
+
+                let response =
+                    run(&settings(), &services, asset_request("/site.css", "style")).await;
+                let _ = body_of(response).await;
+
+                let lifetimes = asset_copy_lifetimes(&cache);
+                assert_eq!(lifetimes.len(), 1, "{cache_control}");
+                let expected = Duration::from_secs(seconds);
+                assert!(
+                    lifetimes[0] <= expected && lifetimes[0] > expected - Duration::from_secs(5),
+                    "{cache_control} should keep a copy for {expected:?}, not {:?}",
+                    lifetimes[0]
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_header_the_origin_varies_on_separates_kept_copies() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryLoadingCache::default());
+            let services = services(&stub, &cache);
+            let settings = settings();
+            for edition in ["red", "blue"] {
+                queue(
+                    &stub,
+                    "text/css",
+                    format!("/* {edition} */").as_bytes(),
+                    &[
+                        ("cache-control", "public, max-age=300"),
+                        ("vary", "X-Edition"),
+                    ],
+                );
+            }
+            let request = |edition: &str| {
+                let mut request = asset_request("/site.css", "style");
+                request.headers_mut().insert(
+                    "x-edition",
+                    HeaderValue::from_str(edition).expect("should be a header value"),
+                );
+                request
+            };
+
+            for edition in ["red", "blue", "red", "blue"] {
+                let css = body_of(run(&settings, &services, request(edition)).await).await;
+                assert_eq!(css, format!("/* {edition} */").into_bytes());
+            }
+
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                2,
+                "each edition is fetched once"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_body_that_outgrows_a_copy_is_served_from_the_one_fetch() {
+            for streaming in [false, true] {
+                let stub = Arc::new(StubHttpClient::new());
+                stub.set_streaming_responses_supported(streaming);
+                let cache = Arc::new(MemoryLoadingCache::default());
+                let services = services(&stub, &cache);
+                let settings = settings();
+                let large = vec![b'a'; crate::asset_cache::MAX_ASSET_COPY_BYTES + 1];
+                for _ in 0..2 {
+                    queue(
+                        &stub,
+                        "text/plain",
+                        &large,
+                        &[("cache-control", "public, max-age=300")],
+                    );
+                }
+
+                let response = run(&settings, &services, asset_request("/big.txt", "empty")).await;
+
+                assert_eq!(
+                    body_of(response).await,
+                    large,
+                    "streaming {streaming}: the reader is served the whole body"
+                );
+                assert_eq!(
+                    stub.recorded_request_uris().len(),
+                    1,
+                    "streaming {streaming}: a body with no Content-Length that outgrows a copy \
+                     is served from the one fetch"
+                );
+                assert!(asset_copy_lifetimes(&cache).is_empty());
+            }
+        }
+
+        #[tokio::test]
+        async fn a_response_whose_vary_changed_is_served_from_the_one_fetch() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryLoadingCache::default());
+            let services = services(&stub, &cache);
+            let settings = settings();
+            for (edition, vary) in [
+                ("red", "X-Edition"),
+                ("blue", "X-Region"),
+                ("blue", "X-Region"),
+            ] {
+                queue(
+                    &stub,
+                    "text/css",
+                    format!("/* {edition} */").as_bytes(),
+                    &[("cache-control", "public, max-age=300"), ("vary", vary)],
+                );
+            }
+            let request = |edition: &str| {
+                let mut request = asset_request("/site.css", "style");
+                request.headers_mut().insert(
+                    "x-edition",
+                    HeaderValue::from_str(edition).expect("should be a header value"),
+                );
+                request
+            };
+
+            let red = body_of(run(&settings, &services, request("red")).await).await;
+            let blue = body_of(run(&settings, &services, request("blue")).await).await;
+
+            assert_eq!(red, b"/* red */");
+            assert_eq!(
+                blue, b"/* blue */",
+                "the request whose fetch found the new Vary is served that fetch"
+            );
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                2,
+                "each request fetches the origin once"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_request_carrying_authorization_is_fetched_for_itself() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryLoadingCache::default());
+            let services = services(&stub, &cache);
+            let settings = settings();
+            for _ in 0..2 {
+                queue(
+                    &stub,
+                    "image/png",
+                    b"png",
+                    &[("cache-control", "public, max-age=300")],
+                );
+                let mut request = asset_request("/a.png", "image");
+                request.headers_mut().insert(
+                    header::AUTHORIZATION,
+                    HeaderValue::from_static("Bearer reader-token"),
+                );
+                let _ = body_of(run(&settings, &services, request).await).await;
+            }
+
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                2,
+                "an authenticated request never shares a copy"
+            );
+            assert!(asset_copy_lifetimes(&cache).is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_request_carrying_a_cookie_is_fetched_for_itself_and_kept_for_no_one() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryLoadingCache::default());
+            let services = services(&stub, &cache);
+            let settings = settings();
+            // The origin answers each reader from their cookie without naming
+            // it in `Vary`, which the cache cannot see.
+            for reader in ["one", "two"] {
+                queue(
+                    &stub,
+                    "application/json",
+                    format!("{{\"reader\":\"{reader}\"}}").as_bytes(),
+                    &[("cache-control", "max-age=300")],
+                );
+            }
+
+            for reader in ["one", "two"] {
+                let mut request = asset_request("/account.json", "empty");
+                request.headers_mut().insert(
+                    header::COOKIE,
+                    HeaderValue::from_str(&format!("session={reader}"))
+                        .expect("should be a header value"),
+                );
+                let answer = body_of(run(&settings, &services, request).await).await;
+                assert_eq!(
+                    answer,
+                    format!("{{\"reader\":\"{reader}\"}}").into_bytes(),
+                    "reader {reader} is served the answer made for their own cookie"
+                );
+            }
+
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                2,
+                "each reader's request is fetched for itself"
+            );
+            assert!(
+                asset_copy_lifetimes(&cache).is_empty(),
+                "no answer to a request carrying a cookie is kept"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_answer_that_sets_a_cookie_is_served_only_to_the_reader_it_was_made_for() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryLoadingCache::default());
+            let services = services(&stub, &cache);
+            let settings = settings();
+            for reader in ["one", "two"] {
+                let cookie = format!("visitor={reader}");
+                queue(
+                    &stub,
+                    "text/css",
+                    format!("/* {reader} */").as_bytes(),
+                    &[
+                        ("cache-control", "public, max-age=300"),
+                        ("set-cookie", cookie.as_str()),
+                    ],
+                );
+            }
+
+            for reader in ["one", "two"] {
+                let response = run(&settings, &services, asset_request("/site.css", "style")).await;
+                let cookie = format!("visitor={reader}");
+                assert!(
+                    response
+                        .headers()
+                        .get_all(header::SET_COOKIE)
+                        .iter()
+                        .any(|value| value.as_bytes() == cookie.as_bytes()),
+                    "reader {reader} is served the cookie the origin set for them"
+                );
+                assert_eq!(
+                    body_of(response).await,
+                    format!("/* {reader} */").into_bytes()
+                );
+            }
+
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                2,
+                "each reader's request is fetched for itself"
+            );
+            assert!(
+                asset_copy_lifetimes(&cache).is_empty(),
+                "an answer that sets a cookie is kept for no one"
+            );
+        }
+
+        /// A loading cache module's cache, which keeps what it loads.
+        fn memory_module_cache() -> Arc<dyn crate::platform::PlatformLoadingCache> {
+            Arc::new(MemoryLoadingCache::default())
+        }
+
+        #[tokio::test]
+        async fn assets_turned_off_in_the_settings_are_fetched_for_every_request() {
+            let module = crate::integrations::IntegrationBuilder::implementations(
+                "loading-cache.memory",
+                "a-crate",
+            )
+            .with_loading_cache(memory_module_cache);
+            for (written, fetches) in [(None, 1), (Some(crate::settings::ASSETS_CACHE_OFF), 2)] {
+                let mut settings = crate::test_support::tests::create_test_settings();
+                settings.cache.assets.module = written.map(str::to_owned);
+                let caches = crate::integrations::loading_caches_from(
+                    &settings,
+                    std::slice::from_ref(&module),
+                )
+                .expect("should select the asset caches");
+                let settings = Arc::new(settings);
+                let stub = Arc::new(StubHttpClient::new());
+                let services = build_services_with_http_client(Arc::clone(&stub) as _)
+                    .with_loading_caches(caches);
+                for _ in 0..2 {
+                    queue(
+                        &stub,
+                        "text/css",
+                        b"body{}",
+                        &[("cache-control", "public, max-age=300")],
+                    );
+                    let response =
+                        run(&settings, &services, asset_request("/site.css", "style")).await;
+                    assert_eq!(body_of(response).await, b"body{}");
+                }
+
+                assert_eq!(
+                    stub.recorded_request_uris().len(),
+                    fetches,
+                    "[cache.assets] module {written:?}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_page_navigation_never_reads_an_asset_copy() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryLoadingCache::default());
+            let services = services(&stub, &cache);
+            let settings = settings();
+            for _ in 0..2 {
+                queue(
+                    &stub,
+                    "text/html; charset=utf-8",
+                    b"<html><head></head><body>page</body></html>",
+                    &[("cache-control", "public, max-age=300")],
+                );
+                let mut request = asset_request("/page", "document");
+                request
+                    .headers_mut()
+                    .insert("sec-fetch-mode", HeaderValue::from_static("navigate"));
+                let _ = body_of(run(&settings, &services, request).await).await;
+            }
+
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                2,
+                "an inline page is fetched for each reader"
+            );
+            assert!(asset_copy_lifetimes(&cache).is_empty());
+        }
+    }
+
     use std::future::Future as _;
     use std::io::{self, Read as _, Write as _};
     use std::sync::atomic::{AtomicUsize, Ordering};

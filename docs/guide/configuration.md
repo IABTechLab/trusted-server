@@ -1783,12 +1783,35 @@ or several, making each answer every time it is asked for. A name that no
 linked crate offers a cache from is refused by `ts config validate` and when
 the service starts, with the names that could be written.
 
+Every response the publisher's origin sends that is not a page, and every
+answer of an asset route under `[[proxy.asset_routes]]`, is held the same way,
+selected by `[cache.assets]`, for the lifetime the origin's cache policy gives
+it and under what the origin says it varies on, so an asset is fetched once
+however many readers and instances ask for it at the same moment. A copy is
+served with the headers that describe it and an `Age` that counts from the
+origin's. Nothing is kept that may not be shared: anything but a `GET`,
+anything but a `200`, HTML, a response carrying `Set-Cookie`, one whose policy
+says `private`, `no-store` or `no-cache` or gives no lifetime, one that varies
+on `*` or on `Cookie`, one larger than a megabyte, an answer the platform's
+image optimizer makes, and the answer to a request carrying `Authorization`, a
+conditional header, a range, or a `Cache-Control` of `no-cache`, `no-store`,
+`min-fresh` or a nonzero `max-age`. A response that may not be shared is served
+to the request whose load fetched it from that one fetch. A request that sends
+the publisher's origin a cookie always goes to the origin, and its answer is not
+kept, because the cache cannot see whether the cookie shaped it. An asset route
+sends its origin no cookie. `[cache.assets] module = "none"` keeps no asset, so
+every asset is fetched from its origin for each request.
+
 | Table                | Field                | Default                 | Range         | Description                                                                     |
 | -------------------- | -------------------- | ----------------------- | ------------- | ------------------------------------------------------------------------------- |
 | `[cache.robots-txt]` | `module`             | the one the build links |               | The module whose loading cache holds each robots.txt module's answer.           |
 | `[cache.robots-txt]` | `memory_seconds`     | `60`                    | 0 to 31536000 | How long the copy in memory is used. Zero keeps none.                           |
 | `[cache.robots-txt]` | `store_seconds`      | `604800`, a week        | 1 to 31536000 | The longest a module's answer is used. The module's own refresh ends it sooner. |
 | `[cache.robots-txt]` | `store_idle_seconds` | `2592000`, 30 days      | 1 to 31536000 | How long an answer in the shared store lasts unused.                            |
+| `[cache.assets]`     | `module`             | the linked module       |               | The loading cache module for assets and route answers. `none` keeps none.       |
+| `[cache.assets]`     | `memory_seconds`     | `5`                     | 0 to 31536000 | How long the copy in memory is used. Zero keeps none.                           |
+| `[cache.assets]`     | `store_seconds`      | `3600`, an hour         | 1 to 31536000 | The longest a copy is used. The origin's own lifetime ends it sooner.           |
+| `[cache.assets]`     | `store_idle_seconds` | `86400`, a day          | 1 to 31536000 | How long a copy in the shared store lasts unused.                               |
 
 A module may declare caches of its own, named by the module, and a deployment
 selects a loading cache for each in its own `[cache.<name>]` table with the

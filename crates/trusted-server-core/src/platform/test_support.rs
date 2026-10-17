@@ -1447,6 +1447,38 @@ impl MemoryLoadingCache {
         keys.sort();
         keys
     }
+
+    /// The value held under `key`, with the time it has left, or `None` for
+    /// its time when its load gave it no lifetime.
+    pub fn held(&self, key: &str) -> Option<(bytes::Bytes, Option<Duration>)> {
+        self.entries
+            .lock()
+            .expect("should lock the entries")
+            .get(key)
+            .map(|(bytes, end)| {
+                let left = end.map(|end| end.saturating_duration_since(web_time::Instant::now()));
+                (bytes.clone(), left)
+            })
+    }
+}
+
+/// The time left to each asset copy `cache` holds, leaving out the records
+/// and the marks of what may not be shared, in no order.
+pub fn asset_copy_lifetimes(cache: &MemoryLoadingCache) -> Vec<Duration> {
+    let copies = format!("/{}/", crate::settings::ASSETS_CACHE);
+    cache
+        .keys()
+        .iter()
+        .filter(|key| key.contains(&copies))
+        .filter_map(|key| cache.held(key))
+        .filter(|(value, _)| {
+            matches!(
+                crate::asset_cache::AssetEntry::decode(value),
+                Ok(crate::asset_cache::AssetEntry::Copy(_))
+            )
+        })
+        .map(|(_, left)| left.unwrap_or(Duration::MAX))
+        .collect()
 }
 
 #[async_trait::async_trait(?Send)]

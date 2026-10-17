@@ -89,6 +89,15 @@ pub struct TemplateCacheKey {
     pub schema_version: u32,
 }
 
+/// Writes `part` into `hasher` with its length before it, so no two lists of
+/// parts run together into the same digest.
+pub(crate) fn hash_length_prefixed(hasher: &mut sha2::Sha256, part: &[u8]) {
+    use sha2::Digest as _;
+
+    hasher.update((part.len() as u64).to_be_bytes());
+    hasher.update(part);
+}
+
 impl TemplateCacheKey {
     /// Render a fixed-size opaque key for the platform cache.
     ///
@@ -98,12 +107,9 @@ impl TemplateCacheKey {
     pub fn to_cache_key(&self) -> String {
         use sha2::Digest as _;
 
-        fn push(out: &mut Vec<u8>, part: &[u8]) {
-            out.extend_from_slice(&(part.len() as u64).to_be_bytes());
-            out.extend_from_slice(part);
-        }
+        use hash_length_prefixed as push;
 
-        let mut canonical = Vec::new();
+        let mut canonical = sha2::Sha256::new();
         push(&mut canonical, b"ts-template-cache");
         push(&mut canonical, &self.schema_version.to_be_bytes());
         push(
@@ -155,7 +161,7 @@ impl TemplateCacheKey {
             }
         }
 
-        let digest = sha2::Sha256::digest(canonical);
+        let digest = canonical.finalize();
         format!(
             "ts-template-cache-v{}-{}",
             self.schema_version,
