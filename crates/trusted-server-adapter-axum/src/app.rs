@@ -74,6 +74,10 @@ pub struct AppState {
     /// Services a caller supplied for every request, rather than services built
     /// from the request context. `None` in a deployment.
     services: Option<RuntimeServices>,
+    /// The loading caches the `[cache.<name>]` tables select from the linked
+    /// builders, taken when this state is built and handed to every request's
+    /// services.
+    loading_caches: Arc<trusted_server_core::platform::LoadingCaches>,
 }
 
 /// Set once startup has logged that this adapter sends no auction telemetry.
@@ -213,6 +217,8 @@ fn build_state_with_registrations_and_services(
             &settings,
             &shipped_signal_modules(),
         )?;
+    let loading_caches =
+        trusted_server_core::integrations::loading_caches_from(&settings, integrations)?;
     // This adapter builds no telemetry sink, so a module `[analytics]` selects
     // sends nothing unless the caller's services carry a sink.
     warn_once_when_analytics_is_unsent(
@@ -228,6 +234,7 @@ fn build_state_with_registrations_and_services(
         registry: Arc::new(registry),
         permission_signal_modules,
         services,
+        loading_caches,
     }))
 }
 
@@ -248,6 +255,7 @@ impl AppState {
     fn services_for_request(&self, ctx: &RequestContext) -> RuntimeServices {
         let mut services = self.services.clone().unwrap_or_else(|| {
             build_runtime_services(ctx, &self.settings, &self.permission_signal_modules)
+                .with_loading_caches(Arc::clone(&self.loading_caches))
         });
         if let Some(module) = self.registry.geo_module() {
             services = services.with_geo(module);
@@ -920,6 +928,7 @@ mod tests {
             // This test drives the per-request path, which builds its services
             // from the request context.
             services: None,
+            loading_caches: Arc::default(),
         }
     }
 
