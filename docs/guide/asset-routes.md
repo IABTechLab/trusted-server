@@ -16,7 +16,7 @@ For a matching `GET` or `HEAD` request, Trusted Server runs this sequence:
 6. Send the request to the resolved backend origin.
 7. Return the origin status, body, and safe headers.
 
-The origin query policy runs before S3 signing, so the signature covers the exact URL sent to S3. Image Optimizer metadata stays separate from the origin URL and is translated by the Fastly adapter.
+The origin query policy runs before S3 signing, so the signature covers the exact URL sent to S3. Image Optimizer metadata stays separate from the origin URL and is translated by the Fastly adapter. Every adapter serves asset routes. The Axum, Cloudflare and Spin adapters hold the asset body whole, and answer a route that enables the Image Optimizer with an error, because they have none.
 
 ## Basic route
 

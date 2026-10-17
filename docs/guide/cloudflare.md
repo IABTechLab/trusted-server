@@ -62,7 +62,10 @@ selects run as on Fastly, and `[device] module = "platform"` classifies from
 the `User-Agent`, because the Worker supplies no TLS or HTTP/2 signals. An
 Edge Cookie module creates and writes its cookie with no identity graph
 behind it, and `POST /_ts/api/v1/ec/resolve` sets one the same way.
-See the [API reference](./api-reference) for route-level behavior.
+`[[proxy.asset_routes]]` are served from each route's own source with the
+asset body held whole, and a route that enables the Image Optimizer answers
+with an error, because Workers has none. See the
+[API reference](./api-reference) for route-level behavior.
 
 Compare the [Fastly](./fastly), [Spin](./spin), and [Axum](./axum-dev)
 adapter journeys.

@@ -58,6 +58,9 @@ normalization layer. The modules' request filters and the device module
 classifies from the `User-Agent`, because Spin supplies no TLS or HTTP/2
 signals. An Edge Cookie module creates and writes its cookie with no identity
 graph behind it, and `POST /_ts/api/v1/ec/resolve` sets one the same way.
+`[[proxy.asset_routes]]` are served from each route's own source with the
+asset body held whole, and a route that enables the Image Optimizer answers
+with an error, because Spin has none.
 
 Spin is not installed in the integration CI environment. The recurring manual
 smoke therefore needs a named owner, tested commit, exact tool versions, and an

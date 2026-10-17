@@ -68,7 +68,10 @@ request filters and the device module `[device]` selects run as on Fastly,
 and `[device] module = "platform"` classifies from the `User-Agent`, because
 the dev server supplies no TLS or HTTP/2 signals. An Edge Cookie module
 creates and writes its cookie with no identity graph behind it, and
-`POST /_ts/api/v1/ec/resolve` sets one the same way.
+`POST /_ts/api/v1/ec/resolve` sets one the same way. `[[proxy.asset_routes]]`
+are served from each route's own source with the asset body held whole, and
+a route that enables the Image Optimizer answers with an error, because the
+dev server has none.
 
 For an edge deployment, use the [Fastly](./fastly),
 [Cloudflare](./cloudflare), or [Spin](./spin) guide.
