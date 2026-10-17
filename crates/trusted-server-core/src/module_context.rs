@@ -165,6 +165,18 @@ impl ResolvedRequest {
         }
     }
 
+    /// The method, address, host and scheme `view` carries.
+    #[must_use]
+    pub fn from_view(view: &ModuleRequest<'_>) -> Self {
+        Self {
+            method: view.method.clone(),
+            path: view.path.to_owned(),
+            query: view.query.to_owned(),
+            host: view.host.to_owned(),
+            scheme: view.scheme.to_owned(),
+        }
+    }
+
     /// The same request with no query, for an answer that is held and served
     /// to every caller, which must not depend on what one caller put in the
     /// address.
@@ -175,11 +187,11 @@ impl ResolvedRequest {
     }
 
     /// The same request for `host`, for an answer that is held under the host
-    /// it is made for, which must be the host the caller read and not one a
-    /// forwarded header names.
+    /// it is made for, which must be the host the request was addressed to
+    /// and not one a forwarded header names.
     #[must_use]
-    pub(crate) fn with_host(mut self, host: String) -> Self {
-        self.host = host;
+    pub(crate) fn with_host(mut self, host: &str) -> Self {
+        host.clone_into(&mut self.host);
         self
     }
 
@@ -227,6 +239,9 @@ impl<T: ?Sized> Copy for Gated<'_, T> {}
 #[derive(Clone, Copy)]
 pub struct ModuleContext<'r> {
     request: ModuleRequest<'r>,
+    /// The host the request was addressed to, which a forwarded header never
+    /// names, where core read it.
+    addressed_host: Option<&'r str>,
     evidence: Option<&'r dyn RequestInfo>,
     client: Option<&'r ClientInfo>,
     permissions: Option<&'r PermissionState>,
@@ -247,6 +262,7 @@ impl<'r> ModuleContext<'r> {
     pub const fn new(request: ModuleRequest<'r>) -> Self {
         Self {
             request,
+            addressed_host: None,
             evidence: None,
             client: None,
             permissions: None,
@@ -309,6 +325,18 @@ impl<'r> ModuleContext<'r> {
     pub fn with_services(self, services: &'r RuntimeServices) -> Self {
         Self {
             services: Some(services),
+            ..self
+        }
+    }
+
+    /// The same context carrying the host the request was addressed to, as
+    /// `http_util::addressed_host` reads it, for an answer held for every
+    /// request to that host. The request's own host may follow a forwarded
+    /// header, which a client can set to any host it likes.
+    #[must_use]
+    pub(crate) fn with_addressed_host(self, host: &'r str) -> Self {
+        Self {
+            addressed_host: Some(host),
             ..self
         }
     }
@@ -479,6 +507,12 @@ impl<'c> ModuleCall<'c> {
     #[must_use]
     pub fn declared(&self) -> PermissionSet {
         self.declared
+    }
+
+    /// The host the request was addressed to, when the context carries it,
+    /// see [`ModuleContext::with_addressed_host`].
+    pub(crate) fn addressed_host(&self) -> Option<&'c str> {
+        self.context.addressed_host
     }
 
     /// A gated value, when this module may be passed it.
