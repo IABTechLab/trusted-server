@@ -9,7 +9,7 @@ use serde_json::Value as JsonValue;
 
 use crate::auction::formats::AdRequest;
 use crate::auction::orchestrator::OrchestrationResult;
-use crate::consent::{consent_allows_server_side_auction, gate_eids_by_permissions};
+use crate::consent::gate_eids_by_permissions;
 use crate::ec::EcContext;
 use crate::ec::EcKvSnapshot;
 use crate::ec::eids::{resolve_partner_ids, to_eids};
@@ -223,13 +223,14 @@ pub async fn handle_auction(
     }
 
     // Server-side auction consent gate. The publisher-navigation and
-    // `/_ts/page-bids` paths fail closed for GDPR/unknown jurisdictions that
-    // lack effective TCF Purpose 1. `/auction` is the programmatic entry point
-    // for the same server-side auction, so it must gate identically: returning
-    // a no-bid response here prevents outbound PBS/APS calls and the forwarding
-    // of request-derived signals (UA/IP/geo, and cookies under some Prebid
+    // `/_ts/page-bids` paths fail closed for GDPR or unknown jurisdictions, and
+    // where a consent record says its regulation applies, unless a record
+    // that applies consents to storage. `/auction` is the programmatic entry
+    // point for the same server-side auction, so it must gate identically:
+    // returning a no-bid response here prevents outbound demand calls and the
+    // forwarding of request-derived signals (UA/IP/geo, and cookies under some
     // consent-forwarding modes) for traffic that must not run an auction.
-    if !consent_allows_server_side_auction(&consent_context) {
+    if !ec_context.server_side_auction_allowed() {
         log::info!(
             "/auction: server-side auction consent gate denied; returning no-bid response without contacting providers"
         );
@@ -283,10 +284,9 @@ pub async fn handle_auction(
     // Gate this on the same identity condition as the EC ID
     // (`ec_id.is_some()`, which is already filtered by the sharing pair via
     // `ec_context.ec_sharing_allowed()`).
-    // Otherwise a US/GPC or US-Privacy opt-out context — where EC identity use is
-    // denied but a non-personalized auction may still run — could forward
-    // persistent client EIDs from the body/cookie, since `gate_eids_by_consent`
-    // only strips on TCF/GDPR signals. This matches the publisher and
+    // Otherwise a US-style opt-out context, where EC identity use is denied
+    // but a non-personalized auction may still run, could forward persistent
+    // client EIDs from the body/cookie. This matches the publisher and
     // `/_ts/page-bids` paths, which also resolve client EIDs only when
     // `ec_id.is_some()`.
     let client_eids = if ec_id.is_some() {
@@ -1304,10 +1304,11 @@ mod tests {
 
     #[tokio::test]
     async fn auction_endpoint_consent_gate_returns_no_bid_without_contacting_providers() {
-        // GDPR/unknown jurisdiction lacking effective TCF Purpose 1 must not run
-        // a server-side auction. The /auction endpoint must short-circuit to a
-        // no-bid response before dispatching to any provider — matching the
-        // publisher-navigation and /_ts/page-bids paths.
+        // A GDPR or unknown jurisdiction with no consent record granting
+        // storage must not run a server-side auction. The /auction endpoint
+        // must short-circuit to a no-bid response before dispatching to any
+        // provider, matching the publisher-navigation and /_ts/page-bids
+        // paths.
         let settings = create_test_settings();
         let config = AuctionConfig {
             enabled: true,
@@ -1490,12 +1491,12 @@ mod tests {
 
     #[tokio::test]
     async fn auction_strips_client_eids_when_ec_identity_denied() {
-        // US-state opt-out via GPC: the server-side auction consent gate still
-        // allows a non-personalized auction, but EC identity use is denied
-        // (`ec_allowed()` is false) and `gate_eids_by_consent` does not strip
-        // because no TCF signal is present and GDPR does not apply. Client EIDs
-        // supplied in the request body/cookie must NOT be forwarded — the
-        // outgoing auction request must have `user.eids == None`.
+        // A US-state opt-out: the server-side auction consent gate still
+        // allows a non-personalized auction, because no consent record says a
+        // regulation applies, but EC identity use is denied (`ec_allowed()` is
+        // false). Client EIDs supplied in the request body/cookie must NOT be
+        // forwarded, so the outgoing auction request must have
+        // `user.eids == None`.
         let settings = create_test_settings();
         let config = AuctionConfig {
             enabled: true,
@@ -1511,13 +1512,12 @@ mod tests {
         }));
         let services = noop_services();
 
-        // US-state jurisdiction with an explicit GPC opt-out: auction allowed,
+        // US-state jurisdiction with an explicit opt-out: auction allowed,
         // EC identity denied.
         let mut ec_context = EcContext::new_for_test(
             None,
             ConsentContext {
                 jurisdiction: Jurisdiction::UsState("CA".to_owned()),
-                gpc: true,
                 ..ConsentContext::default()
             },
         );

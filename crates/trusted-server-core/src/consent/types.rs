@@ -1,683 +1,452 @@
-//! Consent signal types.
+//! The request's consent context: what each permission signal module read
+//! from the request, in neutral terms.
 //!
-//! This module defines the full consent type hierarchy:
-//!
-//! - [`RawConsentSignals`] — raw (undecoded) strings extracted from cookies/headers
-//! - [`ConsentContext`] — the normalized output carrying both raw and decoded data
-//! - [`UsPrivacy`] / [`PrivacyFlag`] — decoded US Privacy (CCPA) 4-char string
-//! - [`TcfConsent`] — decoded TCF v2 core consent data
-//! - [`GppConsent`] — decoded GPP consent data
-//! - [`ConsentSource`] — how consent was sourced (cookie or policy default)
+//! A module reads its own scheme's signal from the request and reports it as
+//! a [`SignalRecord`], being the string as received, whether it decoded, where
+//! it came from, and the decoded form, which is the module's own type and is
+//! opaque here. Core carries the records, the jurisdiction, and nothing of how
+//! any scheme spells its signal.
 
+use core::any::Any;
 use core::fmt;
+use std::sync::Arc;
 
-// ---------------------------------------------------------------------------
-// Raw extraction layer
-// ---------------------------------------------------------------------------
+use super::jurisdiction::Jurisdiction;
+use crate::permissions::{PermissionSet, ValidSignal};
 
-/// Raw consent signals extracted from cookies and HTTP headers.
+/// The consent context for a request, as the permission signal modules
+/// filled it.
 ///
-/// All fields are optional because any combination of consent mechanisms may be
-/// present (or absent) on a given request. No decoding or validation is
-/// performed at this stage — the values are preserved exactly as received.
-///
-/// # Consent sources
-///
-/// | Field | Source | Standard |
-/// |---|---|---|
-/// | [`raw_tc_string`](Self::raw_tc_string) | `euconsent-v2` cookie | IAB TCF v2 |
-/// | [`raw_gpp_string`](Self::raw_gpp_string) | `__gpp` cookie | IAB GPP |
-/// | [`raw_gpp_sid`](Self::raw_gpp_sid) | `__gpp_sid` cookie | IAB GPP |
-/// | [`raw_us_privacy`](Self::raw_us_privacy) | `us_privacy` cookie | IAB US Privacy (CCPA) |
-/// | [`gpc`](Self::gpc) | `Sec-GPC` header | Global Privacy Control |
-#[derive(Debug, Clone, Default)]
-pub struct RawConsentSignals {
-    /// TCF v2 consent string from the `euconsent-v2` cookie.
-    pub raw_tc_string: Option<String>,
-    /// GPP consent string from the `__gpp` cookie.
-    pub raw_gpp_string: Option<String>,
-    /// GPP section IDs from the `__gpp_sid` cookie (raw comma-separated string).
-    pub raw_gpp_sid: Option<String>,
-    /// US Privacy string from the `us_privacy` cookie (4-character format).
-    pub raw_us_privacy: Option<String>,
-    /// Global Privacy Control signal from the `Sec-GPC` header.
-    ///
-    /// When `true`, the browser has signaled the user's opt-out preference.
-    pub gpc: bool,
-}
-
-impl RawConsentSignals {
-    /// Returns `true` when at least one consent cookie signal is present.
-    #[must_use]
-    pub fn has_cookie_signals(&self) -> bool {
-        self.raw_tc_string.is_some()
-            || self.raw_gpp_string.is_some()
-            || self.raw_gpp_sid.is_some()
-            || self.raw_us_privacy.is_some()
-    }
-
-    /// Returns `true` when no consent signals were found on the request.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        !self.has_cookie_signals() && !self.gpc
-    }
-}
-
-impl fmt::Display for RawConsentSignals {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "euconsent-v2=")?;
-        match &self.raw_tc_string {
-            Some(s) => write!(f, "present ({} chars)", s.len())?,
-            None => write!(f, "absent")?,
-        }
-
-        write!(f, ", __gpp=")?;
-        match &self.raw_gpp_string {
-            Some(s) => write!(f, "present ({} chars)", s.len())?,
-            None => write!(f, "absent")?,
-        }
-
-        write!(f, ", __gpp_sid=")?;
-        match &self.raw_gpp_sid {
-            Some(s) => write!(f, "\"{s}\"")?,
-            None => write!(f, "absent")?,
-        }
-
-        write!(f, ", us_privacy=")?;
-        match &self.raw_us_privacy {
-            Some(s) => write!(f, "\"{s}\"")?,
-            None => write!(f, "absent")?,
-        }
-
-        write!(f, ", Sec-GPC={}", if self.gpc { "1" } else { "absent" })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Decoded consent types
-// ---------------------------------------------------------------------------
-
-/// Normalized consent context extracted from cookies and headers.
-///
-/// Carries both raw consent strings (for `OpenRTB` forwarding) and decoded
-/// structured data (for TS-level enforcement and observability). This is the
-/// central type that flows through the entire request lifecycle.
-///
-/// Built from [`RawConsentSignals`] by the decoding pipeline in
-/// [`super::build_consent_context`].
+/// One [`SignalRecord`] per scheme a configured module read, in the order the
+/// modules were asked, and the request's privacy jurisdiction. Built once by
+/// the consent pipeline and read by the permission assembly, the bid request
+/// builders and the identity graph.
 #[derive(Debug, Clone, Default)]
 pub struct ConsentContext {
-    /// Raw TC String from `euconsent-v2` cookie, passed as-is in `user.consent`.
-    pub raw_tc_string: Option<String>,
-    /// Raw GPP string from `__gpp` cookie, passed as-is in `regs.gpp`.
-    pub raw_gpp_string: Option<String>,
-    /// GPP section IDs derived from decoded `__gpp` data.
-    ///
-    /// The `__gpp_sid` cookie is treated as a transport hint and validated
-    /// against decoded section IDs when both are present.
-    pub gpp_section_ids: Option<Vec<u16>>,
-    /// Raw US Privacy string from `us_privacy` cookie.
-    pub raw_us_privacy: Option<String>,
-    /// Raw Google Additional Consent (AC) string.
-    ///
-    /// Covers ad tech providers not in the IAB Global Vendor List but
-    /// participating in the Google ecosystem. Format: `{version}~{ids}~dv.`
-    pub raw_ac_string: Option<String>,
-
-    /// Whether GDPR applies to this request (derived from TCF presence).
-    pub gdpr_applies: bool,
-    /// Decoded TCF v2 consent data.
-    pub tcf: Option<TcfConsent>,
-    /// Decoded GPP consent data.
-    pub gpp: Option<GppConsent>,
-    /// Decoded US Privacy signal.
-    pub us_privacy: Option<UsPrivacy>,
-
-    /// Whether the TCF consent string has expired (age exceeds configured max).
-    ///
-    /// When `true` and `check_expiration` is enabled, the decoded `tcf` field
-    /// is cleared (treated as no consent) but the raw string is preserved for
-    /// proxy-mode forwarding.
-    pub expired: bool,
-
-    /// Global Privacy Control signal from `Sec-GPC` header.
-    pub gpc: bool,
-    /// Detected privacy jurisdiction for this request.
-    pub jurisdiction: super::jurisdiction::Jurisdiction,
-    /// Source of the consent data (for debugging).
-    pub source: ConsentSource,
+    /// What each configured module read, one record per scheme, in module
+    /// order.
+    pub records: Vec<SignalRecord>,
+    /// The privacy jurisdiction the request falls under.
+    pub jurisdiction: Jurisdiction,
 }
 
 impl ConsentContext {
-    /// Keeps only the raw strings a configured module vouched for, so a
-    /// signal that was absent, unreadable, expired or not acted on is never
-    /// forwarded in a bid request or anywhere else this context is read.
-    ///
-    /// `signals` are the [`ValidSignal`]s on the assembled permission state,
-    /// matched by scheme. The decoded records are left alone, because a
-    /// decoded record only exists where the raw string was readable and the
-    /// modules have already read it.
-    pub fn keep_only(&mut self, signals: &[crate::permissions::ValidSignal]) {
-        let vouched = |scheme: &str| signals.iter().any(|signal| signal.scheme == scheme);
-        if !vouched("tcf") {
-            self.raw_tc_string = None;
-        }
-        if !vouched("gpp") {
-            self.raw_gpp_string = None;
-            self.gpp_section_ids = None;
-        }
-        if !vouched("us_privacy") {
-            self.raw_us_privacy = None;
+    /// A context holding no records under `jurisdiction`.
+    #[must_use]
+    pub fn new(jurisdiction: Jurisdiction) -> Self {
+        Self {
+            records: Vec::new(),
+            jurisdiction,
         }
     }
 
-    /// Returns `true` when no consent signals are present.
+    /// The same context with `record` added, replacing any record of the
+    /// same scheme, so one scheme is reported once.
+    #[must_use]
+    pub fn with_record(mut self, record: SignalRecord) -> Self {
+        self.records.retain(|held| held.scheme != record.scheme);
+        self.records.push(record);
+        self
+    }
+
+    /// The record of `scheme`, when a module read one.
+    #[must_use]
+    pub fn record(&self, scheme: &str) -> Option<&SignalRecord> {
+        self.records.iter().find(|record| record.scheme == scheme)
+    }
+
+    /// The decoded form of `scheme`, when a module read one and it is of
+    /// type `T`.
+    #[must_use]
+    pub fn decoded<T: Any>(&self, scheme: &str) -> Option<&T> {
+        self.record(scheme).and_then(SignalRecord::decoded)
+    }
+
+    /// The signal of `scheme` as it was received, when a module read one.
+    #[must_use]
+    pub fn value(&self, scheme: &str) -> Option<&str> {
+        self.record(scheme).and_then(SignalRecord::value)
+    }
+
+    /// Whether any module says the regulation its scheme answers for applies
+    /// to this request.
+    #[must_use]
+    pub fn applies(&self) -> bool {
+        self.records.iter().any(|record| record.applies)
+    }
+
+    /// Whether no record carries a signal.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.raw_tc_string.is_none()
-            && self.raw_gpp_string.is_none()
-            && self.gpp_section_ids.is_none()
-            && self.raw_us_privacy.is_none()
-            && self.raw_ac_string.is_none()
-            && self.tcf.is_none()
-            && self.gpp.is_none()
-            && self.us_privacy.is_none()
-            && !self.gpc
-    }
-}
-
-// ---------------------------------------------------------------------------
-// TCF v2
-// ---------------------------------------------------------------------------
-
-/// Decoded TCF v2.x consent data.
-///
-/// Extracted from either a standalone TC String (`euconsent-v2` cookie)
-/// or from the EU TCF v2.2 section within a GPP string.
-///
-/// Only the core segment (segment type 0) is decoded. Publisher restrictions,
-/// disclosed vendors, and allowed vendors segments are not yet supported.
-#[derive(Debug, Clone)]
-pub struct TcfConsent {
-    /// TCF version (2).
-    pub version: u8,
-    /// CMP ID that collected this consent.
-    pub cmp_id: u16,
-    /// CMP version.
-    pub cmp_version: u16,
-    /// Consent screen number.
-    pub consent_screen: u8,
-    /// CMP language (ISO 639-1, two uppercase letters).
-    pub consent_language: String,
-    /// Vendor list version used.
-    pub vendor_list_version: u16,
-    /// TCF policy version.
-    pub tcf_policy_version: u8,
-    /// Timestamp when consent was created (deciseconds since epoch).
-    pub created_ds: u64,
-    /// Timestamp when consent was last updated (deciseconds since epoch).
-    pub last_updated_ds: u64,
-
-    /// Purpose consents (24 bits, 1-indexed).
-    ///
-    /// `true` at index 0 means purpose 1 is consented, etc.
-    pub purpose_consents: Vec<bool>,
-    /// Purpose legitimate interests (24 bits, 1-indexed).
-    pub purpose_legitimate_interests: Vec<bool>,
-
-    /// Vendor IDs with consent granted.
-    pub vendor_consents: Vec<u16>,
-    /// Vendor IDs with legitimate interest established.
-    pub vendor_legitimate_interests: Vec<u16>,
-
-    /// Special feature opt-ins (12 bits).
-    pub special_feature_opt_ins: Vec<bool>,
-}
-
-impl TcfConsent {
-    /// Looks up a 1-indexed purpose in a TCF bitfield.
-    ///
-    /// Returns `false` for purpose 0 (invalid) and out-of-range indices.
-    fn purpose_bit(bits: &[bool], purpose: usize) -> bool {
-        purpose
-            .checked_sub(1)
-            .and_then(|idx| bits.get(idx).copied())
-            .unwrap_or(false)
+        self.records.iter().all(|record| record.value.is_none())
     }
 
-    /// Checks whether consent was granted for a specific TCF purpose.
+    /// Keeps only the signals a configured module vouched for, so a signal
+    /// that was absent, unreadable, expired or not acted on is never forwarded
+    /// in a bid request or anywhere else this context is read.
     ///
-    /// Purposes are 1-indexed per the TCF specification (Purpose 1 = index 0).
-    /// Returns `false` if the purpose is out of range.
-    #[must_use]
-    pub fn has_purpose_consent(&self, purpose: usize) -> bool {
-        Self::purpose_bit(&self.purpose_consents, purpose)
-    }
-
-    /// Checks whether legitimate interest was established for a specific TCF purpose.
-    ///
-    /// Purposes are 1-indexed per the TCF specification.
-    /// Returns `false` if the purpose is out of range.
-    #[must_use]
-    pub fn has_purpose_li(&self, purpose: usize) -> bool {
-        Self::purpose_bit(&self.purpose_legitimate_interests, purpose)
-    }
-
-    /// Checks whether a specific vendor has been granted consent.
-    ///
-    /// Uses linear search over the vendor ID list, which is adequate for
-    /// current usage patterns. Consider switching to a `HashSet<u16>` or
-    /// sorted vec with binary search if this lands on a hot path (e.g.
-    /// per-EID vendor gating).
-    #[must_use]
-    pub fn has_vendor_consent(&self, vendor_id: u16) -> bool {
-        self.vendor_consents.contains(&vendor_id)
-    }
-
-    /// Checks whether a specific vendor has established legitimate interest.
-    ///
-    /// See [`has_vendor_consent`](Self::has_vendor_consent) for performance
-    /// notes on the linear search.
-    #[must_use]
-    pub fn has_vendor_li(&self, vendor_id: u16) -> bool {
-        self.vendor_legitimate_interests.contains(&vendor_id)
-    }
-
-    /// Whether Purpose 1 (Store/access information on a device) is consented.
-    ///
-    /// Required for any EID or cookie-based identifier to be set.
-    #[must_use]
-    pub fn has_storage_consent(&self) -> bool {
-        self.has_purpose_consent(1)
-    }
-
-    /// Whether Purpose 2 (Basic ads) is consented.
-    ///
-    /// Required for bid adapters to participate in the auction.
-    #[must_use]
-    pub fn has_basic_ads_consent(&self) -> bool {
-        self.has_purpose_consent(2)
-    }
-
-    /// Whether Purpose 4 (Personalized ads) is consented.
-    ///
-    /// Controls whether user first-party data and EIDs are transmitted.
-    #[must_use]
-    pub fn has_personalized_ads_consent(&self) -> bool {
-        self.has_purpose_consent(4)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// GPP
-// ---------------------------------------------------------------------------
-
-/// Decoded GPP (Global Privacy Platform) consent data.
-///
-/// Wraps the `iab_gpp` crate's decoded output with our domain types.
-#[derive(Debug, Clone)]
-pub struct GppConsent {
-    /// GPP header version.
-    pub version: u8,
-    /// Active section IDs present in the GPP string.
-    pub section_ids: Vec<u16>,
-    /// Decoded EU TCF v2.2 section (if present in GPP, section ID 2).
-    pub eu_tcf: Option<TcfConsent>,
-    /// Whether the user opted out of sale of personal information via a US GPP
-    /// section (IDs 7–23).
-    ///
-    /// - `Some(true)` — a US section is present and `sale_opt_out == OptedOut`
-    /// - `Some(false)` — a US section is present and user did not opt out
-    /// - `None` — no US section exists in the GPP string
-    pub us_sale_opt_out: Option<bool>,
-}
-
-// ---------------------------------------------------------------------------
-// US Privacy (CCPA)
-// ---------------------------------------------------------------------------
-
-/// Decoded US Privacy string (legacy 4-character format).
-///
-/// Format: `1YNN` where:
-/// - Char 1: Version (always `1`)
-/// - Char 2: Notice given (`Y`/`N`/`-`)
-/// - Char 3: Opt-out of sale (`Y`/`N`/`-`)
-/// - Char 4: LSPA covered (`Y`/`N`/`-`)
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UsPrivacy {
-    /// Specification version (currently always 1).
-    pub version: u8,
-    /// Whether explicit notice has been given to the consumer.
-    pub notice_given: PrivacyFlag,
-    /// Whether the consumer has opted out of the sale of personal information.
-    pub opt_out_sale: PrivacyFlag,
-    /// Whether the transaction is covered by the Limited Service Provider Agreement.
-    pub lspa_covered: PrivacyFlag,
-}
-
-/// A tri-state flag used in the US Privacy string.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PrivacyFlag {
-    /// `Y` — yes / affirmative.
-    Yes,
-    /// `N` — no / negative.
-    No,
-    /// `-` — not applicable or unknown.
-    NotApplicable,
-}
-
-impl fmt::Display for PrivacyFlag {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Yes => write!(f, "Y"),
-            Self::No => write!(f, "N"),
-            Self::NotApplicable => write!(f, "-"),
+    /// `signals` are the [`ValidSignal`]s on the assembled permission state,
+    /// matched by scheme. A record nobody vouched for keeps its status and
+    /// what it decoded, because the modules have already read those, and loses
+    /// the string and the sections a reader would forward.
+    pub fn keep_only(&mut self, signals: &[ValidSignal]) {
+        for record in &mut self.records {
+            if !signals.iter().any(|signal| signal.scheme == record.scheme) {
+                record.value = None;
+                record.sections = Vec::new();
+            }
         }
     }
-}
 
-impl From<bool> for PrivacyFlag {
-    fn from(value: bool) -> Self {
-        if value { Self::Yes } else { Self::No }
+    /// Drops every record `keep` answers `false` for.
+    pub fn retain(&mut self, keep: impl FnMut(&SignalRecord) -> bool) {
+        self.records.retain(keep);
     }
 }
 
-impl fmt::Display for UsPrivacy {
+/// What a permission signal module read from the request for its scheme.
+#[derive(Clone)]
+pub struct SignalRecord {
+    scheme: &'static str,
+    value: Option<String>,
+    status: SignalStatus,
+    source: ConsentSource,
+    applies: bool,
+    sections: Vec<u16>,
+    consented: PermissionSet,
+    decoded: Option<Arc<dyn Any + Send + Sync>>,
+}
+
+impl SignalRecord {
+    /// A record of `scheme` in `status`, carrying no string, no decoded form
+    /// and no source yet.
+    #[must_use]
+    pub fn new(scheme: &'static str, status: SignalStatus) -> Self {
+        Self {
+            scheme,
+            value: None,
+            status,
+            source: ConsentSource::None,
+            applies: false,
+            sections: Vec::new(),
+            consented: PermissionSet::none(),
+            decoded: None,
+        }
+    }
+
+    /// The same record carrying the signal as it was received, from a cookie
+    /// or a header.
+    #[must_use]
+    pub fn with_value(mut self, value: impl Into<String>) -> Self {
+        self.value = Some(value.into());
+        self.source = ConsentSource::Cookie;
+        self
+    }
+
+    /// The same record carrying `decoded`, the module's own form of the
+    /// signal, read back with [`decoded`](Self::decoded).
+    #[must_use]
+    pub fn with_decoded<T: Any + Send + Sync>(mut self, decoded: T) -> Self {
+        self.decoded = Some(Arc::new(decoded));
+        self
+    }
+
+    /// The same record with where the signal came from.
+    #[must_use]
+    pub fn with_source(mut self, source: ConsentSource) -> Self {
+        self.source = source;
+        self
+    }
+
+    /// The same record saying whether the regulation the scheme answers for
+    /// applies to this request.
+    #[must_use]
+    pub fn with_applies(mut self, applies: bool) -> Self {
+        self.applies = applies;
+        self
+    }
+
+    /// The same record carrying the identifiers of the sections the signal
+    /// is made of, for a scheme whose string carries sections.
+    #[must_use]
+    pub fn with_sections(mut self, sections: Vec<u16>) -> Self {
+        self.sections = sections;
+        self
+    }
+
+    /// The same record carrying the permissions the signal itself holds the
+    /// visitor's consent to, read from the signal alone, whatever the policy
+    /// and the place rules make of it.
+    #[must_use]
+    pub fn with_consented(mut self, consented: PermissionSet) -> Self {
+        self.consented = consented;
+        self
+    }
+
+    /// The scheme, as the module names it and a reader asks for it.
+    #[must_use]
+    pub fn scheme(&self) -> &'static str {
+        self.scheme
+    }
+
+    /// The signal as it was received, when one arrived.
+    #[must_use]
+    pub fn value(&self) -> Option<&str> {
+        self.value.as_deref()
+    }
+
+    /// Whether the signal decoded, could not be read, expired, or was left
+    /// as received.
+    #[must_use]
+    pub fn status(&self) -> SignalStatus {
+        self.status
+    }
+
+    /// Where the signal came from.
+    #[must_use]
+    pub fn source(&self) -> ConsentSource {
+        self.source
+    }
+
+    /// Whether the module says the regulation its scheme answers for applies
+    /// to this request. A scheme that does not say leaves it `false`.
+    #[must_use]
+    pub fn applies(&self) -> bool {
+        self.applies
+    }
+
+    /// The identifiers of the sections the signal is made of, in the scheme's
+    /// own numbering, and empty for a scheme without sections.
+    #[must_use]
+    pub fn sections(&self) -> &[u16] {
+        &self.sections
+    }
+
+    /// The permissions the signal holds the visitor's consent to, and none
+    /// for a signal that carries no consent, such as an opt-out, or one that
+    /// did not decode.
+    #[must_use]
+    pub fn consented(&self) -> PermissionSet {
+        self.consented
+    }
+
+    /// The decoded form, when the module stored one of type `T`.
+    #[must_use]
+    pub fn decoded<T: Any>(&self) -> Option<&T> {
+        self.decoded
+            .as_deref()
+            .and_then(|decoded| decoded.downcast_ref::<T>())
+    }
+}
+
+impl fmt::Debug for SignalRecord {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}{}{}{}",
-            self.version, self.notice_given, self.opt_out_sale, self.lspa_covered,
-        )
+        f.debug_struct("SignalRecord")
+            .field("scheme", &self.scheme)
+            .field("value", &self.value.as_ref().map(String::len))
+            .field("status", &self.status)
+            .field("source", &self.source)
+            .field("applies", &self.applies)
+            .field("sections", &self.sections)
+            .field("consented", &self.consented)
+            .field("decoded", &self.decoded.is_some())
+            .finish()
     }
 }
 
-// ---------------------------------------------------------------------------
-// Metadata types
-// ---------------------------------------------------------------------------
+/// What became of the signal a module read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalStatus {
+    /// No signal of the scheme arrived. A record in this state carries what
+    /// the module can still say without one.
+    Absent,
+    /// The signal decoded, and the record carries the decoded form.
+    Decoded,
+    /// The signal arrived and was left as received, because the settings
+    /// say not to decode.
+    NotDecoded,
+    /// The signal arrived and could not be read.
+    Unreadable,
+    /// The signal decoded and is older than the settings allow.
+    Expired,
+}
 
-/// How consent was sourced for this request.
+impl fmt::Display for SignalStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Absent => "absent",
+            Self::Decoded => "present",
+            Self::NotDecoded => "not-decoded",
+            Self::Unreadable => "decode-failed",
+            Self::Expired => "expired",
+        })
+    }
+}
+
+/// Where a signal came from.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ConsentSource {
-    /// Read from cookies on the incoming request.
+    /// Read from the request, a cookie or a header.
     Cookie,
-    /// Applied from explicit publisher policy defaults.
+    /// Constructed from the deployment's declared policy defaults.
     PolicyDefault,
-    /// No consent data available.
+    /// No signal.
     #[default]
     None,
 }
-
-// ---------------------------------------------------------------------------
-// Consent error
-// ---------------------------------------------------------------------------
-
-/// Errors that can occur during consent string decoding.
-#[derive(Debug, derive_more::Display)]
-pub enum ConsentDecodeError {
-    /// The US Privacy string has an invalid format.
-    #[display("invalid US Privacy string: {reason}")]
-    InvalidUsPrivacy { reason: String },
-    /// The TC String could not be decoded.
-    #[display("invalid TC String: {reason}")]
-    InvalidTcString { reason: String },
-    /// The GPP string could not be decoded.
-    #[display("invalid GPP string: {reason}")]
-    InvalidGppString { reason: String },
-}
-
-impl core::error::Error for ConsentDecodeError {}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn empty_signals() {
-        let signals = RawConsentSignals::default();
-        assert!(signals.is_empty(), "default signals should be empty");
-    }
-
-    #[test]
-    fn not_empty_with_tc_string() {
-        let signals = RawConsentSignals {
-            raw_tc_string: Some("CPXxGfAPXxGfA".to_owned()),
-            ..Default::default()
-        };
-        assert!(!signals.is_empty(), "should not be empty with tc_string");
-    }
-
-    #[test]
-    fn not_empty_with_gpc() {
-        let signals = RawConsentSignals {
-            gpc: true,
-            ..Default::default()
-        };
-        assert!(!signals.is_empty(), "should not be empty with gpc=true");
-    }
-
-    #[test]
-    fn has_no_cookie_signals_with_only_gpc() {
-        let signals = RawConsentSignals {
-            gpc: true,
-            ..Default::default()
-        };
-
-        assert!(
-            !signals.has_cookie_signals(),
-            "should not report cookie signals when only gpc is present"
-        );
-    }
-
-    #[test]
-    fn has_cookie_signals_with_tc_string() {
-        let signals = RawConsentSignals {
-            raw_tc_string: Some("CPXxGfAPXxGfA".to_owned()),
-            ..Default::default()
-        };
-
-        assert!(
-            signals.has_cookie_signals(),
-            "should report cookie signals when tc string is present"
-        );
-    }
-
-    #[test]
-    fn display_all_absent() {
-        let signals = RawConsentSignals::default();
-        let output = signals.to_string();
-        assert!(
-            output.contains("euconsent-v2=absent"),
-            "should show euconsent-v2 absent"
-        );
-        assert!(output.contains("__gpp=absent"), "should show __gpp absent");
-        assert!(
-            output.contains("us_privacy=absent"),
-            "should show us_privacy absent"
-        );
-        assert!(
-            output.contains("Sec-GPC=absent"),
-            "should show Sec-GPC absent"
-        );
-    }
-
-    #[test]
-    fn display_with_values() {
-        let signals = RawConsentSignals {
-            raw_tc_string: Some("CPXxGfAPXxGfA".to_owned()),
-            raw_gpp_string: Some("DBACNYA~CPXxGfA".to_owned()),
-            raw_gpp_sid: Some("2,6".to_owned()),
-            raw_us_privacy: Some("1YNN".to_owned()),
-            gpc: true,
-        };
-        let output = signals.to_string();
-        assert!(
-            output.contains("euconsent-v2=present (13 chars)"),
-            "should show tc_string length"
-        );
-        assert!(
-            output.contains("__gpp=present (15 chars)"),
-            "should show gpp length"
-        );
-        assert!(
-            output.contains("__gpp_sid=\"2,6\""),
-            "should show gpp_sid value"
-        );
-        assert!(
-            output.contains("us_privacy=\"1YNN\""),
-            "should show us_privacy value"
-        );
-        assert!(output.contains("Sec-GPC=1"), "should show Sec-GPC as 1");
-    }
-
-    #[test]
-    fn consent_context_empty_by_default() {
-        let ctx = ConsentContext::default();
-        assert!(ctx.is_empty(), "default ConsentContext should be empty");
-    }
-
-    #[test]
-    fn consent_context_not_empty_with_tc_string() {
-        let ctx = ConsentContext {
-            raw_tc_string: Some("CPXx".to_owned()),
-            ..Default::default()
-        };
-        assert!(
-            !ctx.is_empty(),
-            "should not be empty with raw_tc_string present"
-        );
-    }
-
-    #[test]
-    fn consent_context_not_empty_with_gpc() {
-        let ctx = ConsentContext {
-            gpc: true,
-            ..Default::default()
-        };
-        assert!(!ctx.is_empty(), "should not be empty with gpc=true");
-    }
-
-    #[test]
-    fn us_privacy_display() {
-        let usp = UsPrivacy {
-            version: 1,
-            notice_given: PrivacyFlag::Yes,
-            opt_out_sale: PrivacyFlag::No,
-            lspa_covered: PrivacyFlag::NotApplicable,
-        };
-        assert_eq!(usp.to_string(), "1YN-", "should format as 1YN-");
-    }
-
-    #[test]
-    fn privacy_flag_display() {
-        assert_eq!(PrivacyFlag::Yes.to_string(), "Y");
-        assert_eq!(PrivacyFlag::No.to_string(), "N");
-        assert_eq!(PrivacyFlag::NotApplicable.to_string(), "-");
-    }
-
-    #[test]
-    fn consent_source_default_is_none() {
+    fn a_context_holds_one_record_per_scheme() {
+        let context = ConsentContext::default()
+            .with_record(SignalRecord::new("first", SignalStatus::Decoded).with_value("one"))
+            .with_record(SignalRecord::new("first", SignalStatus::Decoded).with_value("two"));
+        assert_eq!(context.records.len(), 1, "a scheme is reported once");
         assert_eq!(
-            ConsentSource::default(),
-            ConsentSource::None,
-            "default source should be None"
+            context.value("first"),
+            Some("two"),
+            "the later record replaces the earlier one"
         );
-    }
-
-    fn make_tcf_consent() -> TcfConsent {
-        TcfConsent {
-            version: 2,
-            cmp_id: 1,
-            cmp_version: 1,
-            consent_screen: 1,
-            consent_language: "EN".to_owned(),
-            vendor_list_version: 42,
-            tcf_policy_version: 4,
-            created_ds: 0,
-            last_updated_ds: 0,
-            // Purposes 1, 2, 4 consented (indices 0, 1, 3)
-            purpose_consents: vec![
-                true, true, false, true, false, false, false, false, false, false, false, false,
-            ],
-            // Purpose 7 LI (index 6)
-            purpose_legitimate_interests: vec![
-                false, false, false, false, false, false, true, false, false, false, false, false,
-            ],
-            vendor_consents: vec![10, 32, 755],
-            vendor_legitimate_interests: vec![32],
-            special_feature_opt_ins: vec![false; 12],
-        }
-    }
-
-    #[test]
-    fn tcf_has_purpose_consent() {
-        let tcf = make_tcf_consent();
-        assert!(tcf.has_purpose_consent(1), "should have Purpose 1 consent");
-        assert!(tcf.has_purpose_consent(2), "should have Purpose 2 consent");
-        assert!(
-            !tcf.has_purpose_consent(3),
-            "should not have Purpose 3 consent"
-        );
-        assert!(tcf.has_purpose_consent(4), "should have Purpose 4 consent");
-    }
-
-    #[test]
-    fn tcf_purpose_consent_out_of_range() {
-        let tcf = make_tcf_consent();
-        assert!(
-            !tcf.has_purpose_consent(0),
-            "purpose 0 should return false (1-indexed)"
-        );
-        assert!(
-            !tcf.has_purpose_consent(99),
-            "out-of-range purpose should return false"
+        assert_eq!(
+            context.value("other"),
+            None,
+            "an unread scheme has no value"
         );
     }
 
     #[test]
-    fn tcf_has_purpose_li() {
-        let tcf = make_tcf_consent();
-        assert!(
-            tcf.has_purpose_li(7),
-            "should have Purpose 7 legitimate interest"
+    fn a_record_carries_its_decoded_form_by_type() {
+        #[derive(Debug, PartialEq)]
+        struct Decoded(u8);
+
+        let record = SignalRecord::new("example", SignalStatus::Decoded).with_decoded(Decoded(7));
+        assert_eq!(record.decoded::<Decoded>(), Some(&Decoded(7)));
+        assert_eq!(
+            record.decoded::<String>(),
+            None,
+            "asking for another type answers nothing rather than something wrong"
         );
-        assert!(
-            !tcf.has_purpose_li(1),
-            "should not have Purpose 1 legitimate interest"
+        let context = ConsentContext::default().with_record(record);
+        assert_eq!(context.decoded::<Decoded>("example"), Some(&Decoded(7)));
+    }
+
+    #[test]
+    fn a_value_marks_the_record_as_read_from_the_request() {
+        let read = SignalRecord::new("example", SignalStatus::Decoded).with_value("v");
+        assert_eq!(read.source(), ConsentSource::Cookie);
+        let declared = read.with_source(ConsentSource::PolicyDefault);
+        assert_eq!(
+            declared.source(),
+            ConsentSource::PolicyDefault,
+            "a source set afterwards stands"
+        );
+        assert_eq!(
+            SignalRecord::new("example", SignalStatus::Absent).source(),
+            ConsentSource::None
         );
     }
 
     #[test]
-    fn tcf_has_vendor_consent() {
-        let tcf = make_tcf_consent();
+    fn emptiness_and_applicability_read_across_the_records() {
+        assert!(ConsentContext::default().is_empty());
+        let context = ConsentContext::default()
+            .with_record(SignalRecord::new("a", SignalStatus::Absent).with_applies(true))
+            .with_record(SignalRecord::new("b", SignalStatus::Decoded).with_value("x"));
+        assert!(!context.is_empty(), "a record with a value is a signal");
+        assert!(context.applies(), "one record applying is enough");
         assert!(
-            tcf.has_vendor_consent(755),
-            "should have consent for vendor 755"
-        );
-        assert!(
-            !tcf.has_vendor_consent(999),
-            "should not have consent for vendor 999"
+            !ConsentContext::default()
+                .with_record(SignalRecord::new("a", SignalStatus::Absent))
+                .applies()
         );
     }
 
     #[test]
-    fn tcf_convenience_methods() {
-        let tcf = make_tcf_consent();
-        assert!(
-            tcf.has_storage_consent(),
-            "should have storage consent (P1)"
+    fn keep_only_drops_the_strings_nobody_vouched_for() {
+        let mut context = ConsentContext::default()
+            .with_record(
+                SignalRecord::new("kept", SignalStatus::Decoded)
+                    .with_value("k")
+                    .with_sections(vec![1]),
+            )
+            .with_record(
+                SignalRecord::new("dropped", SignalStatus::Unreadable)
+                    .with_value("d")
+                    .with_sections(vec![2])
+                    .with_applies(true),
+            );
+        context.keep_only(&[ValidSignal::new("module", "kept", "k")]);
+        assert_eq!(context.value("kept"), Some("k"));
+        assert_eq!(
+            context.record("kept").map(SignalRecord::sections),
+            Some(&[1][..])
         );
-        assert!(
-            tcf.has_basic_ads_consent(),
-            "should have basic ads consent (P2)"
+        let dropped = context.record("dropped").expect("the record stays");
+        assert_eq!(dropped.value(), None, "the string goes no further");
+        assert!(dropped.sections().is_empty(), "nor do its sections");
+        assert_eq!(
+            dropped.status(),
+            SignalStatus::Unreadable,
+            "what the module read stays on record"
         );
+        assert!(dropped.applies(), "and so does what it said applies");
+    }
+
+    #[test]
+    fn a_record_carries_what_the_visitor_consented_to_whoever_vouched() {
+        use crate::permissions::Permission;
+
+        let storage = PermissionSet::none().with(Permission::StoreOnDevice);
         assert!(
-            tcf.has_personalized_ads_consent(),
-            "should have personalized ads consent (P4)"
+            SignalRecord::new("example", SignalStatus::Decoded)
+                .consented()
+                .is_empty(),
+            "a record holds no consent unless its module says so"
         );
+        let mut context = ConsentContext::default().with_record(
+            SignalRecord::new("example", SignalStatus::Decoded)
+                .with_value("v")
+                .with_consented(storage),
+        );
+        context.keep_only(&[]);
+        assert_eq!(
+            context.record("example").map(SignalRecord::consented),
+            Some(storage),
+            "what the module read stays on record when the string goes no further"
+        );
+    }
+
+    #[test]
+    fn retain_drops_whole_records() {
+        let mut context = ConsentContext::default()
+            .with_record(SignalRecord::new("a", SignalStatus::Decoded).with_value("1"))
+            .with_record(
+                SignalRecord::new("b", SignalStatus::Decoded)
+                    .with_value("2")
+                    .with_source(ConsentSource::PolicyDefault),
+            );
+        context.retain(|record| record.source() == ConsentSource::PolicyDefault);
+        assert!(context.record("a").is_none());
+        assert_eq!(context.value("b"), Some("2"));
+    }
+
+    #[test]
+    fn status_reads_as_a_word() {
+        assert_eq!(SignalStatus::Decoded.to_string(), "present");
+        assert_eq!(SignalStatus::Unreadable.to_string(), "decode-failed");
+        assert_eq!(SignalStatus::Expired.to_string(), "expired");
+        assert_eq!(SignalStatus::NotDecoded.to_string(), "not-decoded");
+        assert_eq!(SignalStatus::Absent.to_string(), "absent");
+    }
+
+    #[test]
+    fn debug_shows_the_length_of_a_signal_and_never_its_text() {
+        let record = SignalRecord::new("example", SignalStatus::Decoded).with_value("secret");
+        let shown = format!("{record:?}");
+        assert!(shown.contains("value: Some(6)"), "{shown}");
+        assert!(!shown.contains("secret"), "{shown}");
     }
 }

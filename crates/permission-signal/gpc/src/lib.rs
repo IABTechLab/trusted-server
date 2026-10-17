@@ -1,18 +1,18 @@
 //! Global Privacy Control as a permission signal module.
 //!
-//! Answers from the `Sec-GPC` request header, which core reads into the
-//! consent record's `gpc` flag. Separate from the GPP and US Privacy modules
-//! so that a publisher who does not act on Global Privacy Control can leave
-//! this one out of the configured list without also losing the other two
-//! opt-outs.
+//! Reads the `Sec-GPC` request header and records it. Separate from the GPP
+//! and US Privacy modules so that a publisher who does not act on Global
+//! Privacy Control can leave this one out of the configured list without also
+//! losing the other two opt-outs.
 //!
 //! This module lives outside `trusted-server-core` deliberately, like every
 //! scheme. Why is set out once, in `permission_signal/README.md` in core.
 
-use trusted_server_core::consent::ConsentContext;
+use trusted_server_core::consent::{ConsentContext, SignalRecord, SignalStatus};
+use trusted_server_core::evidence::RequestInfo;
 use trusted_server_core::module_context::ModuleCall;
 use trusted_server_core::permission_signal::{PermissionSignalModule, SignalInput};
-use trusted_server_core::permissions::{ConsentSignal, OptOutSource, Permission, ValidSignal};
+use trusted_server_core::permissions::{ConsentSignal, Permission, ValidSignal};
 
 /// The name `[permission-signal] modules` selects this module by, from its
 /// crate folder.
@@ -30,6 +30,37 @@ fn short() -> &'static str {
     )
 }
 
+/// The scheme, as a [`ValidSignal`] and a [`SignalRecord`] name it.
+pub const SCHEME: &str = "gpc";
+
+/// The name this scheme is listed under in `signals.us_opt_out.sources` of
+/// the permission policy.
+pub const OPT_OUT_SOURCE: &str = "gpc";
+
+/// The request header carrying the setting.
+pub const HEADER_SEC_GPC: &str = "sec-gpc";
+
+/// Whether the request carries `Sec-GPC: 1`.
+#[must_use]
+pub fn header_set(evidence: &dyn RequestInfo) -> bool {
+    evidence
+        .header(HEADER_SEC_GPC)
+        .is_some_and(|value| value.trim() == "1")
+}
+
+/// Whether this module read the header on the request.
+#[must_use]
+pub fn signaled(consent: &ConsentContext) -> bool {
+    consent.record(SCHEME).is_some()
+}
+
+/// The record this module reports for a sent header, for a caller that
+/// builds a consent context without a request.
+#[must_use]
+pub fn record() -> SignalRecord {
+    SignalRecord::new(SCHEME, SignalStatus::Decoded).with_value("1")
+}
+
 /// The `Sec-GPC` request header, Global Privacy Control.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct GpcModule;
@@ -41,10 +72,16 @@ impl GpcModule {
         Self
     }
 
-    /// The signal this scheme reads from the request's consent record, when
-    /// it can use one.
+    /// The header's one value, when it was sent. There is nothing to
+    /// decode, so a sent header is always read.
+    fn read_record(&self, evidence: &dyn RequestInfo) -> Option<SignalRecord> {
+        header_set(evidence).then(record)
+    }
+
+    /// The signal this scheme vouches for, when the header was sent.
     fn read_signal(&self, consent: &ConsentContext) -> Option<ValidSignal> {
-        consent.gpc.then(|| ValidSignal::new(short(), "gpc", "1"))
+        let value = consent.value(SCHEME)?;
+        Some(ValidSignal::new(short(), SCHEME, value))
     }
 }
 
@@ -53,14 +90,18 @@ impl PermissionSignalModule for GpcModule {
         name()
     }
 
+    fn read(&self, call: ModuleCall<'_>) -> Option<SignalRecord> {
+        call.inject(self, Self::read_record).ok().flatten()
+    }
+
     fn signal(&self, permission: Permission, input: &SignalInput<'_>) -> ConsentSignal {
         // The policy decides whether this scheme counts at all and what an
         // opt-out takes away, so a module the policy does not list stays
         // silent even when configuration names it.
-        if !input.policy.opt_out_sources().contains(&OptOutSource::Gpc) {
+        if !input.policy.is_opt_out_source(OPT_OUT_SOURCE) {
             return ConsentSignal::Neutral;
         }
-        if input.consent.gpc && input.policy.opt_out_revokes(permission) {
+        if signaled(input.consent) && input.policy.opt_out_revokes(permission) {
             return ConsentSignal::Revoke;
         }
         // Silence rather than refusal. Reading an absent signal as a refusal
@@ -69,8 +110,7 @@ impl PermissionSignalModule for GpcModule {
         ConsentSignal::Neutral
     }
 
-    /// The header's one value, when it was sent. There is nothing to
-    /// decode, so a sent header is always valid.
+    /// The header's one value, when it was sent.
     fn valid_signal(&self, call: ModuleCall<'_>) -> Option<ValidSignal> {
         call.inject(self, Self::read_signal).ok().flatten()
     }
@@ -78,6 +118,8 @@ impl PermissionSignalModule for GpcModule {
 
 #[cfg(test)]
 mod tests {
+    use http::HeaderMap;
+
     use super::*;
     use trusted_server_core::consent::ConsentContext;
     use trusted_server_core::evidence::OwnedRequestInfo;
@@ -91,10 +133,19 @@ mod tests {
     }
 
     fn with_header(set: bool) -> ConsentContext {
-        ConsentContext {
-            gpc: set,
-            ..ConsentContext::default()
+        if set {
+            ConsentContext::default().with_record(record())
+        } else {
+            ConsentContext::default()
         }
+    }
+
+    fn evidence(gpc: Option<&str>) -> OwnedRequestInfo {
+        let mut headers = HeaderMap::new();
+        if let Some(value) = gpc {
+            headers.insert("sec-gpc", value.parse().expect("should build the header"));
+        }
+        OwnedRequestInfo::new(String::new(), headers)
     }
 
     fn answer(
@@ -108,10 +159,28 @@ mod tests {
     }
 
     #[test]
+    fn reads_the_header_when_it_is_one() {
+        let module = GpcModule::new();
+        let record = module
+            .read_record(&evidence(Some("1")))
+            .expect("a sent header is read");
+        assert_eq!(record.value(), Some("1"));
+        assert_eq!(record.status(), SignalStatus::Decoded);
+        assert!(
+            module.read_record(&evidence(Some("0"))).is_none(),
+            "a header that is not 1 is not the setting"
+        );
+        assert!(
+            module.read_record(&evidence(None)).is_none(),
+            "no header is no record"
+        );
+    }
+
+    #[test]
     fn vouches_for_the_header_only_when_it_was_sent() {
         assert_eq!(
             GpcModule::new().read_signal(&with_header(true)),
-            Some(ValidSignal::new(short(), "gpc", "1")),
+            Some(ValidSignal::new(short(), SCHEME, "1")),
             "a sent header is the one value it can carry"
         );
         assert_eq!(
@@ -119,6 +188,7 @@ mod tests {
             None,
             "no header is no signal"
         );
+        assert!(signaled(&with_header(true)) && !signaled(&with_header(false)));
     }
 
     #[test]

@@ -788,8 +788,8 @@ impl EdgeCookieModule for HmacModule {
 
     fn required_permissions(&self) -> PermissionSet {
         // The HMAC module writes the Edge Cookie to the device, so it requires
-        // permission to store on the device (TCF Purpose 1). Whether that needs a
-        // signal is decided by the country rules, not by the module.
+        // permission to store on the device. Whether that needs a signal is
+        // decided by the country rules, not by the module.
         PermissionSet::none().with(Permission::StoreOnDevice)
     }
 }
@@ -868,8 +868,8 @@ impl EdgeCookieModule for HostSignalModule {
     }
 
     fn required_permissions(&self) -> PermissionSet {
-        // Writes the Edge Cookie to the device, so it requires necessary.operations.storage
-        // (TCF Purpose 1), the same gate as the HMAC module.
+        // Writes the Edge Cookie to the device, so it requires
+        // necessary.operations.storage, the same gate as the HMAC module.
         PermissionSet::none().with(Permission::StoreOnDevice)
     }
 }
@@ -962,7 +962,7 @@ impl EdgeCookieModule for ClientFixedModule {
 
     fn required_permissions(&self) -> PermissionSet {
         // The module writes the resolved value to the device as the Edge
-        // Cookie, so it requires necessary.operations.storage (TCF Purpose 1), the same gate
+        // Cookie, so it requires necessary.operations.storage, the same gate
         // as the HMAC module.
         PermissionSet::none().with(Permission::StoreOnDevice)
     }
