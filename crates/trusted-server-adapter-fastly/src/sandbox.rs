@@ -569,10 +569,15 @@ mod tests {
     fn test_settings() -> Settings {
         Settings::from_toml(
             r#"
+            [source]
+            module = "origin"
+
+            [source.origin]
+            url = "https://origin.test-publisher.example"
+
             [publisher]
             domain = "test-publisher.example"
             cookie_domain = ".test-publisher.example"
-            origin_url = "https://origin.test-publisher.example"
             proxy_secret = "unit-test-proxy-secret"
 
             [geo]

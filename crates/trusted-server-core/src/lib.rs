@@ -79,6 +79,7 @@ pub mod secret_resolution;
 pub mod service_version;
 pub mod settings;
 pub mod settings_data;
+pub mod source;
 pub mod source_cache;
 pub mod streaming_processor;
 pub mod streaming_replacer;

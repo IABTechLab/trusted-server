@@ -3122,10 +3122,15 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
     #[test]
     fn test_config_parsing() {
         let toml_str = r#"
+[source]
+module = "origin"
+
+[source.origin]
+url = "https://origin.test-publisher.com"
+
 [publisher]
 domain = "test-publisher.com"
 cookie_domain = ".test-publisher.com"
-origin_url = "https://origin.test-publisher.com"
 proxy_secret = "test-secret"
 
 [ec]
@@ -3157,10 +3162,15 @@ assume_single_jurisdiction = true
     #[test]
     fn a_block_for_an_unnamed_integration_is_refused() {
         let toml_str = r#"
+[source]
+module = "origin"
+
+[source.origin]
+url = "https://origin.test-publisher.com"
+
 [publisher]
 domain = "test-publisher.com"
 cookie_domain = ".test-publisher.com"
-origin_url = "https://origin.test-publisher.com"
 proxy_secret = "test-secret"
 
 [ec]

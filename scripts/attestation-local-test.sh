@@ -155,7 +155,7 @@ TOMLEOF
   cd "$WORK"
   TRUSTED_SERVER__PUBLISHER__DOMAIN="$PUBLISHER" \
     TRUSTED_SERVER__PUBLISHER__COOKIE_DOMAIN=".$PUBLISHER" \
-    TRUSTED_SERVER__PUBLISHER__ORIGIN_URL="http://127.0.0.1:$ORIGIN_PORT" \
+    TRUSTED_SERVER__SOURCE__ORIGIN__URL="http://127.0.0.1:$ORIGIN_PORT" \
     "$TS" config push --adapter fastly --local \
     --manifest "$WORK/edgezero.toml" --app-config "$WORK/app.toml" \
     --no-diff --yes >/dev/null
