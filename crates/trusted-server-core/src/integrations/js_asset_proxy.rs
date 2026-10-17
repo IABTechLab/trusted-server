@@ -672,6 +672,7 @@ mod tests {
     ) -> String {
         let chain = MiddlewareChain::new(
             MiddlewarePhase::Fetch,
+            crate::middleware::HTML_MEDIA_TYPE,
             vec![Arc::new(ScriptAddress(integration))],
         );
         let config = HtmlProcessorConfig {

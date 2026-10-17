@@ -401,10 +401,14 @@ mod tests {
     /// The head markup `middleware` write in `phase`, in the order written.
     fn head_markup(phase: MiddlewarePhase, middleware: Vec<Arc<dyn Middleware>>) -> Vec<String> {
         let document_state = IntegrationDocumentState::default();
-        MiddlewareChain::new(phase, middleware)
-            .plan(&context(phase, &document_state))
-            .expect("the chain should plan")
-            .head_inserts
+        MiddlewareChain::new(
+            phase,
+            trusted_server_core::middleware::HTML_MEDIA_TYPE,
+            middleware,
+        )
+        .plan(&context(phase, &document_state))
+        .expect("the chain should plan")
+        .head_inserts
     }
 
     /// The one piece of head markup the prompt writes in `phase`.
