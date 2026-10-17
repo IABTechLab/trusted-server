@@ -1773,6 +1773,17 @@ the service starts, with the names that could be written.
 | `[cache.robots-txt]` | `store_seconds`      | `604800`, a week        | 1 to 31536000 | The longest a module's answer is used. The module's own refresh ends it sooner. |
 | `[cache.robots-txt]` | `store_idle_seconds` | `2592000`, 30 days      | 1 to 31536000 | How long an answer in the shared store lasts unused.                            |
 
+A module may declare caches of its own, named by the module, and a deployment
+selects a loading cache for each in its own `[cache.<name>]` table with the
+same four settings. A module from `crates/geo/example` whose service answers
+once for each request's evidence declares `example-answers`, the cache that
+holds those answers, so `[cache.example-answers] module = "51degrees"` asks
+the service once however many requests carry the same evidence. A name is
+the module's own: `robots-txt` and a name two modules declare are refused. A
+`[cache.<name>]` table naming a cache no linked module declares is refused by
+`ts config validate` and when the deployment starts, and the message lists
+the names this build's modules declare.
+
 ```toml
 [cache.robots-txt]
 module = "51degrees"
