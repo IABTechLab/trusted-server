@@ -1266,45 +1266,6 @@ mod tests {
         );
     }
 
-    thread_local! {
-        /// The lines logged on this thread while a test is capturing them.
-        static CAPTURED_LOG: std::cell::RefCell<Option<Vec<(log::Level, String)>>> =
-            const { std::cell::RefCell::new(None) };
-    }
-
-    /// A logger that keeps the lines logged on a thread that asked for them,
-    /// so a test reads its own lines and none of another test's.
-    struct ThreadLog;
-
-    impl log::Log for ThreadLog {
-        fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
-            true
-        }
-
-        fn log(&self, record: &log::Record<'_>) {
-            CAPTURED_LOG.with(|captured| {
-                if let Some(lines) = captured.borrow_mut().as_mut() {
-                    lines.push((record.level(), record.args().to_string()));
-                }
-            });
-        }
-
-        fn flush(&self) {}
-    }
-
-    /// The lines at warning level or above that `run` logs on this thread.
-    fn warnings_logged_by(run: impl FnOnce()) -> Vec<(log::Level, String)> {
-        static LOGGER: ThreadLog = ThreadLog;
-        static INSTALL: std::sync::Once = std::sync::Once::new();
-        INSTALL.call_once(|| {
-            log::set_logger(&LOGGER).expect("no other test should install a logger");
-            log::set_max_level(log::LevelFilter::Warn);
-        });
-        CAPTURED_LOG.with(|captured| *captured.borrow_mut() = Some(Vec::new()));
-        run();
-        CAPTURED_LOG.with(|captured| captured.borrow_mut().take().unwrap_or_default())
-    }
-
     /// Settings whose `[analytics]` selects the module the example documents.
     fn settings_selecting_analytics() -> Settings {
         Settings::from_toml(&format!(
@@ -1329,36 +1290,39 @@ mod tests {
         }
     }
 
-    #[test]
-    fn an_adapter_that_sends_nothing_warns_once_when_analytics_selects_a_module() {
+    #[tokio::test]
+    async fn an_adapter_that_sends_nothing_warns_once_when_analytics_selects_a_module() {
         let settings = settings_selecting_analytics();
         let logged = AtomicBool::new(false);
 
-        let lines = warnings_logged_by(|| {
+        let ((), lines) = crate::test_support::logs::logged_by(async {
             warn_once_when_analytics_is_unsent(&settings, None, "Example", &logged);
             warn_once_when_analytics_is_unsent(&settings, None, "Example", &logged);
-        });
+        })
+        .await;
 
         assert_eq!(lines.len(), 1, "should log one line, got {lines:?}");
-        assert_eq!(lines[0].0, log::Level::Warn, "should log a warning");
         assert!(
+            lines[0].starts_with("WARN "),
+            "should log a warning, got {:?}",
             lines[0]
-                .1
-                .contains("the Example adapter sends no auction telemetry"),
+        );
+        assert!(
+            lines[0].contains("the Example adapter sends no auction telemetry"),
             "should name the adapter, got {:?}",
-            lines[0].1
+            lines[0]
         );
     }
 
-    #[test]
-    fn no_warning_when_analytics_selects_nothing_or_a_supplied_sink_sends() {
+    #[tokio::test]
+    async fn no_warning_when_analytics_selects_nothing_or_a_supplied_sink_sends() {
         let selecting_nothing = crate::test_support::tests::create_test_settings();
         let selecting = settings_selecting_analytics();
         let sending = crate::platform::test_support::noop_services_with_telemetry_sink(
             std::sync::Arc::new(SendingSink),
         );
 
-        let lines = warnings_logged_by(|| {
+        let ((), lines) = crate::test_support::logs::logged_by(async {
             warn_once_when_analytics_is_unsent(
                 &selecting_nothing,
                 None,
@@ -1371,7 +1335,8 @@ mod tests {
                 "Example",
                 &AtomicBool::new(false),
             );
-        });
+        })
+        .await;
 
         assert!(lines.is_empty(), "should log nothing, got {lines:?}");
     }
