@@ -1,6 +1,7 @@
 //! The sellers a deployment adds to the publisher's `ads.txt`.
 //!
-//! The publisher's own file at the origin stays authoritative.
+//! The publisher's own file at the origin stays authoritative. Where the
+//! origin has none, the file is made of the lines alone.
 
 use std::sync::Arc;
 
@@ -27,6 +28,10 @@ pub const MODULE: &str = "ads-txt.sellers";
 /// The media type an `ads.txt` is served as, and the one the middleware
 /// works on.
 pub const MEDIA_TYPE: &str = "text/plain";
+
+/// The path of the file, which the entry placing the middleware names, so
+/// that the file is also made where the origin has none.
+const PATH: &str = "/ads.txt";
 
 /// The variables the specification names, each written as `NAME=value`.
 const VARIABLES: [&str; 5] = [
@@ -138,21 +143,25 @@ fn validate_lines(config: &SellersConfig) -> Result<(), Report<TrustedServerErro
     Ok(())
 }
 
-/// Refuses a document that selects the module but names it in no entry, where
-/// the lines would never be written.
+/// Refuses a document that selects the module but names it in no entry for
+/// the file's path, where the lines would never be written into the file or
+/// make it where the origin has none.
 fn require_an_entry(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
     let placed = settings.fetch.entries().iter().any(|entry| {
-        entry.media_type == MEDIA_TYPE && entry.middleware.iter().any(|name| name == MODULE)
+        entry.media_type == MEDIA_TYPE
+            && entry.path.as_deref() == Some(PATH)
+            && entry.middleware.iter().any(|name| name == MODULE)
     });
     if placed {
         return Ok(());
     }
     Err(Report::new(TrustedServerError::Settings {
         message: format!(
-            "[ads-txt] selects `sellers`, but no [[fetch]] entry for `{MEDIA_TYPE}` names \
-             `{MODULE}`, so the lines would never be written. Add an entry with media_type = \
-             `{MEDIA_TYPE}`, path = `/ads.txt` and the middleware. The path is a prefix, so \
-             the entry covers every path that starts with `/ads.txt`"
+            "[ads-txt] selects `sellers`, but no [[fetch]] entry for `{MEDIA_TYPE}` with path \
+             = `{PATH}` names `{MODULE}`, so the lines would never be written into the file or \
+             make it where the origin has none. Add an entry with media_type = \
+             `{MEDIA_TYPE}`, path = `{PATH}` and the middleware. The path is a prefix, so the \
+             entry also covers every path that starts with `{PATH}`"
         ),
     }))
 }
@@ -392,11 +401,37 @@ mod tests {
 
         let refused = validate(&settings).expect_err("should refuse a module no entry places");
         assert!(
-            format!("{refused:?}")
-                .contains("no [[fetch]] entry for `text/plain` names `ads-txt.sellers`"),
+            format!("{refused:?}").contains(
+                "no [[fetch]] entry for `text/plain` with path = `/ads.txt` names \
+                 `ads-txt.sellers`"
+            ),
             "{refused:?}"
         );
         assert!(register(&settings).is_err());
+    }
+
+    #[test]
+    fn a_document_placing_the_module_off_the_file_s_path_is_refused() {
+        for path in [None, Some("/robots.txt"), Some("/ads"), Some("/")] {
+            let path_line = path.map_or_else(String::new, |path| format!("path = \"{path}\"\n"));
+            let settings = page_settings(&format!(
+                "[ads-txt]\nmodules = [\"sellers\"]\n\n[ads-txt.sellers]\nlines = \
+                 [\"{RECORD}\"]\n\n[[fetch]]\nmedia_type = \"text/plain\"\n{path_line}\
+                 middleware = [\"ads-txt.sellers\"]\n"
+            ));
+
+            let Err(refused) = validate(&settings) else {
+                panic!("should refuse the module placed at {path:?}, where no file is made");
+            };
+            assert!(
+                format!("{refused:?}").contains("with path = `/ads.txt` names `ads-txt.sellers`"),
+                "should ask for the entry on `/ads.txt`: {refused:?}"
+            );
+            assert!(
+                register(&settings).is_err(),
+                "should not register the module placed at {path:?}"
+            );
+        }
     }
 
     #[test]
