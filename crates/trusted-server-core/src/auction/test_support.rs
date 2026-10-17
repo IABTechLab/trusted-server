@@ -13,8 +13,8 @@ use crate::auction::types::{
     AdFormat, AdSlot, AuctionRequest, DeviceInfo, MediaType, PublisherInfo, UserInfo,
 };
 use crate::consent::{ConsentContext, SignalRecord, SignalStatus};
+use crate::ec::eids::{Eid, Uid};
 use crate::geo::GeoInfo;
-use crate::openrtb::{Eid, Uid};
 use crate::platform::{RuntimeServices, test_support::noop_services};
 use crate::settings::Settings;
 
@@ -216,17 +216,17 @@ pub fn deterministic_signer() -> crate::request_signing::RequestSigner {
         .expect("should load deterministic signer")
 }
 
-/// Builds the request the driver would send to the first demand source of
-/// `plan` once `request` is routed to it, or `None` when the source keeps no
-/// impression.
+/// Builds the request the first demand source of `plan` would send once
+/// `request` is routed to it, or `None` when the source has nothing to ask
+/// for.
 ///
-/// A test in an implementation's own crate checks what its field policy and
-/// its extensions do to a request through this. The signature, when `signer`
-/// is given, is made over [`golden_signing_params`].
+/// A test in an implementation's own crate checks what its source builds
+/// through this. The signature, when `signer` is given, is made over
+/// [`golden_signing_params`].
 ///
 /// # Errors
 ///
-/// Returns the error the request builder returns.
+/// Returns the error the source's request building returns.
 pub fn build_for_first_source(
     plan: &crate::auction::AuctionPlan,
     request: AuctionRequest,
@@ -234,26 +234,63 @@ pub fn build_for_first_source(
     transport_timeout_ms: u32,
     signer: Option<&crate::request_signing::RequestSigner>,
 ) -> Result<
-    Option<crate::openrtb::OpenRtbRequest>,
+    Option<crate::auction::demand::OutboundRequest>,
     error_stack::Report<crate::error::TrustedServerError>,
 > {
-    use crate::auction::openrtb::{OpenRtbBuildOutcome, RequestFinalization, build_request};
-
     let routed = crate::auction::routing::route_auction(request, inbound, plan, None);
-    let outcome = build_request(
+    plan.providers()[0].demand.build_request(
         &routed.inputs()[0],
-        &routed,
-        &plan.providers()[0],
+        routed.transport(),
         transport_timeout_ms,
-        &RequestFinalization {
+        &crate::auction::demand::RequestFinalization {
             signer,
             signing_params: golden_signing_params(),
         },
-    )?;
-    Ok(match outcome {
-        OpenRtbBuildOutcome::Ready(request) => Some(request),
-        OpenRtbBuildOutcome::NoImpressions => None,
-    })
+    )
+}
+
+/// Routes `request` through `plan` as core does for an auction, with the
+/// client address the platform attested, if any.
+///
+/// A test in a protocol's own crate builds a request from the routed input
+/// and transport this returns.
+#[must_use]
+pub fn route_for_test(
+    plan: &crate::auction::AuctionPlan,
+    request: AuctionRequest,
+    inbound: &Request<EdgeBody>,
+    attested_client_ip: Option<std::net::IpAddr>,
+) -> crate::auction::demand::RoutedAuction {
+    crate::auction::routing::route_auction(request, inbound, plan, attested_client_ip)
+}
+
+/// Routes `request` through `plan` with the server-owned routes a page's
+/// slot templates would give, one list of provider names per slot in the
+/// request's order.
+///
+/// # Panics
+///
+/// Panics when a route names a provider id that does not parse.
+#[must_use]
+pub fn route_with_trusted_routes_for_test(
+    plan: &crate::auction::AuctionPlan,
+    request: AuctionRequest,
+    inbound: &Request<EdgeBody>,
+    routes_by_slot: &[&[&str]],
+) -> crate::auction::demand::RoutedAuction {
+    let routes = crate::auction::routing::TrustedProviderRoutes::new(
+        routes_by_slot
+            .iter()
+            .map(|slot| {
+                slot.iter()
+                    .map(|provider| provider.parse().expect("should parse provider ID"))
+                    .collect()
+            })
+            .collect(),
+    );
+    crate::auction::routing::route_auction_with_trusted_routes(
+        request, inbound, plan, None, &routes,
+    )
 }
 
 /// Routes `request` through `plan` and returns the input its first demand
@@ -315,8 +352,7 @@ pub async fn parse_as_first_source(
 > {
     let inbound = Request::new(EdgeBody::empty());
     let routed = crate::auction::routing::route_auction(request, &inbound, plan, None);
-    let provider =
-        crate::auction::provider::GenericOpenRtbProvider::new(plan.providers()[0].clone());
+    let provider = crate::auction::provider::RoutedDemandProvider::new(plan.providers()[0].clone());
     let state = provider.parse_state_for_test(routed.inputs()[0].clone());
     provider
         .parse_response_with_state(response, response_time_ms, Some(state.as_ref()))
@@ -525,16 +561,241 @@ pub(crate) mod adserver_fixture {
     }
 }
 
-/// A stand-in demand implementation for core's own tests of what the driver
-/// does for an implementation that departs from the plain one. It serves
-/// stored requests, forbids all-eligible routing, takes bidder parameters,
-/// keeps the unsigned request identity and completes an endpoint that names
-/// a host alone.
+/// The plain JSON the two stand-in demand implementations speak, so core's
+/// own tests see what a source is given and what core does with its answer
+/// without naming any protocol.
 ///
-/// It writes each impression's usable bidder parameters under
-/// `ext.fixture.bidder`, or the slot id under `ext.fixture.stored` where the
-/// slot allows a stored request, and leaves out an impression that has
-/// neither.
+/// The request carries the auction id, the publisher's domain, the budget,
+/// the identifiers, one entry per slot with its id, its banner formats, its
+/// floor and the stand-in's slot data, the stand-in's request data, and the
+/// signature when the request is signed. The response is read as
+/// `{"bids": [...]}`, each bid naming its `slot`, `seat`, `id`, `price`,
+/// `creative`, `w`, `h`, `nurl` and `burl`, and admitted by core's rules.
+#[cfg(test)]
+pub(crate) mod fixture_wire {
+    use std::collections::{HashMap, HashSet};
+
+    use error_stack::{Report, ResultExt as _};
+    use http::{HeaderMap, HeaderValue, StatusCode, header};
+    use serde_json::{Map, Value, json};
+
+    use crate::auction::admission::{
+        BidRejectionReason, ResponseAdmissionDiagnostics, build_bid_dimension_index,
+        parse_optional_bid_dimension, resolve_bid_dimensions,
+    };
+    use crate::auction::demand::{
+        DemandResponse, DemandTransport, OutboundRequest, ProviderAuctionInput, ProviderSlotInput,
+        RequestFinalization,
+    };
+    use crate::auction::types::{AuctionResponse, Bid};
+    use crate::error::TrustedServerError;
+    use crate::platform::PlatformResponse;
+
+    const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+
+    /// Builds the stand-in request, with `slot_data` deciding what each slot
+    /// carries and whether it is sent at all, and `request_data` the
+    /// stand-in's own request object.
+    pub(crate) fn build(
+        input: &ProviderAuctionInput,
+        transport: DemandTransport<'_>,
+        timeout_ms: u32,
+        finalization: &RequestFinalization<'_>,
+        request_data: Option<Value>,
+        slot_data: impl Fn(&ProviderSlotInput) -> Option<Value>,
+    ) -> Result<Option<OutboundRequest>, Report<TrustedServerError>> {
+        let common = input.common_request();
+        let mut slot_ids = HashSet::new();
+        let mut slots = Vec::new();
+        for slot in input.slots() {
+            let Some(data) = slot_data(slot) else {
+                continue;
+            };
+            let mut entry = Map::from_iter([
+                ("id".to_string(), json!(slot.slot().id)),
+                (
+                    "formats".to_string(),
+                    json!(
+                        slot.slot()
+                            .formats
+                            .iter()
+                            .map(|format| [format.width, format.height])
+                            .collect::<Vec<_>>()
+                    ),
+                ),
+                ("ext".to_string(), data),
+            ]);
+            if let Some(floor) = slot.slot().floor_price {
+                entry.insert("floor".to_string(), json!(floor));
+            }
+            slot_ids.insert(slot.slot().id.clone());
+            slots.push(Value::Object(entry));
+        }
+        if slots.is_empty() {
+            return Ok(None);
+        }
+        let mut request = Map::from_iter([
+            ("auction".to_string(), json!(common.id)),
+            ("publisher".to_string(), json!(common.publisher.domain)),
+            ("timeout_ms".to_string(), json!(timeout_ms)),
+            ("slots".to_string(), Value::Array(slots)),
+        ]);
+        if let Some(dnt) = transport.dnt {
+            request.insert("dnt".to_string(), json!(dnt));
+        }
+        if common.user.id.is_some() || common.user.eids.is_some() {
+            request.insert(
+                "user".to_string(),
+                json!({"id": common.user.id, "eids": common.user.eids}),
+            );
+        }
+        if let Some(data) = request_data {
+            request.insert("ext".to_string(), data);
+        }
+        if let Some(signer) = finalization.signer {
+            let signature = signer.sign_request(&finalization.signing_params)?;
+            request.insert(
+                "signature".to_string(),
+                json!({
+                    "kid": signer.kid,
+                    "signature": signature,
+                    "ts": finalization.signing_params.timestamp,
+                    "host": finalization.signing_params.request_host,
+                    "scheme": finalization.signing_params.request_scheme,
+                }),
+            );
+        }
+        let body = serde_json::to_vec(&request).change_context(TrustedServerError::Auction {
+            message: "stand-in request serialization failed".to_string(),
+        })?;
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        headers.insert(header::ACCEPT, HeaderValue::from_static("application/json"));
+        Ok(Some(OutboundRequest {
+            body,
+            headers,
+            slot_ids,
+            captured: None,
+        }))
+    }
+
+    /// Reads the stand-in response. A `204` is a no-bid, any other
+    /// non-success status or unreadable JSON is an error response, and a
+    /// body over the size limit is an `Err`.
+    pub(crate) async fn read(
+        context: DemandResponse<'_>,
+        response: PlatformResponse,
+    ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+        let provider_id = context.provider_id;
+        let response_time_ms = context.response_time_ms;
+        let response = response.response;
+        let status = response.status();
+        if status == StatusCode::NO_CONTENT {
+            return Ok(AuctionResponse::no_bid(provider_id, response_time_ms));
+        }
+        if !status.is_success() {
+            return Ok(AuctionResponse::error(provider_id, response_time_ms)
+                .with_metadata("error_type", json!("http_status"))
+                .with_metadata("http_status", json!(status.as_u16())));
+        }
+        let body = response
+            .into_body()
+            .into_bytes_bounded(MAX_RESPONSE_BYTES)
+            .await
+            .change_context(TrustedServerError::Auction {
+                message: format!("Provider {provider_id} response body failed"),
+            })?;
+        let value: Value = match serde_json::from_slice(&body) {
+            Ok(value) => value,
+            Err(_) => {
+                return Ok(AuctionResponse::error(provider_id, response_time_ms)
+                    .with_metadata("error_type", json!("parse_response")));
+            }
+        };
+        let Some(entries) = value.as_object() else {
+            return Ok(AuctionResponse::error(provider_id, response_time_ms)
+                .with_metadata("error_type", json!("parse_response")));
+        };
+        let dimensions_by_slot = build_bid_dimension_index(context.input);
+        let mut diagnostics = ResponseAdmissionDiagnostics::default();
+        let mut bids = Vec::new();
+        for entry in entries
+            .get("bids")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            match read_bid(entry, &dimensions_by_slot) {
+                Ok(bid) => bids.push(bid),
+                Err(reason) => diagnostics.record(reason),
+            }
+        }
+        let mut parsed = if bids.is_empty() {
+            AuctionResponse::no_bid(provider_id, response_time_ms)
+        } else {
+            AuctionResponse::success(provider_id, bids, response_time_ms)
+        };
+        diagnostics.attach_to(&mut parsed);
+        Ok(parsed)
+    }
+
+    fn read_bid(
+        entry: &Value,
+        dimensions_by_slot: &crate::auction::admission::BidDimensionIndex,
+    ) -> Result<Bid, BidRejectionReason> {
+        let text = |key: &str| {
+            entry
+                .get(key)
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        };
+        let slot_id = text("slot").ok_or(BidRejectionReason::InvalidBid)?;
+        let width = parse_optional_bid_dimension(entry, "w")?;
+        let height = parse_optional_bid_dimension(entry, "h")?;
+        let (width, height) = resolve_bid_dimensions(dimensions_by_slot, &slot_id, width, height)?;
+        let price = entry
+            .get("price")
+            .and_then(Value::as_f64)
+            .filter(|price| price.is_finite() && *price >= 0.0)
+            .ok_or(BidRejectionReason::InvalidBid)?;
+        let creative = text("creative").ok_or(BidRejectionReason::InvalidBid)?;
+        let seat = text("seat");
+        Ok(Bid {
+            slot_id,
+            price: Some(price),
+            currency: "USD".to_string(),
+            creative: Some(creative),
+            adomain: None,
+            bidder: seat.clone().unwrap_or_else(|| "unknown".to_string()),
+            returned_seat: seat,
+            width,
+            height,
+            nurl: text("nurl"),
+            burl: text("burl"),
+            bid_id: text("id"),
+            ad_id: None,
+            creative_id: None,
+            renderer: None,
+            cache_id: None,
+            cache_host: None,
+            cache_path: None,
+            metadata: HashMap::new(),
+        })
+    }
+}
+
+/// A stand-in demand implementation for core's own tests of what core does
+/// for a source that departs from the plain one. It serves stored requests,
+/// forbids all-eligible routing, takes bidder parameters and completes an
+/// endpoint that names a host alone.
+///
+/// It writes each slot's usable bidder parameters under `ext.fixture.bidder`,
+/// or the slot id under `ext.fixture.stored` where the slot allows a stored
+/// request, and leaves out a slot that has neither.
 #[cfg(test)]
 pub(crate) mod demand_fixture {
     use core::any::Any;
@@ -546,9 +807,10 @@ pub(crate) mod demand_fixture {
     use serde_json::{Map, Value, json};
     use url::Url;
 
+    use super::fixture_wire;
     use crate::auction::demand::{
-        CompiledDemand, DemandFieldPolicy, DemandImplementation, DemandResponse,
-        DemandTimeoutDefault, ProviderAuctionInput, RegsPolicy, RequestExtensions,
+        CompiledDemand, DemandImplementation, DemandResponse, DemandTimeoutDefault,
+        DemandTransport, OutboundRequest, ProviderAuctionInput, RequestFinalization,
     };
     use crate::auction::types::AuctionResponse;
     use crate::error::TrustedServerError;
@@ -598,53 +860,37 @@ pub(crate) mod demand_fixture {
 
     #[async_trait(?Send)]
     impl CompiledDemand for FixtureDemand {
-        fn field_policy(&self) -> DemandFieldPolicy {
-            DemandFieldPolicy {
-                imp_tagid: true,
-                site_ref: true,
-                precise_geo: true,
-                unsigned_request_identity: true,
-                consumes_bidder_params: true,
-                regs: RegsPolicy::Jurisdiction,
-                ..DemandFieldPolicy::default()
-            }
-        }
-
-        fn augment_request(
+        fn build_request(
             &self,
-            extensions: &mut RequestExtensions<'_>,
-            _input: &ProviderAuctionInput,
-        ) -> Result<(), Report<TrustedServerError>> {
-            for impression in &mut extensions.impressions {
-                let slot = impression.slot;
-                let bidder = slot
-                    .bidder_params()
-                    .iter()
-                    .filter(|(_, params)| {
-                        params.as_object().is_some_and(|params| !params.is_empty())
-                    })
-                    .map(|(bidder, params)| (bidder.as_str().to_string(), params.clone()))
-                    .collect::<Map<_, _>>();
-                let mut fixture = Map::new();
-                if !bidder.is_empty() {
-                    fixture.insert("bidder".to_string(), Value::Object(bidder));
-                } else if slot.allows_stored_fallback() {
-                    fixture.insert("stored".to_string(), json!(slot.slot().id));
-                }
-                if fixture.is_empty() {
-                    impression.omitted = true;
-                    continue;
-                }
-                *impression.ext = Some(Map::from_iter([(
-                    "fixture".to_string(),
-                    Value::Object(fixture),
-                )]));
-            }
-            *extensions.request = Some(Map::from_iter([(
-                "fixture".to_string(),
-                Value::Object(Map::new()),
-            )]));
-            Ok(())
+            input: &ProviderAuctionInput,
+            transport: DemandTransport<'_>,
+            timeout_ms: u32,
+            finalization: &RequestFinalization<'_>,
+        ) -> Result<Option<OutboundRequest>, Report<TrustedServerError>> {
+            fixture_wire::build(
+                input,
+                transport,
+                timeout_ms,
+                finalization,
+                Some(json!({"fixture": {}})),
+                |slot| {
+                    let bidder = slot
+                        .bidder_params()
+                        .iter()
+                        .filter(|(_, params)| {
+                            params.as_object().is_some_and(|params| !params.is_empty())
+                        })
+                        .map(|(bidder, params)| (bidder.as_str().to_string(), params.clone()))
+                        .collect::<Map<_, _>>();
+                    let mut fixture = Map::new();
+                    if !bidder.is_empty() {
+                        fixture.insert("bidder".to_string(), Value::Object(bidder));
+                    } else if slot.allows_stored_fallback() {
+                        fixture.insert("stored".to_string(), json!(slot.slot().id));
+                    }
+                    (!fixture.is_empty()).then(|| json!({"fixture": fixture}))
+                },
+            )
         }
 
         async fn parse_response(
@@ -652,7 +898,11 @@ pub(crate) mod demand_fixture {
             context: DemandResponse<'_>,
             response: PlatformResponse,
         ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-            crate::auction::openrtb::parse_openrtb_response(context, response).await
+            fixture_wire::read(context, response).await
+        }
+
+        fn consumes_bidder_params(&self) -> bool {
+            true
         }
 
         fn as_any(&self) -> &dyn Any {
@@ -662,14 +912,13 @@ pub(crate) mod demand_fixture {
 }
 
 /// A stand-in for the plainest demand implementation there can be, which
-/// core's own tests of the plan compiler and the request driver name where
-/// they need a source.
+/// core's own tests of the plan compiler and the provider name where they
+/// need a source.
 ///
 /// It takes every eligible slot, inherits the auction's timeout, leaves its
-/// endpoint as written and has its response read the ordinary way. Its table
-/// may set `request_ext` and `imp_ext`, which it writes into the request and
-/// into every impression as given, so the driver's tests have an
-/// implementation that adds extensions.
+/// endpoint as written and ignores bidder parameters. Its table may set
+/// `request_ext` and `slot_ext`, which it writes into the request and into
+/// every slot as given, so a test has a source that adds data of its own.
 #[cfg(test)]
 pub(crate) mod plain_fixture {
     use core::any::Any;
@@ -680,9 +929,10 @@ pub(crate) mod plain_fixture {
     use serde::Deserialize;
     use serde_json::{Map, Value};
 
+    use super::fixture_wire;
     use crate::auction::demand::{
-        CONSERVATIVE_LANGUAGE_MAX_BYTES, CompiledDemand, DemandFieldPolicy, DemandImplementation,
-        DemandResponse, DemandTimeoutDefault, ProviderAuctionInput, RegsPolicy, RequestExtensions,
+        CompiledDemand, DemandImplementation, DemandResponse, DemandTimeoutDefault,
+        DemandTransport, OutboundRequest, ProviderAuctionInput, RequestFinalization,
         accept_endpoint,
     };
     use crate::auction::types::AuctionResponse;
@@ -706,7 +956,7 @@ pub(crate) mod plain_fixture {
     #[derive(Debug, Clone, Default)]
     pub(crate) struct PlainDemand {
         request_ext: Map<String, Value>,
-        imp_ext: Map<String, Value>,
+        slot_ext: Map<String, Value>,
     }
 
     #[derive(Debug, Deserialize, Default)]
@@ -715,7 +965,7 @@ pub(crate) mod plain_fixture {
         #[serde(default)]
         request_ext: Map<String, Value>,
         #[serde(default)]
-        imp_ext: Map<String, Value>,
+        slot_ext: Map<String, Value>,
     }
 
     fn compile(
@@ -729,31 +979,27 @@ pub(crate) mod plain_fixture {
             })?;
         Ok(Arc::new(PlainDemand {
             request_ext: settings.request_ext,
-            imp_ext: settings.imp_ext,
+            slot_ext: settings.slot_ext,
         }))
     }
 
     #[async_trait(?Send)]
     impl CompiledDemand for PlainDemand {
-        fn field_policy(&self) -> DemandFieldPolicy {
-            DemandFieldPolicy {
-                language_max_bytes: Some(CONSERVATIVE_LANGUAGE_MAX_BYTES),
-                regs: RegsPolicy::Jurisdiction,
-                accept_json: true,
-                ..DemandFieldPolicy::default()
-            }
-        }
-
-        fn augment_request(
+        fn build_request(
             &self,
-            extensions: &mut RequestExtensions<'_>,
-            _input: &ProviderAuctionInput,
-        ) -> Result<(), Report<TrustedServerError>> {
-            *extensions.request = (!self.request_ext.is_empty()).then(|| self.request_ext.clone());
-            for impression in &mut extensions.impressions {
-                *impression.ext = (!self.imp_ext.is_empty()).then(|| self.imp_ext.clone());
-            }
-            Ok(())
+            input: &ProviderAuctionInput,
+            transport: DemandTransport<'_>,
+            timeout_ms: u32,
+            finalization: &RequestFinalization<'_>,
+        ) -> Result<Option<OutboundRequest>, Report<TrustedServerError>> {
+            fixture_wire::build(
+                input,
+                transport,
+                timeout_ms,
+                finalization,
+                (!self.request_ext.is_empty()).then(|| Value::Object(self.request_ext.clone())),
+                |_| Some(Value::Object(self.slot_ext.clone())),
+            )
         }
 
         async fn parse_response(
@@ -761,7 +1007,7 @@ pub(crate) mod plain_fixture {
             context: DemandResponse<'_>,
             response: PlatformResponse,
         ) -> Result<AuctionResponse, Report<TrustedServerError>> {
-            crate::auction::openrtb::parse_openrtb_response(context, response).await
+            fixture_wire::read(context, response).await
         }
 
         fn as_any(&self) -> &dyn Any {

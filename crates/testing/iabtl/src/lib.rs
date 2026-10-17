@@ -31,9 +31,12 @@ use http::header::{self, HeaderValue};
 use http::{Request, Response};
 use serde::Deserialize;
 use serde_json::json;
+use trusted_server_auction_protocol_openrtb::demand::{
+    DemandFieldPolicy, OpenRtbDemand, OpenRtbDriver, RequestExtensions,
+};
 use trusted_server_core::auction::demand::{
-    AdServerImplementation, CompiledDemand, DemandFieldPolicy, DemandImplementation,
-    DemandResponse, DemandTimeoutDefault, ProviderAuctionInput, RequestExtensions, accept_endpoint,
+    AdServerImplementation, CompiledDemand, DemandImplementation, DemandResponse,
+    DemandTimeoutDefault, ProviderAuctionInput, accept_endpoint,
 };
 use trusted_server_core::auction::provider::{AuctionProvider, ProviderRequestOutcome};
 use trusted_server_core::auction::types::{AuctionContext, AuctionRequest, AuctionResponse};
@@ -551,11 +554,11 @@ fn compile_demand(
             message: format!("the seam probe's demand source takes no setting, and `{key}` is set"),
         }));
     }
-    Ok(Arc::new(SeamProbeDemand))
+    Ok(Arc::new(OpenRtbDriver::new(SeamProbeDemand)))
 }
 
 #[async_trait(?Send)]
-impl CompiledDemand for SeamProbeDemand {
+impl OpenRtbDemand for SeamProbeDemand {
     fn field_policy(&self) -> DemandFieldPolicy {
         DemandFieldPolicy::default()
     }

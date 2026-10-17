@@ -11,7 +11,7 @@ const MAX_SOURCE_DOMAIN_LENGTH: usize = 255;
 /// Normalizes a partner source domain for use as the canonical EC partner key.
 ///
 /// The returned value is lowercase ASCII with any trailing dot removed. It is
-/// suitable for matching `OpenRTB` EID `source` values and for use as the EC KV
+/// suitable for matching the `source` of an identifier and for use as the EC KV
 /// `ids` map key.
 ///
 /// # Errors
