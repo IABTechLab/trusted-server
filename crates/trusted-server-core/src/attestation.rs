@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use validator::{Validate, ValidationError};
 
+use crate::http_util::addressed_host;
 use crate::inspect::config::{CONFIG_JSON_PATH, CONFIG_PAGE_PATH};
 use crate::inspect::data::DATA_PAGE_PATH;
 use crate::inspect::html_escape;
@@ -369,7 +370,7 @@ fn answer(
             "No signing key is built in for this time, so no evidence can be signed.",
         );
     };
-    let host = request_host(req);
+    let host = addressed_host(req);
     let evidence = AttestationEvidence {
         v: EVIDENCE_VERSION,
         operator: &config.operator,
@@ -433,7 +434,7 @@ fn answer(
 /// request's scheme and the host it was addressed to.
 ///
 /// The scheme follows a `Forwarded` or `X-Forwarded-Proto` header when one is
-/// sent. The host is read the way [`request_host`] reads the one the evidence
+/// sent. The host is read the way [`addressed_host`] reads the one the evidence
 /// signs, so the link and the signature name the same host, and a forwarded
 /// host header is never read.
 fn json_address(req: &Request<EdgeBody>) -> String {
@@ -516,21 +517,6 @@ fn nonce_from_query(query: Option<&str>) -> Result<Option<String>, &'static str>
     } else {
         Err("A nonce is 1 to 64 characters from A to Z, a to z, 0 to 9, _ and -.")
     }
-}
-
-/// The host the request was addressed to, lowercased with any port removed.
-fn request_host(req: &Request<EdgeBody>) -> String {
-    let raw = req
-        .headers()
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .or_else(|| req.uri().host())
-        .unwrap_or_default();
-    let without_port = match raw.rsplit_once(':') {
-        Some((host, port)) if port.bytes().all(|b| b.is_ascii_digit()) => host,
-        _ => raw,
-    };
-    without_port.to_ascii_lowercase()
 }
 
 /// Seconds since the epoch as RFC 3339 in UTC, to the second.
@@ -1904,13 +1890,13 @@ mod tests {
             .uri("https://Test-Publisher.com:8443/_ex/attestation.json")
             .body(EdgeBody::empty())
             .expect("request");
-        assert_eq!(request_host(&absolute), "test-publisher.com");
+        assert_eq!(addressed_host(&absolute), "test-publisher.com");
         let literal = Request::builder()
             .uri("/_ex/attestation.json")
             .header(header::HOST, "[::1]:8080")
             .body(EdgeBody::empty())
             .expect("request");
-        assert_eq!(request_host(&literal), "[::1]");
+        assert_eq!(addressed_host(&literal), "[::1]");
     }
 
     /// Changing a signed byte, here the host, stops the signature verifying,

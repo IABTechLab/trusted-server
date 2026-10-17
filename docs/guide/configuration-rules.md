@@ -10,7 +10,7 @@ request, and why the file is built this way.
 Everything Trusted Server can switch on is a module, selected the same way:
 the Edge Cookie identity, the location and device lookups, the permission
 signals, the demand sources in an auction, the ad server that picks the
-winner, and the page integrations.
+winner, the rules in `robots.txt`, and the page integrations.
 
 ```toml
 [<type>]
@@ -21,8 +21,9 @@ setting = "value"
 ```
 
 1. **The type is the job.** Each type is one top-level table, named for what
-   its modules do: `ec`, `geo`, `device`, `permission-signal`, `demand` and
-   `ad-server`, and the section of each module type, such as `cmp` or `tag`.
+   its modules do: `ec`, `geo`, `device`, `permission-signal`, `demand`,
+   `ad-server` and `robots-txt`, and the section of each module type, such as
+   `cmp` or `tag`.
 2. **The selector chooses what runs.** A type that runs one module takes
    `module`, a string. A type that runs several takes `modules`, a list.
 3. **`[<type>.<name>]` holds the settings.** A name with nothing to set
@@ -51,6 +52,7 @@ setting = "value"
 | `permission-signal` | several, in order | `modules`, a list  | `gpc`, `gpp`, `us-privacy`, `tcf`                                                                       |
 | `demand`            | several           | `modules`, a list  | `auction-protocol.openrtb`, `auction.prebid-server`, `auction.aps`                                      |
 | `ad-server`         | one               | `module`, a string | `mock`                                                                                                  |
+| `robots-txt`        | several, in order | `modules`, a list  | `refuse_all`, `allow_all`, or a module that supplies robots.txt rules                                   |
 | `cmp`               | one               | `module`, a string | `didomi`, `sourcepoint`, `osano`                                                                        |
 | `tag`               | several           | `modules`, a list  | `google-tag-manager`                                                                                    |
 | `ad-tag`            | several           | `modules`, a list  | `google`, `google.diagnostics`                                                                          |
