@@ -83,7 +83,6 @@ use serde_json::Value as JsonValue;
 use url::Url;
 use validator::Validate;
 
-use trusted_server_core::constants::ENV_FASTLY_IS_STAGING;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::integrations::{
     AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationDocumentState,
@@ -568,7 +567,7 @@ impl DataDomeIntegration {
     }
 
     fn active_protection_test_bypass(&self) -> Option<&ProtectionTestBypassConfig> {
-        if std::env::var(ENV_FASTLY_IS_STAGING).as_deref() != Ok("1") {
+        if !trusted_server_core::platform::platform_is_staging() {
             return None;
         }
 
@@ -1100,7 +1099,8 @@ fn build(
     let protection_test_bypass_active = integration.active_protection_test_bypass().is_some();
     if protection_test_bypass_configured && !protection_test_bypass_active {
         log::warn!(
-            "[datadome] DataDome test bypass is configured but inactive because FASTLY_IS_STAGING is not 1"
+            "[datadome] DataDome test bypass is configured but inactive because the platform \
+             does not run this service in its staging environment"
         );
     }
     log::info!(

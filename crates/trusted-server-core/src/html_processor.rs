@@ -1667,7 +1667,7 @@ mod tests {
         // Process - replace test-publisher.com with our edge domain
         let mut config = create_test_config();
         config.origin_host = "www.test-publisher.com".to_owned(); // Match what's in the HTML
-        config.request_host = "test-publisher-ts.edgecompute.app".to_owned();
+        config.request_host = "test-publisher-ts.edge.example".to_owned();
 
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -1687,7 +1687,7 @@ mod tests {
         // Check URL replacements (not all occurrences will be replaced since
         // we only rewrite attributes, not text/JSON/script bodies)
         let remaining_urls = result.matches("www.test-publisher.com").count();
-        let replaced_urls = result.matches("test-publisher-ts.edgecompute.app").count();
+        let replaced_urls = result.matches("test-publisher-ts.edge.example").count();
 
         println!("After processing:");
         println!("  Remaining original URLs: {remaining_urls}");
@@ -1750,7 +1750,7 @@ mod tests {
         // Process with compression
         let mut config = create_test_config();
         config.origin_host = "www.test-publisher.com".to_owned(); // Match what's in the HTML
-        config.request_host = "test-publisher-ts.edgecompute.app".to_owned();
+        config.request_host = "test-publisher-ts.edge.example".to_owned();
 
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {
@@ -1780,7 +1780,7 @@ mod tests {
 
         let remaining_urls = decompressed.matches("www.test-publisher.com").count();
         let replaced_urls = decompressed
-            .matches("test-publisher-ts.edgecompute.app")
+            .matches("test-publisher-ts.edge.example")
             .count();
 
         assert!(replaced_urls > 0, "Should replace some URLs in attributes");
@@ -1880,7 +1880,7 @@ mod tests {
         // Process it through our pipeline
         let mut config = create_test_config();
         config.origin_host = "www.test-publisher.com".to_owned(); // Match what's in the HTML
-        config.request_host = "test-publisher-ts.edgecompute.app".to_owned();
+        config.request_host = "test-publisher-ts.edge.example".to_owned();
 
         let processor = create_html_processor(config);
         let pipeline_config = PipelineConfig {

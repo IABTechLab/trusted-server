@@ -114,8 +114,9 @@ Choose a prefix the origin serves nothing beneath. An endpoint at
 `/_next/attestation` would answer 404 for every asset a Next.js site serves
 from `/_next`. The settings refuse an endpoint under a prefix a common
 framework serves its assets from, being `_app`, `_astro`, `_content`, `_expo`,
-`_framework`, `_next`, `_nuxt` and `_vercel`, and name the prefix. Any other
-prefix the origin serves is the operator's to avoid.
+`_framework`, `_next` and `_nuxt`, and name the prefix. Any other prefix the
+origin serves is the operator's to avoid, such as `_vercel`, beneath which a
+site hosted on Vercel serves files of the platform's own.
 
 Under the default `_ts` prefix, which other routes share, only GET and HEAD on
 the two attestation addresses are taken. Every other method on those addresses

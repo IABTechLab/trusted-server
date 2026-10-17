@@ -214,7 +214,8 @@ pub struct RuntimeServices {
     ///
     /// `None` when the adapter resolved nothing here, in which case the request
     /// path resolves the selection itself, which is what a deployment that
-    /// selects no module, the Axum adapter, and the core tests all do.
+    /// selects no module, an adapter that threads none, and the core tests all
+    /// do.
     pub(crate) resolved_ec_module: Option<Arc<dyn EdgeCookieModule>>,
     pub(crate) device_module: Option<Arc<dyn DeviceModule>>,
     /// The permission signal modules this deployment runs, in the order
@@ -455,8 +456,8 @@ impl RuntimeServices {
     /// Adapters that build their per-request services through a shared helper
     /// with no application state in hand use this to thread the module the
     /// composition root resolved. `None` leaves the request path to resolve
-    /// `[ec] module` for itself, which is what the Axum adapter and a
-    /// deployment selecting no module both do.
+    /// `[ec] module` for itself, which is what an adapter that threads no
+    /// module and a deployment selecting no module both do.
     #[must_use]
     pub fn with_resolved_ec_module(
         self,

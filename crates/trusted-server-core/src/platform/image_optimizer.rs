@@ -1,18 +1,19 @@
 //! Platform-neutral Image Optimizer request metadata.
 //!
 //! These DTOs describe the closed image transformation set that Trusted Server
-//! attaches to an outbound asset proxy request. They intentionally avoid Fastly
-//! SDK types so the profile-table logic can stay in core while the Fastly
-//! adapter remains responsible for translating metadata into
-//! `fastly::image_optimizer::ImageOptimizerOptions`.
+//! attaches to an outbound asset proxy request. They intentionally avoid any
+//! platform SDK's types so the profile-table logic can stay in core while an
+//! adapter whose platform optimizes images translates the metadata into that
+//! SDK's options.
 //!
 //! Unsupported adapters should reject requests carrying this metadata rather
 //! than silently dropping transformations.
 
 /// Platform-neutral Image Optimizer processing region.
 ///
-/// These variants mirror the regions currently exposed by the Fastly SDK while
-/// keeping config validation in core independent from adapter-specific types.
+/// These variants mirror the processing regions a platform's image optimizer
+/// offers, while keeping config validation in core independent from
+/// adapter-specific types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlatformImageOptimizerRegion {
     /// Apply image optimization in the eastern United States.
@@ -55,10 +56,10 @@ impl PlatformImageOptimizerRegion {
 
 /// Platform-neutral Image Optimizer options for an upstream request.
 ///
-/// Core code stores only a closed transformation set here. The Fastly adapter is
-/// responsible for translating these values to SDK-specific
-/// `ImageOptimizerOptions`, while adapters without Image Optimizer support
-/// should reject requests carrying this metadata.
+/// Core code stores only a closed transformation set here. An adapter whose
+/// platform optimizes images translates these values to its SDK's options,
+/// while adapters without Image Optimizer support should reject requests
+/// carrying this metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlatformImageOptimizerOptions {
     /// Image Optimizer processing region understood by the target adapter.
@@ -176,6 +177,6 @@ impl PlatformImageOptimizerCrop {
 /// Platform-neutral crop focus mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlatformImageOptimizerCropMode {
-    /// Use Fastly IO smart crop mode.
+    /// Use the image optimizer's smart crop mode.
     Smart,
 }
