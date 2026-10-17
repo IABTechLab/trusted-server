@@ -1786,8 +1786,11 @@ the service starts, with the names that could be written.
 Every response the publisher's origin sends that is not a page, and every
 answer of an asset route under `[[proxy.asset_routes]]`, is held the same way,
 selected by `[cache.assets]`, for the lifetime the origin's cache policy gives
-it and under what the origin says it varies on, so an asset is fetched once
-however many readers and instances ask for it at the same moment. A copy is
+it and under what the origin says it varies on, so readers who share a memory
+copy, or on Fastly a location, share one fetch of an asset. On Cloudflare and
+Spin, where a memory copy lasts one request and the key-value store makes no
+request wait, each request that misses at the same moment fetches it, and later
+requests read the stored copy. A copy is
 served with the headers that describe it and an `Age` that counts from the
 origin's. Nothing is kept that may not be shared: anything but a `GET`,
 anything but a `200`, HTML, a response carrying `Set-Cookie`, one whose policy
