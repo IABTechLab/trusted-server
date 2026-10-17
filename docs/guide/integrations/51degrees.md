@@ -104,11 +104,9 @@ service's answer for one reader's browser and what the fetch phase leaves is
 stored for every reader. The request filter asks the service only about a page
 navigation whose path an entry naming the middleware covers, by the same rule
 as the headers, so a deployment that names it in no entry sends no client
-hints headers and no tag and asks the service nothing. Only the Fastly adapter
-runs request filters, so on Axum, Cloudflare and Spin the middleware asks the
-service nothing and writes nothing. The headers are written on every response
-the publisher path sends for a path the entry covers, a redirect included, and
-the tag on each page.
+hints headers and no tag and asks the service nothing. The headers are written
+on every response the publisher path sends for a path the entry covers, a
+redirect included, and the tag on each page.
 
 A page the middleware leaves names for keeps to the origin path, because the
 names are left in the request's state, which is what core does for every
@@ -121,8 +119,10 @@ and set of those hints costs one round trip to the service before the page,
 and every reader whose browser sends the same values then reads the held
 answer. On Fastly the call fails after one second if it cannot connect, and
 once connected it waits `timeout_ms` for the first byte and again for each gap
-between bytes. A service that does not answer leaves the page with no headers
-and no tag, and a logged line says why.
+between bytes. On Axum, Cloudflare and Spin the adapter's HTTP client applies
+no `timeout_ms`, so a call waits up to 30 seconds on Axum and for the runtime's
+own limit on Cloudflare and Spin. A service that does not answer leaves the
+page with no headers and no tag, and a logged line says why.
 
 ## What is checked
 

@@ -209,7 +209,7 @@ high-entropy material under the referenced key in `trusted_server_secrets`, conf
 only while needed, protect the site with an outer access control such as Basic
 Auth, and remove the section when testing finishes.
 
-Whenever the enabled DataDome request filter runs on the Fastly adapter, the
+Whenever the enabled DataDome request filter runs, on any adapter, the
 fixed `x-ts-datadome-bypass` header is removed before configuration or
 credential checks. It therefore cannot reach DataDome or the publisher origin
 through that path when the bypass is absent, disabled, inactive, or invalid.

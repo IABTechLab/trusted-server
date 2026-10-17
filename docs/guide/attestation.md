@@ -161,10 +161,10 @@ The Fastly adapter fills the platform fields from the service's environment.
 The Axum, Cloudflare and Spin adapters report only their own name, with
 `unknown` as the service id, service version and location, and `staging` false.
 
-On Fastly the endpoint answers ahead of the Edge Cookie lifecycle and the
-request filters, because the endpoint is read only and a verifier fetching it
-from a server must not be turned away as a bot. The endpoint makes no outbound
-request and reads no store.
+On every adapter the endpoint answers ahead of the Edge Cookie lifecycle and
+the request filters, because the endpoint is read only and a verifier fetching
+it from a server must not be turned away as a bot. The endpoint makes no
+outbound request and reads no store.
 
 ## Configuration
 
