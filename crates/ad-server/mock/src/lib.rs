@@ -662,6 +662,7 @@ mod tests {
                 user_agent: Some("Mozilla/5.0".to_string()),
                 ip: Some("192.168.1.1".to_string()),
                 geo: None,
+                attributes: None,
             }),
             site: None,
             context: HashMap::new(),

@@ -405,6 +405,18 @@ fn build_common_request(
             }),
             dnt: routed.dnt(),
             language: language.clone(),
+            // Attributes the selected device module resolved, each absent
+            // when nothing resolved it.
+            devicetype: device.attributes.as_ref().and_then(|a| a.device_type),
+            make: device.attributes.as_ref().and_then(|a| a.make.clone()),
+            model: device.attributes.as_ref().and_then(|a| a.model.clone()),
+            os: device.attributes.as_ref().and_then(|a| a.os.clone()),
+            osv: device
+                .attributes
+                .as_ref()
+                .and_then(|a| a.os_version.clone()),
+            w: device.attributes.as_ref().and_then(|a| a.screen_width),
+            h: device.attributes.as_ref().and_then(|a| a.screen_height),
             ..Default::default()
         })
         .or_else(|| {
