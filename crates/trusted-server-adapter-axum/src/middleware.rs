@@ -5,7 +5,7 @@ use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::Response;
 use edgezero_core::middleware::{Middleware, Next};
-use trusted_server_core::ec::finalize::{ec_finalize_response, set_ec_cookie_on_response};
+use trusted_server_core::ec::finalize::ec_finalize_response;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::http_util::{
     ROUTE_NAMESPACE, sanitize_trusted_client_ip_headers, strip_deployment_headers,
@@ -101,10 +101,9 @@ impl Middleware for FinalizeResponseMiddleware {
 /// Finalizes the Edge Cookie on a response with no identity graph, because
 /// this adapter opens none.
 ///
-/// Core writes a created Edge Cookie only with its graph row, so with no graph
-/// the cookie is written here, for a request that passed the bot gate and whose
-/// permissions allow the Edge Cookie. A partner registry that cannot be built
-/// skips finalizing.
+/// Core writes a created Edge Cookie without a graph as it does with one, for
+/// a request that passed the bot gate and whose permissions allow it. A
+/// partner registry that cannot be built skips finalizing.
 async fn finalize_edge_cookie(
     settings: &Settings,
     ec_state: &mut EcFinalizeState,
@@ -127,12 +126,6 @@ async fn finalize_edge_cookie(
         &ec_state.services,
     )
     .await;
-    if ec_state.is_real_browser
-        && ec_state.ec_context.ec_generated()
-        && ec_state.ec_context.ec_allowed()
-    {
-        set_ec_cookie_on_response(settings, &ec_state.ec_context, response);
-    }
 }
 
 /// Applies the request filters' response effects to a finalized response,

@@ -290,8 +290,8 @@ static UNSENT_ANALYTICS_LOGGED: AtomicBool = AtomicBool::new(false);
 static IDENTITY_GRAPH_UNAVAILABLE_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Logs once, at warning level, that `[ec] ec_store` names an identity graph
-/// this adapter does not open, so an Edge Cookie is created with no graph row
-/// and the graph's syncs are skipped.
+/// this adapter does not open, so the Edge Cookie is still written but the
+/// data the graph would keep with it, such as partner IDs, is not.
 ///
 /// The identity graph needs strongly consistent reads and conditional writes,
 /// which the key-value store this adapter can open does not offer.
@@ -304,8 +304,8 @@ fn warn_once_when_the_identity_graph_is_unavailable(settings: &Settings) {
     }
     log::warn!(
         "[ec] ec_store names `{store}`, but the Spin adapter opens no identity \
-         graph, so an Edge Cookie is created with no graph row and the graph's syncs \
-         are skipped"
+         graph, so the Edge Cookie is still written but the data the graph would \
+         keep with it, such as partner IDs, is not"
     );
 }
 
@@ -764,8 +764,8 @@ async fn build_ec_context(
 /// The request's Edge Cookie state, read before its route runs.
 struct EcRequestState {
     ec_context: EcContext,
-    /// Whether the request passed the bot gate, which a created Edge Cookie
-    /// is written behind.
+    /// Whether the request passed the bot gate, which creating an Edge Cookie
+    /// on a page navigation sits behind.
     is_real_browser: bool,
 }
 
@@ -775,7 +775,6 @@ struct EcRequestState {
 #[derive(Clone)]
 pub(crate) struct EcFinalizeState {
     pub(crate) ec_context: EcContext,
-    pub(crate) is_real_browser: bool,
     /// The request's services, which finalizing hands to the selected Edge
     /// Cookie module.
     pub(crate) services: RuntimeServices,
@@ -816,7 +815,6 @@ fn attach_dispatch_extensions(
 ) -> Response {
     response.extensions_mut().insert(EcFinalizeState {
         ec_context: ec.ec_context,
-        is_real_browser: ec.is_real_browser,
         services: services.clone(),
     });
     attach_request_filter_effects(response, effects)
@@ -981,9 +979,8 @@ async fn run_named_route(
             handle_verify_signature(&state.settings, services, req)
         }
         NamedRouteHandler::EcResolve => {
-            // This adapter opens no identity graph, and the resolve route
-            // writes the graph row before the cookie, so it creates no cookie
-            // here.
+            // This adapter opens no identity graph, so a created Edge Cookie
+            // is set with no graph row.
             handle_ec_resolve(&state.settings, req, ec_context, None, services).await
         }
         NamedRouteHandler::Auction => {

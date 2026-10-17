@@ -519,14 +519,21 @@ fn page_view(path: &str, user_agent: &str, cookie: Option<&str>) -> Request {
 }
 
 /// The `Set-Cookie` line that writes the Edge Cookie, if the response has one.
+/// A response writes it at most once, because core alone writes it.
 fn edge_cookie(response: &Response) -> Option<String> {
-    response
+    let lines: Vec<String> = response
         .headers()
         .get_all("set-cookie")
         .iter()
         .filter_map(|value| value.to_str().ok())
-        .find(|line| line.starts_with("ts-ec="))
+        .filter(|line| line.starts_with("ts-ec="))
         .map(str::to_owned)
+        .collect();
+    assert!(
+        lines.len() <= 1,
+        "the Edge Cookie should be written at most once: {lines:?}"
+    );
+    lines.into_iter().next()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -626,7 +633,7 @@ async fn the_resolve_route_answers() {
     assert_eq!(
         own.status(),
         StatusCode::NO_CONTENT,
-        "with no identity graph the route should create nothing"
+        "a server-side module creates nothing from a posted value"
     );
     assert_eq!(edge_cookie(&own), None);
 
