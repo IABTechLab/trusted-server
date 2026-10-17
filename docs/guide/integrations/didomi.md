@@ -162,8 +162,8 @@ appended to API URLs. The incoming API path, query, supported method, headers, a
 body continue through the proxy.
 
 Every API request bypasses the platform outbound cache. Every API response is
-returned with `Cache-Control: private, no-store`; freshness validators and
-independent edge-cache headers are removed.
+returned with `Cache-Control: private, no-store`; freshness validators,
+`Surrogate-Control` and `CDN-Cache-Control` are removed.
 
 ## Forwarded data
 
