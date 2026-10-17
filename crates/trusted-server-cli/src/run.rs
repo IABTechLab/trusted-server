@@ -250,6 +250,29 @@ mod tests {
     }
 
     #[test]
+    fn parses_config_migrate_with_its_file_and_one_mode() {
+        let args = parse(&["ts", "config", "migrate", "--check", "trusted-server.toml"]);
+        let Command::Config(ConfigCommand::Migrate(migrate)) = args.command else {
+            panic!("expected config migrate command");
+        };
+        assert_eq!(migrate.file, PathBuf::from("trusted-server.toml"));
+        assert!(migrate.check, "should check");
+        assert!(!migrate.write, "should not write");
+
+        Args::try_parse_from([
+            "ts",
+            "config",
+            "migrate",
+            "--write",
+            "--check",
+            "trusted-server.toml",
+        ])
+        .expect_err("should refuse writing and checking at once");
+        Args::try_parse_from(["ts", "config", "migrate"])
+            .expect_err("should need the file to migrate");
+    }
+
+    #[test]
     fn parses_keys_rotate_with_its_stores_and_kid() {
         let args = parse(&[
             "ts",
