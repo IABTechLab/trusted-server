@@ -11,6 +11,7 @@ use crate::commands::audit::{AuditArgs, run_audit};
 use crate::commands::config::ad_templates::{AdTemplatesCommand, run_ad_templates};
 use crate::commands::config::init::{ConfigInitArgs, run_config_init};
 use crate::commands::config::keyed_push;
+use crate::commands::config::migrate::{ConfigMigrateArgs, run_config_migrate};
 use crate::commands::pbs::{self, PbsArgs};
 use crate::prebid_bundle::{NpmPrebidBundleGenerator, PrebidBundleArgs, run_bundle};
 
@@ -71,6 +72,9 @@ enum ConfigCommand {
     Diff(ConfigDiffArgs),
     /// Reclaim orphaned chunk entries leaked from prior oversized pushes.
     Gc(ConfigGcArgs),
+    /// Rewrite a config written for an earlier release into the shape this
+    /// release reads.
+    Migrate(ConfigMigrateArgs),
     /// Push `trusted-server.toml` as a blob envelope through `EdgeZero`, or
     /// under a Fastly `--key` of its own.
     Push(ConfigPushArgs),
@@ -148,6 +152,7 @@ fn dispatch(args: Args) -> Result<RunOutcome, String> {
         Command::Config(ConfigCommand::Gc(args)) => {
             edgezero_cli::run_config_gc(&args).map(|()| RunOutcome::Success)
         }
+        Command::Config(ConfigCommand::Migrate(args)) => run_config_migrate(&args),
         Command::Config(ConfigCommand::Push(args)) => match keyed_push::own_key(&args) {
             Some(key) => {
                 let stdout = std::io::stdout();
