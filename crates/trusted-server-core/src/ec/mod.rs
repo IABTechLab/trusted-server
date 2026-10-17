@@ -55,6 +55,7 @@ pub mod pull_sync;
 pub(crate) mod pull_sync_marker;
 pub mod rate_limiter;
 pub mod registry;
+pub mod resolve;
 
 /// Characters of an identifier kept when redacting it for a log.
 const LOG_ID_PREFIX_CHARS: usize = 8;

@@ -64,6 +64,9 @@ uuid = { workspace = true, features = ["js"] }
 chrono = { workspace = true, features = ["wasmbind"] }
 
 [features]
+# Compiles in the `client_fixed` demonstration Edge Cookie module. Off by
+# default so production builds cannot select a fixed shared word as identity.
+client-fixed-demo = []
 default = []
 # Exposes test-only constructors (e.g. `IntegrationRegistry::from_request_filters`)
 # so downstream crates can build registries with stub integrations in their tests.
