@@ -29,10 +29,33 @@ pub fn parse_cookies_to_jar(s: &str) -> CookieJar {
     jar
 }
 
+/// Parses a cookie string into a [`CookieJar`] that keeps the first cookie
+/// of each name.
+///
+/// RFC 6265 section 5.4 says a browser SHOULD list the cookie with the
+/// longer `Path` first. In a browser that does, on a request under a
+/// publisher's path this keeps the publisher's cookie over one of the same
+/// name written under `/`. A browser that does not may list the root cookie
+/// first, and the root cookie is then the one kept.
+fn parse_cookies_to_jar_keeping_first(s: &str) -> CookieJar {
+    let mut jar = CookieJar::new();
+    for cookie in Cookie::split_parse(s.trim().to_owned()).filter_map(Result::ok) {
+        if jar.get(cookie.name()).is_none() {
+            jar.add_original(cookie);
+        }
+    }
+    jar
+}
+
 /// Extracts and parses cookies from an HTTP request.
 ///
 /// Attempts to parse the Cookie header into a [`CookieJar`] for easy access
-/// to individual cookies.
+/// to individual cookies. Where core writes its cookies under the prefix
+/// request addressing removed, the first cookie of each name is kept, which
+/// is the one under the publisher's path in a browser that lists longer
+/// paths first. Otherwise the last is kept, as [`parse_cookies_to_jar`]
+/// keeps it, which covers a request with no removed prefix and one whose
+/// removed prefix is empty, `/` or not a cookie path.
 ///
 /// # Errors
 ///
@@ -47,12 +70,44 @@ pub fn handle_request_cookies(
                 .change_context(TrustedServerError::InvalidHeaderValue {
                     message: "Cookie header contains invalid UTF-8".to_owned(),
                 })?;
-        let jar = parse_cookies_to_jar(header_value_str);
+        let under_removed_prefix = req
+            .extensions()
+            .get::<crate::addressing::RemovedPathPrefix>()
+            .and_then(|prefix| crate::addressing::cookie_path_for(prefix.as_str()))
+            .is_some();
+        let jar = if under_removed_prefix {
+            parse_cookies_to_jar_keeping_first(header_value_str)
+        } else {
+            parse_cookies_to_jar(header_value_str)
+        };
         Ok(Some(jar))
     } else {
         log::debug!("No cookie header found in request");
         Ok(None)
     }
+}
+
+/// Every value of the cookie `name` in the request's `Cookie` header, in the
+/// order the browser sent them, parsed as [`handle_request_cookies`] parses
+/// them.
+///
+/// A browser sends one pair for each cookie of a name it holds, such as one
+/// under `/` and one under a publisher's path, where a [`CookieJar`] keeps
+/// one. A missing or non-UTF-8 header gives none.
+#[must_use]
+pub(crate) fn cookie_values<B>(req: &Request<B>, name: &str) -> Vec<String> {
+    let Some(header_value) = req
+        .headers()
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Vec::new();
+    };
+    Cookie::split_parse(header_value.trim())
+        .filter_map(Result::ok)
+        .filter(|cookie| cookie.name() == name)
+        .map(|cookie| cookie.value().to_owned())
+        .collect()
 }
 
 /// Returns the named value from the request's selected `Cookie` header.
@@ -126,6 +181,62 @@ mod tests {
 
         assert!(jar.iter().count() == 1);
         assert_eq!(jar.get("c1").expect("should have cookie c1").value(), "v2");
+    }
+
+    /// A browser that lists the cookie with the longer path first sends the
+    /// publisher's own cookie first, so on an addressed request that cookie
+    /// is the one read.
+    #[test]
+    fn an_addressed_request_reads_the_first_cookie_of_a_name() {
+        let mut req = build_request(Some("ts-ec=publisher; ts-ec=root; other=1"));
+        req.extensions_mut()
+            .insert(crate::addressing::RemovedPathPrefix::new(
+                "/publisher-a.example".to_owned(),
+            ));
+        let jar = handle_request_cookies(&req)
+            .expect("should parse cookies")
+            .expect("should have cookie jar");
+
+        assert_eq!(jar.get("ts-ec").map(Cookie::value), Some("publisher"));
+        assert_eq!(jar.get("other").map(Cookie::value), Some("1"));
+    }
+
+    #[test]
+    fn a_request_with_no_removed_prefix_reads_the_last_cookie_of_a_name() {
+        let req = build_request(Some("ts-ec=publisher; ts-ec=root"));
+        let jar = handle_request_cookies(&req)
+            .expect("should parse cookies")
+            .expect("should have cookie jar");
+
+        assert_eq!(jar.get("ts-ec").map(Cookie::value), Some("root"));
+    }
+
+    /// An empty removed prefix, `/`, or a prefix that cannot be a cookie's
+    /// `Path` puts core's cookies under `/`, so the request reads them as a
+    /// request with no removed prefix does.
+    #[test]
+    fn a_removed_prefix_whose_cookies_go_under_the_root_reads_the_last_cookie_of_a_name() {
+        for prefix in ["", "/", "/a;b"] {
+            let mut req = build_request(Some("ts-ec=publisher; ts-ec=root"));
+            req.extensions_mut()
+                .insert(crate::addressing::RemovedPathPrefix::new(prefix.to_owned()));
+            let jar = handle_request_cookies(&req)
+                .expect("should parse cookies")
+                .expect("should have cookie jar");
+
+            assert_eq!(
+                jar.get("ts-ec").map(Cookie::value),
+                Some("root"),
+                "removed prefix `{prefix}`"
+            );
+        }
+    }
+
+    #[test]
+    fn cookie_values_gives_every_value_of_a_name_in_the_order_sent() {
+        let req = build_request(Some("ts-ec=publisher; other=1; ts-ec=root"));
+        assert_eq!(cookie_values(&req, "ts-ec"), ["publisher", "root"]);
+        assert!(cookie_values(&build_request(None), "ts-ec").is_empty());
     }
 
     #[test]
