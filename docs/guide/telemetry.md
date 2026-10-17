@@ -5,6 +5,15 @@ Emission is currently wired only by the Fastly adapter. Other adapters use the
 core no-op sink even if they can parse the shared settings, and log a warning
 at startup when `[analytics]` selects a module.
 
+## Adapter support
+
+| Adapter      | Auction telemetry            | Access telemetry |
+| ------------ | ---------------------------- | ---------------- |
+| `axum`       | not sent, warning at startup | refused          |
+| `cloudflare` | not sent, warning at startup | refused          |
+| `fastly`     | sent                         | refused          |
+| `spin`       | not sent, warning at startup | refused          |
+
 ## Data path
 
 The request entry point derives coarse `DeviceSignals`. Auction execution
