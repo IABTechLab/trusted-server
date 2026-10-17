@@ -57,7 +57,9 @@
 domain = "example.com"
 # Cookie scope for first-party identity cookies (leading dot = include subdomains).
 cookie_domain = ".example.com"
-# Upstream origin to proxy publisher content from. No trailing slash.
+# Upstream origin to proxy publisher content from. No trailing slash. A path is
+# kept and the request path is added after it, so a site held in a folder of
+# object storage is "https://storage.example.com/bucket/site".
 origin_url = "https://origin.example.com"
 # Secret Store key for the HMAC secret used to sign first-party proxy URLs.
 proxy_secret = "publisher_proxy_secret"
@@ -67,6 +69,20 @@ proxy_secret = "publisher_proxy_secret"
 # rewriting/injection) instead of streamed. Default 16 MiB; larger responses
 # return 502. Raise for deployments serving very large publisher pages.
 # max_buffered_body_bytes = 16777216  # 16 MiB
+# Optional: file name added to a request path ending in "/" on the way to the
+# origin, for an origin such as object storage that does not answer a folder
+# with its index file. The reader's address is unchanged.
+# directory_index = "index.html"
+# Optional: sign every origin request, for an origin such as private object
+# storage. The same table as [proxy.asset_routes.auth]. Only GET and HEAD are
+# signed, other methods are refused, and the reader's cookies, Authorization,
+# Referer, conditional validators and Range are not sent. origin_url must use
+# https. Keep this table last in [publisher].
+# [publisher.origin_auth]
+# type = "s3_sigv4"
+# region = "example-region-1"
+# access_key_id = "publisher_origin_access_key_id"
+# secret_access_key = "publisher_origin_secret_access_key"
 
 
 # -----------------------------------------------------------------------------
