@@ -53,30 +53,30 @@ fn routes_build_without_panic() {
     let _router = TrustedServerApp::routes();
 }
 
+/// `EdgeZero` opens the key-value store the adapter declares for every
+/// request and treats it as required, so the label it opens has to be one
+/// `spin.toml` grants the component, or every request fails.
 #[test]
-fn edgezero_manifest_loads_and_resolves_spin_stores() {
-    let loader = edgezero_core::manifest::ManifestLoader::load_from_str(include_str!(
-        "../../../edgezero.toml"
-    ));
-    let manifest = loader.manifest();
+fn the_declared_key_value_store_is_a_label_spin_grants() {
+    let declared = TrustedServerApp::stores()
+        .kv
+        .expect("the adapter should declare its key-value store");
+    let manifest = include_str!("../spin.toml");
 
+    // `EdgeZero` takes the label from an `EDGEZERO__STORES__KV__<ID>__NAME`
+    // variable in the component's environment and falls back to the id.
     assert!(
-        manifest.stores.config.is_some(),
-        "Spin EdgeZero manifest must enable config store injection"
+        !manifest.contains("EDGEZERO__STORES__KV__"),
+        "spin.toml should not rename the declared store"
     );
-    assert_eq!(
-        manifest
-            .stores
-            .kv
-            .as_ref()
-            .expect("should declare a KV store")
-            .default_id(),
-        "trusted_server_kv",
-        "Spin KV declaration must expose its default logical store id"
-    );
+    let granted = manifest
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("key_value_stores = "))
+        .expect("spin.toml should grant the component its key-value stores");
     assert!(
-        manifest.secret_store_enabled(edgezero_core::app::SPIN_ADAPTER),
-        "Spin EdgeZero manifest must enable secret handle injection"
+        granted.contains(&format!("\"{}\"", declared.default)),
+        "spin.toml should grant `{}`, which the declared store opens, and grants {granted}",
+        declared.default
     );
 }
 
@@ -1077,12 +1077,16 @@ mod robots_txt_from_a_module {
     use std::time::Duration;
 
     use bytes::Bytes;
+    use edgezero_core::app::Hooks as _;
+    use edgezero_core::context::RequestContext;
     use edgezero_core::http::Request;
     use edgezero_core::key_value_store::{KvError, KvHandle, KvPage, KvStore};
+    use edgezero_core::params::PathParams;
     use edgezero_core::router::RouterService;
     use edgezero_core::store_registry::KvRegistry;
     use error_stack::Report;
     use trusted_server_adapter_spin::app::TrustedServerApp;
+    use trusted_server_adapter_spin::platform::build_runtime_services;
     use trusted_server_core::error::TrustedServerError;
     use trusted_server_core::integrations::{IntegrationBuilder, IntegrationRegistration};
     use trusted_server_core::module_context::ModuleCall;
@@ -1235,18 +1239,56 @@ mod robots_txt_from_a_module {
         }
     }
 
+    /// The registry `run_app` puts on a request for the key-value store the
+    /// adapter declares, built the way `EdgeZero` builds it, with `store`
+    /// standing in for the Spin store.
+    fn declared_store_registry(store: &Arc<MemoryStore>) -> KvRegistry {
+        let declared = TrustedServerApp::stores()
+            .kv
+            .expect("the adapter should declare its key-value store");
+        let handle = KvHandle::new(Arc::clone(store) as Arc<dyn KvStore>);
+        let by_id = declared
+            .ids
+            .iter()
+            .map(|id| ((*id).to_owned(), handle.clone()))
+            .collect();
+        KvRegistry::from_parts(by_id, declared.default.to_owned())
+            .expect("the declared default should be a declared id")
+    }
+
     /// A crawler's `GET` for the file, carrying `store` as the key-value store
     /// the runtime hands the application, when there is one.
     fn robots_get(store: Option<&Arc<MemoryStore>>) -> Request {
         let mut request = robots_request("GET", "/robots.txt");
         if let Some(store) = store {
-            let handle = KvHandle::new(Arc::clone(store) as Arc<dyn KvStore>);
-            request.extensions_mut().insert(KvRegistry::single_id(
-                "trusted_server_kv".to_owned(),
-                handle,
-            ));
+            request
+                .extensions_mut()
+                .insert(declared_store_registry(store));
         }
         request
+    }
+
+    /// The store `run_app` opens for the declaration is the key-value store
+    /// a request's services are given, so what one request writes there the
+    /// next one reads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_declared_store_is_the_key_value_store_a_request_is_given() {
+        let store = Arc::new(MemoryStore::default());
+        let ctx = RequestContext::new(robots_get(Some(&store)), PathParams::default());
+
+        let services = build_runtime_services(&ctx, &Settings::default(), &Arc::default());
+        services
+            .kv_store()
+            .put_bytes("a-key", Bytes::from_static(b"a value"))
+            .await
+            .expect("should write through the request's key-value store");
+
+        let entries = store.entries.lock().expect("should lock the store");
+        assert_eq!(
+            entries.get("a-key").map(|value| &value[..]),
+            Some(&b"a value"[..]),
+            "the write should reach the declared store"
+        );
     }
 
     /// With the store the runtime hands the application, a module's answer
