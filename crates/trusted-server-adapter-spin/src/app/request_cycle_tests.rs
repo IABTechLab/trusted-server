@@ -1,8 +1,9 @@
 //! The request cycle this adapter runs for a routed request, checked through
 //! its router: the request filters run before the route and their response
 //! effects after the finalize headers, the route's module call carries the
-//! device classification, robots.txt is answered ahead of both, and the
-//! Edge Cookie is created and written for a real browser's page view.
+//! device classification, robots.txt is answered ahead of both, the Edge
+//! Cookie is created and written for a real browser's page view, and a
+//! request under an asset route is answered from the route's own source.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
@@ -654,5 +655,95 @@ fn startup_warns_that_this_adapter_opens_no_identity_graph() {
     assert!(
         super::IDENTITY_GRAPH_UNAVAILABLE_LOGGED.load(std::sync::atomic::Ordering::Relaxed),
         "startup should warn that the identity graph is unavailable"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Asset routes
+// ---------------------------------------------------------------------------
+
+/// Settings with an asset route under `/assets/` whose source signs its
+/// requests with the stock `s3_sigv4` signer.
+fn settings_with_a_signed_asset_route() -> Settings {
+    settings_with(
+        r#"
+            [proxy]
+
+            [[proxy.asset_routes]]
+            prefix = "/assets/"
+
+            [proxy.asset_routes.source]
+            module = "origin"
+
+            [proxy.asset_routes.source.origin]
+            url = "https://assets.example.com"
+
+            [proxy.asset_routes.source.origin.auth]
+            type = "s3_sigv4"
+            region = "us-east-1"
+        "#,
+    )
+}
+
+/// What the origin was asked, being each request's address and whether it
+/// carried an `s3_sigv4` signature.
+fn asked(origin: &StubHttpClient) -> Vec<(String, bool)> {
+    origin
+        .recorded_request_uris()
+        .into_iter()
+        .zip(origin.recorded_request_headers())
+        .map(|(uri, headers)| {
+            let signed = headers.iter().any(|(name, value)| {
+                name == "authorization" && value.starts_with("AWS4-HMAC-SHA256 ")
+            });
+            (uri, signed)
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_under_an_asset_route_reaches_the_route_s_origin_signed() {
+    let origin = Arc::new(StubHttpClient::new());
+    origin.push_response_with_headers(
+        200,
+        b"image bytes".to_vec(),
+        vec![("content-type", "image/png")],
+    );
+    let router = router_with(settings_with_a_signed_asset_route(), &[], &origin);
+
+    let response = route(&router, get("/assets/logo.png", None)).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(text(response), "image bytes");
+    assert_eq!(
+        asked(&origin),
+        [(
+            "https://assets.example.com/assets/logo.png".to_owned(),
+            true
+        )],
+        "the route's origin should be asked, signed by the route's signer"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_outside_the_asset_routes_reaches_the_publisher_s_origin() {
+    let origin = Arc::new(StubHttpClient::new());
+    origin.push_response_with_headers(
+        200,
+        b"body { color: black; }".to_vec(),
+        vec![("content-type", "text/css")],
+    );
+    let router = router_with(settings_with_a_signed_asset_route(), &[], &origin);
+
+    let response = route(&router, get("/styles/site.css", None)).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        asked(&origin),
+        [(
+            "https://origin.test-publisher.example.com/styles/site.css".to_owned(),
+            false
+        )],
+        "the publisher's origin should be asked, unsigned"
     );
 }

@@ -38,8 +38,8 @@ use trusted_server_core::integrations::{
 };
 use trusted_server_core::module_context::{ModuleContext, ModuleRequest};
 use trusted_server_core::proxy::{
-    handle_first_party_click, handle_first_party_proxy, handle_first_party_proxy_rebuild,
-    handle_first_party_proxy_sign,
+    AssetProxyCachePolicy, handle_asset_proxy_request, handle_first_party_click,
+    handle_first_party_proxy, handle_first_party_proxy_rebuild, handle_first_party_proxy_sign,
 };
 use trusted_server_core::publisher::{
     AppContext, AuctionDispatch, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH,
@@ -227,7 +227,7 @@ fn build_state_with_settings(
 }
 
 /// The header core writes a shared cache policy in on this adapter.
-const EDGE_CACHE_HEADER: EdgeCacheHeader = EdgeCacheHeader::SMaxageFallback;
+pub(crate) const EDGE_CACHE_HEADER: EdgeCacheHeader = EdgeCacheHeader::SMaxageFallback;
 
 /// Build the application state from explicit settings, composing the modules
 /// this adapter links with the externally supplied builders in
@@ -786,6 +786,15 @@ async fn dispatch_fallback(
                 }))
             })
     } else {
+        // A `GET` or `HEAD` under an asset route goes to the route's own
+        // source in place of the publisher's origin. Its response skips the
+        // Edge Cookie steps, so it carries no Edge Cookie state.
+        let matched_asset_route = matches!(method, Method::GET | Method::HEAD)
+            .then(|| state.settings.asset_route_index_for_path(&path))
+            .flatten();
+        if let Some(index) = matched_asset_route {
+            return dispatch_asset_fallback(state, services, req, index, effects).await;
+        }
         // A real browser's page navigation is given an Edge Cookie when it has
         // none. Another request may lack consent signals such as `Sec-GPC`.
         if ec.is_real_browser
@@ -843,6 +852,64 @@ async fn dispatch_fallback(
         services,
         effects,
     )
+}
+
+/// Whether an asset response carries a body.
+///
+/// `HEAD` responses and the bodiless statuses (204, 304) keep the origin's
+/// `Content-Length` and carry no body, so a body stream is dropped for them.
+fn asset_response_carries_body(method: &Method, status: StatusCode) -> bool {
+    *method != Method::HEAD
+        && status != StatusCode::NO_CONTENT
+        && status != StatusCode::NOT_MODIFIED
+}
+
+/// Answers a request under the asset route at `index` from the route's own
+/// source.
+///
+/// The route's source module locates the asset, its signer signs the request
+/// where the source's `auth` table names one, and core answers from a copy it
+/// holds before it asks the origin. The response carries its cache policy,
+/// which [`FinalizeResponseMiddleware`] applies after the finalize headers,
+/// and the request filters' effects, and no Edge Cookie state, because an
+/// asset response skips the Edge Cookie steps.
+async fn dispatch_asset_fallback(
+    state: &AppState,
+    services: &RuntimeServices,
+    req: Request,
+    index: usize,
+    effects: RequestFilterEffects,
+) -> Response {
+    let method = req.method().clone();
+    let asset_route = &state.settings.proxy.asset_routes[index];
+    let answer = match state.registry.route_source(&state.settings, index) {
+        Ok(source) => {
+            handle_asset_proxy_request(&state.settings, services, req, asset_route, source.as_ref())
+                .await
+        }
+        Err(report) => Err(report),
+    };
+    let response = match answer {
+        Ok(asset_response) => {
+            let cache_policy = asset_response.cache_policy();
+            let (mut response, stream_body) = asset_response.into_response_and_body();
+            if let Some(body) = stream_body
+                && asset_response_carries_body(&method, response.status())
+            {
+                *response.body_mut() = body;
+            }
+            response.extensions_mut().insert(cache_policy);
+            response
+        }
+        Err(report) => {
+            let mut response = http_error(&report);
+            response
+                .extensions_mut()
+                .insert(AssetProxyCachePolicy::NoStorePrivate);
+            response
+        }
+    };
+    attach_request_filter_effects(response, effects)
 }
 
 /// Whether the request is a crawler's `GET` or `HEAD` of the robots.txt that
