@@ -30,8 +30,7 @@ use super::{Contribution, RobotsTxtContributor};
 use crate::error::TrustedServerError;
 use crate::module_context::{ModuleContext, ResolvedRequest};
 use crate::platform::{
-    CacheLifetimes, CacheSpec, KvError, LoadError, LoadedValue, Loader, RuntimeServices,
-    ServerKeyPrefix, StoreKey,
+    CacheLifetimes, CacheSpec, KvError, LoadError, LoadedValue, Loader, RuntimeServices, StoreKey,
 };
 use crate::settings::Settings;
 
@@ -78,10 +77,10 @@ pub(crate) async fn contribution_for(
     services: &RuntimeServices,
     settings: &Settings,
 ) -> Result<Contribution, Report<TrustedServerError>> {
-    let prefix = ServerKeyPrefix::for_settings(settings);
+    let prefix = services.server_key_prefix();
     let held = held_key(id, request.view().host(), &contributor.fingerprint());
-    let key = StoreKey::new(&prefix, CACHE, held.clone());
-    let kept = StoreKey::new(&prefix, KEPT, held);
+    let key = StoreKey::new(prefix, CACHE, held.clone());
+    let kept = StoreKey::new(prefix, KEPT, held);
     let spec = cache_spec(settings);
     // The answer is served to every crawler, so the contributor's services
     // carry nothing of the connection that asked.
@@ -296,6 +295,7 @@ pub(crate) mod tests {
     use crate::evidence::RequestInfo;
     use crate::module_context::{ModuleCall, ModuleRequest};
     use crate::platform::test_support::{MemoryLoadingCache, StubHttpClient};
+    use crate::prefix::test_support::{assert_keys_follow_the_publisher, trusted_server_for};
 
     /// A contributor whose answers a test decides, counting how often it is
     /// asked.
@@ -600,7 +600,8 @@ pub(crate) mod tests {
     }
 
     /// Services keeping answers in `cache` and kept answers in `store`, as one
-    /// instance of a host with no value cache.
+    /// instance of a host with no value cache, for the publisher [`settings`]
+    /// describes.
     pub(crate) fn services_with(
         cache: Arc<MemoryLoadingCache>,
         store: Arc<MemoryKvStore>,
@@ -610,6 +611,7 @@ pub(crate) mod tests {
         ))
         .with_kv_store(store)
         .with_loading_cache(cache)
+        .with_prefixes(trusted_server_for("www.publisher.example"))
     }
 
     /// The publisher the tests hold answers for.
@@ -666,8 +668,6 @@ pub(crate) mod tests {
         ]));
         let cache = Arc::new(MemoryLoadingCache::default());
         let services = services_with(Arc::clone(&cache), Arc::default());
-        let mut other = settings();
-        other.publisher.domain = "other.example".to_owned();
 
         contribution_for(
             "a",
@@ -678,9 +678,15 @@ pub(crate) mod tests {
         )
         .await
         .expect("should answer the first publisher");
-        let answer = contribution_for("a", &contributor(&scripted), &request(), &services, &other)
-            .await
-            .expect("should answer the second publisher");
+        let answer = contribution_for(
+            "a",
+            &contributor(&scripted),
+            &request(),
+            &services.with_prefixes(trusted_server_for("other.example")),
+            &settings(),
+        )
+        .await
+        .expect("should answer the second publisher");
 
         assert_eq!(answer, rules("User-Agent: OtherBot\nDisallow: /"));
         assert_eq!(scripted.times_asked(), 2, "each publisher is asked for");
@@ -693,6 +699,37 @@ pub(crate) mod tests {
             keys[1].starts_with("ts.publisher.example/robots-txt/"),
             "{keys:?}"
         );
+    }
+
+    /// Both the held answer and the one kept for a failure are keyed by the
+    /// publisher the request's services carry.
+    #[tokio::test]
+    async fn the_held_and_kept_keys_follow_the_publisher() {
+        let keys_for = |domain: &str| {
+            let scripted = Arc::new(Scripted::new(vec![Ok(rules("User-Agent: *\nAllow: /"))]));
+            let cache = Arc::new(MemoryLoadingCache::default());
+            let store = Arc::new(MemoryKvStore::default());
+            let services = services_with(Arc::clone(&cache), Arc::clone(&store))
+                .with_prefixes(trusted_server_for(domain));
+            futures::executor::block_on(contribution_for(
+                "a",
+                &contributor(&scripted),
+                &request(),
+                &services,
+                &settings(),
+            ))
+            .expect("should ask the contributor");
+            let kept: Vec<String> = store
+                .entries
+                .lock()
+                .expect("should lock the test store")
+                .keys()
+                .cloned()
+                .collect();
+            format!("{:?} {kept:?}", cache.keys())
+        };
+
+        assert_keys_follow_the_publisher(keys_for);
     }
 
     /// One deployment may serve several hosts, and each is answered for
@@ -973,7 +1010,7 @@ pub(crate) mod tests {
         let services = services_with(Arc::clone(&cache), Arc::default());
         let settings = settings();
         let key = StoreKey::new(
-            &ServerKeyPrefix::for_settings(&settings),
+            services.server_key_prefix(),
             CACHE,
             held_key("a", PUBLISHER, &scripted.fingerprint()),
         );
@@ -1064,6 +1101,7 @@ pub(crate) mod tests {
                 MemoryLoadingCache::default(),
             ))))
             .client_info(crate::platform::ClientInfo::default())
+            .prefixes(trusted_server_for("www.publisher.example"))
             .build();
 
         contribution_for(

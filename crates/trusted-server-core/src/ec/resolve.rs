@@ -152,15 +152,17 @@ pub async fn handle_ec_resolve(
     // Check every response header the module asked for against core's
     // reserved surface, exactly as the organic generation path does in
     // `EcContext::generate_with_module`. A module may set its own cookies
-    // and headers, but not a managed `ts-` cookie, a header in the `x-ts-`
+    // and headers, but not a cookie under the public prefix, a header in the `x-ts-`
     // namespace, or a framing or hop-by-hop header. Without this a
-    // browser-side module could set `ts-ec` itself and walk straight past
+    // browser-side module could set the Edge Cookie itself and walk straight past
     // the identifier bounds, the conflict check and the row-before-cookie
     // rule below. The check sits before the identifier is read because a
     // module can return headers with no identifier at all, which is the
     // 204 path, and that path applies headers too.
     for (name, value) in &generated.response_headers {
-        if let Some(effect) = super::module::reserved_response_effect(name, value) {
+        if let Some(effect) =
+            super::module::reserved_response_effect(name, value, services.public_prefix())
+        {
             return Err(Report::new(TrustedServerError::EdgeCookie {
                 message: format!(
                     "Module `{}` returned a response header `{name}` that {effect}",
@@ -241,11 +243,11 @@ pub async fn handle_ec_resolve(
     // carry, which a replacing write would drop.
     apply_module_response_headers(response.headers_mut(), generated.response_headers);
 
-    set_ec_cookie(settings, &mut response, &ec_id);
+    set_ec_cookie(settings, services.public_prefix(), &mut response, &ec_id);
     // The Edge Cookie is HttpOnly, so the page script cannot see it; the
     // non-HttpOnly marker tells the script the resolve succeeded so it does
     // not post again on every page view.
-    set_resolved_marker_cookie(settings, &mut response);
+    set_resolved_marker_cookie(settings, services.public_prefix(), &mut response);
 
     Ok(response)
 }
@@ -422,7 +424,6 @@ fn content_length_exceeds_limit(req: &Request<EdgeBody>, limit: usize) -> bool {
 mod tests {
     use super::*;
     use crate::consent::types::ConsentContext;
-    use crate::constants::COOKIE_TS_EC_RESOLVED;
     use crate::ec::finalize::ec_finalize_response;
     use crate::ec::module::{
         CLIENT_FIXED_MODULE_KEY, EcModuleSelection, EdgeCookieModule, GeneratedEdgeCookie,
@@ -687,7 +688,7 @@ mod tests {
 
         let err = outcome.expect_err("a managed cookie effect should fail the request");
         assert!(
-            format!("{err:?}").contains("ts-` namespace"),
+            format!("{err:?}").contains("sets a cookie under the public prefix core manages"),
             "the failure should name the reserved effect, got {err:?}"
         );
     }
@@ -1354,6 +1355,9 @@ mod tests {
             .build()
     }
 
+    /// The resolved marker's name under the default public prefix.
+    const RESOLVED_MARKER: &str = "ts-ecr";
+
     /// The publisher cookies a browser holds, by name.
     type Jar = BTreeMap<String, String>;
 
@@ -1474,7 +1478,7 @@ mod tests {
             "the first post should create the identity"
         );
         assert_eq!(
-            jar.get(COOKIE_TS_EC_RESOLVED).map(String::as_str),
+            jar.get(RESOLVED_MARKER).map(String::as_str),
             Some("1"),
             "the resolve should set the marker"
         );
@@ -1487,7 +1491,7 @@ mod tests {
             "core should recognize the demo module's own identifier when it comes back"
         );
         assert_eq!(
-            jar.get(COOKIE_TS_EC_RESOLVED).map(String::as_str),
+            jar.get(RESOLVED_MARKER).map(String::as_str),
             Some("1"),
             "the next view should keep the marker once it is set, got {jar:?}"
         );
@@ -1505,7 +1509,7 @@ mod tests {
             view_page(&settings, &services, &graph, &mut jar).await;
             // The page script posts only when it finds no marker, which its
             // own tests pin in `ec_client_fixed/index.test.ts`.
-            if !jar.contains_key(COOKIE_TS_EC_RESOLVED) {
+            if !jar.contains_key(RESOLVED_MARKER) {
                 posts += 1;
                 post_fixed_word(&settings, &services, &graph, &mut jar).await;
             }

@@ -564,8 +564,19 @@ describe('prebid/auctionBidsToPrebidBids', () => {
   });
 });
 
+// The bundle tag the server writes, carrying the public prefix the page's
+// names start with.
+function serveWithPrefix(prefix: string | null): void {
+  document.getElementById('trustedserver-js')?.remove();
+  const tag = document.createElement('script');
+  tag.id = 'trustedserver-js';
+  if (prefix !== null) tag.setAttribute('data-ts-public-prefix', prefix);
+  document.head.appendChild(tag);
+}
+
 describe('prebid/installPrebidNpm', () => {
   beforeEach(() => {
+    serveWithPrefix('ts');
     vi.clearAllMocks();
     mockSetConfig.mockReset();
     mockProcessQueue.mockReset();
@@ -3213,6 +3224,42 @@ describe('prebid/installPrebidNpm', () => {
           uids: [{ id: 'opaque-test-envelope', atype: 3 }],
         },
       ]);
+    });
+
+    it('names the EIDs cookie after the public prefix of the page', () => {
+      serveWithPrefix('_ex');
+      mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
+        opts?.bidsBackHandler?.();
+      });
+      mockGetUserIdsAsEids.mockReturnValue([
+        { source: 'sharedid.org', uids: [{ id: 'shared-id', atype: 1 }] },
+      ]);
+
+      const installed = installPrebidNpm();
+      installed.requestBids({
+        adUnits: [{ bids: [{ bidder: 'exampleBidder', params: {} }] }],
+      } as unknown as RequestBidsArg);
+
+      expect(document.cookie).toMatch(/(?:^|; )_ex-eids=/);
+      expect(document.cookie).not.toMatch(/(?:^|; )ts-eids=/);
+      document.cookie = '_ex-eids=; Path=/; Max-Age=0';
+    });
+
+    it('writes no EIDs cookie on a page naming no public prefix', () => {
+      serveWithPrefix(null);
+      mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
+        opts?.bidsBackHandler?.();
+      });
+      mockGetUserIdsAsEids.mockReturnValue([
+        { source: 'sharedid.org', uids: [{ id: 'shared-id', atype: 1 }] },
+      ]);
+
+      const installed = installPrebidNpm();
+      installed.requestBids({
+        adUnits: [{ bids: [{ bidder: 'exampleBidder', params: {} }] }],
+      } as unknown as RequestBidsArg);
+
+      expect(document.cookie).toBe('');
     });
 
     it('trims an oversized ts-eids cookie deterministically and logs which sources were dropped', () => {

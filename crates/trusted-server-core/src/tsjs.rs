@@ -24,7 +24,7 @@ pub fn tsjs_script_tag(parts: &[JsModulePart]) -> String {
 #[must_use]
 pub fn tsjs_script_tag_with_attributes(
     parts: &[JsModulePart],
-    attributes: &[(&'static str, &'static str)],
+    attributes: &[(&str, &str)],
 ) -> String {
     let attributes = attributes
         .iter()

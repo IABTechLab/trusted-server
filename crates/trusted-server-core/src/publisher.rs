@@ -57,9 +57,7 @@ use crate::cache_policy::{
     CachePolicy, EdgeCacheHeader, cache_control_headers_are_private_or_no_store,
 };
 use crate::consent::{consent_allows_server_side_auction, gate_eids_by_permissions};
-use crate::constants::{
-    COOKIE_SHAREDID, COOKIE_TS_EIDS, HEADER_X_COMPRESS_HINT, HOST_SIGNAL_HEADERS,
-};
+use crate::constants::{COOKIE_EIDS, COOKIE_SHAREDID, HEADER_X_COMPRESS_HINT, HOST_SIGNAL_HEADERS};
 use crate::cookies::handle_request_cookies;
 use crate::cookies::template_cache_policy::{TemplateCookieDecision, evaluate_cookie_policy};
 use crate::creative_opportunities::{
@@ -662,6 +660,8 @@ struct ProcessResponseParams<'a> {
     /// See [`HtmlStreamProcessorParams::csp_nonce_observed`].
     csp_nonce_observed: Option<&'a Arc<AtomicBool>>,
     prepared: &'a Arc<Prepared>,
+    /// See [`OwnedProcessResponseParams::public_prefix`].
+    public_prefix: &'a crate::prefix::PublicPrefix,
 }
 
 struct PublisherBodyProcessor {
@@ -991,6 +991,7 @@ impl PublisherBodyProcessor {
                 shared_template_authorized: params.template_cache_key.is_some(),
                 csp_nonce_observed: params.csp_nonce_observed.clone(),
                 prepared: Arc::clone(&params.prepared),
+                public_prefix: &params.public_prefix,
                 deferred_inline_marker: inline_seam_token
                     .as_ref()
                     .map(|token| String::from_utf8_lossy(token).into_owned()),
@@ -1112,6 +1113,7 @@ fn process_response_streaming<W: Write>(
             shared_template_authorized: params.shared_template_authorized,
             csp_nonce_observed: params.csp_nonce_observed.cloned(),
             prepared: Arc::clone(params.prepared),
+            public_prefix: params.public_prefix,
             deferred_inline_marker: None,
         })?;
         response_headers = headers;
@@ -1705,6 +1707,8 @@ struct HtmlStreamProcessorParams<'a> {
     /// Request-specific parser marker used by a pending inline auction.
     deferred_inline_marker: Option<String>,
     prepared: Arc<Prepared>,
+    /// See [`OwnedProcessResponseParams::public_prefix`].
+    public_prefix: &'a crate::prefix::PublicPrefix,
 }
 
 /// The marker emitted at the `</body>` seam under [`AssemblyMode::Esi`], reserving the
@@ -1895,6 +1899,7 @@ fn create_html_stream_processor(
         .with_request_state(params.request_state)
         .with_body_close(body_close)
         .with_csp_nonce_observer(csp_nonce_observed)
+        .with_public_prefix(params.public_prefix.clone())
         .with_prepared(params.prepared);
 
     // The middleware of the first [[fetch]] entry covering this path.
@@ -2289,6 +2294,9 @@ pub struct OwnedProcessResponseParams {
     /// What the middleware prepared for this document, see
     /// [`Middleware::prepare`](crate::middleware::Middleware::prepare).
     pub(crate) prepared: Arc<Prepared>,
+    /// The request's public prefix, from its services, which the page's
+    /// bundle tag tells the client script.
+    pub(crate) public_prefix: crate::prefix::PublicPrefix,
 }
 
 /// Response-authorized template cache insert inputs. The key is built before origin lookup; the
@@ -2666,19 +2674,33 @@ fn assemble_if_shared(
 ///
 /// Does not panic: serializing the already-deserialized typed settings to a JSON value is
 /// infallible for this schema.
-fn template_fingerprint(settings: &Settings, integration_registry: &IntegrationRegistry) -> String {
-    template_fingerprint_with_build_digest(settings, integration_registry, TEMPLATE_BUILD_DIGEST)
+fn template_fingerprint(
+    settings: &Settings,
+    integration_registry: &IntegrationRegistry,
+    public_prefix: &crate::prefix::PublicPrefix,
+) -> String {
+    template_fingerprint_with_build_digest(
+        settings,
+        integration_registry,
+        public_prefix,
+        TEMPLATE_BUILD_DIGEST,
+    )
 }
 
 fn template_fingerprint_with_build_digest(
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
+    public_prefix: &crate::prefix::PublicPrefix,
     build_digest: &str,
 ) -> String {
     let mut hasher = sha2::Sha256::new();
     hasher.update(build_digest.as_bytes());
     hasher
         .update(crate::tsjs_bundle::compose_hash(&integration_registry.js_parts_all()).as_bytes());
+    // The bundle tag carries the public prefix, and a change to the selected
+    // module can change it with nothing in the settings changing.
+    hasher.update(public_prefix.as_str().as_bytes());
+    hasher.update([0]);
     // Each part is hashed alone, so no text can move where the next begins.
     for (name, key) in integration_registry.middleware_template_keys() {
         hasher.update(sha2::Sha256::digest(name.as_bytes()));
@@ -2771,6 +2793,8 @@ fn build_template_assembly_params(
         // A request that carries any keeps to the origin path, so none reaches a
         // document served from a template.
         request_state: IntegrationRequestState::default(),
+        // Set by the caller, from the request's services.
+        public_prefix: crate::prefix::PublicPrefix::default(),
     }
 }
 
@@ -3564,6 +3588,7 @@ pub fn stream_publisher_body<W: Write>(
         shared_template_authorized: params.template_cache_key.is_some(),
         csp_nonce_observed: params.csp_nonce_observed.as_ref(),
         prepared: &params.prepared,
+        public_prefix: &params.public_prefix,
     };
     let input_compression = Compression::from_content_encoding(&params.content_encoding);
     let output_compression = if params.template_cache_key.is_some() {
@@ -3660,6 +3685,7 @@ pub async fn stream_publisher_body_async<W: Write>(
     let (mut processor, response_headers) =
         match create_html_stream_processor(HtmlStreamProcessorParams {
             prepared: Arc::clone(&params.prepared),
+            public_prefix: &params.public_prefix,
             origin_host: &params.origin_host,
             request_host: &params.request_host,
             request_scheme: &params.request_scheme,
@@ -5334,12 +5360,18 @@ pub async fn handle_publisher_request(
                 config.origin_is_cookie_independent(),
             )
         });
+    // A key cookie naming one of this request's own identity cookies would
+    // make the template one reader's, so such a request shares none.
+    let identity =
+        crate::cookies::template_cache_policy::identity_cookies(services.public_prefix());
+    let keys_an_identity = key_cookie_names.iter().any(|name| identity.contains(name));
     let (cookie_disqualifies, cookie_values) = match evaluate_cookie_policy(
         req.headers(),
         key_cookie_names,
         bypass_cookie_names,
         cookie_independent,
     ) {
+        _ if keys_an_identity => (true, Vec::new()),
         TemplateCookieDecision::Bypass => (true, Vec::new()),
         TemplateCookieDecision::Eligible(values) => (false, values),
     };
@@ -5497,7 +5529,11 @@ pub async fn handle_publisher_request(
                 .unwrap_or_else(|| VarySpec::new([]))
                 .values_from(req.headers()),
             cookie_values,
-            template_fingerprint: template_fingerprint(settings, integration_registry),
+            template_fingerprint: template_fingerprint(
+                settings,
+                integration_registry,
+                services.public_prefix(),
+            ),
             schema_version: crate::platform::TEMPLATE_SCHEMA_VERSION,
         });
     let mut template_cache_response_state = matches!(assembly_mode, AssemblyMode::Esi)
@@ -5506,9 +5542,11 @@ pub async fn handle_publisher_request(
 
     let request_method = req.method().clone();
     let mut origin_request = Some(req);
-    let eid_cookie_may_need_persistence = cookie_jar
-        .as_ref()
-        .is_some_and(|jar| jar.get(COOKIE_TS_EIDS).is_some() || jar.get(COOKIE_SHAREDID).is_some());
+    let eid_cookie_may_need_persistence = cookie_jar.as_ref().is_some_and(|jar| {
+        jar.get(&services.public_prefix().cookie_name(COOKIE_EIDS))
+            .is_some()
+            || jar.get(COOKIE_SHAREDID).is_some()
+    });
     // This decision also gates the concurrent origin send below. A marker skip
     // cannot currently delay the origin behind an auction because marker
     // validation requires a non-empty registry, and every such auction sets
@@ -5812,6 +5850,7 @@ pub async fn handle_publisher_request(
                         permissions_json.clone(),
                     );
                     params.request_path.clone_from(&request_path);
+                    params.public_prefix = services.public_prefix().clone();
                     params.seam_ad_slots = seam_ad_slots.clone();
                     params.dispatched_auction = dispatched_auction.take();
                     params.auction_observation = auction_observation.take();
@@ -6319,6 +6358,7 @@ pub async fn handle_publisher_request(
                     dispatched_auction,
                     price_granularity,
                     prepared,
+                    public_prefix: services.public_prefix().clone(),
                 }),
             })
         }
@@ -6361,7 +6401,7 @@ fn apply_auction_eids_and_device(
 ) {
     let ts_eids_value = targeting
         .cookie_jar
-        .and_then(|j| j.get(COOKIE_TS_EIDS))
+        .and_then(|j| j.get(&targeting.services.public_prefix().cookie_name(COOKIE_EIDS)))
         .map(|c| c.value().to_owned());
     let client_eids = if targeting.ec_id.is_some() {
         resolve_client_auction_eids(None, ts_eids_value.as_deref())
@@ -9944,6 +9984,7 @@ mod tests {
         content_encoding: &str,
     ) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -10253,6 +10294,7 @@ mod tests {
 
             let config = HtmlProcessorConfig {
                 csp_nonce_observed: None,
+                public_prefix: None,
                 prepared: Arc::new(Prepared::default()),
                 origin_host: "origin.example.com".to_string(),
                 request_host: "example.com".to_string(),
@@ -10523,14 +10565,36 @@ mod tests {
         fn fingerprint_with_build_digest(settings: &Settings, build_digest: &str) -> String {
             let registry =
                 IntegrationRegistry::new(settings).expect("should create integration registry");
-            template_fingerprint_with_build_digest(settings, &registry, build_digest)
+            template_fingerprint_with_build_digest(
+                settings,
+                &registry,
+                &crate::prefix::PublicPrefix::default(),
+                build_digest,
+            )
         }
 
         /// Hash for a configuration, through a registry built from it.
         fn fingerprint(settings: &Settings) -> String {
             let registry =
                 IntegrationRegistry::new(settings).expect("should create integration registry");
-            template_fingerprint(settings, &registry)
+            template_fingerprint(settings, &registry, &crate::prefix::PublicPrefix::default())
+        }
+
+        /// A stored page carries the public prefix on its bundle tag, so a page
+        /// stored under one prefix is never served under another.
+        #[test]
+        fn a_stored_page_is_keyed_by_the_public_prefix() {
+            let settings = crate::test_support::tests::create_test_settings();
+            let registry =
+                IntegrationRegistry::new(&settings).expect("should create integration registry");
+            let key = |public: &crate::prefix::PublicPrefix| {
+                template_fingerprint(&settings, &registry, public)
+            };
+
+            assert_ne!(
+                key(&crate::prefix::PublicPrefix::default()),
+                key(&crate::prefix::PublicPrefix::new(["_ex"]).expect("should accept the prefix"))
+            );
         }
 
         /// A browser module a vendor crate carries, before its rebuild.
@@ -10590,7 +10654,7 @@ mod tests {
             .with_module_name("testing.probe")];
             let registry = IntegrationRegistry::with_registrations(settings, &extra)
                 .expect("should build a registry with a carried module");
-            template_fingerprint(settings, &registry)
+            template_fingerprint(settings, &registry, &crate::prefix::PublicPrefix::default())
         }
 
         /// Base settings with one integration, core's stand-in, configured a
@@ -10749,13 +10813,18 @@ mod tests {
             );
             let first = Settings::from_toml(&source).expect("should parse context allowlist");
             let registry = test_registry(&create_test_settings());
-            let expected = template_fingerprint(&first, &registry);
+            let expected =
+                template_fingerprint(&first, &registry, &crate::prefix::PublicPrefix::default());
 
             for _ in 0..32 {
                 let settings =
                     Settings::from_toml(&source).expect("should reparse context allowlist");
                 assert_eq!(
-                    template_fingerprint(&settings, &registry),
+                    template_fingerprint(
+                        &settings,
+                        &registry,
+                        &crate::prefix::PublicPrefix::default()
+                    ),
                     expected,
                     "should fingerprint independently parsed allowlists identically"
                 );
@@ -11570,6 +11639,53 @@ mod tests {
         /// Shareable HTML: no `Set-Cookie`, no `Vary`, a public `Cache-Control`. Every
         /// condition the gate checks is satisfied, so a bypass here would be a bug in
         /// the wiring rather than in the fixture.
+        /// The client script holds no copy of the public prefix, so every
+        /// page tells it on the bundle tag, a stored page and a fresh one
+        /// alike, and with no prefix module selected that is `ts`.
+        #[tokio::test]
+        async fn a_page_tells_the_client_script_the_public_prefix() {
+            for mode in ["inline", "esi"] {
+                let stub = Arc::new(StubHttpClient::new());
+                let cache = Arc::new(MemoryTemplateCache::default());
+                let settings = Arc::new(settings_with_mode(mode));
+                let services = services(Arc::clone(&stub), Arc::clone(&cache));
+                queue_shareable_html(&stub);
+
+                let page = body_of(run(&settings, &services, navigation_request()).await).await;
+
+                let page = String::from_utf8_lossy(&page);
+                assert!(
+                    page.contains(r#"data-ts-public-prefix="ts""#),
+                    "{mode}: {page}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_page_tells_the_client_script_the_prefix_its_services_carry() {
+            for mode in ["inline", "esi"] {
+                let stub = Arc::new(StubHttpClient::new());
+                let cache = Arc::new(MemoryTemplateCache::default());
+                let settings = Arc::new(settings_with_mode(mode));
+                let services = services(Arc::clone(&stub), Arc::clone(&cache)).with_prefixes(
+                    crate::prefix::Prefixes::new(
+                        crate::prefix::PublicPrefix::new(["_ex"])
+                            .expect("should accept the prefix"),
+                        crate::platform::ServerKeyPrefix::new("ex", "example.com"),
+                    ),
+                );
+                queue_shareable_html(&stub);
+
+                let page = body_of(run(&settings, &services, navigation_request()).await).await;
+
+                let page = String::from_utf8_lossy(&page);
+                assert!(
+                    page.contains(r#"data-ts-public-prefix="_ex""#),
+                    "{mode}: {page}"
+                );
+            }
+        }
+
         fn queue_shareable_html(stub: &StubHttpClient) {
             stub.push_response_with_headers(
                 200,
@@ -15172,6 +15288,41 @@ mod tests {
             Arc::new(settings)
         }
 
+        /// The settings check refuses a key cookie named as core's own identity
+        /// cookies are. A deployment's own prefix is known only on a request,
+        /// so a key cookie naming this request's Edge Cookie shares no
+        /// template.
+        #[tokio::test]
+        async fn a_key_cookie_naming_the_requests_edge_cookie_shares_no_template() {
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryTemplateCache::default());
+            let settings = cookie_policy_settings(Some(&["_ex-ec"]), None, true);
+            let services = services(Arc::clone(&stub), Arc::clone(&cache)).with_prefixes(
+                crate::prefix::Prefixes::new(
+                    crate::prefix::PublicPrefix::new(["_ex"]).expect("should accept the prefix"),
+                    crate::platform::ServerKeyPrefix::new("ex", "test-publisher.com"),
+                ),
+            );
+            queue_shareable_html(&stub);
+
+            let response = run(
+                &settings,
+                &services,
+                cookie_policy_request(&[b"_ex-ec=reader"]),
+            )
+            .await;
+
+            assert_eq!(
+                response.headers()[HEADER_X_TS_TEMPLATE_CACHE],
+                "bypass-request"
+            );
+            let _ = body_of(response).await;
+            assert!(
+                stored_cache_keys(&cache).is_empty(),
+                "a reader's identifier must never key a stored template"
+            );
+        }
+
         fn cookie_policy_request(fields: &[&[u8]]) -> Request<EdgeBody> {
             let mut request = navigation_request();
             for field in fields {
@@ -15787,13 +15938,13 @@ mod tests {
             // fingerprints differ on is the cookie policy.
             let registry = test_registry(&first);
             assert_ne!(
-                template_fingerprint(&first, &registry),
-                template_fingerprint(&second, &registry),
+                template_fingerprint(&first, &registry, &crate::prefix::PublicPrefix::default()),
+                template_fingerprint(&second, &registry, &crate::prefix::PublicPrefix::default()),
                 "should fingerprint the key policy"
             );
             assert_ne!(
-                template_fingerprint(&second, &registry),
-                template_fingerprint(&third, &registry),
+                template_fingerprint(&second, &registry, &crate::prefix::PublicPrefix::default()),
+                template_fingerprint(&third, &registry, &crate::prefix::PublicPrefix::default()),
                 "should fingerprint the bypass policy"
             );
             let stub = Arc::new(StubHttpClient::new());
@@ -21803,6 +21954,7 @@ mod tests {
     ) -> String {
         let registry = IntegrationRegistry::new(settings).expect("should build a registry");
         let params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -21878,6 +22030,7 @@ mod tests {
         );
         let services = noop_services();
         let mut params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -21934,6 +22087,7 @@ mod tests {
         OwnedProcessResponseParams {
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
+            public_prefix: crate::prefix::PublicPrefix::default(),
             template_cache_key: None,
             seam_ad_slots: None,
             policy_headers: Vec::new(),
@@ -23481,6 +23635,7 @@ mod tests {
 
         let body = EdgeBody::from(compressed);
         let params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -23546,6 +23701,7 @@ mod tests {
         let registry =
             IntegrationRegistry::new(&settings).expect("should create integration registry");
         let params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -23632,6 +23788,7 @@ mod tests {
                 b"<html><head></head><body><a href=\"/x\">x</a></body></html>".to_vec(),
             ),
             params: Box::new(OwnedProcessResponseParams {
+                public_prefix: crate::prefix::PublicPrefix::default(),
                 csp_nonce_observed: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
@@ -23727,6 +23884,7 @@ mod tests {
         };
         let params = || {
             Box::new(OwnedProcessResponseParams {
+                public_prefix: crate::prefix::PublicPrefix::default(),
                 csp_nonce_observed: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
@@ -23837,6 +23995,7 @@ mod tests {
         .expect("should create integration registry");
 
         let params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -23888,6 +24047,7 @@ mod tests {
         )
         .expect("should create integration registry");
         let params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -24019,6 +24179,7 @@ mod tests {
             );
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                public_prefix: crate::prefix::PublicPrefix::default(),
                 csp_nonce_observed: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
@@ -24088,6 +24249,7 @@ mod tests {
             );
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                public_prefix: crate::prefix::PublicPrefix::default(),
                 csp_nonce_observed: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
@@ -24160,6 +24322,7 @@ mod tests {
             );
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                public_prefix: crate::prefix::PublicPrefix::default(),
                 csp_nonce_observed: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
@@ -24232,6 +24395,7 @@ mod tests {
             );
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                public_prefix: crate::prefix::PublicPrefix::default(),
                 csp_nonce_observed: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
@@ -24304,6 +24468,7 @@ mod tests {
             );
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                public_prefix: crate::prefix::PublicPrefix::default(),
                 csp_nonce_observed: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
@@ -24356,6 +24521,7 @@ mod tests {
 
     fn non_html_stream_params(content_encoding: &str) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -24584,6 +24750,7 @@ mod tests {
             let services = noop_services();
             let state = AdBidsState::default();
             let mut params = OwnedProcessResponseParams {
+                public_prefix: crate::prefix::PublicPrefix::default(),
                 csp_nonce_observed: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
@@ -24664,6 +24831,7 @@ mod tests {
             let services = noop_services();
             let state = AdBidsState::default();
             let mut params = OwnedProcessResponseParams {
+                public_prefix: crate::prefix::PublicPrefix::default(),
                 csp_nonce_observed: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
@@ -24746,6 +24914,7 @@ mod tests {
             );
             let services = noop_services();
             let mut params = OwnedProcessResponseParams {
+                public_prefix: crate::prefix::PublicPrefix::default(),
                 csp_nonce_observed: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
@@ -24822,6 +24991,7 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build response");
         let params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -24980,6 +25150,7 @@ mod tests {
         dispatched_auction: Option<DispatchedAuction>,
     ) -> OwnedProcessResponseParams {
         OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -25658,6 +25829,7 @@ mod tests {
             let ec_context =
                 EcContext::new_for_test(None, crate::consent::types::ConsentContext::default());
             OwnedProcessResponseParams {
+                public_prefix: crate::prefix::PublicPrefix::default(),
                 csp_nonce_observed: None,
                 prepared: Arc::new(Prepared::default()),
                 template_cache_key: None,
@@ -25858,6 +26030,7 @@ mod tests {
             .map(bytes::Bytes::copy_from_slice)
             .collect();
         let params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -25942,6 +26115,7 @@ mod tests {
             r#"<script>(window.tsjs=window.tsjs||{}).bids=JSON.parse("{}");</script>"#;
         let state = AdBidsState::with_script(bids_script);
         let params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -26009,6 +26183,7 @@ mod tests {
         // Claim gzip encoding but feed non-gzip bytes. The GzDecoder will
         // error as soon as it tries to read the gzip header.
         let params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -26131,6 +26306,7 @@ mod tests {
         let body = EdgeBody::from(html.to_vec());
 
         let params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
@@ -26193,6 +26369,7 @@ mod tests {
         // One small script whose payload is swapped for a placeholder.
         let html = br#"<html><body><script>fixture_payload("link=https://origin.example.com/page")</script></body></html>"#;
         let params = OwnedProcessResponseParams {
+            public_prefix: crate::prefix::PublicPrefix::default(),
             csp_nonce_observed: None,
             prepared: Arc::new(Prepared::default()),
             template_cache_key: None,
