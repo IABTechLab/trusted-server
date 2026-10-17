@@ -357,38 +357,12 @@ pub fn register(
     ))
 }
 
-#[async_trait(?Send)]
-impl IntegrationProxy for PermutiveIntegration {
-    fn integration_name(&self) -> &'static str {
-        PERMUTIVE_INTEGRATION_ID
-    }
-
-    fn routes(&self) -> Vec<IntegrationEndpoint> {
-        vec![
-            // API proxy endpoints
-            self.get("/api/*"),
-            self.post("/api/*"),
-            // Secure Signals endpoints
-            self.get("/secure-signal/*"),
-            self.post("/secure-signal/*"),
-            // Events endpoints
-            self.get("/events/*"),
-            self.post("/events/*"),
-            // Sync endpoints
-            self.get("/sync/*"),
-            self.post("/sync/*"),
-            // CDN endpoint
-            self.get("/cdn/*"),
-            // SDK serving
-            self.get("/sdk"),
-        ]
-    }
-
-    async fn handle(
+impl PermutiveIntegration {
+    async fn route(
         &self,
+        req: http::Request<EdgeBody>,
         settings: &Settings,
         services: &RuntimeServices,
-        req: http::Request<EdgeBody>,
     ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
         let path = req.uri().path().to_string();
 
@@ -445,6 +419,42 @@ impl IntegrationProxy for PermutiveIntegration {
                 path
             ))))
         }
+    }
+}
+
+#[async_trait(?Send)]
+impl IntegrationProxy for PermutiveIntegration {
+    fn integration_name(&self) -> &'static str {
+        PERMUTIVE_INTEGRATION_ID
+    }
+
+    fn routes(&self) -> Vec<IntegrationEndpoint> {
+        vec![
+            // API proxy endpoints
+            self.get("/api/*"),
+            self.post("/api/*"),
+            // Secure Signals endpoints
+            self.get("/secure-signal/*"),
+            self.post("/secure-signal/*"),
+            // Events endpoints
+            self.get("/events/*"),
+            self.post("/events/*"),
+            // Sync endpoints
+            self.get("/sync/*"),
+            self.post("/sync/*"),
+            // CDN endpoint
+            self.get("/cdn/*"),
+            // SDK serving
+            self.get("/sdk"),
+        ]
+    }
+
+    async fn handle(
+        &self,
+        call: trusted_server_core::module_context::ModuleCall<'_>,
+        req: http::Request<EdgeBody>,
+    ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
+        call.inject_with(self, req, Self::route)?.await
     }
 }
 
@@ -678,7 +688,7 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build request");
 
-        let response = futures::executor::block_on(integration.handle(&settings, &services, req))
+        let response = futures::executor::block_on(integration.route(req, &settings, &services))
             .expect("should proxy request");
 
         assert_eq!(
@@ -720,7 +730,7 @@ mod tests {
             .body(EdgeBody::empty())
             .expect("should build request");
 
-        let response = futures::executor::block_on(integration.handle(&settings, &services, req))
+        let response = futures::executor::block_on(integration.route(req, &settings, &services))
             .expect("should proxy request");
         assert_eq!(
             response.status(),
@@ -793,7 +803,7 @@ mod tests {
                 .header("x-permutive-trace", "kept")
                 .body(EdgeBody::empty())
                 .expect("should build request");
-            futures::executor::block_on(integration.handle(&settings, &services, req))
+            futures::executor::block_on(integration.route(req, &settings, &services))
                 .expect("should proxy request");
         }
 

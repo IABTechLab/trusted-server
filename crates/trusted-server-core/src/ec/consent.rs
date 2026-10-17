@@ -18,7 +18,8 @@ use std::sync::Arc;
 
 use crate::consent::ConsentContext;
 use crate::consent::jurisdiction::Jurisdiction;
-use crate::evidence::RequestInfo;
+use crate::evidence::{OwnedRequestInfo, RequestInfo};
+use crate::module_context::ModuleContext;
 use crate::permission_signal::{self, PermissionSignalModule};
 use crate::permissions::{
     Acquisition, ConsentSignal, Permission, PermissionMaps, PermissionState, SignalPolicy,
@@ -102,15 +103,28 @@ pub fn default_jurisdiction(geo: GeoStatus<'_>) -> Jurisdiction {
 /// [`PermissionState::storage_withdrawn`], and declare the terms documents the
 /// request's data is available under, read through
 /// [`PermissionState::tdls`].
+///
+/// The modules are handed `context`, the request's module context, and the
+/// signals are read from the consent and evidence it carries. A context
+/// carrying neither assembles the state of a request that carried no signal.
 #[must_use]
 pub fn assemble_permissions(
-    consent: &ConsentContext,
-    evidence: &dyn RequestInfo,
+    context: &ModuleContext<'_>,
     geo: GeoStatus<'_>,
     modules: &[Arc<dyn PermissionSignalModule>],
 ) -> PermissionState {
+    let no_consent;
+    let consent = match context.consent() {
+        Some(consent) => consent,
+        None => {
+            no_consent = ConsentContext::default();
+            &no_consent
+        }
+    };
+    let no_evidence = OwnedRequestInfo::default();
+    let evidence = context.evidence().unwrap_or(&no_evidence);
     let maps = PermissionMaps::standard();
-    let signal = permission_signal(consent, evidence, maps.signals(), modules);
+    let signal = permission_signal(context, consent, evidence, maps.signals(), modules);
     let state = match geo {
         GeoStatus::Failed => PermissionMaps::floor_with(signal),
         GeoStatus::Located(_) | GeoStatus::NoLocation => {
@@ -125,6 +139,7 @@ pub fn assemble_permissions(
     let withdrawn = permission_signal::withdrawn(
         modules,
         Permission::StoreOnDevice,
+        context,
         consent,
         evidence,
         maps.signals(),
@@ -135,8 +150,8 @@ pub fn assemble_permissions(
         // worth a page waiting for. The rest are unset, not pending.
         .awaiting_only(permission_signal::answerable(modules, maps.signals()))
         .with_storage_withdrawn(withdrawn)
-        .with_tdls(permission_signal::tdls(modules, consent, evidence))
-        .with_signals(permission_signal::signals(modules, consent, evidence))
+        .with_tdls(permission_signal::tdls(modules, context))
+        .with_signals(permission_signal::signals(modules, context))
 }
 
 /// The acquisition rule for Edge Cookie storage in the request's resolved
@@ -184,13 +199,16 @@ pub fn storage_acquisition(geo: GeoStatus<'_>) -> Acquisition {
 ///
 /// [`combine`]: crate::permission_signal::combine
 fn permission_signal<'a>(
+    context: &'a ModuleContext<'a>,
     consent: &'a ConsentContext,
     evidence: &'a dyn RequestInfo,
     signals: &'a SignalPolicy,
     modules: &'a [Arc<dyn PermissionSignalModule>],
 ) -> impl Fn(Permission, Acquisition) -> ConsentSignal + 'a {
     move |permission, baseline| {
-        permission_signal::combine(modules, permission, consent, evidence, signals, baseline)
+        permission_signal::combine(
+            modules, permission, context, consent, evidence, signals, baseline,
+        )
     }
 }
 
@@ -199,7 +217,7 @@ mod tests {
     use http::HeaderMap;
 
     use super::*;
-    use crate::evidence::OwnedRequestInfo;
+    use crate::module_context::{ModuleCall, ModuleRequest};
     use crate::permission_signal::SignalInput;
     use crate::permissions::{PermissionSet, ValidSignal};
     use crate::test_support::tests::create_test_settings;
@@ -233,11 +251,7 @@ mod tests {
             ConsentSignal::Neutral
         }
 
-        fn tdls(
-            &self,
-            _consent: &ConsentContext,
-            _evidence: &dyn crate::evidence::RequestInfo,
-        ) -> Vec<crate::tdl::Tdl> {
+        fn tdls(&self, _call: ModuleCall<'_>) -> Vec<crate::tdl::Tdl> {
             vec![
                 crate::tdl::Tdl::new("https://terms.example.com/marketing/2.txt")
                     .expect("should accept the test locator"),
@@ -258,7 +272,11 @@ mod tests {
         geo: GeoStatus<'_>,
         modules: &[Arc<dyn PermissionSignalModule>],
     ) -> PermissionState {
-        assemble_permissions(consent, &no_evidence(), geo, modules)
+        let evidence = no_evidence();
+        let context = ModuleContext::new(crate::module_context::test_support::request("/"))
+            .with_consent(consent)
+            .with_evidence(&evidence);
+        assemble_permissions(&context, geo, modules)
     }
 
     fn us_ca_geo() -> GeoInfo {
@@ -328,7 +346,7 @@ mod tests {
     fn a_module_declaring_terms_reaches_the_assembled_state() {
         let consent = ConsentContext::default();
         let modules: Vec<Arc<dyn PermissionSignalModule>> = vec![Arc::new(DeclaringTerms)];
-        let state = assemble_permissions(&consent, &no_evidence(), GeoStatus::NoLocation, &modules);
+        let state = assembled(&consent, GeoStatus::NoLocation, &modules);
         let addresses: Vec<&str> = state.tdls().iter().map(crate::tdl::Tdl::as_str).collect();
         assert_eq!(
             addresses,
@@ -340,8 +358,7 @@ mod tests {
     #[test]
     fn a_state_assembled_from_the_shipped_kind_of_module_declares_no_terms() {
         let consent = ConsentContext::default();
-        let state =
-            assemble_permissions(&consent, &no_evidence(), GeoStatus::NoLocation, &granting());
+        let state = assembled(&consent, GeoStatus::NoLocation, &granting());
         assert!(
             state.tdls().is_empty(),
             "should declare nothing, because a scheme carrying no terms says nothing about them"
@@ -426,6 +443,15 @@ mod tests {
     /// standing in for a scheme that decoded it.
     struct VouchingForTcf;
 
+    impl VouchingForTcf {
+        fn vouch(&self, consent: &ConsentContext) -> Option<ValidSignal> {
+            consent
+                .raw_tc_string
+                .as_deref()
+                .map(|raw| ValidSignal::new("vouching", "tcf", raw))
+        }
+    }
+
     impl PermissionSignalModule for VouchingForTcf {
         fn id(&self) -> &'static str {
             "vouching"
@@ -435,16 +461,57 @@ mod tests {
             ConsentSignal::Neutral
         }
 
-        fn valid_signal(
-            &self,
-            consent: &ConsentContext,
-            _evidence: &dyn crate::evidence::RequestInfo,
-        ) -> Option<ValidSignal> {
-            consent
-                .raw_tc_string
-                .as_deref()
-                .map(|raw| ValidSignal::new("vouching", "tcf", raw))
+        fn valid_signal(&self, call: ModuleCall<'_>) -> Option<ValidSignal> {
+            call.inject(self, Self::vouch).ok().flatten()
         }
+    }
+
+    /// A module that grants storage only on one host, so a test can see the
+    /// request reach a signal module through its module call.
+    struct GrantingOnHost(&'static str);
+
+    impl GrantingOnHost {
+        fn on_host(&self, request: ModuleRequest<'_>) -> bool {
+            request.host() == self.0
+        }
+    }
+
+    impl PermissionSignalModule for GrantingOnHost {
+        fn id(&self) -> &'static str {
+            "granting-on-host"
+        }
+
+        fn signal(&self, permission: Permission, input: &SignalInput<'_>) -> ConsentSignal {
+            match input.call().inject(self, Self::on_host) {
+                Ok(true) if permission == Permission::StoreOnDevice => ConsentSignal::Grant,
+                _ => ConsentSignal::Neutral,
+            }
+        }
+
+        fn grants(&self, _policy: &SignalPolicy) -> PermissionSet {
+            PermissionSet::none().with(Permission::StoreOnDevice)
+        }
+    }
+
+    #[test]
+    fn a_signal_module_is_handed_the_request_it_answers_for() {
+        // The top node requires a signal for storage, so storage is set only
+        // where the module grants it, and it grants only on its own host.
+        let consent = ConsentContext::default();
+        let here: Vec<Arc<dyn PermissionSignalModule>> =
+            vec![Arc::new(GrantingOnHost("publisher.example"))];
+        let elsewhere: Vec<Arc<dyn PermissionSignalModule>> =
+            vec![Arc::new(GrantingOnHost("elsewhere.example"))];
+
+        assert!(
+            assembled(&consent, GeoStatus::NoLocation, &here).is_set(Permission::StoreOnDevice),
+            "the module answers for the request it was handed"
+        );
+        assert!(
+            !assembled(&consent, GeoStatus::NoLocation, &elsewhere)
+                .is_set(Permission::StoreOnDevice),
+            "and a request for another host is not that request"
+        );
     }
 
     #[test]

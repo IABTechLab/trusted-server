@@ -1,11 +1,12 @@
 //! Device signal derivation for bot detection and browser classification.
 //!
 //! The [`DeviceSignals`] derivation here is pure computation, with no KV I/O or
-//! Fastly SDK calls. A [`DeviceModule`] is wired by dependency injection. It
-//! reads the [`RequestInfo`] for the User-Agent from the borrowed argument
-//! passed to `detect` at call time, and on a host that supplies them the
-//! [`HostSignals`](crate::evidence::HostSignals) for the TLS and HTTP/2 signals
-//! injected into its constructor, then classifies the request from both.
+//! Fastly SDK calls. A [`DeviceModule`] is handed the request's module context
+//! when `detect` is called and names what it reads from it, the
+//! [`RequestInfo`] for the User-Agent among them. On a host that supplies
+//! them, it also reads the [`HostSignals`](crate::evidence::HostSignals) for
+//! the TLS and HTTP/2 signals injected into its constructor, then classifies
+//! the request from both.
 //!
 //! # Signals
 //!
@@ -21,6 +22,7 @@ use sha2::{Digest as _, Sha256};
 
 use super::kv_types::KvDevice;
 use crate::evidence::RequestInfo;
+use crate::module_context::ModuleCall;
 use crate::settings::Settings;
 
 /// Device signals derived from a single request.
@@ -49,6 +51,13 @@ pub struct DeviceSignals {
 }
 
 impl DeviceSignals {
+    /// The signals of a request nothing could be read from, being an unknown
+    /// device that does not look like a browser.
+    #[must_use]
+    pub fn unknown() -> Self {
+        Self::derive_ua_only("")
+    }
+
     /// Derives device signals from the User-Agent alone, with no
     /// host-specific TLS or HTTP/2 evidence.
     ///
@@ -138,22 +147,21 @@ pub trait DeviceModule: Send + Sync {
     /// and logs.
     fn id(&self) -> &'static str;
 
-    /// Classifies the request into [`DeviceSignals`], reading the request data
-    /// it needs from the [`RequestInfo`] passed borrowed at call time (plus any
-    /// host signals injected into its constructor).
+    /// Classifies the request into [`DeviceSignals`].
+    ///
+    /// See [`crate::module_context`] for what an implementation may name.
+    /// Classification runs before the permissions are resolved, so no value
+    /// whose use needs a permission is passed here.
     ///
     /// Device signals gate identity operations and must always yield a value,
-    /// so this is infallible: a module that cannot determine a signal returns
-    /// the unknown variant rather than failing the request.
+    /// so this is infallible. A module that cannot determine a signal, or
+    /// whose function was not passed what it names, returns
+    /// [`DeviceSignals::unknown`] rather than failing the request.
     /// Asynchronous because a device module may reach a backend, a
     /// key-value store or a secret to classify a request, and a module that
     /// cannot make those calls cannot be written at all. The built-in
-    /// User-Agent provider does no I/O and returns immediately.
-    async fn detect(
-        &self,
-        request_info: &dyn RequestInfo,
-        services: &crate::platform::RuntimeServices,
-    ) -> DeviceSignals;
+    /// User-Agent module does no I/O and returns immediately.
+    async fn detect(&self, call: ModuleCall<'_>) -> DeviceSignals;
 
     /// The permissions this module's data use requires.
     ///
@@ -179,6 +187,11 @@ impl BuiltinDeviceModule {
     pub fn new() -> Self {
         Self
     }
+
+    /// The signals the User-Agent alone gives.
+    fn classify(&self, request_info: &dyn RequestInfo) -> DeviceSignals {
+        DeviceSignals::derive_ua_only(request_info.user_agent())
+    }
 }
 
 #[async_trait::async_trait(?Send)]
@@ -187,12 +200,9 @@ impl DeviceModule for BuiltinDeviceModule {
         "builtin"
     }
 
-    async fn detect(
-        &self,
-        request_info: &dyn RequestInfo,
-        _services: &crate::platform::RuntimeServices,
-    ) -> DeviceSignals {
-        DeviceSignals::derive_ua_only(request_info.user_agent())
+    async fn detect(&self, call: ModuleCall<'_>) -> DeviceSignals {
+        call.inject(self, Self::classify)
+            .unwrap_or_else(|_| DeviceSignals::unknown())
     }
 }
 
@@ -402,6 +412,7 @@ fn evaluate_known_browser(ja4_class: Option<&str>, h2_fp_hash: Option<&str>) -> 
 mod tests {
     use super::*;
     use crate::evidence::OwnedRequestInfo;
+    use crate::module_context::{ModuleContext, test_support};
 
     // Chrome Mac UA
     const CHROME_MAC_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
@@ -801,14 +812,12 @@ mod tests {
         let module = BuiltinDeviceModule::new();
         assert_eq!(module.id(), "builtin");
 
-        // The built-in module classifies from the User-Agent in the request
-        // info passed to `detect` alone, recording no host signal.
+        // The built-in module classifies from the User-Agent in the request's
+        // evidence alone, recording no host signal.
         let request_info = request_info_with_ua(CHROME_MAC_UA);
+        let context = ModuleContext::new(test_support::request("/")).with_evidence(&request_info);
         let signals = module
-            .detect(
-                &request_info,
-                &crate::platform::test_support::noop_services(),
-            )
+            .detect(context.call(module.id(), module.required_permissions()))
             .await;
         assert_eq!(
             signals,
@@ -818,6 +827,27 @@ mod tests {
         assert!(
             signals.ja4_class.is_none(),
             "the built-in module must not record a JA4 class"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_device_module_not_passed_what_it_names_answers_unknown() {
+        let module = BuiltinDeviceModule::new();
+        // A context with no evidence, as for work shared by every reader.
+        let context = ModuleContext::new(test_support::request("/"));
+
+        let signals = module
+            .detect(context.call(module.id(), module.required_permissions()))
+            .await;
+
+        assert_eq!(
+            signals,
+            DeviceSignals::unknown(),
+            "should answer the unknown device rather than fail the request"
+        );
+        assert!(
+            !signals.looks_like_browser,
+            "the unknown device should not look like a browser"
         );
     }
 
@@ -842,12 +872,8 @@ mod tests {
             "fastly"
         }
 
-        async fn detect(
-            &self,
-            _request_info: &dyn RequestInfo,
-            _services: &crate::platform::RuntimeServices,
-        ) -> DeviceSignals {
-            DeviceSignals::derive_ua_only("")
+        async fn detect(&self, _call: ModuleCall<'_>) -> DeviceSignals {
+            DeviceSignals::unknown()
         }
     }
 

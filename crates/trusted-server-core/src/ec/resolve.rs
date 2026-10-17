@@ -19,13 +19,15 @@ use error_stack::Report;
 use http::{HeaderValue, Request, Response, StatusCode, header};
 
 use crate::error::TrustedServerError;
+use crate::evidence::BorrowedRequestInfo;
+use crate::module_context::{ModuleContext, ResolvedRequest};
 use crate::settings::Settings;
 
 use super::EcContext;
 use super::cookies::{ec_id_has_only_allowed_chars, set_ec_cookie, set_resolved_marker_cookie};
 use super::kv::KvIdentityGraph;
 use super::kv_types::KvEntry;
-use super::module::{ClientResolveInput, apply_module_response_headers};
+use super::module::apply_module_response_headers;
 
 /// Maximum size of a resolve request body.
 ///
@@ -111,18 +113,32 @@ pub async fn handle_ec_resolve(
     if content_length_exceeds_limit(&req, MAX_BODY_SIZE) {
         return Ok(status_only(StatusCode::PAYLOAD_TOO_LARGE));
     }
-    let payload = req.into_body().into_bytes().unwrap_or_default();
+    let resolved = ResolvedRequest::of(&req, services.client_info());
+    let (parts, body) = req.into_parts();
+    let payload = body.into_bytes().unwrap_or_default();
     if payload.len() > MAX_BODY_SIZE {
         return Ok(status_only(StatusCode::PAYLOAD_TOO_LARGE));
     }
 
-    let input = ClientResolveInput {
-        payload: payload.as_ref(),
-        permissions: Some(ec_context.permissions()),
-        consent: Some(ec_context.consent()),
-    };
-
-    let generated = module.resolve_from_client(&input, services).await?;
+    // The module is handed the resolve request's own context, its evidence
+    // and what was resolved for it, with the posted value as its argument.
+    // The client IP is the normalized one the request's Edge Cookie state
+    // holds, the same form the module sees when it generates.
+    let evidence = BorrowedRequestInfo::new(
+        ec_context.client_ip().unwrap_or_default(),
+        Some(&parts.headers),
+    )
+    .with_request_target(parts.uri.path(), parts.uri.query().unwrap_or_default());
+    let context = ModuleContext::new(resolved.view())
+        .with_evidence(&evidence)
+        .with_settings(settings)
+        .with_request_state(ec_context, services);
+    let generated = module
+        .resolve_from_client(
+            context.call(module.id(), module.required_permissions()),
+            payload.as_ref(),
+        )
+        .await?;
     log::debug!(
         "EC resolve handled (module={}): id {}",
         module.id(),
@@ -410,10 +426,9 @@ mod tests {
     use crate::ec::finalize::ec_finalize_response;
     use crate::ec::module::{
         CLIENT_FIXED_MODULE_KEY, EcModuleSelection, EdgeCookieModule, GeneratedEdgeCookie,
-        IdentityInput,
     };
     use crate::ec::registry::PartnerRegistry;
-    use crate::evidence::RequestInfo;
+    use crate::module_context::{ModuleCall, ModuleRequest};
     use crate::permission_signal::{PermissionSignalModule, SignalInput};
     use crate::permissions::{ConsentSignal, Permission};
     use crate::platform::test_support::{
@@ -504,8 +519,12 @@ mod tests {
     /// (like any opaque-identifier module) returns the value unchanged.
     ///
     /// [`normalize_id_for_kv`]: EdgeCookieModule::normalize_id_for_kv
-    #[derive(Debug)]
-    struct TestIdModule;
+    #[derive(Debug, Default)]
+    struct TestIdModule {
+        /// The address the module was last asked for, so a test can read
+        /// back the request it was handed.
+        seen_path: std::sync::Mutex<Option<String>>,
+    }
 
     #[async_trait::async_trait(?Send)]
     impl EdgeCookieModule for TestIdModule {
@@ -519,9 +538,7 @@ mod tests {
 
         async fn generate(
             &self,
-            _request_info: &dyn RequestInfo,
-            _input: &IdentityInput<'_>,
-            _services: &crate::platform::RuntimeServices,
+            _call: ModuleCall<'_>,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             // The identifier is created in the browser, so the edge derives nothing.
             Ok(GeneratedEdgeCookie::default())
@@ -529,21 +546,10 @@ mod tests {
 
         async fn resolve_from_client(
             &self,
-            input: &ClientResolveInput<'_>,
-            _services: &crate::platform::RuntimeServices,
+            call: ModuleCall<'_>,
+            payload: &[u8],
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
-            // The page posts the identifier it generated. Accept a well-formed UUID.
-            let value = core::str::from_utf8(input.payload)
-                .unwrap_or_default()
-                .trim();
-            if is_uuid(value) {
-                Ok(GeneratedEdgeCookie {
-                    id: Some(value.to_owned()),
-                    response_headers: Vec::new(),
-                })
-            } else {
-                Ok(GeneratedEdgeCookie::default())
-            }
+            call.inject_with(self, payload, Self::verify)?
         }
 
         fn accepts_id(&self, value: &str) -> bool {
@@ -552,6 +558,29 @@ mod tests {
 
         fn normalize_id_for_kv(&self, value: &str) -> String {
             value.to_owned()
+        }
+    }
+
+    impl TestIdModule {
+        /// Accepts a well-formed UUID, recording the address of the request
+        /// it was handed.
+        fn verify(
+            &self,
+            payload: &[u8],
+            request: ModuleRequest<'_>,
+        ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+            *self.seen_path.lock().expect("should lock the seen address") =
+                Some(request.path().to_owned());
+            // The page posts the identifier it generated. Accept a well-formed UUID.
+            let value = core::str::from_utf8(payload).unwrap_or_default().trim();
+            if is_uuid(value) {
+                Ok(GeneratedEdgeCookie {
+                    id: Some(value.to_owned()),
+                    response_headers: Vec::new(),
+                })
+            } else {
+                Ok(GeneratedEdgeCookie::default())
+            }
         }
     }
 
@@ -580,17 +609,15 @@ mod tests {
 
         async fn generate(
             &self,
-            _request_info: &dyn RequestInfo,
-            _input: &IdentityInput<'_>,
-            _services: &crate::platform::RuntimeServices,
+            _call: ModuleCall<'_>,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             Ok(GeneratedEdgeCookie::default())
         }
 
         async fn resolve_from_client(
             &self,
-            _input: &ClientResolveInput<'_>,
-            _services: &crate::platform::RuntimeServices,
+            _call: ModuleCall<'_>,
+            _payload: &[u8],
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             Ok(GeneratedEdgeCookie {
                 id: self.id.map(str::to_owned),
@@ -813,7 +840,8 @@ mod tests {
         // A client-generated first-party UUID, the value the browser posts back.
         const TEST_ID: &str = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
 
-        let module: Arc<dyn EdgeCookieModule> = Arc::new(TestIdModule);
+        let test_id = Arc::new(TestIdModule::default());
+        let module: Arc<dyn EdgeCookieModule> = test_id.clone();
         let mut settings = create_test_settings();
         settings.ec.module = Some(EcModuleSelection::from("testid"));
         let services = noop_services_with_ec_module(Arc::clone(&module));
@@ -868,6 +896,15 @@ mod tests {
                 .expect("should read the graph")
                 .is_some(),
             "the resolve should persist the identity-graph row, so withdrawal can reach it"
+        );
+        assert_eq!(
+            test_id
+                .seen_path
+                .lock()
+                .expect("should lock the seen address")
+                .as_deref(),
+            Some("/_ts/api/v1/ec/resolve"),
+            "the module is handed the resolve request it answers"
         );
 
         // 3. A later request carries the EC cookie, and the identifier reads

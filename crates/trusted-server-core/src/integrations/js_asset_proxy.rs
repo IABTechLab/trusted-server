@@ -497,26 +497,12 @@ pub fn register(
     ))
 }
 
-#[async_trait(?Send)]
-impl IntegrationProxy for JsAssetProxyIntegration {
-    fn integration_name(&self) -> &'static str {
-        JS_ASSET_PROXY_INTEGRATION_ID
-    }
-
-    fn routes(&self) -> Vec<IntegrationEndpoint> {
-        self.config
-            .assets
-            .iter()
-            .filter(|asset| asset.proxy == JsAssetProxyMode::Enabled)
-            .map(|asset| IntegrationEndpoint::new(Method::GET, asset.path.clone()))
-            .collect()
-    }
-
-    async fn handle(
+impl JsAssetProxyIntegration {
+    async fn route(
         &self,
+        req: Request<EdgeBody>,
         settings: &Settings,
         services: &RuntimeServices,
-        req: Request<EdgeBody>,
     ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
         let request_path = req.uri().path().to_string();
         let asset = self.enabled_asset_for_path(&request_path).ok_or_else(|| {
@@ -551,6 +537,30 @@ impl IntegrationProxy for JsAssetProxyIntegration {
         }
 
         Ok(self.finalize_asset_response(asset, response))
+    }
+}
+
+#[async_trait(?Send)]
+impl IntegrationProxy for JsAssetProxyIntegration {
+    fn integration_name(&self) -> &'static str {
+        JS_ASSET_PROXY_INTEGRATION_ID
+    }
+
+    fn routes(&self) -> Vec<IntegrationEndpoint> {
+        self.config
+            .assets
+            .iter()
+            .filter(|asset| asset.proxy == JsAssetProxyMode::Enabled)
+            .map(|asset| IntegrationEndpoint::new(Method::GET, asset.path.clone()))
+            .collect()
+    }
+
+    async fn handle(
+        &self,
+        call: crate::module_context::ModuleCall<'_>,
+        req: Request<EdgeBody>,
+    ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+        call.inject_with(self, req, Self::route)?.await
     }
 }
 
@@ -1405,7 +1415,7 @@ mod tests {
             );
 
             let response = integration
-                .handle(&settings, &services, request)
+                .route(request, &settings, &services)
                 .await
                 .expect("should proxy conditional asset response");
 
@@ -1455,13 +1465,13 @@ mod tests {
                 Arc::clone(&buffered_stub) as Arc<dyn crate::platform::PlatformHttpClient>
             );
             let success = integration
-                .handle(
-                    &settings,
-                    &buffered_services,
+                .route(
                     build_http_request(
                         Method::GET,
                         "https://publisher.example.com/assets/vendor.js",
                     ),
+                    &settings,
+                    &buffered_services,
                 )
                 .await
                 .expect("should proxy buffered asset response");
@@ -1475,13 +1485,13 @@ mod tests {
                 Arc::clone(&streaming_stub) as Arc<dyn crate::platform::PlatformHttpClient>
             );
             let success = integration
-                .handle(
-                    &settings,
-                    &streaming_services,
+                .route(
                     build_http_request(
                         Method::GET,
                         "https://publisher.example.com/assets/vendor.js",
                     ),
+                    &settings,
+                    &streaming_services,
                 )
                 .await
                 .expect("should proxy streaming asset response");
@@ -1503,13 +1513,13 @@ mod tests {
                 Arc::clone(&unavailable_stub) as Arc<dyn crate::platform::PlatformHttpClient>,
             );
             let unavailable = integration
-                .handle(
-                    &settings,
-                    &unavailable_services,
+                .route(
                     build_http_request(
                         Method::GET,
                         "https://publisher.example.com/assets/vendor.js",
                     ),
+                    &settings,
+                    &unavailable_services,
                 )
                 .await
                 .expect("should map unavailable origin response");
@@ -1528,13 +1538,13 @@ mod tests {
                 Arc::clone(&status_stub) as Arc<dyn crate::platform::PlatformHttpClient>
             );
             let status = integration
-                .handle(
-                    &settings,
-                    &status_services,
+                .route(
                     build_http_request(
                         Method::GET,
                         "https://publisher.example.com/assets/vendor.js",
                     ),
+                    &settings,
+                    &status_services,
                 )
                 .await
                 .expect("should map non-success origin response");

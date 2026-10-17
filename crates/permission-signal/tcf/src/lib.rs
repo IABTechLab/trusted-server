@@ -21,7 +21,7 @@ pub use mapping::purpose_for;
 #[cfg(test)]
 use trusted_server_core::consent::types::TcfConsent;
 use trusted_server_core::consent::{ConsentContext, effective_tcf};
-use trusted_server_core::evidence::RequestInfo;
+use trusted_server_core::module_context::ModuleCall;
 use trusted_server_core::permission_signal::{PermissionSignalModule, SignalInput};
 use trusted_server_core::permissions::{
     ConsentSignal, Permission, PermissionSet, SignalPolicy, ValidSignal,
@@ -56,6 +56,14 @@ impl TcfModule {
     #[must_use]
     pub const fn new() -> Self {
         Self
+    }
+
+    /// The signal this scheme reads from the request's consent record, when
+    /// it can use one.
+    fn read_signal(&self, consent: &ConsentContext) -> Option<ValidSignal> {
+        consent.tcf.as_ref()?;
+        let raw = consent.raw_tc_string.as_deref()?;
+        Some(ValidSignal::new(short(), "tcf", raw))
     }
 }
 
@@ -112,14 +120,8 @@ impl PermissionSignalModule for TcfModule {
     /// The standalone TC string, when it decoded and has not expired. A record
     /// carried inside a GPP string is the GPP string's, which the GPP
     /// module vouches for.
-    fn valid_signal(
-        &self,
-        consent: &ConsentContext,
-        _evidence: &dyn RequestInfo,
-    ) -> Option<ValidSignal> {
-        consent.tcf.as_ref()?;
-        let raw = consent.raw_tc_string.as_deref()?;
-        Some(ValidSignal::new(short(), "tcf", raw))
+    fn valid_signal(&self, call: ModuleCall<'_>) -> Option<ValidSignal> {
+        call.inject(self, Self::read_signal).ok().flatten()
     }
 
     /// Only a TCF record refusing storage withdraws, because only TCF records
@@ -322,13 +324,12 @@ mod tests {
 
     #[test]
     fn vouches_for_the_standalone_tc_string_only_when_it_decoded() {
-        let evidence = OwnedRequestInfo::default();
         let decoded = ConsentContext {
             raw_tc_string: Some("CPreadable".to_owned()),
             ..with_record(&[1])
         };
         assert_eq!(
-            TcfModule::new().valid_signal(&decoded, &evidence),
+            TcfModule::new().read_signal(&decoded),
             Some(ValidSignal::new(short(), "tcf", "CPreadable")),
             "a decoded record vouches for the string as received"
         );
@@ -337,7 +338,7 @@ mod tests {
             ..ConsentContext::default()
         };
         assert_eq!(
-            TcfModule::new().valid_signal(&unreadable, &evidence),
+            TcfModule::new().read_signal(&unreadable),
             None,
             "an unreadable string is not vouched for"
         );
@@ -347,12 +348,12 @@ mod tests {
             ..ConsentContext::default()
         };
         assert_eq!(
-            TcfModule::new().valid_signal(&expired, &evidence),
+            TcfModule::new().read_signal(&expired),
             None,
             "an expired record is not one this module uses, so it is not vouched for"
         );
         assert_eq!(
-            TcfModule::new().valid_signal(&ConsentContext::default(), &evidence),
+            TcfModule::new().read_signal(&ConsentContext::default()),
             None,
             "and no record is no signal"
         );

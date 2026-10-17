@@ -370,7 +370,9 @@ async fn dispatch_fallback(
     }
 
     if state.registry.has_route(&method, &path) {
-        let mut ec_context = EcContext::default();
+        // A module route is handed what was resolved for its request, the
+        // permissions among them, as the publisher path is.
+        let mut ec_context = build_ec_context(state, services, &req).await?;
         return state
             .registry
             .handle_proxy(ProxyDispatchInput {

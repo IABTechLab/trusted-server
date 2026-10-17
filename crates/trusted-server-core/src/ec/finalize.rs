@@ -334,7 +334,10 @@ async fn recover_orphaned_ec(
     // identifier. Whether the client IP is needed is that module's decision.
     const MAX_RECOVERY_ATTEMPTS: usize = 5;
     for _attempt in 0..MAX_RECOVERY_ATTEMPTS {
-        let ec_id = match ec_context.candidate_id(module.as_ref(), services).await {
+        let ec_id = match ec_context
+            .candidate_id(module.as_ref(), settings, services)
+            .await
+        {
             Ok(Some(ec_id)) => ec_id,
             Ok(None) => {
                 log::info!("Orphan EC recovery skipped because the module produced no identifier");
@@ -2613,9 +2616,7 @@ mod tests {
 
         async fn generate(
             &self,
-            _request_info: &dyn crate::evidence::RequestInfo,
-            _input: &crate::ec::module::IdentityInput<'_>,
-            _services: &crate::platform::RuntimeServices,
+            _call: crate::module_context::ModuleCall<'_>,
         ) -> Result<
             crate::ec::module::GeneratedEdgeCookie,
             error_stack::Report<crate::error::TrustedServerError>,
@@ -2741,9 +2742,7 @@ mod tests {
 
         async fn generate(
             &self,
-            _request_info: &dyn crate::evidence::RequestInfo,
-            _input: &crate::ec::module::IdentityInput<'_>,
-            _services: &crate::platform::RuntimeServices,
+            _call: crate::module_context::ModuleCall<'_>,
         ) -> Result<
             crate::ec::module::GeneratedEdgeCookie,
             error_stack::Report<crate::error::TrustedServerError>,

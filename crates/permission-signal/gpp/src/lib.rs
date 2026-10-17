@@ -8,7 +8,7 @@
 //! scheme. Why is set out once, in `permission_signal/README.md` in core.
 
 use trusted_server_core::consent::ConsentContext;
-use trusted_server_core::evidence::RequestInfo;
+use trusted_server_core::module_context::ModuleCall;
 use trusted_server_core::permission_signal::{PermissionSignalModule, SignalInput};
 use trusted_server_core::permissions::{ConsentSignal, OptOutSource, Permission, ValidSignal};
 
@@ -37,6 +37,14 @@ impl GppSaleOptOutModule {
     #[must_use]
     pub const fn new() -> Self {
         Self
+    }
+
+    /// The signal this scheme reads from the request's consent record, when
+    /// it can use one.
+    fn read_signal(&self, consent: &ConsentContext) -> Option<ValidSignal> {
+        consent.gpp.as_ref()?;
+        let raw = consent.raw_gpp_string.as_deref()?;
+        Some(ValidSignal::new(short(), "gpp", raw))
     }
 }
 
@@ -76,14 +84,8 @@ impl PermissionSignalModule for GppSaleOptOutModule {
     }
 
     /// The GPP string, when it decoded.
-    fn valid_signal(
-        &self,
-        consent: &ConsentContext,
-        _evidence: &dyn RequestInfo,
-    ) -> Option<ValidSignal> {
-        consent.gpp.as_ref()?;
-        let raw = consent.raw_gpp_string.as_deref()?;
-        Some(ValidSignal::new(short(), "gpp", raw))
+    fn valid_signal(&self, call: ModuleCall<'_>) -> Option<ValidSignal> {
+        call.inject(self, Self::read_signal).ok().flatten()
     }
 }
 
@@ -155,13 +157,12 @@ mod tests {
 
     #[test]
     fn vouches_for_the_gpp_string_only_when_it_decoded() {
-        let evidence = OwnedRequestInfo::default();
         let decoded = ConsentContext {
             raw_gpp_string: Some("DBABMA~CPreadable".to_owned()),
             ..with_sale_opt_out(Some(false))
         };
         assert_eq!(
-            GppSaleOptOutModule::new().valid_signal(&decoded, &evidence),
+            GppSaleOptOutModule::new().read_signal(&decoded),
             Some(ValidSignal::new(short(), "gpp", "DBABMA~CPreadable")),
             "a decoded string is vouched for as received, whatever it says"
         );
@@ -170,7 +171,7 @@ mod tests {
             ..ConsentContext::default()
         };
         assert_eq!(
-            GppSaleOptOutModule::new().valid_signal(&unreadable, &evidence),
+            GppSaleOptOutModule::new().read_signal(&unreadable),
             None,
             "an unreadable string is not"
         );

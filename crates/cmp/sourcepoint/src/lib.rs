@@ -827,27 +827,11 @@ pub fn register(
     ))
 }
 
-#[async_trait(?Send)]
-impl IntegrationProxy for SourcepointIntegration {
-    fn integration_name(&self) -> &'static str {
-        SOURCEPOINT_INTEGRATION_ID
-    }
-
-    fn routes(&self) -> Vec<IntegrationEndpoint> {
-        let endpoint_path = format!("/integrations/{SOURCEPOINT_INTEGRATION_ID}/cdn/*");
-        vec![
-            self.get("/cdn/*"),
-            self.post("/cdn/*"),
-            IntegrationEndpoint::new(Method::HEAD, endpoint_path.clone()),
-            IntegrationEndpoint::new(Method::OPTIONS, endpoint_path),
-        ]
-    }
-
-    async fn handle(
+impl SourcepointIntegration {
+    async fn route(
         &self,
-        _settings: &Settings,
-        services: &RuntimeServices,
         req: Request<EdgeBody>,
+        services: &RuntimeServices,
     ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
         let path = req.uri().path().to_string();
         let method = req.method().clone();
@@ -1079,6 +1063,31 @@ impl IntegrationProxy for SourcepointIntegration {
     }
 }
 
+#[async_trait(?Send)]
+impl IntegrationProxy for SourcepointIntegration {
+    fn integration_name(&self) -> &'static str {
+        SOURCEPOINT_INTEGRATION_ID
+    }
+
+    fn routes(&self) -> Vec<IntegrationEndpoint> {
+        let endpoint_path = format!("/integrations/{SOURCEPOINT_INTEGRATION_ID}/cdn/*");
+        vec![
+            self.get("/cdn/*"),
+            self.post("/cdn/*"),
+            IntegrationEndpoint::new(Method::HEAD, endpoint_path.clone()),
+            IntegrationEndpoint::new(Method::OPTIONS, endpoint_path),
+        ]
+    }
+
+    async fn handle(
+        &self,
+        call: trusted_server_core::module_context::ModuleCall<'_>,
+        req: Request<EdgeBody>,
+    ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+        call.inject_with(self, req, Self::route)?.await
+    }
+}
+
 impl IntegrationAttributeRewriter for SourcepointIntegration {
     fn integration_id(&self) -> &'static str {
         SOURCEPOINT_INTEGRATION_ID
@@ -1249,7 +1258,6 @@ mod tests {
     #[test]
     fn handle_rewrites_streamed_javascript_without_content_length() {
         futures::executor::block_on(async {
-            let settings = create_test_settings();
             let integration = SourcepointIntegration::new(Arc::new(config()));
             let client = Arc::new(StreamingHttpClient::new());
             let input = format!(r#"var api="https://{SOURCEPOINT_CDN_HOST}/consent/tcfv2";"#);
@@ -1261,13 +1269,12 @@ mod tests {
             let services = build_services_with_http_client(client.clone());
 
             let response = integration
-                .handle(
-                    &settings,
-                    &services,
+                .route(
                     make_req(
                         Method::GET,
                         "https://publisher.example.com/integrations/sourcepoint/cdn/wrapper.js",
                     ),
+                    &services,
                 )
                 .await
                 .expect("should proxy JavaScript without Content-Length");
@@ -1293,7 +1300,6 @@ mod tests {
     #[test]
     fn handle_keeps_encoded_responses_streaming() {
         futures::executor::block_on(async {
-            let settings = create_test_settings();
             let integration = SourcepointIntegration::new(Arc::new(config()));
             for content_type in ["application/javascript", "text/html"] {
                 for encodings in [
@@ -1329,13 +1335,12 @@ mod tests {
                         let services = build_services_with_http_client(client.clone());
 
                         let response = integration
-                            .handle(
-                                &settings,
-                                &services,
+                            .route(
                                 make_req(
                                     Method::GET,
                                     "https://publisher.example.com/integrations/sourcepoint/cdn/asset",
                                 ),
+                                &services,
                             )
                             .await
                             .expect("should pass through encoded responses regardless of size");
@@ -1390,7 +1395,6 @@ mod tests {
     #[test]
     fn handle_rewrites_explicit_identity_encoded_responses() {
         futures::executor::block_on(async {
-            let settings = create_test_settings();
             let integration = SourcepointIntegration::new(Arc::new(config()));
             for content_type in ["application/javascript", "text/html"] {
                 for encoding in ["identity", " IdEnTiTy "] {
@@ -1417,13 +1421,12 @@ mod tests {
                     );
                     let services = build_services_with_http_client(client.clone());
                     let response = integration
-                        .handle(
-                            &settings,
-                            &services,
+                        .route(
                             make_req(
                                 Method::GET,
                                 "https://publisher.example.com/integrations/sourcepoint/cdn/asset",
                             ),
+                            &services,
                         )
                         .await
                         .expect("should rewrite explicitly identity-encoded responses");
@@ -1449,7 +1452,6 @@ mod tests {
     #[test]
     fn handle_rewrites_streamed_html_without_content_length() {
         futures::executor::block_on(async {
-            let settings = create_test_settings();
             let integration = SourcepointIntegration::new(Arc::new(config()));
             let client = Arc::new(StreamingHttpClient::new());
             client.stub.push_response_with_headers(
@@ -1460,10 +1462,9 @@ mod tests {
             let services = build_services_with_http_client(client.clone());
 
             let response = integration
-                .handle(
-                    &settings,
-                    &services,
+                .route(
                     make_req(Method::GET, "https://publisher.example.com/integrations/sourcepoint/cdn/us_pm/index.html"),
+                    &services,
                 )
                 .await
                 .expect("should proxy HTML without Content-Length");
@@ -1484,7 +1485,6 @@ mod tests {
     #[test]
     fn handle_accepts_exact_rewrite_limit_and_stops_reading_on_overflow() {
         futures::executor::block_on(async {
-            let settings = create_test_settings();
             let integration = SourcepointIntegration::new(Arc::new(config()));
             let limit = MAX_REWRITE_BODY_SIZE as usize;
             for content_type in ["application/javascript", "text/html"] {
@@ -1502,10 +1502,9 @@ mod tests {
                         );
                         let services = build_services_with_http_client(client.clone());
 
-                        let result = integration.handle(
-                            &settings,
-                            &services,
+                        let result = integration.route(
                             make_req(Method::GET, "https://publisher.example.com/integrations/sourcepoint/cdn/asset"),
+                            &services,
                         ).await;
 
                         if extra_bytes == 0 {
@@ -1546,7 +1545,6 @@ mod tests {
     #[test]
     fn handle_passes_through_declared_oversize_without_reading() {
         futures::executor::block_on(async {
-            let settings = create_test_settings();
             let integration = SourcepointIntegration::new(Arc::new(config()));
             for content_type in ["application/javascript", "text/html"] {
                 let client = Arc::new(StreamingHttpClient::new());
@@ -1563,13 +1561,12 @@ mod tests {
                 let services = build_services_with_http_client(client.clone());
 
                 let response = integration
-                    .handle(
-                        &settings,
-                        &services,
+                    .route(
                         make_req(
                             Method::GET,
                             "https://publisher.example.com/integrations/sourcepoint/cdn/asset",
                         ),
+                        &services,
                     )
                     .await
                     .expect("should pass through a declared oversized response");
@@ -1600,7 +1597,6 @@ mod tests {
     #[test]
     fn handle_keeps_ineligible_responses_streaming() {
         futures::executor::block_on(async {
-            let settings = create_test_settings();
             for (content_type, method, status, rewrite_sdk) in [
                 ("application/json", Method::GET, 200, true),
                 ("text/css", Method::GET, 200, true),
@@ -1638,7 +1634,7 @@ mod tests {
                 set_req_header(&mut request, header::ACCEPT_ENCODING, "gzip, br");
 
                 let response = integration
-                    .handle(&settings, &services, request)
+                    .route(request, &services)
                     .await
                     .expect("should pass through an ineligible response");
 
@@ -1684,7 +1680,6 @@ mod tests {
     #[test]
     fn handle_rewrites_on_buffered_adapters_with_or_without_content_length() {
         futures::executor::block_on(async {
-            let settings = create_test_settings();
             let integration = SourcepointIntegration::new(Arc::new(config()));
             for has_length in [false, true] {
                 let client = Arc::new(StubHttpClient::new());
@@ -1702,13 +1697,12 @@ mod tests {
                 let services = build_services_with_http_client(client.clone());
 
                 let response = integration
-                    .handle(
-                        &settings,
-                        &services,
+                    .route(
                         make_req(
                             Method::GET,
                             "https://publisher.example.com/integrations/sourcepoint/cdn/wrapper.js",
                         ),
+                        &services,
                     )
                     .await
                     .expect("should rewrite a buffered response");
@@ -1753,7 +1747,6 @@ mod tests {
     #[test]
     fn handle_rejects_buffered_overflow_without_content_length() {
         futures::executor::block_on(async {
-            let settings = create_test_settings();
             let integration = SourcepointIntegration::new(Arc::new(config()));
             for content_type in ["application/javascript", "text/html"] {
                 let client = Arc::new(StubHttpClient::new());
@@ -1765,13 +1758,12 @@ mod tests {
                 let services = build_services_with_http_client(client.clone());
 
                 let error = integration
-                    .handle(
-                        &settings,
-                        &services,
+                    .route(
                         make_req(
                             Method::GET,
                             "https://publisher.example.com/integrations/sourcepoint/cdn/asset",
                         ),
+                        &services,
                     )
                     .await
                     .expect_err("should reject a buffered body over the rewrite limit");
@@ -1793,7 +1785,6 @@ mod tests {
     #[test]
     fn handle_javascript_cache_policy_follows_static_path_classification() {
         futures::executor::block_on(async {
-            let settings = create_test_settings();
             let integration = SourcepointIntegration::new(Arc::new(config()));
             for (path, is_static) in [
                 ("/wrapper/v2/script", false),
@@ -1848,7 +1839,7 @@ mod tests {
                         }
 
                         let response = integration
-                            .handle(&settings, &services, request)
+                            .route(request, &services)
                             .await
                             .expect("should rewrite JavaScript with path-aware cache policy");
                         let expected_cache = if is_static && !sets_cookie {
@@ -1877,7 +1868,6 @@ mod tests {
     #[test]
     fn handle_site_data_requests_identity_and_preserves_dynamic_cache_policy() {
         futures::executor::block_on(async {
-            let settings = create_test_settings();
             let integration = SourcepointIntegration::new(Arc::new(config()));
             for (upstream_cache, forwarded_cookies, sets_cookie, expected_cache) in [
                 (Some("no-store"), false, false, "no-store"),
@@ -1919,7 +1909,7 @@ mod tests {
                 }
 
                 let response = integration
-                    .handle(&settings, &services, request)
+                    .route(request, &services)
                     .await
                     .expect("should rewrite dynamic site data");
 
@@ -1946,7 +1936,6 @@ mod tests {
     #[test]
     fn handle_preserves_invalid_utf8_bytes_and_headers() {
         futures::executor::block_on(async {
-            let settings = create_test_settings();
             let integration = SourcepointIntegration::new(Arc::new(config()));
             let client = Arc::new(StreamingHttpClient::new());
             let bytes = vec![b'a', 0xff, b'b'];
@@ -1962,13 +1951,12 @@ mod tests {
             let services = build_services_with_http_client(client.clone());
 
             let response = integration
-                .handle(
-                    &settings,
-                    &services,
+                .route(
                     make_req(
                         Method::GET,
                         "https://publisher.example.com/integrations/sourcepoint/cdn/wrapper.js",
                     ),
+                    &services,
                 )
                 .await
                 .expect("should retain non-UTF-8 content unchanged");

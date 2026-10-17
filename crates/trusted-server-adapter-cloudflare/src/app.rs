@@ -706,7 +706,13 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                     EdgeCacheHeader::CloudflareCdnCacheControl,
                 )
             } else if state.registry.has_route(&method, &path) {
-                let mut ec_context = EcContext::default();
+                // A module route is handed what was resolved for its request,
+                // the permissions among them, as the publisher path is.
+                let mut ec_context = match build_ec_context(&state.settings, &services, &req).await
+                {
+                    Ok(context) => context,
+                    Err(report) => return Ok(http_error(&report)),
+                };
                 state
                     .registry
                     .handle_proxy(ProxyDispatchInput {

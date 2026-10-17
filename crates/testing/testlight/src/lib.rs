@@ -197,21 +197,12 @@ pub fn register(
     ))
 }
 
-#[async_trait(?Send)]
-impl IntegrationProxy for TestlightIntegration {
-    fn integration_name(&self) -> &'static str {
-        TESTLIGHT_INTEGRATION_ID
-    }
-
-    fn routes(&self) -> Vec<IntegrationEndpoint> {
-        vec![self.post("/auction")]
-    }
-
-    async fn handle(
+impl TestlightIntegration {
+    async fn route(
         &self,
+        req: http::Request<EdgeBody>,
         settings: &Settings,
         services: &RuntimeServices,
-        req: http::Request<EdgeBody>,
     ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
         let (parts, body) = req.into_parts();
         let payload_bytes =
@@ -267,6 +258,25 @@ impl IntegrationProxy for TestlightIntegration {
                 Self::rebuild_response(parts, response_body, false)
             }
         }
+    }
+}
+
+#[async_trait(?Send)]
+impl IntegrationProxy for TestlightIntegration {
+    fn integration_name(&self) -> &'static str {
+        TESTLIGHT_INTEGRATION_ID
+    }
+
+    fn routes(&self) -> Vec<IntegrationEndpoint> {
+        vec![self.post("/auction")]
+    }
+
+    async fn handle(
+        &self,
+        call: trusted_server_core::module_context::ModuleCall<'_>,
+        req: http::Request<EdgeBody>,
+    ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
+        call.inject_with(self, req, Self::route)?.await
     }
 }
 
@@ -479,7 +489,7 @@ mod tests {
             );
 
             let response = integration
-                .handle(&settings, &services, req)
+                .route(req, &settings, &services)
                 .await
                 .expect("should proxy Testlight request");
 
@@ -543,10 +553,10 @@ mod tests {
             let settings = create_test_settings();
 
             let refused = testlight_integration()
-                .handle(
+                .route(
+                    testlight_auction_request(FOREIGN_CODED_EC_ID),
                     &settings,
                     &services,
-                    testlight_auction_request(FOREIGN_CODED_EC_ID),
                 )
                 .await
                 .expect_err("a foreign module code should not be proxied upstream");
@@ -574,10 +584,10 @@ mod tests {
             settings.ec.module_blocks.clear();
 
             let refused = testlight_integration()
-                .handle(
+                .route(
+                    testlight_auction_request(VALID_SYNTHETIC_ID),
                     &settings,
                     &services,
-                    testlight_auction_request(VALID_SYNTHETIC_ID),
                 )
                 .await
                 .expect_err("a deployment that creates no identifier should proxy none");
