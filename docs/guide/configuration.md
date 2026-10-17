@@ -448,6 +448,24 @@ is sent as it arrived, as before. When `origin_url` has a path, a request path
 with a `.` or `..` segment, in any percent-encoded spelling, is refused with
 `400` so no request reaches outside the folder.
 
+**Redirects**: When the origin answers with a redirect whose `Location` names
+the origin itself, the reader is sent to the same path, query and fragment on
+the scheme and host they asked for, so their browser stays on the deployment.
+An origin asked for `/news` that answers `Location:
+https://origin.publisher.com/news/` sends a reader of `www.publisher.com` to
+`https://www.publisher.com/news/`. The origin is named by the host in
+`origin_url`, with its port, or by `origin_host_header_override` where one is
+set. When `origin_url` has a path, a `Location` under that path comes back
+without it, and one outside it is left as the origin wrote it. A `Location`
+naming any other host, one that names no host (such as `/news/`), and the
+`Location` of a response that is not a redirect are also left as the origin
+wrote them. An origin reached over plain HTTP that redirects each request to
+the same address on `https`, and one that redirects its `directory_index` file
+back to its folder, make the reader's browser loop. Where a request addressing
+hook removes a path prefix, the reader is sent to an address without the
+prefix, which a Fastly service whose `__KEY` selector carries `{host}` answers
+`421` if every selector value misses (see One blob for each path).
+
 #### `origin_host_header_override`
 
 **Purpose**: Optional Host header to send to the publisher origin while still
@@ -457,6 +475,8 @@ connecting to the host in `origin_url`.
 
 - Connects, uses SNI, and checks certificates against `origin_url`
 - Sends the configured value as the outbound HTTP `Host` header
+- Is the name a redirect from the origin is compared with (see Redirects under
+  `origin_url`)
 - Useful when the origin endpoint expects a canonical publisher hostname
 
 **Format**: Hostname with optional port, without protocol, path, query, or fragment
@@ -2004,6 +2024,16 @@ A page takes the first entry that covers it and runs that entry's middleware
 alone. Entries are therefore written from the longest path to the entry with
 no path, and a folder is written with its closing slash, because `/news` also
 begins `/newsletter`.
+
+A serve middleware may set response headers as well as change the page. For
+that it is asked about a response the publisher path sends for a request path
+its entry covers, whatever the response's media type and whether or not it
+has a body, with the response's status and headers in hand, so a redirect
+reaches a middleware that rewrites its `Location`. A header it sets replaces
+one of the same name. A serve middleware is not asked about a refusal made
+before the origin is asked, such as the `405` for a method a signed origin
+does not take, about a page served from the template cache or the refusal of
+such a page, or about an answer made from an error.
 
 ```toml
 [[fetch]]
