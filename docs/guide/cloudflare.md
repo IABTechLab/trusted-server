@@ -59,5 +59,11 @@ store registries are also unwired, so EC KV lookup is not available.
 Forwarded client-IP headers are sanitized, but `[trusted_client_ip]` is not
 resolved. See the [API reference](./api-reference) for route-level behavior.
 
+With `[geo] module = "platform"` the Worker reads the location from the `cf-*`
+request headers and the region from `cf-region-code` alone, which Cloudflare's
+Add visitor location headers managed transform adds. Without that header a US
+visitor is placed in no state, so the rules `permissions.yaml` gives a US
+state do not apply to them.
+
 Compare the [Fastly](./fastly), [Spin](./spin), and [Axum](./axum-dev)
 adapter journeys.

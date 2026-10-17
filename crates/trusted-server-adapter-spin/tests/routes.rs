@@ -854,6 +854,25 @@ fn selecting_a_module_this_adapter_cannot_supply_fails_at_startup() {
     );
 }
 
+/// `[geo] module = "platform"` selects the host's own geo lookup, which Spin
+/// does not have, so startup refuses it rather than come up locating no
+/// request with the single-jurisdiction check skipped.
+#[test]
+fn selecting_the_platform_geo_lookup_fails_at_startup() {
+    let mut settings = test_settings();
+    settings.geo.module = Some("platform".to_owned());
+
+    let error = TrustedServerApp::routes_with_settings(settings)
+        .err()
+        .expect("should refuse the host's geo lookup on a host that has none");
+    let message = error.to_string();
+
+    assert!(
+        message.contains(r#"`[geo] module = "platform"`"#) && message.contains("has no geo lookup"),
+        "should name the setting and say the host has no geo lookup: {message}"
+    );
+}
+
 /// Regression test: a Next.js navigation with a pending auction must buffer to
 /// the structural body close. The Flight payload carries a literal `</body>`, so
 /// a parser-blind seam would inject bids early and split the RSC data.

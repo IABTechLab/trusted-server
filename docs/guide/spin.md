@@ -53,7 +53,8 @@ empty variable defaults fail closed. Spin's request-time store registry is
 currently unwired, so EC KV lookup and request-signing key variables are
 unavailable. Forwarded client-IP headers are sanitized, and Spin derives its
 runtime authority, scheme, and client-address headers in the innermost
-normalization layer.
+normalization layer. Spin has no geo lookup, so `[geo] module = "platform"` is
+refused at startup.
 
 Spin is not installed in the integration CI environment. The recurring manual
 smoke therefore needs a named owner, tested commit, exact tool versions, and an

@@ -896,6 +896,8 @@ module, so it sits directly in `[geo]`.
 
 No module is the default, so a default deployment is not tied to any host geo service. A module from a crate at `crates/geo/<name>` is written `<name>` or `geo.<name>`, and the crate's own module has to be selected in the section of its type as well. Naming a module this deployment does not run fails at startup, with the geo modules it does run. A failed geo lookup at request time resolves every permission to the requires-signal floor and is logged at error level, so an outage is handled protectively.
 
+**What `platform` selects.** On Fastly it is Fastly's geo lookup of the client address. On Cloudflare the location is read from the `cf-*` request headers, and the region from `cf-region-code` alone, which Cloudflare's Add visitor location headers managed transform adds. Without that header a US visitor is placed in no state, so the rules `permissions.yaml` gives a US state, and the opt-out signals they read, do not apply. The Axum dev server and Spin have no geo lookup, and refuse `platform` at startup naming the setting.
+
 **Example**:
 
 ```toml
