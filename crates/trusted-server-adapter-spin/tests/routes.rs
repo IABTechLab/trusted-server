@@ -912,6 +912,103 @@ async fn admin_route_with_wrong_credentials_returns_401() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn permissions_endpoint_answers_anyone_as_data_and_as_a_page() {
+    for (path, content_type) in [
+        ("/_ts/permissions.json", "application/json"),
+        ("/_ts/permissions", "text/html; charset=utf-8"),
+    ] {
+        let req = request_builder()
+            .method("GET")
+            .uri(path)
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build request");
+        let resp = route(test_router(), req).await;
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "{path} should answer with no credential"
+        );
+        assert_eq!(
+            resp.headers()["content-type"],
+            content_type,
+            "{path} should answer in its own form"
+        );
+        assert_eq!(
+            resp.headers()["cache-control"],
+            "no-store",
+            "{path} is one request's own answer"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_endpoint_answers_anyone_and_masks_secrets() {
+    for (path, content_type) in [
+        ("/_ts/config.json", "application/json"),
+        ("/_ts/config", "text/html; charset=utf-8"),
+    ] {
+        let req = request_builder()
+            .method("GET")
+            .uri(path)
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build request");
+        let resp = route(test_router(), req).await;
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "{path} should answer with no credential"
+        );
+        assert_eq!(
+            resp.headers()["content-type"],
+            content_type,
+            "{path} should answer in its own form"
+        );
+        let body = resp.into_body().into_bytes().unwrap_or_default();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("XXXX"),
+            "{path} should mask what it does not show"
+        );
+        assert!(
+            !text.contains("admin-pass"),
+            "{path} should not carry the admin password"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn data_endpoint_answers_a_browser_opening_the_page_and_nothing_else() {
+    for (opened_as_a_page, expected) in [(false, 403), (true, 200)] {
+        let mut builder = request_builder().method("GET").uri("/_ts/data");
+        if opened_as_a_page {
+            builder = builder
+                .header("sec-fetch-mode", "navigate")
+                .header("sec-fetch-dest", "document");
+        }
+        let req = builder
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build request");
+        let resp = route(test_router(), req).await;
+        assert_eq!(
+            resp.status().as_u16(),
+            expected,
+            "opened as a page: {opened_as_a_page}"
+        );
+        assert_eq!(
+            resp.headers()["cache-control"],
+            "no-store, private",
+            "should never be stored"
+        );
+        let body = resp.into_body().into_bytes().unwrap_or_default();
+        assert_eq!(
+            String::from_utf8_lossy(&body).contains("keeps no record"),
+            opened_as_a_page,
+            "should say nothing is held to a browser opening the page, and to nothing else"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn discovery_endpoint_does_not_require_auth() {
     let router = test_router();
     let req = request_builder()

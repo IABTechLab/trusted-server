@@ -21,6 +21,11 @@ use trusted_server_core::ec::admin::{
 use trusted_server_core::ec::module::ensure_module_available;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
+use trusted_server_core::inspect::config::{CONFIG_JSON_PATH, CONFIG_PAGE_PATH, handle_config};
+use trusted_server_core::inspect::data::{DATA_PAGE_PATH, handle_data};
+use trusted_server_core::inspect::permissions::{
+    PERMISSIONS_JSON_PATH, PERMISSIONS_PAGE_PATH, handle_permissions,
+};
 use trusted_server_core::integrations::{
     IntegrationBuilder, IntegrationRegistry, ProxyDispatchInput,
 };
@@ -447,6 +452,9 @@ fn fallback_handler(
 enum NamedRouteHandler {
     TrustedServerDiscovery,
     VerifySignature,
+    Permissions,
+    Config,
+    Data,
     AdminNotSupported,
     CachePurgeNotSupported,
     AdminEcNotSupported,
@@ -478,7 +486,7 @@ const LEGACY_ADMIN_DENY_METHODS: &[Method] = &[
     Method::DELETE,
 ];
 
-fn named_routes() -> [NamedRoute; 17] {
+fn named_routes() -> [NamedRoute; 22] {
     [
         NamedRoute {
             path: "/.well-known/trusted-server.json",
@@ -489,6 +497,35 @@ fn named_routes() -> [NamedRoute; 17] {
             path: "/verify-signature",
             primary_methods: &[Method::POST],
             handler: NamedRouteHandler::VerifySignature,
+        },
+        // What the deployment decided for the asking request, shown to anyone.
+        NamedRoute {
+            path: PERMISSIONS_PAGE_PATH,
+            primary_methods: &[Method::GET],
+            handler: NamedRouteHandler::Permissions,
+        },
+        NamedRoute {
+            path: PERMISSIONS_JSON_PATH,
+            primary_methods: &[Method::GET],
+            handler: NamedRouteHandler::Permissions,
+        },
+        // The settings the deployment is running, masked, shown to anyone.
+        NamedRoute {
+            path: CONFIG_PAGE_PATH,
+            primary_methods: &[Method::GET],
+            handler: NamedRouteHandler::Config,
+        },
+        NamedRoute {
+            path: CONFIG_JSON_PATH,
+            primary_methods: &[Method::GET],
+            handler: NamedRouteHandler::Config,
+        },
+        // What is held against the request's own Edge Cookie. This adapter
+        // keeps no identity graph, so the page says nothing is held.
+        NamedRoute {
+            path: DATA_PAGE_PATH,
+            primary_methods: &[Method::GET],
+            handler: NamedRouteHandler::Data,
         },
         // Canonical admin key routes. These match `Settings::ADMIN_ENDPOINTS`
         // and the production basic-auth handler regex (`^/_ts/admin`), so they
@@ -611,6 +648,11 @@ fn named_route_handler(
                     NamedRouteHandler::VerifySignature => {
                         handle_verify_signature(&state.settings, &services, req)
                     }
+                    NamedRouteHandler::Permissions => {
+                        handle_permissions(&state.settings, &services, &req).await
+                    }
+                    NamedRouteHandler::Config => Ok(handle_config(&state.settings, &req)),
+                    NamedRouteHandler::Data => handle_data(None, None, &req),
                     NamedRouteHandler::CachePurgeNotSupported => {
                         // The Axum dev server has no template cache to purge. 501 rather
                         // than a fallthrough 404, so a CMS webhook can tell "not supported

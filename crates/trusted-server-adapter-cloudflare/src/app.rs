@@ -27,6 +27,9 @@ use trusted_server_core::ec::admin::{
 use trusted_server_core::ec::module::{EdgeCookieModule, build_reusable_module};
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::{IntoHttpResponse as _, TrustedServerError};
+use trusted_server_core::inspect::config::{CONFIG_PATHS, handle_config};
+use trusted_server_core::inspect::data::{DATA_PAGE_PATH, handle_data};
+use trusted_server_core::inspect::permissions::{PERMISSIONS_PATHS, handle_permissions};
 use trusted_server_core::integrations::{
     IntegrationBuilder, IntegrationRegistry, ProxyDispatchInput,
 };
@@ -926,6 +929,32 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             router = router.route(path, Method::GET, page_bids.clone());
             router = router.route(path, Method::OPTIONS, page_bids_preflight.clone());
         }
+
+        // What the deployment decided for the asking request, shown to anyone
+        // as a page and as data. Read only, so nothing is written for the
+        // reader.
+        let permissions = make_handler(Arc::clone(&state), |s, services, req| async move {
+            handle_permissions(&s.settings, &services, &req).await
+        });
+        for path in PERMISSIONS_PATHS {
+            router = router.route(path, Method::GET, permissions.clone());
+        }
+
+        // The settings the deployment is running, masked, shown to anyone as
+        // a page and as data.
+        let config = make_handler(Arc::clone(&state), |s, _services, req| async move {
+            Ok(handle_config(&s.settings, &req))
+        });
+        for path in CONFIG_PATHS {
+            router = router.route(path, Method::GET, config.clone());
+        }
+
+        // What is held against the request's own Edge Cookie. This adapter
+        // keeps no identity graph, so the page says nothing is held.
+        let data = make_handler(Arc::clone(&state), |_s, _services, req| async move {
+            handle_data(None, None, &req)
+        });
+        router = router.route(DATA_PAGE_PATH, Method::GET, data);
 
         let cache_purge_unsupported =
             make_handler(Arc::clone(&state), |_s, _services, _req| async move {

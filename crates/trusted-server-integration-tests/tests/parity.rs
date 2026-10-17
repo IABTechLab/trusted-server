@@ -440,6 +440,206 @@ async fn discovery_route_body_is_json_parity() {
     }
 }
 
+/// The configuration view is built by core from the settings alone, so
+/// every adapter shows the same one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn config_endpoint_parity() {
+    use http_body_util::BodyExt as _;
+    use serde_json::Value;
+
+    const PATH: &str = "/_ts/config.json";
+
+    let (axum_status, axum_body) = {
+        let mut svc = EdgeZeroAxumService::new(axum_router());
+        let req = AxumRequest::builder()
+            .method("GET")
+            .uri(PATH)
+            .body(AxumBody::empty())
+            .expect("should build GET request");
+        let resp = svc
+            .ready()
+            .await
+            .expect("should be ready")
+            .call(req)
+            .await
+            .expect("should respond");
+        let status = resp.status().as_u16();
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .expect("should collect body")
+            .to_bytes();
+        (status, body)
+    };
+    let (cf_status, cf_body) = {
+        let req = request_builder()
+            .method("GET")
+            .uri(PATH)
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build GET request");
+        let resp = cf_router().oneshot(req).await.expect("should respond");
+        let status = resp.status().as_u16();
+        (status, resp.into_body().into_bytes().unwrap_or_default())
+    };
+    let (spin_status, _, spin_body) = spin_get_body(PATH).await;
+
+    assert_eq!(axum_status, 200, "Axum should answer {PATH}");
+    assert_eq!(cf_status, 200, "Cloudflare should answer {PATH}");
+    assert_eq!(spin_status, 200, "Spin should answer {PATH}");
+
+    let axum: Value = serde_json::from_slice(&axum_body).expect("Axum should answer JSON");
+    let cf: Value = serde_json::from_slice(&cf_body).expect("Cloudflare should answer JSON");
+    let spin: Value = serde_json::from_slice(&spin_body).expect("Spin should answer JSON");
+    assert_eq!(axum, cf, "{PATH} must match across adapters (axum, cf)");
+    assert_eq!(cf, spin, "{PATH} must match across adapters (cf, spin)");
+    assert_eq!(
+        axum["settings"]["publisher"]["proxy_secret"], "XXXX",
+        "a secret should be masked"
+    );
+    assert!(
+        !String::from_utf8_lossy(&axum_body).contains("parity-test-proxy-secret"),
+        "the view should not carry the secret anywhere"
+    );
+}
+
+/// Whether a request is a browser opening the page is core's decision, and
+/// none of these three adapters keeps an identity graph, so each refuses and
+/// answers alike.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn data_endpoint_parity() {
+    use http_body_util::BodyExt as _;
+
+    const PATH: &str = "/_ts/data";
+    const OPENED_AS_A_PAGE: [(&str, &str); 2] = [
+        ("sec-fetch-mode", "navigate"),
+        ("sec-fetch-dest", "document"),
+    ];
+
+    async fn edge(
+        router: RouterService,
+        headers: &[(&str, &str)],
+    ) -> (u16, Option<http::HeaderValue>, bytes::Bytes) {
+        let mut builder = request_builder().method("GET").uri(PATH);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let req = builder
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build GET request");
+        let resp = router.oneshot(req).await.expect("should respond");
+        (
+            resp.status().as_u16(),
+            resp.headers().get("content-security-policy").cloned(),
+            resp.into_body().into_bytes().unwrap_or_default(),
+        )
+    }
+
+    for (headers, expected) in [(&[][..], 403), (&OPENED_AS_A_PAGE[..], 200)] {
+        let axum = {
+            let mut svc = EdgeZeroAxumService::new(axum_router());
+            let mut builder = AxumRequest::builder().method("GET").uri(PATH);
+            for (name, value) in headers {
+                builder = builder.header(*name, *value);
+            }
+            let req = builder
+                .body(AxumBody::empty())
+                .expect("should build GET request");
+            let resp = svc
+                .ready()
+                .await
+                .expect("should be ready")
+                .call(req)
+                .await
+                .expect("should respond");
+            let status = resp.status().as_u16();
+            let policy = resp.headers().get("content-security-policy").cloned();
+            let body = resp
+                .into_body()
+                .collect()
+                .await
+                .expect("should collect body")
+                .to_bytes();
+            (status, policy, body)
+        };
+        let cf = edge(cf_router(), headers).await;
+        let spin = edge(spin_router(), headers).await;
+
+        assert_eq!(
+            axum.0, expected,
+            "Axum should answer {PATH} with {expected}"
+        );
+        assert_eq!(axum, cf, "{PATH} must match across adapters (axum, cf)");
+        assert_eq!(cf, spin, "{PATH} must match across adapters (cf, spin)");
+        assert!(
+            axum.1
+                .as_ref()
+                .and_then(|policy| policy.to_str().ok())
+                .is_some_and(|policy| policy.starts_with("sandbox;")),
+            "every answer should be in an origin of its own"
+        );
+    }
+}
+
+/// The permissions a request resolves to are core's decision, so the
+/// endpoint that shows them answers the same on every adapter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn permissions_endpoint_parity() {
+    use http_body_util::BodyExt as _;
+    use serde_json::Value;
+
+    const PATH: &str = "/_ts/permissions.json";
+
+    let (axum_status, axum_body) = {
+        let mut svc = EdgeZeroAxumService::new(axum_router());
+        let req = AxumRequest::builder()
+            .method("GET")
+            .uri(PATH)
+            .body(AxumBody::empty())
+            .expect("should build GET request");
+        let resp = svc
+            .ready()
+            .await
+            .expect("should be ready")
+            .call(req)
+            .await
+            .expect("should respond");
+        let status = resp.status().as_u16();
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .expect("should collect body")
+            .to_bytes();
+        (status, body)
+    };
+    let (cf_status, cf_body) = {
+        let req = request_builder()
+            .method("GET")
+            .uri(PATH)
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build GET request");
+        let resp = cf_router().oneshot(req).await.expect("should respond");
+        let status = resp.status().as_u16();
+        (status, resp.into_body().into_bytes().unwrap_or_default())
+    };
+    let (spin_status, _, spin_body) = spin_get_body(PATH).await;
+
+    assert_eq!(axum_status, 200, "Axum should answer {PATH}");
+    assert_eq!(cf_status, 200, "Cloudflare should answer {PATH}");
+    assert_eq!(spin_status, 200, "Spin should answer {PATH}");
+
+    let axum: Value = serde_json::from_slice(&axum_body).expect("Axum should answer JSON");
+    let cf: Value = serde_json::from_slice(&cf_body).expect("Cloudflare should answer JSON");
+    let spin: Value = serde_json::from_slice(&spin_body).expect("Spin should answer JSON");
+    assert_eq!(axum, cf, "{PATH} must match across adapters (axum, cf)");
+    assert_eq!(cf, spin, "{PATH} must match across adapters (cf, spin)");
+    assert!(
+        axum["set"].is_array() && axum["awaiting"].is_array(),
+        "the resolution should say what is set and what is awaited"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn verify_signature_route_parity() {
     // known divergence: without real signing-key configuration the handler may
