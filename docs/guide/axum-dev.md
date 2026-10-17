@@ -66,7 +66,10 @@ Axum sanitizes forwarded client-IP headers but does not resolve
 [adapter matrix](./api-reference#adapter-and-startup-support). The modules'
 request filters and the device module `[device]` selects run as on Fastly,
 and `[device] module = "platform"` classifies from the `User-Agent`, because
-the dev server supplies no TLS or HTTP/2 signals.
+the dev server supplies no TLS or HTTP/2 signals. An Edge Cookie module
+creates and writes its cookie with no identity graph behind it, and
+`POST /_ts/api/v1/ec/resolve` creates none, answering `204` where it would
+answer `200`.
 
 For an edge deployment, use the [Fastly](./fastly),
 [Cloudflare](./cloudflare), or [Spin](./spin) guide.
