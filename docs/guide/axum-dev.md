@@ -65,5 +65,11 @@ Axum sanitizes forwarded client-IP headers but does not resolve
 `[trusted_client_ip]`; see the
 [adapter matrix](./api-reference#adapter-and-startup-support).
 
+Axum always verifies HTTPS origin certificates against the public certificate
+authorities built into its client. It does not honor
+`proxy.certificate_check = false` and logs a warning at startup when the
+setting is off, so an origin whose certificate is self-signed or issued by a
+private authority cannot be reached through it.
+
 For an edge deployment, use the [Fastly](./fastly),
 [Cloudflare](./cloudflare), or [Spin](./spin) guide.
