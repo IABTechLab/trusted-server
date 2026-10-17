@@ -509,20 +509,36 @@ fn validate_secret_key_references(
         )?;
     }
 
-    // Each setting a selected module declares as naming a secret, where the
-    // module's table puts it to use.
+    // Each setting a running builder declares as naming a secret, where the
+    // builder's table puts it to use. A vendor's shared table runs the
+    // builders that carry its mark, and a section runs the module it selects.
     for builder in crate::integrations::all_builders(extra_integrations) {
         let secrets = builder.secret_settings();
-        let Some((section, written)) = builder
-            .module_name()
-            .filter(|_| !secrets.is_empty())
-            .and_then(|name| settings.module_selection(name))
-        else {
+        if secrets.is_empty() {
             continue;
+        }
+        let (place, table) = if let Some(vendor) = builder.shared_settings() {
+            let Some(table) = settings.shared.table(vendor) else {
+                continue;
+            };
+            (
+                format!("{}.{vendor}", crate::settings::SHARED_TYPE),
+                table.clone(),
+            )
+        } else {
+            let Some((section, written)) = builder
+                .module_name()
+                .and_then(|name| settings.module_selection(name))
+            else {
+                continue;
+            };
+            (
+                format!("{section}.{written}"),
+                settings.section_table(section, written),
+            )
         };
-        let table = settings.section_table(section, written);
         for secret in secrets.iter().filter(|secret| (secret.in_use)(&table)) {
-            let path = format!("{section}.{written}.{}", secret.path.join("."));
+            let path = format!("{place}.{}", secret.path.join("."));
             let reference = crate::module_secrets::value_at(&table, secret.path)
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| missing_secret_key_reference(&path))?;
@@ -1731,6 +1747,63 @@ passphrase = "production-secret-key-32-bytes-min"
                 }
                 None => result.unwrap_or_else(|error| {
                     panic!("should accept {table}: {error:?}");
+                }),
+            }
+        }
+    }
+
+    /// A builder its vendor's shared table runs, which declares a secret in
+    /// that table.
+    fn shared_builder_with_a_secret() -> IntegrationBuilder {
+        IntegrationBuilder::new(
+            "probe",
+            "example-crate",
+            crate::integrations::registry_test_support::probe_registration,
+            crate::integrations::registry_test_support::validate_nothing,
+        )
+        .with_shared_settings("probe")
+        .with_secret_settings(MODULE_SECRETS)
+    }
+
+    #[test]
+    fn deploy_validation_refuses_a_shared_table_s_secret_setting_in_use_that_names_no_key() {
+        for (table, expected) in [
+            (
+                Some(serde_json::json!({ "lock": true })),
+                Some("shared.probe.spare.key_name"),
+            ),
+            (
+                Some(serde_json::json!({ "lock": true, "spare": { "key_name": "  " } })),
+                Some("shared.probe.spare.key_name"),
+            ),
+            (
+                Some(serde_json::json!({ "lock": true, "spare": { "key_name": "vendor_key" } })),
+                None,
+            ),
+            // A setting the table does not put to use is not checked.
+            (Some(serde_json::json!({ "lock": false })), None),
+            // Without its table the builder does not run.
+            (None, None),
+        ] {
+            let mut settings = valid_settings();
+            if let Some(table) = &table {
+                settings.shared = serde_json::from_value(serde_json::json!({ "probe": table }))
+                    .expect("should read the shared table");
+            }
+
+            let result =
+                validate_settings_for_deploy_with(&settings, &[shared_builder_with_a_secret()]);
+
+            match expected {
+                Some(path) => {
+                    let error = result.expect_err("should refuse a setting that names no key");
+                    assert!(
+                        format!("{error:?}").contains(path),
+                        "should name the setting for {table:?}: {error:?}"
+                    );
+                }
+                None => result.unwrap_or_else(|error| {
+                    panic!("should accept {table:?}: {error:?}");
                 }),
             }
         }
