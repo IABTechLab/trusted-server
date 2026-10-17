@@ -34,6 +34,7 @@ commands are shown explicitly.
 | `ts config diff`                 | Linux + macOS | Diff `trusted-server.toml` against the live `EdgeZero` config                                    | `ts config diff [OPTIONS] --adapter <ADAPTER>`                                                                 |
 | `ts config gc`                   | Linux + macOS | Reclaim orphaned chunk entries leaked from prior oversized pushes                                | `ts config gc [OPTIONS] --adapter <ADAPTER>`                                                                   |
 | `ts config init`                 | Linux + macOS | Initialize a Trusted Server config file from the example template                                | `ts config init [OPTIONS]`                                                                                     |
+| `ts config migrate`              | Linux + macOS | Rewrite a config written for an earlier release into the shape this release reads                | `ts config migrate [OPTIONS] <FILE>`                                                                           |
 | `ts config push`                 | Linux + macOS | Push `trusted-server.toml` as a blob envelope through `EdgeZero`                                 | `ts config push [OPTIONS] --adapter <ADAPTER>`                                                                 |
 | `ts config validate`             | Linux + macOS | Validate `edgezero.toml` and the typed Trusted Server config                                     | `ts config validate [OPTIONS]`                                                                                 |
 | `ts deploy`                      | Linux + macOS | Deploy the project through a target adapter                                                      | `ts deploy [OPTIONS] --adapter <ADAPTER> [-- <ADAPTER_ARGS>...]`                                               |
@@ -163,6 +164,55 @@ window and no writer is targeting it. Unlike the other `config` subcommands,
 sweep, and `--store <id>` overrides the manifest's config-store id outright.
 Both change which store gets swept, so on a destructive run check the store id
 `gc` reports before passing `--yes`.
+
+### Upgrade a configuration written for an earlier release
+
+Run `ts config migrate` first when you upgrade. A configuration written for an
+earlier release does not load until its settings take the shape this release
+reads, and the command rewrites the ones it can.
+
+```bash
+# Print the migrated configuration, with what changed on stderr.
+ts config migrate trusted-server.toml > trusted-server.migrated.toml
+
+# Rewrite the file in place.
+ts config migrate --write trusted-server.toml
+
+# Change nothing, and exit 1 when the file needs migrating, for CI.
+ts config migrate --check trusted-server.toml
+```
+
+`config migrate <file>` prints the migrated configuration on stdout. On stderr it
+prints a line for each change it made, starting `changed:`, a line for each item
+the configuration cannot load without, starting `to do:`, and a line for each
+change in behavior no setting expresses, starting `check:`. Its last line says
+whether the migrated configuration passes the settings validation
+`ts config validate` runs. A `to do:` item needs a decision or a value the
+configuration does not hold, such as a `[[handlers]]` entry that guards a path
+of the publisher's own, so the command leaves that setting where it is.
+
+The command reads the file alone, with no manifest and no environment overlay.
+It keeps the comments and the order of the tables you wrote. A module that was
+not enabled is written under its new name as a comment block, and to run it you
+uncomment the block and select the module in the section of its type. The
+command never prints a value from the configuration, because a configuration
+can hold secrets. Each line names the setting, a failed validation gives only
+the byte offset or the phase that refused, and `ts config validate` prints the
+whole refusal. Migrating a migrated configuration changes nothing.
+
+It exits 0 when nothing is left to do and the migrated configuration passes
+validation, 1 when an item is left to do or the configuration does not pass,
+and 2 when the file cannot be read or is not TOML. With `--check` it exits 0
+when the configuration needs no migrating and 1 otherwise.
+
+After migrating:
+
+1. Do each `to do:` item, and read each `check:` item.
+2. Run `ts config validate`.
+3. Push the configuration with the new build, because a build from before this
+   release refuses the migrated configuration and this release refuses the old
+   one. On Fastly, `ts deploy --staging` and `ts config push --staging` let you
+   check the pair together first.
 
 ### Diagnose ad-template configuration
 
