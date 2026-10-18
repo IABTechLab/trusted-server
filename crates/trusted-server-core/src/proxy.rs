@@ -5525,8 +5525,14 @@ mod tests {
                 build_http_request(Method::GET, "https://www.example.com/.images/site.css");
 
             // Nothing is queued, so the stub fails the origin request.
-            let Err(error) =
-                handle_asset_proxy_request(&settings, &services, request, &route).await
+            let Err(error) = handle_asset_proxy_request(
+                &settings,
+                &services,
+                request,
+                &route,
+                &origin_source_of(&route),
+            )
+            .await
             else {
                 panic!("should fail when the origin request fails");
             };
