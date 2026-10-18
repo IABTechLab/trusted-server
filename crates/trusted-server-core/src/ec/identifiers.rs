@@ -236,17 +236,18 @@ mod tests {
         }
     }
 
-    /// A module that answers what it was built with.
+    /// A module that answers the identifiers it was built with, under a
+    /// fixed name as every module has.
     #[derive(Debug)]
-    struct Fixed(&'static str, Vec<Eid>);
+    struct Fixed(Vec<Eid>);
 
     impl IdentifierModule for Fixed {
         fn id(&self) -> &'static str {
-            self.0
+            "testing.fixed"
         }
 
         fn identifiers(&self, _call: ModuleCall<'_>) -> Result<Vec<Eid>, Withheld> {
-            Ok(self.1.clone())
+            Ok(self.0.clone())
         }
     }
 
@@ -277,14 +278,8 @@ mod tests {
     #[test]
     fn learn_asks_each_module_in_order_and_keeps_their_order() {
         let modules: Vec<Arc<dyn IdentifierModule>> = vec![
-            Arc::new(Fixed(
-                "testing.first",
-                vec![eid("id5-sync.com", &["ID5_abc"])],
-            )),
-            Arc::new(Fixed(
-                "testing.second",
-                vec![eid("liveramp.com", &["LR_xyz"])],
-            )),
+            Arc::new(Fixed(vec![eid("id5-sync.com", &["ID5_abc"])])),
+            Arc::new(Fixed(vec![eid("liveramp.com", &["LR_xyz"])])),
         ];
 
         let learned = learn(ModuleContext::empty(), &modules);
@@ -322,10 +317,7 @@ mod tests {
     fn learn_skips_a_module_whose_call_withholds_what_it_names() {
         let modules: Vec<Arc<dyn IdentifierModule>> = vec![
             Arc::new(FromCookie),
-            Arc::new(Fixed(
-                "testing.fixed",
-                vec![eid("id5-sync.com", &["ID5_abc"])],
-            )),
+            Arc::new(Fixed(vec![eid("id5-sync.com", &["ID5_abc"])])),
         ];
 
         let learned = learn(ModuleContext::empty(), &modules);
