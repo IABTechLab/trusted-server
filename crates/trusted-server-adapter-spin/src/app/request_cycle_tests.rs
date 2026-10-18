@@ -2,8 +2,8 @@
 //! its router: the request filters run before the route and their response
 //! effects after the finalize headers, the route's module call carries the
 //! device classification, robots.txt is answered ahead of both, and the
-//! Edge Cookie is created and written for a real browser's page view and
-//! expired on a withdrawal.
+//! Edge Cookie is created and written for a real browser's page view, set by
+//! the resolve route for a client-side module and expired on a withdrawal.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
@@ -15,6 +15,7 @@ use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::addressing::addressed_router;
 use trusted_server_core::ec::device::{DeviceModule, DeviceSignals};
+use trusted_server_core::ec::module::{EdgeCookieModule, GeneratedEdgeCookie, ModuleCode};
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::evidence::RequestInfo;
 use trusted_server_core::integrations::{
@@ -23,6 +24,7 @@ use trusted_server_core::integrations::{
     RequestFilterInput,
 };
 use trusted_server_core::module_context::ModuleCall;
+use trusted_server_core::permissions::{Permission, PermissionSet};
 use trusted_server_core::platform::test_support::{
     NoopConfigStore, NoopSecretStore, StubBackend, StubHttpClient, build_services_with_http_client,
 };
@@ -675,6 +677,126 @@ async fn the_resolve_route_answers() {
     );
     assert_eq!(edge_cookie(&own), None);
 
+    assert!(
+        origin.recorded_request_uris().is_empty(),
+        "the resolve route should be answered here, never by the origin"
+    );
+}
+
+/// The id and module name of an Edge Cookie module that creates nothing at
+/// the edge and takes its identifier from the value the page posts, as a
+/// client-side module does.
+const POSTED_VALUE_ID: &str = "posted_value";
+const POSTED_VALUE_MODULE: &str = "testing.posted-value";
+
+/// The value the page posts, which the module takes as its identifier.
+const POSTED_VALUE: &str = "a-posted-value";
+
+#[derive(Debug)]
+struct PostedValueModule;
+
+#[async_trait::async_trait(?Send)]
+impl EdgeCookieModule for PostedValueModule {
+    fn id(&self) -> &'static str {
+        POSTED_VALUE_MODULE
+    }
+
+    fn code(&self) -> ModuleCode {
+        trusted_server_core::module_code!("t0pv")
+    }
+
+    async fn generate(
+        &self,
+        _call: ModuleCall<'_>,
+    ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+        Ok(GeneratedEdgeCookie::default())
+    }
+
+    async fn resolve_from_client(
+        &self,
+        _call: ModuleCall<'_>,
+        payload: &[u8],
+    ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+        Ok(GeneratedEdgeCookie {
+            id: (payload == POSTED_VALUE.as_bytes()).then(|| POSTED_VALUE.to_owned()),
+            response_headers: Vec::new(),
+        })
+    }
+
+    fn accepts_id(&self, value: &str) -> bool {
+        value == POSTED_VALUE
+    }
+
+    fn required_permissions(&self) -> PermissionSet {
+        PermissionSet::none().with(Permission::StoreOnDevice)
+    }
+}
+
+fn register_posted_value(
+    _settings: &Settings,
+) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
+    Ok(Some(
+        IntegrationRegistration::builder(POSTED_VALUE_ID)
+            .without_js()
+            .with_ec_module(POSTED_VALUE_MODULE, Arc::new(PostedValueModule))
+            .build(),
+    ))
+}
+
+fn posted_value_builder() -> IntegrationBuilder {
+    IntegrationBuilder::new(
+        POSTED_VALUE_ID,
+        "adapter-tests",
+        register_posted_value,
+        always,
+    )
+    .with_module_name(POSTED_VALUE_MODULE)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_resolve_route_sets_a_client_side_module_s_edge_cookie() {
+    let mut settings = settings_for_a_reader();
+    settings.select_module("testing", POSTED_VALUE_MODULE);
+    settings.ec.module = Some(POSTED_VALUE_MODULE.into());
+    settings.ec.module_blocks.clear();
+    let origin = Arc::new(StubHttpClient::new());
+    let router = router_for(
+        settings,
+        &[posted_value_builder()],
+        services_for_a_reader(&origin),
+    );
+    let resolve = request_builder()
+        .method("POST")
+        .uri("https://test-publisher.example.com/_ts/api/v1/ec/resolve")
+        .header("host", "test-publisher.example.com")
+        .header("origin", "https://test-publisher.example.com")
+        .header("content-type", "text/plain")
+        .header("user-agent", BROWSER)
+        .body(Body::from(POSTED_VALUE))
+        .expect("should build the resolve request");
+
+    let response = route(&router, resolve).await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the module's identifier should be set with no identity graph"
+    );
+    assert_eq!(header(&response, "cache-control"), Some("no-store"));
+    let cookie = edge_cookie(&response).expect("the resolve route should set the Edge Cookie");
+    assert!(
+        cookie.starts_with("ts-ec=t0pv~a-posted-value;"),
+        "the Edge Cookie should carry the module's coded identifier: {cookie}"
+    );
+    assert!(
+        response
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .any(|line| line.starts_with("ts-ecr=1;")),
+        "the resolved marker should be set beside the Edge Cookie"
+    );
     assert!(
         origin.recorded_request_uris().is_empty(),
         "the resolve route should be answered here, never by the origin"

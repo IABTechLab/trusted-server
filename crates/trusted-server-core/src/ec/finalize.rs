@@ -2259,7 +2259,16 @@ mod tests {
         // the orphan's key, so nothing later treats the miss as authoritative.
         let settings = create_test_settings();
         let hmac_orphan = sample_ec_id("orphn2");
-        let cases: [(&str, EcContext, KvIdentityGraph); 3] = [
+        let cases: [(&str, EcContext, KvIdentityGraph); 4] = [
+            (
+                "a client-side module, which creates nothing at the edge",
+                orphan_context(
+                    "cfix~an-ec",
+                    Some("192.0.2.10"),
+                    std::sync::Arc::new(crate::ec::module::ClientFixedModule),
+                ),
+                KvIdentityGraph::in_memory("test_store"),
+            ),
             (
                 "the HMAC module with no client IP",
                 orphan_context(&hmac_orphan, None, crate::ec::tests::hmac_module()),
