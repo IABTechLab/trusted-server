@@ -316,14 +316,32 @@ fn every_declared_core_secret_is_masked_and_never_served() {
             );
         }
         let view = view(&settings);
+        // A failure lists the paths that are not masked, never the value
+        // the view holds at them.
+        let mut unmasked = Vec::new();
+        let mut unlisted = Vec::new();
         for path in record.paths() {
             let rendered = render_path(path);
             if let Some(value) = at(&view.settings, &rendered) {
-                assert_eq!(value, MASK, "{name}: {rendered}");
-                assert!(is_masked(&view, &rendered), "{name}: {rendered}");
+                if value != MASK {
+                    unmasked.push(rendered.clone());
+                }
+                if !is_masked(&view, &rendered) {
+                    unlisted.push(rendered);
+                }
             }
             covered.insert(generalized(path));
         }
+        assert_eq!(
+            unmasked,
+            Vec::<String>::new(),
+            "{name}: the view should hold the mask at every secret's path"
+        );
+        assert_eq!(
+            unlisted,
+            Vec::<String>::new(),
+            "{name}: the view should list every secret's path as masked"
+        );
         let (json, page) = served(&settings);
         assert!(!json.contains(CANARY), "{name}: the JSON carries a secret");
         assert!(!page.contains(CANARY), "{name}: the page carries a secret");

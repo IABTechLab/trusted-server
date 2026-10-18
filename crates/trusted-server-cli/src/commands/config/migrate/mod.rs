@@ -1,9 +1,10 @@
 //! `ts config migrate`, which rewrites a settings document written for an
 //! earlier release into the shape this release reads.
 //!
-//! The rewrite works on the file alone, keeps the comments and the order
-//! the operator wrote, and leaves in place, with directions, every setting
-//! that needs a decision or a value the document does not hold. See
+//! The rewrite works on the file alone, for the adapter the deployment runs
+//! on, keeps the comments and the order the operator wrote, and leaves in
+//! place, with directions, every setting that needs a decision or a value
+//! the document does not hold. See
 //! `docs/superpowers/specs/2026-10-17-config-migrate-design.md`.
 
 mod layout;
@@ -26,12 +27,51 @@ use rules::{Migration, migrate};
 pub struct ConfigMigrateArgs {
     /// The settings document to migrate, such as `trusted-server.toml`.
     pub file: PathBuf,
+    /// The adapter the deployment runs on, which decides what main's location
+    /// lookup becomes.
+    #[arg(long, value_enum)]
+    pub adapter: Adapter,
     /// Rewrite the file in place, rather than print the migrated document.
     #[arg(long, conflicts_with = "check")]
     pub write: bool,
     /// Change nothing, and exit 1 when the document needs migrating.
     #[arg(long)]
     pub check: bool,
+}
+
+/// The adapter a deployment runs on.
+///
+/// Main's location lookup and location headers differed by adapter, and
+/// the Axum and Spin adapters refuse `[geo] module = "platform"` at startup
+/// because neither host has a location lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Adapter {
+    /// Fastly Compute.
+    Fastly,
+    /// Cloudflare Workers.
+    Cloudflare,
+    /// The Axum dev server.
+    Axum,
+    /// Spin.
+    Spin,
+}
+
+impl Adapter {
+    /// Whether the host has a location lookup of its own, which `[geo]
+    /// module = "platform"` selects.
+    pub(crate) const fn has_location_lookup(self) -> bool {
+        matches!(self, Self::Fastly | Self::Cloudflare)
+    }
+
+    /// The adapter as a line on stderr names it.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::Fastly => "Fastly",
+            Self::Cloudflare => "Cloudflare",
+            Self::Axum => "the Axum dev server",
+            Self::Spin => "Spin",
+        }
+    }
 }
 
 /// Migrates the document `args` names, printing the result on stdout and
@@ -62,7 +102,7 @@ pub(crate) fn run_with_writers(
 ) -> Result<RunOutcome, String> {
     let input = fs::read_to_string(&args.file)
         .map_err(|error| format!("failed to read {}: {error}", args.file.display()))?;
-    let migration = migrate(&input)
+    let migration = migrate(&input, args.adapter)
         .map_err(|error| format!("failed to read {}: {error}", args.file.display()))?;
     write_report(report, &migration)?;
 
