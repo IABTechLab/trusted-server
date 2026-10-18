@@ -464,8 +464,9 @@ held for other settings is never served. Trusted Server hashes it into the key
 the answer is held under, so nothing of it is written to the store.
 
 Every adapter classifies a request with the device module `[device]` selects,
-and a device module a registration offers is shown the User-Agent and the
-request's cookies to do so. In an auction it is also asked for the bid
+and a device module a registration offers is shown the client's IP address,
+the User-Agent and the request's cookies to do so, with the request's method,
+scheme, host, path and query. In an auction it is also asked for the bid
 request's device attributes.
 
 The registry builds only the modules a section selects, so the module that
