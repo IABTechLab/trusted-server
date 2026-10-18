@@ -4,6 +4,7 @@
 //! device classification, robots.txt is answered ahead of both, the Edge
 //! Cookie is created and written for a real browser's page view, and a
 //! request under an asset route is answered from the route's own source.
+//! A source's `Host` that Spin cannot send is refused.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
@@ -30,6 +31,7 @@ use trusted_server_core::platform::{
     RuntimeServices, UnavailableKvStore,
 };
 use trusted_server_core::settings::Settings;
+use trusted_server_core::source::OriginSettings;
 use trusted_server_core::test_support::addressing::FirstSegment;
 
 use super::{build_router, build_state_with_registrations_and_services};
@@ -745,5 +747,99 @@ async fn a_request_outside_the_asset_routes_reaches_the_publisher_s_origin() {
             false
         )],
         "the publisher's origin should be asked, unsigned"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A source's `Host`
+// ---------------------------------------------------------------------------
+
+/// The services of a reader whose requests are registered through the
+/// backend this adapter's own services use, every request sent to `origin`.
+fn services_with_this_adapter_s_backend(origin: &Arc<StubHttpClient>) -> RuntimeServices {
+    RuntimeServices::builder()
+        .config_store(Arc::new(NoopConfigStore))
+        .secret_store(Arc::new(NoopSecretStore))
+        .kv_store(Arc::new(UnavailableKvStore))
+        .backend(Arc::new(crate::platform::NoopBackend))
+        .http_client(Arc::clone(origin) as Arc<dyn PlatformHttpClient>)
+        .geo(Arc::new(PlatformGeoModule::new(
+            "platform",
+            Arc::new(UsGeo),
+        )))
+        .client_info(ClientInfo::default())
+        .build()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_asset_route_whose_source_names_another_host_is_refused_before_its_origin_is_asked() {
+    let origin = Arc::new(StubHttpClient::new());
+    origin.push_response_with_headers(
+        200,
+        b"image bytes".to_vec(),
+        vec![("content-type", "image/png")],
+    );
+    let settings = settings_with(
+        r#"
+            [proxy]
+
+            [[proxy.asset_routes]]
+            prefix = "/assets/"
+
+            [proxy.asset_routes.source]
+            module = "origin"
+
+            [proxy.asset_routes.source.origin]
+            url = "https://assets.example.com"
+            host_header = "media.example.com"
+
+            [[proxy.asset_routes]]
+            prefix = "/media/"
+
+            [proxy.asset_routes.source]
+            module = "origin"
+
+            [proxy.asset_routes.source.origin]
+            url = "https://media.example.com"
+        "#,
+    );
+    let router = router_for(settings, &[], services_with_this_adapter_s_backend(&origin));
+
+    let refused = route(&router, get("/assets/logo.png", None)).await;
+    let served = route(&router, get("/media/logo.png", None)).await;
+
+    assert_eq!(
+        refused.status(),
+        StatusCode::BAD_GATEWAY,
+        "Spin cannot send the source's Host, so the route's request should be refused"
+    );
+    assert_eq!(header(&refused, "cache-control"), Some("no-store, private"));
+    assert_eq!(served.status(), StatusCode::OK);
+    assert_eq!(
+        origin.recorded_request_uris(),
+        ["https://media.example.com/media/logo.png"],
+        "only the route that sends its address's own Host should reach its origin"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_publisher_source_that_names_another_host_is_refused_before_its_origin_is_asked() {
+    let origin = origin_answering(1);
+    let mut settings = settings_with("");
+    let mut source = OriginSettings::new("https://origin.test-publisher.example.com");
+    source.host_header = Some("www.test-publisher.example.com".to_owned());
+    settings.source = source.selection();
+    let router = router_for(settings, &[], services_with_this_adapter_s_backend(&origin));
+
+    let response = route(&router, get("/article", None)).await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_GATEWAY,
+        "Spin cannot send the source's Host, so the page request should be refused"
+    );
+    assert!(
+        origin.recorded_request_uris().is_empty(),
+        "the publisher's origin should not be asked with the wrong Host"
     );
 }
