@@ -1408,6 +1408,21 @@ fn no_location_header_is_selected_for_the_operator() {
 }
 
 #[test]
+fn the_region_the_cloudflare_lookup_now_reads_is_reported_to_check() {
+    // Main's Cloudflare lookup set no region, so its US state rules never
+    // applied there.
+    for adapter in ADAPTERS {
+        let migration = migrated_on(adapter, MAIN_BASE);
+        assert_eq!(
+            reported(&migration.report.check, "`cf-region-code`"),
+            adapter == Adapter::Cloudflare,
+            "{adapter:?}: {:?}",
+            migration.report.check
+        );
+    }
+}
+
+#[test]
 fn a_document_already_in_the_new_shape_gets_no_location_lookup() {
     let input = r#"[publisher]
 domain = "publisher.example.com"

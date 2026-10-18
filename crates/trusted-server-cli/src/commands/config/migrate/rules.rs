@@ -1338,7 +1338,9 @@ impl Migrator {
     /// The host's location lookup main ran on every request, for a document
     /// written for main, on an adapter whose host has one. The Axum and Spin
     /// adapters refuse the selection, and main's lookup there located no
-    /// request, so the document gets no geo module there.
+    /// request, so the document gets no geo module there. Cloudflare's
+    /// lookup now reads the region, which main's did not, so the region
+    /// rules of `permissions.yaml` can apply there, and a check line says so.
     fn main_defaults(&mut self) {
         if !self.adapter.has_location_lookup() || self.root().contains_key("geo") {
             return;
@@ -1350,6 +1352,14 @@ impl Migrator {
             "selected `[geo] module = \"platform\"`, the host's location lookup main ran on \
              every request",
         );
+        if self.adapter == Adapter::Cloudflare {
+            self.push_check(
+                "on Cloudflare the location lookup now reads the reader's region from \
+                 `cf-region-code`, where Cloudflare sends it, and main's read none, so the \
+                 region rules of `permissions.yaml`, such as a US state's `us-state` \
+                 jurisdiction, can apply to a request now",
+            );
+        }
         let anchor = self
             .layout
             .subtree_end(&path(&["source"]))
