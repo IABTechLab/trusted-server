@@ -1295,6 +1295,12 @@ impl Hooks for TrustedServerApp {
         "TrustedServer"
     }
 
+    /// The entry point installs this adapter's logger before `run_app`
+    /// ([`crate::logging::init_logger`]), so `run_app` installs none.
+    fn owns_logging() -> bool {
+        true
+    }
+
     fn routes() -> RouterService {
         let state = match build_state() {
             Ok(s) => s,
