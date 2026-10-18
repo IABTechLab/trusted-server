@@ -1198,8 +1198,9 @@ pub async fn handle_asset_proxy_request(
         .await;
     }
 
-    let platform_resp = if let Some(response) = from_asset_cache {
-        PlatformResponse::new(response)
+    // A load that failed asking the origin is this request's origin failure.
+    let origin_result = if let Some(answer) = from_asset_cache {
+        answer.map(PlatformResponse::new)
     } else {
         let mut platform_req = build_asset_platform_request(
             req.method(),
@@ -1213,14 +1214,11 @@ pub async fn handle_asset_proxy_request(
         if stream_response {
             platform_req = platform_req.with_stream_response();
         }
-        services
-            .http_client()
-            .send(platform_req)
-            .await
-            .change_context(TrustedServerError::Proxy {
-                message: "Failed to proxy asset request".to_string(),
-            })?
+        services.http_client().send(platform_req).await
     };
+    let platform_resp = origin_result.change_context(TrustedServerError::Proxy {
+        message: "Failed to proxy asset request".to_string(),
+    })?;
 
     let mut response = if stream_response {
         platform_response_to_asset(platform_resp)
@@ -5473,6 +5471,37 @@ mod tests {
                 stub.recorded_request_uris().len(),
                 2,
                 "should ask the origin for each request while no loading cache keeps values"
+            );
+        });
+    }
+
+    #[test]
+    fn an_asset_route_load_that_fails_is_the_answer_so_the_origin_is_asked_once() {
+        futures::executor::block_on(async {
+            let stub = held_asset_stub();
+            let cache = Arc::new(crate::platform::test_support::MemoryLoadingCache::default());
+            let services = asset_route_services(&stub, &cache);
+            let settings = create_test_settings();
+            let route = ProxyAssetRoute::new("/.images/", "https://assets.example.com");
+            let request =
+                build_http_request(Method::GET, "https://www.example.com/.images/site.css");
+
+            // Nothing is queued, so the stub fails the origin request.
+            let Err(error) =
+                handle_asset_proxy_request(&settings, &services, request, &route).await
+            else {
+                panic!("should fail when the origin request fails");
+            };
+
+            assert_eq!(
+                error.current_context().status_code(),
+                StatusCode::BAD_GATEWAY,
+                "should answer as a failed origin request does"
+            );
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                1,
+                "should ask the origin once, because the failed load is the answer"
             );
         });
     }
