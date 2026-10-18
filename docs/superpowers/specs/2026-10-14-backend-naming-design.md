@@ -62,12 +62,6 @@ This change makes the first two. The third has no call to move because the comma
 - Not tested. The bucket count is compared with the distinct timers only at a 2,000 ms ceiling, where the coarse ladder is never reached. At a 60,000 ms ceiling the ladder test bounds the distinct timers at 20 and one assertion checks that two providers fit the budget, but nothing asserts that the count equals the timers the ladder reaches.
 - Not tested. Axum and Fastly have no startup test of a plan being refused.
 
-## Review log
-
-1. **Round 1, 2026-10-15.** A review in a fresh session, against `split/47-backend-naming` at `2dbc2d731`. Issues found, one of them blocking. The opening note and the problem section named the `ts` command as one of three callers of the policy, when the command never called it and the callers were each adapter's startup validation and its registration. This revision names the real callers and fixes the two partly true claims, the coverage gaps and the advice the round gave.
-
-2. **Round 2, 2026-10-15.** A lighter review in a fresh session, against this page at `969905300`, of the round 1 fixes and the new text. Approved, with no blocking issues. This revision adds the descriptor changes the compatibility paragraph left out, names the Tech Lab draft pull request, and counts the changed orchestrator assertions as two.
-
 ## Revision record
 
 | Date       | Change                                                                                                                                                                                                                                                                                  |
@@ -76,3 +70,9 @@ This change makes the first two. The third has no call to move because the comma
 | 2026-10-15 | Fixes from review round 1. The real callers of the policy, the break for crates outside core, the descriptor resting on convention, the timer bucket default, the untested paths, the platform names left in core, what the issue asks, the pull request references and the review log. |
 | 2026-10-15 | Fixes from review round 2. The descriptor changes the compatibility paragraph left out, the Tech Lab pull request reference and the count of changed orchestrator assertions.                                                                                                           |
 | 2026-10-17 | The certificate check (IABTechLab/trusted-server#1132). The Axum adapter warns once at startup that it does not honor `proxy.certificate_check = false`, with its test, and the guides say which adapters honor the setting.                                                            |
+
+## Review log
+
+1. **Round 1, 2026-10-15.** A review in a fresh session, against `split/47-backend-naming` at `2dbc2d731`. Issues found, one of them blocking. The opening note and the problem section named the `ts` command as one of three callers of the policy, when the command never called it and the callers were each adapter's startup validation and its registration. This revision names the real callers and fixes the two partly true claims, the coverage gaps and the advice the round gave.
+
+2. **Round 2, 2026-10-15.** A lighter review in a fresh session, against this page at `969905300`, of the round 1 fixes and the new text. Approved, with no blocking issues. This revision adds the descriptor changes the compatibility paragraph left out, names the Tech Lab draft pull request, and counts the changed orchestrator assertions as two.

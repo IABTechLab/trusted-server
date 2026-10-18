@@ -158,11 +158,6 @@ Nothing tests these paths:
 - An `[inspect]` pattern that names an old path.
 - An old environment variable name through the overlay the `ts` command applies.
 
-## Review log
-
-1. **Round 1, 2026-10-15.** A review in a fresh session, against `split/39-source-modules` at `ff33fea74`. Issues found, three of them blocking. The claim that stored pages and assets keep their keys was false for pages and the publisher's assets, the change to the host that a page and every middleware are told as the page's origin host was missing, and the behavior the series adds to asset routes and to modules was missing. This revision corrects the claim and states the other two, and adds the configuration, adapter, consent and privacy, failure and rollout paragraphs, the paths that have no test and a known gap in the spelling of core's source.
-2. **Round 2, 2026-10-15.** A lighter review in a fresh session, against this page at `6eabcc695`, of the round 1 fixes and the new text. Approved, with no blocking issues. No change was needed.
-
 ## Revision record
 
 | Date       | Change                                                                                                                                                                                                                                                                                |
@@ -170,3 +165,8 @@ Nothing tests these paths:
 | 2026-10-14 | First draft.                                                                                                                                                                                                                                                                          |
 | 2026-10-15 | Fixes from review round 1. What the stored keys hold, the host a page names itself by, the behavior added to asset routes and modules, configuration, adapters, consent and privacy, failure handling, rollout, the untested paths, the spelling of core's source and the review log. |
 | 2026-10-15 | Review round 2 recorded, with no change to the design.                                                                                                                                                                                                                                |
+
+## Review log
+
+1. **Round 1, 2026-10-15.** A review in a fresh session, against `split/39-source-modules` at `ff33fea74`. Issues found, three of them blocking. The claim that stored pages and assets keep their keys was false for pages and the publisher's assets, the change to the host that a page and every middleware are told as the page's origin host was missing, and the behavior the series adds to asset routes and to modules was missing. This revision corrects the claim and states the other two, and adds the configuration, adapter, consent and privacy, failure and rollout paragraphs, the paths that have no test and a known gap in the spelling of core's source.
+2. **Round 2, 2026-10-15.** A lighter review in a fresh session, against this page at `6eabcc695`, of the round 1 fixes and the new text. Approved, with no blocking issues. No change was needed.
