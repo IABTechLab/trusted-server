@@ -726,9 +726,10 @@ impl IntegrationBuilder {
     /// Declares the caches this builder's modules load through, by name,
     /// each selected in its own `[cache.<name>]` table the way core's own
     /// are. A name is the module's own, as `example-answers` is for a
-    /// module from `crates/geo/example`: core's `robots-txt` and a name
-    /// another builder declares are refused by [`declared_caches`], and a
-    /// table naming a cache no builder declares by [`check_cache_tables`].
+    /// module from `crates/geo/example`. Declaring core's `robots-txt` or a
+    /// name another builder declares is refused, and so is a table naming a
+    /// cache no builder declares, when a deployment is validated and when
+    /// [`loading_caches_from`] makes its caches.
     #[must_use]
     pub const fn with_cache_features(mut self, features: &'static [&'static str]) -> Self {
         self.cache_features = features;
@@ -939,7 +940,7 @@ pub fn supplied_middleware(
 /// When a builder declares one of core's own caches, or two builders declare
 /// one name, naming the builders, since the two would otherwise share one
 /// cache and its keys without a word.
-pub fn declared_caches(
+pub(crate) fn declared_caches(
     builders: &[IntegrationBuilder],
 ) -> Result<Vec<&'static str>, Report<TrustedServerError>> {
     let mut declared: Vec<(&'static str, &'static str)> = vec![
@@ -983,7 +984,7 @@ pub fn declared_caches(
 /// When a table names an undeclared cache, naming the table and the caches
 /// this build's modules declare, or when the declarations themselves are
 /// refused, see [`declared_caches`].
-pub fn check_cache_tables(
+pub(crate) fn check_cache_tables(
     settings: &Settings,
     builders: &[IntegrationBuilder],
 ) -> Result<(), Report<TrustedServerError>> {
@@ -1012,9 +1013,10 @@ pub fn check_cache_tables(
 /// # Errors
 ///
 /// When a table names a module no linked builder offers a cache from, naming
-/// the table and the modules that do, and when a `[cache.<name>]` table names
-/// a cache no linked module declares, naming the ones they do, see
-/// [`check_cache_tables`].
+/// the table and the modules that do, when a `[cache.<name>]` table names a
+/// cache no linked module declares, naming the ones they do, and when a
+/// builder declares core's `robots-txt` or a name another builder declares,
+/// naming the builders.
 pub fn loading_caches_from(
     settings: &Settings,
     builders: &[IntegrationBuilder],
