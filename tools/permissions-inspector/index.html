@@ -701,8 +701,13 @@ function render(){
     const cn = COUNTRY_NAMES[country] || country;
     who = "a visitor in " + (region && US_STATE_NAMES[region] ? US_STATE_NAMES[region]+", "+cn : cn);
   }
-  $("headline").innerHTML = '<span class="n">'+setCount+"</span> of "+rows.length+
-    " Data Uses are set for "+who+".";
+  // A place code comes from the policy file, so the headline is built as
+  // text and never parsed as HTML.
+  const headline = $("headline"); headline.textContent = "";
+  const n = document.createElement("span"); n.className = "n"; n.textContent = setCount;
+  headline.appendChild(n);
+  headline.appendChild(document.createTextNode(
+    " of "+rows.length+" Data Uses are set for "+who+"."));
 
   const chain = $("chain"); chain.innerHTML = "";
   if (geoFail){
