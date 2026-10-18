@@ -65,6 +65,9 @@ Axum sanitizes forwarded client-IP headers but does not resolve
 `[trusted_client_ip]`; see the
 [adapter matrix](./api-reference#adapter-and-startup-support).
 
+Axum sends no [auction telemetry](./telemetry#adapter-support), and warns at
+startup when `[analytics]` selects a module.
+
 Axum always verifies HTTPS origin certificates against the public certificate
 authorities built into its client. It does not honor
 `proxy.certificate_check = false` and logs a warning at startup when the
