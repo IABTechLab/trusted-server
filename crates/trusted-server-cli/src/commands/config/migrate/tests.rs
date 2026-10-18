@@ -224,6 +224,63 @@ password = "handler_password"
     assert!(reported(&migration.report.to_do, "`[[handlers]]` entry 3"));
 }
 
+/// A document written for main with one handler guarding `pattern`.
+fn guarded(pattern: &str) -> String {
+    main_document(&format!(
+        "[[handlers]]\npath = '{pattern}'\nusername = \"admin\"\npassword = \"handler_password\"\n"
+    ))
+}
+
+#[test]
+fn a_handler_is_removed_only_where_every_path_it_matches_is_closed() {
+    for pattern in [
+        "^/_ts/admin",
+        "^/_ts/admin/",
+        "^/admin/keys/",
+        "^/admin/keys$",
+        "^/admin/keys(?:/|$)",
+        "^/admin/keys(/|$)",
+    ] {
+        let migration = migrated(&guarded(pattern));
+        assert!(
+            parsed(&migration.text).get("handlers").is_none(),
+            "should remove the handler on `{pattern}`:\n{}",
+            migration.text
+        );
+        assert!(
+            migration.report.to_do.is_empty(),
+            "`{pattern}`: {:?}",
+            migration.report.to_do
+        );
+    }
+    // Main matched a pattern anywhere in the path, so `^/admin/keys` also
+    // guarded `/admin/keystore`, which the stack forwards to the origin.
+    for pattern in [
+        "^/admin/keys",
+        "^/admin/keys.*",
+        "^/admin/keysx",
+        "^/admin",
+        "/_ts/admin",
+        "^/admin/keys(?:/|$)|^/members",
+    ] {
+        let migration = migrated(&guarded(pattern));
+        assert_eq!(
+            parsed(&migration.text)["handlers"][0]["path"].as_str(),
+            Some(pattern),
+            "should keep the handler on `{pattern}`"
+        );
+        assert!(
+            reported(
+                &migration.report.to_do,
+                "`[[handlers]]` entry 1 can guard paths beyond the `/_ts/admin` and \
+                 `/admin/keys` paths this release closes"
+            ),
+            "`{pattern}`: {:?}",
+            migration.report.to_do
+        );
+    }
+}
+
 #[test]
 fn request_signing_store_ids_are_removed() {
     let input = main_document(

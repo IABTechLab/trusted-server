@@ -427,8 +427,8 @@ impl Migrator {
         }
     }
 
-    /// `[[handlers]]`, removed where an entry guards only the admin paths,
-    /// where nothing is served now, and left for the operator otherwise.
+    /// `[[handlers]]`, removed where an entry guards only paths this release
+    /// closes, and left for the operator otherwise.
     fn handlers(&mut self) {
         let Some(item) = self.root().get("handlers") else {
             return;
@@ -448,18 +448,19 @@ impl Migrator {
         let mut to_do = Vec::new();
         for (index, pattern) in patterns.iter().enumerate().rev() {
             let number = index + 1;
-            if pattern.as_deref().is_some_and(guards_only_admin_paths) {
+            if pattern.as_deref().is_some_and(guards_only_closed_paths) {
                 self.layout
                     .remove(&[Step::Key("handlers".to_owned()), Step::Index(index)]);
                 changed.push(format!(
-                    "removed `[[handlers]]` entry {number}, which guarded only the admin paths, \
-                     where nothing is served now"
+                    "removed `[[handlers]]` entry {number}, which guarded only paths this release \
+                     closes, where nothing is served now"
                 ));
             } else {
                 to_do.push(format!(
-                    "`[[handlers]]` entry {number} guards paths outside `/_ts/admin`, and no \
-                     request is asked for a password now. Put a password on those paths at the \
-                     origin or in the hosting platform, then remove the entry"
+                    "`[[handlers]]` entry {number} can guard paths beyond the `/_ts/admin` and \
+                     `/admin/keys` paths this release closes, and no request is asked for a \
+                     password now. Put a password on those paths at the origin or in the hosting \
+                     platform, then remove the entry"
                 ));
             }
         }
@@ -1666,14 +1667,21 @@ fn implementation_of(profile: &str) -> Option<&'static str> {
     }
 }
 
-/// Whether a `[[handlers]]` path guards only the admin paths, being a
-/// pattern anchored at `/_ts/admin` or `/admin/keys` with no alternative
-/// outside a group that could match another path.
-fn guards_only_admin_paths(pattern: &str) -> bool {
-    ["^/_ts/admin", "^/admin/keys"]
-        .iter()
-        .any(|start| pattern.starts_with(start))
-        && !has_top_level_alternation(pattern)
+/// Whether every path a `[[handlers]]` pattern matches is one this release
+/// closes, with no alternative outside a group that could match another.
+///
+/// Main matched a pattern anywhere in the path, so the pattern must be
+/// anchored. Every path that starts with `/_ts/admin` is closed, but of
+/// `/admin/keys` only the address itself and the paths below `/admin/keys/`
+/// are, so that prefix must be followed by a `/` or the end of the path, and
+/// `^/admin/keys` alone, which also matches `/admin/keystore`, is not.
+fn guards_only_closed_paths(pattern: &str) -> bool {
+    const KEYS_BOUNDS: &[&str] = &["/", "$", "(?:/|$)", "(/|$)"];
+    let closed = pattern.starts_with("^/_ts/admin")
+        || pattern
+            .strip_prefix("^/admin/keys")
+            .is_some_and(|rest| KEYS_BOUNDS.iter().any(|bound| rest.starts_with(bound)));
+    closed && !has_top_level_alternation(pattern)
 }
 
 /// Whether `pattern` has a `|` outside every group and character class.
