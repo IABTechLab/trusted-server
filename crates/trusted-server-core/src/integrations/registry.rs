@@ -1377,7 +1377,7 @@ fn resolve_prefix_module(
     inner: &IntegrationRegistryInner,
 ) -> Result<SelectedPrefixModule, Report<TrustedServerError>> {
     let selected = match settings.prefix.module.as_deref() {
-        None | Some(crate::prefix::TRUSTED_SERVER_MODULE) => SelectedPrefixModule::trusted_server(),
+        None | Some(crate::prefix::TRUSTED_SERVER_MODULE) => SelectedPrefixModule::default(),
         Some(written) => {
             let module =
                 named_module(PREFIX_TYPE, "prefix", written, &inner.prefix_modules, inner)?;
@@ -7507,14 +7507,20 @@ mod tests {
         );
     }
 
-    /// An identifier module that learns nothing, running under the name it
-    /// was built with.
+    /// Identifier modules that learn nothing, each under a fixed name as
+    /// every module has.
     #[derive(Debug)]
-    struct IdleIdentifiers(&'static str);
+    enum IdleIdentifiers {
+        Probe,
+        Second,
+    }
 
     impl crate::ec::identifiers::IdentifierModule for IdleIdentifiers {
         fn id(&self) -> &'static str {
-            self.0
+            match self {
+                Self::Probe => IDENTIFIER_PROBE_MODULE,
+                Self::Second => IDENTIFIER_SECOND_MODULE,
+            }
         }
 
         fn identifiers(
@@ -7534,7 +7540,7 @@ mod tests {
     ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
         Ok(Some(
             IntegrationRegistration::builder("identifier-probe")
-                .with_identifier_module(Arc::new(IdleIdentifiers(IDENTIFIER_PROBE_MODULE)))
+                .with_identifier_module(Arc::new(IdleIdentifiers::Probe))
                 .build(),
         ))
     }
@@ -7544,7 +7550,7 @@ mod tests {
     ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
         Ok(Some(
             IntegrationRegistration::builder("identifier-second")
-                .with_identifier_module(Arc::new(IdleIdentifiers(IDENTIFIER_SECOND_MODULE)))
+                .with_identifier_module(Arc::new(IdleIdentifiers::Second))
                 .build(),
         ))
     }
@@ -7556,7 +7562,7 @@ mod tests {
     ) -> Result<Option<IntegrationRegistration>, Report<TrustedServerError>> {
         Ok(Some(
             IntegrationRegistration::builder("identifier-second")
-                .with_identifier_module(Arc::new(IdleIdentifiers(IDENTIFIER_PROBE_MODULE)))
+                .with_identifier_module(Arc::new(IdleIdentifiers::Probe))
                 .build(),
         ))
     }
