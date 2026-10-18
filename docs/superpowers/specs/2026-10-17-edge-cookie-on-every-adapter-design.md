@@ -74,9 +74,7 @@ In core:
 
 In the Fastly adapter, under Viceroy, `with_no_ec_store_the_entry_point_writes_a_created_edge_cookie` in `src/app.rs`: with no `[ec] ec_store`, a browser's page view builds no graph, creates an Edge Cookie, and the entry point's finalize step writes it once.
 
-**Decisions.** Two questions this design left open, whether the resolve route should write a client-side module's cookie on an adapter that opens no graph and whether a Fastly service with no `ec_store` should write a created Edge Cookie, are answered yes by James Rosewell's decision of 17 October 2026, quoted here.
-
-> We have an EdgeCookie and then some data that is associated with it. One of those data items is the source information that is used to work out the permissions model. That includes permission-signal providers. Whether the sources for that permission state come from data in the EC values or from client side, or some other source doesn't matter. That's the principles.
+**Decisions.** Two questions this design left open, whether the resolve route should write a client-side module's cookie on an adapter that opens no graph and whether a Fastly service with no `ec_store` should write a created Edge Cookie, are both answered yes. The Edge Cookie is the identifier, and the identity graph is one store of the data associated with it. The permission state comes from the permission model, whose sources may be values the graph holds, signals the client sends or any other source, so a missing graph does not stop the cookie.
 
 So the Edge Cookie is the identifier, the identity graph is one optional store of the data associated with it, the partner IDs among it, and the permission state comes from the permission model whatever its sources. A missing graph does not stop the cookie.
 
@@ -92,7 +90,7 @@ The five tests pass on each of the three adapters, the core and Fastly tests abo
 
 ## Revision record
 
-| Date       | Change                                                                                                                                                                                                                                                                        |
-| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 2026-10-17 | First draft.                                                                                                                                                                                                                                                                  |
-| 2026-10-18 | Core writes a created Edge Cookie with or without an identity graph, behind the bot gate it reads from the device signals, and the resolve route answers without a graph as it does with one, which answers both open questions as James Rosewell decided on 17 October 2026. |
+| Date       | Change                                                                                                                                                                                                                           |
+| ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 2026-10-17 | First draft.                                                                                                                                                                                                                     |
+| 2026-10-18 | Core writes a created Edge Cookie with or without an identity graph, behind the bot gate it reads from the device signals, and the resolve route answers without a graph as it does with one, which answers both open questions. |
