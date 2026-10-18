@@ -10,7 +10,7 @@ permit EC use.
 
 Trusted Server is technology. It is neutral on policy. The Edge Cookie gives the deployer a cookie slot and configuration over the surrounding attributes. The deployer determines the policy posture based on the laws and contractual arrangements that apply to their deployment. Privacy outcomes follow from that configuration, not from the cookie mechanism itself.
 
-An Edge Cookie (EC) is a first-party identifier that the built-in module derives on a first site visit with an HMAC of the client IP address plus a short random suffix, created only when the permission model allows it. It is passed in requests on subsequent visits and activity. Trusted Server surfaces the current EC ID via response headers and a first-party cookie. For the exact header and cookie names, see the [API Reference](/guide/api-reference).
+An Edge Cookie (EC) is a first-party identifier that the built-in module derives on a first site visit with an HMAC of the client IP address plus a short random suffix, created only when the permission model allows it. It is passed in requests on subsequent visits and activity. Trusted Server keeps the current EC ID in the first-party `ts-ec` cookie. For the routes that use the cookie, see the [API Reference](/guide/api-reference).
 
 For full operational onboarding (partner configuration, batch sync, identify, and auction verification), use the [EC Setup Guide](/guide/ec-setup-guide).
 
