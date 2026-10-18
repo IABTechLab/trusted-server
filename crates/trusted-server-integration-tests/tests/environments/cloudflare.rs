@@ -27,7 +27,32 @@ const CI_CONFIG_TEMPLATE: &str = "wrangler.ci.toml";
 const GENERATED_CI_CONFIG: &str = "wrangler.integration.generated.toml";
 const TRUSTED_SERVER_CONFIG_PLACEHOLDER: &str = "TRUSTED_SERVER_CONFIG = \"{}\"";
 
-fn write_generated_ci_config(wrangler_dir: &Path, config_json: &str) -> TestResult<String> {
+/// The table of the CI wrangler template that binds the key-value namespace
+/// the adapter declares.
+const KV_NAMESPACES_TABLE: &str = "[[kv_namespaces]]";
+
+/// Whether a generated wrangler config binds the key-value namespace.
+#[derive(Clone, Copy)]
+enum KvBinding {
+    Bound,
+    Unbound,
+}
+
+/// What [`CloudflareWorkers::spawn_wrangler`] waits for before it hands the
+/// Worker to a test.
+#[derive(Clone, Copy)]
+enum Readiness {
+    /// The health check answers with success.
+    Healthy,
+    /// The Worker answers at all, for a Worker whose every answer is an error.
+    AnyAnswer,
+}
+
+fn write_generated_ci_config(
+    wrangler_dir: &Path,
+    config_json: &str,
+    kv: KvBinding,
+) -> TestResult<String> {
     let template_path = wrangler_dir.join(CI_CONFIG_TEMPLATE);
     let template = std::fs::read_to_string(&template_path)
         .change_context(TestError::RuntimeSpawn)
@@ -35,7 +60,10 @@ fn write_generated_ci_config(wrangler_dir: &Path, config_json: &str) -> TestResu
             "failed to read Cloudflare CI wrangler config at {}",
             template_path.display()
         ))?;
-    let generated = inject_cloudflare_config(&template, config_json)?;
+    let mut generated = inject_cloudflare_config(&template, config_json)?;
+    if matches!(kv, KvBinding::Unbound) {
+        generated = without_kv_namespaces(&generated)?;
+    }
     let output_path = wrangler_dir.join(GENERATED_CI_CONFIG);
     std::fs::write(&output_path, generated)
         .change_context(TestError::RuntimeSpawn)
@@ -60,6 +88,51 @@ fn inject_cloudflare_config(template: &str, config_json: &str) -> TestResult<Str
     ))
 }
 
+/// `template` without its one `[[kv_namespaces]]` table, being the table's
+/// header and every line after it up to the next blank line or table.
+fn without_kv_namespaces(template: &str) -> TestResult<String> {
+    let tables = template
+        .lines()
+        .filter(|line| line.trim() == KV_NAMESPACES_TABLE)
+        .count();
+    if tables != 1 {
+        return Err(Report::new(TestError::RuntimeSpawn).attach(format!(
+            "Cloudflare CI wrangler config must contain exactly one `{KV_NAMESPACES_TABLE}` table, found {tables}"
+        )));
+    }
+
+    let mut kept = Vec::new();
+    let mut in_table = false;
+    for line in template.lines() {
+        let trimmed = line.trim();
+        if trimmed == KV_NAMESPACES_TABLE {
+            in_table = true;
+            continue;
+        }
+        if in_table && (trimmed.is_empty() || trimmed.starts_with('[')) {
+            in_table = false;
+        }
+        if !in_table {
+            kept.push(line);
+        }
+    }
+    let mut generated = kept.join("\n");
+    generated.push('\n');
+    Ok(generated)
+}
+
+/// Polls `base_url` until the Worker answers with any status.
+fn wait_for_any_answer(base_url: &str) -> TestResult<()> {
+    for _ in 0..30 {
+        if reqwest::blocking::get(base_url).is_ok() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    Err(Report::new(TestError::RuntimeNotReady)
+        .attach(format!("Runtime at {base_url} did not answer after 15s")))
+}
+
 impl RuntimeEnvironment for CloudflareWorkers {
     fn id(&self) -> &'static str {
         "cloudflare"
@@ -68,11 +141,15 @@ impl RuntimeEnvironment for CloudflareWorkers {
     fn spawn(&self, _wasm_path: &Path) -> TestResult<RuntimeProcess> {
         let wrangler_dir = self.wrangler_dir();
         let config = if std::env::var("CI").is_ok() {
-            write_generated_ci_config(&wrangler_dir, &cloudflare_config_json(origin_port())?)?
+            write_generated_ci_config(
+                &wrangler_dir,
+                &cloudflare_config_json(origin_port())?,
+                KvBinding::Bound,
+            )?
         } else {
             "wrangler.toml".to_string()
         };
-        self.spawn_wrangler(&wrangler_dir, &config)
+        self.spawn_wrangler(&wrangler_dir, &config, Readiness::Healthy)
     }
 
     fn health_check_path(&self) -> &str {
@@ -94,11 +171,31 @@ impl CloudflareWorkers {
     /// [`TestError::RuntimeNotReady`] if the health check times out.
     pub fn spawn_with_config_json(&self, config_json: &str) -> TestResult<RuntimeProcess> {
         let wrangler_dir = self.wrangler_dir();
-        let config = write_generated_ci_config(&wrangler_dir, config_json)?;
-        self.spawn_wrangler(&wrangler_dir, &config)
+        let config = write_generated_ci_config(&wrangler_dir, config_json, KvBinding::Bound)?;
+        self.spawn_wrangler(&wrangler_dir, &config, Readiness::Healthy)
     }
 
-    fn spawn_wrangler(&self, wrangler_dir: &Path, config: &str) -> TestResult<RuntimeProcess> {
+    /// Start `wrangler dev` with a test-specific `TRUSTED_SERVER_CONFIG`
+    /// binding and no key-value namespace bound, returning once the Worker
+    /// answers at all, because every answer it gives is then an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TestError::RuntimeSpawn`] if the wrangler config cannot be
+    /// written or `wrangler dev` cannot be started, and
+    /// [`TestError::RuntimeNotReady`] if the Worker never answers.
+    pub fn spawn_without_kv_binding(&self, config_json: &str) -> TestResult<RuntimeProcess> {
+        let wrangler_dir = self.wrangler_dir();
+        let config = write_generated_ci_config(&wrangler_dir, config_json, KvBinding::Unbound)?;
+        self.spawn_wrangler(&wrangler_dir, &config, Readiness::AnyAnswer)
+    }
+
+    fn spawn_wrangler(
+        &self,
+        wrangler_dir: &Path,
+        config: &str,
+        readiness: Readiness,
+    ) -> TestResult<RuntimeProcess> {
         let port = super::find_available_port().unwrap_or(CLOUDFLARE_DEFAULT_PORT);
 
         #[cfg(unix)]
@@ -166,7 +263,12 @@ impl CloudflareWorkers {
         let handle = CloudflareHandle { child };
         let base_url = format!("http://127.0.0.1:{port}");
 
-        super::wait_for_ready(&base_url, self.health_check_path(), true)?;
+        match readiness {
+            Readiness::Healthy => {
+                super::wait_for_ready(&base_url, self.health_check_path(), true)?;
+            }
+            Readiness::AnyAnswer => wait_for_any_answer(&base_url)?,
+        }
 
         Ok(RuntimeProcess {
             inner: Box::new(handle),
@@ -251,5 +353,36 @@ mod tests {
         let result = inject_cloudflare_config(&template, r#"{"app_config":"blob"}"#);
 
         assert!(result.is_err(), "should reject duplicate placeholders");
+    }
+
+    #[test]
+    fn without_kv_namespaces_drops_only_the_namespace_table() {
+        let template = include_str!("../../../trusted-server-adapter-cloudflare/wrangler.ci.toml");
+
+        let generated = without_kv_namespaces(template).expect("should drop the namespace table");
+
+        let manifest: toml::Value = toml::from_str(&generated).expect("should stay valid TOML");
+        let original: toml::Value = toml::from_str(template).expect("should parse the template");
+        assert!(
+            manifest.get("kv_namespaces").is_none(),
+            "should bind no namespace"
+        );
+        assert_eq!(
+            manifest.get("vars"),
+            original.get("vars"),
+            "should keep the variables"
+        );
+        assert_eq!(
+            manifest.get("main"),
+            original.get("main"),
+            "should keep the bundle"
+        );
+    }
+
+    #[test]
+    fn without_kv_namespaces_rejects_a_template_without_the_table() {
+        let result = without_kv_namespaces("[vars]\n");
+
+        assert!(result.is_err(), "should reject a template with no table");
     }
 }
