@@ -191,7 +191,9 @@ lookup, which an earlier release ran on every request, becomes
 `[geo] module = "platform"`. The Axum dev server and Spin have no lookup and
 refuse that line at startup, so there the command selects no geo module and
 leaves a `to do:` item for the Edge Cookie module, which then needs
-`[geo] assume_single_jurisdiction = true` or a geo module of your choice.
+`[geo] assume_single_jurisdiction = true` or a geo module of your choice. A
+configuration you push to more than one adapter, such as the Axum dev server
+and Fastly, is migrated once for each adapter into a file of its own.
 
 `config migrate <file>` prints the migrated configuration on stdout. On stderr it
 prints a line for each change it made, starting `changed:`, a line for each item
@@ -237,6 +239,9 @@ After migrating:
    check the pair together first. On Cloudflare and Spin, keep the key-value
    store this release requires, the Workers KV binding `TRUSTED_SERVER_KV` and
    Spin's `default` store, or every request fails.
+5. Expect the stored pages and the publisher's stored assets to be fetched
+   again once after the upgrade, because their keys hold a code worked out from
+   the settings.
 
 ### Diagnose ad-template configuration
 

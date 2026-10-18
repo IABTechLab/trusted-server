@@ -95,8 +95,9 @@ const ENTRIES_COMMENT: &str = concat!(
 pub(crate) struct Report {
     /// A line for each rewrite made.
     pub(crate) changed: Vec<String>,
-    /// A line for each item the document cannot load without, which needs a
-    /// decision or a value the document does not hold.
+    /// A line for each item the document cannot load without, or setting the
+    /// stack ignores whose value the operator carries elsewhere, which needs
+    /// a decision or a value the document does not hold.
     pub(crate) to_do: Vec<String>,
     /// A line for each change in behavior no setting expresses.
     pub(crate) check: Vec<String>,
