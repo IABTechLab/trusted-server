@@ -6246,6 +6246,7 @@ pub async fn handle_publisher_request(
     // origin TTFB tracks origin latency rather than the auction timeout.
     // Any other response is looked for the same way, before the origin is
     // fetched, and a copy found is served as the origin's response would be.
+    // A load that failed asking the origin is this request's origin failure.
     let mut from_asset_cache = None;
     if let Some(key) = asset_cache_key.as_ref() {
         let prepared = origin_request.as_ref().ok_or_else(|| {
@@ -6264,8 +6265,8 @@ pub async fn handle_publisher_request(
         })
         .await;
     }
-    let origin_result = if let Some(response) = from_asset_cache {
-        Ok(crate::platform::PlatformResponse::new(response))
+    let origin_result = if let Some(answer) = from_asset_cache {
+        answer.map(crate::platform::PlatformResponse::new)
     } else if let Some(pending) = pending_origin {
         services.http_client().wait(pending).await
     } else {
@@ -8685,10 +8686,14 @@ pub(crate) struct AssetRequest<'a> {
     pub(crate) stream_response: bool,
 }
 
-/// The asset cache's answer for `request`, being a kept copy served as the
-/// origin's response would be, or the response this request's own load
-/// fetched and may not share, or `None` when the origin is to be asked.
-pub(crate) async fn asset_from_cache(request: &AssetRequest<'_>) -> Option<Response<EdgeBody>> {
+/// The asset cache's answer for `request`, or `None` when the origin is to be
+/// asked. The answer is a kept copy served as the origin's response would be,
+/// the response this request's own load fetched and may not share, or the
+/// failure of the load this request ran or waited on, which the caller treats
+/// as its own origin request failing, so the origin is not asked again.
+pub(crate) async fn asset_from_cache(
+    request: &AssetRequest<'_>,
+) -> Option<Result<Response<EdgeBody>, Report<crate::platform::PlatformError>>> {
     let services = request.services;
     let cache = asset_cache(request.settings);
     let address = asset_address(services, request.key);
@@ -8720,11 +8725,11 @@ pub(crate) async fn asset_from_cache(request: &AssetRequest<'_>) -> Option<Respo
     match found {
         Ok(Found::Copy { value, key }) => match crate::asset_cache::AssetEntry::decode(&value) {
             Ok(crate::asset_cache::AssetEntry::Copy(copy)) => {
-                Some(copy.into_response(unix_seconds()))
+                Some(Ok(copy.into_response(unix_seconds())))
             }
             // This request's own load fetched the asset, so it is served from
             // that fetch rather than a second one.
-            Ok(crate::asset_cache::AssetEntry::NotShareable) => hand_back.take(),
+            Ok(crate::asset_cache::AssetEntry::NotShareable) => hand_back.take().map(Ok),
             Err(miss) => {
                 log::warn!("asset_cache invalid entry: {miss}; removing it");
                 services
@@ -8734,10 +8739,14 @@ pub(crate) async fn asset_from_cache(request: &AssetRequest<'_>) -> Option<Respo
                 None
             }
         },
-        Ok(Found::NoCopies) => hand_back.take(),
+        Ok(Found::NoCopies) => hand_back.take().map(Ok),
+        // The load failed asking the origin, and every request waiting on it
+        // is given that failure, so none of them asks the origin again.
         Err(error) => {
-            log::warn!("asset_cache load failed: {error}; fetching the origin");
-            None
+            log::warn!("asset_cache load failed: {error}");
+            Some(Err(
+                Report::new(error).change_context(crate::platform::PlatformError::HttpClient)
+            ))
         }
     }
 }
@@ -9087,6 +9096,18 @@ mod tests {
             services: &RuntimeServices,
             request: Request<EdgeBody>,
         ) -> Response<EdgeBody> {
+            try_run(settings, services, request)
+                .await
+                .expect("should proxy the asset request")
+        }
+
+        /// The publisher path's finished response to `request`, or the error
+        /// it answers with.
+        async fn try_run(
+            settings: &Arc<Settings>,
+            services: &RuntimeServices,
+            request: Request<EdgeBody>,
+        ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
             let registry =
                 IntegrationRegistry::new(settings).expect("should create integration registry");
             let orchestrator = AuctionOrchestrator::new(
@@ -9113,8 +9134,7 @@ mod tests {
                 request,
                 EdgeCacheHeader::SMaxageFallback,
             )
-            .await
-            .expect("should proxy the asset request");
+            .await?;
             buffer_publisher_response_async(
                 publisher_response,
                 &Method::GET,
@@ -9124,7 +9144,6 @@ mod tests {
                 services,
             )
             .await
-            .expect("should finalize the asset response")
         }
 
         async fn body_of(response: Response<EdgeBody>) -> Vec<u8> {
@@ -9375,6 +9394,46 @@ mod tests {
                 stub.recorded_request_uris().len(),
                 2,
                 "each request fetches the origin once"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_load_that_fails_is_the_answer_so_the_origin_is_asked_once() {
+            use crate::error::IntoHttpResponse as _;
+
+            let stub = Arc::new(StubHttpClient::new());
+            let cache = Arc::new(MemoryLoadingCache::default());
+            let services = services(&stub, &cache);
+            let settings = settings();
+
+            // Nothing is queued, so the stub fails the origin request.
+            let request = asset_request("/site.css", "style");
+            let Err(error) = try_run(&settings, &services, request).await else {
+                panic!("should fail when the origin request fails");
+            };
+            assert_eq!(
+                error.current_context().status_code(),
+                StatusCode::BAD_GATEWAY,
+                "a failed load answers as a failed origin request does"
+            );
+            assert_eq!(
+                stub.recorded_request_uris().len(),
+                1,
+                "the failed load is the request's answer, so the origin is asked once"
+            );
+            assert!(cache.keys().is_empty(), "nothing is kept for a failed load");
+
+            queue(
+                &stub,
+                "text/css",
+                b"body{}",
+                &[("cache-control", "public, max-age=300")],
+            );
+            let response = run(&settings, &services, asset_request("/site.css", "style")).await;
+            assert_eq!(
+                body_of(response).await,
+                b"body{}",
+                "the next request loads the asset again"
             );
         }
 
