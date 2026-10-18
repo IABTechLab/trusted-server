@@ -392,6 +392,8 @@ The data kept with the Edge Cookie needs one KV store. Without it the Edge Cooki
 
 - Identity graph store (`ec_store`) - EC identity graph, source-domain keyed partner UIDs, minimal consent metadata, and withdrawal tombstones
 
+Adding the store to a service that ran without it gives each browser holding a cookie the service wrote without it a new identifier on its first page view, because the identity graph replaces an identifier it has no row for.
+
 Partners are configured statically in `[[ec.partners]]` and loaded into an in-memory registry at startup. There is no separate consent KV store. Consent is interpreted from live request cookies, headers, geolocation, and policy defaults.
 
 Create it:
