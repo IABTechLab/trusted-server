@@ -5,7 +5,7 @@ use std::sync::atomic::AtomicBool;
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use edgezero_adapter_spin::config_store::SpinConfigStore;
 use edgezero_adapter_spin::context::SpinRequestContext;
-use edgezero_core::app::Hooks;
+use edgezero_core::app::{Hooks, StoreMetadata, StoresMetadata};
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::context::RequestContext;
@@ -69,7 +69,11 @@ use crate::platform::{ConfigStoreHandleAdapter, SpinSecretStoreAdapter};
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 const SPIN_DEFAULT_CONFIG_STORE: &str = "default";
 
-/// Application state built once at startup and shared across all requests.
+/// Application state shared by everything that serves one request.
+///
+/// Not built once per process, because `edgezero_adapter_spin::run_app`
+/// calls `build_app` inside the per-request entry point, so this is
+/// rebuilt on every request.
 pub struct AppState {
     settings: Arc<Settings>,
     orchestrator: Arc<AuctionOrchestrator>,
@@ -669,6 +673,15 @@ fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
 /// `EdgeZero` [`Hooks`] implementation for the Trusted Server application.
 pub struct TrustedServerApp;
 
+/// The key-value store this adapter declares, by the label `spin.toml`
+/// grants the component, which is also the store startup reads the settings
+/// from. `EdgeZero` opens the label named by the id unless
+/// `EDGEZERO__STORES__KV__DEFAULT__NAME` names another.
+///
+/// `EdgeZero` treats a declared store as required, so a component that
+/// cannot open the label fails every request before any route runs.
+const KV_STORE_ID: &str = "default";
+
 impl Hooks for TrustedServerApp {
     fn name() -> &'static str {
         "TrustedServer"
@@ -684,6 +697,22 @@ impl Hooks for TrustedServerApp {
         };
 
         build_router(&state)
+    }
+
+    /// Declares the key-value store alone, so `run_app` opens it for every
+    /// request and the request's services keep copies in it between
+    /// requests. Startup opens the same store itself for the settings, and
+    /// secrets come from Spin variables, so no config or secret store is
+    /// declared.
+    fn stores() -> StoresMetadata {
+        StoresMetadata {
+            config: None,
+            kv: Some(StoreMetadata {
+                default: KV_STORE_ID,
+                ids: &[KV_STORE_ID],
+            }),
+            secrets: None,
+        }
     }
 }
 
