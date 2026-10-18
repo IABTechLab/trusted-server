@@ -232,6 +232,12 @@ Without the build input, or with an empty file, the schedule is empty and the
 endpoint answers 503. That is every build its builder names no schedule for,
 which the test `no_usable_key_in_force_answers_service_unavailable` pins.
 
+A Cloudflare build reads the input from the repository's root `.env`, which the
+adapter's `build.sh` exports before it runs `worker-build`, and a Spin build
+from the environment `spin build` runs in. Name the file by its absolute path,
+because core's build script resolves a relative one from
+`crates/trusted-server-core`.
+
 The build fields come from four more build inputs. `TRUSTED_SERVER_COMMIT`,
 `TRUSTED_SERVER_BUILD_RUN` and `TRUSTED_SERVER_BUILD_TAG` become
 `build.commit`, `build.run` and `build.tag`, or `unknown` when absent, and

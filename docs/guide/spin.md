@@ -49,11 +49,18 @@ manifest, SQLite store, response captures, and logs.
 ## Runtime boundaries
 
 Use the same store mapping and encoded variables in the deployment provider;
-empty variable defaults fail closed. Spin's request-time store registry is
-currently unwired, so EC KV lookup and request-signing key variables are
-unavailable. Forwarded client-IP headers are sanitized, and Spin derives its
+empty variable defaults fail closed. The adapter declares Spin's `default`
+key-value store, the store startup reads the settings from, so EdgeZero opens it
+for every request and the loading cache keeps its copies there between requests,
+while a copy in memory lasts one request because Spin builds the state for each
+request. EdgeZero treats a declared store as required, so a component that
+cannot open `default` fails every request before any route runs, `/health`
+included. No request-time config store is declared, so request signing cannot
+read its key metadata, and EC KV lookup is not available. Forwarded client-IP
+headers are sanitized, and Spin derives its
 runtime authority, scheme, and client-address headers in the innermost
-normalization layer. The modules' request filters and the device module
+normalization layer. Spin has no geo lookup, so `[geo] module = "platform"` is
+refused at startup. The modules' request filters and the device module
 `[device]` selects run as on Fastly, and `[device] module = "platform"`
 classifies from the `User-Agent`, because Spin supplies no TLS or HTTP/2
 signals. An Edge Cookie module creates and writes its cookie with no identity
@@ -61,6 +68,9 @@ graph behind it, and `POST /_ts/api/v1/ec/resolve` sets one the same way.
 `[[proxy.asset_routes]]` are served from each route's own source with the
 asset body held whole, and a route that enables the Image Optimizer answers
 with an error, because Spin has none.
+
+Spin sends no [auction telemetry](./telemetry#adapter-support), and warns at
+startup when `[analytics]` selects a module.
 
 Spin is not installed in the integration CI environment. The recurring manual
 smoke therefore needs a named owner, tested commit, exact tool versions, and an

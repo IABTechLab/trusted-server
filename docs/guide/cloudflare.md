@@ -51,11 +51,18 @@ the validated envelope from the target KV namespace, construct the same nested
 `TRUSTED_SERVER_CONFIG` JSON, and configure it in the deployment environment.
 Store the two credential values with `wrangler secret put
 publisher_proxy_secret` and `wrangler secret put ec_passphrase`; do not commit
-them to a Wrangler manifest. Deploy only after all three bindings are present.
+them to a Wrangler manifest. Deploy only after all three bindings and the
+`TRUSTED_SERVER_KV` namespace are present.
 
-A successful `ts config push` alone does not configure this runtime: the
-Worker currently does not open `TRUSTED_SERVER_KV` during startup. Request-time
-store registries are also unwired, so EC KV lookup is not available.
+A successful `ts config push` alone does not configure this runtime, because
+the Worker reads its settings from `TRUSTED_SERVER_CONFIG` at startup and does
+not open `TRUSTED_SERVER_KV` for them. The adapter declares `TRUSTED_SERVER_KV`
+as its key-value store, so EdgeZero opens it for every request and the loading
+cache keeps its copies there between requests, while a copy in memory lasts one
+request because the Worker builds its state for each request. EdgeZero treats a
+declared store as required, so a Worker deployed without the binding answers
+every request with `500` before any route runs. No request-time config store is
+declared, and EC KV lookup is not available.
 Forwarded client-IP headers are sanitized, but `[trusted_client_ip]` is not
 resolved. The modules' request filters and the device module `[device]`
 selects run as on Fastly, and `[device] module = "platform"` classifies from
@@ -66,6 +73,15 @@ behind it, and `POST /_ts/api/v1/ec/resolve` sets one the same way.
 asset body held whole, and a route that enables the Image Optimizer answers
 with an error, because Workers has none. See the
 [API reference](./api-reference) for route-level behavior.
+
+The Worker sends no [auction telemetry](./telemetry#adapter-support), and warns
+at startup when `[analytics]` selects a module.
+
+With `[geo] module = "platform"` the Worker reads the location from the `cf-*`
+request headers and the region from `cf-region-code` alone, which Cloudflare's
+Add visitor location headers managed transform adds. Without that header a US
+visitor is placed in no state, so the rules `permissions.yaml` gives a US
+state do not apply to them.
 
 Compare the [Fastly](./fastly), [Spin](./spin), and [Axum](./axum-dev)
 adapter journeys.

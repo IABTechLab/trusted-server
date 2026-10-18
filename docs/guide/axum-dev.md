@@ -73,5 +73,14 @@ are served from each route's own source with the asset body held whole, and
 a route that enables the Image Optimizer answers with an error, because the
 dev server has none.
 
+Axum sends no [auction telemetry](./telemetry#adapter-support), and warns at
+startup when `[analytics]` selects a module.
+
+Axum always verifies HTTPS origin certificates against the public certificate
+authorities built into its client. It does not honor
+`proxy.certificate_check = false` and logs a warning at startup when the
+setting is off, so an origin whose certificate is self-signed or issued by a
+private authority cannot be reached through it.
+
 For an edge deployment, use the [Fastly](./fastly),
 [Cloudflare](./cloudflare), or [Spin](./spin) guide.
