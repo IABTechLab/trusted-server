@@ -117,6 +117,26 @@ fn a_path_in_the_origin_address_is_reported_to_check() {
 }
 
 #[test]
+fn a_host_header_override_is_reported_to_check() {
+    let migration = migrated(&MAIN_BASE.replacen(
+        "proxy_secret =",
+        "origin_host_header_override = \"www.publisher.example.com\"\nproxy_secret =",
+        1,
+    ));
+
+    assert!(
+        reported(
+            &migration.report.check,
+            "`[source.origin] host_header` is set, so the addresses a page gives under that host"
+        ),
+        "{:?}",
+        migration.report.check
+    );
+    let plain = migrated(MAIN_BASE);
+    assert!(!reported(&plain.report.check, "host_header"));
+}
+
+#[test]
 fn an_asset_route_origin_moves_to_its_source_with_the_signer_renamed() {
     let input = main_document(
         r#"[proxy]

@@ -315,6 +315,13 @@ impl Migrator {
                  site there, or remove the path",
             );
         }
+        if origin.contains_key("host_header") {
+            self.push_check(
+                "`[source.origin] host_header` is set, so the addresses a page gives under that \
+                 host are now rewritten to the request's host, where main rewrote those under the \
+                 host of `[source.origin] url`. Check which host the origin's pages name",
+            );
+        }
         let auth_is_table = origin.get("auth").is_some_and(Item::is_table);
         let mut source = Table::new();
         source.insert("module", value("origin"));
