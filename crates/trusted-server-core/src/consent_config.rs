@@ -44,7 +44,9 @@ impl<'de> Deserialize<'de> for ConsentConfig {
             .find(|key| written.settings.contains_key(**key))
         {
             return Err(D::Error::custom(format!(
-                "[consent] {removed} was removed and is no longer accepted. Remove the                  line, because consent is read from the request on every request and                  kept with the identity graph, never in a store of its own"
+                "[consent] {removed} was removed and is no longer accepted. Remove the \
+                 line, because consent is read from the request on every request and \
+                 kept with the identity graph, never in a store of its own"
             )));
         }
         Ok(Self {
