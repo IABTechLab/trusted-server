@@ -2,10 +2,12 @@
 //! its router: the request filters run before the route and their response
 //! effects after the finalize headers, the route's module call carries the
 //! device classification, robots.txt is answered ahead of both, and the
-//! Edge Cookie is created and written for a real browser's page view.
+//! Edge Cookie is created and written for a real browser's page view and
+//! expired on a withdrawal.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use edgezero_core::body::Body;
 use edgezero_core::http::{Request, Response, StatusCode, request_builder};
@@ -432,6 +434,16 @@ const CRAWLER: &str = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.googl
 /// A page the publisher's origin answers.
 const PAGE: &[u8] = b"<html><head></head><body>article</body></html>";
 
+/// An Edge Cookie identifier in the shape the `hmac` module gives one.
+const CARRIED_EC: &str =
+    "hmac~0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.abc123";
+
+/// A TC String that consents to no purpose, so it refuses storage, Purpose 1.
+/// It is version 2 from CMP 1, in English, for vendor list 1 and no vendor,
+/// last updated at time zero, so the settings that read it turn the TCF
+/// module's expiry check off.
+const STORAGE_REFUSING_TC_STRING: &str = "CAAAAAAAAAAAAABABAENABCAAAAAAAAAAAhoAAA";
+
 /// A location in the US, where the sample permission rules grant the Edge
 /// Cookie with no signal.
 struct UsGeo;
@@ -456,7 +468,8 @@ impl PlatformGeo for UsGeo {
     }
 }
 
-/// The services of a reader in the US with an address, every request sent to
+/// The services of a reader in the US with an address, carrying the
+/// permission signal modules this adapter links, every request sent to
 /// `origin`.
 fn services_for_a_reader(origin: &Arc<StubHttpClient>) -> RuntimeServices {
     RuntimeServices::builder()
@@ -473,6 +486,7 @@ fn services_for_a_reader(origin: &Arc<StubHttpClient>) -> RuntimeServices {
             client_ip: Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10))),
             ..ClientInfo::default()
         })
+        .permission_signal_modules(super::shipped_signal_modules().into())
         .build()
 }
 
@@ -605,6 +619,30 @@ async fn a_bot_s_page_view_gets_no_edge_cookie() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_withdrawal_expires_the_edge_cookie_the_browser_carries() {
+    // No `[geo]` module, so the reader resolves at the top of the sample
+    // rules, the `gdpr-eu` group, where storage needs a signal, so a TC String
+    // refusing storage withdraws it.
+    let origin = origin_answering(1);
+    let router = router_for(
+        settings_with("[consent]\ncheck_expiration = false"),
+        &[],
+        services_for_a_reader(&origin),
+    );
+    let cookies = format!("ts-ec={CARRIED_EC}; euconsent-v2={STORAGE_REFUSING_TC_STRING}");
+
+    let response = route(&router, page_view("/article", BROWSER, Some(&cookies))).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let expired =
+        edge_cookie(&response).expect("a withdrawal should expire the Edge Cookie it carries");
+    assert!(
+        expired.starts_with("ts-ec=;") && expired.contains("Max-Age=0"),
+        "the Edge Cookie should be expired: {expired}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_resolve_route_answers() {
     let origin = Arc::new(StubHttpClient::new());
     let router = router_for(settings_for_a_reader(), &[], services_for_a_reader(&origin));
@@ -644,6 +682,15 @@ async fn the_resolve_route_answers() {
 
 #[test]
 fn startup_warns_that_this_adapter_opens_no_identity_graph() {
+    // The flag is set as the warning is logged, so a deployment whose
+    // `[ec] ec_store` names no store logs nothing.
+    let logged = AtomicBool::new(false);
+    super::warn_once_when_the_identity_graph_is_unavailable(&settings_for_a_reader(), &logged);
+    assert!(
+        !logged.load(Ordering::Relaxed),
+        "with no ec_store there is no identity graph to warn about"
+    );
+
     let mut settings = settings_for_a_reader();
     settings.ec.ec_store = Some("ec_identity_store".to_owned());
     let origin = Arc::new(StubHttpClient::new());
@@ -651,7 +698,7 @@ fn startup_warns_that_this_adapter_opens_no_identity_graph() {
     let _router = router_for(settings, &[], services_for_a_reader(&origin));
 
     assert!(
-        super::IDENTITY_GRAPH_UNAVAILABLE_LOGGED.load(std::sync::atomic::Ordering::Relaxed),
+        super::IDENTITY_GRAPH_UNAVAILABLE_LOGGED.load(Ordering::Relaxed),
         "startup should warn that the identity graph is unavailable"
     );
 }

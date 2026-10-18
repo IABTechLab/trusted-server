@@ -342,7 +342,7 @@ fn build_state_with_registrations_and_services(
         "Cloudflare",
         &UNSENT_ANALYTICS_LOGGED,
     );
-    warn_once_when_the_identity_graph_is_unavailable(&settings);
+    warn_once_when_the_identity_graph_is_unavailable(&settings, &IDENTITY_GRAPH_UNAVAILABLE_LOGGED);
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
@@ -367,15 +367,16 @@ static IDENTITY_GRAPH_UNAVAILABLE_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Logs once, at warning level, that `[ec] ec_store` names an identity graph
 /// this adapter does not open, so the Edge Cookie is still written but the
-/// data the graph would keep with it, such as partner IDs, is not.
+/// data the graph would keep with it, such as partner IDs, is not. `logged`
+/// is set as the line is logged, and once set, nothing more is logged.
 ///
 /// The identity graph needs strongly consistent reads and conditional writes,
 /// which the key-value store this adapter can open does not offer.
-fn warn_once_when_the_identity_graph_is_unavailable(settings: &Settings) {
+fn warn_once_when_the_identity_graph_is_unavailable(settings: &Settings, logged: &AtomicBool) {
     let Some(store) = settings.ec.ec_store.as_deref() else {
         return;
     };
-    if IDENTITY_GRAPH_UNAVAILABLE_LOGGED.swap(true, Ordering::Relaxed) {
+    if logged.swap(true, Ordering::Relaxed) {
         return;
     }
     log::warn!(
