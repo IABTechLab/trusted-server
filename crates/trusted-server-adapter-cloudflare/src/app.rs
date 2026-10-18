@@ -3,7 +3,7 @@ use core::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use edgezero_core::app::Hooks;
+use edgezero_core::app::{Hooks, StoreMetadata, StoresMetadata};
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderMap, HeaderValue, Method, Request, Response, header};
@@ -1069,6 +1069,15 @@ fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
 /// `EdgeZero` [`Hooks`] implementation for the Trusted Server application.
 pub struct TrustedServerApp;
 
+/// The key-value store this adapter declares, which is also the Workers KV
+/// binding `run_app` opens for it on every request, because `EdgeZero` binds
+/// a store by its id unless `EDGEZERO__STORES__KV__TRUSTED_SERVER_KV__NAME`
+/// names another binding.
+///
+/// `EdgeZero` treats a declared store as required, so a Worker deployed
+/// without the binding fails every request before any route runs.
+const KV_STORE_ID: &str = "TRUSTED_SERVER_KV";
+
 impl Hooks for TrustedServerApp {
     fn name() -> &'static str {
         "TrustedServer"
@@ -1084,6 +1093,22 @@ impl Hooks for TrustedServerApp {
         };
 
         build_router(&state)
+    }
+
+    /// Declares the key-value store alone, so `run_app` opens it for every
+    /// request and the request's services keep copies in Workers KV between
+    /// requests. The settings come from the `TRUSTED_SERVER_CONFIG` variable
+    /// at startup and secrets from the Worker environment, so no config or
+    /// secret store is declared.
+    fn stores() -> StoresMetadata {
+        StoresMetadata {
+            config: None,
+            kv: Some(StoreMetadata {
+                default: KV_STORE_ID,
+                ids: &[KV_STORE_ID],
+            }),
+            secrets: None,
+        }
     }
 }
 

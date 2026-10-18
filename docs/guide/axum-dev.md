@@ -68,5 +68,14 @@ request filters and the device module `[device]` selects run as on Fastly,
 and `[device] module = "platform"` classifies from the `User-Agent`, because
 the dev server supplies no TLS or HTTP/2 signals.
 
+Axum sends no [auction telemetry](./telemetry#adapter-support), and warns at
+startup when `[analytics]` selects a module.
+
+Axum always verifies HTTPS origin certificates against the public certificate
+authorities built into its client. It does not honor
+`proxy.certificate_check = false` and logs a warning at startup when the
+setting is off, so an origin whose certificate is self-signed or issued by a
+private authority cannot be reached through it.
+
 For an edge deployment, use the [Fastly](./fastly),
 [Cloudflare](./cloudflare), or [Spin](./spin) guide.

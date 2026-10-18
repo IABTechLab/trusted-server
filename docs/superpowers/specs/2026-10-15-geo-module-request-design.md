@@ -5,7 +5,7 @@
 **Related specs:** `2026-10-12-module-context-design.md`, `2026-10-12-device-signals-design.md`, `2026-08-27-integration-provider-seam-design.md`, `2026-09-07-didomi-geo-design.md`. Every design document of the stack is in IABTechLab/trusted-server#1342.
 **Related PRs:** IABTechLab/trusted-server#1374, reviewed on jwrosewell/trusted-server#28 (closed)
 **Issues:** IABTechLab/trusted-server#1321
-**Last updated:** 2026-10-16
+**Last updated:** 2026-10-17
 
 > **Why this spec exists.** A geo module was handed the client address and nothing else of the request, so a vendor whose one service answers location and device from the same request could not answer both from one call.
 
@@ -130,9 +130,11 @@ Every adapter builds the services for a request with `build_geo_module`, wrappin
 | Adapter    | What `platform` selects                                                                                                                                                                |
 | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Fastly     | `FastlyPlatformGeo` in `crates/geo/fastly`, which resolves the client address with Fastly's geo lookup                                                                                 |
-| Axum       | `AxumPlatformGeo`, which resolves nothing                                                                                                                                              |
+| Axum       | `AxumPlatformGeo`, which resolves nothing, so startup refuses `platform` unless the caller supplies its own services                                                                   |
 | Cloudflare | `CloudflareGeo`, built from the request's `cf-ipcountry`, `cf-ipcity`, `cf-ipcontinent`, `cf-iplatitude`, `cf-iplongitude` and `cf-region-code` headers and ignores the client address |
-| Spin       | `NullGeo`, which resolves nothing                                                                                                                                                      |
+| Spin       | `NullGeo`, which resolves nothing, so startup refuses `platform` unless the caller supplies its own services                                                                           |
+
+On Cloudflare the region comes from `cf-region-code` alone, which Cloudflare's Add visitor location headers managed transform adds. Without it a US visitor is placed in no state, so the rules `permissions.yaml` gives a US state do not apply (`a_us_state_visitor_reaches_the_us_state_jurisdiction_and_its_opt_out` in the adapter's `platform.rs`).
 
 **Fastly.** `build_per_request_services` in `crates/trusted-server-adapter-fastly/src/app.rs` builds the services with `build_geo_module(&state.settings, Arc::new(FastlyPlatformGeo))` and replaces the module with `state.registry.geo_module()` when that returns one. The Edge Cookie state, the auction endpoint and every module that calls `services.geo()` use that module.
 
@@ -155,6 +157,7 @@ No setting is added or changed. The `[geo]` section keeps its two keys.
 - Two registrations that offer a geo module under one name are refused at startup, and the error names both.
 - An offered module that the selector does not choose is logged as a warning when the registry is built.
 - `assume_single_jurisdiction` must be `true` when an Edge Cookie module is configured and `[geo] module` is unset or `none` (`GeoConfig::validate_jurisdiction_acknowledgment` in `settings.rs`).
+- On Axum and Spin, whose own lookups resolve nothing, `platform` is refused at startup naming the setting (`refuse_platform_geo` in each adapter's `app.rs`). The selection would locate no request and still pass as a geo module, so the acknowledgement above would never be asked for. Services a caller supplies carry a lookup of their own, which `platform` selects, so the check is skipped for them.
 
 **Defaults.** The defaults are unchanged. A deployment with no `[geo] module` resolves no location and makes no host geo call.
 
@@ -198,7 +201,7 @@ The Edge Cookie state resolves permissions at the top node of the `permissions.y
 
 ### 2.9 Rollout for existing deployments
 
-**Deployments.** No stored data changes. A deployment on `none` or `platform` resolves the location as before, because the wrapped lookups read the same address and the built-in lookups ignore the added evidence.
+**Deployments.** No stored data changes. A deployment on `none` or `platform` resolves the location as before, because the wrapped lookups read the same address and the built-in lookups ignore the added evidence. A deployment on Axum or Spin that selected `platform`, which located nothing there, no longer starts, and leaves `[geo] module` unset, with `assume_single_jurisdiction = true` where it runs an Edge Cookie module, or selects a module a linked crate offers. The integration tests start the Axum dev server that way (`axum_app_config_envelope` in `crates/trusted-server-integration-tests/tests/common/config.rs`), because their shared fixture selects `platform` for Viceroy.
 
 **The headers, a breaking change.** No response carries an `x-geo-*` header until a deployment selects `headers.geo` and names it in a `[[serve]]` entry, and then only the responses the entry covers carry them (section 2.10). Anything that reads the headers from a route of Trusted Server's own, an image or another response no entry covers gets none. On Cloudflare `x-geo-info-available` followed `cf-ipcountry` whatever `[geo] module` selected, and it now follows the location the selected module resolves, so it says `false` with the key unset.
 
@@ -286,6 +289,7 @@ Follow-ups from review round 2 that need an edit and no decision, each with the 
 - `crates/headers/geo/src/lib.rs` has the tests of `headers.geo`. `the_location_in_the_module_call_is_written_as_the_headers`, `a_metro_code_of_zero_and_no_region_are_not_written`, `a_value_a_header_cannot_carry_is_skipped`, `no_location_says_none_is_available`, `a_location_whose_use_needs_a_permission_the_middleware_does_not_declare_is_not_written` and `nothing_prepared_says_no_location_is_known` cover what it writes. `a_page_carries_the_location_the_request_resolved_and_the_geo_module_is_asked_once` and `a_page_no_serve_entry_names_the_middleware_on_carries_no_geo_header` send a page through `handle_publisher_request` and the buffered finalizer, with a geo module that counts its calls. `a_document_selecting_the_module_and_naming_it_in_no_serve_entry_is_refused` covers the refusal.
 - Each adapter's finalize step is tested to write no `x-geo-*` header, by `finalizing_writes_no_geo_header` in the `middleware.rs` of all four adapters, `finalize_handle_writes_no_geo_header` in the Fastly adapter's `middleware.rs`, `entry_point_finalize_writes_no_geo_header` in its `lib.rs`, `finalize_middleware_writes_the_operators_headers_and_no_geo_header` in the `tests/routes.rs` of Axum, Cloudflare and Spin, and `no_adapter_writes_a_geo_header_on_its_own_routes` in `crates/trusted-server-integration-tests/tests/parity.rs`. `a_finished_response_carries_no_geo_header_and_the_geo_module_is_asked_once`, in the Fastly adapter's `src/app/seam_probe_tests.rs`, sends a request through the router with a registry geo module that answers a location and counts its calls.
 - `crates/trusted-server-adapter-fastly/src/app/seam_probe_tests.rs` and `crates/trusted-server-adapter-axum/tests/seam_probe.rs` each have `proxy_route_reports_the_modules_geo_and_that_the_preparer_ran`, where a route reaches the registry's module selected by `[geo] module` and gets its country back. Each also has `geo_selector_naming_a_module_without_a_geo_module_fails_at_startup`.
+- The `tests/routes.rs` of Axum and of Spin each have `selecting_the_platform_geo_lookup_fails_at_startup`, which checks that `platform` is refused at startup with an error naming the setting and saying the host has no geo lookup.
 - `crates/trusted-server-adapter-spin/src/platform.rs` has `build_runtime_services_uses_noop_native_stores_without_handles`, which checks that the default module is named `none`.
 - `crates/trusted-server-integration-tests/tests/documentation_snippets.rs` has `integration_guide_runtime_services_fixture_compiles`, which compiles the runtime services example in the integration guide, the example that wraps `FixtureGeo` in `PlatformGeoModule::new`.
 
@@ -318,3 +322,4 @@ The pull request records the fork's CI green on all 19 checks at 1b8b43858. Its 
 | 2026-10-15 | Fixes from review round 1. The title, what a device module and a geo module are each handed, the evidence the router path's call carries, the 401 rule, the services the finalize steps get, the response headers that no permission guards, the wait for the module, the breaking items, the missing tests, the open questions and the review log.                                       |
 | 2026-10-15 | Corrections from review round 2. Why the entry-point step skips the registry, which responses carry `EcFinalizeState`, what the Fastly device module reads, the type of the registration field, the permissions endpoint in Axum, Cloudflare and Spin, the round 1 log sentence on the code changes, and the follow-ups for the changelog, the integration guide and four stale comments. |
 | 2026-10-16 | The `x-geo-*` response headers move from core and the adapters to the serve middleware `headers.geo` (section 2.10), so no finalize step calls a geo module, which answers open questions 1, 2, 3 and 5 of the previous revision. Section 2.11 lists the other changes a finalize step makes to a response, and section 4 the tests.                                                      |
+| 2026-10-17 | Axum and Spin refuse `[geo] module = "platform"` at startup, with a test on each, and the integration tests start the Axum dev server without it (sections 2.5, 2.6, 2.9 and 4). Section 2.5 says Cloudflare's region needs the `cf-region-code` header.                                                                                                                                  |
