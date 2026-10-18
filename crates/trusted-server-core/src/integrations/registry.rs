@@ -1321,7 +1321,7 @@ fn resolve_prefix_module(
     inner: &IntegrationRegistryInner,
 ) -> Result<SelectedPrefixModule, Report<TrustedServerError>> {
     let selected = match settings.prefix.module.as_deref() {
-        None | Some(crate::prefix::TRUSTED_SERVER_MODULE) => SelectedPrefixModule::trusted_server(),
+        None | Some(crate::prefix::TRUSTED_SERVER_MODULE) => SelectedPrefixModule::default(),
         Some(written) => {
             let module =
                 named_module(PREFIX_TYPE, "prefix", written, &inner.prefix_modules, inner)?;
