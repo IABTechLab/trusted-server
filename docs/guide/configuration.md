@@ -1822,7 +1822,10 @@ every asset is fetched from its origin for each request.
 
 A module may declare caches of its own, named by the module, and a deployment
 selects a loading cache for each in its own `[cache.<name>]` table with the
-same four settings. A module from `crates/geo/example` whose service answers
+same four settings. Core applies none of the lifetimes in such a table. They
+are checked against the ranges above and change nothing unless the module
+reads its own table and applies them.
+A module from `crates/geo/example` whose service answers
 once for each request's evidence declares `example-answers`, the cache that
 holds those answers, so `[cache.example-answers] module = "51degrees"` asks
 the service once however many requests carry the same evidence. A name is
@@ -1830,6 +1833,14 @@ the module's own: `robots-txt` and a name two modules declare are refused. A
 `[cache.<name>]` table naming a cache no linked module declares is refused by
 `ts config validate` and when the deployment starts, and the message lists
 the names this build's modules declare.
+
+::: warning Deploy the code before pushing the config
+A binary that predates declared caches fails to load a blob containing a
+`[cache.<name>]` table other than `[cache.robots-txt]` and returns its
+startup-error response. Upgrade every instance before pushing a config with
+such a table, and restore a config without those tables before rolling
+instances back.
+:::
 
 ```toml
 [cache.robots-txt]
