@@ -68,7 +68,11 @@ use crate::platform::{ConfigStoreHandleAdapter, SpinSecretStoreAdapter};
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 const SPIN_DEFAULT_CONFIG_STORE: &str = "default";
 
-/// Application state built once at startup and shared across all requests.
+/// Application state shared by everything that serves one request.
+///
+/// Not built once per process, because `edgezero_adapter_spin::run_app`
+/// calls `build_app` inside the per-request entry point, so this is
+/// rebuilt on every request.
 pub struct AppState {
     settings: Arc<Settings>,
     orchestrator: Arc<AuctionOrchestrator>,
