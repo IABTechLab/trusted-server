@@ -140,6 +140,8 @@ impl RequestInfo {
     /// 1. `Forwarded` header (`host=...`)
     /// 2. `X-Forwarded-Host`
     /// 3. `Host` header
+    /// 4. The request URI's authority, which an HTTP/2 request may carry
+    ///    in place of a `Host` header
     ///
     /// Scheme fallback order:
     /// 1. Fastly SDK TLS detection
@@ -212,6 +214,10 @@ fn extract_request_host(req: &Request<EdgeBody>) -> &str {
                 .get(header::HOST)
                 .and_then(|h| h.to_str().ok())
         })
+        // An HTTP/2 client may send its `:authority` and no `Host` header, and
+        // an empty host leaves a page unprocessed, so the URI's authority comes
+        // last, as `Host` would carry it.
+        .or_else(|| req.uri().authority().map(http::uri::Authority::as_str))
         .unwrap_or_default()
 }
 
@@ -660,6 +666,55 @@ mod tests {
             info.scheme, "http",
             "Scheme should default to http without TLS or forwarded headers"
         );
+    }
+
+    #[test]
+    fn request_info_falls_back_to_the_uri_authority_without_a_host_header() {
+        // An HTTP/2 client may send its `:authority` and no `Host` header.
+        let req = build_request(Method::GET, "https://publisher.example:8443/page");
+        assert!(
+            req.headers().get(header::HOST).is_none(),
+            "the request must carry no Host header, or it proves nothing"
+        );
+
+        let info = RequestInfo::from_request(&req, &default_client_info());
+        assert_eq!(
+            info.host, "publisher.example:8443",
+            "should read the host from the URI's authority, with its port as Host carries it"
+        );
+
+        let path_only = build_request(Method::GET, "/page");
+        assert_eq!(
+            RequestInfo::from_request(&path_only, &default_client_info()).host,
+            "",
+            "should name no host when neither a header nor the URI names one"
+        );
+    }
+
+    #[test]
+    fn request_info_prefers_each_host_header_to_the_uri_authority() {
+        for (name, value, expected) in [
+            ("host", "from-host.example", "from-host.example"),
+            (
+                "x-forwarded-host",
+                "from-x-forwarded-host.example",
+                "from-x-forwarded-host.example",
+            ),
+            (
+                "forwarded",
+                "host=from-forwarded.example",
+                "from-forwarded.example",
+            ),
+        ] {
+            let mut req = build_request(Method::GET, "https://from-authority.example/page");
+            set_header(&mut req, name, value);
+
+            let info = RequestInfo::from_request(&req, &default_client_info());
+            assert_eq!(
+                info.host, expected,
+                "should prefer {name} to the URI's authority"
+            );
+        }
     }
 
     #[test]
