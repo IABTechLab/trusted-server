@@ -1062,6 +1062,8 @@ module, so it sits directly in `[geo]`.
 
 No module is the default, so a default deployment is not tied to any host geo service. A module from a crate at `crates/geo/<name>` is written `<name>` or `geo.<name>`, and the crate's own module has to be selected in the section of its type as well. Naming a module this deployment does not run fails at startup, with the geo modules it does run. A failed geo lookup at request time resolves every permission to the requires-signal floor and is logged at error level, so an outage is handled protectively.
 
+**What `platform` selects.** On Fastly it is Fastly's geo lookup of the client address. On Cloudflare the location is read from the `cf-*` request headers, and the region from `cf-region-code` alone, which Cloudflare's Add visitor location headers managed transform adds. Without that header a US visitor is placed in no state, so the rules `permissions.yaml` gives a US state, and the opt-out signals they read, do not apply. The Axum dev server and Spin have no geo lookup, and refuse `platform` at startup naming the setting.
+
 **Example**:
 
 ```toml
@@ -1282,7 +1284,7 @@ A module with settings of its own reads them from its own block, `[robots-txt.<n
 1. With `refuse_all` selected the file is the refusal and nothing else, whatever else is selected, and every response the deployment finalizes carries `X-Robots-Tag: noindex, nofollow`.
 2. A path in `always_allow` stays open to every crawler a module's rules refuse the whole site to, `*` included. A narrower rule is kept as the module gave it, so `Disallow: /ads` still closes off `/ads.txt`.
 3. The rules appear in the order `modules` names them, between `top_text` above and the `Sitemap` line and `bottom_text` below.
-4. A module is asked for the host the request was addressed to, never one that `Forwarded` or `X-Forwarded-Host` names, and is given nothing of the crawler's connection. Holding is the normal case. A module's answer is held for that host in the loading cache of the one loading cache module the build links, or of the module `[cache.robots-txt]` names, briefly in memory and in the shared store outside it, so a module is asked again only when no copy young enough is held, rather than by every request, and `[cache.robots-txt]` sets how long the copies last, as described under [Loading caches](#loading-caches). The last answer is also kept apart for 30 days, in the value cache on Fastly and in the key-value store on the other adapters. A value cache can drop an entry early, so on Fastly an answer past its age is likely, rather than certain, to be there when a module cannot answer.
+4. A module is asked for the host the request was addressed to, never one that `Forwarded` or `X-Forwarded-Host` names, and is given nothing of the crawler's connection. Holding is the normal case. A module's answer is held for that host in the loading cache of the one loading cache module the build links, or of the module `[cache.robots-txt]` names, briefly in memory and in the shared store outside it, so a module is asked again only when no copy young enough is held, rather than by every request, and `[cache.robots-txt]` sets how long the copies last, as described under [Loading caches](#loading-caches). The last answer is also kept apart for 30 days, in the value cache on Fastly and in the key-value store on Cloudflare and Spin, and Axum, which has no key-value store, keeps none. A value cache can drop an entry early, so on Fastly an answer past its age is likely, rather than certain, to be there when a module cannot answer.
 5. A module that cannot answer has its last answer served past its age. With no answer kept at all, or with no rule anywhere in the file, the file is `503` with `Retry-After: 600`, never an empty file, which a crawler would read as permission to crawl everything. Select `allow_all` to allow every crawler.
 6. Spin's key-value store gives an entry no lifetime, so there a kept answer stays until it is replaced, and one kept for settings that have since changed stays until it is deleted from the store. With no loading cache module linked, or several linked and none named in `[cache.robots-txt]`, no copy is held, so every request for the file asks each module, and a deployment whose key-value store cannot be opened keeps no last answer either.
 7. The file is made by the `robots_txt` middleware, which runs on `text/plain` at `/robots.txt` alone, in the phase the entry places it in, prepares the file before the document is processed, and replaces the origin's `text/plain` file with it. The origin is asked for its whole file, without a crawler's conditional or range headers. Any other answer to a `GET` or `HEAD`, such as a `404`, a page from a single-page application's catch-all, a redirect or a `401` from a staging site behind a login, has the file made in its place with status `200`. An origin that cannot be reached gives `502`, which a crawler reads as refusing everything. The response takes the deployment's cache policy for the path, as every file does, so where the response is stored a module is asked only when the stored copy has ended, however soon its refresh is due. A refusal, as in point 5, is answered before any document is processed, and nothing is stored.
@@ -2000,7 +2002,9 @@ shared store, and is shared by the requests an adapter serves with one
 application state, which is one request on Cloudflare and Spin because they
 build their state for each request. The copy in the shared store is the one
 every instance reads. The shared store is the host's value cache where
-it supplies one, being Fastly's cache, and its key-value store otherwise. A
+it supplies one, being Fastly's cache, and its key-value store otherwise, being
+the `TRUSTED_SERVER_KV` namespace on Cloudflare and the `default` store on
+Spin. Axum has neither, so there the memory copy is the only one. A
 copy in the shared store goes when its lifetime ends, or sooner when no request
 has used it for the idle time, and an answer with a shorter lifetime of its own
 ends sooner still. Every key starts with `ts.` and the publisher's domain, with
@@ -2020,8 +2024,11 @@ the service starts, with the names that could be written.
 Every response the publisher's origin sends that is not a page, and every
 answer of an asset route under `[[proxy.asset_routes]]`, is held the same way,
 selected by `[cache.assets]`, for the lifetime the origin's cache policy gives
-it and under what the origin says it varies on, so an asset is fetched once
-however many readers and instances ask for it at the same moment. A copy is
+it and under what the origin says it varies on, so readers who share a memory
+copy, or on Fastly a location, share one fetch of an asset. On Cloudflare and
+Spin, where a memory copy lasts one request and the key-value store makes no
+request wait, each request that misses at the same moment fetches it, and later
+requests read the stored copy. A copy is
 served with the headers that describe it and an `Age` that counts from the
 origin's. Nothing is kept that may not be shared: anything but a `GET`,
 anything but a `200`, HTML, a response carrying `Set-Cookie`, one whose policy
