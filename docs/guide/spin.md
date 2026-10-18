@@ -66,8 +66,12 @@ classifies from the `User-Agent`, because Spin supplies no TLS or HTTP/2
 signals. An Edge Cookie module creates and writes its cookie with no identity
 graph behind it, and `POST /_ts/api/v1/ec/resolve` sets one the same way.
 `[[proxy.asset_routes]]` are served from each route's own source with the
-asset body held whole, and a route that enables the Image Optimizer answers
-with an error, because Spin has none.
+asset body held whole, up to 8 MiB, and a larger one answers `502`. Spin has
+no Image Optimizer, so startup warns about each route that enables one, and
+each request such a route would optimize answers `502` (see
+[Asset Routes](./asset-routes)). Spin sends the address's own host as the
+`Host`, so a request to a source whose `host_header` names another host, a
+route's or the publisher's, answers `502` before its origin is asked.
 
 Spin sends no [auction telemetry](./telemetry#adapter-support), and warns at
 startup when `[analytics]` selects a module.

@@ -70,9 +70,16 @@ the `User-Agent`, because the Worker supplies no TLS or HTTP/2 signals. An
 Edge Cookie module creates and writes its cookie with no identity graph
 behind it, and `POST /_ts/api/v1/ec/resolve` sets one the same way.
 `[[proxy.asset_routes]]` are served from each route's own source with the
-asset body held whole, and a route that enables the Image Optimizer answers
-with an error, because Workers has none. See the
-[API reference](./api-reference) for route-level behavior.
+asset body held whole, up to 10 MiB, and a larger one answers `502`. The
+adapter does not translate Image Optimizer metadata into Cloudflare's own
+image options, so startup warns about each route that enables the Image
+Optimizer, and each request such a route would optimize answers `502` (see
+[Asset Routes](./asset-routes)). Cloudflare
+[documents](https://developers.cloudflare.com/workers/runtime-apis/request/)
+that a Worker cannot set a `Host` naming a host outside its zone unless the
+request goes to that host, so a source's `host_header` naming such a host
+does not reach its origin. See the [API reference](./api-reference) for
+route-level behavior.
 
 The Worker sends no [auction telemetry](./telemetry#adapter-support), and warns
 at startup when `[analytics]` selects a module.

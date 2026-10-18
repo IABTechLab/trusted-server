@@ -604,6 +604,8 @@ selector value misses (see One blob for each path).
 - Is the name a redirect from the origin is compared with (see Redirects under
   `url`)
 - Useful when the origin endpoint expects a canonical publisher hostname
+- Cannot be sent on Spin, which sends the host in `url` as the `Host`, so
+  there every request for the origin answers `502` and the origin is not asked
 
 **Format**: Hostname with optional port, without protocol, path, query, or fragment
 
@@ -1701,7 +1703,8 @@ beneath. Core's `origin` source takes these settings:
 - `directory_index` follows the same rules as the publisher's
   [`directory_index`](#directory-index).
 - With `host_header`, Trusted Server still connects, uses SNI, and checks
-  certificates against the host in `url`.
+  certificates against the host in `url`. Spin cannot send it, so there
+  every request under the route answers `502`.
 
 ### `[proxy.asset_routes.source.origin.auth]`
 
@@ -1983,7 +1986,7 @@ origin cache directives, including `no-cache`, are replaced by the configured
 policy. `Vary` is preserved, so do not assign a public immutable rule to paths
 that vary by cookies or other user-specific request state.
 
-On a configured Fastly asset-rehost route, a matching rule is authoritative
+On a configured asset route, a matching rule is authoritative
 over the third-party origin's cache defaults, including `no-store`, because
 Trusted Server owns the rehosted copy. A later Trusted Server or operator-applied
 `private` or `no-store` directive still vetoes public policy reapplication and

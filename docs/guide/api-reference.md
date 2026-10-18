@@ -1022,8 +1022,8 @@ https://edge.example.com/_ts/debug/ja4`.
 
 ### GET or HEAD `<proxy.asset_routes[].prefix>{path}`
 
-**Contract:** Fastly-only and registered once for each
-`[[proxy.asset_routes]]` entry. Auth: optional origin signing by the signer
+**Contract:** Answered on every adapter for each `[[proxy.asset_routes]]`
+entry. Auth: optional origin signing by the signer
 the route's `auth` table names, which authenticates Trusted Server to the
 origin rather than the caller.
 Request body: not applicable. The route maps the remainder of the path and the
@@ -1031,8 +1031,11 @@ configured query policy to the selected origin, preserves range and conditional
 request semantics, and returns the origin status/body after stripping unsafe
 response headers. Cache behavior follows the route's normalized cache policy;
 credentialed or otherwise private responses are forced `private, no-store`.
-No dedicated CORS grant or rate limiter is installed. Example: if the prefix is
-`/assets/`, request `curl -I https://edge.example.com/assets/logo.svg`.
+No dedicated CORS grant or rate limiter is installed. On Axum, Cloudflare and
+Spin a request the route's Image Optimizer would optimize answers `502`, and
+on Spin so does a request to a source whose `host_header` names another
+host. Example: if the prefix is `/assets/`, request
+`curl -I https://edge.example.com/assets/logo.svg`.
 
 ### Publisher fallback: `/` and `/{*rest}`
 
