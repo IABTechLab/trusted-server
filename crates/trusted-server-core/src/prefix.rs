@@ -328,12 +328,6 @@ impl SelectedPrefixModule {
         Self { name, module }
     }
 
-    /// Core's own module, which runs when nothing is selected.
-    #[must_use]
-    pub fn trusted_server() -> Self {
-        Self::new(TRUSTED_SERVER_MODULE, Arc::new(TrustedServerPrefix))
-    }
-
     /// The name the module runs under.
     #[must_use]
     pub fn name(&self) -> &'static str {
@@ -355,9 +349,10 @@ impl SelectedPrefixModule {
     }
 }
 
+/// Core's own module, which runs when nothing is selected.
 impl Default for SelectedPrefixModule {
     fn default() -> Self {
-        Self::trusted_server()
+        Self::new(TRUSTED_SERVER_MODULE, Arc::new(TrustedServerPrefix))
     }
 }
 
