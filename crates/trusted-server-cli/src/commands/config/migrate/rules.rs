@@ -1748,13 +1748,20 @@ fn implementation_of(profile: &str) -> Option<&'static str> {
 /// `/admin/keys` only the address itself and the paths below `/admin/keys/`
 /// are, so that prefix must be followed by a `/` or the end of the path, and
 /// `^/admin/keys` alone, which also matches `/admin/keystore`, is not.
+/// `?` and `*` let what comes before them match no times, and so can a
+/// count in `{}`, so none of the three may follow `^/_ts/admin` or that
+/// bound, as `^/_ts/admin?` also matches `/_ts/admit` and `^/admin/keys/?`
+/// matches `/admin/keystore`.
 fn guards_only_closed_paths(pattern: &str) -> bool {
     const KEYS_BOUNDS: &[&str] = &["/", "$", "(?:/|$)", "(/|$)"];
-    let closed = pattern.starts_with("^/_ts/admin")
-        || pattern
-            .strip_prefix("^/admin/keys")
-            .is_some_and(|rest| KEYS_BOUNDS.iter().any(|bound| rest.starts_with(bound)));
-    closed && !has_top_level_alternation(pattern)
+    let rest = match pattern.strip_prefix("^/admin/keys") {
+        Some(rest) => KEYS_BOUNDS
+            .iter()
+            .find_map(|bound| rest.strip_prefix(bound)),
+        None => pattern.strip_prefix("^/_ts/admin"),
+    };
+    rest.is_some_and(|rest| !rest.starts_with(['?', '*', '{']))
+        && !has_top_level_alternation(pattern)
 }
 
 /// Whether `pattern` has a `|` outside every group and character class.

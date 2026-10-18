@@ -1,6 +1,10 @@
 use std::fs;
 
+use edgezero_core::body::Body as EdgeBody;
+use http::Request;
+use regex::Regex;
 use tempfile::TempDir;
+use trusted_server_core::closed_paths::closed_path_response;
 use trusted_server_core::settings::Settings;
 
 use super::rules::Migration;
@@ -272,16 +276,87 @@ fn guarded(pattern: &str) -> String {
     ))
 }
 
+/// Request paths that tell apart what a handler pattern guarded on main.
+const PROBE_PATHS: [&str; 16] = [
+    "/",
+    "/admin",
+    "/admin/keys",
+    "/admin/keys/",
+    "/admin/keys/rotate",
+    "/admin/keys-old",
+    "/admin/keystore",
+    "/admin/keysx",
+    "/members",
+    "/members/_ts/admin",
+    "/_ts/admi",
+    "/_ts/admit",
+    "/_ts/admin",
+    "/_ts/admin/",
+    "/_ts/admin/ec",
+    "/_ts/adminx",
+];
+
+/// The probe paths a handler on `pattern` guarded on main that this release
+/// forwards to the origin. Main searched the path with the `regex` crate, so
+/// a match anywhere in it counted.
+fn forwarded_paths_main_guarded(pattern: &str) -> Vec<&'static str> {
+    let regex = Regex::new(pattern).expect("should compile as main compiled it");
+    PROBE_PATHS
+        .into_iter()
+        .filter(|path| regex.is_match(path))
+        .filter(|path| {
+            let request = Request::builder()
+                .uri(format!("https://publisher.example.com{path}"))
+                .body(EdgeBody::empty())
+                .expect("should build a request");
+            closed_path_response(&request).is_none()
+        })
+        .collect()
+}
+
+/// Checks that the handler on `pattern` is kept and left to do.
+fn assert_left_to_do(pattern: &str) {
+    let migration = migrated(&guarded(pattern));
+    let value = parsed(&migration.text);
+    let kept = value
+        .get("handlers")
+        .and_then(|handlers| handlers.get(0))
+        .and_then(|handler| handler.get("path"))
+        .and_then(toml::Value::as_str);
+    assert_eq!(
+        kept,
+        Some(pattern),
+        "should keep the handler on `{pattern}`:\n{}",
+        migration.text
+    );
+    assert!(
+        reported(
+            &migration.report.to_do,
+            "`[[handlers]]` entry 1 can guard paths beyond the `/_ts/admin` and \
+             `/admin/keys` paths this release closes"
+        ),
+        "`{pattern}`: {:?}",
+        migration.report.to_do
+    );
+}
+
 #[test]
 fn a_handler_is_removed_only_where_every_path_it_matches_is_closed() {
     for pattern in [
         "^/_ts/admin",
         "^/_ts/admin/",
+        "^/_ts/admin+",
         "^/admin/keys/",
+        "^/admin/keys/+",
         "^/admin/keys$",
         "^/admin/keys(?:/|$)",
         "^/admin/keys(/|$)",
     ] {
+        let forwarded = forwarded_paths_main_guarded(pattern);
+        assert!(
+            forwarded.is_empty(),
+            "`{pattern}` guarded {forwarded:?} on main, which this release forwards"
+        );
         let migration = migrated(&guarded(pattern));
         assert!(
             parsed(&migration.text).get("handlers").is_none(),
@@ -295,7 +370,9 @@ fn a_handler_is_removed_only_where_every_path_it_matches_is_closed() {
         );
     }
     // Main matched a pattern anywhere in the path, so `^/admin/keys` also
-    // guarded `/admin/keystore`, which the stack forwards to the origin.
+    // guarded `/admin/keystore`, which the stack forwards to the origin, and
+    // so does `^/admin/keys/?`, whose quantifier lets the bound match
+    // nothing. `^/_ts/admin?` matches `/_ts/admit` the same way.
     for pattern in [
         "^/admin/keys",
         "^/admin/keys.*",
@@ -303,23 +380,27 @@ fn a_handler_is_removed_only_where_every_path_it_matches_is_closed() {
         "^/admin",
         "/_ts/admin",
         "^/admin/keys(?:/|$)|^/members",
+        "^/admin/keys/?",
+        "^/admin/keys/*",
+        "^/admin/keys/{0}",
+        "^/admin/keys$?",
+        "^/admin/keys(?:/|$)?",
+        "^/admin/keys(/|$)??",
+        "^/_ts/admin?",
+        "^/_ts/admin*",
+        "^/_ts/admin{0,1}",
     ] {
-        let migration = migrated(&guarded(pattern));
-        assert_eq!(
-            parsed(&migration.text)["handlers"][0]["path"].as_str(),
-            Some(pattern),
-            "should keep the handler on `{pattern}`"
-        );
         assert!(
-            reported(
-                &migration.report.to_do,
-                "`[[handlers]]` entry 1 can guard paths beyond the `/_ts/admin` and \
-                 `/admin/keys` paths this release closes"
-            ),
-            "`{pattern}`: {:?}",
-            migration.report.to_do
+            !forwarded_paths_main_guarded(pattern).is_empty(),
+            "`{pattern}` should guard a path this release forwards"
         );
+        assert_left_to_do(pattern);
     }
+    // The command reads what follows the bound and not what the whole
+    // pattern means, so a quantifier there leaves the handler to do even
+    // where every path it matches is closed.
+    assert!(forwarded_paths_main_guarded("^/admin/keys/?$").is_empty());
+    assert_left_to_do("^/admin/keys/?$");
 }
 
 #[test]
