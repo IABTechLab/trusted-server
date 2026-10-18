@@ -10,6 +10,15 @@ Cloudflare and Spin adapters link the module and check its settings, and use
 core's no-op sink, so they send nothing, and log a warning at startup when
 `[analytics]` selects a module.
 
+## Adapter support
+
+| Adapter      | Auction telemetry            | Access telemetry |
+| ------------ | ---------------------------- | ---------------- |
+| `axum`       | not sent, warning at startup | refused          |
+| `cloudflare` | not sent, warning at startup | refused          |
+| `fastly`     | sent                         | refused          |
+| `spin`       | not sent, warning at startup | refused          |
+
 ## Data path
 
 The request entry point derives coarse `DeviceSignals`. Auction execution
