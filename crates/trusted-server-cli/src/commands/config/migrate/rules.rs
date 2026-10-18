@@ -1370,8 +1370,8 @@ impl Migrator {
     }
 
     /// The `[[fetch]]` and `[[serve]]` entries that place the page changes
-    /// of the selected modules, for a document with none, and the entry
-    /// each file a module makes needs.
+    /// of the selected modules, for a document written for main, and the
+    /// entry each file a module makes needs.
     fn page_entries(&mut self) {
         let entries = self.wanted_entries();
         let mut new: Vec<TablePath> = Vec::new();
@@ -1428,12 +1428,14 @@ impl Migrator {
 
     /// The page entries the document lacks: one for each phase and media
     /// type the selected modules supply middleware for, in the order the
-    /// builders supply it, when the document has no entry at all, and one
-    /// for each file a selected module makes that no entry places.
+    /// builders supply it, for a document written for main, whose modules
+    /// changed every page, and one for each file a selected module makes
+    /// that no entry places, which startup refuses. A document in the
+    /// stack's shape loads without page entries, so they are left to the
+    /// operator there.
     fn wanted_entries(&self) -> Vec<PageEntry> {
         let selected = self.selected_ids();
         let supplied = supplied_middleware(&crate::app_config::linked_builders());
-        let has_entries = self.root().contains_key("fetch") || self.root().contains_key("serve");
         let mut entries = Vec::new();
         for phase in MiddlewarePhase::ALL {
             let mut media_types: Vec<&'static str> = Vec::new();
@@ -1472,7 +1474,7 @@ impl Migrator {
                         None => rest.push(name),
                     }
                 }
-                if !has_entries && !rest.is_empty() {
+                if self.for_main && !rest.is_empty() {
                     entries.push(PageEntry {
                         phase: phase.as_str(),
                         media_type,

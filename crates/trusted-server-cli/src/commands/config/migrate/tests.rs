@@ -1299,6 +1299,32 @@ enabled = true
 }
 
 #[test]
+fn a_document_in_the_stack_shape_with_no_page_entries_gets_none_added() {
+    let input = r#"[publisher]
+domain = "publisher.example.com"
+cookie_domain = ".publisher.example.com"
+proxy_secret = "publisher_proxy_secret"
+
+[source]
+module = "origin"
+
+[source.origin]
+url = "https://origin.publisher.example.com"
+
+[cmp]
+module = "didomi"
+"#;
+    let migration = migrated(input);
+
+    assert!(
+        migration.report.changed.is_empty(),
+        "should leave the page changes to the operator: {:?}",
+        migration.report.changed
+    );
+    assert_eq!(migration.text, input);
+}
+
+#[test]
 fn a_document_with_page_entries_gets_none_added() {
     let input = r#"[cmp]
 module = "didomi"
