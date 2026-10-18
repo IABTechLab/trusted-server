@@ -1068,8 +1068,10 @@ async fn dispatch_fallback(
 
 /// Whether an asset response carries a body.
 ///
-/// `HEAD` responses and the bodiless statuses (204, 304) keep the origin's
-/// `Content-Length` and carry no body, so a body stream is dropped for them.
+/// `HEAD` responses and the bodiless statuses (204, 304) carry no body, so a
+/// body stream is dropped for them. This adapter's HTTP client holds every
+/// response whole and writes the length of the body it read as the
+/// `Content-Length`, which for a `HEAD` is `0`.
 fn asset_response_carries_body(method: &Method, status: StatusCode) -> bool {
     *method != Method::HEAD
         && status != StatusCode::NO_CONTENT
