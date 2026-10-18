@@ -15,6 +15,8 @@ compatibility_flags = ["nodejs_compat", "cache_option_enabled"]
 command = "bash build.sh"
 
 [[kv_namespaces]]
+# The adapter declares this store and opens it for every request, so a Worker
+# without the binding answers every request with a 500.
 binding = "TRUSTED_SERVER_KV"
 # Run `wrangler kv:namespace create TRUSTED_SERVER_KV` and paste the returned
 # id here before `wrangler deploy` or `wrangler dev --remote`.
