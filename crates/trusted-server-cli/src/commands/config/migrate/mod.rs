@@ -57,6 +57,12 @@ pub enum Adapter {
 }
 
 impl Adapter {
+    /// Whether the host has a location lookup of its own, which `[geo]
+    /// module = "platform"` selects.
+    pub(crate) const fn has_location_lookup(self) -> bool {
+        matches!(self, Self::Fastly | Self::Cloudflare)
+    }
+
     /// The adapter as a line on stderr names it.
     pub(crate) const fn name(self) -> &'static str {
         match self {

@@ -226,6 +226,7 @@ impl Migrator {
         if self.for_main {
             self.main_defaults();
         }
+        self.location_at_startup();
         self.page_entries();
         if self.for_main {
             self.main_checks();
@@ -1335,9 +1336,11 @@ impl Migrator {
     }
 
     /// The host's location lookup main ran on every request, for a document
-    /// written for main.
+    /// written for main, on an adapter whose host has one. The Axum and Spin
+    /// adapters refuse the selection, and main's lookup there located no
+    /// request, so the document gets no geo module there.
     fn main_defaults(&mut self) {
-        if self.root().contains_key("geo") {
+        if !self.adapter.has_location_lookup() || self.root().contains_key("geo") {
             return;
         }
         let mut geo = Table::new();
@@ -1353,6 +1356,62 @@ impl Migrator {
             .or_else(|| self.layout.position_of(&path(&["publisher"])))
             .unwrap_or_else(|| self.layout.last_position());
         self.layout.place_after(anchor, &[path(&["geo"])]);
+    }
+
+    /// The location settings startup refuses and `ts config validate` does
+    /// not check, being the host's own lookup on an adapter whose host has
+    /// none, and an Edge Cookie module with no geo module unless `[geo]
+    /// assume_single_jurisdiction` accepts that every request then takes the
+    /// top of the `permissions.yaml` rules. Which way out to take is the
+    /// operator's decision, so each is left to do.
+    fn location_at_startup(&mut self) {
+        let geo = self.root().get("geo");
+        let module = geo
+            .and_then(|geo| geo.get("module"))
+            .and_then(Item::as_str)
+            .map(str::to_owned);
+        let acknowledged = geo
+            .and_then(|geo| geo.get("assume_single_jurisdiction"))
+            .and_then(Item::as_bool)
+            == Some(true);
+        let edge_cookie = self
+            .root()
+            .get("ec")
+            .and_then(|ec| ec.get("module"))
+            .and_then(Item::as_str)
+            .is_some_and(|module| module != "none");
+        let name = self.adapter.name();
+        if module.as_deref() == Some("platform") && !self.adapter.has_location_lookup() {
+            let acknowledge = if edge_cookie {
+                " and set `[geo] assume_single_jurisdiction = true`, which accepts that every \
+                 request takes the top of the `permissions.yaml` rules"
+            } else {
+                ""
+            };
+            self.push_to_do(format!(
+                "`[geo] module = \"platform\"` selects the host's location lookup, and {name} has \
+                 none, so startup refuses it. Select a geo module a linked crate offers, or remove \
+                 the line{acknowledge}"
+            ));
+            return;
+        }
+        if edge_cookie && matches!(module.as_deref(), None | Some("none")) && !acknowledged {
+            self.push_to_do(if self.adapter.has_location_lookup() {
+                "`[ec]` selects an Edge Cookie module and `[geo]` selects no geo module, so every \
+                 request takes the top of the `permissions.yaml` rules, which startup refuses \
+                 unless `[geo] assume_single_jurisdiction = true` accepts it. Select a geo \
+                 module, such as `platform`, or set that line"
+                    .to_owned()
+            } else {
+                format!(
+                    "`[ec]` selects an Edge Cookie module and no geo module is selected, because \
+                     {name} has no location lookup of its own, so every request takes the top of \
+                     the `permissions.yaml` rules, which startup refuses unless `[geo] \
+                     assume_single_jurisdiction = true` accepts it. Set that line, or select a geo \
+                     module a linked crate offers"
+                )
+            });
+        }
     }
 
     /// The `[[fetch]]` and `[[serve]]` entries that place the page changes

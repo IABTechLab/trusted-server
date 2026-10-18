@@ -1,6 +1,7 @@
 use std::fs;
 
 use tempfile::TempDir;
+use trusted_server_core::settings::Settings;
 
 use super::rules::Migration;
 use super::{Adapter, ConfigMigrateArgs, migrate, run_with_writers};
@@ -64,6 +65,11 @@ fn migrated_on(adapter: Adapter, input: &str) -> Migration {
 
 fn parsed(text: &str) -> toml::Value {
     toml::from_str(text).unwrap_or_else(|error| panic!("should be TOML: {error}\n{text}"))
+}
+
+/// `text` read as core reads its settings, before the checks startup makes.
+fn settings_of(text: &str) -> Settings {
+    toml::from_str(text).unwrap_or_else(|error| panic!("should read the settings: {error}\n{text}"))
 }
 
 fn main_document(rest: &str) -> String {
@@ -1159,6 +1165,116 @@ fn a_document_for_main_keeps_the_location_lookup() {
         "{:?}",
         migration.report.to_do
     );
+}
+
+#[test]
+fn the_location_lookup_is_the_one_each_adapter_accepts() {
+    for adapter in [Adapter::Fastly, Adapter::Cloudflare] {
+        let migration = migrated_on(adapter, MAIN_BASE);
+        assert_eq!(
+            parsed(&migration.text)["geo"]["module"].as_str(),
+            Some("platform"),
+            "{adapter:?} should keep the host's lookup:\n{}",
+            migration.text
+        );
+        assert!(
+            migration.report.to_do.is_empty(),
+            "{adapter:?}: {:?}",
+            migration.report.to_do
+        );
+        let settings = settings_of(&migration.text);
+        settings
+            .geo
+            .validate_jurisdiction_acknowledgment(&settings.ec)
+            .unwrap_or_else(|error| panic!("{adapter:?} should pass the startup check: {error:?}"));
+    }
+    // Neither host has a lookup, so each refuses `platform` at startup, and
+    // main's lookup there located no request.
+    for adapter in [Adapter::Axum, Adapter::Spin] {
+        let migration = migrated_on(adapter, MAIN_BASE);
+        assert!(
+            parsed(&migration.text).get("geo").is_none(),
+            "{adapter:?} has no lookup to select:\n{}",
+            migration.text
+        );
+        assert!(
+            reported(
+                &migration.report.to_do,
+                "no geo module is selected, because"
+            ),
+            "{adapter:?}: {:?}",
+            migration.report.to_do
+        );
+        let settings = settings_of(&migration.text);
+        assert!(
+            settings
+                .geo
+                .validate_jurisdiction_acknowledgment(&settings.ec)
+                .is_err(),
+            "{adapter:?}: startup should refuse what the item left to do names"
+        );
+
+        let done = format!(
+            "{}\n[geo]\nassume_single_jurisdiction = true\n",
+            migration.text
+        );
+        let settings = settings_of(&done);
+        settings
+            .geo
+            .validate_jurisdiction_acknowledgment(&settings.ec)
+            .unwrap_or_else(|error| panic!("{adapter:?} should pass the startup check: {error:?}"));
+        let again = migrate(&done, adapter).expect("should migrate the document");
+        assert!(
+            again.report.to_do.is_empty() && again.report.changed.is_empty(),
+            "{adapter:?}: {:?}",
+            again.report
+        );
+    }
+}
+
+#[test]
+fn the_location_settings_startup_refuses_are_left_to_do_in_any_document() {
+    let platform = "[geo]\nmodule = \"platform\"\n";
+    for adapter in [Adapter::Axum, Adapter::Spin] {
+        let migration = migrated_on(adapter, platform);
+        assert!(
+            reported(
+                &migration.report.to_do,
+                "`[geo] module = \"platform\"` selects the host's location lookup"
+            ),
+            "{adapter:?}: {:?}",
+            migration.report.to_do
+        );
+        assert_eq!(migration.text, platform);
+    }
+    for adapter in [Adapter::Fastly, Adapter::Cloudflare] {
+        let migration = migrated_on(adapter, platform);
+        assert!(
+            migration.report.to_do.is_empty(),
+            "{adapter:?}: {:?}",
+            migration.report.to_do
+        );
+    }
+
+    let unlocated = "[ec]\nmodule = \"hmac\"\n\n[ec.hmac]\npassphrase = \"ec_passphrase\"\n";
+    let acknowledged = format!("{unlocated}\n[geo]\nassume_single_jurisdiction = true\n");
+    for adapter in ADAPTERS {
+        let migration = migrated_on(adapter, unlocated);
+        assert!(
+            reported(
+                &migration.report.to_do,
+                "`[ec]` selects an Edge Cookie module and"
+            ),
+            "{adapter:?}: {:?}",
+            migration.report.to_do
+        );
+        let migration = migrated_on(adapter, &acknowledged);
+        assert!(
+            migration.report.to_do.is_empty(),
+            "{adapter:?}: {:?}",
+            migration.report.to_do
+        );
+    }
 }
 
 #[test]
