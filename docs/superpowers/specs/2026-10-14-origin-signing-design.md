@@ -5,7 +5,7 @@
 **Related specs:** `2026-10-14-source-modules-design.md`, `2026-10-13-publisher-object-storage-origin-design.md`, `2026-05-19-asset-s3-auth-fastly-io-design.md` and `2026-10-14-no-modules-crate-design.md`, all in IABTechLab/trusted-server#1342, which holds every design document of the stack
 **Related PRs:** jwrosewell/trusted-server#43, IABTechLab/trusted-server#1391
 **Issues:** IABTechLab/trusted-server#1338
-**Last updated:** 2026-10-15
+**Last updated:** 2026-10-18
 
 > **Why this spec exists.** Core signs reads from the publisher's origin and from each asset route's origin with one cloud vendor's signing scheme, and its settings know that scheme's credentials, so an origin that wants another scheme has to add a branch to core.
 
@@ -17,7 +17,7 @@ So core knows one vendor's scheme. A signed read from another vendor's storage, 
 
 ## 2. Design
 
-**Core keeps an origin authentication interface.** `trusted_server_core::origin_auth` declares `OriginSigner`, which signs the headers of a request for a method on a final address, and removes every header in the scheme's own namespace so a reader's header there cannot reach the origin beside the signature. Core calls it where it signed before, in the asset route path, in the preflight that path runs ahead of the image optimizer, and in the publisher path, through the `OriginSigning` a `SourceLocation` carries. The publisher path is core's own, so it signs on all four adapters. Asset routes and the preflight run on the Fastly adapter alone, because only that adapter calls `handle_asset_proxy_request`.
+**Core keeps an origin authentication interface.** `trusted_server_core::origin_auth` declares `OriginSigner`, which signs the headers of a request for a method on a final address, and removes every header in the scheme's own namespace so a reader's header there cannot reach the origin beside the signature. Core calls it where it signed before, in the asset route path, in the preflight that path runs ahead of the image optimizer, and in the publisher path, through the `OriginSigning` a `SourceLocation` carries. The publisher path and the asset route path with its preflight are core's own, and every adapter calls both, so all three sign on all four adapters. On Spin a request to a source whose `host_header` names another host is refused before it is signed, because Spin sends the address's own host as the `Host`.
 
 Three things differ from what core did before. First, the `HEAD` preflight, which asked an S3 origin for the object before the image optimizer did, now runs for any signed asset route that uses the optimizer, whatever its signer. Second, removing the headers in the signer's namespace is each signer's duty, so core calls `remove_namespace_headers` before `sign` on the publisher path and the asset route path, and does not check afterwards that none is left. Third, the asset route path's call to `remove_namespace_headers` is new, because that call was made on the publisher path alone. The asset route path starts its outbound headers from eleven named request headers (`ASSET_PROXY_FORWARD_HEADERS` in `crates/trusted-server-core/src/proxy.rs`) and none of them is in the `x-amz-` namespace, so for `s3_sigv4` the call removes nothing. The preflight signs its `HEAD` and its `GET` without calling `remove_namespace_headers`, which also makes no difference for `s3_sigv4`, because it signs copies of those same headers and `Host`.
 
@@ -99,6 +99,7 @@ Four cases have no test that can fail:
 | 2026-10-14 | First draft.                                                                                                                                                                                                                                                                                               |
 | 2026-10-15 | Fixes from review round 1. The stale modules crate and deploy rules claims, the stages that refuse a mistake, the gap and open question for a `type` nothing offers, the breaking removal of `s3_sig_v4`, failure answers, rollout, the adapters that run each path, the missing tests and the review log. |
 | 2026-10-15 | Corrections from review round 2. The specs pull request number, the preflight's signing without removing namespace headers, the requests an adapter answers whatever its startup error, the deploy validation test for an empty token and the Tinybird changelog entry.                                    |
+| 2026-10-18 | Where the asset route path and its preflight run, which is every adapter once asset routes are served on every adapter, and Spin's refusal of a `host_header` that names another host.                                                                                                                     |
 
 ## Review log
 
