@@ -506,7 +506,9 @@ async fn derive_device_signals(
 /// # Errors
 ///
 /// Returns an error when the selected Edge Cookie module cannot be built for
-/// this request, or when the request's `Cookie` header is not valid UTF-8.
+/// this request, or when the request's `Cookie` header cannot be read as
+/// text, because it holds a byte outside visible ASCII, as an accented letter
+/// in UTF-8 does.
 async fn build_ec_context(
     state: &AppState,
     services: &RuntimeServices,
@@ -787,8 +789,9 @@ async fn dispatch_fallback(
 
     // A crawler asking for robots.txt is answered once the modules have
     // prepared the request, before the Edge Cookie steps and the request
-    // filters, so nothing is read from its cookies and no filter's answer
-    // stands in for the file.
+    // filters, so its Edge Cookie and consent are not read, no device
+    // module is shown its cookies and no filter's answer stands in for the
+    // file.
     if asks_for_robots_txt(&state.settings, &method, &path) {
         return answer_robots_txt(state, services, req, &method).await;
     }
@@ -895,8 +898,8 @@ fn asks_for_robots_txt(settings: &Settings, method: &Method, path: &str) -> bool
 }
 
 /// Answers robots.txt through the publisher path with an empty Edge Cookie
-/// context and no auction, so none of the crawler's cookies or consent
-/// signals are read.
+/// context and no auction, so the crawler's Edge Cookie and consent
+/// signals are not read.
 async fn answer_robots_txt(
     state: &AppState,
     services: &RuntimeServices,

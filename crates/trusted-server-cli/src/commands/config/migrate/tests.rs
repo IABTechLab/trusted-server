@@ -1,11 +1,23 @@
 use std::fs;
 
+use edgezero_core::body::Body as EdgeBody;
+use http::Request;
+use regex::Regex;
 use tempfile::TempDir;
+use trusted_server_core::closed_paths::closed_path_response;
+use trusted_server_core::settings::Settings;
 
 use super::rules::Migration;
-use super::{ConfigMigrateArgs, migrate, run_with_writers};
+use super::{Adapter, ConfigMigrateArgs, migrate, run_with_writers};
 use crate::RunOutcome;
 use crate::commands::audit::generate::validate::validate_source_config;
+
+const ADAPTERS: [Adapter; 4] = [
+    Adapter::Fastly,
+    Adapter::Cloudflare,
+    Adapter::Axum,
+    Adapter::Spin,
+];
 
 /// Main's own example settings document.
 const MAIN_EXAMPLE: &str = include_str!(concat!(
@@ -32,9 +44,17 @@ proxy_secret = "publisher_proxy_secret"
 passphrase = "ec_passphrase"
 "#;
 
+/// `input` migrated for Fastly, checked to change nothing when migrated
+/// again.
 fn migrated(input: &str) -> Migration {
-    let migration = migrate(input).expect("should migrate the document");
-    let again = migrate(&migration.text).expect("should migrate the migrated document");
+    migrated_on(Adapter::Fastly, input)
+}
+
+/// `input` migrated for `adapter`, checked to change nothing when migrated
+/// again.
+fn migrated_on(adapter: Adapter, input: &str) -> Migration {
+    let migration = migrate(input, adapter).expect("should migrate the document");
+    let again = migrate(&migration.text, adapter).expect("should migrate the migrated document");
     assert!(
         again.report.changed.is_empty(),
         "migrating a migrated document should change nothing, got {:?}",
@@ -49,6 +69,11 @@ fn migrated(input: &str) -> Migration {
 
 fn parsed(text: &str) -> toml::Value {
     toml::from_str(text).unwrap_or_else(|error| panic!("should be TOML: {error}\n{text}"))
+}
+
+/// `text` read as core reads its settings, before the checks startup makes.
+fn settings_of(text: &str) -> Settings {
+    toml::from_str(text).unwrap_or_else(|error| panic!("should read the settings: {error}\n{text}"))
 }
 
 fn main_document(rest: &str) -> String {
@@ -114,6 +139,26 @@ fn a_path_in_the_origin_address_is_reported_to_check() {
     ));
     let plain = migrated(MAIN_BASE);
     assert!(!reported(&plain.report.check, "has a path"));
+}
+
+#[test]
+fn a_host_header_override_is_reported_to_check() {
+    let migration = migrated(&MAIN_BASE.replacen(
+        "proxy_secret =",
+        "origin_host_header_override = \"www.publisher.example.com\"\nproxy_secret =",
+        1,
+    ));
+
+    assert!(
+        reported(
+            &migration.report.check,
+            "`[source.origin] host_header` is set, so the addresses a page gives under that host"
+        ),
+        "{:?}",
+        migration.report.check
+    );
+    let plain = migrated(MAIN_BASE);
+    assert!(!reported(&plain.report.check, "host_header"));
 }
 
 #[test]
@@ -222,6 +267,162 @@ password = "handler_password"
     ));
     assert!(reported(&migration.report.to_do, "`[[handlers]]` entry 2"));
     assert!(reported(&migration.report.to_do, "`[[handlers]]` entry 3"));
+}
+
+/// A document written for main with one handler guarding `pattern`.
+fn guarded(pattern: &str) -> String {
+    let path = toml::Value::String(pattern.to_owned());
+    main_document(&format!(
+        "[[handlers]]\npath = {path}\nusername = \"admin\"\npassword = \"handler_password\"\n"
+    ))
+}
+
+/// Request paths that tell apart what a handler pattern guarded on main.
+const PROBE_PATHS: [&str; 16] = [
+    "/",
+    "/admin",
+    "/admin/keys",
+    "/admin/keys/",
+    "/admin/keys/rotate",
+    "/admin/keys-old",
+    "/admin/keystore",
+    "/admin/keysx",
+    "/members",
+    "/members/_ts/admin",
+    "/_ts/admi",
+    "/_ts/admit",
+    "/_ts/admin",
+    "/_ts/admin/",
+    "/_ts/admin/ec",
+    "/_ts/adminx",
+];
+
+/// The probe paths a handler on `pattern` guarded on main that this release
+/// forwards to the origin. Main searched the path with the `regex` crate, so
+/// a match anywhere in it counted.
+fn forwarded_paths_main_guarded(pattern: &str) -> Vec<&'static str> {
+    let regex = Regex::new(pattern).expect("should compile as main compiled it");
+    PROBE_PATHS
+        .into_iter()
+        .filter(|path| regex.is_match(path))
+        .filter(|path| {
+            let request = Request::builder()
+                .uri(format!("https://publisher.example.com{path}"))
+                .body(EdgeBody::empty())
+                .expect("should build a request");
+            closed_path_response(&request).is_none()
+        })
+        .collect()
+}
+
+/// Checks that the handler on `pattern` is kept and left to do.
+fn assert_left_to_do(pattern: &str) {
+    let migration = migrated(&guarded(pattern));
+    let value = parsed(&migration.text);
+    let kept = value
+        .get("handlers")
+        .and_then(|handlers| handlers.get(0))
+        .and_then(|handler| handler.get("path"))
+        .and_then(toml::Value::as_str);
+    assert_eq!(
+        kept,
+        Some(pattern),
+        "should keep the handler on `{pattern}`:\n{}",
+        migration.text
+    );
+    assert!(
+        reported(
+            &migration.report.to_do,
+            "`[[handlers]]` entry 1 can guard paths beyond the `/_ts/admin` and \
+             `/admin/keys` paths this release closes"
+        ),
+        "`{pattern}`: {:?}",
+        migration.report.to_do
+    );
+}
+
+#[test]
+fn a_handler_is_removed_only_where_every_path_it_matches_is_closed() {
+    for pattern in [
+        "^/_ts/admin",
+        "^/_ts/admin/",
+        "^/_ts/admin+",
+        "^/admin/keys/",
+        "^/admin/keys/+",
+        "^/admin/keys$",
+        "^/admin/keys(?:/|$)",
+        "^/admin/keys(/|$)",
+    ] {
+        let forwarded = forwarded_paths_main_guarded(pattern);
+        assert!(
+            forwarded.is_empty(),
+            "`{pattern}` guarded {forwarded:?} on main, which this release forwards"
+        );
+        let migration = migrated(&guarded(pattern));
+        assert!(
+            parsed(&migration.text).get("handlers").is_none(),
+            "should remove the handler on `{pattern}`:\n{}",
+            migration.text
+        );
+        assert!(
+            migration.report.to_do.is_empty(),
+            "`{pattern}`: {:?}",
+            migration.report.to_do
+        );
+    }
+    // Main matched a pattern anywhere in the path, so `^/admin/keys` also
+    // guarded `/admin/keystore`, which the stack forwards to the origin, and
+    // so does `^/admin/keys/?`, whose quantifier lets the bound match
+    // nothing. `^/_ts/admin?` matches `/_ts/admit` the same way.
+    for pattern in [
+        "^/admin/keys",
+        "^/admin/keys.*",
+        "^/admin/keysx",
+        "^/admin",
+        "/_ts/admin",
+        "^/admin/keys(?:/|$)|^/members",
+        "^/admin/keys/?",
+        "^/admin/keys/*",
+        "^/admin/keys/{0}",
+        "^/admin/keys$?",
+        "^/admin/keys(?:/|$)?",
+        "^/admin/keys(/|$)??",
+        "^/_ts/admin?",
+        "^/_ts/admin*",
+        "^/_ts/admin{0,1}",
+    ] {
+        assert!(
+            !forwarded_paths_main_guarded(pattern).is_empty(),
+            "`{pattern}` should guard a path this release forwards"
+        );
+        assert_left_to_do(pattern);
+    }
+    // The command reads what follows the bound and not what the whole
+    // pattern means, so a quantifier there leaves the handler to do even
+    // where every path it matches is closed.
+    assert!(forwarded_paths_main_guarded("^/admin/keys/?$").is_empty());
+    assert_left_to_do("^/admin/keys/?$");
+}
+
+#[test]
+fn a_handler_with_a_class_or_comment_after_its_prefix_is_left_to_do() {
+    // The `(` in a class, or in a comment the `(?x)` flag allows, opens no
+    // group, so each pattern ends in an alternative that guarded `/members`.
+    for pattern in [
+        "^/_ts/admin[](]|^/members",
+        "^/_ts/admin[[:alpha:](]|^/members",
+        "^/_ts/admin(?x)#(\n|^/members",
+    ] {
+        assert!(
+            forwarded_paths_main_guarded(pattern).contains(&"/members"),
+            "`{pattern}` should guard `/members`"
+        );
+        assert_left_to_do(pattern);
+    }
+    // The command does not read classes, so it leaves one to do even where
+    // every path the pattern matches is closed.
+    assert!(forwarded_paths_main_guarded("^/_ts/admin/[a-z]+").is_empty());
+    assert_left_to_do("^/_ts/admin/[a-z]+");
 }
 
 #[test]
@@ -1053,28 +1254,172 @@ template_cache_key_cookies = ["ab_bucket", "ts-tester"]
 }
 
 #[test]
-fn a_document_for_main_keeps_the_location_lookup_and_the_geo_headers() {
+fn a_document_for_main_keeps_the_location_lookup() {
     let migration = migrated(MAIN_BASE);
     let value = parsed(&migration.text);
 
     assert_eq!(value["geo"]["module"].as_str(), Some("platform"));
-    assert_eq!(value["headers"]["modules"][0].as_str(), Some("geo"));
-    let serve = value["serve"].as_array().expect("should place the headers");
-    assert_eq!(serve.len(), 1);
-    assert_eq!(serve[0]["media_type"].as_str(), Some("text/html"));
-    assert_eq!(serve[0]["middleware"][0].as_str(), Some("headers.geo"));
     assert!(value.get("fetch").is_none());
+    assert!(value.get("serve").is_none());
     assert!(reported(&migration.report.check, "`x-ts-version`"));
     assert!(reported(&migration.report.check, "Flight response"));
-    assert!(reported(
-        &migration.report.check,
-        "`x-geo-*` headers now go only"
-    ));
     assert!(
         migration.report.to_do.is_empty(),
         "{:?}",
         migration.report.to_do
     );
+}
+
+#[test]
+fn the_location_lookup_is_the_one_each_adapter_accepts() {
+    for adapter in [Adapter::Fastly, Adapter::Cloudflare] {
+        let migration = migrated_on(adapter, MAIN_BASE);
+        assert_eq!(
+            parsed(&migration.text)["geo"]["module"].as_str(),
+            Some("platform"),
+            "{adapter:?} should keep the host's lookup:\n{}",
+            migration.text
+        );
+        assert!(
+            migration.report.to_do.is_empty(),
+            "{adapter:?}: {:?}",
+            migration.report.to_do
+        );
+        let settings = settings_of(&migration.text);
+        settings
+            .geo
+            .validate_jurisdiction_acknowledgment(&settings.ec)
+            .unwrap_or_else(|error| panic!("{adapter:?} should pass the startup check: {error:?}"));
+    }
+    // Neither host has a lookup, so each refuses `platform` at startup, and
+    // main's lookup there located no request.
+    for adapter in [Adapter::Axum, Adapter::Spin] {
+        let migration = migrated_on(adapter, MAIN_BASE);
+        assert!(
+            parsed(&migration.text).get("geo").is_none(),
+            "{adapter:?} has no lookup to select:\n{}",
+            migration.text
+        );
+        assert!(
+            reported(
+                &migration.report.to_do,
+                "no geo module is selected, because"
+            ),
+            "{adapter:?}: {:?}",
+            migration.report.to_do
+        );
+        let settings = settings_of(&migration.text);
+        assert!(
+            settings
+                .geo
+                .validate_jurisdiction_acknowledgment(&settings.ec)
+                .is_err(),
+            "{adapter:?}: startup should refuse what the item left to do names"
+        );
+
+        let done = format!(
+            "{}\n[geo]\nassume_single_jurisdiction = true\n",
+            migration.text
+        );
+        let settings = settings_of(&done);
+        settings
+            .geo
+            .validate_jurisdiction_acknowledgment(&settings.ec)
+            .unwrap_or_else(|error| panic!("{adapter:?} should pass the startup check: {error:?}"));
+        let again = migrate(&done, adapter).expect("should migrate the document");
+        assert!(
+            again.report.to_do.is_empty() && again.report.changed.is_empty(),
+            "{adapter:?}: {:?}",
+            again.report
+        );
+    }
+}
+
+#[test]
+fn the_location_settings_startup_refuses_are_left_to_do_in_any_document() {
+    let platform = "[geo]\nmodule = \"platform\"\n";
+    for adapter in [Adapter::Axum, Adapter::Spin] {
+        let migration = migrated_on(adapter, platform);
+        assert!(
+            reported(
+                &migration.report.to_do,
+                "`[geo] module = \"platform\"` selects the host's location lookup"
+            ),
+            "{adapter:?}: {:?}",
+            migration.report.to_do
+        );
+        assert_eq!(migration.text, platform);
+    }
+    for adapter in [Adapter::Fastly, Adapter::Cloudflare] {
+        let migration = migrated_on(adapter, platform);
+        assert!(
+            migration.report.to_do.is_empty(),
+            "{adapter:?}: {:?}",
+            migration.report.to_do
+        );
+    }
+
+    let unlocated = "[ec]\nmodule = \"hmac\"\n\n[ec.hmac]\npassphrase = \"ec_passphrase\"\n";
+    let acknowledged = format!("{unlocated}\n[geo]\nassume_single_jurisdiction = true\n");
+    for adapter in ADAPTERS {
+        let migration = migrated_on(adapter, unlocated);
+        assert!(
+            reported(
+                &migration.report.to_do,
+                "`[ec]` selects an Edge Cookie module and"
+            ),
+            "{adapter:?}: {:?}",
+            migration.report.to_do
+        );
+        let migration = migrated_on(adapter, &acknowledged);
+        assert!(
+            migration.report.to_do.is_empty(),
+            "{adapter:?}: {:?}",
+            migration.report.to_do
+        );
+    }
+}
+
+#[test]
+fn no_location_header_is_selected_for_the_operator() {
+    for adapter in ADAPTERS {
+        let migration = migrated_on(adapter, MAIN_BASE);
+        let value = parsed(&migration.text);
+        assert!(
+            value.get("headers").is_none() && value.get("serve").is_none(),
+            "{adapter:?} should select no location header:\n{}",
+            migration.text
+        );
+    }
+    assert!(reported(
+        &migrated_on(Adapter::Fastly, MAIN_BASE).report.check,
+        "To keep them, select `[headers] modules = [\"geo\"]`"
+    ));
+    assert!(reported(
+        &migrated_on(Adapter::Cloudflare, MAIN_BASE).report.check,
+        "the one `x-geo-*` header main wrote on Cloudflare"
+    ));
+    for adapter in [Adapter::Axum, Adapter::Spin] {
+        assert!(reported(
+            &migrated_on(adapter, MAIN_BASE).report.check,
+            "which main wrote as `false`"
+        ));
+    }
+}
+
+#[test]
+fn the_region_the_cloudflare_lookup_now_reads_is_reported_to_check() {
+    // Main's Cloudflare lookup set no region, so its US state rules never
+    // applied there.
+    for adapter in ADAPTERS {
+        let migration = migrated_on(adapter, MAIN_BASE);
+        assert_eq!(
+            reported(&migration.report.check, "`cf-region-code`"),
+            adapter == Adapter::Cloudflare,
+            "{adapter:?}: {:?}",
+            migration.report.check
+        );
+    }
 }
 
 #[test]
@@ -1200,6 +1545,7 @@ enabled = true
         .filter(|name| {
             ![
                 "tag.google-tag",
+                "headers.geo",
                 "51degrees.client_hints",
                 "service_version",
             ]
@@ -1219,6 +1565,32 @@ enabled = true
         "every main integration should name a module the tool links: {:?}",
         migration.report.to_do
     );
+}
+
+#[test]
+fn a_document_in_the_stack_shape_with_no_page_entries_gets_none_added() {
+    let input = r#"[publisher]
+domain = "publisher.example.com"
+cookie_domain = ".publisher.example.com"
+proxy_secret = "publisher_proxy_secret"
+
+[source]
+module = "origin"
+
+[source.origin]
+url = "https://origin.publisher.example.com"
+
+[cmp]
+module = "didomi"
+"#;
+    let migration = migrated(input);
+
+    assert!(
+        migration.report.changed.is_empty(),
+        "should leave the page changes to the operator: {:?}",
+        migration.report.changed
+    );
+    assert_eq!(migration.text, input);
 }
 
 #[test]
@@ -1475,21 +1847,23 @@ template_cache_key_cookies = ["ts-SECRET-cookie"]
 
 #[test]
 fn no_line_carries_a_value_from_the_document() {
-    let migration = migrate(SECRET_DOCUMENT).expect("should migrate the document");
-    let lines: Vec<&String> = migration
-        .report
-        .changed
-        .iter()
-        .chain(&migration.report.to_do)
-        .chain(&migration.report.check)
-        .collect();
-    assert!(!lines.is_empty());
-    for line in lines {
-        let shown = line.replace("SECRET-integration", "");
-        assert!(
-            !shown.contains("SECRET"),
-            "a line printed a value from the document: {line}"
-        );
+    for adapter in ADAPTERS {
+        let migration = migrate(SECRET_DOCUMENT, adapter).expect("should migrate the document");
+        let lines: Vec<&String> = migration
+            .report
+            .changed
+            .iter()
+            .chain(&migration.report.to_do)
+            .chain(&migration.report.check)
+            .collect();
+        assert!(!lines.is_empty());
+        for line in lines {
+            let shown = line.replace("SECRET-integration", "");
+            assert!(
+                !shown.contains("SECRET"),
+                "a line printed a value from the document on {adapter:?}: {line}"
+            );
+        }
     }
 
     let temp = TempDir::new().expect("should make a folder");
@@ -1497,16 +1871,7 @@ fn no_line_carries_a_value_from_the_document() {
     fs::write(&file, SECRET_DOCUMENT).expect("should write the document");
     let mut out = Vec::new();
     let mut report = Vec::new();
-    run_with_writers(
-        &ConfigMigrateArgs {
-            file: file.clone(),
-            write: false,
-            check: false,
-        },
-        &mut out,
-        &mut report,
-    )
-    .expect("should run");
+    run_with_writers(&args(file.clone(), false, false), &mut out, &mut report).expect("should run");
     let report = String::from_utf8(report).expect("should report text");
     assert!(
         !report.replace("SECRET-integration", "").contains("SECRET"),
@@ -1514,22 +1879,20 @@ fn no_line_carries_a_value_from_the_document() {
     );
 
     fs::write(&file, "token = \"SECRET-token\"\n[broken\n").expect("should write the document");
-    let error = run_with_writers(
-        &ConfigMigrateArgs {
-            file,
-            write: false,
-            check: false,
-        },
-        &mut Vec::new(),
-        &mut Vec::new(),
-    )
-    .expect_err("should refuse a document that is not TOML");
+    let error = run_with_writers(&args(file, false, false), &mut Vec::new(), &mut Vec::new())
+        .expect_err("should refuse a document that is not TOML");
     assert!(error.contains("line 2"), "should name the line: {error}");
     assert!(!error.contains("SECRET"), "should quote nothing: {error}");
 }
 
+/// The command's arguments for `file` on Fastly.
 fn args(file: std::path::PathBuf, write: bool, check: bool) -> ConfigMigrateArgs {
-    ConfigMigrateArgs { file, write, check }
+    ConfigMigrateArgs {
+        file,
+        adapter: Adapter::Fastly,
+        write,
+        check,
+    }
 }
 
 #[test]
@@ -1556,7 +1919,9 @@ fn check_changes_nothing_and_says_whether_the_document_needs_migrating() {
         "{report}"
     );
 
-    let migrated = migrate(MAIN_BASE).expect("should migrate").text;
+    let migrated = migrate(MAIN_BASE, Adapter::Fastly)
+        .expect("should migrate")
+        .text;
     fs::write(&file, &migrated).expect("should write the migrated document");
     let mut report = Vec::new();
     let outcome = run_with_writers(&args(file, false, true), &mut Vec::new(), &mut report)
@@ -1575,7 +1940,9 @@ fn write_rewrites_the_file_and_the_default_prints_the_document() {
     let temp = TempDir::new().expect("should make a folder");
     let file = temp.path().join("trusted-server.toml");
     fs::write(&file, MAIN_BASE).expect("should write the document");
-    let expected = migrate(MAIN_BASE).expect("should migrate").text;
+    let expected = migrate(MAIN_BASE, Adapter::Fastly)
+        .expect("should migrate")
+        .text;
 
     let mut out = Vec::new();
     let mut report = Vec::new();
