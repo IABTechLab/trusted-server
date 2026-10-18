@@ -4,8 +4,8 @@
 **Author:** 51Degrees (contributed), for Tech Lab review
 **Related specs:** `2026-10-12-config-by-host-design.md`, `2026-10-12-middleware-prepare-design.md`, `2026-10-12-prefix-module-design.md`, `2026-08-27-integration-provider-seam-design.md` and `2026-10-15-cookies-by-path-design.md`, all in IABTechLab/trusted-server#1342, which holds every design document of the stack
 **Related PRs:** IABTechLab/trusted-server#1376, jwrosewell/trusted-server#30 (closed)
-**Issues:** IABTechLab/trusted-server#1328
-**Last updated:** 2026-10-16
+**Issues:** IABTechLab/trusted-server#1328, IABTechLab/trusted-server#1118
+**Last updated:** 2026-10-17
 
 > **Why this spec exists.** An adapter chooses the app-config blob that serves a request by the request's host alone, before any settings exist, so one host cannot serve several publishers under paths of their own.
 
@@ -92,6 +92,8 @@ On Spin the hook is usually given no host, because Spin rarely passes the `Host`
 
 **Putting the removed path prefix back.** Core never writes the removed path prefix into a response. A deployment whose pages must carry it, in their links for example, does that with a middleware of its own, whose module's request preparer reads `RemovedPathPrefix` and leaves it for the middleware in `IntegrationRequestState`. That middleware runs in the serve phase. This has a cost. A request that carries any value in `IntegrationRequestState` keeps to the origin path, so its page is never read from a stored template or stored as one, and its HTML is sent `private, no-store` (see `IntegrationRequestState` in `crates/trusted-server-core/src/integrations/registry.rs`). Every page whose removed path prefix is put back this way is therefore made for its reader alone. The request to the origin for that page bypasses the platform's cache only when origin readthrough is on or the ad stack runs (`apply_origin_cache_intent` in `crates/trusted-server-core/src/publisher.rs`). Origin readthrough is off by default (`origin_readthrough_enabled`, see "Origin readthrough caching" in `docs/guide/configuration.md`), so with no ad stack the platform's cache can still answer under the origin's own `Cache-Control`. The stored template is keyed by the request's host and continuing path and by its blob's settings, not by the removed path prefix, so a page changed in the fetch phase could be stored with one removed path prefix and served under another that names the same blob.
 
+**The host core processes a request for.** Once a request is routed, core reads the host it rewrites a page for and tells each middleware from `Forwarded`, then `X-Forwarded-Host`, then `Host`, and last from the URI's authority, as `address_request` gives the hook the authority where no `Host` is sent (`RequestInfo::from_request` in `crates/trusted-server-core/src/http_util.rs`). An HTTP/2 client may send its `:authority` and no `Host` header, and before the authority was read such a request had no host, so its page was returned unprocessed (IABTechLab/trusted-server#1118).
+
 ## 3. What is not in this change
 
 - **The deployment's policy.** Which part of a path names a publisher, and how a value is spelled, belong to the deployment that supplies the hook.
@@ -108,6 +110,8 @@ Tests in `crates/trusted-server-core/src/addressing.rs` cover the default answer
 
 Tests in `crates/trusted-server-adapter-fastly/src/config_selection.rs` cover a value taking the placeholder's place, the first existing value winning with no later lookup, every value missing refused and not served from the logical store ID or another host's blob, a value that is not a host name passed over without a lookup, a selector without the placeholder ignoring the values, and a failed lookup refusing and trying no later value. Tests in `crates/trusted-server-adapter-fastly/src/lib.rs` drive the entry point's selection under Viceroy, with no hook and with a "by host" hook choosing as before, the registered hook being the one asked, a rewritten request converted with its path, query and removed path prefix, the first existing value read from a real local store, and every value missing answered `421` with the request left as it was. Each of the Axum, Cloudflare and Spin route tests serves `/<publisher>/_ts/config.json` as the configuration endpoint through `routes_with_addressing`, and routes a "by host" request as the router with no hook does.
 
+Tests in `crates/trusted-server-core/src/http_util.rs` cover the host read from the URI's authority, with its port, where no header names one, no host where nothing names one, and each of `Host`, `X-Forwarded-Host` and `Forwarded` taking precedence over the authority. `a_request_naming_its_host_only_in_its_uri_reaches_the_middleware`, in `crates/trusted-server-core/src/publisher.rs`, sends a request with no `Host` header through the publisher path and finds that the entry's middleware ran for the host the URI names.
+
 Two paths have no test. No test drives `edgezero_main` with a hook registered through `run_with_addressing`, which appears only in a doctest that is not run, and no test covers the `500` that `addressed_router` answers when the continuing path cannot be set on the request.
 
 ## Review log
@@ -122,3 +126,4 @@ Two paths have no test. No test drives `edgezero_main` with a hook registered th
 | 2026-10-13 | First draft.                                                                                                                                                                                                                                   |
 | 2026-10-15 | Fixes from review round 1. The cost of putting the removed path prefix back, the shared browser origin as a limit, the host each adapter gives the hook, failure handling, rollout, the untested paths and the review log.                     |
 | 2026-10-15 | Corrections from review round 2. The origin fetch of a page whose removed path prefix is put back, the rollout order on Fastly, where the copy on `split/6-integration-seam` is brought up to date, and the removed path prefix named in full. |
+| 2026-10-17 | The host core processes a request for falls back to the URI's authority where no header names one (IABTechLab/trusted-server#1118), with its tests.                                                                                            |
