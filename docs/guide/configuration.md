@@ -604,8 +604,9 @@ selector value misses (see One blob for each path).
 - Is the name a redirect from the origin is compared with (see Redirects under
   `url`)
 - Useful when the origin endpoint expects a canonical publisher hostname
-- Cannot be sent on Spin, which sends the host in `url` as the `Host`, so
-  there every request for the origin answers `502` and the origin is not asked
+- Cannot name another host on Spin, which sends the host in `url` as the
+  `Host`, so there such a value makes every request for the origin answer
+  `502`, and the origin is not asked
 
 **Format**: Hostname with optional port, without protocol, path, query, or fragment
 
@@ -1703,8 +1704,8 @@ beneath. Core's `origin` source takes these settings:
 - `directory_index` follows the same rules as the publisher's
   [`directory_index`](#directory-index).
 - With `host_header`, Trusted Server still connects, uses SNI, and checks
-  certificates against the host in `url`. Spin cannot send it, so there
-  every request under the route answers `502`.
+  certificates against the host in `url`. Spin cannot send one that names
+  another host, so there every request under such a route answers `502`.
 
 ### `[proxy.asset_routes.source.origin.auth]`
 

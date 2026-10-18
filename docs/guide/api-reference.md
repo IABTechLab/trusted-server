@@ -1047,7 +1047,9 @@ streaming where supported. The origin status is normally preserved; fetch or
 processing failures use shared adapter errors. Cacheability is decided from
 the origin response plus personalization, cookie, template, and rewrite
 effects. CORS is therefore the sanitized publisher-origin policy, not a global
-Trusted Server policy. There is no built-in endpoint rate limiter. Example:
+Trusted Server policy. There is no built-in endpoint rate limiter. On Spin,
+where `[source.origin] host_header` names a host other than the one in `url`,
+every request answers `502` and the origin is not asked. Example:
 `curl -i https://edge.example.com/article`.
 
 When startup fails, the degraded router replaces normal routing: Fastly,

@@ -44,6 +44,24 @@ The exit trap stops Wrangler and the stub origin and removes the isolated KV,
 generated Wrangler manifests, response captures, and logs. It does not modify
 the checked-in manifests.
 
+## Logging
+
+The Worker installs its own logger, because EdgeZero installs none on
+Workers. Each line goes to the console method of its level, `console.error`,
+`console.warn` or, for `info`, `console.log`, with its level and module first,
+such as `WARN [trusted_server_adapter_cloudflare::app] ...`. `wrangler dev` prints the
+lines in its terminal. For a deployed Worker, `wrangler tail` and the
+dashboard's live logs show them, and
+[Workers Logs](https://developers.cloudflare.com/workers/observability/logs/workers-logs/)
+keeps them where the Wrangler file sets `[observability] enabled = true`,
+which the checked-in `wrangler.toml` does not. The Worker writes `info` and
+above, and no setting changes the level.
+
+A warning the Worker logs once, such as the one about a route that enables
+the Image Optimizer, is logged once for each instance of the Worker. One
+instance can serve many requests, so the warning appears again only when
+Cloudflare starts another instance.
+
 ## Configure a deployed Worker
 
 Local `[vars]` are only for the isolated smoke. For a deployed Worker, obtain
@@ -72,8 +90,9 @@ behind it, and `POST /_ts/api/v1/ec/resolve` sets one the same way.
 `[[proxy.asset_routes]]` are served from each route's own source with the
 asset body held whole, up to 10 MiB, and a larger one answers `502`. The
 adapter does not translate Image Optimizer metadata into Cloudflare's own
-image options, so startup warns about each route that enables the Image
-Optimizer, and each request such a route would optimize answers `502` (see
+image options, so the Worker warns about each route that enables the Image
+Optimizer, once for each instance (see [Logging](#logging)), and each request
+such a route would optimize answers `502` (see
 [Asset Routes](./asset-routes)). Cloudflare
 [documents](https://developers.cloudflare.com/workers/runtime-apis/request/)
 that a Worker cannot set a `Host` naming a host outside its zone unless the
