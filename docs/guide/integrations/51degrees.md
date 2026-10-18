@@ -85,7 +85,7 @@ calls, and never the public resource key, so the table needs one.
 | ------------- | ------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | `endpoint`    | URL     | Required | The service's JSON endpoint, with any resource key the deployment requires in its path, whose origin the browser's hints are delegated to |
 | `license_key` | String  | Required | The name of the license key's entry in the secret store                                                                                   |
-| `timeout_ms`  | Integer | `500`    | How long a call to the service waits, `1..=10000` milliseconds                                                                            |
+| `timeout_ms`  | Integer | `500`    | How long a call to the service waits on the Fastly adapter, `1..=10000` milliseconds                                                      |
 
 The middleware's own table, `[middleware.51degrees.client_hints]`, has one
 field, `critical`, on by default. Each table refuses a field it does not
