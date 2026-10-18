@@ -1751,7 +1751,11 @@ fn implementation_of(profile: &str) -> Option<&'static str> {
 /// `?` and `*` let what comes before them match no times, and so can a
 /// count in `{}`, so none of the three may follow `^/_ts/admin` or that
 /// bound, as `^/_ts/admin?` also matches `/_ts/admit` and `^/admin/keys/?`
-/// matches `/admin/keystore`.
+/// matches `/admin/keystore`. The text after the prefix or the bound may
+/// hold no `[` and no `#` either, because a character class, or a comment
+/// the `(?x)` flag allows, can hide a `|` from
+/// [`has_top_level_alternation`], as the `(` in `[](]` is a character and
+/// not a group.
 fn guards_only_closed_paths(pattern: &str) -> bool {
     const KEYS_BOUNDS: &[&str] = &["/", "$", "(?:/|$)", "(/|$)"];
     let rest = match pattern.strip_prefix("^/admin/keys") {
@@ -1760,25 +1764,25 @@ fn guards_only_closed_paths(pattern: &str) -> bool {
             .find_map(|bound| rest.strip_prefix(bound)),
         None => pattern.strip_prefix("^/_ts/admin"),
     };
-    rest.is_some_and(|rest| !rest.starts_with(['?', '*', '{']))
+    rest.is_some_and(|rest| !rest.starts_with(['?', '*', '{']) && !rest.contains(['[', '#']))
         && !has_top_level_alternation(pattern)
 }
 
-/// Whether `pattern` has a `|` outside every group and character class.
+/// Whether `pattern` has a `|` outside every group.
+///
+/// It reads escapes and groups, and no character class or comment, which
+/// its caller refuses.
 fn has_top_level_alternation(pattern: &str) -> bool {
     let mut depth = 0_usize;
-    let mut in_class = false;
     let mut characters = pattern.chars();
     while let Some(character) = characters.next() {
         match character {
             '\\' => {
                 characters.next();
             }
-            '[' if !in_class => in_class = true,
-            ']' if in_class => in_class = false,
-            '(' if !in_class => depth += 1,
-            ')' if !in_class => depth = depth.saturating_sub(1),
-            '|' if !in_class && depth == 0 => return true,
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            '|' if depth == 0 => return true,
             _ => {}
         }
     }

@@ -271,8 +271,9 @@ password = "handler_password"
 
 /// A document written for main with one handler guarding `pattern`.
 fn guarded(pattern: &str) -> String {
+    let path = toml::Value::String(pattern.to_owned());
     main_document(&format!(
-        "[[handlers]]\npath = '{pattern}'\nusername = \"admin\"\npassword = \"handler_password\"\n"
+        "[[handlers]]\npath = {path}\nusername = \"admin\"\npassword = \"handler_password\"\n"
     ))
 }
 
@@ -401,6 +402,27 @@ fn a_handler_is_removed_only_where_every_path_it_matches_is_closed() {
     // where every path it matches is closed.
     assert!(forwarded_paths_main_guarded("^/admin/keys/?$").is_empty());
     assert_left_to_do("^/admin/keys/?$");
+}
+
+#[test]
+fn a_handler_with_a_class_or_comment_after_its_prefix_is_left_to_do() {
+    // The `(` in a class, or in a comment the `(?x)` flag allows, opens no
+    // group, so each pattern ends in an alternative that guarded `/members`.
+    for pattern in [
+        "^/_ts/admin[](]|^/members",
+        "^/_ts/admin[[:alpha:](]|^/members",
+        "^/_ts/admin(?x)#(\n|^/members",
+    ] {
+        assert!(
+            forwarded_paths_main_guarded(pattern).contains(&"/members"),
+            "`{pattern}` should guard `/members`"
+        );
+        assert_left_to_do(pattern);
+    }
+    // The command does not read classes, so it leaves one to do even where
+    // every path the pattern matches is closed.
+    assert!(forwarded_paths_main_guarded("^/_ts/admin/[a-z]+").is_empty());
+    assert_left_to_do("^/_ts/admin/[a-z]+");
 }
 
 #[test]
