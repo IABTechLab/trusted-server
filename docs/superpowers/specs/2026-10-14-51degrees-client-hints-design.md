@@ -211,10 +211,13 @@ hints is held like any other, for up to an hour. On Fastly a call that cannot
 connect fails after one second, and one that connects waits `timeout_ms` for
 the first byte and for each gap between bytes, so while the service is down
 every page navigation an entry covers with no held answer waits for those
-limits before its page is built. On Axum, Cloudflare and Spin the call waits
-until the adapter's HTTP client gives up, which is 30 seconds on Axum and the
-runtime's own limit on Cloudflare and Spin, so while the service is down each
-such navigation waits that long.
+limits before its page is built. On Axum, Cloudflare and Spin only the
+adapter's HTTP client bounds the call. On Axum a service that cannot be
+reached fails within the client's 5 second connection limit, a refused
+connection fails at once, and a service that accepts the connection and then
+stalls holds the call for up to 30 seconds in all. On Cloudflare and Spin the
+runtime's own limit bounds it. So while the service is slow or cannot be
+reached, each such navigation waits up to that bound.
 
 **Rollout.** A deployment without `[shared.51degrees]` is unchanged. On every
 adapter, adding the table and an entry naming the middleware changes the
@@ -299,20 +302,24 @@ Six things have no test.
    `permissions: None`, so nothing shows what the filter does with permission
    state.
 6. The two crates' tests run natively under `cargo test-axum`, and their lints
-   under `cargo clippy-axum`. No alias for the Fastly target lists them, so
-   they do not run for `wasm32-wasip1`, the Fastly adapter's target.
+   under `cargo clippy-axum`. No alias runs their tests for an adapter's
+   WebAssembly target, being `wasm32-wasip1` for Fastly and Spin and
+   `wasm32-unknown-unknown` for Cloudflare, because the Fastly aliases do not
+   list them and `cargo test-cloudflare` and `cargo test-spin` test the
+   adapter crate alone, on the host.
 
 ## Revision record
 
-| Date       | Change                                                                                                                                                                                                                                                                                                                                                                      |
-| ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 2026-10-14 | First draft.                                                                                                                                                                                                                                                                                                                                                                |
-| 2026-10-15 | Fixes from review round 1. What the filter runs on and that only the Fastly adapter runs it, the cost to pages, what each navigation sends and the open questions on consent, how each adapter bounds the call, the answers on failure, the settings, what the headers keep, the definition of a page navigation, the untested paths, the related specs and the review log. |
-| 2026-10-15 | Fixes from review round 2. The pull request that holds the design documents, the wait for the first call in the guide, and the code comments left for a later change.                                                                                                                                                                                                       |
-| 2026-10-15 | Code fixes for the call's scope, what it sends and header merging. The permission question stays open, with what was found, and the answer lifetime is a new open question.                                                                                                                                                                                                 |
-| 2026-10-18 | Every adapter runs the filter, from `2026-10-17-request-filters-on-every-adapter-design.md` and its first review round. The table of parts, the builder, the `timeout_ms` setting, what bounds the call on each adapter, consent, failure, rollout, section 3 and the tests say so.                                                                                         |
+| Date       | Change                                                                                                                                                                                                                                                                                                                                                                                |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 2026-10-14 | First draft.                                                                                                                                                                                                                                                                                                                                                                          |
+| 2026-10-15 | Fixes from review round 1. What the filter runs on and that only the Fastly adapter runs it, the cost to pages, what each navigation sends and the open questions on consent, how each adapter bounds the call, the answers on failure, the settings, what the headers keep, the definition of a page navigation, the untested paths, the related specs and the review log.           |
+| 2026-10-15 | Fixes from review round 2. The pull request that holds the design documents, the wait for the first call in the guide, and the code comments left for a later change.                                                                                                                                                                                                                 |
+| 2026-10-15 | Code fixes for the call's scope, what it sends and header merging. The permission question stays open, with what was found, and the answer lifetime is a new open question.                                                                                                                                                                                                           |
+| 2026-10-18 | Every adapter runs the filter, from `2026-10-17-request-filters-on-every-adapter-design.md` and its first review round. The table of parts, the builder, the `timeout_ms` setting, what bounds the call on each adapter, consent, failure, rollout, section 3 and the tests say so. Fixes from review round 3, the wait on Axum for a service that cannot be reached and test item 6. |
 
 ## Review log
 
 1. **Round 1, 2026-10-15.** A review in a fresh session, against `split/44-client-hints` at `1f6b83d0c`. Issues found, four of them blocking. The four were that the request filter runs wherever the table is present and not only where an entry covers the page, that the cost to existing pages was not stated, that failure handling and the timeout of each adapter were not stated, and that nothing said what each navigation sends to the service or what consent it needs. This revision states each from the code, which also shows that only the Fastly adapter runs request filters, and it corrects the claims about page navigations, the headers and the tests, replaces a related spec that exists in no branch, and corrects the guide, the changelog and the middleware readme.
 2. **Round 2, 2026-10-15.** A lighter review in a fresh session, against this page at `126347b00`, of the round 1 fixes and the new text. No blocking issues once the pull request number was corrected. This revision names the pull request that now holds every design document, makes the guide's description of the wait for the first call match the one second connection limit and the limit on each gap between bytes, and lists in section 3 the code comments that still say more than the design does.
+3. **Round 3, 2026-10-18.** A review in a fresh session, against `split/52-request-filters` at `17136d04b`, of the change that has every adapter run the filter, made with the request filters design's first round. Issues found, none blocking. The two were that When it fails gave 30 seconds on Axum as the wait for a service that cannot be reached, which fails within the client's 5 second connection limit, and that test item 6 named only the Fastly adapter's target, when no alias runs the two crates' tests for the WebAssembly target of any adapter, all of which now run the filter. Fixed in `e7417c898`.
