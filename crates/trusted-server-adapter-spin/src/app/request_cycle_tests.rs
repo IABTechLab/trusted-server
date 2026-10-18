@@ -3,8 +3,10 @@
 //! effects after the finalize headers, the route's module call carries the
 //! device classification, robots.txt is answered ahead of both, the Edge
 //! Cookie is created and written for a real browser's page view, and a
-//! request under an asset route is answered from the route's own source.
-//! A source's `Host` that Spin cannot send is refused.
+//! request under an asset route is answered from the route's own source,
+//! with the route's cache rule written after the finalize headers, an
+//! error that no cache stores and no Edge Cookie. A source's `Host` that Spin
+//! cannot send is refused.
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
@@ -747,6 +749,91 @@ async fn a_request_outside_the_asset_routes_reaches_the_publisher_s_origin() {
             false
         )],
         "the publisher's origin should be asked, unsigned"
+    );
+}
+
+/// Settings with an asset route under `/assets/` and a cache rule covering
+/// it, which keeps an answer for a minute in a browser and an hour in a
+/// shared cache.
+fn settings_with_a_cached_asset_route() -> Settings {
+    settings_with(
+        r#"
+            [proxy]
+
+            [[proxy.asset_routes]]
+            prefix = "/assets/"
+
+            [proxy.asset_routes.source]
+            module = "origin"
+
+            [proxy.asset_routes.source.origin]
+            url = "https://assets.example.com"
+
+            [[cache.asset_rules]]
+            id = "assets"
+            enabled = true
+            path_prefix = "/assets/"
+            browser_ttl_seconds = 60
+            edge_ttl_seconds = 3600
+        "#,
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_asset_route_s_cache_rule_is_written_after_the_finalize_headers() {
+    let origin = Arc::new(StubHttpClient::new());
+    origin.push_response_with_headers(
+        200,
+        b"image bytes".to_vec(),
+        vec![("content-type", "image/png")],
+    );
+    let router = router_with(settings_with_a_cached_asset_route(), &[], &origin);
+
+    let response = route(&router, get("/assets/logo.png", None)).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        header(&response, "cache-control"),
+        Some("public, max-age=60, s-maxage=3600"),
+        "the rule should be written with this adapter's `s-maxage` for shared caches"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_asset_route_whose_origin_fails_answers_502_and_is_not_stored() {
+    // No answer is queued, so the request to the route's origin fails.
+    let origin = Arc::new(StubHttpClient::new());
+    let router = router_with(settings_with_a_cached_asset_route(), &[], &origin);
+
+    let response = route(&router, get("/assets/logo.png", None)).await;
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        header(&response, "cache-control"),
+        Some("no-store, private"),
+        "an asset route's error should not be stored by any cache"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_page_view_under_an_asset_route_gets_no_edge_cookie() {
+    let origin = origin_answering(1);
+    let mut settings = settings_with_a_cached_asset_route();
+    settings.geo.module = Some("platform".to_owned());
+    let router = router_for(settings, &[], services_for_a_reader(&origin));
+
+    let response = route(&router, page_view("/assets/guide.html", BROWSER, None)).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        edge_cookie(&response),
+        None,
+        "an asset response skips the Edge Cookie steps, so none is written"
+    );
+    assert_eq!(
+        origin.recorded_request_uris(),
+        ["https://assets.example.com/assets/guide.html"],
+        "the route's origin should answer the page view"
     );
 }
 
