@@ -2,10 +2,10 @@
 
 **Status:** Proposed, 2026-10-14. Raised as draft pull request IABTechLab/trusted-server#1386 (from jwrosewell/trusted-server#39), for Tech Lab review.
 **Author:** 51Degrees (contributed), for Tech Lab review
-**Related specs:** `2026-10-12-shared-vendor-tables-design.md` (the `[shared.51degrees]` table), `2026-10-12-loading-cache-design.md` (the `51degrees-answers` cache), `2026-10-12-page-middleware-design.md` (the `[[serve]]` entries) and `2026-10-14-source-modules-design.md` (the source a page is fetched from), all in IABTechLab/trusted-server#1342, which holds every design document of the stack
+**Related specs:** `2026-10-12-shared-vendor-tables-design.md` (the `[shared.51degrees]` table), `2026-10-12-loading-cache-design.md` (the `51degrees-answers` cache), `2026-10-12-page-middleware-design.md` (the `[[serve]]` entries), `2026-10-14-source-modules-design.md` (the source a page is fetched from) and `2026-10-17-request-filters-on-every-adapter-design.md` (the request filters every adapter runs), all in IABTechLab/trusted-server#1342, which holds every design document of the stack
 **Related PRs:** jwrosewell/trusted-server#39, IABTechLab/trusted-server#1386
 **Issues:** IABTechLab/trusted-server#1333
-**Last updated:** 2026-10-16
+**Last updated:** 2026-10-18
 
 > **Why this spec exists.** A browser sends its high entropy client hints only when the site asks for them and delegates them, and nothing in the stack writes the headers and the tag that do so for a deployment that uses the 51Degrees service, so every first page view of a session is priced on the User-Agent alone.
 
@@ -50,11 +50,11 @@ own, because a browser keeps an origin's set until a response names another.
 
 The three parts run in different places.
 
-| Part                                                | Runs                                                                                                                                   | Decided by                                                                                                 |
-| --------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
-| The filter, which asks the service and leaves names | Before routing, on the Fastly adapter alone, which is the only adapter that runs request filters, and it acts on page navigations only | Any `[[serve]]` entry naming the middleware whose `path` covers the request path, the rule the headers use |
-| The `Delegate-CH` tag                               | In the serve phase, on each page                                                                                                       | The first `[[serve]]` entry that covers the page's media type and path                                     |
-| `Accept-CH`, `Critical-CH` and `Permissions-Policy` | In the headers step of the serve phase, on each response the publisher path sends, a redirect included                                 | Any `[[serve]]` entry whose `path` covers the request path, whatever its media type                        |
+| Part                                                | Runs                                                                                                   | Decided by                                                                                                 |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------- |
+| The filter, which asks the service and leaves names | Before routing, on every adapter, and it acts on page navigations only                                 | Any `[[serve]]` entry naming the middleware whose `path` covers the request path, the rule the headers use |
+| The `Delegate-CH` tag                               | In the serve phase, on each page                                                                       | The first `[[serve]]` entry that covers the page's media type and path                                     |
+| `Accept-CH`, `Critical-CH` and `Permissions-Policy` | In the headers step of the serve phase, on each response the publisher path sends, a redirect included | Any `[[serve]]` entry whose `path` covers the request path, whatever its media type                        |
 
 A page navigation, for the filter, is a `GET` or `HEAD` request whose
 `Sec-Fetch-Dest` is `document` or whose `Accept` names `text/html`, so a
@@ -111,7 +111,7 @@ first navigation from each such browser waits for the service.
 the vendor's shared table, declares the license key as a secret setting in
 use whenever the table is present, and registers the filter and the
 middleware together. The stock list ships it, so every adapter and the `ts`
-command line tool take it, although only the Fastly adapter runs its filter.
+command line tool take it, and every adapter runs its filter.
 
 ```toml
 [shared.51degrees]
@@ -129,28 +129,25 @@ middleware = ["51degrees.client_hints"]
 | ---------------------------------------------- | -------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `[shared.51degrees] endpoint`                  | Required                                                                   | A URL. The call goes to the endpoint with its last path segment replaced by `json`, so a resource key written in that segment is never sent, and a query or fragment on the endpoint is dropped. The hints are delegated to the endpoint's origin |
 | `[shared.51degrees] license_key`               | Required                                                                   | The name of the license key's entry in the secret store. A table with none, or an empty one, is refused by the configuration check and when the application state is built                                                                        |
-| `[shared.51degrees] timeout_ms`                | `500`                                                                      | `1` to `10000` milliseconds. Only the Fastly adapter makes the call, and it applies the value, see "Which adapters run the filter"                                                                                                                |
+| `[shared.51degrees] timeout_ms`                | `500`                                                                      | `1` to `10000` milliseconds. Only the Fastly adapter applies it, see "What bounds the call on each adapter"                                                                                                                                       |
 | `[middleware.51degrees.client_hints] critical` | `true`                                                                     | `true` or `false`                                                                                                                                                                                                                                 |
 | `[cache.51degrees-answers]`                    | `memory_seconds` 60, `store_seconds` 604800 and `store_idle_seconds` 86400 | The four settings every declared cache takes. An answer ends after an hour whatever `store_seconds` says                                                                                                                                          |
 
 `[shared.51degrees]` and `[middleware.51degrees.client_hints]` each refuse a
 key they do not read.
 
-**Which adapters run the filter.** Only the Fastly adapter runs request filters
-(`docs/guide/permission-model.md`), and no other adapter calls
-`IntegrationRegistry::filter_request`. On Axum, Cloudflare and Spin the table
-is accepted, the license key is required and the middleware is registered,
-but nothing runs the filter, so the service is asked nothing and no headers
-and no tag are written. The table gives what `timeout_ms` does to the call
-where it is made, and what the adapter's HTTP client would do with it where
-it is not.
+**What bounds the call on each adapter.** Every adapter runs request filters
+(`2026-10-17-request-filters-on-every-adapter-design.md`), so the filter asks
+the service on each of them. A module's time limit reaches an adapter only as
+the timeouts of the backend it registers for the call, and only the Fastly
+adapter applies them, so `timeout_ms` bounds the call there alone.
 
-| Adapter                     | Runs the filter | What `timeout_ms` does to the call                                                                                                                                                                                           |
-| --------------------------- | --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Fastly                      | Yes             | It sets the first byte and between bytes timeouts of the backend, and the connection timeout is fixed at one second (`crates/trusted-server-adapter-fastly/src/backend.rs`)                                                  |
-| Axum, a development adapter | No              | The call is never made. The adapter's HTTP client would ignore `timeout_ms` and allow 5 seconds to connect and 30 in all (`crates/trusted-server-adapter-axum/src/platform.rs`)                                              |
-| Cloudflare                  | No              | The call is never made. The adapter's fetch would set no timeout, and the adapter's own note says only the Workers runtime's limit bounds a call (`crates/trusted-server-adapter-cloudflare/src/platform.rs`)                |
-| Spin                        | No              | The call is never made. `spin_sdk::http::send` takes no timeout, so `timeout_ms` would be ignored, and the adapter's own note says the Spin runtime's default applies (`crates/trusted-server-adapter-spin/src/platform.rs`) |
+| Adapter                     | What bounds the call                                                                                                                                                                           |
+| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Fastly                      | `timeout_ms` sets the first byte and between bytes timeouts of the backend, and the connection timeout is fixed at one second (`crates/trusted-server-adapter-fastly/src/backend.rs`)          |
+| Axum, a development adapter | The adapter's HTTP client ignores `timeout_ms` and allows 5 seconds to connect and 30 in all (`crates/trusted-server-adapter-axum/src/platform.rs`)                                            |
+| Cloudflare                  | The adapter's fetch sets no timeout, and the adapter's own note says only the Workers runtime's limit bounds a call (`crates/trusted-server-adapter-cloudflare/src/platform.rs`)               |
+| Spin                        | `spin_sdk::http::send` takes no timeout, so `timeout_ms` is ignored, and the adapter's own note says the Spin runtime's default applies (`crates/trusted-server-adapter-spin/src/platform.rs`) |
 
 **What each navigation sends.** For a page navigation an entry covers, the
 filter asks the cache for the answer to one question, and where none is held
@@ -163,7 +160,7 @@ address nor a cookie nor any other header is sent. A request with no
 `User-Agent` asks nothing. The filter reads only the three hint properties
 from the answer.
 
-**Consent.** The Fastly adapter hands every request filter the permissions
+**Consent.** Every adapter hands every request filter the permissions
 resolved for the request, so a filter can skip or narrow what it does when a
 permission it depends on is unset (`docs/guide/permission-model.md`). The
 51Degrees filter does not read them and the middleware declares no
@@ -214,12 +211,14 @@ hints is held like any other, for up to an hour. On Fastly a call that cannot
 connect fails after one second, and one that connects waits `timeout_ms` for
 the first byte and for each gap between bytes, so while the service is down
 every page navigation an entry covers with no held answer waits for those
-limits before its page is built. The other three adapters make no call.
+limits before its page is built. On Axum, Cloudflare and Spin the call waits
+until the adapter's HTTP client gives up, which is 30 seconds on Axum and the
+runtime's own limit on Cloudflare and Spin, so while the service is down each
+such navigation waits that long.
 
-**Rollout.** A deployment without `[shared.51degrees]` is unchanged. On any
-adapter but Fastly, adding the table writes nothing on a page and needs only
-the license key. On Fastly, adding the table and an entry naming the
-middleware changes the pages that entry covers, served to a browser the service
+**Rollout.** A deployment without `[shared.51degrees]` is unchanged. On every
+adapter, adding the table and an entry naming the middleware changes the
+pages that entry covers, served to a browser the service
 names hints for. The filter leaves state on the request, so core keeps the
 request to the origin
 path (`IntegrationRequestState` in
@@ -247,10 +246,10 @@ the middleware covers.
 - Any change to core. The middleware uses the serve phase, the headers step,
   the request state and the middleware and shared tables the stack already
   has.
-- **Request filters on Axum, Cloudflare and Spin.** Those adapters run none,
-  so the middleware asks the service nothing and writes nothing there. A
-  filter step added to them would call the service through HTTP clients that
-  apply no `timeout_ms`.
+- **`timeout_ms` on Axum, Cloudflare and Spin.** Those adapters' HTTP clients
+  apply no module's time limit, and
+  `2026-10-17-request-filters-on-every-adapter-design.md` says why that is
+  left to a change of its own.
 - **Asking permission first, or holding answers longer.** The two open
   questions under "Open questions for the reviewer" decide those.
 
@@ -301,8 +300,7 @@ Six things have no test.
    state.
 6. The two crates' tests run natively under `cargo test-axum`, and their lints
    under `cargo clippy-axum`. No alias for the Fastly target lists them, so
-   they do not run for `wasm32-wasip1`, although the Fastly adapter is the only
-   one that runs the filter.
+   they do not run for `wasm32-wasip1`, the Fastly adapter's target.
 
 ## Revision record
 
@@ -312,6 +310,7 @@ Six things have no test.
 | 2026-10-15 | Fixes from review round 1. What the filter runs on and that only the Fastly adapter runs it, the cost to pages, what each navigation sends and the open questions on consent, how each adapter bounds the call, the answers on failure, the settings, what the headers keep, the definition of a page navigation, the untested paths, the related specs and the review log. |
 | 2026-10-15 | Fixes from review round 2. The pull request that holds the design documents, the wait for the first call in the guide, and the code comments left for a later change.                                                                                                                                                                                                       |
 | 2026-10-15 | Code fixes for the call's scope, what it sends and header merging. The permission question stays open, with what was found, and the answer lifetime is a new open question.                                                                                                                                                                                                 |
+| 2026-10-18 | Every adapter runs the filter, from `2026-10-17-request-filters-on-every-adapter-design.md` and its first review round. The table of parts, the builder, the `timeout_ms` setting, what bounds the call on each adapter, consent, failure, rollout, section 3 and the tests say so.                                                                                         |
 
 ## Review log
 
