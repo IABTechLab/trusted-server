@@ -1,15 +1,15 @@
 //! The request cycle this adapter runs for a routed request, checked through
-//! its router: the request filters run before the route and their response
-//! effects after the finalize headers, without making the response less
-//! private, the route's module call carries the device classification, an
-//! Edge Cookie context that cannot be read answers before the filters, and
-//! robots.txt, the inspection endpoints and the attestation pages are answered
-//! without them.
+//! its router: the request filters run before a page and before every named
+//! route in the cycle, and their response effects after the finalize headers,
+//! without making the response less private, the route's module call carries
+//! the device classification, an Edge Cookie context that cannot be read
+//! answers before the filters, and robots.txt, the inspection endpoints and
+//! the attestation pages are answered without them.
 
 use std::sync::{Arc, Mutex};
 
 use edgezero_core::body::Body;
-use edgezero_core::http::{HeaderValue, Request, Response, StatusCode, request_builder};
+use edgezero_core::http::{HeaderValue, Method, Request, Response, StatusCode, request_builder};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::ec::device::{DeviceModule, DeviceSignals};
@@ -25,6 +25,7 @@ use trusted_server_core::platform::PlatformHttpClient;
 use trusted_server_core::platform::test_support::{
     StubHttpClient, build_services_with_http_client,
 };
+use trusted_server_core::publisher::{PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH};
 use trusted_server_core::response_privacy::enforce_terminal_private_cache_privacy;
 use trusted_server_core::settings::Settings;
 
@@ -72,11 +73,14 @@ const CRAWLER_COOKIE: &str = "crawler_session=robots";
 const READER_COOKIE: &str = "reader_session=route";
 
 /// The id and module name of a module whose preparer leaves the request for
-/// [`SPOILED_PATH`] with a `Cookie` header the Edge Cookie context cannot
-/// read.
+/// [`SPOILED_PATH`] or [`DISCOVERY_PATH`] with a `Cookie` header the Edge
+/// Cookie context cannot read.
 const SPOILING_ID: &str = "spoiling_preparer";
 const SPOILING_MODULE: &str = "testing.spoiling-preparer";
 const SPOILED_PATH: &str = "/spoiled";
+
+/// The discovery route, a named route in the request cycle.
+const DISCOVERY_PATH: &str = "/.well-known/trusted-server.json";
 
 /// Every `Cookie` header the marking device module was shown, by every test
 /// in this file, so a test can tell whether a request's cookies reached it.
@@ -311,14 +315,15 @@ fn register_nothing(
     Ok(None)
 }
 
-/// Leaves the request for [`SPOILED_PATH`] with an unreadable `Cookie`
-/// header. A deployment's own modules prepare a request after the modules
-/// the adapter links, so this runs after every one of them.
+/// Leaves the request for [`SPOILED_PATH`], a page, or [`DISCOVERY_PATH`], a
+/// named route, with an unreadable `Cookie` header. A deployment's own
+/// modules prepare a request after the modules the adapter links, so this
+/// runs after every one of them.
 fn spoil_cookie(
     _settings: &Settings,
     request: &mut Request,
 ) -> Result<(), Report<TrustedServerError>> {
-    if request.uri().path() == SPOILED_PATH {
+    if matches!(request.uri().path(), SPOILED_PATH | DISCOVERY_PATH) {
         request.headers_mut().insert("cookie", unreadable_cookie());
     }
     Ok(())
@@ -411,6 +416,35 @@ fn get(path: &str, cookie: Option<&str>) -> Request {
         .expect("should build the request")
 }
 
+/// A request for `path` by `method`, with no cookie.
+fn request_for(method: &Method, path: &str) -> Request {
+    request_builder()
+        .method(method.clone())
+        .uri(format!("https://test-publisher.example.com{path}"))
+        .header("host", "test-publisher.example.com")
+        .body(Body::empty())
+        .expect("should build the request")
+}
+
+/// Every named route the request cycle runs, by method and path.
+fn named_routes_in_the_cycle() -> [(Method, &'static str); 13] {
+    [
+        (Method::GET, DISCOVERY_PATH),
+        (Method::POST, "/verify-signature"),
+        (Method::POST, "/auction"),
+        (Method::GET, PAGE_BIDS_PATH),
+        (Method::OPTIONS, PAGE_BIDS_PATH),
+        (Method::GET, PAGE_BIDS_LEGACY_PATH),
+        (Method::OPTIONS, PAGE_BIDS_LEGACY_PATH),
+        (Method::GET, "/first-party/proxy"),
+        (Method::GET, "/first-party/click"),
+        (Method::GET, "/first-party/sign"),
+        (Method::POST, "/first-party/sign"),
+        (Method::GET, "/first-party/proxy-rebuild"),
+        (Method::POST, "/first-party/proxy-rebuild"),
+    ]
+}
+
 /// A `Cookie` header holding an accented letter in UTF-8, which a header
 /// value read as text refuses.
 fn unreadable_cookie() -> HeaderValue {
@@ -473,6 +507,36 @@ async fn a_filter_that_answers_stands_in_for_the_page() {
     assert!(
         origin.recorded_request_uris().is_empty(),
         "the publisher's origin should not be asked"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_filter_that_answers_stands_in_for_every_named_route_in_the_cycle() {
+    let origin = Arc::new(StubHttpClient::new());
+    let router = router_with(
+        settings_with("[testing]\nmodules = [\"answering-filter\"]"),
+        &[answering_builder()],
+        &origin,
+    );
+
+    for (method, path) in named_routes_in_the_cycle() {
+        let response = route(&router, request_for(&method, path)).await;
+
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "the filter's answer should stand in for {method} {path}"
+        );
+        assert_eq!(
+            header(&response, EFFECT_HEADER),
+            Some("answered"),
+            "the effects the answering filter left should be applied to {method} {path}"
+        );
+        assert_eq!(text(response), ANSWER, "{method} {path}");
+    }
+    assert!(
+        origin.recorded_request_uris().is_empty(),
+        "no request should be sent on, because no route runs"
     );
 }
 
@@ -645,26 +709,31 @@ async fn an_edge_cookie_context_that_cannot_be_read_answers_before_the_filters()
     let mut sent = get("/article", None);
     sent.headers_mut().insert("cookie", unreadable_cookie());
     let page = route(&router, sent).await;
-    let spoiled = route(&router, get(SPOILED_PATH, None)).await;
 
-    // A preparer the adapter links rebuilds the `Cookie` header from the
-    // values it can read, so a client's unreadable header never reaches the
+    // A preparer the adapter links drops a `Cookie` header value it cannot
+    // read as text, so a client's unreadable header never reaches the
     // context.
     assert_eq!(
         text(page),
         ANSWER,
         "a client's unreadable Cookie header should not stop the cycle"
     );
-    assert_eq!(
-        spoiled.status(),
-        StatusCode::BAD_REQUEST,
-        "the context's error should answer the request"
-    );
-    assert_eq!(
-        header(&spoiled, EFFECT_HEADER),
-        None,
-        "the filters should not run once the context cannot be read"
-    );
+    // A page reaches the context through the fallback, and discovery through
+    // the named route's handler, each once the preparers have run.
+    for path in [SPOILED_PATH, DISCOVERY_PATH] {
+        let spoiled = route(&router, get(path, None)).await;
+
+        assert_eq!(
+            spoiled.status(),
+            StatusCode::BAD_REQUEST,
+            "the context's error should answer {path}"
+        );
+        assert_eq!(
+            header(&spoiled, EFFECT_HEADER),
+            None,
+            "the filters should not run for {path} once the context cannot be read"
+        );
+    }
     assert!(
         origin.recorded_request_uris().is_empty(),
         "the publisher's origin should not be asked"
