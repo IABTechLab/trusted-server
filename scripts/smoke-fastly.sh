@@ -174,7 +174,7 @@ run_case missing-proxy "$((BASE_PORT + 2))" 500 \
     "failed to resolve secret reference at \`publisher.proxy_secret\`"
 write_without_secret "$CONFIGURED_FASTLY" "$FASTLY_MANIFEST" ec_passphrase
 run_case missing-ec "$((BASE_PORT + 3))" 500 \
-    "failed to resolve secret reference at \`ec.passphrase\`"
+    "failed to resolve secret reference at \`ec.hmac.passphrase\`"
 
 cp "$CONFIGURED_FASTLY" "$FASTLY_MANIFEST"
 run_case positive "$((BASE_PORT + 4))" 200
