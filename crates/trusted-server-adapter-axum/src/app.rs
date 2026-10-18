@@ -303,6 +303,11 @@ fn build_state_with_registrations_and_services(
             .and_then(RuntimeServices::resolved_ec_module)
             .or_else(|| registry.ec_module()),
     )?;
+    // Services a caller supplies carry a geo lookup of their own for
+    // `platform` to select, and this host's own resolves nothing.
+    if services.is_none() {
+        refuse_platform_geo(&settings)?;
+    }
     let permission_signal_modules =
         trusted_server_core::permission_signal::build_permission_signal_modules(
             &settings,
@@ -318,6 +323,7 @@ fn build_state_with_registrations_and_services(
         "Axum",
         &UNSENT_ANALYTICS_LOGGED,
     );
+    warn_when_certificate_check_is_off(&settings);
     warn_once_when_the_identity_graph_is_unavailable(&settings);
 
     Ok(Arc::new(AppState {
@@ -327,6 +333,40 @@ fn build_state_with_registrations_and_services(
         permission_signal_modules,
         services,
         loading_caches,
+    }))
+}
+
+/// Warns that `proxy.certificate_check = false` is not honored here.
+///
+/// This adapter's HTTP client always verifies an HTTPS origin's certificate,
+/// so a deployment that turned the check off for a self-signed origin would
+/// otherwise see only failed requests. The state is built once for the
+/// process, so this warns once, at startup.
+fn warn_when_certificate_check_is_off(settings: &Settings) {
+    if !settings.proxy.certificate_check {
+        log::warn!(
+            "proxy.certificate_check is false, but the Axum adapter does not honor it \
+             and still verifies every HTTPS origin's certificate"
+        );
+    }
+}
+
+/// Refuses `[geo] module = "platform"`, because this host has no geo lookup.
+///
+/// The selection would locate no request and still count as a geo module,
+/// so a deployment running an Edge Cookie module would never be asked to
+/// acknowledge single-jurisdiction operation.
+fn refuse_platform_geo(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
+    if settings.geo.module.as_deref() != Some("platform") {
+        return Ok(());
+    }
+    Err(Report::new(TrustedServerError::Configuration {
+        message: "`[geo] module = \"platform\"` selects the host's own geo lookup, and the \
+                  Axum dev server has no geo lookup, so no request would be located. Select \
+                  a geo module a linked crate offers, or leave `[geo] module` unset, which \
+                  needs `[geo] assume_single_jurisdiction = true` when an Edge Cookie module \
+                  is configured"
+            .to_owned(),
     }))
 }
 
@@ -1371,6 +1411,94 @@ mod tests {
             "ts.publisher.example"
         );
         assert_eq!(services.public_prefix().as_str(), "ts");
+    }
+
+    /// What `run` returns, and each line it logs on this thread at warning
+    /// level or above, as the level and then the message.
+    fn warnings_logged_by<T>(run: impl FnOnce() -> T) -> (T, Vec<String>) {
+        use std::cell::RefCell;
+        use std::sync::Once;
+
+        thread_local! {
+            static CAPTURED: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+        }
+
+        struct ThreadLogger;
+
+        impl log::Log for ThreadLogger {
+            fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
+                CAPTURED.with(|captured| captured.borrow().is_some())
+            }
+
+            fn log(&self, record: &log::Record<'_>) {
+                CAPTURED.with(|captured| {
+                    if let Some(lines) = captured.borrow_mut().as_mut() {
+                        lines.push(format!("{} {}", record.level(), record.args()));
+                    }
+                });
+            }
+
+            fn flush(&self) {}
+        }
+
+        static LOGGER: ThreadLogger = ThreadLogger;
+        static INSTALL: Once = Once::new();
+
+        INSTALL.call_once(|| {
+            log::set_logger(&LOGGER).expect("should be the only logger these tests install");
+            log::set_max_level(log::LevelFilter::Warn);
+        });
+        CAPTURED.with(|captured| *captured.borrow_mut() = Some(Vec::new()));
+        let output = run();
+        let lines = CAPTURED.with(|captured| captured.borrow_mut().take().unwrap_or_default());
+        (output, lines)
+    }
+
+    /// This adapter's HTTP client always verifies an origin's certificate, so
+    /// startup with `proxy.certificate_check = false` warns once that the
+    /// setting is not honored, and startup with the check on warns nothing.
+    #[test]
+    fn startup_warns_once_that_turning_the_certificate_check_off_is_not_honored() {
+        let warnings_naming_the_check = |certificate_check: bool| {
+            let settings = Settings::from_toml(&format!(
+                r#"
+                    [source]
+                    module = "origin"
+
+                    [source.origin]
+                    url = "https://origin.publisher.example"
+
+                    [publisher]
+                    domain = "www.publisher.example"
+                    cookie_domain = ".publisher.example"
+                    proxy_secret = "fictional-proxy-secret-32-bytes-ok"
+
+                    [proxy]
+                    certificate_check = {certificate_check}
+
+                    [geo]
+                    assume_single_jurisdiction = true
+                "#
+            ))
+            .expect("should parse the settings");
+            let (state, lines) = warnings_logged_by(|| build_state_with_settings(settings));
+            state.expect("should build the state");
+            lines
+                .into_iter()
+                .filter(|line| line.contains("proxy.certificate_check"))
+                .collect::<Vec<_>>()
+        };
+
+        let off = warnings_naming_the_check(false);
+        assert_eq!(off.len(), 1, "should warn once: {off:?}");
+        assert!(
+            off[0].starts_with("WARN ") && off[0].contains("still verifies"),
+            "should say certificates are still verified: {off:?}"
+        );
+        assert!(
+            warnings_naming_the_check(true).is_empty(),
+            "should not warn while the check is on"
+        );
     }
 
     /// Builds application state directly, bypassing the composition root's
