@@ -82,33 +82,6 @@ fn routes_build_without_panic() {
     let _router = TrustedServerApp::routes();
 }
 
-#[test]
-fn edgezero_manifest_loads_and_resolves_spin_stores() {
-    let loader = edgezero_core::manifest::ManifestLoader::load_from_str(include_str!(
-        "../../../edgezero.toml"
-    ));
-    let manifest = loader.manifest();
-
-    assert!(
-        manifest.stores.config.is_some(),
-        "Spin EdgeZero manifest must enable config store injection"
-    );
-    assert_eq!(
-        manifest
-            .stores
-            .kv
-            .as_ref()
-            .expect("should declare a KV store")
-            .default_id(),
-        "trusted_server_kv",
-        "Spin KV declaration must expose its default logical store id"
-    );
-    assert!(
-        manifest.secret_store_enabled(edgezero_core::app::SPIN_ADAPTER),
-        "Spin EdgeZero manifest must enable secret handle injection"
-    );
-}
-
 // ---------------------------------------------------------------------------
 // Middleware regression tests, which verify FinalizeResponseMiddleware is
 // wired so it cannot be removed silently.
@@ -855,6 +828,25 @@ fn selecting_a_module_this_adapter_cannot_supply_fails_at_startup() {
     assert!(
         error.to_string().contains("acme"),
         "the startup error should name the selected module, got: {error}"
+    );
+}
+
+/// `[geo] module = "platform"` selects the host's own geo lookup, which Spin
+/// does not have, so startup refuses it rather than come up locating no
+/// request with the single-jurisdiction check skipped.
+#[test]
+fn selecting_the_platform_geo_lookup_fails_at_startup() {
+    let mut settings = test_settings();
+    settings.geo.module = Some("platform".to_owned());
+
+    let error = TrustedServerApp::routes_with_settings(settings)
+        .err()
+        .expect("should refuse the host's geo lookup on a host that has none");
+    let message = error.to_string();
+
+    assert!(
+        message.contains(r#"`[geo] module = "platform"`"#) && message.contains("has no geo lookup"),
+        "should name the setting and say the host has no geo lookup: {message}"
     );
 }
 

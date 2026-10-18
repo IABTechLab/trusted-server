@@ -717,6 +717,23 @@ fn selecting_a_module_this_adapter_cannot_supply_fails_at_startup() {
     );
 }
 
+/// `[geo] module = "platform"` selects the host's own geo lookup, which the
+/// Axum dev server does not have, so startup refuses it rather than come up
+/// locating no request with the single-jurisdiction check skipped.
+#[test]
+fn selecting_the_platform_geo_lookup_fails_at_startup() {
+    let error =
+        TrustedServerApp::routes_with_settings(test_settings_with(r#"module = "platform""#))
+            .err()
+            .expect("should refuse the host's geo lookup on a host that has none");
+    let message = error.to_string();
+
+    assert!(
+        message.contains(r#"`[geo] module = "platform"`"#) && message.contains("has no geo lookup"),
+        "should name the setting and say the host has no geo lookup: {message}"
+    );
+}
+
 /// Builds a registration claiming an id a stock module already owns.
 fn duplicate_lockr_registration(
     _settings: &trusted_server_core::settings::Settings,
