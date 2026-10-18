@@ -275,7 +275,7 @@ fn build_state_with_registrations_and_services(
         "Spin",
         &UNSENT_ANALYTICS_LOGGED,
     );
-    warn_once_when_the_identity_graph_is_unavailable(&settings);
+    warn_once_when_the_identity_graph_is_unavailable(&settings, &IDENTITY_GRAPH_UNAVAILABLE_LOGGED);
     warn_once_when_an_asset_route_enables_the_image_optimizer(&settings);
 
     Ok(Arc::new(AppState {
@@ -320,15 +320,16 @@ static IDENTITY_GRAPH_UNAVAILABLE_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// Logs once, at warning level, that `[ec] ec_store` names an identity graph
 /// this adapter does not open, so the Edge Cookie is still written but the
-/// data the graph would keep with it, such as partner IDs, is not.
+/// data the graph would keep with it, such as partner IDs, is not. `logged`
+/// is set as the line is logged, and once set, nothing more is logged.
 ///
 /// The identity graph needs strongly consistent reads and conditional writes,
 /// which the key-value store this adapter can open does not offer.
-fn warn_once_when_the_identity_graph_is_unavailable(settings: &Settings) {
+fn warn_once_when_the_identity_graph_is_unavailable(settings: &Settings, logged: &AtomicBool) {
     let Some(store) = settings.ec.ec_store.as_deref() else {
         return;
     };
-    if IDENTITY_GRAPH_UNAVAILABLE_LOGGED.swap(true, Ordering::Relaxed) {
+    if logged.swap(true, Ordering::Relaxed) {
         return;
     }
     log::warn!(
@@ -810,7 +811,9 @@ async fn derive_device_signals(
 /// # Errors
 ///
 /// Returns an error when the selected Edge Cookie module cannot be built for
-/// this request, or when the request's `Cookie` header is not valid UTF-8.
+/// this request, or when the request's `Cookie` header cannot be read as
+/// text, because it holds a byte outside visible ASCII, as an accented letter
+/// in UTF-8 does.
 async fn build_ec_context(
     settings: &Settings,
     services: &RuntimeServices,
@@ -1124,8 +1127,9 @@ async fn dispatch_fallback(
 
     // A crawler asking for robots.txt is answered once the modules have
     // prepared the request, before the Edge Cookie steps and the request
-    // filters, so nothing is read from its cookies and no filter's answer
-    // stands in for the file.
+    // filters, so its Edge Cookie and consent are not read, no device
+    // module is shown its cookies and no filter's answer stands in for the
+    // file.
     if asks_for_robots_txt(&state.settings, &method, &path) {
         return answer_robots_txt(state, services, req, &method).await;
     }
@@ -1297,8 +1301,8 @@ fn asks_for_robots_txt(settings: &Settings, method: &Method, path: &str) -> bool
 }
 
 /// Answers robots.txt through the publisher path with an empty Edge Cookie
-/// context and no auction, so none of the crawler's cookies or consent
-/// signals are read.
+/// context and no auction, so the crawler's Edge Cookie and consent
+/// signals are not read.
 async fn answer_robots_txt(
     state: &AppState,
     services: &RuntimeServices,

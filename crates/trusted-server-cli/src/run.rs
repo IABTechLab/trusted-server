@@ -212,6 +212,7 @@ mod tests {
     use edgezero_cli::args::{AuthSub, ConfigDiffArgs, ConfigPushArgs, ConfigValidateArgs};
 
     use super::*;
+    use crate::commands::config::migrate::Adapter;
 
     fn parse(args: &[&str]) -> Args {
         Args::try_parse_from(args).expect("should parse args")
@@ -250,12 +251,21 @@ mod tests {
     }
 
     #[test]
-    fn parses_config_migrate_with_its_file_and_one_mode() {
-        let args = parse(&["ts", "config", "migrate", "--check", "trusted-server.toml"]);
+    fn parses_config_migrate_with_its_file_its_adapter_and_one_mode() {
+        let args = parse(&[
+            "ts",
+            "config",
+            "migrate",
+            "--adapter",
+            "spin",
+            "--check",
+            "trusted-server.toml",
+        ]);
         let Command::Config(ConfigCommand::Migrate(migrate)) = args.command else {
             panic!("expected config migrate command");
         };
         assert_eq!(migrate.file, PathBuf::from("trusted-server.toml"));
+        assert_eq!(migrate.adapter, Adapter::Spin);
         assert!(migrate.check, "should check");
         assert!(!migrate.write, "should not write");
 
@@ -263,13 +273,26 @@ mod tests {
             "ts",
             "config",
             "migrate",
+            "--adapter",
+            "fastly",
             "--write",
             "--check",
             "trusted-server.toml",
         ])
         .expect_err("should refuse writing and checking at once");
-        Args::try_parse_from(["ts", "config", "migrate"])
+        Args::try_parse_from(["ts", "config", "migrate", "--adapter", "fastly"])
             .expect_err("should need the file to migrate");
+        Args::try_parse_from(["ts", "config", "migrate", "trusted-server.toml"])
+            .expect_err("should need the adapter the deployment runs on");
+        Args::try_parse_from([
+            "ts",
+            "config",
+            "migrate",
+            "--adapter",
+            "other",
+            "trusted-server.toml",
+        ])
+        .expect_err("should refuse an adapter the stack does not have");
     }
 
     #[test]

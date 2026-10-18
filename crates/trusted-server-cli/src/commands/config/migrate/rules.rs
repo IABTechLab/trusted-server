@@ -10,6 +10,7 @@ use trusted_server_core::middleware::{HTML_MEDIA_TYPE, MiddlewarePhase};
 use trusted_server_core::module_name::short_form;
 use trusted_server_core::prefix::PublicPrefix;
 
+use super::Adapter;
 use super::layout::{Layout, Step, TablePath, path, prefix_of, set_prefix, to_crlf, uses_crlf};
 
 /// The tables main read at the top level of a document. Main refused any
@@ -94,8 +95,9 @@ const ENTRIES_COMMENT: &str = concat!(
 pub(crate) struct Report {
     /// A line for each rewrite made.
     pub(crate) changed: Vec<String>,
-    /// A line for each item the document cannot load without, which needs a
-    /// decision or a value the document does not hold.
+    /// A line for each item the document cannot load without, or setting the
+    /// stack ignores whose value the operator carries elsewhere, which needs
+    /// a decision or a value the document does not hold.
     pub(crate) to_do: Vec<String>,
     /// A line for each change in behavior no setting expresses.
     pub(crate) check: Vec<String>,
@@ -111,13 +113,14 @@ pub(crate) struct Migration {
     pub(crate) report: Report,
 }
 
-/// Rewrites `input`, a settings document, into the shape the stack reads.
+/// Rewrites `input`, a settings document, into the shape the stack reads on
+/// `adapter`.
 ///
 /// # Errors
 ///
 /// When `input` is not TOML, naming the line reading stopped at and nothing
 /// from the line.
-pub(crate) fn migrate(input: &str) -> Result<Migration, String> {
+pub(crate) fn migrate(input: &str, adapter: Adapter) -> Result<Migration, String> {
     let doc = input
         .parse::<DocumentMut>()
         .map_err(|error| match error.span() {
@@ -129,7 +132,7 @@ pub(crate) fn migrate(input: &str) -> Result<Migration, String> {
             ),
             None => "the document is not TOML".to_owned(),
         })?;
-    let mut migrator = Migrator::new(doc);
+    let mut migrator = Migrator::new(doc, adapter);
     migrator.run();
     let Migrator { layout, report, .. } = migrator;
     let text = if report.changed.is_empty() {
@@ -159,19 +162,19 @@ struct PageEntry {
     middleware: Vec<&'static str>,
 }
 
-/// The document being migrated, what the migration has reported, and what
-/// the tool's builders say of the modules.
+/// The document being migrated, the adapter it is for, what the migration
+/// has reported, and what the tool's builders say of the modules.
 struct Migrator {
     layout: Layout,
+    adapter: Adapter,
     report: Report,
     modules: Vec<KnownModule>,
     shared: Vec<(&'static str, &'static str)>,
     for_main: bool,
-    added_headers: bool,
 }
 
 impl Migrator {
-    fn new(doc: DocumentMut) -> Self {
+    fn new(doc: DocumentMut, adapter: Adapter) -> Self {
         let builders = crate::app_config::linked_builders();
         let mut modules = vec![KnownModule {
             id: JS_ASSET_PROXY,
@@ -196,11 +199,11 @@ impl Migrator {
         let for_main = written_for_main(doc.as_table());
         Self {
             layout: Layout::new(doc),
+            adapter,
             report: Report::default(),
             modules,
             shared,
             for_main,
-            added_headers: false,
         }
     }
 
@@ -224,6 +227,7 @@ impl Migrator {
         if self.for_main {
             self.main_defaults();
         }
+        self.location_at_startup();
         self.page_entries();
         if self.for_main {
             self.main_checks();
@@ -313,6 +317,13 @@ impl Migrator {
                 "`[source.origin] url` has a path, which main dropped and this release keeps, so \
                  each request now goes to the folder the path names. Check the origin serves the \
                  site there, or remove the path",
+            );
+        }
+        if origin.contains_key("host_header") {
+            self.push_check(
+                "`[source.origin] host_header` is set, so the addresses a page gives under that \
+                 host are now rewritten to the request's host, where main rewrote those under the \
+                 host of `[source.origin] url`. Check which host the origin's pages name",
             );
         }
         let auth_is_table = origin.get("auth").is_some_and(Item::is_table);
@@ -427,8 +438,8 @@ impl Migrator {
         }
     }
 
-    /// `[[handlers]]`, removed where an entry guards only the admin paths,
-    /// where nothing is served now, and left for the operator otherwise.
+    /// `[[handlers]]`, removed where an entry guards only paths this release
+    /// closes, and left for the operator otherwise.
     fn handlers(&mut self) {
         let Some(item) = self.root().get("handlers") else {
             return;
@@ -448,18 +459,19 @@ impl Migrator {
         let mut to_do = Vec::new();
         for (index, pattern) in patterns.iter().enumerate().rev() {
             let number = index + 1;
-            if pattern.as_deref().is_some_and(guards_only_admin_paths) {
+            if pattern.as_deref().is_some_and(guards_only_closed_paths) {
                 self.layout
                     .remove(&[Step::Key("handlers".to_owned()), Step::Index(index)]);
                 changed.push(format!(
-                    "removed `[[handlers]]` entry {number}, which guarded only the admin paths, \
-                     where nothing is served now"
+                    "removed `[[handlers]]` entry {number}, which guarded only paths this release \
+                     closes, where nothing is served now"
                 ));
             } else {
                 to_do.push(format!(
-                    "`[[handlers]]` entry {number} guards paths outside `/_ts/admin`, and no \
-                     request is asked for a password now. Put a password on those paths at the \
-                     origin or in the hosting platform, then remove the entry"
+                    "`[[handlers]]` entry {number} can guard paths beyond the `/_ts/admin` and \
+                     `/admin/keys` paths this release closes, and no request is asked for a \
+                     password now. Put a password on those paths at the origin or in the hosting \
+                     platform, then remove the entry"
                 ));
             }
         }
@@ -1324,46 +1336,98 @@ impl Migrator {
         }
     }
 
-    /// The location lookup and the `x-geo-*` headers main gave every
-    /// request, for a document written for main.
+    /// The host's location lookup main ran on every request, for a document
+    /// written for main, on an adapter whose host has one. The Axum and Spin
+    /// adapters refuse the selection, and main's lookup there located no
+    /// request, so the document gets no geo module there. Cloudflare's
+    /// lookup now reads the region, which main's did not, so the region
+    /// rules of `permissions.yaml` can apply there, and a check line says so.
     fn main_defaults(&mut self) {
-        let mut new = Vec::new();
-        if !self.root().contains_key("geo") {
-            let mut geo = Table::new();
-            geo.insert("module", value("platform"));
-            self.root_mut().insert("geo", Item::Table(geo));
-            new.push(path(&["geo"]));
-            self.push_changed(
-                "selected `[geo] module = \"platform\"`, the host's location lookup main ran on \
-                 every request",
-            );
-        }
-        if !self.root().contains_key("headers") {
-            let mut headers = Table::new();
-            let modules: Array = std::iter::once("geo").collect();
-            headers.insert("modules", value(modules));
-            self.root_mut().insert("headers", Item::Table(headers));
-            new.push(path(&["headers"]));
-            self.added_headers = true;
-            self.push_changed(
-                "selected `[headers] modules = [\"geo\"]`, with `headers.geo` in the `[[serve]]` \
-                 entry, for the `x-geo-*` headers main wrote",
-            );
-        }
-        if new.is_empty() {
+        if !self.adapter.has_location_lookup() || self.root().contains_key("geo") {
             return;
+        }
+        let mut geo = Table::new();
+        geo.insert("module", value("platform"));
+        self.root_mut().insert("geo", Item::Table(geo));
+        self.push_changed(
+            "selected `[geo] module = \"platform\"`, the host's location lookup main ran on \
+             every request",
+        );
+        if self.adapter == Adapter::Cloudflare {
+            self.push_check(
+                "on Cloudflare the location lookup now reads the reader's region from \
+                 `cf-region-code`, where Cloudflare sends it, and main's read none, so the \
+                 region rules of `permissions.yaml`, such as a US state's `us-state` \
+                 jurisdiction, can apply to a request now",
+            );
         }
         let anchor = self
             .layout
             .subtree_end(&path(&["source"]))
             .or_else(|| self.layout.position_of(&path(&["publisher"])))
             .unwrap_or_else(|| self.layout.last_position());
-        self.layout.place_after(anchor, &new);
+        self.layout.place_after(anchor, &[path(&["geo"])]);
+    }
+
+    /// The location settings startup refuses and `ts config validate` does
+    /// not check, being the host's own lookup on an adapter whose host has
+    /// none, and an Edge Cookie module with no geo module unless `[geo]
+    /// assume_single_jurisdiction` accepts that every request then takes the
+    /// top of the `permissions.yaml` rules. Which way out to take is the
+    /// operator's decision, so each is left to do.
+    fn location_at_startup(&mut self) {
+        let geo = self.root().get("geo");
+        let module = geo
+            .and_then(|geo| geo.get("module"))
+            .and_then(Item::as_str)
+            .map(str::to_owned);
+        let acknowledged = geo
+            .and_then(|geo| geo.get("assume_single_jurisdiction"))
+            .and_then(Item::as_bool)
+            == Some(true);
+        let edge_cookie = self
+            .root()
+            .get("ec")
+            .and_then(|ec| ec.get("module"))
+            .and_then(Item::as_str)
+            .is_some_and(|module| module != "none");
+        let name = self.adapter.name();
+        if module.as_deref() == Some("platform") && !self.adapter.has_location_lookup() {
+            let acknowledge = if edge_cookie {
+                " and set `[geo] assume_single_jurisdiction = true`, which accepts that every \
+                 request takes the top of the `permissions.yaml` rules"
+            } else {
+                ""
+            };
+            self.push_to_do(format!(
+                "`[geo] module = \"platform\"` selects the host's location lookup, and {name} has \
+                 none, so startup refuses it. Select a geo module a linked crate offers, or remove \
+                 the line{acknowledge}"
+            ));
+            return;
+        }
+        if edge_cookie && matches!(module.as_deref(), None | Some("none")) && !acknowledged {
+            self.push_to_do(if self.adapter.has_location_lookup() {
+                "`[ec]` selects an Edge Cookie module and `[geo]` selects no geo module, so every \
+                 request takes the top of the `permissions.yaml` rules, which startup refuses \
+                 unless `[geo] assume_single_jurisdiction = true` accepts it. Select a geo \
+                 module, such as `platform`, or set that line"
+                    .to_owned()
+            } else {
+                format!(
+                    "`[ec]` selects an Edge Cookie module and no geo module is selected, because \
+                     {name} has no location lookup of its own, so every request takes the top of \
+                     the `permissions.yaml` rules, which startup refuses unless `[geo] \
+                     assume_single_jurisdiction = true` accepts it. Set that line, or select a geo \
+                     module a linked crate offers"
+                )
+            });
+        }
     }
 
     /// The `[[fetch]]` and `[[serve]]` entries that place the page changes
-    /// of the selected modules, for a document with none, and the entry
-    /// each file a module makes needs.
+    /// of the selected modules, for a document written for main, and the
+    /// entry each file a module makes needs.
     fn page_entries(&mut self) {
         let entries = self.wanted_entries();
         let mut new: Vec<TablePath> = Vec::new();
@@ -1420,12 +1484,14 @@ impl Migrator {
 
     /// The page entries the document lacks: one for each phase and media
     /// type the selected modules supply middleware for, in the order the
-    /// builders supply it, when the document has no entry at all, and one
-    /// for each file a selected module makes that no entry places.
+    /// builders supply it, for a document written for main, whose modules
+    /// changed every page, and one for each file a selected module makes
+    /// that no entry places, which startup refuses. A document in the
+    /// stack's shape loads without page entries, so they are left to the
+    /// operator there.
     fn wanted_entries(&self) -> Vec<PageEntry> {
         let selected = self.selected_ids();
         let supplied = supplied_middleware(&crate::app_config::linked_builders());
-        let has_entries = self.root().contains_key("fetch") || self.root().contains_key("serve");
         let mut entries = Vec::new();
         for phase in MiddlewarePhase::ALL {
             let mut media_types: Vec<&'static str> = Vec::new();
@@ -1464,7 +1530,7 @@ impl Migrator {
                         None => rest.push(name),
                     }
                 }
-                if !has_entries && !rest.is_empty() {
+                if self.for_main && !rest.is_empty() {
                     entries.push(PageEntry {
                         phase: phase.as_str(),
                         media_type,
@@ -1494,11 +1560,30 @@ impl Migrator {
                  `framework.nextjs.flight` in a `[[fetch]]` entry for `text/x-component`",
             );
         }
-        if self.added_headers {
-            self.push_check(
-                "the `x-geo-*` headers now go only on the pages the `[[serve]]` entry covers, \
-                 where main wrote them on every response",
-            );
+        self.push_check(self.geo_headers_check());
+    }
+
+    /// What became of the location headers main wrote on every response on
+    /// the adapter. `headers.geo` is never selected for the operator,
+    /// because it writes the reader's location.
+    fn geo_headers_check(&self) -> String {
+        match self.adapter {
+            Adapter::Fastly => "no response carries an `x-geo-*` header now, where main wrote the \
+                                reader's location in them on every response. To keep them, \
+                                select `[headers] modules = [\"geo\"]` and name `headers.geo` in a \
+                                `[[serve]]` entry for the pages that are to carry them"
+                .to_owned(),
+            Adapter::Cloudflare => "no response carries `x-geo-info-available` now, the one \
+                                    `x-geo-*` header main wrote on Cloudflare. `headers.geo` \
+                                    would write it again, and with it the reader's location in \
+                                    the other `x-geo-*` headers, which main never sent on \
+                                    Cloudflare"
+                .to_owned(),
+            Adapter::Axum | Adapter::Spin => format!(
+                "no response carries `x-geo-info-available` now, which main wrote as `false` on \
+                 every response on {}, where it located no request",
+                self.adapter.name()
+            ),
         }
     }
 
@@ -1666,31 +1751,49 @@ fn implementation_of(profile: &str) -> Option<&'static str> {
     }
 }
 
-/// Whether a `[[handlers]]` path guards only the admin paths, being a
-/// pattern anchored at `/_ts/admin` or `/admin/keys` with no alternative
-/// outside a group that could match another path.
-fn guards_only_admin_paths(pattern: &str) -> bool {
-    ["^/_ts/admin", "^/admin/keys"]
-        .iter()
-        .any(|start| pattern.starts_with(start))
+/// Whether every path a `[[handlers]]` pattern matches is one this release
+/// closes, with no alternative outside a group that could match another.
+///
+/// Main matched a pattern anywhere in the path, so the pattern must be
+/// anchored. Every path that starts with `/_ts/admin` is closed, but of
+/// `/admin/keys` only the address itself and the paths below `/admin/keys/`
+/// are, so that prefix must be followed by a `/` or the end of the path, and
+/// `^/admin/keys` alone, which also matches `/admin/keystore`, is not.
+/// `?` and `*` let what comes before them match no times, and so can a
+/// count in `{}`, so none of the three may follow `^/_ts/admin` or that
+/// bound, as `^/_ts/admin?` also matches `/_ts/admit` and `^/admin/keys/?`
+/// matches `/admin/keystore`. The text after the prefix or the bound may
+/// hold no `[` and no `#` either, because a character class, or a comment
+/// the `(?x)` flag allows, can hide a `|` from
+/// [`has_top_level_alternation`], as the `(` in `[](]` is a character and
+/// not a group.
+fn guards_only_closed_paths(pattern: &str) -> bool {
+    const KEYS_BOUNDS: &[&str] = &["/", "$", "(?:/|$)", "(/|$)"];
+    let rest = match pattern.strip_prefix("^/admin/keys") {
+        Some(rest) => KEYS_BOUNDS
+            .iter()
+            .find_map(|bound| rest.strip_prefix(bound)),
+        None => pattern.strip_prefix("^/_ts/admin"),
+    };
+    rest.is_some_and(|rest| !rest.starts_with(['?', '*', '{']) && !rest.contains(['[', '#']))
         && !has_top_level_alternation(pattern)
 }
 
-/// Whether `pattern` has a `|` outside every group and character class.
+/// Whether `pattern` has a `|` outside every group.
+///
+/// It reads escapes and groups, and no character class or comment, which
+/// its caller refuses.
 fn has_top_level_alternation(pattern: &str) -> bool {
     let mut depth = 0_usize;
-    let mut in_class = false;
     let mut characters = pattern.chars();
     while let Some(character) = characters.next() {
         match character {
             '\\' => {
                 characters.next();
             }
-            '[' if !in_class => in_class = true,
-            ']' if in_class => in_class = false,
-            '(' if !in_class => depth += 1,
-            ')' if !in_class => depth = depth.saturating_sub(1),
-            '|' if !in_class && depth == 0 => return true,
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            '|' if depth == 0 => return true,
             _ => {}
         }
     }
