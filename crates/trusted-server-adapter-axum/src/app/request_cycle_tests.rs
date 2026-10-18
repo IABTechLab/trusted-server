@@ -746,3 +746,39 @@ async fn a_request_outside_the_asset_routes_reaches_the_publisher_s_origin() {
         "the publisher's origin should be asked, unsigned"
     );
 }
+
+#[test]
+fn startup_warns_when_an_asset_route_enables_the_image_optimizer() {
+    let settings = settings_with(
+        r#"
+            [image_optimizer.profile_sets.photos]
+            default_profile = "default"
+
+            [image_optimizer.profile_sets.photos.profiles]
+            default = "width=640"
+
+            [proxy]
+
+            [[proxy.asset_routes]]
+            prefix = "/images/"
+
+            [proxy.asset_routes.source]
+            module = "origin"
+
+            [proxy.asset_routes.source.origin]
+            url = "https://images.example.com"
+
+            [proxy.asset_routes.image_optimizer]
+            region = "us_east"
+            profile_set = "photos"
+        "#,
+    );
+    let origin = Arc::new(StubHttpClient::new());
+
+    let _router = router_with(settings, &[], &origin);
+
+    assert!(
+        super::IMAGE_OPTIMIZER_UNAVAILABLE_LOGGED.load(std::sync::atomic::Ordering::Relaxed),
+        "startup should warn that this adapter cannot optimize the route's images"
+    );
+}

@@ -115,6 +115,38 @@ fn warn_once_when_the_identity_graph_is_unavailable(settings: &Settings) {
     );
 }
 
+/// Set once startup has logged that an asset route enables the Image
+/// Optimizer, which this adapter does not have. The state can be built more
+/// than once, so the flag keeps the warning to one for each instance.
+static IMAGE_OPTIMIZER_UNAVAILABLE_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Logs once, at warning level, the prefix of each asset route that enables
+/// the Image Optimizer, which this adapter does not have.
+///
+/// The HTTP client refuses a request carrying Image Optimizer metadata, so
+/// such a route answers each request it would optimize with `502`. The route
+/// is not refused at startup, because its SVG paths and debug requests are
+/// still answered, as are the deployment's other routes and pages.
+fn warn_once_when_an_asset_route_enables_the_image_optimizer(settings: &Settings) {
+    let prefixes: Vec<String> = settings
+        .proxy
+        .asset_routes
+        .iter()
+        .filter(|route| route.image_optimizer.as_ref().is_some_and(|io| io.enabled))
+        .map(|route| format!("`{}`", route.prefix))
+        .collect();
+    if prefixes.is_empty() || IMAGE_OPTIMIZER_UNAVAILABLE_LOGGED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    log::warn!(
+        "the Axum adapter has no Image Optimizer, so each request these asset \
+         routes would optimize answers 502 Bad Gateway, and their SVG paths and \
+         requests that set the profile set's debug parameter are served \
+         unoptimized: {}",
+        prefixes.join(", ")
+    );
+}
+
 /// The permission signal modules this adapter links, in the order they run
 /// when configuration names none. Global Privacy Control is first because it
 /// is a browser setting with no interface of its own, and the three that
@@ -325,6 +357,7 @@ fn build_state_with_registrations_and_services(
     );
     warn_when_certificate_check_is_off(&settings);
     warn_once_when_the_identity_graph_is_unavailable(&settings);
+    warn_once_when_an_asset_route_enables_the_image_optimizer(&settings);
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),

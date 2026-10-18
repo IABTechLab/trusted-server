@@ -344,6 +344,7 @@ fn build_state_with_registrations_and_services(
         &UNSENT_ANALYTICS_LOGGED,
     );
     warn_once_when_the_identity_graph_is_unavailable(&settings);
+    warn_once_when_an_asset_route_enables_the_image_optimizer(&settings);
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
@@ -383,6 +384,38 @@ fn warn_once_when_the_identity_graph_is_unavailable(settings: &Settings) {
         "[ec] ec_store names `{store}`, but the Cloudflare adapter opens no identity \
          graph, so the Edge Cookie is still written but the data the graph would \
          keep with it, such as partner IDs, is not"
+    );
+}
+
+/// Set once startup has logged that an asset route enables the Image
+/// Optimizer, which this adapter does not translate. The state is built for
+/// every request, so the flag keeps the warning to one for each instance.
+static IMAGE_OPTIMIZER_UNAVAILABLE_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Logs once, at warning level, the prefix of each asset route that enables
+/// the Image Optimizer, whose metadata this adapter does not translate.
+///
+/// The HTTP client refuses a request carrying Image Optimizer metadata, so
+/// such a route answers each request it would optimize with `502`. The route
+/// is not refused at startup, because its SVG paths and debug requests are
+/// still answered, as are the deployment's other routes and pages.
+fn warn_once_when_an_asset_route_enables_the_image_optimizer(settings: &Settings) {
+    let prefixes: Vec<String> = settings
+        .proxy
+        .asset_routes
+        .iter()
+        .filter(|route| route.image_optimizer.as_ref().is_some_and(|io| io.enabled))
+        .map(|route| format!("`{}`", route.prefix))
+        .collect();
+    if prefixes.is_empty() || IMAGE_OPTIMIZER_UNAVAILABLE_LOGGED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    log::warn!(
+        "the Cloudflare adapter does not translate Image Optimizer metadata, so \
+         each request these asset routes would optimize answers 502 Bad Gateway, \
+         and their SVG paths and requests that set the profile set's debug \
+         parameter are served unoptimized: {}",
+        prefixes.join(", ")
     );
 }
 
