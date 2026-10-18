@@ -3572,12 +3572,13 @@ mod tests {
         }
     }
 
-    struct CanonicalTimeoutBackend {
-        canonical_ms: u32,
+    /// Canonicalizes every transport timeout to `CANONICAL_MS`, fixed by the
+    /// type as a platform's rule is, and records each call's arguments.
+    struct CanonicalTimeoutBackend<const CANONICAL_MS: u32> {
         calls: Arc<Mutex<Vec<(u32, u32)>>>,
     }
 
-    impl PlatformBackend for CanonicalTimeoutBackend {
+    impl<const CANONICAL_MS: u32> PlatformBackend for CanonicalTimeoutBackend<CANONICAL_MS> {
         fn predict_name(
             &self,
             _spec: &PlatformBackendSpec,
@@ -3594,7 +3595,7 @@ mod tests {
                 .lock()
                 .expect("should lock canonicalization calls")
                 .push((remaining_ms, configured_ms));
-            self.canonical_ms
+            CANONICAL_MS
         }
     }
 
@@ -4763,8 +4764,7 @@ mod tests {
             stub.push_response(200, b"{}".to_vec());
             let calls = Arc::new(Mutex::new(Vec::new()));
             let services = build_services_with_backend_and_http_client(
-                Arc::new(CanonicalTimeoutBackend {
-                    canonical_ms: 750,
+                Arc::new(CanonicalTimeoutBackend::<750> {
                     calls: Arc::clone(&calls),
                 }),
                 stub,
@@ -4807,10 +4807,7 @@ mod tests {
         futures::executor::block_on(async {
             let calls = Arc::new(Mutex::new(Vec::new()));
             let services = build_services_with_backend_and_http_client(
-                Arc::new(CanonicalTimeoutBackend {
-                    canonical_ms: 0,
-                    calls,
-                }),
+                Arc::new(CanonicalTimeoutBackend::<0> { calls }),
                 Arc::new(StubHttpClient::new()),
             );
             let predicted = Arc::new(Mutex::new(Vec::new()));
@@ -4850,10 +4847,7 @@ mod tests {
             stub.push_response(200, b"{}".to_vec());
             let calls = Arc::new(Mutex::new(Vec::new()));
             let services = build_services_with_backend_and_http_client(
-                Arc::new(CanonicalTimeoutBackend {
-                    canonical_ms: 500,
-                    calls,
-                }),
+                Arc::new(CanonicalTimeoutBackend::<500> { calls }),
                 stub,
             );
             let predicted = Arc::new(Mutex::new(Vec::new()));
@@ -4898,10 +4892,7 @@ mod tests {
             stub.push_response(200, b"{}".to_vec());
             let calls = Arc::new(Mutex::new(Vec::new()));
             let services = build_services_with_backend_and_http_client(
-                Arc::new(CanonicalTimeoutBackend {
-                    canonical_ms: 500,
-                    calls,
-                }),
+                Arc::new(CanonicalTimeoutBackend::<500> { calls }),
                 stub,
             );
             let bidder_predicted = Arc::new(Mutex::new(Vec::new()));
@@ -4969,8 +4960,7 @@ mod tests {
         futures::executor::block_on(async {
             let calls = Arc::new(Mutex::new(Vec::new()));
             let services = build_services_with_backend_and_http_client(
-                Arc::new(CanonicalTimeoutBackend {
-                    canonical_ms: 0,
+                Arc::new(CanonicalTimeoutBackend::<0> {
                     calls: Arc::clone(&calls),
                 }),
                 Arc::new(StubHttpClient::new()),
