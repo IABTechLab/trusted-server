@@ -3,9 +3,16 @@ use std::fs;
 use tempfile::TempDir;
 
 use super::rules::Migration;
-use super::{ConfigMigrateArgs, migrate, run_with_writers};
+use super::{Adapter, ConfigMigrateArgs, migrate, run_with_writers};
 use crate::RunOutcome;
 use crate::commands::audit::generate::validate::validate_source_config;
+
+const ADAPTERS: [Adapter; 4] = [
+    Adapter::Fastly,
+    Adapter::Cloudflare,
+    Adapter::Axum,
+    Adapter::Spin,
+];
 
 /// Main's own example settings document.
 const MAIN_EXAMPLE: &str = include_str!(concat!(
@@ -32,9 +39,17 @@ proxy_secret = "publisher_proxy_secret"
 passphrase = "ec_passphrase"
 "#;
 
+/// `input` migrated for Fastly, checked to change nothing when migrated
+/// again.
 fn migrated(input: &str) -> Migration {
-    let migration = migrate(input).expect("should migrate the document");
-    let again = migrate(&migration.text).expect("should migrate the migrated document");
+    migrated_on(Adapter::Fastly, input)
+}
+
+/// `input` migrated for `adapter`, checked to change nothing when migrated
+/// again.
+fn migrated_on(adapter: Adapter, input: &str) -> Migration {
+    let migration = migrate(input, adapter).expect("should migrate the document");
+    let again = migrate(&migration.text, adapter).expect("should migrate the migrated document");
     assert!(
         again.report.changed.is_empty(),
         "migrating a migrated document should change nothing, got {:?}",
@@ -1130,28 +1145,47 @@ template_cache_key_cookies = ["ab_bucket", "ts-tester"]
 }
 
 #[test]
-fn a_document_for_main_keeps_the_location_lookup_and_the_geo_headers() {
+fn a_document_for_main_keeps_the_location_lookup() {
     let migration = migrated(MAIN_BASE);
     let value = parsed(&migration.text);
 
     assert_eq!(value["geo"]["module"].as_str(), Some("platform"));
-    assert_eq!(value["headers"]["modules"][0].as_str(), Some("geo"));
-    let serve = value["serve"].as_array().expect("should place the headers");
-    assert_eq!(serve.len(), 1);
-    assert_eq!(serve[0]["media_type"].as_str(), Some("text/html"));
-    assert_eq!(serve[0]["middleware"][0].as_str(), Some("headers.geo"));
     assert!(value.get("fetch").is_none());
+    assert!(value.get("serve").is_none());
     assert!(reported(&migration.report.check, "`x-ts-version`"));
     assert!(reported(&migration.report.check, "Flight response"));
-    assert!(reported(
-        &migration.report.check,
-        "`x-geo-*` headers now go only"
-    ));
     assert!(
         migration.report.to_do.is_empty(),
         "{:?}",
         migration.report.to_do
     );
+}
+
+#[test]
+fn no_location_header_is_selected_for_the_operator() {
+    for adapter in ADAPTERS {
+        let migration = migrated_on(adapter, MAIN_BASE);
+        let value = parsed(&migration.text);
+        assert!(
+            value.get("headers").is_none() && value.get("serve").is_none(),
+            "{adapter:?} should select no location header:\n{}",
+            migration.text
+        );
+    }
+    assert!(reported(
+        &migrated_on(Adapter::Fastly, MAIN_BASE).report.check,
+        "To keep them, select `[headers] modules = [\"geo\"]`"
+    ));
+    assert!(reported(
+        &migrated_on(Adapter::Cloudflare, MAIN_BASE).report.check,
+        "the one `x-geo-*` header main wrote on Cloudflare"
+    ));
+    for adapter in [Adapter::Axum, Adapter::Spin] {
+        assert!(reported(
+            &migrated_on(adapter, MAIN_BASE).report.check,
+            "which main wrote as `false`"
+        ));
+    }
 }
 
 #[test]
@@ -1277,6 +1311,7 @@ enabled = true
         .filter(|name| {
             ![
                 "tag.google-tag",
+                "headers.geo",
                 "51degrees.client_hints",
                 "service_version",
             ]
@@ -1578,21 +1613,23 @@ template_cache_key_cookies = ["ts-SECRET-cookie"]
 
 #[test]
 fn no_line_carries_a_value_from_the_document() {
-    let migration = migrate(SECRET_DOCUMENT).expect("should migrate the document");
-    let lines: Vec<&String> = migration
-        .report
-        .changed
-        .iter()
-        .chain(&migration.report.to_do)
-        .chain(&migration.report.check)
-        .collect();
-    assert!(!lines.is_empty());
-    for line in lines {
-        let shown = line.replace("SECRET-integration", "");
-        assert!(
-            !shown.contains("SECRET"),
-            "a line printed a value from the document: {line}"
-        );
+    for adapter in ADAPTERS {
+        let migration = migrate(SECRET_DOCUMENT, adapter).expect("should migrate the document");
+        let lines: Vec<&String> = migration
+            .report
+            .changed
+            .iter()
+            .chain(&migration.report.to_do)
+            .chain(&migration.report.check)
+            .collect();
+        assert!(!lines.is_empty());
+        for line in lines {
+            let shown = line.replace("SECRET-integration", "");
+            assert!(
+                !shown.contains("SECRET"),
+                "a line printed a value from the document on {adapter:?}: {line}"
+            );
+        }
     }
 
     let temp = TempDir::new().expect("should make a folder");
@@ -1600,16 +1637,7 @@ fn no_line_carries_a_value_from_the_document() {
     fs::write(&file, SECRET_DOCUMENT).expect("should write the document");
     let mut out = Vec::new();
     let mut report = Vec::new();
-    run_with_writers(
-        &ConfigMigrateArgs {
-            file: file.clone(),
-            write: false,
-            check: false,
-        },
-        &mut out,
-        &mut report,
-    )
-    .expect("should run");
+    run_with_writers(&args(file.clone(), false, false), &mut out, &mut report).expect("should run");
     let report = String::from_utf8(report).expect("should report text");
     assert!(
         !report.replace("SECRET-integration", "").contains("SECRET"),
@@ -1617,22 +1645,20 @@ fn no_line_carries_a_value_from_the_document() {
     );
 
     fs::write(&file, "token = \"SECRET-token\"\n[broken\n").expect("should write the document");
-    let error = run_with_writers(
-        &ConfigMigrateArgs {
-            file,
-            write: false,
-            check: false,
-        },
-        &mut Vec::new(),
-        &mut Vec::new(),
-    )
-    .expect_err("should refuse a document that is not TOML");
+    let error = run_with_writers(&args(file, false, false), &mut Vec::new(), &mut Vec::new())
+        .expect_err("should refuse a document that is not TOML");
     assert!(error.contains("line 2"), "should name the line: {error}");
     assert!(!error.contains("SECRET"), "should quote nothing: {error}");
 }
 
+/// The command's arguments for `file` on Fastly.
 fn args(file: std::path::PathBuf, write: bool, check: bool) -> ConfigMigrateArgs {
-    ConfigMigrateArgs { file, write, check }
+    ConfigMigrateArgs {
+        file,
+        adapter: Adapter::Fastly,
+        write,
+        check,
+    }
 }
 
 #[test]
@@ -1659,7 +1685,9 @@ fn check_changes_nothing_and_says_whether_the_document_needs_migrating() {
         "{report}"
     );
 
-    let migrated = migrate(MAIN_BASE).expect("should migrate").text;
+    let migrated = migrate(MAIN_BASE, Adapter::Fastly)
+        .expect("should migrate")
+        .text;
     fs::write(&file, &migrated).expect("should write the migrated document");
     let mut report = Vec::new();
     let outcome = run_with_writers(&args(file, false, true), &mut Vec::new(), &mut report)
@@ -1678,7 +1706,9 @@ fn write_rewrites_the_file_and_the_default_prints_the_document() {
     let temp = TempDir::new().expect("should make a folder");
     let file = temp.path().join("trusted-server.toml");
     fs::write(&file, MAIN_BASE).expect("should write the document");
-    let expected = migrate(MAIN_BASE).expect("should migrate").text;
+    let expected = migrate(MAIN_BASE, Adapter::Fastly)
+        .expect("should migrate")
+        .text;
 
     let mut out = Vec::new();
     let mut report = Vec::new();

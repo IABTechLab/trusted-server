@@ -10,6 +10,7 @@ use trusted_server_core::middleware::{HTML_MEDIA_TYPE, MiddlewarePhase};
 use trusted_server_core::module_name::short_form;
 use trusted_server_core::prefix::PublicPrefix;
 
+use super::Adapter;
 use super::layout::{Layout, Step, TablePath, path, prefix_of, set_prefix, to_crlf, uses_crlf};
 
 /// The tables main read at the top level of a document. Main refused any
@@ -111,13 +112,14 @@ pub(crate) struct Migration {
     pub(crate) report: Report,
 }
 
-/// Rewrites `input`, a settings document, into the shape the stack reads.
+/// Rewrites `input`, a settings document, into the shape the stack reads on
+/// `adapter`.
 ///
 /// # Errors
 ///
 /// When `input` is not TOML, naming the line reading stopped at and nothing
 /// from the line.
-pub(crate) fn migrate(input: &str) -> Result<Migration, String> {
+pub(crate) fn migrate(input: &str, adapter: Adapter) -> Result<Migration, String> {
     let doc = input
         .parse::<DocumentMut>()
         .map_err(|error| match error.span() {
@@ -129,7 +131,7 @@ pub(crate) fn migrate(input: &str) -> Result<Migration, String> {
             ),
             None => "the document is not TOML".to_owned(),
         })?;
-    let mut migrator = Migrator::new(doc);
+    let mut migrator = Migrator::new(doc, adapter);
     migrator.run();
     let Migrator { layout, report, .. } = migrator;
     let text = if report.changed.is_empty() {
@@ -159,19 +161,19 @@ struct PageEntry {
     middleware: Vec<&'static str>,
 }
 
-/// The document being migrated, what the migration has reported, and what
-/// the tool's builders say of the modules.
+/// The document being migrated, the adapter it is for, what the migration
+/// has reported, and what the tool's builders say of the modules.
 struct Migrator {
     layout: Layout,
+    adapter: Adapter,
     report: Report,
     modules: Vec<KnownModule>,
     shared: Vec<(&'static str, &'static str)>,
     for_main: bool,
-    added_headers: bool,
 }
 
 impl Migrator {
-    fn new(doc: DocumentMut) -> Self {
+    fn new(doc: DocumentMut, adapter: Adapter) -> Self {
         let builders = crate::app_config::linked_builders();
         let mut modules = vec![KnownModule {
             id: JS_ASSET_PROXY,
@@ -196,11 +198,11 @@ impl Migrator {
         let for_main = written_for_main(doc.as_table());
         Self {
             layout: Layout::new(doc),
+            adapter,
             report: Report::default(),
             modules,
             shared,
             for_main,
-            added_headers: false,
         }
     }
 
@@ -1332,41 +1334,25 @@ impl Migrator {
         }
     }
 
-    /// The location lookup and the `x-geo-*` headers main gave every
-    /// request, for a document written for main.
+    /// The host's location lookup main ran on every request, for a document
+    /// written for main.
     fn main_defaults(&mut self) {
-        let mut new = Vec::new();
-        if !self.root().contains_key("geo") {
-            let mut geo = Table::new();
-            geo.insert("module", value("platform"));
-            self.root_mut().insert("geo", Item::Table(geo));
-            new.push(path(&["geo"]));
-            self.push_changed(
-                "selected `[geo] module = \"platform\"`, the host's location lookup main ran on \
-                 every request",
-            );
-        }
-        if !self.root().contains_key("headers") {
-            let mut headers = Table::new();
-            let modules: Array = std::iter::once("geo").collect();
-            headers.insert("modules", value(modules));
-            self.root_mut().insert("headers", Item::Table(headers));
-            new.push(path(&["headers"]));
-            self.added_headers = true;
-            self.push_changed(
-                "selected `[headers] modules = [\"geo\"]`, with `headers.geo` in the `[[serve]]` \
-                 entry, for the `x-geo-*` headers main wrote",
-            );
-        }
-        if new.is_empty() {
+        if self.root().contains_key("geo") {
             return;
         }
+        let mut geo = Table::new();
+        geo.insert("module", value("platform"));
+        self.root_mut().insert("geo", Item::Table(geo));
+        self.push_changed(
+            "selected `[geo] module = \"platform\"`, the host's location lookup main ran on \
+             every request",
+        );
         let anchor = self
             .layout
             .subtree_end(&path(&["source"]))
             .or_else(|| self.layout.position_of(&path(&["publisher"])))
             .unwrap_or_else(|| self.layout.last_position());
-        self.layout.place_after(anchor, &new);
+        self.layout.place_after(anchor, &[path(&["geo"])]);
     }
 
     /// The `[[fetch]]` and `[[serve]]` entries that place the page changes
@@ -1504,11 +1490,30 @@ impl Migrator {
                  `framework.nextjs.flight` in a `[[fetch]]` entry for `text/x-component`",
             );
         }
-        if self.added_headers {
-            self.push_check(
-                "the `x-geo-*` headers now go only on the pages the `[[serve]]` entry covers, \
-                 where main wrote them on every response",
-            );
+        self.push_check(self.geo_headers_check());
+    }
+
+    /// What became of the location headers main wrote on every response on
+    /// the adapter. `headers.geo` is never selected for the operator,
+    /// because it writes the reader's location.
+    fn geo_headers_check(&self) -> String {
+        match self.adapter {
+            Adapter::Fastly => "no response carries an `x-geo-*` header now, where main wrote the \
+                                reader's location in them on every response. To keep them, \
+                                select `[headers] modules = [\"geo\"]` and name `headers.geo` in a \
+                                `[[serve]]` entry for the pages that are to carry them"
+                .to_owned(),
+            Adapter::Cloudflare => "no response carries `x-geo-info-available` now, the one \
+                                    `x-geo-*` header main wrote on Cloudflare. `headers.geo` \
+                                    would write it again, and with it the reader's location in \
+                                    the other `x-geo-*` headers, which main never sent on \
+                                    Cloudflare"
+                .to_owned(),
+            Adapter::Axum | Adapter::Spin => format!(
+                "no response carries `x-geo-info-available` now, which main wrote as `false` on \
+                 every response on {}, where it located no request",
+                self.adapter.name()
+            ),
         }
     }
 
