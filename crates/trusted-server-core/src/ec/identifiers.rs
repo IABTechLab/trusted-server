@@ -105,8 +105,10 @@ pub(crate) fn collect_eid_updates(
 fn collect_eid_updates_from_eids(eids: &[Eid], registry: &PartnerRegistry) -> Vec<PartnerIdUpdate> {
     let mut updates = Vec::new();
     for eid in eids {
+        // An EID's source is what the reader sent, so no log line carries
+        // it. A line names the partner's configured domain instead.
         let Some(partner) = registry.find_by_source_domain(&eid.source) else {
-            log::debug!("EIDs: no partner for source '{}'", eid.source);
+            log::debug!("EIDs: skipped an EID whose source matches no partner");
             continue;
         };
 
@@ -115,9 +117,8 @@ fn collect_eid_updates_from_eids(eids: &[Eid], registry: &PartnerRegistry) -> Ve
         // source.
         let Some(uid) = first_valid_uid(&eid.uids) else {
             log::debug!(
-                "EIDs: no valid uid for source_domain '{}' from source '{}'",
-                partner.source_domain,
-                eid.source,
+                "EIDs: no valid uid for source_domain '{}'",
+                partner.source_domain
             );
             continue;
         };
@@ -235,17 +236,18 @@ mod tests {
         }
     }
 
-    /// A module that answers what it was built with.
+    /// A module that answers the identifiers it was built with, under a
+    /// fixed name as every module has.
     #[derive(Debug)]
-    struct Fixed(&'static str, Vec<Eid>);
+    struct Fixed(Vec<Eid>);
 
     impl IdentifierModule for Fixed {
         fn id(&self) -> &'static str {
-            self.0
+            "testing.fixed"
         }
 
         fn identifiers(&self, _call: ModuleCall<'_>) -> Result<Vec<Eid>, Withheld> {
-            Ok(self.1.clone())
+            Ok(self.0.clone())
         }
     }
 
@@ -276,14 +278,8 @@ mod tests {
     #[test]
     fn learn_asks_each_module_in_order_and_keeps_their_order() {
         let modules: Vec<Arc<dyn IdentifierModule>> = vec![
-            Arc::new(Fixed(
-                "testing.first",
-                vec![eid("id5-sync.com", &["ID5_abc"])],
-            )),
-            Arc::new(Fixed(
-                "testing.second",
-                vec![eid("liveramp.com", &["LR_xyz"])],
-            )),
+            Arc::new(Fixed(vec![eid("id5-sync.com", &["ID5_abc"])])),
+            Arc::new(Fixed(vec![eid("liveramp.com", &["LR_xyz"])])),
         ];
 
         let learned = learn(ModuleContext::empty(), &modules);
@@ -321,10 +317,7 @@ mod tests {
     fn learn_skips_a_module_whose_call_withholds_what_it_names() {
         let modules: Vec<Arc<dyn IdentifierModule>> = vec![
             Arc::new(FromCookie),
-            Arc::new(Fixed(
-                "testing.fixed",
-                vec![eid("id5-sync.com", &["ID5_abc"])],
-            )),
+            Arc::new(Fixed(vec![eid("id5-sync.com", &["ID5_abc"])])),
         ];
 
         let learned = learn(ModuleContext::empty(), &modules);
@@ -426,6 +419,39 @@ mod tests {
         assert!(
             updates.is_empty(),
             "should skip EIDs without configured source-domain partners"
+        );
+    }
+
+    /// Each EID skipped is logged without the source as the reader sent it,
+    /// and an EID a partner owns is named by the partner's configured domain.
+    #[test]
+    fn no_log_line_carries_the_source_a_reader_sent() {
+        let registry = make_registry(&["id5-sync.com"]);
+        let module_eids = vec![
+            eid("reader-sent.example", &["unmatched"]),
+            eid("ID5-Sync.COM.", &["   "]),
+        ];
+
+        let (updates, lines) = futures::executor::block_on(crate::test_support::logs::logged_at(
+            log::Level::Debug,
+            async { collect_eid_updates(&module_eids, None, None, &registry) },
+        ));
+
+        assert!(updates.is_empty(), "neither EID should give an update");
+        assert_eq!(
+            lines.len(),
+            2,
+            "each skipped EID should be logged: {lines:?}"
+        );
+        for sent in ["reader-sent.example", "ID5-Sync.COM."] {
+            assert!(
+                lines.iter().all(|line| !line.contains(sent)),
+                "no line should carry the source `{sent}`: {lines:?}"
+            );
+        }
+        assert!(
+            lines[1].contains("'id5-sync.com'"),
+            "the partner's EID should be named by its configured domain: {lines:?}"
         );
     }
 
