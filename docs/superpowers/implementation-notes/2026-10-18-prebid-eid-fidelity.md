@@ -149,3 +149,24 @@ Failures:
 - `preserves publisher userSync and autoRefresh=%s when seeding late IDs` (both `false` and `true`): PASS with the extended `syncDelay` and `filterSettings` fields. This is the seeding net; its proof follows in Task 8's green run.
 
 Net proof (seeding path): with `src/integrations/prebid/index.ts` line 2181 changed from `...(isRecord(effectiveUserSync) ? effectiveUserSync : {}),` to `...{},`, `-t "preserves publisher userSync"` FAILS on both cases: `preserves publisher userSync and autoRefresh=false when seeding late IDs` and `… autoRefresh=true …`, with `expected { userIds: [ { …(3) } ], …(1) } to deeply equal { userIds: [ { …(3) } ], …(5) }`. Line restored; the full file then passes 294 of 294.
+
+## Task 9: Real Prebid.js arms for D1, D3, D4 and TCF
+
+Command (the shim built from `main`'s sources: `src/integrations/prebid/index.ts` and `src/core/auction.ts` checked out from the merge base `a9037770a` for one run, then restored with `git checkout --`; `git status --short crates/trusted-server-js/lib/src` was clean afterwards):
+
+```bash
+cd crates/trusted-server-js/lib && mise exec node@24.12.0 -- npx vitest run test/prebid-eid-fidelity.test.mjs
+```
+
+Result: 5 failed, 1 passed (6 tests). Each failure is the one spec 7.5 predicts.
+
+Failures:
+
+- `D1: never forwards an ID restricted to another bidder`: `the /auction body should carry the control and not the restricted ID: expected [ [ { source: 'pubcid.org', …(1) } ] ] to deeply equal [ [ { …(2) } ] ]` (the precondition passed: sharedId produced `pubcid.org` from the preset `_sharedid` cookie)
+- `D3: forwards same-source entries separately with their own EID-level fields`: `expected [ undefined ] to deeply equal [ [ { …(5) }, { …(5) } ] ]` (`main` never reads `ortb2`)
+- `D4: the first auction after window.load waits for a pending User ID module`: `Prebid's default auctionDelay should apply: expected +0 to be 500`
+- `TCF: without an exception no client EIDs reach TS and ts-eids is cleared`: `ts-eids should be cleared: expected [ { source: 'liveramp.com', …(1) } ] to be undefined` (the positive control and the no-`/auction` check passed; `main`'s `bidsBackHandler` rewrote the cookie)
+- `TCF: with the full basicAds rule TS gets its EIDs and other bidders stay blocked`: `expected [ Array(1) ] to deeply equal [ [ { …(2) }, { …(2) } ] ]` (the body carried `liveramp.com` only)
+- `D4 control: the first auction before window.load waits, on every build`: PASS, as intended
+
+D4 mechanism probe: a temporary copy of the suite without the `auctionDelay` assertion, run with `-t "D4"` against the same `main` sources, still fails the D4 arm at the body: `the first /auction should carry the delayed unifiedId: expected [ undefined ] to deeply equal [ Array(1) ]`. So on `main` the first auction after `window.load` goes out without `adserver.org`, not merely with a different setting. The copy was deleted and the sources restored.
