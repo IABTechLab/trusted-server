@@ -660,7 +660,7 @@ pub(super) fn fat(thin: &[u8]) -> Vec<u8> {
 }
 
 /// Builds a core Wasm module importing `() -> ()` functions.
-pub(super) fn wasm_module(imports: &[(&str, &str)]) -> Vec<u8> {
+pub(crate) fn wasm_module(imports: &[(&str, &str)]) -> Vec<u8> {
     let mut out = b"\0asm\x01\0\0\0".to_vec();
     if imports.is_empty() {
         return out;

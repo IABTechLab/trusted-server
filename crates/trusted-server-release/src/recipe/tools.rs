@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use error_stack::Report;
+use serde::Serialize;
 
 use super::apple::AppleDeveloperTools;
 use super::fresh::{real_directory, real_file};
@@ -87,6 +88,28 @@ pub(crate) struct SelectedRustTools {
     apple: Option<AppleDeveloperTools>,
 }
 
+/// Candidate identity of the measured Rust tree and its selected component roles.
+///
+/// This covers the installed tree, not original acquisition or qualification.
+#[derive(Debug, Serialize)]
+pub(crate) struct RustToolEvidence {
+    tree_sha256: String,
+    target: &'static str,
+    cargo: &'static str,
+    rustc: &'static str,
+    target_standard_library: PathBuf,
+    identity_scope: &'static str,
+    origin: &'static str,
+    qualification: &'static str,
+}
+
+impl RustToolEvidence {
+    /// Returns the measured installed-tree digest retained in this receipt.
+    pub(crate) fn tree_sha256(&self) -> &str {
+        &self.tree_sha256
+    }
+}
+
 /// Requires the fixed layout for `target` below the canonical `root`.
 ///
 /// The target's `lib/rustlib/<triple>/lib` directory must hold a `libstd-*`
@@ -117,6 +140,27 @@ fn check_layout(root: &Path, target: ReleaseTarget) -> Result<(), Report<Release
 }
 
 impl SelectedRustTools {
+    /// Measures the owned installed tree and identifies the selected Rust roles.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a changed tool layout or a tree that cannot be safely measured.
+    pub(crate) fn candidate_measurement(&self) -> Result<RustToolEvidence, Report<ReleaseError>> {
+        check_layout(&self.root, self.target)?;
+        Ok(RustToolEvidence {
+            tree_sha256: self.digest()?,
+            target: self.target.triple(),
+            cargo: "bin/cargo",
+            rustc: "bin/rustc",
+            target_standard_library: Path::new("lib/rustlib")
+                .join(self.target.triple())
+                .join("lib"),
+            identity_scope: "selected_tool_tree",
+            origin: "candidate_measurement",
+            qualification: "unqualified",
+        })
+    }
+
     /// Accepts only a qualified selection; production construction stays closed.
     pub(crate) fn qualified(_root: &Path, qualification: QualifiedRustTools) -> Self {
         match qualification {}

@@ -6,6 +6,56 @@ use super::*;
 use crate::boundary::DescendantCleanup;
 use crate::policy::FIXED_ARTIFACTS;
 
+#[test]
+fn candidate_tool_evidence_records_measured_tree_and_selected_relative_roles() {
+    let fixture = Fixture::new(COMMIT);
+    let tools = fixture.tools_for(ReleaseTarget::Wasm32Wasip1);
+    let evidence = tools
+        .candidate_measurement()
+        .expect("should measure selected tools without granting release authority");
+    let value = serde_json::to_value(evidence).expect("should serialize candidate tool evidence");
+    assert_eq!(
+        value["tree_sha256"],
+        tools.digest().expect("should hash tools"),
+        "should bind the whole selected Rust tree"
+    );
+    assert_eq!(
+        value["cargo"], "bin/cargo",
+        "should identify the selected Cargo role"
+    );
+    assert_eq!(
+        value["rustc"], "bin/rustc",
+        "should identify the selected compiler role"
+    );
+    assert_eq!(
+        value["target_standard_library"], "lib/rustlib/wasm32-wasip1/lib",
+        "should identify the selected target sysroot libraries"
+    );
+    assert_eq!(
+        value["identity_scope"], "selected_tool_tree",
+        "should state measured identity scope"
+    );
+    assert_eq!(
+        value["origin"], "candidate_measurement",
+        "should not claim original acquisition provenance"
+    );
+    assert_eq!(
+        value["qualification"], "unqualified",
+        "should preserve candidate authority"
+    );
+}
+
+#[test]
+fn candidate_tool_measurement_rechecks_selected_layout() {
+    let fixture = Fixture::new(COMMIT);
+    let tools = fixture.tools_for(ReleaseTarget::Wasm32Wasip1);
+    fs::remove_file(fixture.base.join("tools/bin/rustc")).expect("should remove selected compiler");
+    assert!(
+        tools.candidate_measurement().is_err(),
+        "should reject a missing selected compiler"
+    );
+}
+
 fn rejection(fixture: &Fixture, target: ReleaseTarget) -> String {
     match SelectedRustTools::for_tests(&fixture.base.join("tools"), target) {
         Ok(_) => panic!("should reject the tools"),

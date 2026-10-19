@@ -17,10 +17,12 @@ use crate::policy::ReleaseTarget;
 use crate::recipe::observed_cargo_messages;
 
 mod capture;
+pub(crate) mod external;
 pub(crate) mod graph;
 pub(crate) mod javascript;
 pub(crate) mod native;
 pub(crate) mod origin;
+pub(crate) mod platform;
 pub(crate) use capture::CargoCapture;
 
 const MAX_PACKAGES: usize = 16_384;

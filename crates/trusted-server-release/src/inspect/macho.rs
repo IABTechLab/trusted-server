@@ -180,6 +180,10 @@ pub(crate) fn inspect_macho(
     };
     Ok(MachoFacts {
         sha256: sha256_hex(bytes),
+        loader: observed
+            .dylinkers
+            .pop()
+            .expect("should retain the validated dynamic linker"),
         cpu: policy.cpu,
         minos,
         sdk,

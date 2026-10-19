@@ -70,8 +70,9 @@ controls, both full suites and final-byte equality before constructing
 CI, including the formerly residual scrubbed process-group escape. That
 candidate evidence is not hosted qualification and opens no production
 selector. Task 9 now has ordinary-CI Fastly canonical/reproduction equality,
-final-byte publisher acceptance and Linux CLI startup evidence; Apple recipe
-runtime validation and authenticated selections remain open. Ordinary CI passes do not change the pending
+final-byte publisher acceptance, Linux CLI startup evidence, and Apple ARM CLI
+startup with byte-identical canonical/reproduction output. Intel runtime
+validation and authenticated selections remain open. Ordinary CI passes do not change the pending
 qualification pins or authorize release publication.
 
 ## Work breakdown and ownership
@@ -345,6 +346,8 @@ The candidate completion path now also reconciles normal/build metadata and tree
 The verified vendoring path records a read-only package index on `PreparedCargoMaterials`, keyed by vendor directory. Registry entries retain the locked source, original archive SHA-256 and prepared manifest SHA-256; Git entries additionally retain the complete selector/revision, repository/package trees, package path, committed manifest blob/SHA-256 and any producer-normalized manifest SHA-256. Entries are constructed only after package writing succeeds. The origin join selects only observed packages from this larger prepared-material index; preparation alone never establishes contributor membership.
 
 A read-only full-workspace graph check caught and fixed a real input-size mismatch: the CLI's `--no-dedupe` tree contains 163,493 occurrences, exceeding the separate 65,536 compiler-message limit. Trees now have their own 1,048,576-occurrence bound within the unchanged 16 MiB byte bound. An indexed name/version lookup preserves conservative ambiguity rejection. The actual Fastly and Linux CLI potential trees parse successfully; this parser check uses synthetic selected-root membership and does not establish actual full-product compiled membership for the new receipts.
+
+Candidate platform receipts additionally retain the measured installed Rust tree digest and explicit Cargo/compiler/selected target standard-library roles. Typed Apple exports retain the measured clang, archiver, linker and SDK-settings identities and versions, with explicit exclusions for SDK headers, stubs, frameworks, helper tools, libLTO and compiler resources. Accepted ELF/Mach-O/Wasm facts supply artifact-bound observed runtime requirements; these are logical dependencies, not installed runtime-library hashes or provenance. The collector independently checks artifact, target and Apple SDK agreement, compares the retained Rust digest with its bound identity, and rechecks inputs before retaining evidence. Linux host-PATH native tools remain unresolved, original acquisition is not inferred, and coverage remains incomplete. The component/integration verification batch passes 252 focused tests, native and Linux cross-target Clippy, formatting and documentation generation; independent review passed. All-cohort execution of these new receipts remains pending.
 
 ### Task 11: Generate complete artifact-specific SPDX
 

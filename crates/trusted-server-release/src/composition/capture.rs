@@ -13,6 +13,7 @@ use super::graph::{self, GraphEvidence};
 use super::javascript::JsMembership;
 use super::native::NativeInventory;
 use super::origin::VerifiedPackageOrigins;
+use super::platform::PlatformEvidence;
 use super::{CargoLayout, CargoObservations, composition_error, observe_cargo};
 use crate::documents::{hash_bounded_with_check, lower_hex};
 use crate::error::ReleaseError;
@@ -42,6 +43,7 @@ struct CompositionReceipt {
     package_origins: VerifiedPackageOrigins,
     native: NativeInventory,
     javascript: JsMembership,
+    platform: PlatformEvidence,
 }
 
 impl core::fmt::Debug for CargoCapture {
@@ -120,7 +122,7 @@ impl CargoCapture {
     ///
     /// Native sources and archives are rehashed here. Later handoffs verify the
     /// retained receipt bytes, allowing completed working roots to be cleaned.
-    /// Graph and tool/platform qualification remain separate coverage gates.
+    /// Full tool/platform coverage and qualification remain separate gates.
     ///
     /// # Errors
     ///
@@ -131,6 +133,7 @@ impl CargoCapture {
         package_origins: VerifiedPackageOrigins,
         native: NativeInventory,
         javascript: JsMembership,
+        platform: PlatformEvidence,
     ) -> Result<Self, Report<ReleaseError>> {
         let graph = graph::reconcile(
             &self.metadata,
@@ -144,6 +147,7 @@ impl CargoCapture {
             package_origins,
             native,
             javascript,
+            platform,
         };
         let normalized = serde_json::to_vec(&json!({
             "metadata_plan_sha256": self.query_plan_digests[0],

@@ -28,6 +28,7 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Component, Path, PathBuf};
 
 use error_stack::Report;
+use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
@@ -102,6 +103,28 @@ pub(crate) struct AppleToolFacts {
 pub(crate) struct AppleDeveloperTools {
     facts: AppleToolFacts,
     selection: AppleSelection,
+}
+
+/// Candidate identity of the explicitly measured Apple files.
+///
+/// The exclusions describe SDK and toolchain inputs this record does not hash.
+#[derive(Debug, Serialize)]
+pub(crate) struct AppleToolEvidence {
+    identity_sha256: String,
+    xcode_version: String,
+    sdk_version: String,
+    tools: [AppleFileEvidence; 3],
+    sdk_settings: AppleFileEvidence,
+    coverage_exclusions: [&'static str; 6],
+    origin: &'static str,
+    qualification: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct AppleFileEvidence {
+    role: &'static str,
+    path: PathBuf,
+    sha256: String,
 }
 
 fn lower_hex_digest(text: &str) -> bool {
@@ -226,6 +249,54 @@ fn hash_regular(label: &str, path: &Path, limit: u64) -> Result<String, Report<R
 }
 
 impl AppleDeveloperTools {
+    /// Exports typed candidate facts after rechecking the measured Apple files.
+    ///
+    /// # Errors
+    ///
+    /// Rejects changed tools or SDK settings, or invalid relative component paths.
+    pub(crate) fn candidate_measurement(&self) -> Result<AppleToolEvidence, Report<ReleaseError>> {
+        self.verify()?;
+        let file = |role, path: &Path, sha256: &str| {
+            Ok::<_, Report<ReleaseError>>(AppleFileEvidence {
+                role,
+                path: path
+                    .strip_prefix(&self.facts.developer_dir)
+                    .map_err(|error| {
+                        recipe_error(format!(
+                            "Apple component escapes developer directory: {error}"
+                        ))
+                    })?
+                    .to_owned(),
+                sha256: sha256.to_owned(),
+            })
+        };
+        Ok(AppleToolEvidence {
+            identity_sha256: self.identity_sha256()?,
+            xcode_version: self.facts.xcode_version.clone(),
+            sdk_version: self.facts.sdk_version.to_string(),
+            tools: [
+                file("compiler", &self.facts.clang, &self.facts.clang_sha256)?,
+                file("archiver", &self.facts.ar, &self.facts.ar_sha256)?,
+                file("linker", &self.facts.ld, &self.facts.ld_sha256)?,
+            ],
+            sdk_settings: file(
+                "sdk_settings",
+                &self.facts.sdk_root.join(SDK_SETTINGS),
+                &self.facts.sdk_settings_sha256,
+            )?,
+            coverage_exclusions: [
+                "sdk_headers",
+                "sdk_stubs",
+                "sdk_frameworks",
+                "tool_helpers",
+                "liblto",
+                "clang_resource_directory",
+            ],
+            origin: "candidate_measurement",
+            qualification: "unqualified",
+        })
+    }
+
     /// Accepts only a qualified selection; production construction stays closed.
     pub(crate) fn qualified(_facts: AppleToolFacts, qualification: QualifiedAppleTools) -> Self {
         match qualification {}

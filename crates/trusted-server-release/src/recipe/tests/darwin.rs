@@ -8,6 +8,86 @@ use super::super::paths::PrefixPaths;
 use super::fixture::*;
 use super::*;
 
+#[test]
+fn candidate_apple_evidence_records_only_measured_files_and_explicit_exclusions() {
+    let fixture = Fixture::new(COMMIT);
+    let apple = fixture.apple_tools();
+    let evidence = apple
+        .candidate_measurement()
+        .expect("should export checked Apple candidate evidence");
+    let value = serde_json::to_value(evidence).expect("should serialize Apple candidate evidence");
+    assert_eq!(
+        value["identity_sha256"],
+        apple.identity_sha256().expect("should bind Apple identity"),
+        "should preserve the bound identity record"
+    );
+    assert_eq!(
+        value["tools"][0]["sha256"],
+        fixture.apple_facts().clang_sha256,
+        "should retain actual clang bytes identity"
+    );
+    assert_eq!(
+        value["sdk_settings"]["sha256"],
+        fixture.apple_facts().sdk_settings_sha256,
+        "should retain SDK settings bytes identity"
+    );
+    assert_eq!(
+        value["xcode_version"], "16.4",
+        "should retain measured Xcode version"
+    );
+    assert_eq!(
+        value["sdk_version"], "15.5.0",
+        "should retain measured SDK version"
+    );
+    assert_eq!(
+        value["origin"], "candidate_measurement",
+        "should not authenticate original acquisitions"
+    );
+    assert_eq!(
+        value["qualification"], "unqualified",
+        "should not grant release authority"
+    );
+    assert_eq!(
+        value["coverage_exclusions"],
+        serde_json::json!([
+            "sdk_headers",
+            "sdk_stubs",
+            "sdk_frameworks",
+            "tool_helpers",
+            "liblto",
+            "clang_resource_directory"
+        ]),
+        "should explicitly retain every unmeasured SDK/tool closure class"
+    );
+    let serialized = serde_json::to_string(&value).expect("should serialize measurement");
+    assert!(
+        !serialized.contains(fixture.base.to_str().expect("should have UTF-8 root")),
+        "should serialize relative component roles without host roots"
+    );
+}
+
+#[test]
+fn candidate_apple_evidence_rechecks_every_owned_measured_file() {
+    for relative in [
+        "Toolchains/XcodeDefault.xctoolchain/usr/bin/clang",
+        "Toolchains/XcodeDefault.xctoolchain/usr/bin/ar",
+        "Toolchains/XcodeDefault.xctoolchain/usr/bin/ld",
+        "Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.5.sdk/SDKSettings.json",
+    ] {
+        let fixture = Fixture::new(COMMIT);
+        let apple = fixture.apple_tools();
+        fs::write(
+            fixture.developer_dir().join(relative),
+            b"changed measured input",
+        )
+        .expect("should alter selected Apple input");
+        assert!(
+            apple.candidate_measurement().is_err(),
+            "should reject changed {relative}"
+        );
+    }
+}
+
 /// The macOS boundary namespace: every root keeps its host path.
 fn mac_paths(fixture: &Fixture) -> PrefixPaths {
     let identity = |paths: PrefixPaths, root: &Path, writable: bool| {

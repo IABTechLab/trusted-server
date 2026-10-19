@@ -61,7 +61,9 @@ pub(crate) use ambient::{AmbientProfile, CheckedAmbient};
     unused_imports,
     reason = "the qualified Apple selection has no production caller yet"
 )]
-pub(crate) use apple::{AppleDeveloperTools, AppleToolFacts, QualifiedAppleTools};
+pub(crate) use apple::{
+    AppleDeveloperTools, AppleToolEvidence, AppleToolFacts, QualifiedAppleTools,
+};
 pub(crate) use cargo_output::successful_messages as observed_cargo_messages;
 pub(crate) use completed::RecipeCompleted;
 pub(crate) use paths::ExecutionPaths;
@@ -70,7 +72,9 @@ pub(crate) use plan::CargoPlan;
     unused_imports,
     reason = "the qualified selection has no production caller yet"
 )]
-pub(crate) use tools::{Authority, QualifiedRustTools, SelectedRustTools, ToolSelection};
+pub(crate) use tools::{
+    Authority, QualifiedRustTools, RustToolEvidence, SelectedRustTools, ToolSelection,
+};
 
 #[cfg(test)]
 use execute::RunOutput;

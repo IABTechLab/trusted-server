@@ -306,7 +306,7 @@ fn decimal(text: &str) -> Option<u32> {
 }
 
 /// One `(library, version name)` pair from `.gnu.version_r`.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 pub(crate) struct VersionRequirement {
     file: String,
     name: String,
@@ -457,6 +457,7 @@ impl MacosVersion {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MachoFacts {
     sha256: String,
+    loader: String,
     cpu: MachoCpu,
     minos: MacosVersion,
     sdk: MacosVersion,
@@ -468,6 +469,11 @@ pub(crate) struct MachoFacts {
 }
 
 impl MachoFacts {
+    /// Observed and validated `LC_LOAD_DYLINKER` install name.
+    pub(crate) fn loader(&self) -> &str {
+        &self.loader
+    }
+
     /// Observed `LC_UUID`; a linked executable always carries exactly one.
     pub(crate) fn uuid(&self) -> [u8; 16] {
         self.uuid

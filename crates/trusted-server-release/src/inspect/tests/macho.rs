@@ -27,6 +27,11 @@ fn conforming_executable_is_accepted_with_observed_facts() {
 
     assert_eq!(facts.cpu(), MachoCpu::Arm64);
     assert_eq!(
+        facts.loader(),
+        "/usr/lib/dyld",
+        "should retain the observed and validated dynamic linker"
+    );
+    assert_eq!(
         facts.minos(),
         MacosVersion::new(13, 0),
         "should record minos 13.0"

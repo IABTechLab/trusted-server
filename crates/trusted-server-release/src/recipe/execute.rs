@@ -19,9 +19,11 @@ use super::{
     Authority, ExecutionPaths, PreparedRecipe, RecipeCompleted, WorkspaceSelection, recipe_error,
 };
 use crate::boundary::{Boundary, DenialProof, DescendantCleanup};
+use crate::composition::external::ExternalRequirements;
 use crate::composition::javascript::{JsInputs, JsRetentionPolicy, collect_js};
 use crate::composition::native::{self, NativeInputs};
 use crate::composition::origin::join_origins;
+use crate::composition::platform::PlatformEvidence;
 use crate::composition::{CargoCapture, CargoLayout};
 use crate::documents::{Role as DocumentRole, read_bounded};
 use crate::error::ReleaseError;
@@ -363,7 +365,7 @@ impl PreparedRecipe {
                 "copied artifact changed before final-byte checks",
             ));
         }
-        inspect_copied(artifact.target, &raw.bytes, self.tools.apple())?;
+        let requirements = inspect_copied(artifact.target, &raw.bytes, self.tools.apple())?;
         self.check_final_paths(&raw.bytes, paths)?;
 
         let cargo_observations = if let Some((captured, selected_package_id)) =
@@ -401,7 +403,22 @@ impl PreparedRecipe {
                         },
                     )?;
                     self.check_source()?;
-                    captured.with_evidence(&selected_package_id, origins, native, javascript)?
+                    let platform = PlatformEvidence::collect(
+                        &self.tools,
+                        &self.tools_digest,
+                        requirements,
+                        artifact.target,
+                        copied.sha256(),
+                    )?;
+                    let captured = captured.with_evidence(
+                        &selected_package_id,
+                        origins,
+                        native,
+                        javascript,
+                        platform,
+                    )?;
+                    self.check_source()?;
+                    captured
                 }
                 #[cfg(test)]
                 WorkspaceSelection::Fixture => captured,
@@ -443,7 +460,7 @@ impl PreparedRecipe {
     }
 }
 
-/// Inspects the copied final bytes of the artifact for its target.
+/// Returns observed runtime requirements after accepting the copied final bytes.
 ///
 /// Wasm must be a core module that kept its debug sections. A Linux
 /// executable must pass the reviewed glibc 2.34 ELF policy (`x86_64`, the
@@ -463,11 +480,17 @@ fn inspect_copied(
     target: ReleaseTarget,
     bytes: &[u8],
     apple: Option<&AppleDeveloperTools>,
-) -> Result<(), Report<ReleaseError>> {
+) -> Result<ExternalRequirements, Report<ReleaseError>> {
     let cpu = match target {
-        ReleaseTarget::Wasm32Wasip1 => return inspect_wasm(bytes)?.require_debug_sections(),
+        ReleaseTarget::Wasm32Wasip1 => {
+            let facts = inspect_wasm(bytes)?;
+            facts.require_debug_sections()?;
+            return Ok(ExternalRequirements::from_wasm(&facts));
+        }
         ReleaseTarget::X86_64UnknownLinuxGnu => {
-            return inspect_elf(bytes, &ElfPolicy::linux_x86_64_gnu())?.require_debug_sections();
+            let facts = inspect_elf(bytes, &ElfPolicy::linux_x86_64_gnu())?;
+            facts.require_debug_sections()?;
+            return Ok(ExternalRequirements::from_elf(&facts));
         }
         ReleaseTarget::Aarch64AppleDarwin => MachoCpu::Arm64,
         ReleaseTarget::X86_64AppleDarwin => MachoCpu::X86_64,
@@ -483,7 +506,7 @@ fn inspect_copied(
             apple.sdk_version()
         )));
     }
-    Ok(())
+    Ok(ExternalRequirements::from_macho(&facts))
 }
 
 /// Digest of the whole retained JS root: contents, modes, names and aliases.
