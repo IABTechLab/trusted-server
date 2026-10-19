@@ -24,8 +24,8 @@ regional Events API host configured by `analytics.tinybird.api_host`, when
 `[analytics] module = "tinybird"` selects the module.
 
 For runtime behavior, limits, privacy properties, and the Fastly-only emission
-boundary, see [Auction Telemetry](../docs/guide/telemetry.md). For exact
-configuration fields, see [Configuration](../docs/guide/configuration.md).
+boundary, see [Auction Telemetry](../../../../docs/guide/telemetry.md). For exact
+configuration fields, see [Configuration](../../../../docs/guide/configuration.md).
 
 ## Deploy ordering
 
