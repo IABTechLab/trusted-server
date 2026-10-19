@@ -67,6 +67,35 @@ fn registry_crates_become_directory_source_packages_with_cargo_checksums() {
     let prepared = prepare(&locked, &entries);
     let materials = prepared.outcome.expect("should prepare the vendor tree");
     let vendor = materials.vendor_dir();
+    let index = serde_json::to_value(materials.packages()).expect("should encode verified index");
+    let identity = &index["example-one-1.0.0"];
+    assert_eq!(
+        identity["name"], "example-one",
+        "should retain locked package name"
+    );
+    assert_eq!(
+        identity["version"], "1.0.0",
+        "should retain locked package version"
+    );
+    assert_eq!(
+        identity["origin"]["kind"], "registry",
+        "should identify original source class"
+    );
+    assert_eq!(
+        identity["origin"]["archive_sha256"],
+        hex::encode(Sha256::digest(&one)),
+        "should bind the exact verified original archive"
+    );
+    assert_eq!(
+        identity["prepared_manifest_sha256"],
+        hex::encode(Sha256::digest(manifest("example-one", "1.0.0"))),
+        "should bind the manifest Cargo actually reads"
+    );
+    assert_eq!(
+        materials.packages().len(),
+        2,
+        "should index exactly the prepared packages"
+    );
     assert_eq!(
         vendor,
         prepared.root.join("vendor"),
@@ -163,6 +192,11 @@ fn preparation_is_deterministic_and_content_sensitive() {
         second.digest(),
         "should reproduce the digest across roots"
     );
+    assert_eq!(
+        serde_json::to_value(first.packages()).expect("should encode first index"),
+        serde_json::to_value(second.packages()).expect("should encode second index"),
+        "should keep original identities independent of staging paths"
+    );
 
     let changed = plain_crate_with("example-one", "1.0.0", b"pub fn other() {}\n");
     let changed_entries: [(&str, &str, &[u8]); 2] = [
@@ -177,6 +211,11 @@ fn preparation_is_deterministic_and_content_sensitive() {
         first.digest(),
         third.digest(),
         "should change the digest with content"
+    );
+    assert_ne!(
+        serde_json::to_value(first.packages()).expect("should encode original index"),
+        serde_json::to_value(third.packages()).expect("should encode changed index"),
+        "should bind changed original archives even when package names and versions match"
     );
 }
 

@@ -119,6 +119,38 @@ fn plain_manifest_package_is_vendored_without_derivation() {
     let material = built.objects.material(SELECTOR, REVISION, &built.root_tree);
     let result = run(&locked_core(), &material);
     let materials = result.outcome.expect("should vendor the plain package");
+    let index = serde_json::to_value(materials.packages()).expect("should encode Git index");
+    let identity = &index["example-core"];
+    assert_eq!(
+        identity["source"],
+        format!("{SELECTOR}#{REVISION}"),
+        "should preserve the complete locked source"
+    );
+    assert_eq!(
+        identity["origin"]["kind"], "git",
+        "should identify verified Git originals"
+    );
+    assert_eq!(
+        identity["origin"]["repository_tree"], built.root_tree,
+        "should bind verified repository tree"
+    );
+    assert_eq!(
+        identity["origin"]["committed_manifest_blob"], built.manifest_blob,
+        "should retain the exact committed manifest blob"
+    );
+    assert_eq!(
+        identity["origin"]["committed_manifest_sha256"],
+        hex::encode(Sha256::digest(PLAIN.as_bytes())),
+        "should bind original manifest bytes"
+    );
+    assert_eq!(
+        identity["origin"]["package_path"], "crates/core",
+        "should bind package location within repository"
+    );
+    assert!(
+        identity["origin"]["normalized_manifest_sha256"].is_null(),
+        "should not invent normalization for a plain manifest"
+    );
     let package = result.root.join("vendor/example-core");
     assert_eq!(
         fs::read(package.join("Cargo.toml")).expect("should read manifest"),
@@ -208,6 +240,21 @@ fn workspace_inheritance_is_normalized_by_the_producer_from_the_verified_tree() 
         "should keep the committed manifest as the original"
     );
     let digest = hex::encode(Sha256::digest(&written));
+    let index = serde_json::to_value(materials.packages()).expect("should encode normalized index");
+    let identity = &index["example-core"];
+    assert_eq!(
+        identity["prepared_manifest_sha256"], digest,
+        "should identify the prepared normalized manifest"
+    );
+    assert_eq!(
+        identity["origin"]["normalized_manifest_sha256"], digest,
+        "should retain reviewed normalization identity"
+    );
+    assert_eq!(
+        identity["origin"]["committed_manifest_sha256"],
+        hex::encode(Sha256::digest(INHERITING.as_bytes())),
+        "should retain distinct original bytes"
+    );
     assert_eq!(
         materials.normalized_manifest_digests().get("example-core"),
         Some(&digest),

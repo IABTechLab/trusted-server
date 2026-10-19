@@ -49,19 +49,19 @@ The producer helper MUST itself be built and executable inside the selected GNU 
 
 Current implementation includes strict documents/policy, local source/preflight checks, bounded process supervision, owning build facts, checked JS inventory and Node composition. Original archive authentication, bounded private extraction and lifecycle declaration review are implemented. Final-artifact inspection and experimental native boundaries are implemented, with separate consumer evidence verification. The experimental macOS profile now kills and rejects descendants that escape the process group, including with a scrubbed environment, by identifying its sandbox instance after each run; it remains unqualified and does not own descendant cleanup the way a container does. Native boundary controls pass ordinary Ubuntu 24.04 and macOS 15 CI; they do not qualify complete release recipes or authenticated tool selections. Original npm and Cargo Git material verification and two-installation JS orchestration are implemented; the full Linux A/B execution test passed in ordinary PR CI. Canonical recipes, authenticated bootstrap/acquisition and hosted qualification remain incomplete. Production wrappers and qualified selection remain closed.
 
-## Current task status — 2026-10-15
+## Current task status — 2026-10-19
 
 Count complete task exits separately from implemented code awaiting external
 qualification. There are **8 complete tasks and 14 open tasks**. One open task
 has its implementation finished; nine tasks therefore have completed code.
 Task counts do not measure remaining effort.
 
-| Status                                         | Count | Tasks                     | Remaining exit work                                                                                                                                  |
-| ---------------------------------------------- | ----- | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Complete                                       | 8     | 2, 4, 5, 6, 7, 17, 18, 20 | Implementation, local verification, real pinned-verifier public-fixture validation where required, and independent review completed                  |
-| Implementation complete; qualification pending | 1     | 19                        | Official Trusted Server signed-release first-use verification; upstream provenance/SPDX format compatibility has been measured                       |
-| Partial or prerequisite approval pending       | 4     | 1, 3, 8, 9                | Maintainer scope approval; authenticated bootstrap/tool selection; platform qualification; full Rust recipes/runtime acceptance                      |
-| Pending implementation                         | 9     | 10–16, 21–22              | Cargo/native composition, SPDX, transfers, evidence collector, trusted workflows, immutable publication, manual Fastly route and final qualification |
+| Status                                         | Count | Tasks                     | Remaining exit work                                                                                                                                   |
+| ---------------------------------------------- | ----- | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Complete                                       | 8     | 2, 4, 5, 6, 7, 17, 18, 20 | Implementation, local verification, real pinned-verifier public-fixture validation where required, and independent review completed                   |
+| Implementation complete; qualification pending | 1     | 19                        | Official Trusted Server signed-release first-use verification; upstream provenance/SPDX format compatibility has been measured                        |
+| Partial or prerequisite approval pending       | 5     | 1, 3, 8, 9, 10            | Maintainer scope approval; authenticated bootstrap/tool selection; platform qualification; full Rust recipes/runtime acceptance; composition coverage |
+| Pending implementation                         | 8     | 11–16, 21–22              | SPDX, transfers, evidence collector, trusted workflows, immutable publication, manual Fastly route and final qualification                            |
 
 Task 7's Linux JS exit (M3) passed: an actual ordinary-CI run completed both
 fresh offline installations, lifecycle observations, missing-tool and download
@@ -69,9 +69,9 @@ controls, both full suites and final-byte equality before constructing
 `JsBuildCompleted`. Task 7's macOS regression ports then passed on macOS 15
 CI, including the formerly residual scrubbed process-group escape. That
 candidate evidence is not hosted qualification and opens no production
-selector. Task 9's
-structural binary inspection does not prove a successful canonical build or
-Fastly publisher request. Ordinary CI passes do not change the pending
+selector. Task 9 now has ordinary-CI Fastly canonical/reproduction equality,
+final-byte publisher acceptance and Linux CLI startup evidence; Apple recipe
+runtime validation and authenticated selections remain open. Ordinary CI passes do not change the pending
 qualification pins or authorize release publication.
 
 ## Work breakdown and ownership
@@ -339,6 +339,8 @@ Progress (2026-10-16, no Task 9 exit yet): the closed recipe, checked A/B ambien
 - [ ] Inspect final files conservatively for complete JS module strings. Record absence explicitly; Fastly and CLI do not need the same retained set. Do not force unused JS into CLI. Commit `Collect artifact-specific build composition` after negatives pass.
 
 Progress (2026-10-19, partial Task 10 only): candidate recipes now run explicit-target Cargo metadata and tree queries under the same denied boundary and selected tool/environment/source replacements as the build. Completion joins actual compiler messages to exact metadata package/target identities, preserves observed host/target unit features and build-script outputs, and requires the selected final executable to appear exactly once. Raw metadata/tree and normalized observations, including query plan digests, are retained privately and rehashed at handoff; candidate measurements expose their hashes/counts with `material_native_coverage_complete: false`. Pure tests include real Cargo 1.95 observations with only absolute roots relocated, distinct source IDs, uncompiled dev entries, ambiguous joins, invalid contexts, duplicate scripts, bounded input and retained-file tampering. Local macOS and Linux Clippy pass. Same-boundary full-product CI capture, tree/graph reconciliation, verified original-material joins, native archive coverage and final-byte JS membership are still required; none of the task exit checkboxes is satisfied by this observation-only slice.
+
+The verified vendoring path now also records a read-only package index on `PreparedCargoMaterials`, keyed by vendor directory. Registry entries retain the locked source, original archive SHA-256 and prepared manifest SHA-256; Git entries additionally retain the complete selector/revision, repository/package trees, package path, committed manifest blob/SHA-256 and any producer-normalized manifest SHA-256. Entries are constructed only after package writing succeeds. Tests cover original binding, normalized versus committed manifests, staging-path independence and changed archive identities. This index includes prepared dependencies and is not yet joined to the observed compiled packages; it does not establish contributor membership or native coverage.
 
 ### Task 11: Generate complete artifact-specific SPDX
 

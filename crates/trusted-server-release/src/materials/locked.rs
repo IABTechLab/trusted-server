@@ -13,7 +13,7 @@ use crate::error::ReleaseError;
 
 // This runtime acquisition identity must match the approved lockfile registry.
 pub(super) const NPM_REGISTRY: &str = "https://registry.npmjs.org/"; // allow-domain: registry.npmjs.org
-const CARGO_REGISTRY: &str = "registry+https://github.com/rust-lang/crates.io-index";
+pub(super) const CARGO_REGISTRY: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
 /// One original npm distribution, retaining its installation-path join.
 pub(super) struct NpmMaterial {

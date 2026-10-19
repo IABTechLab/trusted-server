@@ -23,6 +23,7 @@
 #[cfg(test)]
 mod differential;
 mod git_tree;
+mod index;
 mod normalize;
 mod source;
 mod writer;
@@ -34,8 +35,10 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use error_stack::Report;
+use sha2::{Digest as _, Sha256};
 
 use super::git::VerifiedGitMaterial;
+use super::locked::CARGO_REGISTRY;
 use super::locked::GitPackage;
 use super::{LockedMaterials, material_error};
 use crate::error::ReleaseError;
@@ -44,6 +47,7 @@ use crate::tool_tree::tool_tree_digest;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use differential::resolution_differences;
 use git_tree::{Store, ancestor_manifests, find_package, materialize};
+pub(crate) use index::{CargoOrigin, VerifiedCargoPackage};
 use normalize::{PackageManifest, check_target_paths, normalize_manifest};
 pub(crate) use source::GitSourceConfig;
 use writer::PackageWriter;
@@ -91,9 +95,18 @@ pub(crate) struct PreparedCargoMaterials {
     git_sources: Vec<GitSourceConfig>,
     normalized_manifests: BTreeMap<String, String>,
     derived_manifests: BTreeMap<String, String>,
+    packages: BTreeMap<String, VerifiedCargoPackage>,
 }
 
 impl PreparedCargoMaterials {
+    /// Verified original identities, keyed by the prepared vendor directory.
+    ///
+    /// This includes prepared but uncompiled dependencies. Observed compiler
+    /// units must be joined separately before claiming artifact membership.
+    pub(crate) fn packages(&self) -> &BTreeMap<String, VerifiedCargoPackage> {
+        &self.packages
+    }
+
     /// The materials root that holds only the vendor directory.
     pub(crate) fn root(&self) -> &Path {
         &self.root
@@ -215,6 +228,7 @@ impl PreparedCargoMaterials {
                 .collect::<Result<_, _>>()?,
             normalized_manifests: BTreeMap::new(),
             derived_manifests: BTreeMap::new(),
+            packages: BTreeMap::new(),
         })
     }
 }
@@ -447,17 +461,26 @@ impl LockedMaterials {
             .mode(0o755)
             .create(&vendor)
             .map_err(material_error)?;
+        let mut packages = BTreeMap::new();
         for ((name, version), path) in inputs.registry_archives {
             attempt_check(deadline, cancellation)?;
-            self.vendor_registry(name, version, path, &vendor, deadline, cancellation)?;
+            let identity =
+                self.vendor_registry(name, version, path, &vendor, deadline, cancellation)?;
+            packages.insert(directory_name(name, version)?, identity);
         }
         let mut normalized = BTreeMap::new();
         for package in &self.cargo.git_packages {
             attempt_check(deadline, cancellation)?;
             let input = self.matching_git_input(package, inputs)?;
-            if let Some(digest) = vendor_git(package, input, &vendor)? {
-                normalized.insert(git_directory_name(&package.name)?, digest);
+            let identity = vendor_git(package, input, &vendor)?;
+            if let CargoOrigin::Git {
+                normalized_manifest_sha256: Some(digest),
+                ..
+            } = &identity.origin
+            {
+                normalized.insert(git_directory_name(&package.name)?, digest.clone());
             }
+            packages.insert(git_directory_name(&package.name)?, identity);
         }
         attempt_check(deadline, cancellation)?;
         Ok(PreparedCargoMaterials {
@@ -469,6 +492,7 @@ impl LockedMaterials {
             git_sources: sources.into_values().collect(),
             normalized_manifests: normalized,
             derived_manifests: BTreeMap::new(),
+            packages,
         })
     }
 
@@ -480,7 +504,7 @@ impl LockedMaterials {
         vendor: &Path,
         deadline: Instant,
         cancellation: &Cancellation,
-    ) -> Result<(), Report<ReleaseError>> {
+    ) -> Result<VerifiedCargoPackage, Report<ReleaseError>> {
         let directory = directory_name(name, version)?;
         let checksum = self
             .cargo
@@ -496,22 +520,34 @@ impl LockedMaterials {
         let mut writer = PackageWriter::create(vendor, &directory)?;
         copy_extracted(extracted.root(), &mut writer)?;
         extracted.verify_unchanged()?;
-        writer.finish(Some(&checksum))?;
-        Ok(())
+        let files = writer.finish(Some(&checksum))?;
+        let prepared_manifest_sha256 = files
+            .get("Cargo.toml")
+            .ok_or_else(|| material_error("prepared registry manifest is missing"))?
+            .clone();
+        Ok(VerifiedCargoPackage {
+            name: name.to_owned(),
+            version: version.to_owned(),
+            source: CARGO_REGISTRY.to_owned(),
+            prepared_manifest_sha256,
+            origin: CargoOrigin::Registry {
+                archive_sha256: checksum,
+            },
+        })
     }
 }
 
-/// Vendors one Git package; returns the producer-normalized manifest digest
-/// when the committed manifest inherits from its workspace.
+/// Vendors one Git package and records its verified original and prepared identity.
 fn vendor_git(
     package: &GitPackage,
     input: &GitVendorInput<'_>,
     vendor: &Path,
-) -> Result<Option<String>, Report<ReleaseError>> {
+) -> Result<VerifiedCargoPackage, Report<ReleaseError>> {
     let directory = git_directory_name(&package.name)?;
     let store = Store::new(input.material.object_store());
     let root = find_package(&store, input.material.root_tree(), &package.name)?;
     let committed = store.read("blob", &root.manifest, MANIFEST_LIMIT)?;
+    let committed_manifest_sha256 = hex::encode(Sha256::digest(&committed));
     let table = parse_manifest(&committed)?;
     check_target_paths(&table)?;
     match declared_identity(&table) {
@@ -554,8 +590,26 @@ fn vendor_git(
     let normalized = original
         .as_ref()
         .and_then(|_| writer.digest_of("Cargo.toml").map(str::to_owned));
-    writer.finish(None)?;
-    Ok(normalized)
+    let files = writer.finish(None)?;
+    let prepared_manifest_sha256 = files
+        .get("Cargo.toml")
+        .ok_or_else(|| material_error("prepared Git manifest is missing"))?
+        .clone();
+    Ok(VerifiedCargoPackage {
+        name: package.name.clone(),
+        version: package.version.clone(),
+        source: format!("{}#{}", package.selector, package.revision),
+        prepared_manifest_sha256,
+        origin: CargoOrigin::Git {
+            revision: package.revision.clone(),
+            repository_tree: input.material.root_tree().to_owned(),
+            package_tree: root.tree,
+            package_path: root.path,
+            committed_manifest_blob: root.manifest,
+            committed_manifest_sha256,
+            normalized_manifest_sha256: normalized,
+        },
+    })
 }
 
 #[cfg(test)]
