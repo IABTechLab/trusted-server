@@ -51,7 +51,7 @@ jobs:
       - name: Require the shared Rust setup action
         shell: bash
         run: |
-          if grep -rnE 'uses:[[:space:]]*(actions-rust-lang/setup-rust-toolchain|Swatinem/rust-cache)@' .github \
+          if grep -rnE "uses:[[:space:]]*[\"']?(actions-rust-lang/setup-rust-toolchain|Swatinem/rust-cache)@" .github \
               | grep -v '^\.github/actions/setup-rust/action\.yml:'; then
             echo "::error::Set up Rust with ./.github/actions/setup-rust, not setup-rust-toolchain or rust-cache directly."
             exit 1
