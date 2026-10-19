@@ -85,3 +85,21 @@ Failures (against the old ingestion, which always read the cookie first):
 - `navigation_ingests_the_cookie_only_source`, `finalize_generated_ec_without_sync_source_ingests_the_ts_eids_cookie`, the edited `finalize_recovers_orphaned_ec_when_purpose_four_denial_empties_updates` and `auction_route_carries_the_raw_ts_eids_cookie_to_finalization` pass against the old code (regression nets)
 - Revert proof: with `browser_eid_input`'s fallback arm changed to `_ => (None, ec_context.client_eids()),`, `navigation_ingests_the_cookie_only_source`, `finalize_generated_ec_without_sync_source_ingests_the_ts_eids_cookie` and `finalize_recovers_orphaned_ec_when_purpose_four_denial_empties_updates` each FAIL (wasm abort); arm restored
 - Revert proof: with the Fastly adapter's `let eids_cookie = crate::extract_cookie_value(req, COOKIE_TS_EIDS);` replaced by `let eids_cookie: Option<String> = None;`, `auction_route_carries_the_raw_ts_eids_cookie_to_finalization` FAILS (wasm abort); line restored
+
+## Task 6: Pure EID collector and cookie value builder
+
+Command (against a stub `eids.ts` whose functions return `undefined` and an empty cookie):
+
+```bash
+cd crates/trusted-server-js/lib && mise exec node@24.12.0 -- npx vitest run test/integrations/prebid/eids.test.ts
+```
+
+Result: 22 failed, 9 passed (31 tests). The 9 passes are the four `returns undefined for …` cases, the four `… not an object` cases and `does not modify the entries it is given`, which the stub passes trivially.
+
+Failures:
+
+- `collectBidderEids` tests (`reads ortb2.user.ext.eids`, `reads ortb2.user.eids, …`, `reads user.ext.eids before user.eids`, `returns plain-data copies without undefined fields`, `drops an entry whose serialization throws …`, `keeps a set that fits the UTF-8 budget exactly`, `drops the entry that crosses the budget …`, `measures the budget in UTF-8 bytes …`, `keeps order and repeated sources`, `forwards a lone surrogate unchanged …`, `passes the Prebid module shapes from spec 3.5 …`): `expected undefined to deeply equal [...]`
+- `fitEidCookie` tests (`removes EID-level ext and drops the duplicates …`, `trims UIDs from the last source …`, `reports a source trimmed and then dropped only as dropped`, both `removes a last entry that is … whole` cases, `removes a null last entry whole …`, `encodes non-Latin-1 text as UTF-8 base64 …`): `should produce a cookie value: expected undefined to be defined`
+- `fitEidCookie > drops whole tail sources until the cookie fits`: `TypeError: Cannot read properties of undefined (reading 'length')`
+- `fitEidCookie > returns no value when nothing fits`: `droppedSources` is `[]` instead of `['huge.example.com']`
+- `fitEidCookie > matches btoa output for ASCII payloads`, `fitEidCookie > produces exactly the ts-eids-cookie fixture for the fixture input`: `expected undefined to be '<base64>'`
