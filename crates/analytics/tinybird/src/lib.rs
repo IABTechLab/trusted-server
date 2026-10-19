@@ -443,9 +443,9 @@ mod tests {
     use trusted_server_core::config_payload::settings_from_config_blob_with;
     use trusted_server_core::integrations::IntegrationRegistry;
     use trusted_server_core::platform::{
-        BackendNamingPolicy, ClientInfo, PlatformBackend, PlatformConfigStore, PlatformError,
-        PlatformGeo, PlatformHttpClient, PlatformPendingRequest, PlatformResponse,
-        PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId, StoreName,
+        ClientInfo, PlatformBackend, PlatformConfigStore, PlatformError, PlatformGeo,
+        PlatformHttpClient, PlatformPendingRequest, PlatformResponse, PlatformSecretStore,
+        PlatformSelectResult, RuntimeServices, StoreId, StoreName,
     };
     use trusted_server_core::test_support::template::{
         template_with_resolved_required_secrets, uncomment_block,
@@ -539,10 +539,6 @@ mod tests {
     }
 
     impl PlatformBackend for RecordingBackend {
-        fn naming_policy(&self) -> BackendNamingPolicy {
-            BackendNamingPolicy::Fastly
-        }
-
         fn predict_name(
             &self,
             _spec: &PlatformBackendSpec,
