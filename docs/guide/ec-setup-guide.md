@@ -189,6 +189,13 @@ Expected decoded payload contains:
 - `source = ssp.example.com`
 - `uids[0].id = <partner-uid>`
 
+When the request also carries browser EIDs, the decoded header lists them
+first, exactly as the `trustedServer` adapter sent them (including `inserter`,
+`matcher` and `mm`), followed by KV-only partner sources. The browser copies
+the same EIDs, without EID-level `ext`, into the `ts-eids` cookie, which
+navigations and `GET /_ts/page-bids` ingest. `/auction` ingests its own body
+EIDs instead of the cookie.
+
 ## 8) Fastly KV Operational Checks
 
 List stores:
