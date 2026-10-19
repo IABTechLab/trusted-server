@@ -168,7 +168,8 @@ so the revert is exact:
 
 Hunks without evidence still receive a revert suggestion, marked "none
 cited". Copilot output that names unknown hunk ids is ignored, and evidence
-text is stripped of backticks, newlines, and `@` mentions before it is posted.
+text is stripped of backticks, newlines, and `@` mentions, then posted as
+inline code so links, HTML, and issue references in it stay inert.
 
 GitHub only allows suggestions on lines inside the pull request diff, which is
 why the edits are commits and suggestions are reverts.
