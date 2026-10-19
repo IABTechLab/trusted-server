@@ -2,11 +2,174 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use super::super::apple::{plist_string, sdk_settings_version};
 use super::super::paths::PrefixPaths;
 use super::fixture::*;
 use super::*;
+use crate::process::Cancellation;
+
+fn detached_apple(fixture: &Fixture) -> AppleDeveloperTools {
+    AppleDeveloperTools::with_detached_sdk_for_tests(
+        fixture.apple_facts(),
+        Instant::now() + Duration::from_secs(60),
+        &Cancellation::default(),
+    )
+    .expect("should stage selected SDK")
+}
+
+#[test]
+fn owned_sdk_identity_is_path_independent_and_binds_the_selected_tree() {
+    let fixture = Fixture::new(COMMIT);
+    let first = detached_apple(&fixture);
+    let second = detached_apple(&fixture);
+    assert_ne!(
+        first.sdk_root(),
+        second.sdk_root(),
+        "should use independent private roots"
+    );
+    assert_eq!(
+        first.identity_sha256().expect("should identify first SDK"),
+        second
+            .identity_sha256()
+            .expect("should identify second SDK"),
+        "should not bind random snapshot paths"
+    );
+    fs::write(
+        fixture.apple_facts().sdk_root.join("example.h"),
+        b"new selected SDK input",
+    )
+    .expect("should add SDK header");
+    let changed = detached_apple(&fixture);
+    assert_ne!(
+        first.identity_sha256().expect("should identify first SDK"),
+        changed
+            .identity_sha256()
+            .expect("should identify changed SDK"),
+        "should bind complete tree digest into Apple identity"
+    );
+    first
+        .verify()
+        .expect("should independently retain original selected SDK");
+}
+
+#[test]
+fn owned_sdk_closure_rechecks_headers_stubs_and_frameworks_and_retains_clone_lifetime() {
+    for relative in [
+        "usr/include/example.h",
+        "usr/lib/libExample.tbd",
+        "System/Library/Frameworks/Example.framework/Example",
+    ] {
+        let fixture = Fixture::new(COMMIT);
+        let source = fixture.apple_facts().sdk_root.join(relative);
+        fs::create_dir_all(source.parent().expect("should have parent"))
+            .expect("should create SDK directories");
+        fs::write(source, b"selected SDK input").expect("should write SDK input");
+        let apple = detached_apple(&fixture);
+        let clone = apple.clone();
+        let root = apple.sdk_root().to_owned();
+        let identity = apple.identity_sha256().expect("should measure identity");
+        drop(apple);
+        clone
+            .verify()
+            .expect("should retain SDK while clone exists");
+        let value =
+            serde_json::to_value(clone.candidate_measurement().expect("should measure SDK"))
+                .expect("should serialize SDK");
+        assert!(
+            value["sdk_tree"]["tree_sha256"]
+                .as_str()
+                .is_some_and(|digest| digest.len() == 64),
+            "should bind typed SDK receipt"
+        );
+        assert_eq!(
+            value["coverage_exclusions"],
+            serde_json::json!(["tool_helpers", "liblto", "clang_resource_directory"]),
+            "should remove only covered SDK exclusions"
+        );
+        fs::write(root.join(relative), b"changed SDK input").expect("should mutate owned input");
+        assert_eq!(
+            clone
+                .identity_sha256()
+                .expect("should retain original identity"),
+            identity,
+            "should retain original digest for comparison"
+        );
+        assert!(
+            clone.verify().is_err(),
+            "should detect changed {relative} while four existing file hashes remain unchanged"
+        );
+        drop(clone);
+        assert!(!root.exists(), "should remove SDK after last clone");
+    }
+}
+
+#[test]
+fn detached_sdk_is_the_actual_readonly_plan_sysroot_and_has_stable_remaps() {
+    let fixture = Fixture::new(COMMIT);
+    let apple = detached_apple(&fixture);
+    let root = apple.sdk_root().to_owned();
+    let tools = fixture
+        .rust_tools_for(ReleaseTarget::Aarch64AppleDarwin)
+        .with_apple_developer_tools(apple);
+    let prepared = fixture
+        .bind_parts(
+            fixture.request("ts-aarch64-apple-darwin", "A", COMMIT),
+            Role::Canonical,
+            COMMIT,
+            tools,
+            fixture.materials(COMMIT),
+        )
+        .expect("should bind detached SDK");
+    assert!(
+        prepared
+            .boundary_roots()
+            .expect("should bind roots")
+            .immutable()
+            .contains(&root),
+        "should scan SDK as readonly owned root"
+    );
+    let plan = prepared
+        .plan(&mac_paths(&fixture).with(&root, root.to_str().expect("should be UTF-8"), false))
+        .expect("should plan selected SDK");
+    assert_eq!(
+        plan.environment["SDKROOT"],
+        text(&root),
+        "should select copy as SDKROOT"
+    );
+    let cflags = &plan.environment["CFLAGS_aarch64_apple_darwin"];
+    for flag in [
+        format!("-isysroot {}", text(&root)),
+        format!("-ffile-prefix-map={}=/apple-sdk", text(&root)),
+        format!("-fdebug-prefix-map={}=/apple-sdk", text(&root)),
+    ] {
+        assert!(
+            cflags.contains(&flag),
+            "should use selected SDK C flag {flag}"
+        );
+    }
+    let flags = plan.arguments.join(" ");
+    assert!(
+        flags.contains(&format!("--remap-path-prefix={}=/apple-sdk", text(&root))),
+        "should remap selected SDK in Rust"
+    );
+    assert!(
+        flags.contains("-Clink-arg=-isysroot")
+            && flags.contains(&format!("-Clink-arg={}", text(&root))),
+        "should explicitly select linker SDK"
+    );
+    let paths = mac_paths(&fixture).with(&root, "/selected-sdk", false);
+    for prefix in [text(&root), "/selected-sdk".to_owned()] {
+        let bytes = format!("/trusted-server/src/main.rs {prefix}/usr/include/example.h");
+        assert!(
+            prepared
+                .check_final_paths(bytes.as_bytes(), &paths)
+                .is_err(),
+            "should reject literal SDK path {prefix} in final bytes"
+        );
+    }
+}
 
 #[test]
 fn candidate_apple_evidence_records_only_measured_files_and_explicit_exclusions() {

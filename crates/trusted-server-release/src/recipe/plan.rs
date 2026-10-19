@@ -15,7 +15,7 @@ use serde_json::json;
 use sha2::{Digest as _, Sha256};
 
 use super::ambient::CheckedAmbient;
-use super::apple::AppleDeveloperTools;
+use super::apple::{AppleDeveloperTools, REMAPPED_SDK};
 use super::paths::{ExecutionPaths, execution_text};
 use super::remap::{RemapSources, c_prefix_map_environment_with, remap_arguments_with};
 use super::sources::source_replacement_arguments;
@@ -297,7 +297,28 @@ pub(super) fn plan_for(inputs: &PlanInputs<'_>) -> Result<CargoPlan, Report<Rele
     configs.extend(remap_arguments_with(target.triple(), &sources, link_flags)?);
     let developer = darwin.as_ref().map(|darwin| darwin.developer.as_str());
     let c_prefix_map = c_prefix_map_environment_with(target, &sources, developer)?;
-    if let Some((name, value)) = c_prefix_map {
+    if let Some((name, mut value)) = c_prefix_map {
+        if let Some(sdk) = darwin.as_ref().and_then(|darwin| darwin.sdk.as_deref()) {
+            super::fresh::disjoint(&[
+                ("owned SDK", std::path::Path::new(sdk)),
+                ("checkout", std::path::Path::new(&checkout)),
+                ("vendor", std::path::Path::new(&vendor)),
+                (
+                    "Cargo home",
+                    std::path::Path::new(&environment[CARGO_HOME_VARIABLE]),
+                ),
+                ("Rust tools", std::path::Path::new(&tool_root)),
+                (
+                    "target",
+                    std::path::Path::new(&environment[TARGET_DIR_VARIABLE]),
+                ),
+                (
+                    "Apple developer",
+                    std::path::Path::new(developer.expect("should have Darwin developer root")),
+                ),
+            ])?;
+            value.push_str(&format!(" -isysroot {sdk} -ffile-prefix-map={sdk}={REMAPPED_SDK} -fdebug-prefix-map={sdk}={REMAPPED_SDK}"));
+        }
         environment.insert(name, value);
     }
     let apple_identity_sha256 = match darwin {
@@ -330,6 +351,8 @@ struct DarwinPlan {
     environment: BTreeMap<String, String>,
     /// Execution path of the developer directory for the C path remap.
     developer: String,
+    /// Execution path of a separately owned SDK.
+    sdk: Option<String>,
     /// Digest of the Apple tool identity record.
     identity_sha256: String,
 }
@@ -360,6 +383,10 @@ fn darwin_plan(
         ));
     }
     let developer = execution_text(paths, "Apple developer directory", apple.developer_dir())?;
+    let sdk = apple
+        .owned_sdk_root()
+        .map(|root| execution_text(paths, "owned Apple SDK", root))
+        .transpose()?;
     let clang = execution_text(paths, "Apple clang", apple.clang())?;
     let parent = std::path::Path::new(tool_root)
         .parent()
@@ -383,14 +410,23 @@ fn darwin_plan(
         // Cargo's LibreSSL initialization must not read ambient host configuration.
         ("OPENSSL_CONF".to_owned(), "/dev/null".to_owned()),
     ]);
+    let mut rustflags = vec![format!("-Clink-arg=-Wl,-oso_prefix,{parent}/")];
+    if let Some(sdk) = &sdk {
+        rustflags.extend([
+            format!("--remap-path-prefix={sdk}={REMAPPED_SDK}"),
+            "-Clink-arg=-isysroot".to_owned(),
+            format!("-Clink-arg={sdk}"),
+        ]);
+    }
     Ok(DarwinPlan {
-        rustflags: vec![format!("-Clink-arg=-Wl,-oso_prefix,{parent}/")],
+        rustflags,
         configs: vec![
             "--config".to_owned(),
             format!("target.\"{triple}\".linker=\"{clang}\""),
         ],
         environment,
         developer,
+        sdk,
         identity_sha256: apple.identity_sha256()?,
     })
 }

@@ -256,10 +256,12 @@ fn macos_cli_candidate_builds_inspects_and_starts_cleanly() {
     let (js, js_handoff) =
         JsBuildCompleted::adopt_ordinary_ci_handoff_for_tests(&source, &handoff, &js_measurement)
             .expect("should adopt the Linux job's handoff for this source");
-    let apple = AppleDeveloperTools::for_ordinary_ci().expect("should measure the selected Xcode");
+    let deadline = Instant::now() + Duration::from_secs(60 * 60);
+    let cancellation = Cancellation::default();
+    let apple = AppleDeveloperTools::for_ordinary_ci(deadline, &cancellation)
+        .expect("should measure the selected Xcode");
     let host = measure_host_identity().expect("should measure the macOS host");
     let (audited, removed) = environment_with_operator_values();
-    let cancellation = Cancellation::default();
     let inputs = MacosInputs {
         fixture: &fixture,
         source: &source,
@@ -268,7 +270,7 @@ fn macos_cli_candidate_builds_inspects_and_starts_cleanly() {
         apple: &apple,
         asset,
         audited: &audited,
-        deadline: Instant::now() + Duration::from_secs(60 * 60),
+        deadline,
         cancellation: &cancellation,
     };
 

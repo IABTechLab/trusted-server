@@ -2,7 +2,7 @@
 //!
 //! The developer directory is a host system root: the macOS boundary allows
 //! only reading and executing below it and never scans it. Its identity is
-//! therefore this explicit record: the developer directory, the SDK root,
+//! therefore this explicit record: the developer directory, the selected SDK,
 //! `clang`, `ar` and `ld` selected directly from the default toolchain (never
 //! through `xcrun` or the `/usr/bin` shims), the Xcode and SDK versions, and
 //! the SHA-256 of the three tools and of `SDKSettings.json`. The record is
@@ -10,14 +10,15 @@
 //!
 //! # Identity scope
 //!
-//! The record pins only those four files. Everything else `clang` and `ld`
-//! load or read below the developer directory is not hashed: clang's helper
-//! executables and resource directory, `libLTO` and other toolchain
-//! libraries, and the SDK's headers, `.tbd` stubs and frameworks. They are
-//! covered only by the versions and by the read-only system root, so a
-//! change to them inside an unchanged Xcode bundle would go unnoticed. This
-//! record is candidate evidence; Task 8 qualification must decide whether
-//! the whole toolchain and SDK tree needs a digest.
+//! Ordinary CI selection independently copies the selected SDK into an owned,
+//! bounded tree and binds its digest into this record. Headers, `.tbd` stubs,
+//! frameworks, modes and internal aliases in that selected copy are rehashed
+//! before and after execution and at evidence sealing. Explicit lexical test
+//! fixtures retain only the four-file record and never claim SDK coverage.
+//! Clang's helpers, resource directory, `libLTO`, other toolchain libraries,
+//! host runtime and original acquisition remain unresolved. The developer
+//! directory still permits broad read/execute access; the snapshot does not
+//! prove every compiler input came from the selected SDK.
 //!
 //! Only the test-only ordinary CI selection constructs a record; the
 //! qualified selection is uninhabited until Task 8 qualifies a toolchain.
@@ -26,6 +27,9 @@ use std::fs::File;
 use std::io::Read as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+#[cfg(test)]
+use std::time::Instant;
 
 use error_stack::Report;
 use serde::Serialize;
@@ -39,9 +43,16 @@ use super::tools::Authority;
 use crate::documents::{Role, canonical_json};
 use crate::error::ReleaseError;
 use crate::inspect::MacosVersion;
+#[cfg(test)]
+use crate::process::Cancellation;
+use sdk::{OwnedSdk, SdkReceipt};
+
+mod sdk;
 
 /// Fixed prefix the C path remap gives the developer directory.
 pub(crate) const REMAPPED_DEVELOPER: &str = "/apple-developer";
+/// Fixed prefix for a separately owned SDK snapshot.
+pub(crate) const REMAPPED_SDK: &str = "/apple-sdk";
 /// Default toolchain binary directory below the developer directory.
 const TOOLCHAIN_BIN: &str = "Toolchains/XcodeDefault.xctoolchain/usr/bin";
 /// macOS SDK alias below the developer directory.
@@ -103,11 +114,13 @@ pub(crate) struct AppleToolFacts {
 pub(crate) struct AppleDeveloperTools {
     facts: AppleToolFacts,
     selection: AppleSelection,
+    sdk: Option<Arc<OwnedSdk>>,
 }
 
 /// Candidate identity of the explicitly measured Apple files.
 ///
-/// The exclusions describe SDK and toolchain inputs this record does not hash.
+/// The exclusions describe inputs this selection does not hash. A detached
+/// SDK receipt is present only for a measured owned snapshot.
 #[derive(Debug, Serialize)]
 pub(crate) struct AppleToolEvidence {
     identity_sha256: String,
@@ -115,7 +128,8 @@ pub(crate) struct AppleToolEvidence {
     sdk_version: String,
     tools: [AppleFileEvidence; 3],
     sdk_settings: AppleFileEvidence,
-    coverage_exclusions: [&'static str; 6],
+    sdk_tree: Option<SdkReceipt>,
+    coverage_exclusions: Vec<&'static str>,
     origin: &'static str,
     qualification: &'static str,
 }
@@ -279,19 +293,32 @@ impl AppleDeveloperTools {
                 file("archiver", &self.facts.ar, &self.facts.ar_sha256)?,
                 file("linker", &self.facts.ld, &self.facts.ld_sha256)?,
             ],
-            sdk_settings: file(
-                "sdk_settings",
-                &self.facts.sdk_root.join(SDK_SETTINGS),
-                &self.facts.sdk_settings_sha256,
-            )?,
-            coverage_exclusions: [
-                "sdk_headers",
-                "sdk_stubs",
-                "sdk_frameworks",
-                "tool_helpers",
-                "liblto",
-                "clang_resource_directory",
-            ],
+            sdk_settings: if self.sdk.is_some() {
+                AppleFileEvidence {
+                    role: "sdk_settings",
+                    path: PathBuf::from(SDK_SETTINGS),
+                    sha256: self.facts.sdk_settings_sha256.clone(),
+                }
+            } else {
+                file(
+                    "sdk_settings",
+                    &self.facts.sdk_root.join(SDK_SETTINGS),
+                    &self.facts.sdk_settings_sha256,
+                )?
+            },
+            sdk_tree: self.sdk.as_ref().map(|sdk| sdk.receipt().clone()),
+            coverage_exclusions: if self.sdk.is_some() {
+                vec!["tool_helpers", "liblto", "clang_resource_directory"]
+            } else {
+                vec![
+                    "sdk_headers",
+                    "sdk_stubs",
+                    "sdk_frameworks",
+                    "tool_helpers",
+                    "liblto",
+                    "clang_resource_directory",
+                ]
+            },
             origin: "candidate_measurement",
             qualification: "unqualified",
         })
@@ -319,7 +346,28 @@ impl AppleDeveloperTools {
         Ok(Self {
             facts,
             selection: AppleSelection::OrdinaryCi,
+            sdk: None,
         })
+    }
+
+    /// Stages an explicit test selection through the same detached SDK policy.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid source facts, unsafe trees, changes, cancellation or expiration.
+    #[cfg(test)]
+    pub(crate) fn with_detached_sdk_for_tests(
+        facts: AppleToolFacts,
+        deadline: Instant,
+        cancellation: &Cancellation,
+    ) -> Result<Self, Report<ReleaseError>> {
+        let mut selected = Self::from_facts_for_tests(facts)?;
+        selected.verify()?;
+        let sdk = OwnedSdk::stage(&selected.facts.sdk_root, deadline, cancellation)?;
+        plain_path("owned Apple SDK root", sdk.root())?;
+        selected.sdk = Some(Arc::new(sdk));
+        selected.verify()?;
+        Ok(selected)
     }
 
     /// Measures the selected Xcode of an ordinary CI macOS runner.
@@ -336,10 +384,29 @@ impl AppleDeveloperTools {
     /// toolchain, the macOS SDK or a version cannot be read, or as
     /// [`Self::from_facts_for_tests`].
     #[cfg(test)]
-    pub(crate) fn for_ordinary_ci() -> Result<Self, Report<ReleaseError>> {
+    pub(crate) fn for_ordinary_ci(
+        deadline: Instant,
+        cancellation: &Cancellation,
+    ) -> Result<Self, Report<ReleaseError>> {
         let io = |error: std::io::Error| recipe_error(format!("cannot measure Xcode: {error}"));
         let link = std::fs::read_link("/var/db/xcode_select_link").map_err(io)?;
         let developer_dir = std::fs::canonicalize(link).map_err(io)?;
+        Self::measure_selected_developer(developer_dir, deadline, cancellation)
+    }
+
+    /// Measures one explicitly selected canonical test developer directory.
+    ///
+    /// This is shared only by the strict CI link selection and the ignored
+    /// local smoke override. Neither grants qualification or acquisition trust.
+    #[cfg(test)]
+    fn measure_selected_developer(
+        developer_dir: PathBuf,
+        deadline: Instant,
+        cancellation: &Cancellation,
+    ) -> Result<Self, Report<ReleaseError>> {
+        plain_path("Apple developer directory", &developer_dir)?;
+        real_directory("Apple developer directory", &developer_dir)?;
+        let io = |error: std::io::Error| recipe_error(format!("cannot measure Xcode: {error}"));
         let sdk_root = std::fs::canonicalize(developer_dir.join(MACOS_SDK)).map_err(io)?;
         let settings = read_small(&sdk_root.join(SDK_SETTINGS))?;
         let sdk_version = sdk_settings_version(&settings)?;
@@ -363,7 +430,7 @@ impl AppleDeveloperTools {
             xcode_version,
             sdk_version,
         };
-        Self::from_facts_for_tests(facts)
+        Self::with_detached_sdk_for_tests(facts, deadline, cancellation)
     }
 
     /// The authority of this selection.
@@ -382,7 +449,14 @@ impl AppleDeveloperTools {
 
     /// The macOS SDK root.
     pub(crate) fn sdk_root(&self) -> &Path {
-        &self.facts.sdk_root
+        self.sdk
+            .as_ref()
+            .map_or(&self.facts.sdk_root, |sdk| sdk.root())
+    }
+
+    /// The separately owned SDK root, absent for lexical fixture records.
+    pub(crate) fn owned_sdk_root(&self) -> Option<&Path> {
+        self.sdk.as_ref().map(|sdk| sdk.root())
     }
 
     /// The selected `clang`.
@@ -409,8 +483,11 @@ impl AppleDeveloperTools {
     /// regular file, or any digest differs.
     pub(crate) fn verify(&self) -> Result<(), Report<ReleaseError>> {
         real_directory("Apple developer directory", &self.facts.developer_dir)?;
-        real_directory("Apple SDK root", &self.facts.sdk_root)?;
-        let settings = self.facts.sdk_root.join(SDK_SETTINGS);
+        real_directory("Apple SDK root", self.sdk_root())?;
+        if let Some(sdk) = &self.sdk {
+            sdk.verify()?;
+        }
+        let settings = self.sdk_root().join(SDK_SETTINGS);
         let expected = [
             (
                 "Apple clang",
@@ -448,9 +525,9 @@ impl AppleDeveloperTools {
     /// The identity record as a measurement value.
     pub(crate) fn measurement(&self) -> Value {
         let text = |path: &Path| path.to_string_lossy().into_owned();
-        json!({
+        let mut value = json!({
             "developer_dir": text(&self.facts.developer_dir),
-            "sdk_root": text(&self.facts.sdk_root),
+            "sdk_root": if self.sdk.is_some() { REMAPPED_SDK.to_owned() } else { text(&self.facts.sdk_root) },
             "clang": text(&self.facts.clang),
             "ar": text(&self.facts.ar),
             "ld": text(&self.facts.ld),
@@ -460,7 +537,11 @@ impl AppleDeveloperTools {
             "ar_sha256": self.facts.ar_sha256,
             "ld_sha256": self.facts.ld_sha256,
             "sdk_settings_sha256": self.facts.sdk_settings_sha256,
-        })
+        });
+        if let Some(sdk) = &self.sdk {
+            value["sdk_tree"] = json!(sdk.receipt());
+        }
+        value
     }
 
     /// SHA-256 of the canonical identity record, bound into the plan digest.

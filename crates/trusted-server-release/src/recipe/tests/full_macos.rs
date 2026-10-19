@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 
@@ -25,7 +25,7 @@ use super::macos_candidate::darwin_cli_asset;
 use super::real_fixture::{ATTEMPTS, DenialCase, DenialSelection, bind_denial_case, cargo_fixture};
 use super::*;
 use crate::boundary::{Boundary, DenialProof, DescendantCleanup, ProbeProgram};
-use crate::process::ProcessLimits;
+use crate::process::{Cancellation, ProcessLimits};
 
 /// Reads the ordinary CI Cargo fixture and requires its macOS kind.
 pub(super) fn macos_cargo_fixture() -> CargoFixture {
@@ -132,7 +132,12 @@ fn bind_darwin_denial_case(
 fn cargo_children_inherit_denial_macos() {
     let fixture = macos_cargo_fixture();
     let target = job_host_asset().artifact().target;
-    let apple = AppleDeveloperTools::for_ordinary_ci().expect("should measure the selected Xcode");
+    let cancellation = Cancellation::default();
+    let apple = AppleDeveloperTools::for_ordinary_ci(
+        Instant::now() + Duration::from_secs(60 * 60),
+        &cancellation,
+    )
+    .expect("should measure the selected Xcode");
     let target_dir = darwin_target_dir(&fixture);
     let mut observed = BTreeMap::new();
     for case in ATTEMPTS {

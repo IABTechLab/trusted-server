@@ -587,18 +587,28 @@ impl PreparedRecipe {
     /// The checkout, retained JS and prepared materials are read-only. Cargo
     /// home, `HOME`, `TMPDIR` and the target directory are the only writable
     /// roots, and the output directory is not mounted. A Darwin build adds
-    /// the Apple developer directory as its only read-and-execute system root.
+    /// its detached SDK as a scanned immutable root and the Apple developer
+    /// directory as its only read-and-execute system root. Explicit lexical
+    /// test fixtures have no detached SDK root.
     ///
     /// # Errors
     ///
     /// Returns [`ReleaseError::Boundary`] for missing or overlapping roots.
     pub(crate) fn boundary_roots(&self) -> Result<BoundaryRoots, Report<ReleaseError>> {
+        let mut immutable = vec![
+            self.ambient.checkout_root().to_owned(),
+            self.retained_root.clone(),
+            self.request.materials.clone(),
+        ];
+        if let Some(sdk) = self
+            .tools
+            .apple()
+            .and_then(AppleDeveloperTools::owned_sdk_root)
+        {
+            immutable.push(sdk.to_owned());
+        }
         let roots = BoundaryRoots::new(
-            &[
-                self.ambient.checkout_root().to_owned(),
-                self.retained_root.clone(),
-                self.request.materials.clone(),
-            ],
+            &immutable,
             std::slice::from_ref(&self.tools.root().to_owned()),
             &[
                 self.request.cargo_state.clone(),
@@ -782,6 +792,9 @@ fn check_fresh_and_disjoint(
     ];
     if let Some(apple) = tools.apple() {
         roots.push(("Apple developer directory", apple.developer_dir()));
+        if let Some(sdk) = apple.owned_sdk_root() {
+            roots.push(("owned Apple SDK", sdk));
+        }
     }
     disjoint(&roots)
 }

@@ -23,7 +23,8 @@ impl PreparedRecipe {
     /// The six mounted roots contribute both names. Output is host-only and
     /// never translated because the build cannot access it. Whole material and
     /// Cargo-state roots include vendor files, HOME, TMPDIR and Cargo home. A
-    /// Darwin build's Apple developer directory contributes both names too.
+    /// Darwin build's Apple developer directory and detached SDK contribute
+    /// both names too.
     ///
     /// # Errors
     ///
@@ -43,9 +44,9 @@ impl PreparedRecipe {
             self.request.target_dir.as_path(),
         ];
         // Six host roots, six execution roots, the host output and a Darwin
-        // build's developer directory under both names stay below the
-        // existing scanner's fixed limit of sixty-four prefixes.
-        let mut forbidden = Vec::with_capacity(15);
+        // build's developer directory and detached SDK under both names stay
+        // below the existing scanner's fixed limit of sixty-four prefixes.
+        let mut forbidden = Vec::with_capacity(17);
         for root in roots {
             forbidden.push(host_text(root)?);
             forbidden.push(execution_text(paths, "final-path root", root)?);
@@ -59,6 +60,10 @@ impl PreparedRecipe {
                 "Apple developer directory",
                 developer,
             )?);
+            if let Some(sdk) = apple.owned_sdk_root() {
+                forbidden.push(host_text(sdk)?);
+                forbidden.push(execution_text(paths, "owned Apple SDK", sdk)?);
+            }
         }
         let forbidden: Vec<&str> = forbidden.iter().map(String::as_str).collect();
         scan_remapped_bytes(bytes, &forbidden)?;
