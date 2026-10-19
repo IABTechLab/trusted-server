@@ -7,7 +7,7 @@ mod gpt_slots;
 mod page_patterns;
 mod slot_toml;
 mod unit_template;
-mod validate;
+pub(crate) mod validate;
 
 use std::collections::BTreeSet;
 use std::fs;
