@@ -2823,32 +2823,6 @@ export function installRefreshHandler(timeoutMs = 1500): void {
   });
 }
 
-/**
- * Configure identity sync behavior for the generated Prebid User ID modules.
- *
- * The external bundle generator statically imports the selected modules into
- * its generated entry. This post-window-load configuration controls when
- * those modules synchronize identities; it does not select or register modules.
- */
-export function installUserIdModules(): void {
-  try {
-    pbjs.setConfig({
-      userSync: {
-        syncEnabled: true,
-        filterSettings: {
-          all: { bidders: '*', filter: 'include' },
-        },
-        auctionDelay: 0,
-        syncsPerBidder: 5,
-        syncDelay: 3000,
-      },
-    });
-    log.info('[tsjs-prebid] userID modules configured');
-  } catch {
-    // pbjs not ready — userID modules will use defaults
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Prebid EID forwarding and the ts-eids cookie
 // ---------------------------------------------------------------------------
@@ -2971,21 +2945,10 @@ if (typeof window !== 'undefined') {
   // fail to run the replacement auction — leave GPT untouched instead.
   if (hasPrebidJsApi()) {
     installRefreshHandler();
-    // The slim-Prebid lazy loader appends this bundle from a window.load
-    // handler, so `load` may already have fired by the time this code runs —
-    // waiting for it again would skip user ID setup entirely on that path.
-    if (document.readyState === 'complete') {
-      installUserIdModules();
-    } else {
-      window.addEventListener(
-        'load',
-        () => {
-          installUserIdModules();
-        },
-        { once: true }
-      );
-    }
   }
+  // TS writes no userSync values beyond managed userIds (and autoRefresh on a
+  // late seed), so the publisher's or Prebid's auctionDelay applies from the
+  // first auction.
 }
 
 export { pbjs };

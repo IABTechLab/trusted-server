@@ -131,3 +131,21 @@ Failures:
 - `leaves ts-eids alone when an auction builds no trustedServer request`: `only buildRequests may write or clear the cookie: expected 'W3sic291cmNl…' to be 'preset-value'`
 - `exposes the getUserIdsAsEids canary on the pbjs the shim uses` and `sends no eids in the /auction body`: PASS (positive control and net)
 - Net proof: with `src/core/request.ts:45` changed to pass `{ eids: [{ source: 'net.example.com', … }] }` to `buildAdRequest`, `sends no eids in the /auction body` FAILS (`requestAds should leave EIDs to the ts-eids cookie: expected { adUnits: […], …(2) } to not have property "eids"`); line restored
+
+## Task 8: Stop writing Prebid userSync settings
+
+Command (new self-init tests added; `installUserIdModules` still present):
+
+```bash
+cd crates/trusted-server-js/lib && mise exec node@24.12.0 -- npx vitest run test/integrations/prebid/index.test.ts -t "writes no userSync|preserves publisher userSync"
+```
+
+Result: 2 failed, 2 passed. The file-level `afterAll` canary also reports `the canary should have inspected at least one /auction body: expected 0 to be greater than 0`. This comes from the `-t` filter selecting no `/auction` test, not from this change, and a full run satisfies it.
+
+Failures:
+
+- `prebid self-init writes no Prebid userSync settings > writes no userSync when the bundle loads after window load`: `TS should leave userSync to the publisher and Prebid: expected [ [ { userSync: { …(6) } } ], …(1) ] to deeply equal []` (the `auctionDelay: 0`, `syncDelay: 3000`, `filterSettings.all` write)
+- `prebid self-init writes no Prebid userSync settings > writes no userSync when window load fires after install`: same assertion, same write after the `load` event
+- `preserves publisher userSync and autoRefresh=%s when seeding late IDs` (both `false` and `true`): PASS with the extended `syncDelay` and `filterSettings` fields. This is the seeding net; its proof follows in Task 8's green run.
+
+Net proof (seeding path): with `src/integrations/prebid/index.ts` line 2181 changed from `...(isRecord(effectiveUserSync) ? effectiveUserSync : {}),` to `...{},`, `-t "preserves publisher userSync"` FAILS on both cases: `preserves publisher userSync and autoRefresh=false when seeding late IDs` and `… autoRefresh=true …`, with `expected { userIds: [ { …(3) } ], …(1) } to deeply equal { userIds: [ { …(3) } ], …(5) }`. Line restored; the full file then passes 294 of 294.

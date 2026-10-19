@@ -1459,7 +1459,14 @@ describe('prebid/installPrebidNpm', () => {
     'preserves publisher userSync and autoRefresh=%s when seeding late IDs',
     (autoRefresh) => {
       testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
-      const userSync = { userIds: [], auctionDelay: 300, syncEnabled: false, autoRefresh };
+      const userSync = {
+        userIds: [],
+        auctionDelay: 300,
+        syncDelay: 50,
+        filterSettings: { image: { bidders: '*', filter: 'include' } },
+        syncEnabled: false,
+        autoRefresh,
+      };
       mockGetConfig.mockImplementation((key?: string) => {
         if (key === 'userSync.userIds') return [];
         if (key === 'userSync') return userSync;
@@ -8080,10 +8087,11 @@ describe('prebid/self-init without the external bundle', () => {
   });
 });
 
-describe('prebid self-init user ID module timing', () => {
-  const userSyncCallCount = () =>
-    mockSetConfig.mock.calls.filter(([arg]) => arg && typeof arg === 'object' && 'userSync' in arg)
-      .length;
+describe('prebid self-init writes no Prebid userSync settings', () => {
+  const userSyncCalls = () =>
+    mockSetConfig.mock.calls.filter(
+      ([arg]) => arg !== null && typeof arg === 'object' && 'userSync' in arg
+    );
 
   const setReadyState = (value: DocumentReadyState) => {
     Object.defineProperty(document, 'readyState', { value, configurable: true });
@@ -8098,28 +8106,26 @@ describe('prebid self-init user ID module timing', () => {
     setReadyState('complete');
   });
 
-  it('installs user ID modules immediately when the bundle loads after window load', async () => {
-    // The GPT slim loader appends this bundle from a window.load handler, so
-    // the document is already complete — a load listener would never fire.
+  it('writes no userSync when the bundle loads after window load', async () => {
     setReadyState('complete');
 
     await import('../../../src/integrations/prebid/index');
 
-    expect(userSyncCallCount()).toBeGreaterThan(0);
+    expect(mockSetConfig, 'the shim should still apply its own config').toHaveBeenCalledWith({
+      debug: false,
+    });
+    expect(userSyncCalls(), 'TS should leave userSync to the publisher and Prebid').toEqual([]);
   });
 
-  it('defers user ID modules to window load when the document is still loading', async () => {
+  it('writes no userSync when window load fires after install', async () => {
     setReadyState('loading');
 
     await import('../../../src/integrations/prebid/index');
-
-    expect(userSyncCallCount()).toBe(0);
-
     window.dispatchEvent(new Event('load'));
-    expect(userSyncCallCount()).toBe(1);
 
-    // { once: true } — a second load event must not reinstall.
-    window.dispatchEvent(new Event('load'));
-    expect(userSyncCallCount()).toBe(1);
+    expect(mockSetConfig, 'the shim should still apply its own config').toHaveBeenCalledWith({
+      debug: false,
+    });
+    expect(userSyncCalls(), 'TS should leave userSync to the publisher and Prebid').toEqual([]);
   });
 });
