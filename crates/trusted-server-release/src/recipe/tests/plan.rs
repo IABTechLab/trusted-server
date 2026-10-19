@@ -27,23 +27,37 @@ fn expected_replacement() -> Vec<String> {
     .collect()
 }
 
-/// The exact target path remap for the fixture's mount layout.
-fn expected_remap(triple: &str) -> Vec<String> {
-    let flags = [
+/// Execution path of the fictional Apple clang in the fixture layout.
+const FIXTURE_CLANG: &str = "/boundary/system/0/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang";
+
+/// The exact target path remap for the fixture's mount layout, with the
+/// Darwin debug-map prefix and target linker for a Darwin target.
+fn expected_remap(target: ReleaseTarget) -> Vec<String> {
+    let triple = target.triple();
+    let mut flags = vec![
         "\"--remap-path-prefix=/boundary/immutable/0=/trusted-server\"",
         "\"--remap-path-prefix=/boundary/immutable/2/vendor=/cargo-vendor\"",
         "\"--remap-path-prefix=/boundary/writable/0/cargo-home=/cargo-home\"",
         "\"--remap-path-prefix=/boundary/tool/0=/rust-tools\"",
         "\"--remap-path-prefix=/boundary/writable/1=/cargo-target\"",
     ];
-    vec![
+    if target.is_darwin() {
+        flags.push("\"-Clink-arg=-Wl,-oso_prefix,/boundary/tool/\"");
+    }
+    let mut arguments = vec![
         "--config".to_owned(),
         format!("target.\"{triple}\".rustflags=[{}]", flags.join(",")),
-    ]
+    ];
+    if target.is_darwin() {
+        arguments.push("--config".to_owned());
+        arguments.push(format!("target.\"{triple}\".linker=\"{FIXTURE_CLANG}\""));
+    }
+    arguments
 }
 
 /// The exact C path remap a native asset's plan sets for the fixture layout.
-fn expected_c_prefix_map() -> String {
+fn expected_c_prefix_map(target: ReleaseTarget) -> String {
+    let developer = [("/boundary/system/0", "/apple-developer")];
     [
         ("/boundary/immutable/0", "/trusted-server"),
         ("/boundary/immutable/2/vendor", "/cargo-vendor"),
@@ -52,6 +66,7 @@ fn expected_c_prefix_map() -> String {
         ("/boundary/writable/1", "/cargo-target"),
     ]
     .iter()
+    .chain(developer.iter().filter(|_| target.is_darwin()))
     .flat_map(|(from, to)| {
         [
             format!("-ffile-prefix-map={from}={to}"),
@@ -97,7 +112,7 @@ fn cargo_plan_has_fixed_release_frozen_json_flags_and_exact_source_replacement()
         .map(str::to_owned)
         .collect();
         expected_arguments.extend(expected_replacement());
-        expected_arguments.extend(expected_remap(artifact.target.triple()));
+        expected_arguments.extend(expected_remap(artifact.target));
         expected_arguments.extend(
             ["--message-format=json-render-diagnostics", "--jobs", jobs]
                 .into_iter()
@@ -161,13 +176,27 @@ fn assert_environment(actual: &BTreeMap<String, String>, fixture: &Fixture, targ
         ),
         "0".to_owned(),
     );
+    let underscored = target.triple().replace('-', "_");
     if target.is_darwin() {
-        expected.insert("MACOSX_DEPLOYMENT_TARGET".to_owned(), "13.0".to_owned());
+        let bin = "/boundary/system/0/Toolchains/XcodeDefault.xctoolchain/usr/bin";
+        for (name, value) in [
+            ("MACOSX_DEPLOYMENT_TARGET".to_owned(), "13.0".to_owned()),
+            ("DEVELOPER_DIR".to_owned(), "/boundary/system/0".to_owned()),
+            (
+                "SDKROOT".to_owned(),
+                format!("/boundary/system/0/{SDK_ROOT}"),
+            ),
+            (format!("CC_{underscored}"), FIXTURE_CLANG.to_owned()),
+            (format!("AR_{underscored}"), format!("{bin}/ar")),
+            ("ZERO_AR_DATE".to_owned(), "1".to_owned()),
+        ] {
+            expected.insert(name, value);
+        }
     }
     if target != ReleaseTarget::Wasm32Wasip1 {
         expected.insert(
-            format!("CFLAGS_{}", target.triple().replace('-', "_")),
-            expected_c_prefix_map(),
+            format!("CFLAGS_{underscored}"),
+            expected_c_prefix_map(target),
         );
     }
     assert_eq!(
@@ -185,7 +214,8 @@ fn assert_environment(actual: &BTreeMap<String, String>, fixture: &Fixture, targ
 /// One mapped location per path-carrying variable, so each can be omitted alone.
 fn granular(fixture: &Fixture, omit: &[&str]) -> PrefixPaths {
     let retained = fixture.retained();
-    let all: [(&str, PathBuf, &str, bool); 11] = [
+    let all: [(&str, PathBuf, &str, bool); 12] = [
+        ("developer", fixture.developer_dir(), "/c/developer", false),
         ("target", fixture.base.join("target"), "/c/target", true),
         (
             "cargo-home",
@@ -243,7 +273,8 @@ fn path_variables_outside_every_root_are_rejected() {
     prepared
         .plan(&granular(&fixture, &[]))
         .expect("should derive the plan when every location is mapped");
-    let cases: [(&str, &[&str]); 10] = [
+    let cases: [(&str, &[&str]); 11] = [
+        ("Apple developer directory", &["developer"]),
         ("CARGO_TARGET_DIR", &["target"]),
         ("CARGO_HOME", &["cargo-home"]),
         ("HOME", &["home"]),
@@ -345,7 +376,7 @@ fn cargo_plan_rejects_inherited_rustflags_and_selectors() {
     );
     assert_eq!(
         configs.last().map(|config| config.as_str()),
-        expected_remap("x86_64-unknown-linux-gnu")
+        expected_remap(ReleaseTarget::X86_64UnknownLinuxGnu)
             .last()
             .map(String::as_str),
         "should remap paths only through target rustflags of the asset triple"

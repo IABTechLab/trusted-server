@@ -40,7 +40,16 @@
 //!   descendant, and a confined process cannot re-apply a sandbox.
 //! - Survivors are found only after the run exits, so the macOS backend
 //!   still does not own descendant cleanup the way a container does
-//!   ([`Boundary::has_owned_descendant_cleanup`] stays false).
+//!   ([`Boundary::has_owned_descendant_cleanup`] stays false). It reports
+//!   [`DescendantCleanup::ReapedAfterRun`], which only a selection that
+//!   explicitly permits it may accept.
+//!
+//! # System roots
+//!
+//! A host system tool directory (the Apple developer directory) is a
+//! read-and-execute-only system root. It is not scanned; its identity is
+//! the caller's record of versions and tool hashes. The Linux container
+//! boundary refuses system roots.
 //!
 //! # What this module does not prove
 //!
@@ -107,11 +116,35 @@ pub(crate) fn random_bytes<const N: usize>() -> Result<[u8; N], Report<ReleaseEr
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum QualifiedSandboxProfile {}
 
+/// How a boundary ends the descendants a confined run started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, derive_more::Display)]
+pub(crate) enum DescendantCleanup {
+    /// Container teardown ends every descendant: the run's private PID
+    /// namespace dies with its container.
+    #[display("owned-by-container")]
+    OwnedByContainer,
+    /// After the run exits, every process of the run's sandbox instance (or
+    /// carrying its nonce) is found, killed and the run rejected. Survivors
+    /// exist until that post-run reap, so this is weaker than ownership.
+    #[display("post-run-reaped")]
+    ReapedAfterRun,
+}
+
 /// The platform mechanism enforcing denial.
 #[derive(Debug)]
 enum Platform {
     MacSandbox(macos::MacProfile),
     LinuxContainer(Box<docker::DockerBoundary>),
+}
+
+impl Platform {
+    /// The descendant cleanup this mechanism provides.
+    fn descendant_cleanup(&self) -> DescendantCleanup {
+        match self {
+            Self::MacSandbox(_) => DescendantCleanup::ReapedAfterRun,
+            Self::LinuxContainer(_) => DescendantCleanup::OwnedByContainer,
+        }
+    }
 }
 
 /// A configured OS network-denial boundary.
@@ -158,9 +191,18 @@ impl Boundary {
 
     /// Reports whether container teardown owns every run descendant.
     ///
-    /// The experimental macOS backend deliberately cannot satisfy this gate.
+    /// The experimental macOS backend deliberately cannot satisfy this gate,
+    /// which the JS and preparation callers keep using.
     pub(crate) fn has_owned_descendant_cleanup(&self) -> bool {
         matches!(self.platform, Platform::LinuxContainer(_))
+    }
+
+    /// Returns how this boundary ends run descendants.
+    ///
+    /// The recipe gate admits [`DescendantCleanup::ReapedAfterRun`] only for a
+    /// selection that explicitly permits it.
+    pub(crate) fn descendant_cleanup(&self) -> DescendantCleanup {
+        self.platform.descendant_cleanup()
     }
 
     /// Translates a selected host path into the command's execution namespace.
@@ -393,5 +435,7 @@ impl Boundary {
     }
 }
 
+#[cfg(test)]
+mod cleanup_and_system_root_tests;
 #[cfg(test)]
 mod selector_placement_tests;

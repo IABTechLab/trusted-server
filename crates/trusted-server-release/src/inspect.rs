@@ -34,7 +34,7 @@ use crate::error::ReleaseError;
 #[allow(unused_imports, reason = "consumed by Task 9 recipes")]
 pub(crate) use self::{
     elf::{ElfPolicy, inspect_elf},
-    macho::{MachoCpu, MachoPolicy, inspect_macho},
+    macho::{CodeSignature, MachoCpu, MachoPolicy, inspect_macho},
     wasm::inspect_wasm,
 };
 
@@ -125,6 +125,18 @@ pub(crate) enum Violation {
     /// is missing or mistyped, or the downstream request ABI is not imported.
     #[display("WebAssembly module lacks the Fastly Compute entry ABI")]
     WasmAbi,
+    /// The Mach-O code signature is malformed, not a linker-signed ad-hoc
+    /// signature, carries a CMS signature or team identifier, or is missing
+    /// where the CPU requires it.
+    #[display("Mach-O code signature is not the reviewed linker-signed ad-hoc form")]
+    CodeSignature,
+    /// The Mach-O debug map names an absolute or empty object path, records
+    /// a nonzero object modification time, or is missing where required.
+    #[display("Mach-O debug map is missing, absolute or time-stamped")]
+    MachoDebugMap,
+    /// The Mach-O `LC_UUID` is missing or duplicated.
+    #[display("Mach-O executable identity is missing or duplicated")]
+    MachoIdentity,
 }
 
 /// Builds the inspection rejection carrying `violation` and a detail line.
@@ -407,6 +419,29 @@ impl MacosVersion {
         }
     }
 
+    /// Parses `major.minor` or `major.minor.patch` decimal text, as an SDK
+    /// settings file states its version.
+    ///
+    /// Returns `None` for any other shape, a component with a leading zero or
+    /// sign, or a component out of range.
+    pub(crate) fn parse(text: &str) -> Option<Self> {
+        fn component<T: std::str::FromStr>(part: &str) -> Option<T> {
+            let canonical = !part.is_empty()
+                && part.bytes().all(|byte| byte.is_ascii_digit())
+                && (part == "0" || !part.starts_with('0'));
+            canonical.then(|| part.parse().ok()).flatten()
+        }
+        let mut parts = text.split('.');
+        let major = component(parts.next()?)?;
+        let minor = component(parts.next()?)?;
+        let patch = parts.next().map_or(Some(0), component)?;
+        parts.next().is_none().then_some(Self {
+            major,
+            minor,
+            patch,
+        })
+    }
+
     /// Decodes the `xxxx.yy.zz` nibble encoding.
     fn from_encoded(encoded: u32) -> Self {
         let [high, low, minor, patch] = encoded.to_be_bytes();
@@ -426,9 +461,53 @@ pub(crate) struct MachoFacts {
     minos: MacosVersion,
     sdk: MacosVersion,
     dylibs: Vec<String>,
+    uuid: [u8; 16],
+    symbols: usize,
+    debug_map_objects: usize,
+    signature: CodeSignature,
 }
 
 impl MachoFacts {
+    /// Observed `LC_UUID`; a linked executable always carries exactly one.
+    pub(crate) fn uuid(&self) -> [u8; 16] {
+        self.uuid
+    }
+
+    /// Number of `LC_SYMTAB` entries, including debug-map stabs.
+    pub(crate) fn symbol_count(&self) -> usize {
+        self.symbols
+    }
+
+    /// Number of `N_OSO` debug-map object entries, all relative with zero
+    /// modification time.
+    pub(crate) fn debug_map_objects(&self) -> usize {
+        self.debug_map_objects
+    }
+
+    /// Observed code signature form.
+    pub(crate) fn signature(&self) -> CodeSignature {
+        self.signature
+    }
+
+    /// Requires the debug map a release build keeps: a non-empty symbol
+    /// table holding at least one `N_OSO` object entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Violation::MachoDebugMap`] when the symbol table is empty
+    /// or holds no object entry, so the executable was stripped.
+    pub(crate) fn require_debug_map(&self) -> Result<(), Report<ReleaseError>> {
+        if self.symbols == 0 || self.debug_map_objects == 0 {
+            return Err(rejected(
+                Violation::MachoDebugMap,
+                format!(
+                    "{} symbols and {} debug-map objects; the executable was stripped",
+                    self.symbols, self.debug_map_objects
+                ),
+            ));
+        }
+        Ok(())
+    }
     /// Lowercase hex SHA-256 of the inspected bytes.
     pub(crate) fn sha256(&self) -> &str {
         &self.sha256

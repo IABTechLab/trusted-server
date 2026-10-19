@@ -15,8 +15,9 @@ use serde_json::json;
 use sha2::{Digest as _, Sha256};
 
 use super::ambient::CheckedAmbient;
+use super::apple::AppleDeveloperTools;
 use super::paths::{ExecutionPaths, execution_text};
-use super::remap::{RemapSources, c_prefix_map_environment, remap_arguments};
+use super::remap::{RemapSources, c_prefix_map_environment_with, remap_arguments_with};
 use super::sources::source_replacement_arguments;
 use super::tools::SelectedRustTools;
 use super::{AssetId, RecipeRequest, recipe_error};
@@ -35,6 +36,9 @@ const HOME_VARIABLE: &str = "HOME";
 const TMPDIR_VARIABLE: &str = "TMPDIR";
 const RUSTC_VARIABLE: &str = "RUSTC";
 const PATH_VARIABLE: &str = "PATH";
+const DEVELOPER_DIR_VARIABLE: &str = "DEVELOPER_DIR";
+const SDKROOT_VARIABLE: &str = "SDKROOT";
+const ZERO_AR_DATE_VARIABLE: &str = "ZERO_AR_DATE";
 
 /// The exact Cargo invocation of one recipe.
 #[derive(Debug, PartialEq, Eq)]
@@ -45,6 +49,8 @@ pub(crate) struct CargoPlan {
     pub(super) environment: BTreeMap<String, String>,
     pub(super) working_directory: PathBuf,
     pub(super) umask: Umask,
+    /// Digest of the Apple developer tool record a Darwin plan links with.
+    pub(super) apple_identity_sha256: Option<String>,
 }
 
 impl CargoPlan {
@@ -83,7 +89,7 @@ impl CargoPlan {
                 .map(str::to_owned)
                 .ok_or_else(|| recipe_error(format!("plan {label} is not UTF-8")))
         };
-        let description = json!({
+        let mut description = json!({
             "asset": self.asset.artifact().name,
             "program": text("program", &self.program)?,
             "arguments": self.arguments,
@@ -91,6 +97,9 @@ impl CargoPlan {
             "working_directory": text("working directory", &self.working_directory)?,
             "umask": self.umask.to_string(),
         });
+        if let Some(identity) = &self.apple_identity_sha256 {
+            description["apple_developer_tools_sha256"] = json!(identity);
+        }
         let bytes = canonical_json(&description, Role::Metadata)
             .map_err(|error| error.change_context(ReleaseError::Recipe))?;
         Ok(hex::encode(Sha256::digest(bytes)))
@@ -209,6 +218,10 @@ pub(super) fn plan_for(inputs: &PlanInputs<'_>) -> Result<CargoPlan, Report<Rele
     let target = request.asset().artifact().target;
     let checkout = execution_text(*paths, "checkout root", ambient.checkout_root())?;
     let tool_root = execution_text(*paths, "Rust tools root", tools.root())?;
+    let darwin = tools
+        .apple()
+        .map(|apple| darwin_plan(*paths, target, apple, &tool_root))
+        .transpose()?;
     let sources = RemapSources {
         checkout: &checkout,
         vendor: &vendor,
@@ -216,11 +229,23 @@ pub(super) fn plan_for(inputs: &PlanInputs<'_>) -> Result<CargoPlan, Report<Rele
         tools: &tool_root,
         target: &environment[TARGET_DIR_VARIABLE],
     };
-    configs.extend(remap_arguments(target.triple(), &sources)?);
-    let c_prefix_map = c_prefix_map_environment(target, &sources)?;
+    let link_flags = darwin
+        .as_ref()
+        .map_or(&[][..], |darwin| darwin.rustflags.as_slice());
+    configs.extend(remap_arguments_with(target.triple(), &sources, link_flags)?);
+    let developer = darwin.as_ref().map(|darwin| darwin.developer.as_str());
+    let c_prefix_map = c_prefix_map_environment_with(target, &sources, developer)?;
     if let Some((name, value)) = c_prefix_map {
         environment.insert(name, value);
     }
+    let apple_identity_sha256 = match darwin {
+        Some(darwin) => {
+            configs.extend(darwin.configs);
+            environment.extend(darwin.environment);
+            Some(darwin.identity_sha256)
+        }
+        None => None,
+    };
     Ok(CargoPlan {
         asset: request.asset(),
         program: tools.cargo(),
@@ -228,5 +253,80 @@ pub(super) fn plan_for(inputs: &PlanInputs<'_>) -> Result<CargoPlan, Report<Rele
         environment,
         working_directory: ambient.checkout_root().to_owned(),
         umask: ambient.umask()?,
+        apple_identity_sha256,
+    })
+}
+
+/// The Darwin additions to one plan, all in the execution namespace.
+struct DarwinPlan {
+    /// Linker arguments appended inside the target rustflags entry.
+    rustflags: Vec<String>,
+    /// Extra `--config` pairs: the target linker.
+    configs: Vec<String>,
+    /// `DEVELOPER_DIR`, `SDKROOT`, `CC_<triple>`, `AR_<triple>` and
+    /// `ZERO_AR_DATE`.
+    environment: BTreeMap<String, String>,
+    /// Execution path of the developer directory for the C path remap.
+    developer: String,
+    /// Digest of the Apple tool identity record.
+    identity_sha256: String,
+}
+
+/// Derives the Darwin linker, C tool and debug-map settings.
+///
+/// The Mach-O debug map is kept, but `-oso_prefix` makes the linker strip
+/// the recipe-owned parent of the Rust tool root (and, as binding requires,
+/// of the target directory) from every object path, and `ZERO_AR_DATE=1`
+/// makes it record zero object modification times. The linker is selected
+/// through `--config target."<triple>".linker` because the environment form
+/// is a denied tool selector; `xcrun` and the `/usr/bin` shims are never used.
+///
+/// # Errors
+///
+/// Returns [`ReleaseError::Recipe`] when the target is not Darwin, an Apple
+/// path is outside the boundary roots or not plain text, or the parent of the
+/// Rust tool root is missing or holds a `,` that `-Wl,` would split.
+fn darwin_plan(
+    paths: &dyn ExecutionPaths,
+    target: crate::policy::ReleaseTarget,
+    apple: &AppleDeveloperTools,
+    tool_root: &str,
+) -> Result<DarwinPlan, Report<ReleaseError>> {
+    if !target.is_darwin() {
+        return Err(recipe_error(
+            "Apple developer tools apply only to Darwin targets",
+        ));
+    }
+    let developer = execution_text(paths, "Apple developer directory", apple.developer_dir())?;
+    let clang = execution_text(paths, "Apple clang", apple.clang())?;
+    let parent = std::path::Path::new(tool_root)
+        .parent()
+        .and_then(std::path::Path::to_str)
+        .filter(|parent| *parent != "/" && !parent.contains(','))
+        .ok_or_else(|| recipe_error("Rust tool root has no plain recipe-owned parent"))?;
+    let triple = target.triple();
+    let underscored = triple.replace('-', "_");
+    let environment = BTreeMap::from([
+        (DEVELOPER_DIR_VARIABLE.to_owned(), developer.clone()),
+        (
+            SDKROOT_VARIABLE.to_owned(),
+            execution_text(paths, "Apple SDK root", apple.sdk_root())?,
+        ),
+        (format!("CC_{underscored}"), clang.clone()),
+        (
+            format!("AR_{underscored}"),
+            execution_text(paths, "Apple ar", apple.ar())?,
+        ),
+        (ZERO_AR_DATE_VARIABLE.to_owned(), "1".to_owned()),
+    ]);
+    Ok(DarwinPlan {
+        rustflags: vec![format!("-Clink-arg=-Wl,-oso_prefix,{parent}/")],
+        configs: vec![
+            "--config".to_owned(),
+            format!("target.\"{triple}\".linker=\"{clang}\""),
+        ],
+        environment,
+        developer,
+        identity_sha256: apple.identity_sha256()?,
     })
 }

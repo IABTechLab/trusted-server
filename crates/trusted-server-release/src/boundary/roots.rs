@@ -44,14 +44,25 @@ pub(crate) enum RootRole {
     /// Private writable installation or output root.
     #[display("writable")]
     Writable,
+    /// Read-and-execute-only host system tool directory, such as the Apple
+    /// developer directory.
+    ///
+    /// It is never scanned: its identity is an explicit record of versions
+    /// and tool hashes held by the caller, not a tree snapshot.
+    #[display("system")]
+    System,
 }
 
 /// Validated, canonical and pairwise-disjoint boundary roots.
+///
+/// System roots take part in equality, so a boundary configured without the
+/// exact system roots never matches a recipe that requires them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BoundaryRoots {
     immutable: Vec<PathBuf>,
     tools: Vec<PathBuf>,
     writable: Vec<PathBuf>,
+    system: Vec<PathBuf>,
 }
 
 /// Rejects path text that cannot travel unescaped as a profile define.
@@ -137,11 +148,35 @@ impl BoundaryRoots {
             immutable: canonical_roots(immutable, RootRole::Immutable)?,
             tools: canonical_roots(tools, RootRole::Tool)?,
             writable: canonical_roots(writable, RootRole::Writable)?,
+            system: Vec::new(),
         };
         if roots.writable.is_empty() {
             return Err(boundary_error("a boundary needs a private writable root"));
         }
-        let all: Vec<(RootRole, usize, &Path)> = roots.entries().collect();
+        roots.check_disjoint()?;
+        Ok(roots)
+    }
+
+    /// Adds read-and-execute-only system roots, replacing any set before.
+    ///
+    /// System roots are never scanned or written; the macOS profile allows
+    /// only reading and executing below them and the Linux container
+    /// boundary refuses them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReleaseError::Boundary`] for invalid path text, a missing or
+    /// non-directory root, more than [`MAX_ROOTS`] system roots, or a system
+    /// root equal to or nested with any other root.
+    pub(crate) fn with_system(mut self, system: &[PathBuf]) -> Result<Self, Report<ReleaseError>> {
+        self.system = canonical_roots(system, RootRole::System)?;
+        self.check_disjoint()?;
+        Ok(self)
+    }
+
+    /// Requires every pair of roots to be neither equal nor nested.
+    fn check_disjoint(&self) -> Result<(), Report<ReleaseError>> {
+        let all: Vec<(RootRole, usize, &Path)> = self.entries().collect();
         for (index, (_, _, first)) in all.iter().enumerate() {
             for (_, _, second) in all.iter().skip(index + 1) {
                 if overlaps(first, second) {
@@ -153,7 +188,7 @@ impl BoundaryRoots {
                 }
             }
         }
-        Ok(roots)
+        Ok(())
     }
 
     /// Returns every root with its role and per-role index.
@@ -170,6 +205,13 @@ impl BoundaryRoots {
         tag(RootRole::Immutable, &self.immutable)
             .chain(tag(RootRole::Tool, &self.tools))
             .chain(tag(RootRole::Writable, &self.writable))
+            .chain(tag(RootRole::System, &self.system))
+    }
+
+    /// Returns the read-and-execute-only system roots.
+    #[must_use]
+    pub(crate) fn system(&self) -> &[PathBuf] {
+        &self.system
     }
 
     /// Returns the immutable roots.

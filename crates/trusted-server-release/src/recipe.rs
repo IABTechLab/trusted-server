@@ -37,6 +37,7 @@ use fresh::{
 };
 
 mod ambient;
+mod apple;
 mod artifact;
 mod cargo_output;
 mod compare;
@@ -54,6 +55,11 @@ mod startup;
 mod tools;
 
 pub(crate) use ambient::{AmbientProfile, CheckedAmbient};
+#[allow(
+    unused_imports,
+    reason = "the qualified Apple selection has no production caller yet"
+)]
+pub(crate) use apple::{AppleDeveloperTools, AppleToolFacts, QualifiedAppleTools};
 pub(crate) use completed::RecipeCompleted;
 pub(crate) use paths::ExecutionPaths;
 pub(crate) use plan::CargoPlan;
@@ -130,6 +136,30 @@ impl AssetId {
             .find(|artifact| artifact.package == package)
             .map(|artifact| Self { artifact })
             .ok_or_else(|| recipe_error(format!("unknown denial fixture member {package:?}")))
+    }
+
+    /// Resolves a Cargo denial fixture member built for a Darwin `target`,
+    /// for tests only.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReleaseError::Recipe`] for any package or target not in the
+    /// Darwin test rows.
+    #[cfg(test)]
+    pub(crate) fn darwin_denial_fixture(
+        package: &str,
+        target: ReleaseTarget,
+    ) -> Result<Self, Report<ReleaseError>> {
+        crate::policy::DARWIN_DENIAL_FIXTURE_ARTIFACTS
+            .iter()
+            .find(|artifact| artifact.package == package && artifact.target == target)
+            .map(|artifact| Self { artifact })
+            .ok_or_else(|| {
+                recipe_error(format!(
+                    "unknown Darwin denial fixture member {package:?} for {}",
+                    target.triple()
+                ))
+            })
     }
 }
 
@@ -459,8 +489,11 @@ impl PreparedRecipe {
     /// environment or materials name another commit, the JS handoff no longer
     /// rehashes or is not the requested directory, the materials are not the
     /// requested root or changed, the tools were selected for another target,
-    /// the ambient role differs, a root is no longer fresh, or the checkout,
-    /// tools, retained JS, materials, state and target roots overlap.
+    /// the ambient role differs, a root is no longer fresh, the checkout,
+    /// tools, retained JS, materials, state, target and Apple developer roots
+    /// overlap, Apple developer tools are missing for a Darwin asset, given
+    /// for another, carry another authority or no longer rehash, or a Darwin
+    /// tool root and target directory do not share one parent.
     fn bind(inputs: BindInputs<'_>) -> Result<Self, Report<ReleaseError>> {
         check_commits(&inputs)?;
         check_parts(&inputs)?;
@@ -475,6 +508,7 @@ impl PreparedRecipe {
         } = inputs;
         let retained_root = resolve_js_handoff(completed, &request)?;
         check_fresh_and_disjoint(&request, &ambient, &tools, &materials, &retained_root)?;
+        check_recipe_owned_parent(&request, &tools)?;
         let tools_digest = tools.digest()?;
         let retained_digest = retained_tree_digest(&retained_root)?;
         create_private_roots(&request)?;
@@ -519,13 +553,14 @@ impl PreparedRecipe {
     ///
     /// The checkout, retained JS and prepared materials are read-only. Cargo
     /// home, `HOME`, `TMPDIR` and the target directory are the only writable
-    /// roots, and the output directory is not mounted.
+    /// roots, and the output directory is not mounted. A Darwin build adds
+    /// the Apple developer directory as its only read-and-execute system root.
     ///
     /// # Errors
     ///
     /// Returns [`ReleaseError::Boundary`] for missing or overlapping roots.
     pub(crate) fn boundary_roots(&self) -> Result<BoundaryRoots, Report<ReleaseError>> {
-        BoundaryRoots::new(
+        let roots = BoundaryRoots::new(
             &[
                 self.ambient.checkout_root().to_owned(),
                 self.retained_root.clone(),
@@ -536,7 +571,11 @@ impl PreparedRecipe {
                 self.request.cargo_state.clone(),
                 self.request.target_dir.clone(),
             ],
-        )
+        )?;
+        match self.tools.apple() {
+            Some(apple) => roots.with_system(&[apple.developer_dir().to_owned()]),
+            None => Ok(roots),
+        }
     }
 }
 
@@ -592,7 +631,66 @@ fn check_parts(inputs: &BindInputs<'_>) -> Result<(), Report<ReleaseError>> {
     if inputs.ambient.role() != request.role {
         return Err(recipe_error("ambient role differs from the request role"));
     }
+    check_apple_tools(request, &inputs.tools)?;
     check_child_state(request, &inputs.child)
+}
+
+/// Requires Apple developer tools for exactly the Darwin targets, carrying
+/// the Rust tools' authority and still matching their record.
+fn check_apple_tools(
+    request: &RecipeRequest,
+    tools: &SelectedRustTools,
+) -> Result<(), Report<ReleaseError>> {
+    let darwin = request.asset.artifact().target.is_darwin();
+    let apple = match (darwin, tools.apple()) {
+        (false, None) => return Ok(()),
+        (false, Some(_)) => {
+            return Err(recipe_error(
+                "only Darwin assets take Apple developer tools",
+            ));
+        }
+        (true, None) => {
+            return Err(recipe_error("Darwin assets require Apple developer tools"));
+        }
+        (true, Some(apple)) => apple,
+    };
+    if apple.authority() != tools.authority() {
+        return Err(recipe_error(
+            "Apple developer tools and Rust tools carry different authority",
+        ));
+    }
+    apple.verify()
+}
+
+/// Requires a Darwin build's Rust tool root and target directory to be
+/// direct children of one recipe-owned parent.
+///
+/// The linker strips that parent from every debug-map object path
+/// (`-oso_prefix`), so the standard library objects and the build's own
+/// objects both become relative.
+fn check_recipe_owned_parent(
+    request: &RecipeRequest,
+    tools: &SelectedRustTools,
+) -> Result<(), Report<ReleaseError>> {
+    if tools.apple().is_none() {
+        return Ok(());
+    }
+    let target_parent = request
+        .target_dir
+        .parent()
+        .ok_or_else(|| recipe_error("Darwin target directory has no parent"))?;
+    let target_parent = std::fs::canonicalize(target_parent).map_err(|error| {
+        recipe_error(format!(
+            "cannot resolve the Darwin target directory's parent: {error}"
+        ))
+    })?;
+    if tools.root().parent() != Some(target_parent.as_path()) {
+        return Err(recipe_error(
+            "Darwin Rust tool root and target directory must be direct children of one \
+             recipe-owned parent",
+        ));
+    }
+    Ok(())
 }
 
 /// Rehashes the JS handoff and requires the request to name its directories.
@@ -640,7 +738,7 @@ fn check_fresh_and_disjoint(
     absent_in_real_parent("target directory", &request.target_dir)?;
     let checkout = std::fs::canonicalize(ambient.checkout_root())
         .map_err(|error| recipe_error(format!("cannot resolve checkout root: {error}")))?;
-    disjoint(&[
+    let mut roots = vec![
         ("checkout root", checkout.as_path()),
         ("Rust tools root", tools.root()),
         ("retained JS root", retained_root),
@@ -648,7 +746,11 @@ fn check_fresh_and_disjoint(
         ("cargo state root", request.cargo_state.as_path()),
         ("output root", request.output.as_path()),
         ("target directory", request.target_dir.as_path()),
-    ])
+    ];
+    if let Some(apple) = tools.apple() {
+        roots.push(("Apple developer directory", apple.developer_dir()));
+    }
+    disjoint(&roots)
 }
 
 #[cfg(test)]

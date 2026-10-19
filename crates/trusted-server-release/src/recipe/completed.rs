@@ -17,6 +17,7 @@ use sha2::{Digest as _, Sha256};
 
 use super::artifact::{CopiedArtifact, EXECUTABLE_LIMIT};
 use super::{AssetId, CheckedAmbient, Role, recipe_error};
+use crate::boundary::DescendantCleanup;
 use crate::documents::hash_bounded_with_check;
 use crate::error::ReleaseError;
 use crate::source::CommitId;
@@ -40,6 +41,7 @@ pub(super) struct SuccessFacts {
     pub(super) ambient: CheckedAmbient,
     pub(super) started_at_seconds: u64,
     pub(super) elapsed: Duration,
+    pub(super) descendant_cleanup: DescendantCleanup,
     pub(super) stdout: Vec<u8>,
     pub(super) stderr_sha256: String,
     pub(super) artifact: CopiedArtifact,
@@ -173,6 +175,11 @@ impl RecipeCompleted {
     /// Unix start time of the build in seconds.
     pub(crate) fn started_at_seconds(&self) -> u64 {
         self.facts.started_at_seconds
+    }
+
+    /// How the boundary that ran the build ended its descendants.
+    pub(crate) fn descendant_cleanup(&self) -> DescendantCleanup {
+        self.facts.descendant_cleanup
     }
 
     /// Wall time the build took.

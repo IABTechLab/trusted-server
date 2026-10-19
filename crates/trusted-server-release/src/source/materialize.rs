@@ -49,23 +49,7 @@ impl FreshSource {
 
     /// Returns the complete approved JS entry-point set in sorted order.
     pub(crate) fn module_ids(&self) -> Vec<String> {
-        let prefix = "crates/trusted-server-js/lib/src/";
-        let mut ids: Vec<_> = self
-            .records
-            .keys()
-            .filter_map(|path| {
-                let path = path.strip_prefix(prefix)?;
-                if path == "core/index.ts" {
-                    return Some("core".to_owned());
-                }
-                let integration = path
-                    .strip_prefix("integrations/")?
-                    .strip_suffix("/index.ts")?;
-                (!integration.contains('/')).then(|| integration.to_owned())
-            })
-            .collect();
-        ids.sort();
-        ids
+        super::js_module_ids(&self.records)
     }
 
     /// Rechecks every tracked path and rejects unexpected source files.

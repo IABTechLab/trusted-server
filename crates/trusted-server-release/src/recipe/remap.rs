@@ -46,6 +46,7 @@ use std::path::Path;
 
 use error_stack::Report;
 
+use super::apple::REMAPPED_DEVELOPER;
 use super::fresh::disjoint;
 use super::recipe_error;
 use crate::error::ReleaseError;
@@ -103,8 +104,33 @@ pub(super) fn remap_arguments(
     triple: &str,
     sources: &RemapSources<'_>,
 ) -> Result<Vec<String>, Report<ReleaseError>> {
+    remap_arguments_with(triple, sources, &[])
+}
+
+/// Returns the same `--config` pair with `extra` rustflags appended inside
+/// the one target rustflags entry, such as the Darwin linker arguments.
+///
+/// # Errors
+///
+/// As [`remap_arguments`], or [`ReleaseError::Recipe`] when an extra flag
+/// holds a quote, backslash or control character a TOML basic string would
+/// need to escape.
+pub(super) fn remap_arguments_with(
+    triple: &str,
+    sources: &RemapSources<'_>,
+    extra: &[String],
+) -> Result<Vec<String>, Report<ReleaseError>> {
+    if extra
+        .iter()
+        .any(|flag| flag.contains(['"', '\\']) || flag.chars().any(char::is_control))
+    {
+        return Err(recipe_error(
+            "an extra rustflag holds a quote, backslash or control character",
+        ));
+    }
     let flags: Vec<String> = remapped_pairs(sources)?
         .map(|(from, to)| format!("\"--remap-path-prefix={from}={to}\""))
+        .chain(extra.iter().map(|flag| format!("\"{flag}\"")))
         .collect();
     Ok(vec![
         "--config".to_owned(),
@@ -158,11 +184,37 @@ pub(super) fn c_prefix_map_environment(
     target: ReleaseTarget,
     sources: &RemapSources<'_>,
 ) -> Result<Option<(String, String)>, Report<ReleaseError>> {
+    c_prefix_map_environment_with(target, sources, None)
+}
+
+/// Returns the same variable, also mapping the Apple developer directory to
+/// [`REMAPPED_DEVELOPER`] when `developer` is given, so SDK header paths in
+/// C debug info and `__FILE__` strings do not name the host Xcode.
+///
+/// # Errors
+///
+/// As [`c_prefix_map_environment`], with the developer directory included in
+/// the overlap and whitespace checks.
+pub(super) fn c_prefix_map_environment_with(
+    target: ReleaseTarget,
+    sources: &RemapSources<'_>,
+    developer: Option<&str>,
+) -> Result<Option<(String, String)>, Report<ReleaseError>> {
     if target == ReleaseTarget::Wasm32Wasip1 {
         return Ok(None);
     }
+    let mut pairs: Vec<(&str, &str)> = remapped_pairs(sources)?.collect();
+    if let Some(developer) = developer {
+        let mut labelled: Vec<(&str, &Path)> = pairs
+            .iter()
+            .map(|(from, _)| ("remapped root", Path::new(*from)))
+            .collect();
+        labelled.push(("remapped Apple developer directory", Path::new(developer)));
+        disjoint(&labelled)?;
+        pairs.push((developer, REMAPPED_DEVELOPER));
+    }
     let mut flags = Vec::new();
-    for (from, to) in remapped_pairs(sources)? {
+    for (from, to) in pairs {
         if from.chars().any(char::is_whitespace) {
             return Err(recipe_error(
                 "a remapped root holds whitespace, which cc would split",

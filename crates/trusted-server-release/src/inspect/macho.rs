@@ -1,8 +1,18 @@
 //! Mach-O inspection for thin 64-bit macOS executables.
+//!
+//! Beyond identity, loader and libraries, the inspector records the
+//! `LC_UUID`, the symbol table and its debug map, and the code signature
+//! form. Every `N_OSO` debug-map object path must be relative and carry a
+//! zero modification time (the recipe links with `-oso_prefix` and
+//! `ZERO_AR_DATE=1`). An arm64 executable must carry the linker's ad-hoc
+//! signature, which macOS requires to run it; an `x86_64` executable may be
+//! unsigned or carry the same signature.
+
+mod signature;
 
 use error_stack::Report;
 use object::macho::{self as format, MachHeader64};
-use object::read::macho::{LoadCommandData, LoadCommandVariant, MachHeader as _};
+use object::read::macho::{LoadCommandData, LoadCommandVariant, MachHeader as _, Nlist as _};
 use object::{Endianness, FileKind};
 
 use super::{
@@ -70,12 +80,34 @@ impl MachoPolicy {
     }
 }
 
+/// The code signature form an accepted executable carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display)]
+pub(crate) enum CodeSignature {
+    /// No `LC_CODE_SIGNATURE`; accepted for `x86_64` only.
+    #[display("unsigned")]
+    Unsigned,
+    /// The linker's ad-hoc signature: one code directory with flags
+    /// `0x20002`, no CMS blob and no team identifier.
+    #[display("linker-signed-ad-hoc")]
+    LinkerSignedAdhoc,
+}
+
+/// Symbol table counts after every debug-map entry was checked.
+#[derive(Default)]
+struct SymbolSummary {
+    symbols: usize,
+    debug_map_objects: usize,
+}
+
 /// Load-command observations accumulated before policy checks.
 #[derive(Default)]
 struct Observed {
     build_versions: Vec<(u32, MacosVersion, MacosVersion)>,
     dylinkers: Vec<String>,
     dylibs: Vec<String>,
+    uuids: Vec<[u8; 16]>,
+    symbol_tables: Vec<SymbolSummary>,
+    signatures: Vec<(u32, u32)>,
 }
 
 /// Inspects a final Mach-O executable against `policy`.
@@ -88,7 +120,11 @@ struct Observed {
 /// (or an `LC_VERSION_MIN_*` is present); the dynamic linker is not
 /// `/usr/lib/dyld`; a dylib is outside the allowlist or loaded weak,
 /// re-exported, lazy or upward; `LC_RPATH`/`LC_DYLD_ENVIRONMENT` is present;
-/// or a runner-only path is embedded anywhere in the file.
+/// a runner-only path is embedded anywhere in the file; a debug-map object
+/// path is absolute or time-stamped; there is not exactly one `LC_UUID`
+/// (the linker always writes one); `LC_SYMTAB` or `LC_CODE_SIGNATURE` is
+/// duplicated; the code signature is not the linker's ad-hoc form; or an
+/// arm64 executable is unsigned.
 pub(crate) fn inspect_macho(
     bytes: &[u8],
     policy: &MachoPolicy,
@@ -99,7 +135,7 @@ pub(crate) fn inspect_macho(
         .endian()
         .map_err(|error| malformed("Mach-O endianness", error))?;
     check_identity(header, endian, policy.cpu)?;
-    let observed = load_commands(header, endian, bytes)?;
+    let mut observed = load_commands(header, endian, bytes)?;
     let (minos, sdk) = deployment_target(&observed, policy.minimum)?;
     if observed.dylinkers.as_slice() != [MACOS_DYLINKER] {
         return Err(rejected(
@@ -121,13 +157,119 @@ pub(crate) fn inspect_macho(
         ));
     }
     reject_denied_paths(bytes, policy.denied_path_prefixes)?;
+    let signature = code_signature(&observed, bytes, policy.cpu)?;
+    let [uuid] = observed.uuids.as_slice() else {
+        return Err(rejected(
+            Violation::MachoIdentity,
+            format!(
+                "expected exactly one LC_UUID, found {}",
+                observed.uuids.len()
+            ),
+        ));
+    };
+    let uuid = *uuid;
+    let summary = match observed.symbol_tables.as_mut_slice() {
+        [] => SymbolSummary::default(),
+        [summary] => std::mem::take(summary),
+        _ => {
+            return Err(rejected(
+                Violation::MachoDebugMap,
+                "more than one LC_SYMTAB",
+            ));
+        }
+    };
     Ok(MachoFacts {
         sha256: sha256_hex(bytes),
         cpu: policy.cpu,
         minos,
         sdk,
         dylibs: observed.dylibs,
+        uuid,
+        symbols: summary.symbols,
+        debug_map_objects: summary.debug_map_objects,
+        signature,
     })
+}
+
+/// Classifies the code signature and applies the per-CPU requirement.
+fn code_signature(
+    observed: &Observed,
+    bytes: &[u8],
+    cpu: MachoCpu,
+) -> Result<CodeSignature, Report<ReleaseError>> {
+    let signature = match observed.signatures.as_slice() {
+        [] => CodeSignature::Unsigned,
+        [(offset, size)] => {
+            let start = usize::try_from(*offset).ok();
+            let end = start.and_then(|start| start.checked_add(usize::try_from(*size).ok()?));
+            let blob = start
+                .zip(end)
+                .and_then(|(start, end)| bytes.get(start..end))
+                .ok_or_else(|| {
+                    rejected(
+                        Violation::CodeSignature,
+                        "LC_CODE_SIGNATURE data lies outside the file",
+                    )
+                })?;
+            signature::check_linker_signed(blob)?;
+            CodeSignature::LinkerSignedAdhoc
+        }
+        _ => {
+            return Err(rejected(
+                Violation::CodeSignature,
+                "more than one LC_CODE_SIGNATURE",
+            ));
+        }
+    };
+    if cpu == MachoCpu::Arm64 && signature == CodeSignature::Unsigned {
+        return Err(rejected(
+            Violation::CodeSignature,
+            "an arm64 executable must carry the linker's ad-hoc signature",
+        ));
+    }
+    Ok(signature)
+}
+
+/// Counts the symbol table, requiring every `N_OSO` debug-map entry to name
+/// a non-empty relative UTF-8 path with a zero modification time.
+fn symbol_summary(
+    symtab: &format::SymtabCommand<Endianness>,
+    endian: Endianness,
+    bytes: &[u8],
+) -> Result<SymbolSummary, Report<ReleaseError>> {
+    let parse_error = |error| malformed("Mach-O symbol table", error);
+    // The parser rejects an empty slice it cannot align, so an empty table
+    // is counted without reading it.
+    if symtab.nsyms.get(endian) == 0 {
+        return Ok(SymbolSummary::default());
+    }
+    let table = symtab
+        .symbols::<Header, _>(endian, bytes)
+        .map_err(parse_error)?;
+    let mut summary = SymbolSummary::default();
+    for symbol in table.iter() {
+        summary.symbols += 1;
+        if symbol.n_type() != format::N_OSO {
+            continue;
+        }
+        let name = symbol.name(endian, table.strings()).map_err(parse_error)?;
+        let name = utf8(name, "Mach-O debug-map object")?;
+        if name.is_empty() || name.starts_with('/') {
+            return Err(rejected(
+                Violation::MachoDebugMap,
+                format!("debug-map object {name:?} is not a relative path"),
+            ));
+        }
+        let modified = symbol.n_value(endian);
+        if modified != 0 {
+            return Err(rejected(
+                Violation::MachoDebugMap,
+                format!("debug-map object {name:?} records modification time {modified}"),
+            ));
+        }
+        summary.debug_map_objects += 1;
+    }
+    Ok(summary)
 }
 
 /// Requires a thin 64-bit Mach-O container.
@@ -182,7 +324,7 @@ fn load_commands(
         .map_err(parse_error)?;
     let mut observed = Observed::default();
     while let Some(command) = commands.next().map_err(parse_error)? {
-        record_command(&command, endian, &mut observed)?;
+        record_command(&command, endian, bytes, &mut observed)?;
     }
     Ok(observed)
 }
@@ -191,10 +333,20 @@ fn load_commands(
 fn record_command(
     command: &LoadCommandData<'_, Endianness>,
     endian: Endianness,
+    bytes: &[u8],
     observed: &mut Observed,
 ) -> Result<(), Report<ReleaseError>> {
     let parse_error = |error| malformed("Mach-O load command", error);
     match command.variant().map_err(parse_error)? {
+        LoadCommandVariant::Uuid(uuid) => observed.uuids.push(uuid.uuid),
+        LoadCommandVariant::Symtab(symtab) => observed
+            .symbol_tables
+            .push(symbol_summary(symtab, endian, bytes)?),
+        LoadCommandVariant::LinkeditData(data) if command.cmd() == format::LC_CODE_SIGNATURE => {
+            observed
+                .signatures
+                .push((data.dataoff.get(endian), data.datasize.get(endian)));
+        }
         LoadCommandVariant::BuildVersion(build) => observed.build_versions.push((
             build.platform.get(endian),
             MacosVersion::from_encoded(build.minos.get(endian)),

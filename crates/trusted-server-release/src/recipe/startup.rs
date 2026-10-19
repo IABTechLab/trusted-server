@@ -13,6 +13,7 @@
 //! every run.
 
 mod lifecycle;
+pub(crate) mod native;
 
 use std::ffi::OsString;
 use std::fs;
@@ -384,6 +385,15 @@ impl StartupCopy {
                 "startup copy directory cannot be bind-mounted verbatim",
             ));
         }
+        Self::write_private(completed, directory)
+    }
+
+    /// Writes the accepted bytes as the only `0555` file of the fresh
+    /// `0555` `directory` and rehashes the copy.
+    fn write_private(
+        completed: &RecipeCompleted,
+        directory: &Path,
+    ) -> Result<Self, Report<ReleaseError>> {
         let bytes = read_artifact(completed)?;
         let io = |error: std::io::Error| recipe_error(format!("cannot copy for startup: {error}"));
         fs::create_dir(directory).map_err(io)?;

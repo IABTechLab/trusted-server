@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use error_stack::Report;
 
+use super::apple::AppleDeveloperTools;
 use super::fresh::{real_directory, real_file};
 use super::recipe_error;
 use crate::error::ReleaseError;
@@ -61,6 +62,20 @@ impl ToolSelection {
             Self::OrdinaryCi => true,
         }
     }
+
+    /// Reports whether this selection accepts a boundary whose descendants
+    /// are only reaped after the run instead of owned by a container.
+    ///
+    /// Only the test-only ordinary CI selection does, so macOS candidate runs
+    /// can produce the evidence Task 8 needs. A qualified selection must
+    /// decide this explicitly when one exists.
+    pub(crate) fn permits_post_run_reaped_cleanup(&self) -> bool {
+        match self {
+            Self::Qualified(qualification) => match *qualification {},
+            #[cfg(test)]
+            Self::OrdinaryCi => true,
+        }
+    }
 }
 
 /// Fixed `bin/cargo`, `bin/rustc` and target standard-library layout, retained
@@ -69,6 +84,7 @@ pub(crate) struct SelectedRustTools {
     root: PathBuf,
     target: ReleaseTarget,
     selection: ToolSelection,
+    apple: Option<AppleDeveloperTools>,
 }
 
 /// Requires the fixed layout for `target` below the canonical `root`.
@@ -125,7 +141,23 @@ impl SelectedRustTools {
             root,
             target,
             selection: ToolSelection::OrdinaryCi,
+            apple: None,
         })
+    }
+
+    /// Adds the Apple developer tools a Darwin build compiles and links with.
+    ///
+    /// Binding requires them for exactly the Darwin targets.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_apple_developer_tools(mut self, apple: AppleDeveloperTools) -> Self {
+        self.apple = Some(apple);
+        self
+    }
+
+    /// The Apple developer tools, present only for a Darwin build.
+    pub(crate) fn apple(&self) -> Option<&AppleDeveloperTools> {
+        self.apple.as_ref()
     }
 
     /// The canonical tool root.
@@ -146,6 +178,11 @@ impl SelectedRustTools {
     /// Whether this selection may start an unqualified candidate run.
     pub(crate) fn permits_candidate_run(&self) -> bool {
         self.selection.permits_candidate_run()
+    }
+
+    /// Whether this selection accepts post-run-reaped descendant cleanup.
+    pub(crate) fn permits_post_run_reaped_cleanup(&self) -> bool {
+        self.selection.permits_post_run_reaped_cleanup()
     }
 
     /// Host path of the selected Cargo.

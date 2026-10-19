@@ -3,6 +3,7 @@ use std::os::unix::fs::{PermissionsExt as _, symlink};
 
 use super::fixture::*;
 use super::*;
+use crate::boundary::DescendantCleanup;
 use crate::policy::FIXED_ARTIFACTS;
 
 fn rejection(fixture: &Fixture, target: ReleaseTarget) -> String {
@@ -263,4 +264,52 @@ fn only_the_ordinary_ci_selection_permits_a_candidate_run() {
         Authority::Unqualified,
         "should still carry no release authority"
     );
+}
+
+#[test]
+fn cleanup_gate_admits_reaped_cleanup_only_with_the_allowance() {
+    let cases = [
+        (DescendantCleanup::OwnedByContainer, false, true),
+        (DescendantCleanup::OwnedByContainer, true, true),
+        (DescendantCleanup::ReapedAfterRun, true, true),
+        (DescendantCleanup::ReapedAfterRun, false, false),
+    ];
+    for (cleanup, allowance, admitted) in cases {
+        let result = super::super::execute::cleanup_gate(cleanup, allowance);
+        assert_eq!(
+            result.is_ok(),
+            admitted,
+            "should decide {cleanup} with allowance {allowance}"
+        );
+        if let Err(error) = result {
+            assert!(
+                format!("{error:?}")
+                    .contains("post-run-reaped cleanup is not permitted for this selection"),
+                "should name the refused cleanup: {error:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn only_the_ordinary_ci_selection_permits_post_run_reaped_cleanup() {
+    let fixture = Fixture::new(COMMIT);
+    for artifact in &FIXED_ARTIFACTS {
+        assert!(
+            fixture
+                .tools_for(artifact.target)
+                .permits_post_run_reaped_cleanup(),
+            "should let the ordinary CI selection accept reaped cleanup for {}",
+            artifact.name
+        );
+    }
+    assert!(
+        ToolSelection::OrdinaryCi.permits_post_run_reaped_cleanup(),
+        "should allow the cfg(test) ordinary CI selection"
+    );
+    // The qualified arm cannot be reached: no qualified selection exists, so
+    // Task 8 must add an explicit decision before production can pass.
+    let never: fn(QualifiedRustTools) -> ! = |qualification| match qualification {};
+    let qualified: fn(QualifiedRustTools) -> ToolSelection = ToolSelection::Qualified;
+    let _ = (never, qualified);
 }

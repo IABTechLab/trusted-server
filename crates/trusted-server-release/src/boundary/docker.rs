@@ -189,6 +189,7 @@ fn role_directory(role: RootRole) -> &'static str {
         RootRole::Immutable => "immutable",
         RootRole::Tool => "tool",
         RootRole::Writable => "writable",
+        RootRole::System => "system",
     }
 }
 
@@ -274,8 +275,15 @@ pub(crate) fn host_path(
 /// # Errors
 ///
 /// Returns [`ReleaseError::Boundary`] when a source path contains `,` or `=`,
-/// which the `--mount` field syntax cannot carry unambiguously.
+/// which the `--mount` field syntax cannot carry unambiguously, or when any
+/// system root is present: the container exposes only reviewed image tools,
+/// never a host system directory.
 pub(crate) fn mounts(roots: &BoundaryRoots) -> Result<Vec<Mount>, Report<ReleaseError>> {
+    if !roots.system().is_empty() {
+        return Err(docker_error(
+            "the container boundary refuses host system roots",
+        ));
+    }
     roots
         .entries()
         .map(|(role, _, source)| {

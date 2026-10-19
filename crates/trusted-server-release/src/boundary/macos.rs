@@ -18,6 +18,16 @@
 //! `(deny syscall-unix (syscall-number …))` makes both fail with `EPERM` in
 //! the confined process and its descendants.
 //!
+//! System roots, such as the Apple developer directory, are allowed only
+//! `file-read*` and `process-exec` and carry the same explicit `file-write*`
+//! denial as immutable and tool roots.
+//!
+//! `xcrun`, `xcodebuild`, `xcode-select`, `sudo`, `su`, `login` and
+//! `newgrp` in `/usr/bin` may not be executed. A build script that invokes
+//! `xcrun` (for example to locate an SDK) therefore fails closed; the recipe
+//! supplies `SDKROOT`, `DEVELOPER_DIR` and the direct Xcode `clang` and `ar`
+//! instead. The `/usr/bin` `cc`, `clang` and `ld` shims are not denied.
+//!
 //! Each run also binds two fresh empty marker files, created outside every
 //! root: the profile allows reading one and denies reading the other. That
 //! pair of rules identifies processes of exactly this run's sandbox instance
@@ -76,6 +86,26 @@ const PROFILE_HEADER: &str = r#"(version 1)
 "#;
 /// Network denial; later SBPL rules take precedence over earlier ones.
 const NETWORK_DENIAL: &str = "(deny network*)\n";
+/// Tools no build step may start, even though `/usr/bin` is executable: the
+/// Xcode selection shims (`xcrun`, `xcodebuild`, `xcode-select`), which
+/// would pick a developer directory outside the bound record, and the
+/// privilege tools. The `/usr/bin` compiler and linker shims stay allowed:
+/// the recipe selects the bound Xcode tools directly, and the shims honour
+/// the bound `DEVELOPER_DIR` if a build script runs them anyway.
+pub(crate) const DENIED_EXECUTABLES: [&str; 7] = [
+    "/usr/bin/sudo",
+    "/usr/bin/su",
+    "/usr/bin/login",
+    "/usr/bin/newgrp",
+    "/usr/bin/xcrun",
+    "/usr/bin/xcodebuild",
+    "/usr/bin/xcode-select",
+];
+
+/// One explicit `process-exec` denial for a fixed compiled-in path.
+fn execution_denial(path: &str) -> String {
+    format!("(deny process-exec (literal \"{path}\"))\n")
+}
 /// Profile parameter naming the run marker the instance may read.
 pub(crate) const RUN_MARK_ALLOW: &str = "RUN_MARK_ALLOW";
 /// Profile parameter naming the run marker the instance must not read.
@@ -101,13 +131,14 @@ fn slot_name(role: RootRole, index: usize) -> String {
         RootRole::Immutable => "IMMUTABLE",
         RootRole::Tool => "TOOL",
         RootRole::Writable => "WRITABLE",
+        RootRole::System => "SYSTEM",
     };
     format!("{prefix}_{index}")
 }
 
 fn allow_rule(role: RootRole, name: &str) -> String {
     let operations = match role {
-        RootRole::Immutable | RootRole::Tool => "file-read* process-exec",
+        RootRole::Immutable | RootRole::Tool | RootRole::System => "file-read* process-exec",
         RootRole::Writable => "file-read* file-write* process-exec",
     };
     format!("(allow {operations} (subpath (param \"{name}\")))\n")
@@ -164,6 +195,9 @@ impl MacProfile {
             defines.push(define(&name, path)?);
         }
         text.push_str(&denials);
+        for path in DENIED_EXECUTABLES {
+            text.push_str(&execution_denial(path));
+        }
         text.push_str(NETWORK_DENIAL);
         text.push_str(&sockets);
         text.push_str(RUN_MARK_RULES);

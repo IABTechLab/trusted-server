@@ -14,6 +14,7 @@ use super::super::startup::{
     expected_version_output, startup_arguments,
 };
 use super::complete::{Built, built};
+use super::complete_darwin::darwin_executable;
 use super::*;
 use crate::inspect::tests::builders::{ElfSpec, elf};
 use crate::process::{ProcessOutcome, Stream};
@@ -122,7 +123,7 @@ fn native_measurement_rejects_fastly_and_mismatched_pairs() {
     let other = native_build(
         "ts-aarch64-apple-darwin",
         Role::Reproduction,
-        b"fictional executable /trusted-server/src/main.rs",
+        &darwin_executable(),
     );
     assert!(
         measure_native_repeatability(&canonical.completed, &other.completed).is_err(),
@@ -368,11 +369,51 @@ fn startup_copy_is_read_only_rehashed_and_linux_only() {
     let other = native_build(
         "ts-aarch64-apple-darwin",
         Role::Canonical,
-        b"fictional executable /trusted-server/src/main.rs",
+        &darwin_executable(),
     );
     assert!(
         StartupCopy::create(&other.completed, &base.join("other-copy")).is_err(),
         "should start only the Linux executable"
+    );
+}
+
+#[test]
+fn native_startup_copy_is_sealed_and_darwin_only() {
+    let darwin = native_build(
+        "ts-aarch64-apple-darwin",
+        Role::Canonical,
+        &darwin_executable(),
+    );
+    let scratch = tempfile::tempdir().expect("should create scratch space");
+    let base = fs::canonicalize(scratch.path()).expect("should resolve scratch space");
+    let directory = base.join("native-copy");
+
+    let copy = StartupCopy::create_native(&darwin.completed, &directory).expect("should copy");
+
+    let mode = |path: &Path| {
+        fs::metadata(path)
+            .expect("should inspect the copy")
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    assert_eq!(mode(&directory), 0o555, "should seal the copy directory");
+    assert_eq!(mode(&directory.join("ts")), 0o555, "should seal the copy");
+    copy.verify().expect("should rehash the untouched copy");
+    copy.remove().expect("should remove the copy");
+
+    let linux = native_build(
+        LINUX_CLI_ASSET,
+        Role::Canonical,
+        &linux_executable(b"fictional dwarf info"),
+    );
+    assert!(
+        StartupCopy::create_native(&linux.completed, &base.join("linux-copy")).is_err(),
+        "should start only Darwin executables natively"
+    );
+    assert!(
+        StartupCopy::create_native(&darwin.completed, Path::new("relative-copy")).is_err(),
+        "should refuse a relative copy directory"
     );
 }
 

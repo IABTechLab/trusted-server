@@ -338,6 +338,8 @@ mod cli;
 mod cli_candidate;
 mod compare;
 mod complete;
+mod complete_darwin;
+mod darwin;
 mod fixture;
 #[cfg(target_os = "linux")]
 mod full;

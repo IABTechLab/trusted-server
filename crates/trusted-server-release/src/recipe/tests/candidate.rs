@@ -19,8 +19,19 @@ use crate::process::ProcessLimits;
 
 /// Schema version of `fixture.json` and of every measurement.
 pub(super) const SCHEMA_VERSION: u64 = 1;
-/// Kind of the Cargo fixture description.
+/// Kind of the Linux Cargo fixture description.
 const FIXTURE_KIND: &str = "ordinary-ci-cargo-fixture";
+/// Kind of the macOS Cargo fixture description, which names no image.
+const MACOS_FIXTURE_KIND: &str = "ordinary-ci-macos-cargo-fixture";
+
+/// Which host a Cargo fixture was prepared for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FixtureHost {
+    /// The Linux container job; the fixture names a local builder image ID.
+    LinuxContainer,
+    /// A macOS sandbox job; the fixture names no image (`image_id: null`).
+    MacosSandbox,
+}
 /// How the fixture inputs were acquired.
 const ACQUISITION: &str = "unauthenticated-ordinary-ci";
 /// Every field `fixture.json` must hold, and nothing else.
@@ -72,7 +83,8 @@ pub(super) struct CargoFixture {
     pub(super) root: PathBuf,
     pub(super) source_commit: String,
     pub(super) cargo_lock_sha256: String,
-    pub(super) image_id: String,
+    pub(super) host: FixtureHost,
+    pub(super) image_id: Option<String>,
     pub(super) registry: BTreeMap<(String, String), PathBuf>,
     pub(super) git: Vec<GitObjects>,
     pub(super) comparison_manifests: Vec<ComparisonManifest>,
@@ -126,7 +138,8 @@ impl CargoFixture {
     /// # Errors
     ///
     /// Returns [`ReleaseError::Recipe`] for another schema, kind or
-    /// acquisition, a missing or extra field, a malformed commit, digest or
+    /// acquisition, a missing or extra field, a malformed commit or digest,
+    /// a Linux fixture without a local image ID or a macOS fixture with any
     /// image ID, a path that is absolute or dotted, a repeated registry
     /// identity, no Git source, or a comparison manifest whose selector names
     /// no retained Git source.
@@ -140,20 +153,35 @@ impl CargoFixture {
         if fields != BTreeSet::from(FIXTURE_FIELDS) {
             return Err(fixture_error("description fields differ from the schema"));
         }
+        let host = match text(document, "kind")? {
+            FIXTURE_KIND => FixtureHost::LinuxContainer,
+            MACOS_FIXTURE_KIND => FixtureHost::MacosSandbox,
+            _ => return Err(fixture_error("unsupported schema, kind or acquisition")),
+        };
         if document["schema_version"].as_u64() != Some(SCHEMA_VERSION)
-            || text(document, "kind")? != FIXTURE_KIND
             || text(document, "acquisition")? != ACQUISITION
         {
             return Err(fixture_error("unsupported schema, kind or acquisition"));
         }
         let source_commit = text(document, "source_commit")?.to_owned();
         let cargo_lock_sha256 = text(document, "cargo_lock_sha256")?.to_owned();
-        let image_id = text(document, "image_id")?.to_owned();
-        let image_ok = image_id
-            .strip_prefix("sha256:")
-            .is_some_and(|digest| lower_hex(digest, 64));
-        if !lower_hex(&source_commit, 40) || !lower_hex(&cargo_lock_sha256, 64) || !image_ok {
-            return Err(fixture_error("malformed commit, lock digest or image ID"));
+        let image_id = match (host, &document["image_id"]) {
+            (FixtureHost::LinuxContainer, Value::String(id))
+                if id
+                    .strip_prefix("sha256:")
+                    .is_some_and(|digest| lower_hex(digest, 64)) =>
+            {
+                Some(id.clone())
+            }
+            (FixtureHost::MacosSandbox, Value::Null) => None,
+            _ => {
+                return Err(fixture_error(
+                    "a Linux fixture needs a local image ID and a macOS fixture none",
+                ));
+            }
+        };
+        if !lower_hex(&source_commit, 40) || !lower_hex(&cargo_lock_sha256, 64) {
+            return Err(fixture_error("malformed commit or lock digest"));
         }
         let git = entries(document, "git")?
             .iter()
@@ -174,9 +202,21 @@ impl CargoFixture {
             root: root.to_owned(),
             source_commit,
             cargo_lock_sha256,
+            host,
             image_id,
             git,
         })
+    }
+
+    /// The local builder image ID of a Linux container fixture.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReleaseError::Recipe`] for a macOS fixture, which names none.
+    pub(super) fn container_image_id(&self) -> Result<&str, Report<ReleaseError>> {
+        self.image_id
+            .as_deref()
+            .ok_or_else(|| fixture_error("a macOS fixture names no container image"))
     }
 
     /// The private single-link Rust tool root.
@@ -292,6 +332,7 @@ pub(super) fn cargo_measurement(completed: &RecipeCompleted) -> Value {
         "js_settings_sha256": js_settings,
         "js_tools_sha256": js_tools,
         "boundary_fingerprint": hex::encode(completed.boundary_fingerprint()),
+        "descendant_cleanup": completed.descendant_cleanup().to_string(),
         "stdout_sha256": completed.stdout_sha256(),
         "stderr_sha256": completed.stderr_sha256(),
         "elapsed_seconds": completed.elapsed().as_secs(),
@@ -476,6 +517,61 @@ fn fixture_description_rejects_unsafe_or_foreign_inputs() {
 }
 
 #[test]
+fn fixture_kind_decides_whether_an_image_is_named() {
+    let root = Path::new("/example/fixture");
+    let linux = CargoFixture::parse(root, &description()).expect("should parse Linux");
+    assert_eq!(linux.host, FixtureHost::LinuxContainer);
+    assert_eq!(
+        linux.container_image_id().ok(),
+        Some(format!("sha256:{}", "b".repeat(64)).as_str()),
+        "should keep the Linux builder image ID"
+    );
+
+    let mut macos = description();
+    macos["kind"] = json!("ordinary-ci-macos-cargo-fixture");
+    macos["image_id"] = Value::Null;
+    let parsed = CargoFixture::parse(root, &macos).expect("should parse macOS");
+    assert_eq!(parsed.host, FixtureHost::MacosSandbox);
+    assert_eq!(parsed.image_id, None, "should name no image");
+    assert!(
+        parsed.container_image_id().is_err(),
+        "should refuse a container image for a macOS fixture"
+    );
+
+    let cases: [(&str, &str, Value); 4] = [
+        (
+            "macOS with an image",
+            "ordinary-ci-macos-cargo-fixture",
+            json!(format!("sha256:{}", "b".repeat(64))),
+        ),
+        (
+            "Linux without an image",
+            "ordinary-ci-cargo-fixture",
+            Value::Null,
+        ),
+        (
+            "macOS with an empty image",
+            "ordinary-ci-macos-cargo-fixture",
+            json!(""),
+        ),
+        (
+            "an unknown kind",
+            "ordinary-ci-windows-cargo-fixture",
+            Value::Null,
+        ),
+    ];
+    for (label, kind, image) in cases {
+        let mut value = description();
+        value["kind"] = json!(kind);
+        value["image_id"] = image;
+        assert!(
+            CargoFixture::parse(root, &value).is_err(),
+            "should reject {label}"
+        );
+    }
+}
+
+#[test]
 fn cargo_container_settings_are_explicit_and_fit_the_runner() {
     let settings = cargo_docker_settings((1001, 1001), 16);
     assert_eq!(settings.pids_limit, 4096, "should allow Cargo's job tree");
@@ -561,6 +657,59 @@ fn denial_fixture_rows_stay_outside_the_fixed_table() {
         AssetId::denial_fixture("trusted-server-adapter-fastly").is_err(),
         "should resolve only fixture members"
     );
+}
+
+#[test]
+fn darwin_denial_rows_stay_outside_the_fixed_table() {
+    for target in [
+        ReleaseTarget::Aarch64AppleDarwin,
+        ReleaseTarget::X86_64AppleDarwin,
+    ] {
+        for package in [
+            "build-direct",
+            "build-grandchild",
+            "macro-attempt",
+            "control",
+        ] {
+            let artifact = AssetId::darwin_denial_fixture(package, target)
+                .expect("should resolve the Darwin fixture member")
+                .artifact();
+            assert_eq!(
+                artifact.bin, package,
+                "should name the binary after the package"
+            );
+            assert_eq!(
+                artifact.target, target,
+                "should build for the Darwin target"
+            );
+            assert!(
+                artifact.name.ends_with(target.triple()),
+                "should name the row after its target"
+            );
+            assert!(
+                AssetId::parse(artifact.name).is_err(),
+                "should keep {} unreachable from request text",
+                artifact.name
+            );
+            assert!(
+                FIXED_ARTIFACTS
+                    .iter()
+                    .all(|fixed| fixed.name != artifact.name && fixed.package != package),
+                "should not touch the fixed release table"
+            );
+        }
+    }
+    for (package, target) in [
+        ("trusted-server-cli", ReleaseTarget::Aarch64AppleDarwin),
+        ("control", ReleaseTarget::Wasm32Wasip1),
+        ("control", ReleaseTarget::X86_64UnknownLinuxGnu),
+    ] {
+        assert!(
+            AssetId::darwin_denial_fixture(package, target).is_err(),
+            "should resolve only Darwin fixture members, not {package} for {}",
+            target.triple()
+        );
+    }
 }
 
 fn description() -> Value {

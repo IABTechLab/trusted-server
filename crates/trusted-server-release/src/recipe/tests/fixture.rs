@@ -71,11 +71,48 @@ impl Fixture {
             )
             .expect("should write fictional libstd");
         }
+        write_fictional_developer_dir(&base.join(APPLE_DEVELOPER));
         Self {
             _directory: directory,
             base,
             completed: JsBuildCompleted::fixture_for_tests(js_commit),
         }
+    }
+
+    /// The fictional Apple developer directory.
+    pub(super) fn developer_dir(&self) -> PathBuf {
+        self.base.join(APPLE_DEVELOPER)
+    }
+
+    /// Facts measured from the fictional developer directory.
+    pub(super) fn apple_facts(&self) -> AppleToolFacts {
+        let developer_dir = self.developer_dir();
+        let bin = developer_dir.join(TOOLCHAIN_BIN);
+        let sdk_root = developer_dir.join(SDK_ROOT);
+        let digest = |path: &Path| {
+            hex::encode(Sha256::digest(
+                fs::read(path).expect("should read a fictional Apple file"),
+            ))
+        };
+        AppleToolFacts {
+            clang_sha256: digest(&bin.join("clang")),
+            ar_sha256: digest(&bin.join("ar")),
+            ld_sha256: digest(&bin.join("ld")),
+            sdk_settings_sha256: digest(&sdk_root.join("SDKSettings.json")),
+            clang: bin.join("clang"),
+            ar: bin.join("ar"),
+            ld: bin.join("ld"),
+            developer_dir,
+            sdk_root,
+            xcode_version: "16.4".to_owned(),
+            sdk_version: crate::inspect::MacosVersion::new(15, 5),
+        }
+    }
+
+    /// The fictional Apple developer tools as an ordinary CI selection.
+    pub(super) fn apple_tools(&self) -> AppleDeveloperTools {
+        AppleDeveloperTools::from_facts_for_tests(self.apple_facts())
+            .expect("should record the fictional Apple tools")
     }
 
     pub(super) fn retained(&self) -> PathBuf {
@@ -138,7 +175,19 @@ impl Fixture {
         .expect("should check the fixture ambient")
     }
 
+    /// Ordinary CI tools for `target`, with the fictional Apple developer
+    /// tools for a Darwin target.
     pub(super) fn tools_for(&self, target: ReleaseTarget) -> SelectedRustTools {
+        let tools = self.rust_tools_for(target);
+        if target.is_darwin() {
+            tools.with_apple_developer_tools(self.apple_tools())
+        } else {
+            tools
+        }
+    }
+
+    /// Ordinary CI Rust tools for `target` without Apple developer tools.
+    pub(super) fn rust_tools_for(&self, target: ReleaseTarget) -> SelectedRustTools {
         SelectedRustTools::for_tests(&self.base.join("tools"), target)
             .expect("should select fixture tools")
     }
@@ -206,7 +255,30 @@ impl Fixture {
             .with(&self.base.join("tools"), "/boundary/tool/0", false)
             .with(&self.base.join("cargo-state"), "/boundary/writable/0", true)
             .with(&self.base.join("target"), "/boundary/writable/1", true)
+            .with(&self.developer_dir(), "/boundary/system/0", false)
     }
+}
+
+/// Fictional developer directory below the fixture base.
+pub(super) const APPLE_DEVELOPER: &str = "apple-developer";
+/// Default toolchain binaries below the developer directory.
+pub(super) const TOOLCHAIN_BIN: &str = "Toolchains/XcodeDefault.xctoolchain/usr/bin";
+/// Fictional SDK root below the developer directory.
+pub(super) const SDK_ROOT: &str = "Platforms/MacOSX.platform/Developer/SDKs/MacOSX15.5.sdk";
+
+/// Writes fictional `clang`, `ar`, `ld` and SDK settings below `developer`.
+fn write_fictional_developer_dir(developer: &Path) {
+    let bin = developer.join(TOOLCHAIN_BIN);
+    let sdk = developer.join(SDK_ROOT);
+    for directory in [&bin, &sdk] {
+        fs::create_dir_all(directory).expect("should create a fictional Apple directory");
+    }
+    for tool in ["clang", "ar", "ld"] {
+        fs::write(bin.join(tool), format!("fictional Apple {tool}"))
+            .expect("should write a fictional Apple tool");
+    }
+    fs::write(sdk.join("SDKSettings.json"), br#"{"Version":"15.5"}"#)
+        .expect("should write fictional SDK settings");
 }
 
 pub(super) fn plan_error(prepared: &PreparedRecipe, paths: &PrefixPaths) -> String {

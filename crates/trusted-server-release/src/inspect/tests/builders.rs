@@ -3,8 +3,12 @@
 //! The images contain only the structures the inspectors read; they are not
 //! runnable. Building them in-process keeps the fixtures host-independent.
 
+mod macho_data;
+
 use object::elf as elf_format;
 use object::macho as macho_format;
+
+pub(crate) use macho_data::{code_signature, debug_map_symbols, linker_signature};
 
 /// One non-loaded ELF section `(name, sh_type, payload)`.
 pub(crate) type ExtraSection = (&'static str, u32, &'static [u8]);
@@ -379,31 +383,63 @@ fn write_sections(out: &mut Writer, table: &[Section]) {
     }
 }
 
+/// One synthetic Mach-O symbol table entry.
+#[derive(Clone)]
+pub(crate) struct Symbol {
+    pub(crate) n_type: u8,
+    pub(crate) name: &'static str,
+    pub(crate) value: u64,
+}
+
 /// One synthetic Mach-O load command.
-pub(super) enum Command {
-    BuildVersion { platform: u32, minos: u32 },
-    VersionMin { version: u32 },
+#[derive(Clone)]
+pub(crate) enum Command {
+    BuildVersion {
+        platform: u32,
+        minos: u32,
+    },
+    BuildVersionSdk {
+        platform: u32,
+        minos: u32,
+        sdk: u32,
+    },
+    VersionMin {
+        version: u32,
+    },
     Dylinker(&'static str),
-    Dylib { cmd: u32, name: &'static str },
+    Dylib {
+        cmd: u32,
+        name: &'static str,
+    },
     Rpath(&'static str),
+    Uuid([u8; 16]),
+    /// `LC_SYMTAB` whose entries and strings follow the payload.
+    Symtab(Vec<Symbol>),
+    /// `LC_CODE_SIGNATURE` whose blob follows the symbol data.
+    CodeSignature(Vec<u8>),
 }
 
 /// Parameters of a synthetic thin 64-bit Mach-O executable.
-pub(super) struct MachoSpec {
-    pub(super) cputype: u32,
-    pub(super) cpusubtype: u32,
-    pub(super) commands: Vec<Command>,
-    pub(super) payload: &'static [u8],
+pub(crate) struct MachoSpec {
+    pub(crate) cputype: u32,
+    pub(crate) cpusubtype: u32,
+    pub(crate) commands: Vec<Command>,
+    pub(crate) payload: &'static [u8],
 }
 
 /// Encodes `major.minor` in the Mach-O nibble form.
-pub(super) const fn macos(major: u32, minor: u32) -> u32 {
+pub(crate) const fn macos(major: u32, minor: u32) -> u32 {
     (major << 16) | (minor << 8)
 }
 
+/// The SDK version every synthetic `LC_BUILD_VERSION` records unless a
+/// [`Command::BuildVersionSdk`] states another.
+pub(crate) const SYNTHETIC_SDK: (u32, u32) = (15, 5);
+
 impl MachoSpec {
-    /// A conforming arm64 `ts`-like executable targeting macOS 13.0.
-    pub(super) fn conforming() -> Self {
+    /// A conforming arm64 `ts`-like executable targeting macOS 13.0, linker
+    /// signed, with a UUID and a relative zero-time debug map.
+    pub(crate) fn conforming() -> Self {
         Self {
             cputype: macho_format::CPU_TYPE_ARM64,
             cpusubtype: macho_format::CPU_SUBTYPE_ARM64_ALL,
@@ -421,17 +457,60 @@ impl MachoSpec {
                     cmd: macho_format::LC_LOAD_DYLIB,
                     name: "/usr/lib/libSystem.B.dylib",
                 },
+                Command::Uuid([0x5a; 16]),
+                Command::Symtab(debug_map_symbols()),
+                Command::CodeSignature(linker_signature()),
             ],
             payload: b"fictional cstring /opt/example/src/main.rs",
         }
     }
+
+    /// Returns the index of the first command `matches` selects.
+    pub(crate) fn position(&self, matches: impl Fn(&Command) -> bool) -> usize {
+        self.commands
+            .iter()
+            .position(matches)
+            .expect("should hold the command")
+    }
+}
+
+/// Encoded size of one load command.
+fn command_size(command: &Command) -> usize {
+    match command {
+        Command::BuildVersion { .. } | Command::BuildVersionSdk { .. } | Command::Uuid(_) => 24,
+        Command::VersionMin { .. } | Command::CodeSignature(_) => 16,
+        Command::Symtab(_) => 24,
+        Command::Dylinker(text) | Command::Rpath(text) => (12 + text.len() + 1).div_ceil(8) * 8,
+        Command::Dylib { name, .. } => (24 + name.len() + 1).div_ceil(8) * 8,
+    }
 }
 
 /// Builds a synthetic thin Mach-O executable from `spec`.
-pub(super) fn macho(spec: &MachoSpec) -> Vec<u8> {
-    let mut commands = Writer::default();
+///
+/// Symbol and signature data follow the payload, the signature last, so a
+/// truncated image always cuts referenced data.
+pub(crate) fn macho(spec: &MachoSpec) -> Vec<u8> {
+    let commands_size: usize = spec.commands.iter().map(command_size).sum();
+    // Symbol entries need four-byte alignment, as in a real `__LINKEDIT`.
+    let base = (32 + commands_size + spec.payload.len()).div_ceil(8) * 8;
+    let mut data = Writer::default();
+    let mut tables = Vec::new();
     for command in &spec.commands {
-        encode_command(&mut commands, command);
+        if let Command::Symtab(symbols) = command {
+            tables.push(symbol_data(symbols, &mut data, base));
+        }
+    }
+    let mut layout = Layout {
+        tables: tables.into_iter(),
+        next_signature: base + data.0.len(),
+    };
+    let mut commands = Writer::default();
+    let mut signatures = Writer::default();
+    for command in &spec.commands {
+        encode_command(&mut commands, command, &mut layout);
+        if let Command::CodeSignature(blob) = command {
+            signatures.0.extend_from_slice(blob);
+        }
     }
     let mut out = Writer::default();
     out.u32(macho_format::MH_MAGIC_64);
@@ -444,18 +523,93 @@ pub(super) fn macho(spec: &MachoSpec) -> Vec<u8> {
     out.u32(0);
     out.0.extend_from_slice(&commands.0);
     out.0.extend_from_slice(spec.payload);
+    if !data.0.is_empty() || !signatures.0.is_empty() {
+        out.align(8);
+    }
+    out.0.extend_from_slice(&data.0);
+    out.0.extend_from_slice(&signatures.0);
     out.0
 }
 
-fn encode_command(out: &mut Writer, command: &Command) {
+/// Appends a symbol table's entries and strings to `data`; returns the
+/// `(symoff, nsyms, stroff, strsize)` fields.
+fn symbol_data(symbols: &[Symbol], data: &mut Writer, base: usize) -> [u32; 4] {
+    let mut strings = Strings::new();
+    let mut entries = Writer::default();
+    for symbol in symbols {
+        entries.u32(strings.add(symbol.name));
+        entries.0.push(symbol.n_type);
+        entries.0.push(1);
+        entries.u16(0);
+        entries.u64(symbol.value);
+    }
+    let field = |value: usize| u32::try_from(value).expect("should fit");
+    let symoff = base + data.0.len();
+    data.0.extend_from_slice(&entries.0);
+    let stroff = base + data.0.len();
+    data.0.extend_from_slice(&strings.0);
+    [
+        field(symoff),
+        field(symbols.len()),
+        field(stroff),
+        field(strings.0.len()),
+    ]
+}
+
+/// Precomputed data placement for the commands that reference file data.
+struct Layout {
+    tables: std::vec::IntoIter<[u32; 4]>,
+    next_signature: usize,
+}
+
+fn encode_command(out: &mut Writer, command: &Command, layout: &mut Layout) {
     match command {
         Command::BuildVersion { platform, minos } => {
+            let (major, minor) = SYNTHETIC_SDK;
+            encode_command(
+                out,
+                &Command::BuildVersionSdk {
+                    platform: *platform,
+                    minos: *minos,
+                    sdk: macos(major, minor),
+                },
+                layout,
+            );
+        }
+        Command::BuildVersionSdk {
+            platform,
+            minos,
+            sdk,
+        } => {
             out.u32(macho_format::LC_BUILD_VERSION);
             out.u32(24);
             out.u32(*platform);
             out.u32(*minos);
-            out.u32(macos(15, 5));
+            out.u32(*sdk);
             out.u32(0);
+        }
+        Command::Uuid(uuid) => {
+            out.u32(macho_format::LC_UUID);
+            out.u32(24);
+            out.0.extend_from_slice(uuid);
+        }
+        Command::Symtab(_) => {
+            out.u32(macho_format::LC_SYMTAB);
+            out.u32(24);
+            for field in layout
+                .tables
+                .next()
+                .expect("should hold the table placement")
+            {
+                out.u32(field);
+            }
+        }
+        Command::CodeSignature(blob) => {
+            out.u32(macho_format::LC_CODE_SIGNATURE);
+            out.u32(16);
+            out.u32(u32::try_from(layout.next_signature).expect("should fit"));
+            out.u32(u32::try_from(blob.len()).expect("should fit"));
+            layout.next_signature += blob.len();
         }
         Command::VersionMin { version } => {
             out.u32(macho_format::LC_VERSION_MIN_MACOSX);

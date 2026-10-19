@@ -6,6 +6,7 @@ use super::super::compare::{
 };
 use super::super::completed::SuccessFacts;
 use super::complete::{Built, ManifestMarks, built, built_with, wasm_with};
+use super::complete_darwin::darwin_executable;
 use super::fixture::OTHER_COMMIT;
 use super::*;
 
@@ -247,7 +248,7 @@ fn mismatched_inputs_or_another_asset_are_rejected() {
     let native = finish(built(
         "ts-aarch64-apple-darwin",
         Role::Canonical,
-        b"fictional executable /trusted-server/src/main.rs",
+        &darwin_executable(),
     ));
     let reproduction = completed(
         FASTLY_ASSET,

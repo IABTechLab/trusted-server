@@ -103,6 +103,13 @@ pub(super) struct Proven {
     pub(super) proof: DenialProof,
 }
 
+/// The builder image ID a Linux container fixture names.
+fn linux_image(fixture: &CargoFixture) -> &str {
+    fixture
+        .container_image_id()
+        .expect("should name the Linux builder image")
+}
+
 /// Configures the exact recipe boundary in the image `image_id` and proves
 /// its denial.
 pub(super) fn proven_boundary(
@@ -244,7 +251,7 @@ fn cargo_children_inherit_denial() {
     let mut proof_errno = None;
     for case in ATTEMPTS {
         let bound = bind_denial_case(&fixture, case);
-        let proven = proven_boundary(&bound.prepared, &fixture, &fixture.image_id);
+        let proven = proven_boundary(&bound.prepared, &fixture, linux_image(&fixture));
         let errno = proven.proof.denied_errno();
         let error = bound
             .prepared
@@ -266,7 +273,7 @@ fn cargo_children_inherit_denial() {
         proof_errno = Some(errno);
     }
     let bound = bind_denial_case(&fixture, "control");
-    let proven = proven_boundary(&bound.prepared, &fixture, &fixture.image_id);
+    let proven = proven_boundary(&bound.prepared, &fixture, linux_image(&fixture));
     let control = bound
         .prepared
         .execute(&proven.boundary, &proven.proof)
@@ -479,7 +486,7 @@ fn build_fastly(
         request,
     )
     .expect("should bind the real source, handoff, tools and materials");
-    let proven = proven_boundary(&prepared, fixture, &fixture.image_id);
+    let proven = proven_boundary(&prepared, fixture, linux_image(fixture));
     let execution_checkout = path_text(
         &proven
             .boundary

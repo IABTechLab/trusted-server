@@ -96,6 +96,26 @@ impl Mode {
 /// Tracked path records: mode and SHA-256 of content or symlink target.
 type Records = BTreeMap<String, (Mode, String)>;
 
+/// Returns the complete approved JS entry-point set of `records`, sorted.
+fn js_module_ids(records: &Records) -> Vec<String> {
+    let prefix = "crates/trusted-server-js/lib/src/";
+    let mut ids: Vec<_> = records
+        .keys()
+        .filter_map(|path| {
+            let path = path.strip_prefix(prefix)?;
+            if path == "core/index.ts" {
+                return Some("core".to_owned());
+            }
+            let integration = path
+                .strip_prefix("integrations/")?
+                .strip_suffix("/index.ts")?;
+            (!integration.contains('/')).then(|| integration.to_owned())
+        })
+        .collect();
+    ids.sort();
+    ids
+}
+
 /// Fingerprint of every tracked worktree path at the approved commit.
 pub(crate) struct SourceSnapshot {
     root: PathBuf,
@@ -153,6 +173,35 @@ impl ApprovedSource {
     /// Sorted paths covered by [`Self::closure_digest`].
     pub(crate) fn closure_paths(&self) -> &[String] {
         &self.closure_paths
+    }
+
+    /// Returns the complete approved JS entry-point set in sorted order.
+    pub(crate) fn module_ids(&self) -> Vec<String> {
+        js_module_ids(&self.snapshot.records)
+    }
+
+    /// Describes an approved source in memory without reading Git, for unit
+    /// tests whose subject consumes only the commit and tracked path names.
+    ///
+    /// Every path is recorded as a regular file with a fictional digest.
+    #[cfg(test)]
+    pub(crate) fn in_memory_for_tests(commit: &CommitId, tracked: &[&str]) -> Self {
+        let records: Records = tracked
+            .iter()
+            .map(|path| ((*path).to_owned(), (Mode::Regular, "0".repeat(64))))
+            .collect();
+        let fingerprint = digest_records(records.iter());
+        Self {
+            commit: commit.clone(),
+            epoch: 1_700_000_000,
+            snapshot: SourceSnapshot {
+                root: PathBuf::from("/example/in-memory-source"),
+                records,
+                fingerprint,
+            },
+            closure_digest: "0".repeat(64),
+            closure_paths: Vec::new(),
+        }
     }
 
     /// SHA-256 of a tracked path's content at the approved commit.

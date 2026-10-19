@@ -2,6 +2,8 @@ use super::*;
 use serde_json::{Value, json};
 use std::os::unix::fs::symlink;
 
+mod adopt;
+
 #[test]
 fn one_byte_final_module_difference_rejects_the_complete_comparison() {
     let first = tempfile::tempdir().expect("should create A outputs");

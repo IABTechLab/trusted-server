@@ -140,31 +140,6 @@ fn execute_rejects_boundary_with_other_roots() {
     );
 }
 
-#[cfg(target_os = "macos")]
-#[test]
-fn execute_rejects_boundary_without_owned_descendant_cleanup() {
-    let fixture = Fixture::new(COMMIT);
-    let prepared = fixture
-        .bind("ts-aarch64-apple-darwin", Role::Canonical)
-        .expect("should bind the recipe");
-    let roots = prepared
-        .boundary_roots()
-        .expect("should derive exact roots");
-    let boundary =
-        Boundary::mac_sandbox_for_tests(roots.clone()).expect("should configure, not run");
-    assert!(
-        boundary.matches_roots(&roots),
-        "should hold the exact recipe roots so only cleanup can reject"
-    );
-    let error = prepared
-        .execute(&boundary, &DenialProof::for_tests())
-        .expect_err("should reject a boundary without owned cleanup");
-    assert!(
-        format!("{error:?}").contains("descendant cleanup"),
-        "should name the missing descendant cleanup"
-    );
-}
-
 #[test]
 fn qualified_rust_tools_constructor_is_uninhabited() {
     let never: fn(QualifiedRustTools) -> ! = |qualification| match qualification {};
@@ -340,11 +315,17 @@ fn boundary_roots_mount_materials_read_only_state_and_target_writable_output_unm
             fixture.base.join("target"),
         ],
     )
+    .and_then(|roots| roots.with_system(&[fixture.developer_dir()]))
     .expect("should build the expected roots");
     assert_eq!(
         prepared.boundary_roots().expect("should derive roots"),
         expected,
         "should mount exactly the planned roles"
+    );
+    assert_eq!(
+        expected.system(),
+        [fixture.developer_dir()],
+        "should add the Apple developer directory as the only system root"
     );
     let all: Vec<_> = expected
         .entries()

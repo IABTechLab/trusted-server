@@ -185,6 +185,79 @@ pub(crate) const DENIAL_FIXTURE_ARTIFACTS: [FixedArtifact; 4] = [
     denial_fixture_row("denial-control.wasm", "control"),
 ];
 
+/// Test-only rows naming the Cargo denial fixture members built for each
+/// macOS CPU, so the macOS candidate jobs can prove build-script, grandchild
+/// and procedural-macro denial through the actual Darwin recipe.
+///
+/// Like [`DENIAL_FIXTURE_ARTIFACTS`] they are outside [`FIXED_ARTIFACTS`]
+/// and the cohort; only test code reaches them by package and target.
+#[cfg(test)]
+pub(crate) const DARWIN_DENIAL_FIXTURE_ARTIFACTS: [FixedArtifact; 8] = [
+    darwin_denial_row(
+        "denial-build-direct-aarch64-apple-darwin",
+        "build-direct",
+        ARM64,
+    ),
+    darwin_denial_row(
+        "denial-build-grandchild-aarch64-apple-darwin",
+        "build-grandchild",
+        ARM64,
+    ),
+    darwin_denial_row(
+        "denial-macro-attempt-aarch64-apple-darwin",
+        "macro-attempt",
+        ARM64,
+    ),
+    darwin_denial_row("denial-control-aarch64-apple-darwin", "control", ARM64),
+    darwin_denial_row(
+        "denial-build-direct-x86_64-apple-darwin",
+        "build-direct",
+        INTEL,
+    ),
+    darwin_denial_row(
+        "denial-build-grandchild-x86_64-apple-darwin",
+        "build-grandchild",
+        INTEL,
+    ),
+    darwin_denial_row(
+        "denial-macro-attempt-x86_64-apple-darwin",
+        "macro-attempt",
+        INTEL,
+    ),
+    darwin_denial_row("denial-control-x86_64-apple-darwin", "control", INTEL),
+];
+
+/// The arm64 macOS target of the Darwin denial rows.
+#[cfg(test)]
+const ARM64: ReleaseTarget = ReleaseTarget::Aarch64AppleDarwin;
+/// The Intel macOS target of the Darwin denial rows.
+#[cfg(test)]
+const INTEL: ReleaseTarget = ReleaseTarget::X86_64AppleDarwin;
+
+/// One Darwin denial fixture row for `target`.
+#[cfg(test)]
+const fn darwin_denial_row(
+    name: &'static str,
+    package: &'static str,
+    target: ReleaseTarget,
+) -> FixedArtifact {
+    // Evaluated at compile time, so a non-Darwin row fails the build.
+    let architecture = match target {
+        ReleaseTarget::Aarch64AppleDarwin => "aarch64",
+        ReleaseTarget::X86_64AppleDarwin => "x86_64",
+        ReleaseTarget::Wasm32Wasip1 | ReleaseTarget::X86_64UnknownLinuxGnu => {
+            panic!("Darwin denial rows need a Darwin target")
+        }
+    };
+    FixedArtifact {
+        target,
+        architecture,
+        minimum_version: "13.0",
+        runtime: "macos",
+        ..denial_fixture_row(name, package)
+    }
+}
+
 /// One Wasm denial fixture row whose binary is named after its package.
 #[cfg(test)]
 const fn denial_fixture_row(name: &'static str, package: &'static str) -> FixedArtifact {

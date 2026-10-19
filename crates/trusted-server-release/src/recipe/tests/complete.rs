@@ -5,10 +5,12 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
+use super::complete_darwin::{darwin_executable, darwin_executable_with, rejects_embedded_path};
 use super::fixture::*;
 use super::*;
+use crate::boundary::DescendantCleanup;
 use crate::inspect::Violation;
-use crate::inspect::tests::builders::{ElfSpec, elf};
+use crate::inspect::tests::builders::{ElfSpec, MachoSpec, elf, macho};
 
 const FINGERPRINT: [u8; 32] = [7; 32];
 
@@ -46,6 +48,7 @@ pub(super) struct Built {
     prepared: Option<PreparedRecipe>,
     asset: &'static str,
     role: Role,
+    cleanup: DescendantCleanup,
 }
 
 /// Which Git manifest digests the fictional materials token records.
@@ -100,11 +103,17 @@ pub(super) fn built_with(
         .join("release");
     fs::create_dir_all(&release).expect("should create the release directory");
     fs::write(release.join(executable_name(asset)), bytes).expect("should write the executable");
+    let cleanup = if artifact.target.is_darwin() {
+        DescendantCleanup::ReapedAfterRun
+    } else {
+        DescendantCleanup::OwnedByContainer
+    };
     Built {
         fixture,
         prepared: Some(prepared),
         asset,
         role,
+        cleanup,
     }
 }
 
@@ -147,6 +156,7 @@ impl Built {
             stderr_sha256: hex::encode(Sha256::digest(b"fictional diagnostics")),
             started_at_seconds: 1_700_000_000,
             elapsed: Duration::from_secs(42),
+            cleanup: self.cleanup,
         }
     }
 
@@ -172,8 +182,8 @@ fn rejection(result: Result<RecipeCompleted, Report<ReleaseError>>) -> String {
 
 #[test]
 fn successful_run_binds_every_input_and_copies_the_artifact() {
-    let bytes = b"fictional native executable /trusted-server/src/main.rs";
-    let mut built = built("ts-aarch64-apple-darwin", Role::Canonical, bytes);
+    let bytes = darwin_executable();
+    let mut built = built("ts-aarch64-apple-darwin", Role::Canonical, &bytes);
     let stdout = built.stdout(|_| {});
     let expected_plan = built
         .prepared()
@@ -271,7 +281,7 @@ fn successful_run_binds_every_input_and_copies_the_artifact() {
     );
     assert_eq!(
         completed.artifact().sha256(),
-        hex::encode(Sha256::digest(bytes)),
+        hex::encode(Sha256::digest(&bytes)),
         "should record the digest"
     );
     assert_eq!(
@@ -315,11 +325,8 @@ fn rehash_rejects_changed_output_and_retained_stream() {
         ("symlink swap", |output, _| {
             let path = output.join("ts-aarch64-apple-darwin");
             fs::remove_file(&path).expect("should remove");
-            fs::write(
-                output.join("..").join("elsewhere"),
-                b"fictional native executable /trusted-server/src/main.rs",
-            )
-            .expect("should write target");
+            fs::write(output.join("..").join("elsewhere"), darwin_executable())
+                .expect("should write target");
             symlink(output.join("..").join("elsewhere"), path).expect("should swap in a symlink");
         }),
         ("retained stream", |_, completed| {
@@ -330,7 +337,7 @@ fn rehash_rejects_changed_output_and_retained_stream() {
         let mut built = built(
             "ts-aarch64-apple-darwin",
             Role::Canonical,
-            b"fictional native executable /trusted-server/src/main.rs",
+            &darwin_executable(),
         );
         let stdout = built.stdout(|_| {});
         let output = built.fixture.base.join("output");
@@ -364,7 +371,7 @@ fn malformed_streams_complete_nothing_and_copy_nothing() {
         let mut built = built(
             "ts-aarch64-apple-darwin",
             Role::Canonical,
-            b"fictional native executable /trusted-server/src/main.rs",
+            &darwin_executable(),
         );
         let stdout = built.stdout(edit);
         let output = built.fixture.base.join("output");
@@ -385,7 +392,7 @@ fn changed_tools_or_materials_or_existing_output_reject_completion() {
     let mut built_tools = built(
         "ts-aarch64-apple-darwin",
         Role::Canonical,
-        b"fictional native executable /trusted-server/src/main.rs",
+        &darwin_executable(),
     );
     let stdout = built_tools.stdout(|_| {});
     fs::write(built_tools.fixture.base.join("tools/bin/cargo"), b"swapped")
@@ -398,7 +405,7 @@ fn changed_tools_or_materials_or_existing_output_reject_completion() {
     let mut built_materials = built(
         "ts-aarch64-apple-darwin",
         Role::Canonical,
-        b"fictional native executable /trusted-server/src/main.rs",
+        &darwin_executable(),
     );
     let stdout = built_materials.stdout(|_| {});
     fs::write(
@@ -417,7 +424,7 @@ fn changed_tools_or_materials_or_existing_output_reject_completion() {
     let mut built_output = built(
         "ts-aarch64-apple-darwin",
         Role::Canonical,
-        b"fictional native executable /trusted-server/src/main.rs",
+        &darwin_executable(),
     );
     let stdout = built_output.stdout(|_| {});
     fs::write(
@@ -530,7 +537,7 @@ fn execute_stays_closed_for_an_ordinary_ci_selection() {
     let built = built(
         "ts-aarch64-apple-darwin",
         Role::Canonical,
-        b"fictional native executable /trusted-server/src/main.rs",
+        &darwin_executable(),
     );
     assert_eq!(
         built.prepared().tools.authority(),
@@ -545,7 +552,7 @@ fn manifest_digests_are_carried_into_the_completion() {
         let mut built = built_with(
             "ts-aarch64-apple-darwin",
             Role::Canonical,
-            b"fictional native executable /trusted-server/src/main.rs",
+            &darwin_executable(),
             marks,
         );
         let stdout = built.stdout(|_| {});
@@ -655,15 +662,16 @@ fn innocuous_paths(built: &Built) -> super::super::paths::PrefixPaths {
         .with(prepared.tools.root(), "/work/compiler", false)
         .with(&prepared.request.cargo_state, "/work/state", true)
         .with(&prepared.request.target_dir, "/work/products", true)
+        .with(&built.fixture.developer_dir(), "/work/developer", false)
 }
 
 #[test]
 fn completion_rejects_every_bound_host_and_execution_root() {
-    for index in 0..13 {
+    for index in 0..15 {
         let mut build = built(
             "ts-aarch64-apple-darwin",
             Role::Canonical,
-            b"/trusted-server/src/main.rs",
+            &darwin_executable(),
         );
         let paths = innocuous_paths(&build);
         let prepared = build.prepared();
@@ -674,6 +682,7 @@ fn completion_rejects_every_bound_host_and_execution_root() {
             prepared.tools.root().to_owned(),
             prepared.request.cargo_state.clone(),
             prepared.request.target_dir.clone(),
+            build.fixture.developer_dir(),
         ];
         let mut denied = host.to_vec();
         denied.extend(host.iter().map(|root| {
@@ -691,7 +700,8 @@ fn completion_rejects_every_bound_host_and_execution_root() {
             .request
             .target_dir
             .join("aarch64-apple-darwin/release/ts");
-        fs::write(&target, payload).expect("should plant the literal in the executable");
+        fs::write(&target, darwin_executable_with(payload.as_bytes()))
+            .expect("should plant the literal in the executable");
         let stdout = build.stdout(|message| {
             message["manifest_path"] = json!("/work/source/crates/trusted-server-cli/Cargo.toml");
             message["executable"] = json!("/work/products/aarch64-apple-darwin/release/ts");
@@ -704,7 +714,7 @@ fn completion_rejects_every_bound_host_and_execution_root() {
             .complete(run, FINGERPRINT, &paths);
         let error = rejection(result);
         assert!(
-            error.contains("unremapped path prefix"),
+            rejects_embedded_path(&error),
             "should reject bound root {} by final-path gate: {error}",
             denied[index].display()
         );
@@ -717,18 +727,17 @@ fn completion_rejects_cargo_state_home_and_temporary_literals() {
         let mut build = built(
             "ts-aarch64-apple-darwin",
             Role::Canonical,
-            b"/trusted-server/src/main.rs",
+            &darwin_executable(),
         );
         let paths = innocuous_paths(&build);
-        let payload =
-            format!("/trusted-server/src/main.rs env!(OUT_DIR)=/work/state/{child}/generated.rs");
+        let payload = format!(" env!(OUT_DIR)=/work/state/{child}/generated.rs");
         fs::write(
             build
                 .prepared()
                 .request
                 .target_dir
                 .join("aarch64-apple-darwin/release/ts"),
-            payload,
+            darwin_executable_with(payload.as_bytes()),
         )
         .expect("should plant cargo-state descendant");
         let stdout = build.stdout(|message| {
@@ -741,9 +750,10 @@ fn completion_rejects_cargo_state_home_and_temporary_literals() {
             .take()
             .expect("should retain the prepared recipe")
             .complete(run, FINGERPRINT, &paths);
+        let error = rejection(result);
         assert!(
-            rejection(result).contains("unremapped path prefix"),
-            "should reject {child} outside remapped Cargo home too"
+            rejects_embedded_path(&error),
+            "should reject {child} outside remapped Cargo home too: {error}"
         );
     }
 }
@@ -753,7 +763,7 @@ fn completion_requires_a_fixed_remapped_prefix() {
     let mut build = built(
         "ts-aarch64-apple-darwin",
         Role::Canonical,
-        b"fictional executable with no remap",
+        &macho(&MachoSpec::conforming()),
     );
     let stdout = build.stdout(|_| {});
     assert!(
@@ -767,7 +777,7 @@ fn completion_accepts_fixed_prefixes_in_an_innocuous_execution_namespace() {
     let mut build = built(
         "ts-aarch64-apple-darwin",
         Role::Canonical,
-        b"/trusted-server/src/main.rs /cargo-target/generated/file.rs",
+        &darwin_executable_with(b" /cargo-target/generated/file.rs"),
     );
     let paths = innocuous_paths(&build);
     let stdout = build.stdout(|message| {

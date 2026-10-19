@@ -10,14 +10,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use error_stack::Report;
 use sha2::{Digest as _, Sha256};
 
+use super::apple::AppleDeveloperTools;
 use super::artifact::{EXECUTABLE_LIMIT, copy_artifact};
 use super::cargo_output::{ExpectedBinary, locate_host_binary};
 use super::completed::SuccessFacts;
 use super::{Authority, ExecutionPaths, PreparedRecipe, RecipeCompleted, recipe_error};
-use crate::boundary::{Boundary, DenialProof};
+use crate::boundary::{Boundary, DenialProof, DescendantCleanup};
 use crate::documents::{Role as DocumentRole, read_bounded};
 use crate::error::ReleaseError;
-use crate::inspect::{ElfPolicy, inspect_elf, inspect_wasm};
+use crate::inspect::{ElfPolicy, MachoCpu, MachoPolicy, inspect_elf, inspect_macho, inspect_wasm};
 use crate::policy::ReleaseTarget;
 use crate::process::ProcessLimits;
 use crate::tool_tree::tool_tree_digest;
@@ -42,20 +43,51 @@ pub(super) struct RunOutput {
     pub(super) stderr_sha256: String,
     pub(super) started_at_seconds: u64,
     pub(super) elapsed: Duration,
+    /// The descendant cleanup of the boundary that ran the build.
+    pub(super) cleanup: DescendantCleanup,
+}
+
+/// Admits a boundary's descendant cleanup for a selection.
+///
+/// Container-owned cleanup is always admitted. Post-run-reaped cleanup,
+/// where survivors exist until the reap after the run, is admitted only when
+/// `allowance` (the selection's
+/// [`permits_post_run_reaped_cleanup`](super::SelectedRustTools::permits_post_run_reaped_cleanup))
+/// holds.
+///
+/// # Errors
+///
+/// Returns [`ReleaseError::Recipe`] for post-run-reaped cleanup without the
+/// allowance.
+pub(super) fn cleanup_gate(
+    cleanup: DescendantCleanup,
+    allowance: bool,
+) -> Result<(), Report<ReleaseError>> {
+    match cleanup {
+        DescendantCleanup::OwnedByContainer => Ok(()),
+        DescendantCleanup::ReapedAfterRun if allowance => Ok(()),
+        DescendantCleanup::ReapedAfterRun => Err(recipe_error(
+            "post-run-reaped cleanup is not permitted for this selection",
+        )),
+    }
 }
 
 impl PreparedRecipe {
-    /// Requires the tools to be the tree measured at binding.
+    /// Requires the tools to be the tree measured at binding and any Apple
+    /// developer tools to still match their record.
     ///
     /// # Errors
     ///
     /// Returns [`ReleaseError::Recipe`] when anything under the tool root was
-    /// edited, linked, added or removed.
+    /// edited, linked, added or removed, or an Apple tool or the SDK settings
+    /// changed.
     pub(super) fn check_tools(&self) -> Result<(), Report<ReleaseError>> {
         if self.tools.digest()? != self.tools_digest {
             return Err(recipe_error("Rust tools changed after binding"));
         }
-        Ok(())
+        self.tools
+            .apple()
+            .map_or(Ok(()), super::apple::AppleDeveloperTools::verify)
     }
 
     /// Requires the prepared materials to be unchanged.
@@ -107,15 +139,18 @@ impl PreparedRecipe {
     }
 
     /// Requires unchanged inputs, a derivable plan, the exact planned roots
-    /// and owned descendant cleanup.
+    /// and a descendant cleanup the selection accepts; returns that cleanup.
     ///
     /// # Errors
     ///
     /// Returns [`ReleaseError::Recipe`] when the tools or materials changed,
     /// the plan cannot be derived in the boundary's namespace, the boundary
-    /// roots differ from [`Self::boundary_roots`], or the boundary does not
-    /// own descendant cleanup.
-    fn check_boundary(&self, boundary: &Boundary) -> Result<(), Report<ReleaseError>> {
+    /// roots differ from [`Self::boundary_roots`], or [`cleanup_gate`]
+    /// rejects the boundary's descendant cleanup.
+    fn check_boundary(
+        &self,
+        boundary: &Boundary,
+    ) -> Result<DescendantCleanup, Report<ReleaseError>> {
         self.check_tools()?;
         self.check_materials()?;
         self.plan(boundary)?;
@@ -124,12 +159,9 @@ impl PreparedRecipe {
                 "boundary roots differ from the exact recipe roots",
             ));
         }
-        if !boundary.has_owned_descendant_cleanup() {
-            return Err(recipe_error(
-                "boundary does not own descendant cleanup for Cargo build scripts",
-            ));
-        }
-        Ok(())
+        let cleanup = boundary.descendant_cleanup();
+        cleanup_gate(cleanup, self.tools.permits_post_run_reaped_cleanup())?;
+        Ok(cleanup)
     }
 
     /// Checks every gate, runs Cargo confined and completes the run.
@@ -154,7 +186,7 @@ impl PreparedRecipe {
         boundary: &Boundary,
         proof: &DenialProof,
     ) -> Result<RecipeCompleted, Report<ReleaseError>> {
-        self.check_boundary(boundary)?;
+        let cleanup = self.check_boundary(boundary)?;
         let command = self.plan(boundary)?.confined_command(build_limits())?;
         if !self.tools.permits_candidate_run() {
             return Err(Report::new(ReleaseError::Unqualified)
@@ -187,6 +219,7 @@ impl PreparedRecipe {
             stderr_sha256,
             started_at_seconds,
             elapsed,
+            cleanup,
         };
         self.complete(output, boundary.execution_fingerprint(), boundary)
     }
@@ -195,9 +228,10 @@ impl PreparedRecipe {
     ///
     /// Parses Cargo's stream, maps the executable back through a writable
     /// root, copies it into the output directory and inspects the copy: a
-    /// Wasm module or Linux executable must pass its inspector and keep the
-    /// debug sections a stripped file lacks. Every target must also exclude
-    /// all bound host and execution roots and contain a fixed remapped prefix.
+    /// Wasm module, Linux or macOS executable must pass its inspector and
+    /// keep the debug sections or debug map a stripped file lacks (see
+    /// [`inspect_copied`]). Every target must also exclude all bound host and
+    /// execution roots and contain a fixed remapped prefix.
     ///
     /// # Errors
     ///
@@ -251,7 +285,7 @@ impl PreparedRecipe {
                 "copied artifact changed before final-byte checks",
             ));
         }
-        inspect_copied(artifact.target, &raw.bytes)?;
+        inspect_copied(artifact.target, &raw.bytes, self.tools.apple())?;
         self.check_final_paths(&raw.bytes, paths)?;
 
         if self.tools.authority() == Authority::Qualified
@@ -275,6 +309,7 @@ impl PreparedRecipe {
             ambient: self.ambient.clone(),
             started_at_seconds: run.started_at_seconds,
             elapsed: run.elapsed,
+            descendant_cleanup: run.cleanup,
             stdout: run.stdout,
             stderr_sha256: run.stderr_sha256,
             artifact: copied,
@@ -285,29 +320,47 @@ impl PreparedRecipe {
     }
 }
 
-/// Inspects the copied final bytes of a Wasm or Linux artifact.
+/// Inspects the copied final bytes of the artifact for its target.
 ///
 /// Wasm must be a core module that kept its debug sections. A Linux
 /// executable must pass the reviewed glibc 2.34 ELF policy (`x86_64`, the
 /// reviewed loader and libraries, no search path, no runner path) and keep
-/// its DWARF sections. macOS executables never reach a completed run while
-/// their boundary stays closed, and are inspected by their own gate.
+/// its DWARF sections. A macOS executable must pass the reviewed Mach-O
+/// policy for its CPU (minimum macOS 13.0, reviewed loader and libraries,
+/// linker ad-hoc signature on arm64, relative zero-time debug map), keep a
+/// non-empty debug map, and record the SDK version measured from the bound
+/// Apple developer tools.
 ///
 /// # Errors
 ///
-/// Returns [`ReleaseError::Inspect`] when the final bytes are rejected.
-fn inspect_copied(target: ReleaseTarget, bytes: &[u8]) -> Result<(), Report<ReleaseError>> {
-    if !matches!(
-        target,
-        ReleaseTarget::Wasm32Wasip1 | ReleaseTarget::X86_64UnknownLinuxGnu
-    ) {
-        return Ok(());
+/// Returns [`ReleaseError::Inspect`] when the final bytes are rejected, or
+/// [`ReleaseError::Recipe`] for a Darwin artifact without Apple developer
+/// tools or whose recorded SDK differs from the measured one.
+fn inspect_copied(
+    target: ReleaseTarget,
+    bytes: &[u8],
+    apple: Option<&AppleDeveloperTools>,
+) -> Result<(), Report<ReleaseError>> {
+    let cpu = match target {
+        ReleaseTarget::Wasm32Wasip1 => return inspect_wasm(bytes)?.require_debug_sections(),
+        ReleaseTarget::X86_64UnknownLinuxGnu => {
+            return inspect_elf(bytes, &ElfPolicy::linux_x86_64_gnu())?.require_debug_sections();
+        }
+        ReleaseTarget::Aarch64AppleDarwin => MachoCpu::Arm64,
+        ReleaseTarget::X86_64AppleDarwin => MachoCpu::X86_64,
+    };
+    let apple =
+        apple.ok_or_else(|| recipe_error("Darwin artifact has no Apple developer tools"))?;
+    let facts = inspect_macho(bytes, &MachoPolicy::macos(cpu))?;
+    facts.require_debug_map()?;
+    if facts.sdk() != apple.sdk_version() {
+        return Err(recipe_error(format!(
+            "Mach-O records SDK {}, but the bound Apple SDK is {}",
+            facts.sdk(),
+            apple.sdk_version()
+        )));
     }
-    if target == ReleaseTarget::Wasm32Wasip1 {
-        inspect_wasm(bytes)?.require_debug_sections()
-    } else {
-        inspect_elf(bytes, &ElfPolicy::linux_x86_64_gnu())?.require_debug_sections()
-    }
+    Ok(())
 }
 
 /// Digest of the whole retained JS root: contents, modes, names and aliases.
