@@ -47,6 +47,7 @@ mod completed;
 mod execute;
 mod final_paths;
 mod fresh;
+mod identity;
 mod native;
 mod paths;
 mod plan;
@@ -66,6 +67,7 @@ pub(crate) use apple::{
 };
 pub(crate) use cargo_output::successful_messages as observed_cargo_messages;
 pub(crate) use completed::RecipeCompleted;
+pub(crate) use identity::{ExactInvocationDigest, RecipeDefinitionIdentity};
 pub(crate) use paths::ExecutionPaths;
 pub(crate) use plan::CargoPlan;
 #[allow(
@@ -403,9 +405,14 @@ struct JsFacts {
 
 /// Source authority of one recipe; bypass exists only in explicit test fixtures.
 enum WorkspaceSelection {
-    Approved(WorkspaceOrigins),
+    Approved(Box<ApprovedWorkspace>),
     #[cfg(test)]
     Fixture,
+}
+
+struct ApprovedWorkspace {
+    origins: WorkspaceOrigins,
+    definition: RecipeDefinitionIdentity,
 }
 
 /// Everything [`PreparedRecipe::bind`] cross-checks before a recipe may run.
@@ -487,9 +494,13 @@ impl PreparedRecipe {
             source.tracked_sha256(remap::LEGACY_CARGO_CONFIG).is_some(),
         )?;
         let child = child_environment(audited, source, &child_request(&request))?;
+        let workspace = ApprovedWorkspace {
+            origins: WorkspaceOrigins::bind(source, fresh)?,
+            definition: RecipeDefinitionIdentity::from_source(source, request.asset)?,
+        };
         Self::bind(BindInputs {
             commit: source.commit(),
-            workspace: WorkspaceSelection::Approved(WorkspaceOrigins::bind(source, fresh)?),
+            workspace: WorkspaceSelection::Approved(Box::new(workspace)),
             child,
             completed,
             tools,

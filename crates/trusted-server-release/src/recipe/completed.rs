@@ -16,8 +16,10 @@ use error_stack::Report;
 use sha2::{Digest as _, Sha256};
 
 use super::artifact::{CopiedArtifact, EXECUTABLE_LIMIT};
-use super::{AssetId, CheckedAmbient, Role, recipe_error};
-use crate::boundary::DescendantCleanup;
+use super::{
+    AssetId, CheckedAmbient, ExactInvocationDigest, RecipeDefinitionIdentity, Role, recipe_error,
+};
+use crate::boundary::{DenialReceipt, DescendantCleanup};
 use crate::composition::CargoCapture;
 use crate::documents::hash_bounded_with_check;
 use crate::error::ReleaseError;
@@ -38,7 +40,9 @@ pub(super) struct SuccessFacts {
     pub(super) js_tools_sha256: String,
     pub(super) rust_tools_digest: String,
     pub(super) boundary_fingerprint: [u8; 32],
-    pub(super) plan_digest: String,
+    pub(super) denial_receipt: Option<DenialReceipt>,
+    pub(super) recipe_definition: Option<RecipeDefinitionIdentity>,
+    pub(super) plan_digest: ExactInvocationDigest,
     pub(super) ambient: CheckedAmbient,
     pub(super) started_at_seconds: u64,
     pub(super) elapsed: Duration,
@@ -72,6 +76,43 @@ impl std::fmt::Debug for RecipeCompleted {
 }
 
 impl RecipeCompleted {
+    /// Returns the approved source-owned definition retained by this build.
+    ///
+    /// This selects recipe policy without proving tool qualification or which
+    /// bootstrap built the producer that executed it.
+    ///
+    /// # Errors
+    ///
+    /// Rejects changed outputs, an unbound fixture or another source/asset selection.
+    pub(crate) fn recipe_definition(
+        &self,
+    ) -> Result<&RecipeDefinitionIdentity, Report<ReleaseError>> {
+        self.rehash_for_handoff()?;
+        self.facts
+            .recipe_definition
+            .as_ref()
+            .filter(|definition| definition.matches_selection(&self.facts.commit, self.facts.asset))
+            .ok_or_else(|| {
+                recipe_error("completed build has no matching approved recipe definition")
+            })
+    }
+
+    /// Returns measured socket observations bound to this completed execution.
+    ///
+    /// This diagnostic receipt does not reconstruct a network-denial capability.
+    ///
+    /// # Errors
+    ///
+    /// Rejects changed retained outputs, an unmeasured fixture or another boundary.
+    pub(crate) fn denial_receipt(&self) -> Result<&DenialReceipt, Report<ReleaseError>> {
+        self.rehash_for_handoff()?;
+        self.facts
+            .denial_receipt
+            .as_ref()
+            .filter(|receipt| receipt.matches_fingerprint(&self.facts.boundary_fingerprint))
+            .ok_or_else(|| recipe_error("completed build has no matching measured socket receipt"))
+    }
+
     /// Records one successful run and retains its Cargo message stream.
     ///
     /// Only the recipe's successful-run path calls this.
@@ -170,7 +211,7 @@ impl RecipeCompleted {
 
     /// Digest of the exact Cargo plan that ran.
     pub(crate) fn plan_digest(&self) -> &str {
-        &self.facts.plan_digest
+        self.facts.plan_digest.sha256()
     }
 
     /// The ambient conditions the build ran under.

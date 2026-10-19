@@ -16,9 +16,10 @@ use super::cargo_output::{ExpectedBinary, locate_host_binary};
 use super::completed::SuccessFacts;
 use super::plan::CargoQuery;
 use super::{
-    Authority, ExecutionPaths, PreparedRecipe, RecipeCompleted, WorkspaceSelection, recipe_error,
+    Authority, ExactInvocationDigest, ExecutionPaths, PreparedRecipe, RecipeCompleted,
+    WorkspaceSelection, recipe_error,
 };
-use crate::boundary::{Boundary, DenialProof, DescendantCleanup};
+use crate::boundary::{Boundary, DenialProof, DenialReceipt, DescendantCleanup};
 use crate::composition::external::ExternalRequirements;
 use crate::composition::javascript::{JsInputs, JsRetentionPolicy, collect_js};
 use crate::composition::native::{self, NativeInputs};
@@ -65,6 +66,7 @@ pub(super) enum CargoQueryOutput {
         metadata: Vec<u8>,
         tree: Vec<u8>,
         plan_digests: [String; 2],
+        denial: DenialReceipt,
     },
     /// Pure completion tests never execute Cargo and cannot supply real observations.
     #[cfg(test)]
@@ -142,7 +144,7 @@ impl PreparedRecipe {
     /// Rechecks source while its working root still exists, before receipt sealing.
     fn check_source(&self) -> Result<(), Report<ReleaseError>> {
         match &self.workspace {
-            WorkspaceSelection::Approved(workspace) => workspace.verify_unchanged(),
+            WorkspaceSelection::Approved(workspace) => workspace.origins.verify_unchanged(),
             #[cfg(test)]
             WorkspaceSelection::Fixture => Ok(()),
         }
@@ -228,6 +230,7 @@ impl PreparedRecipe {
         }
         self.check_inputs()?;
         self.check_no_fetched_sources()?;
+        let denial = proof.receipt_for(&boundary.execution_fingerprint())?;
         let run: Result<_, Report<ReleaseError>> = (|| {
             let query = |kind| {
                 let plan = self.plan(boundary)?.observation_query(kind)?;
@@ -250,6 +253,7 @@ impl PreparedRecipe {
                     metadata,
                     tree,
                     plan_digests: [metadata_plan, tree_plan],
+                    denial,
                 },
                 result,
                 started_at_seconds,
@@ -308,7 +312,7 @@ impl PreparedRecipe {
     ) -> Result<RecipeCompleted, Report<ReleaseError>> {
         self.check_tools()?;
         self.check_materials()?;
-        let plan_digest = self.plan(paths)?.digest()?;
+        let plan_digest = ExactInvocationDigest::from_plan(&self.plan(paths)?)?;
         let artifact = self.request.asset.artifact();
         let manifest = paths.execution_path(
             &self
@@ -331,12 +335,18 @@ impl PreparedRecipe {
             },
             paths,
         )?;
-        let mut cargo_observations = match run.queries {
+        let (mut cargo_observations, denial_receipt) = match run.queries {
             CargoQueryOutput::Captured {
                 metadata,
                 tree,
                 plan_digests,
+                denial,
             } => {
+                if !denial.matches_fingerprint(&boundary_fingerprint) {
+                    return Err(recipe_error(
+                        "socket observations belong to another execution boundary",
+                    ));
+                }
                 let layout = CargoLayout::new(
                     artifact.target,
                     paths.execution_path(&self.request.target_dir)?,
@@ -346,10 +356,10 @@ impl PreparedRecipe {
                     CargoCapture::new(metadata, tree, &run.stdout, &layout, plan_digests)?;
                 let selected_package_id =
                     captured.require_binary(&manifest, artifact.bin, &located.execution)?;
-                Some((captured, selected_package_id))
+                (Some((captured, selected_package_id)), Some(denial))
             }
             #[cfg(test)]
-            CargoQueryOutput::Fixture => None,
+            CargoQueryOutput::Fixture => (None, None),
         };
         let copied = copy_artifact(
             &located.host,
@@ -368,64 +378,67 @@ impl PreparedRecipe {
         let requirements = inspect_copied(artifact.target, &raw.bytes, self.tools.apple())?;
         self.check_final_paths(&raw.bytes, paths)?;
 
-        let cargo_observations = if let Some((captured, selected_package_id)) =
-            cargo_observations.take()
-        {
-            Some(match &self.workspace {
-                WorkspaceSelection::Approved(workspace) => {
-                    let origins =
-                        join_origins(captured.observations(), workspace, &self.materials, paths)?;
-                    let plan = self.plan(paths)?;
-                    let native = native::collect(
-                        captured.observations(),
-                        &NativeInputs {
-                            origins: origins.native_sources(),
-                            execution_output_root: &paths
-                                .execution_path(&self.request.target_dir)?,
-                            host_output_root: &self.request.target_dir,
-                            target: artifact.target,
-                            environment: &plan.environment,
-                            check: &|| Ok(()),
-                        },
-                    )?;
-                    let javascript = collect_js(
-                        &raw.bytes,
-                        copied.sha256(),
-                        &JsInputs {
-                            retained_root: &self.retained_root,
-                            modules: &self.js.modules,
-                            inventory_sha256: &self.js.inventory_sha256,
-                            policy: if artifact.target == ReleaseTarget::Wasm32Wasip1 {
-                                JsRetentionPolicy::FastlyAll
-                            } else {
-                                JsRetentionPolicy::ObserveCli
+        let cargo_observations =
+            if let Some((captured, selected_package_id)) = cargo_observations.take() {
+                Some(match &self.workspace {
+                    WorkspaceSelection::Approved(workspace) => {
+                        let origins = join_origins(
+                            captured.observations(),
+                            &workspace.origins,
+                            &self.materials,
+                            paths,
+                        )?;
+                        let plan = self.plan(paths)?;
+                        let native = native::collect(
+                            captured.observations(),
+                            &NativeInputs {
+                                origins: origins.native_sources(),
+                                execution_output_root: &paths
+                                    .execution_path(&self.request.target_dir)?,
+                                host_output_root: &self.request.target_dir,
+                                target: artifact.target,
+                                environment: &plan.environment,
+                                check: &|| Ok(()),
                             },
-                        },
-                    )?;
-                    self.check_source()?;
-                    let platform = PlatformEvidence::collect(
-                        &self.tools,
-                        &self.tools_digest,
-                        requirements,
-                        artifact.target,
-                        copied.sha256(),
-                    )?;
-                    let captured = captured.with_evidence(
-                        &selected_package_id,
-                        origins,
-                        native,
-                        javascript,
-                        platform,
-                    )?;
-                    self.check_source()?;
-                    captured
-                }
-                #[cfg(test)]
-                WorkspaceSelection::Fixture => captured,
-            })
-        } else {
-            None
-        };
+                        )?;
+                        let javascript = collect_js(
+                            &raw.bytes,
+                            copied.sha256(),
+                            &JsInputs {
+                                retained_root: &self.retained_root,
+                                modules: &self.js.modules,
+                                inventory_sha256: &self.js.inventory_sha256,
+                                policy: if artifact.target == ReleaseTarget::Wasm32Wasip1 {
+                                    JsRetentionPolicy::FastlyAll
+                                } else {
+                                    JsRetentionPolicy::ObserveCli
+                                },
+                            },
+                        )?;
+                        self.check_source()?;
+                        let platform = PlatformEvidence::collect(
+                            &self.tools,
+                            &self.tools_digest,
+                            requirements,
+                            artifact.target,
+                            copied.sha256(),
+                        )?;
+                        let captured = captured.with_evidence(
+                            &selected_package_id,
+                            origins,
+                            native,
+                            javascript,
+                            platform,
+                        )?;
+                        self.check_source()?;
+                        captured
+                    }
+                    #[cfg(test)]
+                    WorkspaceSelection::Fixture => captured,
+                })
+            } else {
+                None
+            };
 
         if self.tools.authority() == Authority::Qualified
             && !self.materials.derived_manifest_digests().is_empty()
@@ -433,6 +446,11 @@ impl PreparedRecipe {
             return Err(Report::new(ReleaseError::Unqualified)
                 .attach("a build from caller-derived manifests cannot carry qualified authority"));
         }
+        let recipe_definition = match self.workspace {
+            WorkspaceSelection::Approved(workspace) => Some(workspace.definition),
+            #[cfg(test)]
+            WorkspaceSelection::Fixture => None,
+        };
         RecipeCompleted::record_success(SuccessFacts {
             asset: self.request.asset,
             role: self.request.role,
@@ -444,6 +462,8 @@ impl PreparedRecipe {
             js_tools_sha256: self.js.tools_sha256.clone(),
             rust_tools_digest: self.tools_digest.clone(),
             boundary_fingerprint,
+            denial_receipt,
+            recipe_definition,
             plan_digest,
             ambient: self.ambient.clone(),
             started_at_seconds: run.started_at_seconds,

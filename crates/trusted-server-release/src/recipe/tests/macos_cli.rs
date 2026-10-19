@@ -150,6 +150,11 @@ fn build_macos_cli(
     // Attempt every cleanup even when setup, execution, or another cleanup fails.
     let built = finish_cleanup(built, fresh.close());
     let built = finish_cleanup(built, remove_target_dir(&target_dir));
+    let built = built.and_then(|(completed, host_roots)| {
+        completed.denial_receipt()?;
+        completed.recipe_definition()?;
+        Ok((completed, host_roots))
+    });
     match built {
         Ok((completed, host_roots)) => Ok(MacosBuild {
             _materials: materials_directory

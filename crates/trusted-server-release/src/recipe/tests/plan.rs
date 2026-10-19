@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use super::super::paths::PrefixPaths;
 use super::super::plan::CargoQuery;
+use super::complete::{built, wasm_with};
 use super::fixture::*;
 use super::*;
 use crate::policy::FIXED_ARTIFACTS;
@@ -30,6 +31,20 @@ fn expected_replacement() -> Vec<String> {
 
 /// Execution path of the fictional Apple clang in the fixture layout.
 const FIXTURE_CLANG: &str = "/boundary/system/0/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang";
+
+#[test]
+fn pure_completion_fixture_cannot_export_a_source_owned_recipe_definition() {
+    let bytes = wasm_with(&[(".debug_info", b"i"), (".debug_line", b"l")]);
+    let mut build = built("trusted-server-fastly.wasm", Role::Canonical, &bytes);
+    let stdout = build.stdout(|_| {});
+    let completed = build
+        .finish(stdout)
+        .expect("should complete the accepted pure fixture");
+    assert!(
+        completed.recipe_definition().is_err(),
+        "should require the actual approved source binding to export a shared recipe definition"
+    );
+}
 
 #[test]
 fn recipe_binding_keeps_checked_module_facts_and_explicit_fixture_source() {

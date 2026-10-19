@@ -18,6 +18,7 @@
 use std::path::Path;
 
 use error_stack::Report;
+use serde::Serialize;
 
 use super::probe::{DENIED_STATUS, LoopbackListener, ProbeProgram, ProbeReport};
 use super::{Boundary, ConfinedCommand};
@@ -36,9 +37,113 @@ fn proof_error(message: impl std::fmt::Display) -> Report<ReleaseError> {
 pub(crate) struct DenialProof {
     fingerprint: [u8; 32],
     denied_errno: i32,
+    observations: ProofObservations,
+}
+
+#[derive(Debug)]
+enum ProofObservations {
+    Measured {
+        control: Observation,
+        confined: Observation,
+    },
+    #[cfg(test)]
+    Fixture,
+}
+
+/// Read-only measured socket diagnostics; never an execution capability.
+#[derive(Debug, Serialize)]
+pub(crate) struct DenialReceipt {
+    fingerprint: String,
+    denied_errno: i32,
+    control: ProbeReceipt,
+    probe: ProbeReceipt,
+}
+
+impl DenialReceipt {
+    /// Returns whether these measured diagnostics name the expected boundary instance.
+    pub(crate) fn matches_fingerprint(&self, expected: &[u8; 32]) -> bool {
+        self.fingerprint == hex::encode(expected)
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ProbeReceipt {
+    outcome: ExitReceipt,
+    report: ReportReceipt,
+    accepted_connections: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ExitReceipt {
+    Exited { status: i32 },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ReportReceipt {
+    Connected,
+    Denied { errno: i32 },
+}
+
+impl ProbeReceipt {
+    fn from_observation(observed: Observation) -> Result<Self, Report<ReleaseError>> {
+        let ProcessOutcome::Exited { code } = observed.outcome else {
+            return Err(proof_error(
+                "measured socket observation did not exit normally",
+            ));
+        };
+        let report = match observed.report {
+            Some(ProbeReport::Connected) => ReportReceipt::Connected,
+            Some(ProbeReport::Denied { errno }) => ReportReceipt::Denied { errno },
+            None => return Err(proof_error("measured socket observation has no report")),
+        };
+        Ok(Self {
+            outcome: ExitReceipt::Exited { status: code },
+            report,
+            accepted_connections: observed.accepts,
+        })
+    }
 }
 
 impl DenialProof {
+    /// Exports actual socket observations for the expected boundary instance.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a mismatched instance, missing measured observations or any
+    /// control/probe pair that does not establish successful socket denial.
+    pub(crate) fn receipt_for(
+        &self,
+        expected_boundary_fingerprint: &[u8; 32],
+    ) -> Result<DenialReceipt, Report<ReleaseError>> {
+        if !self.matches(expected_boundary_fingerprint) {
+            return Err(proof_error(
+                "measured denial receipt belongs to another boundary instance",
+            ));
+        }
+        let (control, confined) = match &self.observations {
+            ProofObservations::Measured { control, confined } => (*control, *confined),
+            #[cfg(test)]
+            ProofObservations::Fixture => {
+                return Err(proof_error(
+                    "synthetic test proof has no measured socket observations",
+                ));
+            }
+        };
+        if validate_observations(control, confined)? != self.denied_errno {
+            return Err(proof_error(
+                "stored denial errno differs from measured observations",
+            ));
+        }
+        Ok(DenialReceipt {
+            fingerprint: hex::encode(self.fingerprint),
+            denied_errno: self.denied_errno,
+            control: ProbeReceipt::from_observation(control)?,
+            probe: ProbeReceipt::from_observation(confined)?,
+        })
+    }
+
     /// Returns whether the proof was established for `fingerprint`.
     pub(super) fn matches(&self, fingerprint: &[u8; 32]) -> bool {
         &self.fingerprint == fingerprint
@@ -50,6 +155,7 @@ impl DenialProof {
         Self {
             fingerprint: [0; 32],
             denied_errno: 1,
+            observations: ProofObservations::Fixture,
         }
     }
 
@@ -83,6 +189,18 @@ fn evaluate(
     control: Observation,
     confined: Observation,
 ) -> Result<DenialProof, Report<ReleaseError>> {
+    let denied_errno = validate_observations(control, confined)?;
+    Ok(DenialProof {
+        fingerprint,
+        denied_errno,
+        observations: ProofObservations::Measured { control, confined },
+    })
+}
+
+fn validate_observations(
+    control: Observation,
+    confined: Observation,
+) -> Result<i32, Report<ReleaseError>> {
     let control_ok = control.outcome == (ProcessOutcome::Exited { code: 0 })
         && control.report == Some(ProbeReport::Connected)
         && control.accepts == 1;
@@ -108,10 +226,7 @@ fn evaluate(
             )));
         }
     };
-    Ok(DenialProof {
-        fingerprint,
-        denied_errno,
-    })
+    Ok(denied_errno)
 }
 
 fn observe(
@@ -195,6 +310,8 @@ mod tests {
     use std::ffi::OsString;
     use std::time::Duration;
 
+    use serde_json::json;
+
     use super::*;
 
     #[test]
@@ -238,6 +355,85 @@ mod tests {
 
     fn denied(errno: i32, accepts: usize) -> Observation {
         observation(3, Some(ProbeReport::Denied { errno }), accepts)
+    }
+
+    #[test]
+    fn measured_receipt_retains_validated_control_and_probe_observations() {
+        let fingerprint = [7; 32];
+        let control = observation(0, Some(ProbeReport::Connected), 1);
+        for errno in [libc::EPERM, libc::EACCES] {
+            let proof = evaluate(fingerprint, control, denied(errno, 0))
+                .expect("should evaluate a successful pure observation fixture");
+            let receipt = proof
+                .receipt_for(&fingerprint)
+                .expect("should export validated observations for the same boundary");
+            assert!(
+                receipt.matches_fingerprint(&fingerprint),
+                "should bind diagnostics to the measured boundary instance"
+            );
+            assert!(
+                !receipt.matches_fingerprint(&[8; 32]),
+                "should reject an unrelated boundary fingerprint"
+            );
+            let value =
+                serde_json::to_value(&receipt).expect("should serialize measured diagnostics");
+            assert_eq!(
+                value,
+                json!({
+                    "fingerprint": hex::encode(fingerprint), "denied_errno": errno,
+                    "control": {"outcome":{"kind":"exited","status":0},"report":{"kind":"connected"},"accepted_connections":1},
+                    "probe": {"outcome":{"kind":"exited","status":3},"report":{"kind":"denied","errno":errno},"accepted_connections":0}
+                }),
+                "should retain exactly the successful fixture observations without claiming an operating-system run"
+            );
+        }
+    }
+
+    #[test]
+    fn measured_receipt_rejects_other_instances_and_unmeasured_test_proofs() {
+        let proof = evaluate(
+            [7; 32],
+            observation(0, Some(ProbeReport::Connected), 1),
+            denied(libc::EPERM, 0),
+        )
+        .expect("should evaluate a successful pure observation fixture");
+        assert!(
+            proof.receipt_for(&[8; 32]).is_err(),
+            "should reject a different boundary instance"
+        );
+        assert!(
+            DenialProof::for_tests().receipt_for(&[0; 32]).is_err(),
+            "should never export measured success from a synthetic test capability"
+        );
+    }
+
+    #[test]
+    fn measured_receipt_revalidates_stored_observations_and_errno() {
+        let control = observation(0, Some(ProbeReport::Connected), 1);
+        let confined = denied(libc::EPERM, 0);
+        for (changed_control, changed_confined) in [
+            (observation(0, Some(ProbeReport::Connected), 0), confined),
+            (control, denied(libc::EPERM, 1)),
+            (control, observation(3, None, 0)),
+        ] {
+            let mut proof = evaluate([7; 32], control, confined)
+                .expect("should evaluate a successful pure observation fixture");
+            proof.observations = ProofObservations::Measured {
+                control: changed_control,
+                confined: changed_confined,
+            };
+            assert!(
+                proof.receipt_for(&[7; 32]).is_err(),
+                "should reject corrupted stored observations"
+            );
+        }
+        let mut proof = evaluate([7; 32], control, confined)
+            .expect("should evaluate a successful pure observation fixture");
+        proof.denied_errno = libc::EACCES;
+        assert!(
+            proof.receipt_for(&[7; 32]).is_err(),
+            "should reject a stored errno that differs from the observed report"
+        );
     }
 
     #[test]

@@ -170,6 +170,11 @@ fn build_cli(inputs: &CliInputs<'_>, role: Role) -> Result<CliBuild, Report<Rele
                 Err(error) => Err(fixture_io(error)),
             }),
     );
+    let built = built.and_then(|(completed, host_roots)| {
+        completed.denial_receipt()?;
+        completed.recipe_definition()?;
+        Ok((completed, host_roots))
+    });
     match built {
         Ok((completed, host_roots)) => Ok(CliBuild {
             _materials: materials_directory

@@ -344,6 +344,12 @@ fn build_fastly(
     );
     fs::remove_dir_all(base.join("target")).expect("should remove the spent target directory");
     fresh.close().expect("should remove the fresh source copy");
+    completed
+        .denial_receipt()
+        .expect("should retain measured socket observations after working-root cleanup");
+    completed
+        .recipe_definition()
+        .expect("should retain the approved recipe definition after working-root cleanup");
     FastlyBuild {
         _materials: materials_directory,
         _work: work,

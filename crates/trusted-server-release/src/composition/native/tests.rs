@@ -157,6 +157,67 @@ impl Fixture {
 }
 
 #[test]
+fn reviewed_aws_lc_bindings_profiles_keep_verified_static_archive_evidence() {
+    for features in [
+        vec![],
+        vec!["prebuilt-nasm"],
+        vec!["all-bindings", "default"],
+    ] {
+        let mut fixture = Fixture::new("aws-lc-sys");
+        fixture.observations.units[0].features = features
+            .iter()
+            .map(|feature| (*feature).to_owned())
+            .collect();
+        let evidence = fixture
+            .collect()
+            .expect("should accept reviewed bindings profiles for supported Unix targets");
+        assert_eq!(
+            evidence.contributors[0].features, fixture.observations.units[0].features,
+            "should preserve actual effective features without enabling extra bindings"
+        );
+        assert_eq!(
+            evidence.contributors[0].linked_libs,
+            ["static=aws_lc_0_42_0_crypto"],
+            "should preserve the verified static crypto archive requirement"
+        );
+        assert_eq!(
+            evidence.contributors[0].archives.len(),
+            1,
+            "should retain the measured native archive"
+        );
+    }
+}
+
+#[test]
+fn native_feature_errors_identify_package_context_and_bounded_observed_features() {
+    let mut fixture = Fixture::new("aws-lc-sys");
+    fixture.observations.units[0]
+        .features
+        .push("fips".to_owned());
+    let error = format!(
+        "{:?}",
+        fixture
+            .collect()
+            .expect_err("should reject unreviewed features")
+    );
+    assert!(
+        error.contains("aws-lc-sys") && error.contains("fips") && error.contains("Target"),
+        "should diagnose the exact package, context and rejected feature: {error}"
+    );
+    fixture.observations.units[0].features = vec!["x".repeat(8192); 128];
+    let error = format!(
+        "{:?}",
+        fixture
+            .collect()
+            .expect_err("should reject excessive unknown feature text")
+    );
+    assert!(
+        error.len() < 4096,
+        "should bound native feature diagnostics"
+    );
+}
+
+#[test]
 fn captures_actual_archives_and_verified_source_materials_for_all_reviewed_origins() {
     for name in ["aws-lc-sys", "ring", "libsqlite3-sys"] {
         let fixture = Fixture::new(name);

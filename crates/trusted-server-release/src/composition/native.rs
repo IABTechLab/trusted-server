@@ -100,8 +100,11 @@ fn reviewed(name: &str) -> Option<ReviewedNative> {
     Some(match name {
         "aws-lc-sys" => ReviewedNative {
             version: "0.42.0",
-            allowed_features: &["all-bindings", "default"],
-            required_features: &["all-bindings"],
+            // The locked Rust wrapper disables default bindings. Its NASM
+            // feature can select prebuilt objects only on Windows x86_64,
+            // outside the selected Linux and macOS build platforms.
+            allowed_features: &["all-bindings", "default", "prebuilt-nasm"],
+            required_features: &[],
             libraries: &["aws_lc_0_42_0_crypto"],
             source_subtrees: &["aws-lc"],
         },
@@ -243,6 +246,7 @@ fn check_environment(name: &str, inputs: &NativeInputs<'_>) -> Result<(), Report
 
 fn features_for(
     observations: &CargoObservations,
+    package: &RustPackage,
     script: &BuildScriptObservation,
     rule: &ReviewedNative,
 ) -> Result<Vec<String>, Report<ReleaseError>> {
@@ -254,19 +258,31 @@ fn features_for(
     let first = matches
         .next()
         .ok_or_else(|| composition_error("native script has no observed consuming unit"))?;
-    if matches.any(|unit| unit.features != first.features)
-        || first
+    let conflicting = matches.any(|unit| unit.features != first.features);
+    let unreviewed = first
+        .features
+        .iter()
+        .any(|feature| !rule.allowed_features.contains(&feature.as_str()));
+    let missing = rule
+        .required_features
+        .iter()
+        .any(|feature| !first.features.iter().any(|actual| actual == feature));
+    if conflicting || unreviewed || missing {
+        let observed: Vec<String> = first
             .features
             .iter()
-            .any(|feature| !rule.allowed_features.contains(&feature.as_str()))
-        || rule
-            .required_features
-            .iter()
-            .any(|feature| !first.features.iter().any(|actual| actual == feature))
-    {
-        return Err(composition_error(
-            "native unit has ambiguous or unreviewed effective features",
-        ));
+            .take(16)
+            .map(|feature| feature.chars().take(96).collect())
+            .collect();
+        return Err(composition_error(format!(
+            "native package {}@{} {:?}: conflicting_units={conflicting}, unreviewed_features={unreviewed}, missing_required_features={missing}; observed={observed:?} ({} total); required={:?}; allowed={:?}",
+            package.name.chars().take(96).collect::<String>(),
+            package.version.chars().take(96).collect::<String>(),
+            script.context,
+            first.features.len(),
+            rule.required_features,
+            rule.allowed_features,
+        )));
     }
     Ok(first.features.clone())
 }
@@ -335,7 +351,7 @@ fn contributor(
         ));
     }
     check_environment(&package.name, inputs)?;
-    let features = features_for(observations, script, &rule)?;
+    let features = features_for(observations, package, script, &rule)?;
     let source = inputs
         .origins
         .get(&package.id)
