@@ -12,7 +12,8 @@
 //!   `Refresh`, `Link`): an absolute or protocol-relative URL whose authority is
 //!   the publisher origin is mapped to the serving host, using the same
 //!   scheme mapping as the HTML body rewriter. Relative URLs and other hosts
-//!   are left unchanged.
+//!   are left unchanged. When the origin is a folder of its host, only a URL in
+//!   that folder is mapped, and it loses the folder.
 //! - **Content Security Policy** (`Content-Security-Policy`,
 //!   `Content-Security-Policy-Report-Only`): every source expression that names
 //!   the publisher origin gains a sibling expression for the serving host.
@@ -23,6 +24,8 @@
 //! Each response's own header values are rewritten, so per-page policies are
 //! preserved. Operator `[response_headers]` overrides are applied later and
 //! still take precedence.
+
+use std::borrow::Cow;
 
 use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, header};
 use url::Url;
@@ -50,6 +53,13 @@ pub(crate) struct OriginHeaderRewrite<'a> {
     /// point of view, so the retry through Trusted Server is redirected again
     /// whatever cookies the response sets.
     pub origin_host_header: &'a str,
+    /// Path of the publisher origin's folder (`/bucket/site`), or empty or `/`
+    /// when the origin is the whole host.
+    ///
+    /// A URL on the origin host is the origin's only at or beneath this path,
+    /// and maps to the serving host without it. One outside the folder has no
+    /// address on the serving host and is left unchanged.
+    pub origin_path: &'a str,
     /// Serving host authority the browser addressed.
     pub request_host: &'a str,
     /// Scheme the browser used to reach the serving host.
@@ -84,21 +94,55 @@ impl OriginHeaderRewrite<'_> {
 
     /// Rewrite a URL reference that points at the publisher origin.
     ///
-    /// Returns [`None`] when `url` is relative, names another host, or names the
-    /// origin host with a different port.
+    /// Returns [`None`] when `url` is relative, names another host, names the
+    /// origin host with a different port, or names a path outside the origin
+    /// folder.
     fn rewrite_url(&self, url: &str) -> Option<String> {
         let rest = strip_prefix_ignore_ascii_case(url, "https://")
             .or_else(|| strip_prefix_ignore_ascii_case(url, "http://"));
         if let Some(rest) = rest {
-            let suffix = self.strip_origin_authority(rest)?;
+            let suffix = self.serving_suffix(self.strip_origin_authority(rest)?)?;
             return Some(format!(
                 "{}://{}{suffix}",
                 self.request_scheme, self.request_host
             ));
         }
 
-        let suffix = self.strip_origin_authority(url.strip_prefix("//")?)?;
+        let suffix = self.serving_suffix(self.strip_origin_authority(url.strip_prefix("//")?)?)?;
         Some(format!("//{}{suffix}", self.request_host))
+    }
+
+    /// What follows the serving host for `suffix`, the path, query and
+    /// fragment that follow the origin authority in a URL on the origin.
+    ///
+    /// With an [`Self::origin_path`], dot segments are resolved first, as the
+    /// browser resolves them, so a path that climbs out of the folder is
+    /// outside it, and [`None`] is returned for a path outside the folder.
+    fn serving_suffix<'b>(&self, suffix: &'b str) -> Option<Cow<'b, str>> {
+        if self.origin_path.trim_end_matches('/').is_empty() {
+            return Some(Cow::Borrowed(suffix));
+        }
+        let target = Url::parse(&format!(
+            "{}://{}{suffix}",
+            self.origin_scheme, self.origin_host
+        ))
+        .ok()?;
+        let path = self.serving_path(target.path())?;
+        Some(Cow::Owned(format!(
+            "{path}{}",
+            &target[url::Position::AfterPath..]
+        )))
+    }
+
+    /// The serving-host path for `path`, a path on the origin host, being
+    /// `path` without [`Self::origin_path`], or [`None`] when `path` is outside
+    /// that folder. The folder counts only where it ends at a `/`, so
+    /// `/bucket/site` does not come off `/bucket/sitemap.xml`.
+    fn serving_path<'b>(&self, path: &'b str) -> Option<&'b str> {
+        let path = path
+            .strip_prefix(self.origin_path.trim_end_matches('/'))
+            .filter(|path| path.is_empty() || path.starts_with('/'))?;
+        Some(if path.is_empty() { "/" } else { path })
     }
 
     /// Rewrite a navigation target (`Location`, `Refresh`), unless rewriting
@@ -195,7 +239,7 @@ impl OriginHeaderRewrite<'_> {
             Some((path, query)) => (path, Some(query)),
             None => (self.request_path_and_query, None),
         };
-        target.path() == request_path && target.query() == request_query
+        self.serving_path(target.path()) == Some(request_path) && target.query() == request_query
     }
 
     /// Strip the origin authority from the start of `rest`, returning the
@@ -208,15 +252,27 @@ impl OriginHeaderRewrite<'_> {
 
     /// Build the serving-host CSP source for a source expression naming the
     /// origin, or [`None`] when the expression names something else.
+    ///
+    /// A source with no path permits every path on the origin, so its sibling
+    /// names the whole serving host even when the origin is a folder.
     fn csp_source_for(&self, source: &str) -> Option<String> {
         if source.starts_with('\'') {
             return None;
         }
+        let rest = source.split_once("://").map_or(source, |(_, rest)| rest);
+        let mapping = if self.strip_origin_authority(rest)?.is_empty() {
+            OriginHeaderRewrite {
+                origin_path: "",
+                ..*self
+            }
+        } else {
+            *self
+        };
         if source.contains("://") {
-            return self.rewrite_url(source);
+            return mapping.rewrite_url(source);
         }
-        let suffix = self.strip_origin_authority(source)?;
-        Some(format!("{}{suffix}", self.request_host))
+        let suffix = mapping.serving_suffix(mapping.strip_origin_authority(source)?)?;
+        Some(format!("{}{suffix}", mapping.request_host))
     }
 }
 
@@ -232,6 +288,7 @@ impl OriginHeaderRewrite<'_> {
 /// let rewrite = OriginHeaderRewrite {
 ///     origin_host: "origin.example.com",
 ///     origin_host_header: "origin.example.com",
+///     origin_path: "",
 ///     request_host: "www.example.com",
 ///     request_scheme: "https",
 ///     origin_scheme: "https",
@@ -564,11 +621,21 @@ mod tests {
     const REWRITE: OriginHeaderRewrite<'static> = OriginHeaderRewrite {
         origin_host: "origin.example.com",
         origin_host_header: "origin.example.com",
+        origin_path: "",
         request_host: "www.example.com",
         request_scheme: "https",
         origin_scheme: "http",
         request_path_and_query: "/current?page=1",
         request_is_get_or_head: false,
+    };
+
+    /// An origin that is a folder of object storage, served at `www.example.com`.
+    const FOLDER: OriginHeaderRewrite<'static> = OriginHeaderRewrite {
+        origin_host: "storage.example.com",
+        origin_host_header: "storage.example.com",
+        origin_path: "/bucket/site",
+        origin_scheme: "https",
+        ..REWRITE
     };
 
     fn rewritten(name: &HeaderName, values: &[&str]) -> Vec<String> {
@@ -645,6 +712,7 @@ mod tests {
         let rewrite = OriginHeaderRewrite {
             origin_host: "127.0.0.1:8301",
             origin_host_header: "127.0.0.1:8301",
+            origin_path: "",
             request_host: "127.0.0.1:3031",
             request_scheme: "http",
             origin_scheme: "http",
@@ -1062,6 +1130,163 @@ mod tests {
                 "should leave `{value}` unchanged"
             );
         }
+    }
+
+    #[test]
+    fn folder_origin_maps_urls_in_the_folder_without_it() {
+        // (why, URL on the origin, URL on the serving host)
+        let cases = [
+            (
+                "a path in the folder loses the folder",
+                "https://storage.example.com/bucket/site/about/",
+                "https://www.example.com/about/",
+            ),
+            (
+                "the query and the fragment are kept",
+                "https://storage.example.com/bucket/site/about/index.html?v=2#team",
+                "https://www.example.com/about/index.html?v=2#team",
+            ),
+            (
+                "the folder itself is the serving host's root",
+                "https://storage.example.com/bucket/site",
+                "https://www.example.com/",
+            ),
+            (
+                "the folder with a closing slash is the serving host's root",
+                "https://storage.example.com/bucket/site/",
+                "https://www.example.com/",
+            ),
+            (
+                "a dot segment that stays in the folder is resolved first",
+                "https://storage.example.com/bucket/site/about/../news/",
+                "https://www.example.com/news/",
+            ),
+            (
+                "a protocol-relative URL stays protocol-relative",
+                "//storage.example.com/bucket/site/about/",
+                "//www.example.com/about/",
+            ),
+        ];
+        for (why, url, expected) in cases {
+            assert_eq!(
+                FOLDER.rewrite_url(url).as_deref(),
+                Some(expected),
+                "should map `{url}`: {why}"
+            );
+        }
+
+        let closing_slash = OriginHeaderRewrite {
+            origin_path: "/bucket/site/",
+            ..FOLDER
+        };
+        assert_eq!(
+            closing_slash
+                .rewrite_url("https://storage.example.com/bucket/site/about/")
+                .as_deref(),
+            Some("https://www.example.com/about/"),
+            "should read a folder written with a closing slash as the same folder"
+        );
+        let whole_host = OriginHeaderRewrite {
+            origin_path: "/",
+            ..FOLDER
+        };
+        assert_eq!(
+            whole_host
+                .rewrite_url("https://storage.example.com/bucket/site/about/")
+                .as_deref(),
+            Some("https://www.example.com/bucket/site/about/"),
+            "should take nothing off for an origin path of `/`"
+        );
+    }
+
+    #[test]
+    fn folder_origin_leaves_urls_outside_the_folder_unchanged() {
+        // (why, URL on the origin host)
+        let cases = [
+            (
+                "another folder of the host",
+                "https://storage.example.com/bucket/other/about/",
+            ),
+            (
+                "the folder counts only where it ends at a separator",
+                "https://storage.example.com/bucket/sitemap.xml",
+            ),
+            (
+                "a folder whose name starts with the folder's is another folder",
+                "https://storage.example.com/bucket/site-two/about/",
+            ),
+            (
+                "the host's root is above the folder",
+                "https://storage.example.com/",
+            ),
+            (
+                "a URL that stops at the host names its root",
+                "https://storage.example.com",
+            ),
+            (
+                "a dot segment that climbs out of the folder is outside it",
+                "https://storage.example.com/bucket/site/../other/about/",
+            ),
+            (
+                "a path in another letter case is another path",
+                "https://storage.example.com/Bucket/Site/about/",
+            ),
+        ];
+        for (why, url) in cases {
+            assert_eq!(
+                FOLDER.rewrite_url(url),
+                None,
+                "should leave `{url}` unchanged: {why}"
+            );
+        }
+    }
+
+    #[test]
+    fn folder_origin_keeps_redirects_to_the_current_request_that_would_loop() {
+        let rewrite = OriginHeaderRewrite {
+            request_path_and_query: "/news?page=2",
+            request_is_get_or_head: true,
+            ..FOLDER
+        };
+        assert_eq!(
+            rewrite.rewrite_location("http://storage.example.com/bucket/site/news?page=2", true),
+            None,
+            "should keep a scheme change to the current request in the folder"
+        );
+        assert_eq!(
+            rewrite.rewrite_location("https://storage.example.com/bucket/site/news?page=2", false),
+            None,
+            "should keep a cookieless GET redirect to the current request in the folder"
+        );
+        assert_eq!(
+            rewrite
+                .rewrite_location(
+                    "https://storage.example.com/bucket/site/news/?page=2",
+                    false
+                )
+                .as_deref(),
+            Some("https://www.example.com/news/?page=2"),
+            "should map a redirect to another address in the folder"
+        );
+    }
+
+    #[test]
+    fn folder_origin_csp_sources_follow_the_folder() {
+        assert_eq!(
+            rewrite_csp(
+                "img-src https://storage.example.com storage.example.com/bucket/site/img/ \
+                 storage.example.com/bucket/other/",
+                &FOLDER,
+            )
+            .as_deref(),
+            Some(
+                "img-src https://storage.example.com https://www.example.com \
+                 storage.example.com/bucket/site/img/ www.example.com/img/ \
+                 storage.example.com/bucket/other/"
+            ),
+            "should give a source with no path the whole serving host, map one in the \
+             folder without it, and add nothing beside one outside it"
+        );
     }
 
     #[test]
