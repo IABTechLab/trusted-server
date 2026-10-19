@@ -44,9 +44,12 @@ const FIXTURE_TRUST: &str = "TS_TEST_AXUM_TRUST";
 #[test]
 #[ignore = "server fixture invoked only by proxy integration tests"]
 fn trusted_server_fixture() {
+    // Direct ignored-test runs have no parent process to serve.
+    let Ok(addr) = std::env::var(FIXTURE_ADDR) else {
+        return;
+    };
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-    let addr: SocketAddr = std::env::var(FIXTURE_ADDR)
-        .expect("should supply the fixture listener address")
+    let addr: SocketAddr = addr
         .parse()
         .expect("should parse the fixture listener address");
     let origin = std::env::var(FIXTURE_ORIGIN).expect("should supply the publisher origin");

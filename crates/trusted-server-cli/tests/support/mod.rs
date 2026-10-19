@@ -1750,7 +1750,7 @@ struct Echo {
     path: String,
 }
 
-/// Parses `host=..;orig=..;fwd=..;origin=..;path=..` echoed by the upstream.
+/// Parses `host=..;orig=..;fwd=..;origin=..;proto=..;auth=..;path=..` echoed by the upstream.
 fn parse_echo(body: &str) -> Echo {
     let mut echo = Echo::default();
     for field in body.split(';') {

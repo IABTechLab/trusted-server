@@ -302,6 +302,172 @@ fn insecure_mode_warns_before_startup_failure() {
     );
 }
 
+#[test]
+fn forwarder_token_warns_only_for_unprotected_non_loopback_upstreams() {
+    let directory = tempfile::tempdir().expect("should create temporary proxy directory");
+    let invalid_ca_dir = directory.path().join("not-a-directory");
+    std::fs::write(&invalid_ca_dir, "fictional CA blocker")
+        .expect("should prevent CA startup without opening a listener");
+    let token = "fictional-forwarder-token-0123456789";
+    let token_file = directory.path().join("forwarder-token");
+    std::fs::write(&token_file, token).expect("should write fictional token");
+    for (options, credential, expected_warning) in [
+        (
+            &["--map", "a.example.com=192.0.2.10", "--upstream-plaintext"][..],
+            true,
+            true,
+        ),
+        (
+            &[
+                "--map",
+                "a.example.com=[2001:db8::1]",
+                "--upstream-plaintext",
+            ][..],
+            true,
+            true,
+        ),
+        (
+            &[
+                "--map",
+                "a.example.com=upstream.example.com",
+                "--upstream-plaintext",
+            ][..],
+            true,
+            true,
+        ),
+        (
+            &["--map", "a.example.com=upstream.example.com", "--insecure"][..],
+            true,
+            true,
+        ),
+        (
+            &["--map", "a.example.com=upstream.example.com"][..],
+            true,
+            false,
+        ),
+        (
+            &["--map", "a.example.com=127.0.0.1", "--upstream-plaintext"][..],
+            true,
+            false,
+        ),
+        (
+            &["--map", "a.example.com=127.7.8.9", "--upstream-plaintext"][..],
+            true,
+            false,
+        ),
+        (
+            &["--map", "a.example.com=[::1]", "--upstream-plaintext"][..],
+            true,
+            false,
+        ),
+        (
+            &["--map", "a.example.com=[::1]", "--insecure"][..],
+            true,
+            false,
+        ),
+        (
+            &[
+                "--map",
+                "a.example.com=upstream.example.com",
+                "--upstream-plaintext",
+                "--resolve",
+                "upstream.example.com:127.0.0.1",
+            ][..],
+            true,
+            false,
+        ),
+        (
+            &[
+                "--map",
+                "a.example.com=upstream.example.com",
+                "--insecure",
+                "--resolve",
+                "upstream.example.com:::1",
+            ][..],
+            true,
+            false,
+        ),
+        (
+            &[
+                "--map",
+                "a.example.com=upstream.example.com",
+                "--insecure",
+                "--resolve",
+                "upstream.example.com:192.0.2.10",
+            ][..],
+            true,
+            true,
+        ),
+        (
+            &[
+                "--map",
+                "a.example.com=127.0.0.1",
+                "--upstream-plaintext",
+                "--resolve",
+                "127.0.0.1:192.0.2.10",
+            ][..],
+            true,
+            true,
+        ),
+        (
+            &[
+                "--map",
+                "a.example.com=192.0.2.10",
+                "--upstream-plaintext",
+                "--resolve",
+                "192.0.2.10:127.0.0.1",
+            ][..],
+            true,
+            false,
+        ),
+        (
+            &[
+                "--map",
+                "a.example.com=127.0.0.1",
+                "--map",
+                "b.example.com=192.0.2.10",
+                "--upstream-plaintext",
+            ][..],
+            true,
+            true,
+        ),
+        (
+            &["--map", "a.example.com=192.0.2.10", "--upstream-plaintext"][..],
+            false,
+            false,
+        ),
+    ] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ts"));
+        command
+            .args([
+                "dev",
+                "proxy",
+                "--ca-dir",
+                invalid_ca_dir.to_str().expect("should encode CA path"),
+            ])
+            .args(options);
+        if credential {
+            command.arg("--forwarder-secret-file").arg(&token_file);
+        }
+        let output = command.output().expect("should run proxy startup");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !output.status.success(),
+            "should fail startup with an unusable CA directory"
+        );
+        assert_eq!(
+            stderr.contains("--forwarder-secret-file token crosses"),
+            expected_warning,
+            "should warn for the effective upstream transport and address: {options:?}; stderr: {stderr}"
+        );
+        assert!(
+            !stderr.contains(token) && !stdout.contains(token),
+            "should omit token bytes from diagnostics"
+        );
+    }
+}
+
 #[tokio::test]
 async fn keep_alive_serves_multiple_sequential_requests() {
     let upstream = support::start_echo_upstream().await;

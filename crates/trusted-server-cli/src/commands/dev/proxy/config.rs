@@ -10,7 +10,7 @@ use hyper::header::HeaderValue;
 
 use super::ProxyArgs;
 use super::rewrite::{Authority, Rule, RuleTable};
-use super::upstream::key::AddressPolicy;
+use super::upstream::key::{AddressPolicy, ReferenceIdentity, Transport, VerifyMode};
 
 /// Errors from configuration resolution.
 #[derive(Debug, derive_more::Display)]
@@ -47,8 +47,8 @@ pub enum ConfigError {
     )]
     BasicAuthNonLoopback { value: String },
     /// The forwarding token file could not be read.
-    #[display("cannot read --forwarder-secret-file")]
-    ForwarderSecretFile,
+    #[display("cannot read --forwarder-secret-file `{path}`")]
+    ForwarderSecretFile { path: String },
     /// The forwarding token was invalid.
     #[display("--forwarder-secret-file must contain at least 32 ASCII graphic bytes on one line")]
     ForwarderSecret,
@@ -101,7 +101,7 @@ impl core::fmt::Debug for BasicAuth {
 }
 
 /// Authentication header shared with Trusted Server's trusted-forwarder configuration.
-pub const FORWARDER_AUTH_HEADER: &str = "x-ts-forwarder-auth";
+pub use trusted_server_core::forwarder::FORWARDER_AUTH_HEADER;
 
 /// A validated forwarding token whose debug representation is redacted.
 #[derive(Clone)]
@@ -362,7 +362,8 @@ pub fn resolve(args: &ProxyArgs) -> Result<ResolvedConfig, Report<ConfigError>> 
         .forwarder_secret_file
         .as_ref()
         .map(|path| {
-            let raw = std::fs::read(path).map_err(|_| ConfigError::ForwarderSecretFile)?;
+            let raw = std::fs::read(path)
+                .map_err(|_| ConfigError::ForwarderSecretFile { path: path.clone() })?;
             ForwarderSecret::parse(&raw)
         })
         .transpose()
@@ -374,6 +375,13 @@ pub fn resolve(args: &ProxyArgs) -> Result<ResolvedConfig, Report<ConfigError>> 
         if let Some(address) = resolve.get(rule.to.host()) {
             rule.set_address_policy(AddressPolicy::Resolve(*address));
         }
+    }
+
+    if forwarder_upstream_warning_needed(&rules, forwarder_secret.as_ref()) {
+        log::warn!(
+            "--forwarder-secret-file token crosses a cleartext or unverified upstream connection \
+             outside loopback; use verified TLS or a loopback destination"
+        );
     }
 
     // A `--resolve HOST:IP` whose HOST matches no rule's TO host is almost
@@ -398,6 +406,24 @@ pub fn resolve(args: &ProxyArgs) -> Result<ResolvedConfig, Report<ConfigError>> 
         ca_dir,
         resolve,
         connect_timeout: std::time::Duration::from_secs(args.connect_timeout),
+    })
+}
+
+fn forwarder_upstream_warning_needed(
+    rules: &RuleTable,
+    forwarder_secret: Option<&ForwarderSecret>,
+) -> bool {
+    forwarder_secret.is_some() && rules.0.iter().any(|rule| {
+        let key = rule.origin_key();
+        let unprotected =
+            key.transport() == Transport::Plaintext || key.verify_mode() == VerifyMode::Insecure;
+        let loopback = match key.address_policy() {
+            AddressPolicy::Resolve(address) => address.is_loopback(),
+            AddressPolicy::Dns => {
+                matches!(key.reference(), ReferenceIdentity::Ip(address) if address.is_loopback())
+            }
+        };
+        unprotected && !loopback
     })
 }
 
@@ -561,7 +587,7 @@ mod tests {
     }
 
     #[test]
-    fn forwarder_secret_file_read_failure_is_redacted() {
+    fn forwarder_secret_file_read_failure_reports_path() {
         let dir = tempfile::tempdir().expect("should create temporary directory");
         let path = dir.path().join("missing");
         let args = parse_args(&[
@@ -573,8 +599,17 @@ mod tests {
         ]);
         let error = resolve(&args).expect_err("should reject missing token file");
         assert!(
-            matches!(error.current_context(), ConfigError::ForwarderSecretFile),
+            matches!(
+                error.current_context(),
+                ConfigError::ForwarderSecretFile { .. }
+            ),
             "should report file error"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains(path.to_str().expect("should encode missing token path")),
+            "should identify the unreadable token file without disclosing token contents"
         );
     }
 
