@@ -3051,16 +3051,9 @@ impl Settings {
     /// - [`TrustedServerError::Configuration`] if the TOML is invalid or missing required fields
     #[cfg(test)]
     pub fn from_toml_and_env(toml_str: &str) -> Result<Self, Report<TrustedServerError>> {
-        // Cargo also exposes rustc-env build metadata while running tests.
-        // The git version is not a Settings field; keep rejecting all other
-        // unknown keys rather than admitting build metadata into the schema.
-        let settings_environment = std::env::vars()
-            .filter(|(key, _)| !key.eq_ignore_ascii_case("TRUSTED_SERVER__GIT_VERSION"))
-            .collect();
         let environment = Environment::default()
             .prefix(ENVIRONMENT_VARIABLE_PREFIX)
-            .separator(ENVIRONMENT_VARIABLE_SEPARATOR)
-            .source(Some(settings_environment));
+            .separator(ENVIRONMENT_VARIABLE_SEPARATOR);
 
         let toml = File::from_str(toml_str, FileFormat::Toml);
         let config = Config::builder()
@@ -6282,27 +6275,6 @@ source_domain = "partner.example.com"
                 assert_eq!(
                     settings.expect("should load settings").publisher.origin_url,
                     "https://change-publisher.com"
-                );
-            },
-        );
-    }
-
-    #[test]
-    fn legacy_settings_loader_ignores_build_git_version() {
-        temp_env::with_vars(
-            [
-                ("TRUSTED_SERVER__GIT_VERSION", Some("v1.2.3")),
-                (
-                    "TRUSTED_SERVER__PUBLISHER__ORIGIN_URL",
-                    Some("https://origin.example.com"),
-                ),
-            ],
-            || {
-                let settings = Settings::from_toml_and_env(&crate_test_settings_str())
-                    .expect("should ignore build metadata while applying settings overrides");
-                assert_eq!(
-                    settings.publisher.origin_url, "https://origin.example.com",
-                    "should still apply runtime settings overrides"
                 );
             },
         );
