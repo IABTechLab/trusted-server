@@ -170,3 +170,17 @@ Failures:
 - `D4 control: the first auction before window.load waits, on every build`: PASS, as intended
 
 D4 mechanism probe: a temporary copy of the suite without the `auctionDelay` assertion, run with `-t "D4"` against the same `main` sources, still fails the D4 arm at the body: `the first /auction should carry the delayed unifiedId: expected [ undefined ] to deeply equal [ Array(1) ]`. So on `main` the first auction after `window.load` goes out without `adserver.org`, not merely with a different setting. The copy was deleted and the sources restored.
+
+## Task 10: Delete the dead EID-to-module resolver
+
+Command:
+
+```bash
+cd crates/trusted-server-js/lib && mise exec node@24.12.0 -- npx vitest run test/integrations/prebid/user_id_modules.test.ts -t "no EID source metadata"
+```
+
+Failures:
+
+- `carries no EID source metadata`: `no entry should keep eidSources: expected [ 'connectIdSystem', …(10) ] to deeply equal []` (11 modules still carry `eidSources`)
+
+Green: after deleting `eidSources` and the resolver, `carries no EID source metadata` passes. The three targeted suites (`user_id_modules.test.ts`, `prebid-user-id-registry.test.mjs`, `build-prebid-external.test.mjs`) pass 81 of 81. `./scripts/test-cli.sh` exits 0. The full Vitest run under Node 24.12.0 passes 1249 of 1249 across 52 files.
