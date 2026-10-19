@@ -10,8 +10,10 @@
 //!
 //! The removed prefix travels on the request as a [`RemovedPathPrefix`]
 //! extension, where a module's request preparer or a handler reads it. Core
-//! never writes it into a response. A deployment whose pages must carry the
-//! prefix puts it back with a middleware of its own.
+//! writes it into a response only as the `Path` of the cookies core writes,
+//! see [`PublicPrefix::for_request`](crate::prefix::PublicPrefix::for_request).
+//! A deployment whose pages must carry the prefix, in their links for
+//! example, puts it back with a middleware of its own.
 
 use std::sync::Arc;
 
@@ -93,7 +95,9 @@ impl RequestAddress {
     /// An address that names `selector_values` in order, continues the
     /// request at `path` and records `removed_prefix` as the prefix removed.
     ///
-    /// The request's query is kept, so `path` carries none.
+    /// The request's query is kept, so `path` carries none. Any
+    /// `removed_prefix` is accepted, and where it cannot be a cookie's
+    /// `Path`, core writes the request's cookies under `/`.
     ///
     /// # Errors
     ///
@@ -172,9 +176,10 @@ impl RequestAddressing for ByHostAddressing {
 /// The path prefix a [`RequestAddressing`] removed from a request, carried
 /// as a request extension.
 ///
-/// Present only on a request a hook addressed. Putting the prefix back into
-/// a response, such as into the links of a page, is the deployment's job,
-/// done by a middleware of its own.
+/// Present only on a request a hook addressed. Core writes its own cookies
+/// under the prefix. Putting the prefix back into the rest of a response,
+/// such as into the links of a page, is the deployment's job, done by a
+/// middleware of its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemovedPathPrefix(String);
 
@@ -274,6 +279,30 @@ fn addressed_handler(
             router.oneshot(request).await
         })
     }
+}
+
+/// Whether `path` can be the `Path` attribute of a cookie.
+///
+/// It starts with `/` and holds only visible ASCII other than `;`, so
+/// written into a `Set-Cookie` header it cannot end the attribute and add
+/// another.
+#[must_use]
+pub fn is_cookie_path(path: &str) -> bool {
+    path.starts_with('/')
+        && path
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && byte != b';')
+}
+
+/// The `Path` core writes its cookies under on a request whose removed
+/// prefix is `prefix`, or `None` for `/`.
+///
+/// An empty prefix, `/` itself and a prefix that cannot be a cookie's `Path`
+/// all give `None`, so such a request writes and reads its cookies as a
+/// request with no removed prefix does.
+#[must_use]
+pub(crate) fn cookie_path_for(prefix: &str) -> Option<&str> {
+    (prefix != "/" && is_cookie_path(prefix)).then_some(prefix)
 }
 
 /// Whether `path` is one a request can continue with, which is a
@@ -412,6 +441,50 @@ mod tests {
                 "should refuse `{path}` as an invalid path"
             );
         }
+    }
+
+    /// The hook in this module's documentation, which addresses a request
+    /// by host when [`RequestAddress::new`] refuses it.
+    struct DocumentedHook;
+
+    impl RequestAddressing for DocumentedHook {
+        fn address(&self, _host: Option<&str>, path: &str) -> Addressing {
+            let rest = path.strip_prefix('/').unwrap_or(path);
+            let (segment, tail) = rest.split_once('/').unwrap_or((rest, ""));
+            RequestAddress::new(
+                vec![segment.to_owned()],
+                format!("/{tail}"),
+                format!("/{segment}"),
+            )
+            .map_or(Addressing::ByHost, Addressing::Addressed)
+        }
+    }
+
+    /// A removed prefix that cannot be a cookie's `Path` still addresses the
+    /// request, so an adapter that chooses a blob by the selector values
+    /// answers it as it answers any value with no blob. Core's cookies for
+    /// that request go under `/`.
+    #[test]
+    fn a_prefix_that_is_not_a_cookie_path_still_addresses_the_request() {
+        let Addressing::Addressed(address) =
+            DocumentedHook.address(Some("front.example"), "/a;b/news")
+        else {
+            panic!("should address `/a;b/news` by its first segment");
+        };
+        assert_eq!(address.selector_values(), ["a;b"]);
+        assert_eq!(address.path(), "/news");
+        assert_eq!(address.removed_prefix(), "/a;b");
+
+        let mut addressed = request("https://front.example/a;b/news", Some("front.example"));
+        address_request(&DocumentedHook, &mut addressed).expect("should address the request");
+        assert_eq!(addressed.uri().path(), "/news");
+        assert_eq!(
+            crate::prefix::PublicPrefix::default()
+                .for_request(&addressed)
+                .cookie_path(),
+            "/",
+            "a prefix holding `;` should never reach a cookie's `Path`"
+        );
     }
 
     #[test]

@@ -213,7 +213,8 @@ fn format_marker_cookie(public: &PublicPrefix, value: &str, max_age: u64) -> Str
     // request host, so a Domain attribute would allow replay across sibling
     // hosts that share the domain-wide EC cookie and passphrase.
     let name = public.cookie_name(COOKIE_EC_PULL_COMPLETE);
-    format!("{name}={value}; Path=/; Secure; SameSite=Lax; Max-Age={max_age}; HttpOnly")
+    let path = public.cookie_path();
+    format!("{name}={value}; Path={path}; Secure; SameSite=Lax; Max-Age={max_age}; HttpOnly")
 }
 
 #[cfg(test)]
@@ -731,5 +732,16 @@ mod tests {
             "ts-ec-pull-complete=value; Path=/; Secure; SameSite=Lax; Max-Age=3600; HttpOnly"
         );
         assert!(!cookie.contains("Domain="), "marker should be host-only");
+    }
+
+    #[test]
+    fn marker_cookie_is_under_the_removed_prefix_on_an_addressed_request() {
+        let public = PublicPrefix::default().under_path(Some("/publisher-a.example"));
+        let cookie = format_marker_cookie(&public, "value", MARKER_MAX_AGE_SECS);
+        assert_eq!(
+            cookie,
+            "ts-ec-pull-complete=value; Path=/publisher-a.example; Secure; SameSite=Lax; \
+             Max-Age=3600; HttpOnly"
+        );
     }
 }
