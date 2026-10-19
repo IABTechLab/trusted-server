@@ -2670,6 +2670,75 @@ describe('prebid/installPrebidNpm', () => {
       expect(readTsEidsCookie(), 'the cookie should be cleared').toBeUndefined();
     });
 
+    it('clears ts-eids when no EID fits the cookie budget but still sends the body', () => {
+      const debugSpy = vi.spyOn(log, 'debug').mockImplementation(() => {});
+      const spec = getAdapterSpec();
+      presetTsEidsCookie('preset-value');
+      const entry = { source: 'huge.example.com', uids: [{ id: 'h'.repeat(5000) }] };
+
+      const result = spec.buildRequests(
+        trustedServerBidRequests(),
+        prebidBidderRequest({ ext: { eids: [entry] } })
+      );
+
+      expect(JSON.parse(String(result.data)).eids, 'the body keeps the entry').toEqual([entry]);
+      expect(readTsEidsCookie(), 'the cookie should be cleared').toBeUndefined();
+      expect(debugSpy).toHaveBeenCalledWith('[tsjs-prebid] forwarding bidder EIDs', {
+        forwarded: 1,
+        unserializable: 0,
+        overBudget: 0,
+        cookie: 'cleared',
+      });
+    });
+
+    describe('when document.cookie writes throw', () => {
+      function withBlockedCookieWrites(run: () => void): void {
+        const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, 'cookie')!;
+        Object.defineProperty(document, 'cookie', {
+          configurable: true,
+          get: () => descriptor.get!.call(document),
+          set: () => {
+            throw new Error('cookies blocked');
+          },
+        });
+        try {
+          run();
+        } finally {
+          delete (document as unknown as Record<string, unknown>).cookie;
+        }
+      }
+
+      it('still builds the request with the entry when the cookie write fails', () => {
+        vi.spyOn(log, 'warn').mockImplementation(() => {});
+        const spec = getAdapterSpec();
+        const entry = { source: 'liveramp.com', uids: [{ id: 'lr-uid', atype: 3 }] };
+
+        withBlockedCookieWrites(() => {
+          const result = spec.buildRequests(
+            trustedServerBidRequests(),
+            prebidBidderRequest({ ext: { eids: [entry] } })
+          );
+
+          const payload = JSON.parse(String(result.data));
+          expect(payload.adUnits[0].code, 'the request should still be built').toBe('div-gpt-1');
+          expect(payload.eids, 'the body should carry the entry').toEqual([entry]);
+        });
+      });
+
+      it('still builds the request without eids when the cookie clear fails', () => {
+        vi.spyOn(log, 'warn').mockImplementation(() => {});
+        const spec = getAdapterSpec();
+
+        withBlockedCookieWrites(() => {
+          const result = spec.buildRequests(trustedServerBidRequests(), prebidBidderRequest({}));
+
+          const payload = JSON.parse(String(result.data));
+          expect(payload.adUnits[0].code, 'the request should still be built').toBe('div-gpt-1');
+          expect(payload.eids, 'the body should carry no eids').toBeUndefined();
+        });
+      });
+    });
+
     it('sends no eids and leaves ts-eids alone without a bidder request object', () => {
       const debugSpy = vi.spyOn(log, 'debug').mockImplementation(() => {});
       const spec = getAdapterSpec();

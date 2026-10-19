@@ -2838,7 +2838,11 @@ type EidCookieDecision = 'written' | 'trimmed' | 'cleared';
 
 /** Clears any previously persisted Prebid EIDs cookie. */
 function clearPrebidEidsCookie(): void {
-  document.cookie = `${EID_COOKIE_NAME}=; Path=/; Secure; SameSite=Lax; Max-Age=0`;
+  try {
+    document.cookie = `${EID_COOKIE_NAME}=; Path=/; Secure; SameSite=Lax; Max-Age=0`;
+  } catch {
+    log.warn('[tsjs-prebid] failed to clear the ts-eids cookie');
+  }
 }
 
 /**
