@@ -40,7 +40,7 @@ pub fn copy_custom_headers(from: &Request<EdgeBody>, to: &mut Request<EdgeBody>)
 /// Fastly adapter may first consume an authenticated `fastly-client-ip`, but
 /// removes it before routing along with every other listed header. Stripping
 /// them forces [`RequestInfo::from_request`] to fall back to the trustworthy
-/// `Host` header and [`ClientInfo`] TLS detection.
+/// `Host` header or URI authority and [`ClientInfo`] TLS detection.
 pub const SPOOFABLE_FORWARDED_HEADERS: &[&str] = &[
     "forwarded",
     "x-forwarded-host",
@@ -123,23 +123,24 @@ pub fn is_navigation_request(req: &Request<EdgeBody>) -> bool {
 /// The parser checks forwarded headers (`Forwarded`, `X-Forwarded-Host`,
 /// `X-Forwarded-Proto`) as fallbacks, but on the Fastly edge
 /// [`sanitize_forwarded_headers`] strips those headers before this method is
-/// called, so the `Host` header and Fastly SDK TLS detection are the effective
-/// sources in production.
+/// called, so the `Host` header (falling back to URI authority) and Fastly SDK
+/// TLS detection are the effective sources in production.
 #[derive(Debug, Clone)]
 pub struct RequestInfo {
-    /// The effective host for URL rewriting (typically the `Host` header after edge sanitization).
+    /// The effective host for URL rewriting (`Host` or URI authority after edge sanitization).
     pub host: String,
     /// The effective scheme (typically from Fastly SDK TLS detection after edge sanitization).
     pub scheme: String,
 }
 
 impl RequestInfo {
-    /// Extract request info from a Fastly request.
+    /// Extract host and scheme information from a request.
     ///
     /// Host fallback order (first present wins):
     /// 1. `Forwarded` header (`host=...`)
     /// 2. `X-Forwarded-Host`
     /// 3. `Host` header
+    /// 4. Request URI authority (including any port)
     ///
     /// Scheme fallback order:
     /// 1. Fastly SDK TLS detection
@@ -149,8 +150,8 @@ impl RequestInfo {
     /// 5. Default `http`
     ///
     /// In production the forwarded headers are stripped by
-    /// [`sanitize_forwarded_headers`] at the edge, so `Host` and
-    /// [`ClientInfo`] TLS detection are the only sources that fire.
+    /// [`sanitize_forwarded_headers`] at the edge, so `Host` or URI authority
+    /// and [`ClientInfo`] TLS detection are the effective sources.
     pub fn from_request(req: &Request<EdgeBody>, client_info: &ClientInfo) -> Self {
         let host = extract_request_host(req);
         let scheme = detect_request_scheme(
@@ -179,6 +180,7 @@ fn extract_request_host(req: &Request<EdgeBody>) -> String {
                 .get(header::HOST)
                 .and_then(|h| h.to_str().ok())
         })
+        .or_else(|| req.uri().authority().map(http::uri::Authority::as_str))
         .unwrap_or_default()
         .to_owned()
 }
@@ -571,6 +573,81 @@ mod tests {
     }
 
     // RequestInfo tests
+
+    #[test]
+    fn request_info_uses_uri_authority_without_host_headers() {
+        for (uri, expected_host) in [
+            (
+                "https://publisher.example.com/page",
+                "publisher.example.com",
+            ),
+            (
+                "https://publisher.example.com:8443/page",
+                "publisher.example.com:8443",
+            ),
+            ("https://[2001:db8::1]:8443/page", "[2001:db8::1]:8443"),
+        ] {
+            let req = Request::builder()
+                .version(http::Version::HTTP_2)
+                .uri(uri)
+                .body(EdgeBody::empty())
+                .expect("should build authority-only HTTP/2 request");
+            assert!(req.headers().is_empty(), "should have no host headers");
+
+            let info = RequestInfo::from_request(&req, &default_client_info());
+
+            assert_eq!(
+                info.host, expected_host,
+                "should preserve URI authority including ports and IPv6 brackets"
+            );
+        }
+    }
+
+    #[test]
+    fn request_info_preserves_host_header_precedence_over_uri_authority() {
+        for (headers, expected_host) in [
+            (vec![("host", "header.example.com")], "header.example.com"),
+            (
+                vec![
+                    ("host", "header.example.com"),
+                    ("x-forwarded-host", "proxy.example.com"),
+                ],
+                "proxy.example.com",
+            ),
+            (
+                vec![
+                    ("host", "header.example.com"),
+                    ("x-forwarded-host", "proxy.example.com"),
+                    ("forwarded", "host=public.example.com"),
+                ],
+                "public.example.com",
+            ),
+        ] {
+            let mut req = build_request(Method::GET, "https://authority.example.com/page");
+            for (name, value) in headers {
+                set_header(&mut req, name, value);
+            }
+
+            let info = RequestInfo::from_request(&req, &default_client_info());
+
+            assert_eq!(
+                info.host, expected_host,
+                "should preserve forwarded and explicit host precedence over URI authority"
+            );
+        }
+    }
+
+    #[test]
+    fn request_info_keeps_empty_host_without_headers_or_uri_authority() {
+        let req = build_request(Method::GET, "/page");
+
+        let info = RequestInfo::from_request(&req, &default_client_info());
+
+        assert!(
+            info.host.is_empty(),
+            "should keep the host empty when no host source is available"
+        );
+    }
 
     #[test]
     fn test_request_info_from_host_header() {

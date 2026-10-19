@@ -19435,6 +19435,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn publisher_request_rewrites_http2_html_without_host_headers() {
+        let mut settings = create_test_settings();
+        settings.publisher.origin_url = "https://origin.example.com".to_owned();
+        let registry =
+            IntegrationRegistry::new(&settings).expect("should create integration registry");
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response_with_headers(
+            200,
+            b"<html><head></head><body><a href=\"https://origin.example.com/article\">Article</a></body></html>".to_vec(),
+            vec![("content-type", "text/html; charset=utf-8")],
+        );
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let req = HttpRequest::builder()
+            .version(http::Version::HTTP_2)
+            .uri("https://publisher.example.com:8443/page")
+            .header("x-forwarded-proto", "https")
+            .header("sec-fetch-dest", "document")
+            .body(EdgeBody::empty())
+            .expect("should build authority-only publisher request");
+        for name in ["forwarded", "x-forwarded-host", "host"] {
+            assert!(
+                !req.headers().contains_key(name),
+                "should have no {name} header"
+            );
+        }
+
+        let publisher_response = run_publisher_proxy(&settings, &services, req).await;
+        let response = buffer_publisher_response_async(
+            publisher_response,
+            &Method::GET,
+            &settings,
+            &registry,
+            &AuctionOrchestrator::new(settings.auction.clone()),
+            &services,
+        )
+        .await
+        .expect("should buffer processed publisher response");
+        let html = response_body_string(response);
+
+        assert!(
+            html.contains("href=\"https://publisher.example.com:8443/article\""),
+            "should rewrite origin links using URI authority: {html}"
+        );
+        assert!(
+            html.contains("id=\"trustedserver-js\""),
+            "should inject the Trusted Server script: {html}"
+        );
+    }
+
+    #[tokio::test]
     async fn publisher_request_sends_configured_host_header_override() {
         let mut settings = create_test_settings();
         settings.publisher.origin_host_header_override = Some("www.example.com".to_string());
