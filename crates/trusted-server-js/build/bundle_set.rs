@@ -75,13 +75,13 @@ pub(crate) fn expected_module_ids(
     Ok(ids)
 }
 
-/// The folders directly inside `dir`, or none when it does not exist.
+/// The folders directly inside `dir`, or none when it is not a folder.
 ///
 /// # Errors
 ///
-/// Returns a message when `dir` exists but cannot be read.
+/// Returns a message when `dir` is a folder but cannot be read.
 pub(crate) fn folders_in(dir: &Path) -> Result<Vec<PathBuf>, String> {
-    if !dir.exists() {
+    if !dir.is_dir() {
         return Ok(Vec::new());
     }
     let entries = fs::read_dir(dir)

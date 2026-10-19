@@ -86,11 +86,18 @@ describe('the settings editors find for crate scripts', () => {
       fs.readFileSync(path.join(libDir, '..', '..', '.prettierrc.json'), 'utf8')
     );
 
-    expect(crates.overrides).toEqual([{ files: '*/*/js/{src,test}/**', options: own }]);
+    expect(crates.overrides).toEqual([
+      {
+        files: ['*/*/js/{src,test}/**', '.prettierrc.json', 'eslint.config.js', 'tsconfig.json'],
+        options: own,
+      },
+    ]);
   });
 
   it('extend this crate TypeScript settings', () => {
-    const crates = JSON.parse(fs.readFileSync(path.join(libDir, '..', '..', 'tsconfig.json'), 'utf8'));
+    const crates = JSON.parse(
+      fs.readFileSync(path.join(libDir, '..', '..', 'tsconfig.json'), 'utf8')
+    );
 
     expect(crates.extends).toBe('./trusted-server-js/lib/tsconfig.json');
   });

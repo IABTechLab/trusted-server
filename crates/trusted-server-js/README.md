@@ -15,12 +15,12 @@ Prebid's shim and the APS renderer, which are still under
 import an npm package, because packages resolve only from this crate's
 `node_modules`. `tsconfig.json` lists each crate's `js/src` folder for
 `@tsjs/module`, and a test checks the list. The `crates` folder holds a
-`tsconfig.json`, an ESLint config and a Prettier config that apply this
-crate's settings to crate scripts in an editor. Cargo reruns the build when a
-watched script folder changes, and a crate's first `js/src` folder is watched
-from the next build that runs for another reason, so touch `lib/package.json`
-after adding one. Cargo builds the
-bundles into a private directory under its `OUT_DIR` and fails if any expected
+`tsconfig.json` and a Prettier config that editors find for crate scripts,
+and an ESLint config that `npm run lint` uses from the crates folder. Cargo
+reruns the build when a watched script folder changes, and a crate's first
+`js/src` folder is watched from the next build that runs for another reason,
+so touch `lib/package.json` after adding one. Cargo builds the bundles into a
+private directory under its `OUT_DIR` and fails if any expected
 bundle is missing or empty; the `dist` directory is written only by a manual
 `npm run build` (for browser tests) and is never embedded unless you pass it
 explicitly through `TSJS_PREBUILT_DIR`. The external Prebid.js artifact is

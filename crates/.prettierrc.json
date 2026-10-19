@@ -1,7 +1,7 @@
 {
   "overrides": [
     {
-      "files": "*/*/js/{src,test}/**",
+      "files": ["*/*/js/{src,test}/**", ".prettierrc.json", "eslint.config.js", "tsconfig.json"],
       "options": {
         "semi": true,
         "singleQuote": true,

@@ -33,6 +33,9 @@ fn main() {
         "lib/src",
         "lib/build-all.mjs",
         "lib/build-module-options.mjs",
+        // Vite reads the nearest tsconfig.json when it compiles a script, and
+        // for a module script in another crate that is this one.
+        "../tsconfig.json",
         "lib/build-prebid-external.mjs",
         "lib/package.json",
         "lib/package-lock.json",

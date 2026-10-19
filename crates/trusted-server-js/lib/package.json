@@ -13,8 +13,8 @@
     "lint": "eslint . --max-warnings=0 && npm run lint:crates",
     "lint:crates": "cd ../.. && eslint --max-warnings=0 \"*/*/js/{src,test}/**/*.{ts,tsx,js,mjs}\"",
     "lint:fix": "eslint --fix . --max-warnings=0 && cd ../.. && eslint --fix --max-warnings=0 \"*/*/js/{src,test}/**/*.{ts,tsx,js,mjs}\"",
-    "format": "prettier --check \"**/*.{ts,tsx,js,json,css,md}\" && prettier --check \"../../*/*/js/{src,test}/**/*.{ts,tsx,js,json,css,md}\"",
-    "format:write": "prettier --write \"**/*.{ts,tsx,js,json,css,md}\" && prettier --write \"../../*/*/js/{src,test}/**/*.{ts,tsx,js,json,css,md}\""
+    "format": "prettier --check \"**/*.{ts,tsx,js,mjs,json,css,md}\" && prettier --check \"../../*/*/js/{src,test}/**/*.{ts,tsx,js,mjs,json,css,md}\" \"../../{.prettierrc.json,eslint.config.js,tsconfig.json}\"",
+    "format:write": "prettier --write \"**/*.{ts,tsx,js,mjs,json,css,md}\" && prettier --write \"../../*/*/js/{src,test}/**/*.{ts,tsx,js,mjs,json,css,md}\" \"../../{.prettierrc.json,eslint.config.js,tsconfig.json}\""
   },
   "dependencies": {
     "prebid.js": "^10.26.0"
