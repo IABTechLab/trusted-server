@@ -189,6 +189,7 @@ fn assert_environment(actual: &BTreeMap<String, String>, fixture: &Fixture, targ
             (format!("CC_{underscored}"), FIXTURE_CLANG.to_owned()),
             (format!("AR_{underscored}"), format!("{bin}/ar")),
             ("ZERO_AR_DATE".to_owned(), "1".to_owned()),
+            ("OPENSSL_CONF".to_owned(), "/dev/null".to_owned()),
         ] {
             expected.insert(name, value);
         }
