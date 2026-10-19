@@ -161,7 +161,7 @@ sequenceDiagram
       Note right of Client: Fragment-bound nonce and one-time acknowledgement<br/>No allow-same-origin on the outer frame
     else Ordinary creative
       Client->>Client: Inject winning creative<br/>Render iframe<br/>Load creative resources
-      Note right of Client: Default: first-party proxy/click URLs<br/>rewrite_creatives=false: asset URLs direct; clicks follow rewrite_clicks
+      Note right of Client: Default: first-party proxy/click URLs<br/>rewrite_creatives=false: asset URLs direct; links wrapped only if rewrite_clicks=true
     end
     deactivate Client
   end
@@ -652,8 +652,9 @@ rewrite_creatives = true
 
 The table below assumes `rewrite_clicks` is unset, so links follow
 `rewrite_creatives`. An explicit `rewrite_clicks` decides link wrapping and
-click-guard attributes on its own, and turns on creative TSJS injection on
-`POST /auction` even when `rewrite_creatives = false`; see
+click-guard attributes on its own; `rewrite_clicks = true` also drops a bidder
+`<base>` URL and injects creative TSJS on `POST /auction` even when
+`rewrite_creatives = false`. See
 [Assets and clicks](/guide/creative-processing#assets-and-clicks).
 
 | `sanitize_creatives` | `rewrite_creatives` | Winning-bid `adm` behavior                                                                                                              |
@@ -848,7 +849,9 @@ missing leaves or replace arrays, tables, maps, or rules. Existing configs must 
 `rewrite_creatives = true` and `sanitize_creatives = false` before relying on
 those scalar overrides. `rewrite_clicks` is unset by default; add
 `rewrite_clicks = true` or `false` under `[auction]` before relying on
-`TRUSTED_SERVER__AUCTION__REWRITE_CLICKS`. Edit and re-push TOML for other values. Provider map
+`TRUSTED_SERVER__AUCTION__REWRITE_CLICKS`; with `rewrite_creatives = false`, no
+explicit value reproduces unset (see
+[Configuration](/guide/configuration#auction-configuration)). Edit and re-push TOML for other values. Provider map
 keys preserve hyphens, so `pbs-main` uses the `PBS-MAIN` segment and needs
 `env` shell syntax:
 

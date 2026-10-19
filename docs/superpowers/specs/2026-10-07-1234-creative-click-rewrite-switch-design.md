@@ -317,6 +317,16 @@ Callers:
 - No JavaScript changes. With clicks off no anchor carries `data-tsclick`, so the click guard still installs its listeners and attribute observer (`click.ts:483-511`) but never acts.
 - No change to `TsCreativeConfig`.
 
+## Consent and privacy
+
+Click wrapping decides whether a creative click carries the visitor's EC ID to the landing page. `/first-party/click` (`proxy.rs:1627-1668`) appends the request's `ts-ec` value to the landing URL and logs the click (target, referer, user agent, EC ID) at `info`. `/first-party/proxy` appends it to proxied asset requests (`forward_ec_id: true`, `proxy.rs:1592`).
+
+- `rewrite_clicks = false` stops landing-page forwarding on every path, including links in HTML fetched through `/first-party/proxy`.
+- `rewrite_clicks = true` with `rewrite_creatives = false` forwards it to landing pages while assets load direct.
+- Unset keeps today's behavior, including forwarding from links in HTML fetched through `/first-party/proxy` whatever `rewrite_creatives` says.
+
+Neither switch is a consent control. EC issuance stays consent-gated per jurisdiction, and neither endpoint re-checks consent at request time: both forward whatever EC ID the request carries. This design does not change that. The operator docs (`creative-processing.md`, Assets and clicks) and the `rewrite_clicks` CHANGELOG entry say which combinations forward the EC ID.
+
 ## Open decisions resolved
 
 ### 1. Switch name, table and type
@@ -346,6 +356,7 @@ Both run whenever the pass runs, which is when either switch is on.
 
 - Dropping the bidder base URL protects root-relative `/first-party/proxy` URLs, root-relative `/first-party/click` URLs and the root-relative `/static/tsjs=` script alike, so it is needed whichever feature is on. Leaving `<base>` alone in clicks-only mode is not safe: `/auction` click URLs are root-relative, and a bidder `href` would rebase them onto the bidder origin. On the inline path URLs are absolute, but the handling is kept for parity, as `inline_rewrite_strips_base_elements` (`creative.rs`) pins today.
 - `<base>` handling keeps `target` and drops only the base URL: the pass removes the `href` attribute and removes the element only when no `target` remains. Today the whole element is removed, which also drops `<base target="_blank">`, common in display creatives, so raw (unwrapped) links would open inside the iframe. `<base href>` without `target` is still removed outright, so default output is unchanged; only a `<base>` that carries `target` changes, to `<base target="…">`. The sanitizer still removes `<base>` entirely when `sanitize_creatives = true`.
+- Known gap on `POST /auction` and in proxied HTML: the injected click guard navigates wrapped links using only the anchor's own `target`, so a kept `<base target>` applies to raw links but not to wrapped ones. Resolving `<base target>` in the guard is tracked in #1392; until then, bidders should give links an explicit `target`.
 - Side effect in clicks-only mode (`rewrite_creatives = false`, `rewrite_clicks = true`): relative asset URLs that resolved against the bidder base now resolve against the document's own base. This matches today's default mode, where the base is removed too. Bidders that need assets to load in that mode must use absolute URLs. `creative-processing.md` says so.
 - TSJS injection on `/auction` with clicks on delivers the click guard, which is required.
 - TSJS injection on `/auction` with only clicks on does not reopen asset proxying in practice: `/auction` creatives render in a sandbox without `allow-same-origin` (`render.ts:14-29`), so the render guard's `signProxyUrl` returns early on an opaque origin (`proxy_sign.ts:40`) and script-inserted assets load direct. Independently, `/first-party/sign` checks no auction setting, so `rewrite_creatives = false` has never gated it; `creative-processing.md` says so.
@@ -457,7 +468,7 @@ Add a sibling of `auction_rewrite_setting_does_not_change_proxied_html_or_css_re
 - `auction/formats.rs`: one `convert_to_openrtb_response` test with clicks on and assets off. The `adm` has a wrapped anchor, a raw image and TSJS.
 - `publisher.rs`: one inline-path test, near the existing `rewrite_creatives` tests at `publisher.rs:22627`, with clicks off and assets on. The `adm` has a raw anchor and an absolute proxied image.
 
-No adapter-specific tests are needed. Every adapter calls the shared core functions.
+No adapter-specific tests are needed. The Fastly, Cloudflare, Spin and Axum adapters all route `/first-party/click` and `/first-party/proxy` to the shared core handlers, and none of them runs the creative rewrite pass or reads `rewrite_creatives` or `rewrite_clicks` itself, so the shared core tests cover every adapter.
 
 ### JavaScript
 
@@ -481,7 +492,7 @@ No changes and no new tests. The click guard's early return without `data-tsclic
 
 - Click URLs signed before a switch-off keep working, because `/first-party/click` and `/first-party/proxy-rebuild` stay routed.
 - The case-insensitive `exclude_domains` matching ships with whichever of #1231 and #1234 lands first, and that PR carries the CHANGELOG note.
-- Pre-existing and out of scope: a trailing-dot host such as `https://excluded.example.com./x` matches no `exclude_domains` entry, so it is still proxied and wrapped in both old and new code. Tracked as a follow-up shared with #1231 (for example, strip one trailing `.` before matching).
+- Pre-existing and out of scope: a trailing-dot host such as `https://excluded.example.com./x` matches no `exclude_domains` entry, so it is still proxied and wrapped in both old and new code. Tracked in #1393, shared with #1231, which also covers IDN entries (an entry written as `bücher.example` never matches the punycode `host_str()`) and warnings for entries that can never match.
 
 ## Documentation updates
 
@@ -515,7 +526,7 @@ No changes and no new tests. The click guard's early return without `data-tsclic
 | `crates/trusted-server-cli/tests/config_env_overlay.rs`  | Overlay tests.                                                                                      |
 | Documentation files listed above                         | As listed.                                                                                          |
 
-No dependency, adapter, routing or JavaScript changes are expected.
+No dependency, adapter, routing or JavaScript changes are expected. The Fastly, Cloudflare, Spin and Axum adapters need no changes because all four route `/first-party/click` and `/first-party/proxy` to the shared core handlers, and the switches are resolved inside core.
 
 ## Completion criteria
 
@@ -528,3 +539,9 @@ No dependency, adapter, routing or JavaScript changes are expected.
 - A config round-trip test shows the unset default is left out of the serialized blob.
 - The documentation and CHANGELOG updates above are made.
 - All CI gates in `AGENTS.md` pass.
+
+## Review log
+
+- Round 1 (agent-assisted review on spec PR #1249): found that the doc-update list missed operator text that the split makes false, and that the `renderGuard` caveat was wrong for the sandboxed `/auction` renderer. Expanded the Documentation updates table, rewrote decision 3 around the opaque-origin sandbox, and settled on keeping `<base target>` while dropping the base URL.
+- Round 2 (agent-assisted review on #1252): found contradictory docs for the asset/click split, an unstated `<base target>` change under the default config, imprecise CHANGELOG wording for the shared step, and an untested `http(s)` prefix check. Fixed the docs and CHANGELOG, stated the `<base target>` change, and added `ftp://`, `ws://` and `file://` test rows. Moved the click-guard `<base target>` gap to #1392 and IDN and trailing-dot matching to #1393.
+- Round 3 (agent-assisted review on #1252): found no consent and privacy section, no named adapters and no review log, plus documentation precision items. Added the Consent and privacy section, named the four adapters, cited #1392 and #1393, and added this log.

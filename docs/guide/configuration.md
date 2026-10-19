@@ -1936,16 +1936,16 @@ provider or bidder route.
 
 ### `[auction]`
 
-| Field                  | Type    | Default            | Description                                                                    |
-| ---------------------- | ------- | ------------------ | ------------------------------------------------------------------------------ |
-| `enabled`              | Boolean | `false`            | Enable the auction orchestrator                                                |
-| `sanitize_creatives`   | Boolean | `false`            | Strip executable markup from winning-bid `adm` before delivery                 |
-| `rewrite_creatives`    | Boolean | `true`             | Rewrite winning-bid asset URLs through first-party endpoints                   |
-| `rewrite_clicks`       | Boolean | unset              | Wrap creative links in `/first-party/click`; unset follows `rewrite_creatives` |
-| `timeout_ms`           | Integer | `2000`             | Logical auction budget in milliseconds                                         |
-| `mediator`             | String  | `None`             | Optional separate `adserver_mock` mediator                                     |
-| `creative_store`       | String  | `"creative_store"` | Deprecated; creatives are delivered inline                                     |
-| `allowed_context_keys` | Array   | `[]`               | Request context keys admitted into the auction                                 |
+| Field                  | Type    | Default            | Description                                                                                                  |
+| ---------------------- | ------- | ------------------ | ------------------------------------------------------------------------------------------------------------ |
+| `enabled`              | Boolean | `false`            | Enable the auction orchestrator                                                                              |
+| `sanitize_creatives`   | Boolean | `false`            | Strip executable markup from winning-bid `adm` before delivery                                               |
+| `rewrite_creatives`    | Boolean | `true`             | Rewrite winning-bid asset URLs through first-party endpoints                                                 |
+| `rewrite_clicks`       | Boolean | unset              | Wrap creative links in `/first-party/click`; unset follows `rewrite_creatives` (proxied HTML keeps wrapping) |
+| `timeout_ms`           | Integer | `2000`             | Logical auction budget in milliseconds                                                                       |
+| `mediator`             | String  | `None`             | Optional separate `adserver_mock` mediator                                                                   |
+| `creative_store`       | String  | `"creative_store"` | Deprecated; creatives are delivered inline                                                                   |
+| `allowed_context_keys` | Array   | `[]`               | Request context keys admitted into the auction                                                               |
 
 Creative markup delivered by `POST /auction` and the publisher SSAT/page-bids
 path is processed by two independent passes. With `sanitize_creatives = true`
@@ -1995,7 +1995,9 @@ remove that field's non-default value (and any environment override), run
 roll back the binary. Older binaries tie click wrapping to `rewrite_creatives`
 in both directions: rolling back from `rewrite_creatives = true` with
 `rewrite_clicks = false` turns click wrapping back on, and rolling back from
-`rewrite_creatives = false` with `rewrite_clicks = true` turns it off.
+`rewrite_creatives = false` with `rewrite_clicks = true` turns it off. Rolling
+back from any `rewrite_clicks = false` also turns click wrapping back on in HTML
+fetched through `/first-party/proxy`.
 
 **Environment overlays:** The pinned EdgeZero loader cannot create missing TOML
 leaves. Existing configs must add **both** leaves under `[auction]`
@@ -2005,7 +2007,11 @@ leaves. Existing configs must add **both** leaves under `[auction]`
 missing leaf is silently ignored. `rewrite_clicks` is unset by default and so
 cannot appear as a TOML leaf until you set it; add `rewrite_clicks = true` or
 `false` under `[auction]` before relying on
-`TRUSTED_SERVER__AUCTION__REWRITE_CLICKS`.
+`TRUSTED_SERVER__AUCTION__REWRITE_CLICKS`. The leaf only preserves today's
+behavior when it matches what unset resolves to: with `rewrite_creatives =
+true`, `rewrite_clicks = true` does, but with `rewrite_creatives = false` no
+value does (`true` wraps auction links, `false` stops wrapping links in HTML
+fetched through `/first-party/proxy`).
 :::
 
 ### Provider map

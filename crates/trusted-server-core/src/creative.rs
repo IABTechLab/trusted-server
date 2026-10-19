@@ -1132,7 +1132,8 @@ pub fn rewrite_creative_html(settings: &Settings, markup: &str) -> String {
 /// Same rewrite pass as [`rewrite_creative_html`], but bounded by the proxy's
 /// own [`MAX_REWRITABLE_BODY_SIZE`] rather than the per-creative auction cap:
 /// a proxied document is a whole page, not an `adm`, and legitimately exceeds
-/// 1 MiB. The creative runtime is still injected so click mediation survives.
+/// 1 MiB. The creative runtime is always injected; its click guard acts only
+/// on links wrapped by this pass.
 ///
 /// Asset rewriting here is unconditional. Click wrapping follows an explicit
 /// `[auction] rewrite_clicks`; when that is unset, links keep being wrapped

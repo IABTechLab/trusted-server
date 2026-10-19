@@ -123,6 +123,15 @@ parameters. With `rewrite_clicks` off and `rewrite_creatives` on, the injected
 guard installs its listeners but never acts, because no link carries
 `data-tsclick`.
 
+Both switches also decide where the visitor's EC ID goes. `/first-party/click`
+appends the request's `ts-ec` value to the landing URL and logs the click with
+it, and `/first-party/proxy` appends it to proxied asset requests. With
+`rewrite_clicks = false`, creative links stop forwarding it on every path; with
+`rewrite_clicks = true` and `rewrite_creatives = false`, landing pages receive
+it while assets load direct. Neither switch is a consent control: EC issuance
+is consent-gated, and both endpoints forward whatever EC ID the request
+carries.
+
 With `rewrite_creatives = false` and `rewrite_clicks = true`, `POST /auction`
 still injects TSJS, but this does not reopen asset proxying in practice:
 `/auction` creatives render in a sandbox without `allow-same-origin`, so the
@@ -135,7 +144,8 @@ false` and `rewrite_clicks = true`, relative asset URLs therefore no longer
 resolve against the bidder base, so bidders should use absolute asset URLs.
 With `sanitize_creatives = true` the sanitizer removes `<base>` entirely first.
 
-On `POST /auction`, the injected click guard navigates a `data-tsclick` link
+On `POST /auction` and in HTML fetched through `/first-party/proxy`, the
+injected click guard navigates a `data-tsclick` link
 using only the link's own `target`, not a kept `<base target>`. A creative that
 relies on `<base target="_blank">` can therefore open wrapped links in the frame
 and unwrapped links in a new tab; give links an explicit `target` to avoid this.
@@ -358,7 +368,7 @@ If the iframe content itself contains HTML, it will be processed recursively. Ea
 
 **Rewrite Mode**: Uses `/first-party/click` for direct redirects
 
-**Controlled by**: `[auction].rewrite_clicks` (follows `rewrite_creatives` when unset)
+**Controlled by**: `[auction].rewrite_clicks` (follows `rewrite_creatives` when unset; HTML fetched through `/first-party/proxy` keeps wrapping links when unset)
 
 **Example**:
 
