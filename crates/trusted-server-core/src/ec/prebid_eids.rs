@@ -140,13 +140,11 @@ fn raw_diagnostic_sources(raw: &RawValue) -> Vec<DiagnosticEidSource> {
 
 /// Collects validated request-local partner updates without performing KV I/O.
 ///
-/// `body_eids` is the current request's own EIDs (e.g. an `/auction` JSON
-/// body), when the route captured any. It is applied after the `ts-eids`
-/// cookie so it wins on conflicts: the cookie is size-capped by the browser
-/// (see `MAX_EID_COOKIE_BYTES` in the TSJS Prebid integration) and may be
-/// missing partners the request body still carries in full. The `sharedId`
-/// cookie is applied last, unaffected by `body_eids`, preserving its existing
-/// override behavior.
+/// Finalization passes either the `ts-eids` cookie or the request's own client
+/// EIDs, never both: `/auction` passes the client set it used, every other
+/// route the cookie. The `sharedId` cookie is applied last, so it wins over a
+/// Prebid EID for the same partner. With repeated sources, the later entry's
+/// first valid UID is the candidate for that partner.
 pub(crate) fn collect_eid_updates(
     eids_cookie: Option<&str>,
     sharedid_cookie: Option<&str>,

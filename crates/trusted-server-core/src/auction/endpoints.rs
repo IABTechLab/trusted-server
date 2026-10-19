@@ -717,6 +717,183 @@ mod tests {
         );
     }
 
+    const COOKIE_ONLY_SOURCE: &str = "cookie-only.example.com";
+
+    fn ingestion_registry(extra_source: &str) -> PartnerRegistry {
+        PartnerRegistry::from_config(&[
+            counting_test_partner(COOKIE_ONLY_SOURCE),
+            counting_test_partner(extra_source),
+        ])
+        .expect("should build partner registry")
+    }
+
+    fn cookie_only_ts_eids() -> String {
+        BASE64.encode(
+            serde_json::to_vec(&json!([
+                { "source": COOKIE_ONLY_SOURCE, "uids": [{ "id": "cookie-uid" }] }
+            ]))
+            .expect("should serialize cookie"),
+        )
+    }
+
+    fn seeded_graph(ec_id: &str) -> KvIdentityGraph {
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let mut live = crate::ec::kv_types::KvEntry::tombstone(1000);
+        live.consent.ok = true;
+        graph.create(ec_id, &live).expect("should seed live row");
+        graph
+    }
+
+    fn stored_ids(graph: &KvIdentityGraph, ec_id: &str) -> Vec<(String, String)> {
+        let (stored, _) = graph
+            .get(ec_id)
+            .expect("should read store")
+            .expect("row should exist");
+        stored
+            .ids
+            .iter()
+            .map(|(source, id)| (source.clone(), id.uid.clone()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn auction_ingests_its_body_eids_and_not_a_cookie_only_source() {
+        let settings = create_test_settings();
+        let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
+            enabled: true,
+            providers: AuctionConfig::legacy_provider_map(&["eid_capturing_provider"]),
+            timeout_ms: 2000,
+            mediator: None,
+            ..Default::default()
+        });
+        orchestrator.register_provider(Arc::new(EidCapturingProvider {
+            had_eids: Arc::new(std::sync::Mutex::new(None)),
+        }));
+        let registry = ingestion_registry("body.example.com");
+        let ec_id = format!("{}.ingbdy", "a".repeat(64));
+        let graph = seeded_graph(&ec_id);
+        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        ec_context.set_eid_sync_source(crate::ec::EidSyncSource::Auction);
+        let cookie = cookie_only_ts_eids();
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://test-publisher.com/auction")
+            .header(header::COOKIE, format!("{COOKIE_TS_EIDS}={cookie}"))
+            .body(EdgeBody::from(
+                serde_json::to_vec(&json!({
+                    "adUnits": [{ "code": "div-gpt-ad-1", "mediaTypes": { "banner": { "sizes": [[300, 250]] } } }],
+                    "eids": [{ "source": "body.example.com", "uids": [{ "id": "body-uid" }] }]
+                }))
+                .expect("should serialize body"),
+            ))
+            .expect("should build auction request");
+
+        let _ = handle_auction(
+            &settings,
+            &orchestrator,
+            Some(&graph),
+            Some(&registry),
+            &mut ec_context,
+            &noop_services(),
+            req,
+        )
+        .await;
+        let mut response = http::Response::new(EdgeBody::empty());
+        crate::ec::finalize::ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry,
+            Some(&cookie),
+            None,
+            &mut response,
+        );
+
+        assert_eq!(
+            stored_ids(&graph, &ec_id),
+            vec![("body.example.com".to_owned(), "body-uid".to_owned())],
+            "KV should learn the body's source and not the cookie-only source"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_auction_ingests_nothing_from_the_cookie_but_keeps_shared_id() {
+        let settings = create_test_settings();
+        let orchestrator = AuctionOrchestrator::new(AuctionConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        let registry = ingestion_registry("sharedid.org");
+        let ec_id = format!("{}.ingdis", "a".repeat(64));
+        let graph = seeded_graph(&ec_id);
+        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        ec_context.set_eid_sync_source(crate::ec::EidSyncSource::Auction);
+        let cookie = cookie_only_ts_eids();
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://test-publisher.com/auction")
+            .header(header::COOKIE, format!("{COOKIE_TS_EIDS}={cookie}"))
+            .body(EdgeBody::from(ad_units_only_body()))
+            .expect("should build auction request");
+
+        let _ = handle_auction(
+            &settings,
+            &orchestrator,
+            Some(&graph),
+            Some(&registry),
+            &mut ec_context,
+            &noop_services(),
+            req,
+        )
+        .await;
+        let mut response = http::Response::new(EdgeBody::empty());
+        crate::ec::finalize::ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry,
+            Some(&cookie),
+            Some("shared-cookie-id"),
+            &mut response,
+        );
+
+        assert_eq!(
+            stored_ids(&graph, &ec_id),
+            vec![("sharedid.org".to_owned(), "shared-cookie-id".to_owned())],
+            "an /auction that resolved no client set should ingest only the sharedId cookie"
+        );
+    }
+
+    #[test]
+    fn navigation_ingests_the_cookie_only_source() {
+        // Control for the two tests above: the registry does match the
+        // cookie-only source when the route reads the cookie.
+        let settings = create_test_settings();
+        let registry = ingestion_registry("body.example.com");
+        let ec_id = format!("{}.ingnav", "a".repeat(64));
+        let graph = seeded_graph(&ec_id);
+        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        ec_context.set_eid_sync_source(crate::ec::EidSyncSource::Navigation);
+        let cookie = cookie_only_ts_eids();
+        let mut response = http::Response::new(EdgeBody::empty());
+
+        crate::ec::finalize::ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry,
+            Some(&cookie),
+            None,
+            &mut response,
+        );
+
+        assert_eq!(
+            stored_ids(&graph, &ec_id),
+            vec![(COOKIE_ONLY_SOURCE.to_owned(), "cookie-uid".to_owned())],
+            "a navigation should ingest the cookie's registered source"
+        );
+    }
+
     #[tokio::test]
     async fn auction_body_eids_reach_kv_even_when_the_ts_eids_cookie_is_absent() {
         // Regression test for #1184: `/auction` sends every EID it has in the

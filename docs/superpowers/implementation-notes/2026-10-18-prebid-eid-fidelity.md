@@ -69,3 +69,19 @@ Failures (against the old merge):
 - `merge_case_7_forwards_kv_entries_when_the_browser_sent_none`, `merge_drops_entries_without_uids`, `merge_auction_eids_deduplicates_client_and_resolved_ids`: pass against the old merge (regression nets)
 - Revert proof: with `merged.push(eid);` replaced by `let _ = eid;`, `merge_case_7_forwards_kv_entries_when_the_browser_sent_none` FAILS (wasm abort); line restored
 - Revert proof: with `.filter(|eid| !eid.uids.is_empty())` removed from the browser branch, `merge_drops_entries_without_uids` FAILS (wasm abort); line restored
+
+## Task 5: KV ingestion on /auction reads only the auction's own client set
+
+Command (each test run alone, because a failed assertion aborts the wasm test binary):
+
+```bash
+cargo test-fastly -- <module path>::<name> --exact
+```
+
+Failures (against the old ingestion, which always read the cookie first):
+
+- `auction::endpoints::tests::auction_ingests_its_body_eids_and_not_a_cookie_only_source`: KV held `body.example.com` and also `cookie-only.example.com`
+- `auction::endpoints::tests::disabled_auction_ingests_nothing_from_the_cookie_but_keeps_shared_id`: KV held `cookie-only.example.com` next to `sharedid.org`
+- `navigation_ingests_the_cookie_only_source`, `finalize_generated_ec_without_sync_source_ingests_the_ts_eids_cookie`, the edited `finalize_recovers_orphaned_ec_when_purpose_four_denial_empties_updates` and `auction_route_carries_the_raw_ts_eids_cookie_to_finalization` pass against the old code (regression nets)
+- Revert proof: with `browser_eid_input`'s fallback arm changed to `_ => (None, ec_context.client_eids()),`, `navigation_ingests_the_cookie_only_source`, `finalize_generated_ec_without_sync_source_ingests_the_ts_eids_cookie` and `finalize_recovers_orphaned_ec_when_purpose_four_denial_empties_updates` each FAIL (wasm abort); arm restored
+- Revert proof: with the Fastly adapter's `let eids_cookie = crate::extract_cookie_value(req, COOKIE_TS_EIDS);` replaced by `let eids_cookie: Option<String> = None;`, `auction_route_carries_the_raw_ts_eids_cookie_to_finalization` FAILS (wasm abort); line restored
