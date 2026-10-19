@@ -35,7 +35,7 @@ rpassword = { workspace = true }
 # panics on first use — which broke the dev-proxy tests. The `-no-provider` variant uses
 # whichever provider is already present instead of adding a second.
 #
-# Features: `blocking` for the `ts dev audit headers` origin client (OriginClient uses
+# Features: `blocking` for the `ts origin audit-headers` origin client (OriginClient uses
 # reqwest::blocking); `gzip`/`json` for the probe's Accept-Encoding axis and JSON bodies.
 reqwest = { version = "0.12", default-features = false, features = [
     "blocking",
@@ -46,7 +46,7 @@ reqwest = { version = "0.12", default-features = false, features = [
 # The `-no-provider` reqwest variant expects the process-level rustls `CryptoProvider`
 # to be installed by the caller. `ts dev proxy` only exists on macOS, so on other hosts
 # nothing else pulls a rustls provider; this pins aws-lc-rs (rustls's default) on every
-# host target so `ts dev audit` can install it before its first HTTPS fetch. On macOS it
+# host target so `ts origin audit-headers` can install it before its first HTTPS fetch. On macOS it
 # deduplicates with the proxy's aws-lc-rs — still exactly one provider, so no ambiguity.
 rustls = { workspace = true }
 scraper = { workspace = true }

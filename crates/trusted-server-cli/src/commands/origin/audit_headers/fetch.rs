@@ -1,10 +1,14 @@
 //! Origin fetching, config-derived URL discovery, and response classification.
 //!
-//! `ts dev audit headers` fetches directly from the publisher origin. When no
-//! explicit URLs are given, it fetches the origin root, parses the returned HTML
+//! `ts origin audit-headers` fetches directly from the publisher origin. When no
+//! explicit `--url` is given, it fetches the origin root, parses the returned HTML
 //! for asset URLs, and audits those. Routes under `/_ts/` are served by the
 //! Trusted Server edge — not the origin — so they are never probed here; supply
 //! them explicitly if you need to audit them.
+//!
+//! Every target must use a credential-safe transport (HTTPS, or HTTP only for a
+//! loopback development origin), enforced through the shared
+//! [`crate::url_guard`] used by `ts origin probe-shareability`.
 
 use std::io::Read;
 use std::path::PathBuf;
@@ -29,12 +33,14 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// the timeout alone would not catch.
 const MAX_BODY_BYTES: u64 = 2 * 1024 * 1024;
 
-/// Arguments for `ts dev audit headers`.
+/// Arguments for `ts origin audit-headers`.
 #[derive(Debug, clap::Args)]
 pub struct AuditHeadersArgs {
-    /// Explicit URLs to audit. When omitted, URLs are discovered from the
-    /// origin root page.
-    pub urls: Vec<String>,
+    /// URL to audit. Repeat for several pages. When omitted, URLs are
+    /// discovered from the origin root page. Every URL must be HTTPS; plain
+    /// HTTP is accepted only for a loopback development origin.
+    #[arg(long = "url")]
+    pub url: Vec<String>,
     /// Path to `trusted-server.toml`, used to resolve the origin when no URLs
     /// and no `--origin` are given.
     #[arg(long, default_value = "trusted-server.toml")]
@@ -47,6 +53,10 @@ pub struct AuditHeadersArgs {
     /// URLs are always fetched regardless of this flag.
     #[arg(long)]
     pub include_cross_origin: bool,
+    /// Treat WARN verdicts as failures (exit 1), so a CI gate can require a
+    /// clean posture rather than special-casing an exit code.
+    #[arg(long)]
+    pub strict: bool,
     /// Emit machine-readable JSON instead of the human table.
     #[arg(long)]
     pub json: bool,
@@ -142,10 +152,10 @@ pub(crate) fn collect_responses(
     args: &AuditHeadersArgs,
     client: &dyn OriginClient,
 ) -> CliResult<(String, Vec<FetchedResponse>)> {
-    if args.urls.is_empty() {
+    if args.url.is_empty() {
         collect_via_discovery(args, client)
     } else {
-        collect_explicit(&args.urls, client)
+        collect_explicit(&args.url, client)
     }
 }
 
@@ -160,6 +170,9 @@ fn collect_explicit(
     let mut responses = Vec::with_capacity(urls.len());
     for raw in urls {
         let url = Url::parse(raw).map_err(|error| format!("invalid URL `{raw}`: {error}"))?;
+        // Transport safety before any fetch: refuse plain HTTP off loopback and
+        // URL-embedded credentials, shared with `ts origin probe-shareability`.
+        crate::url_guard::require_credential_safe_transport(&url, "--url")?;
         match client.fetch(&url) {
             Ok(response) => responses.push(FetchedResponse {
                 url,
@@ -188,6 +201,9 @@ fn collect_via_discovery(
     let origin = resolve_origin(args)?;
     let root =
         Url::parse(&origin).map_err(|error| format!("invalid origin `{origin}`: {error}"))?;
+    // The origin root carries no credential, but the same transport rule keeps
+    // the audit from fetching a plain-HTTP origin off loopback.
+    crate::url_guard::require_credential_safe_transport(&root, "origin")?;
 
     let root_response = client.fetch(&root)?;
     let discovered = discover_asset_urls(&root, &root_response.body, args.include_cross_origin);
@@ -199,6 +215,14 @@ fn collect_via_discovery(
     });
 
     for url in discovered {
+        // A discovered asset off a safe transport is skipped, not fatal — one
+        // bad link must not abort the audit of the rest.
+        if let Err(error) =
+            crate::url_guard::require_credential_safe_transport(&url, "discovered URL")
+        {
+            log::warn!("skipping {url}: {error}");
+            continue;
+        }
         // A single asset fetch failing should not abort the whole audit.
         match client.fetch(&url) {
             Ok(response) => responses.push(FetchedResponse {
@@ -259,6 +283,7 @@ fn discover_asset_urls(base: &Url, html: &str, include_cross_origin: bool) -> Ve
             return;
         }
         if let Ok(resolved) = base.join(raw)
+            && matches!(resolved.scheme(), "http" | "https")
             && (include_cross_origin || resolved.origin() == base.origin())
             && !urls.contains(&resolved)
         {
@@ -348,10 +373,11 @@ mod tests {
 
     fn args(origin: &str) -> AuditHeadersArgs {
         AuditHeadersArgs {
-            urls: Vec::new(),
+            url: Vec::new(),
             config: PathBuf::from("trusted-server.toml"),
             origin: Some(origin.to_owned()),
             include_cross_origin: false,
+            strict: false,
             json: false,
         }
     }
@@ -456,10 +482,11 @@ mod tests {
     fn explicit_urls_skip_discovery() {
         let client = FakeClient::new().with("https://origin.example/rtb", "application/json", "");
         let explicit = AuditHeadersArgs {
-            urls: vec!["https://origin.example/rtb".to_owned()],
+            url: vec!["https://origin.example/rtb".to_owned()],
             config: PathBuf::from("trusted-server.toml"),
             origin: None,
             include_cross_origin: false,
+            strict: false,
             json: false,
         };
         let (_, responses) = collect_responses(&explicit, &client).expect("should collect");
@@ -475,10 +502,11 @@ mod tests {
     fn invalid_explicit_url_is_rejected() {
         let client = FakeClient::new();
         let explicit = AuditHeadersArgs {
-            urls: vec!["not a url".to_owned()],
+            url: vec!["not a url".to_owned()],
             config: PathBuf::from("trusted-server.toml"),
             origin: None,
             include_cross_origin: false,
+            strict: false,
             json: false,
         };
         let error = collect_responses(&explicit, &client).expect_err("should reject invalid URL");
@@ -491,13 +519,14 @@ mod tests {
         // verdict rather than aborting on the first failure.
         let client = FakeClient::new().with("https://origin.example/ok", "text/html", "");
         let explicit = AuditHeadersArgs {
-            urls: vec![
+            url: vec![
                 "https://origin.example/ok".to_owned(),
                 "https://origin.example/down".to_owned(),
             ],
             config: PathBuf::from("trusted-server.toml"),
             origin: None,
             include_cross_origin: false,
+            strict: false,
             json: false,
         };
         let (_, responses) =
@@ -513,10 +542,11 @@ mod tests {
     fn explicit_urls_error_when_all_fail() {
         let client = FakeClient::new();
         let explicit = AuditHeadersArgs {
-            urls: vec!["https://origin.example/down".to_owned()],
+            url: vec!["https://origin.example/down".to_owned()],
             config: PathBuf::from("trusted-server.toml"),
             origin: None,
             include_cross_origin: false,
+            strict: false,
             json: false,
         };
         let error =

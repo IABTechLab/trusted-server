@@ -8,6 +8,7 @@ use serde::Serialize;
 use url::Url;
 
 use super::rules::{ContentTypeGroup, HeaderVerdict, ResponseHeaders, Verdict, evaluate};
+use crate::run::RunOutcome;
 
 /// One fetched origin response, paired with the URL it came from.
 #[derive(Debug, Clone)]
@@ -56,20 +57,17 @@ pub(crate) struct AuditReport {
 }
 
 impl AuditReport {
-    /// The process exit code the CLI should return: 1 if any group failed,
-    /// 3 if any warned (and none failed), 0 otherwise.
-    ///
-    /// 2 is deliberately skipped: `main` exits 2 for any CLI error, so reusing
-    /// it for warnings would make a warn-only audit indistinguishable from an
-    /// audit that never ran (unreachable origin, bad config). CI gates keying
-    /// on the code can then tell "cache warnings" (3) from "audit failed" (2).
-    pub(crate) fn exit_code(&self) -> i32 {
-        if self.summary.fail > 0 {
-            1
-        } else if self.summary.warn > 0 {
-            3
+    /// The process outcome per the spec's exit-code contract (§59-69):
+    /// a `FAIL` verdict — or a `WARN` verdict under `--strict` — is an
+    /// assertion failure (exit 1); everything else is success (exit 0).
+    /// Warnings alone exit 0 unless `strict` promotes them. Transport and
+    /// config errors never reach here: they return `Err` and `main` exits 2,
+    /// so a warn-only audit is never confused with an audit that could not run.
+    pub(crate) fn outcome(&self, strict: bool) -> RunOutcome {
+        if self.summary.fail > 0 || (strict && self.summary.warn > 0) {
+            RunOutcome::AssertionFailed
         } else {
-            0
+            RunOutcome::Success
         }
     }
 }
@@ -256,7 +254,11 @@ mod tests {
             report.summary.fail, 0,
             "cacheable origin JSON is not failed — it carries no assumed posture"
         );
-        assert_eq!(report.exit_code(), 0, "no failures should exit 0");
+        assert_eq!(
+            report.outcome(false),
+            RunOutcome::Success,
+            "no failures should succeed (exit 0)"
+        );
     }
 
     #[test]
@@ -285,7 +287,7 @@ mod tests {
     }
 
     #[test]
-    fn warn_only_exits_three() {
+    fn warn_only_succeeds_unless_strict() {
         let responses = vec![response(
             "https://origin.example/app.js",
             "application/javascript",
@@ -294,9 +296,14 @@ mod tests {
         let report = run_analysis("https://origin.example", &responses);
         assert_eq!(report.summary.warn, 1, "non-immutable JS should warn");
         assert_eq!(
-            report.exit_code(),
-            3,
-            "warn-only should exit 3, not 2 (2 is the CLI error code)"
+            report.outcome(false),
+            RunOutcome::Success,
+            "warnings alone exit 0 (spec §59-69); 2 is reserved for a run that could not complete"
+        );
+        assert_eq!(
+            report.outcome(true),
+            RunOutcome::AssertionFailed,
+            "--strict promotes a warning to a failing exit 1"
         );
     }
 

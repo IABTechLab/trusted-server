@@ -745,33 +745,36 @@ upload, provision, deploy, or push config.
 
 ## Audit origin cache headers
 
-`ts dev audit headers` fetches responses from the publisher origin, classifies
+`ts origin audit-headers` fetches responses from the publisher origin, classifies
 each by content type, and grades its cache-related response headers
 (`Cache-Control`, `Surrogate-Control`, `s-maxage`, `Surrogate-Key`, `Vary`,
 `ETag`) against the expected posture for that type. It reports a per-type
 pass/warn/fail verdict naming the responsible header and the recommended value.
+It sits beside `ts origin probe-shareability` and follows its conventions: URLs
+arrive through a repeatable `--url`, and every target must be HTTPS (plain HTTP
+only for a loopback development origin).
 
 ```bash
 # Audit the origin from trusted-server.toml (publisher.origin_url), discovering
 # assets from the root page's HTML.
-ts dev audit headers
+ts origin audit-headers
 
 # Point at an origin explicitly, skipping the config lookup.
-ts dev audit headers --origin https://origin.publisher.com
+ts origin audit-headers --origin https://origin.publisher.com
 
 # Audit specific URLs instead of crawling.
-ts dev audit headers https://origin.publisher.com/app.js https://origin.publisher.com/
+ts origin audit-headers --url https://origin.publisher.com/app.js --url https://origin.publisher.com/
 
-# Machine-readable output for pipelines.
-ts dev audit headers --json
+# Fail the command on warnings too (CI gate), and emit machine-readable output.
+ts origin audit-headers --strict --json
 ```
 
-When no URLs are given, discovery fetches the origin root and follows the
+When no `--url` is given, discovery fetches the origin root and follows the
 `<script>`, `<img>`, and `<link>` assets it links, restricted to the same origin
 (pass `--include-cross-origin` to follow off-origin assets, e.g. to audit a
-CDN's posture). Redirects are not followed, so a long-lived cached 3xx is graded
-on its own headers rather than the target's. Edge-only `/_ts/` routes are never
-probed against the origin.
+CDN's posture). Discovery only follows `http`/`https` assets. Redirects are not
+followed, so a long-lived cached 3xx is graded on its own headers rather than
+the target's. Edge-only `/_ts/` routes are never probed against the origin.
 
 ### Content-type postures
 
@@ -787,16 +790,16 @@ probed against the origin.
 
 The command is meant to be wired into CI, so the exit code carries the outcome:
 
-| Code | Meaning                                                 |
-| ---- | ------------------------------------------------------- |
-| 0    | All audited content-type groups pass                    |
-| 1    | At least one group has a FAIL verdict                   |
-| 2    | The CLI itself errored (unreachable origin, bad config) |
-| 3    | Warnings only, no failures                              |
+| Code | Meaning                                                            |
+| ---- | ------------------------------------------------------------------ |
+| 0    | Audit completed; no FAIL verdicts (WARN allowed unless `--strict`) |
+| 1    | A FAIL verdict, or a WARN verdict with `--strict`                  |
+| 2    | The audit could not run (bad arguments, config error, transport)   |
 
-Code 2 is the generic CLI error code (shared with every `ts` command), so a CI
-gate must treat 2 as "the audit could not run", distinct from 3 ("cache
-warnings"). `ts dev audit` is available on all host platforms.
+`--strict` promotes warnings to a failing exit 1 so a gate can require a clean
+posture; without it, warnings exit 0. Exit 2 is the shared `ts` error code, so a
+CI gate can tell "the audit could not run" from a cache FAIL. `ts origin
+audit-headers` is available on all host platforms.
 
 ## Operate a self-hosted Prebid Server
 

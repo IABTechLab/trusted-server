@@ -1,11 +1,12 @@
-//! `ts dev audit headers` — audits origin cache-header posture per content type.
+//! `ts origin audit-headers` — audits origin cache-header posture per content type.
 //!
-//! Fetches origin responses (explicit URLs, or discovered from the origin root),
-//! classifies them by content type, evaluates each against the cacheability
-//! rules, and renders a per-type pass/warn/fail report. The command exits 1 when
-//! any content-type group fails, 3 when only warnings are present, and 0 when
-//! all pass. Exit 2 is reserved for CLI-level errors (see `main.rs`), so a CI
-//! gate can distinguish cache warnings from an audit that never ran.
+//! Fetches origin responses (explicit `--url`, or discovered from the origin
+//! root), classifies them by content type, evaluates each against the
+//! cacheability rules, and renders a per-type pass/warn/fail report. A `FAIL`
+//! verdict — or a `WARN` under `--strict` — is an assertion failure (exit 1);
+//! otherwise it succeeds (exit 0). Transport or config errors return `Err`, so
+//! `main` exits 2 and a CI gate can tell a warn-only audit from one that never
+//! ran.
 
 mod analyze;
 mod fetch;
@@ -17,18 +18,18 @@ use std::io::Write;
 pub use fetch::AuditHeadersArgs;
 
 use crate::error::CliResult;
+use crate::run::RunOutcome;
 use analyze::AuditReport;
 use fetch::{OriginClient, ReqwestOriginClient, collect_responses};
 
-/// Runs the header audit against a live origin, printing to stdout and returning
-/// the process exit code (0 pass, 1 fail, 3 warn-only; 2 is reserved for CLI
-/// errors).
-pub fn run(args: &AuditHeadersArgs) -> Result<i32, String> {
+/// Runs the header audit against a live origin, writing the report to `out` and
+/// mapping the result to a [`RunOutcome`] (`AssertionFailed` on a FAIL, or a
+/// WARN under `--strict`; otherwise `Success`). Transport/config failures
+/// propagate as `Err`, which `main` turns into exit 2.
+pub(crate) fn run(args: &AuditHeadersArgs, out: &mut dyn Write) -> CliResult<RunOutcome> {
     let client = ReqwestOriginClient::new()?;
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
-    let report = run_audit_headers(args, &client, &mut out)?;
-    Ok(report.exit_code())
+    let report = run_audit_headers(args, &client, out)?;
+    Ok(report.outcome(args.strict))
 }
 
 /// Fetches, analyzes, and renders the audit, returning the report.
@@ -95,10 +96,11 @@ mod tests {
 
     fn args_for(origin: &str, json: bool) -> AuditHeadersArgs {
         AuditHeadersArgs {
-            urls: Vec::new(),
+            url: Vec::new(),
             config: PathBuf::from("trusted-server.toml"),
             origin: Some(origin.to_owned()),
             include_cross_origin: false,
+            strict: false,
             json,
         }
     }
@@ -153,7 +155,11 @@ mod tests {
             report.summary.total_groups >= 2,
             "should audit at least HTML and JS groups"
         );
-        assert_eq!(report.exit_code(), 0, "clean posture should exit 0");
+        assert_eq!(
+            report.outcome(false),
+            RunOutcome::Success,
+            "clean posture should succeed (exit 0)"
+        );
         let text = String::from_utf8(buffer).expect("should be utf-8");
         assert!(text.contains("Origin:"), "should render the report");
     }
@@ -189,9 +195,9 @@ mod tests {
         )
         .expect("should run");
         assert_eq!(
-            report.exit_code(),
-            1,
-            "cacheable HTML should drive a failing exit code"
+            report.outcome(false),
+            RunOutcome::AssertionFailed,
+            "cacheable HTML should drive a failing outcome (exit 1)"
         );
     }
 }
