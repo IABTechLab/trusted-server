@@ -71,6 +71,7 @@ pub struct ModuleRequest<'r> {
     query: &'r str,
     host: &'r str,
     scheme: &'r str,
+    removed_prefix: Option<&'r str>,
 }
 
 impl<'r> ModuleRequest<'r> {
@@ -83,6 +84,7 @@ impl<'r> ModuleRequest<'r> {
             query: "",
             host,
             scheme,
+            removed_prefix: None,
         }
     }
 
@@ -97,12 +99,27 @@ impl<'r> ModuleRequest<'r> {
             request.uri().path(),
         )
         .with_query(request.uri().query().unwrap_or_default())
+        .with_removed_prefix(
+            request
+                .extensions()
+                .get::<crate::addressing::RemovedPathPrefix>()
+                .map(crate::addressing::RemovedPathPrefix::as_str),
+        )
     }
 
     /// The same request with the query string, without its leading `?`.
     #[must_use]
     pub fn with_query(self, query: &'r str) -> Self {
         Self { query, ..self }
+    }
+
+    /// The same request with the path prefix request addressing removed.
+    #[must_use]
+    pub fn with_removed_prefix(self, removed_prefix: Option<&'r str>) -> Self {
+        Self {
+            removed_prefix,
+            ..self
+        }
     }
 
     /// The request method.
@@ -134,6 +151,14 @@ impl<'r> ModuleRequest<'r> {
     pub fn scheme(&self) -> &'r str {
         self.scheme
     }
+
+    /// The path prefix request addressing removed, such as `/www.example.com`
+    /// on a host that serves several publishers by path, if it removed one.
+    /// [`Self::path`] is the path the request continues with.
+    #[must_use]
+    pub fn removed_prefix(&self) -> Option<&'r str> {
+        self.removed_prefix
+    }
 }
 
 /// A [`ModuleRequest`] that owns its parts, for a caller that must keep them
@@ -148,6 +173,7 @@ pub struct ResolvedRequest {
     query: String,
     host: String,
     scheme: String,
+    removed_prefix: Option<String>,
 }
 
 impl ResolvedRequest {
@@ -155,14 +181,7 @@ impl ResolvedRequest {
     /// scheme read as the publisher path reads them.
     #[must_use]
     pub fn of(request: &http::Request<EdgeBody>, client: &ClientInfo) -> Self {
-        let view = ModuleRequest::of(request, client);
-        Self {
-            method: view.method.clone(),
-            path: view.path.to_owned(),
-            query: view.query.to_owned(),
-            host: view.host.to_owned(),
-            scheme: view.scheme.to_owned(),
-        }
+        Self::from_view(&ModuleRequest::of(request, client))
     }
 
     /// The method, address, host and scheme `view` carries.
@@ -174,6 +193,7 @@ impl ResolvedRequest {
             query: view.query.to_owned(),
             host: view.host.to_owned(),
             scheme: view.scheme.to_owned(),
+            removed_prefix: view.removed_prefix.map(str::to_owned),
         }
     }
 
@@ -200,6 +220,7 @@ impl ResolvedRequest {
     pub fn view(&self) -> ModuleRequest<'_> {
         ModuleRequest::new(&self.method, &self.host, &self.scheme, &self.path)
             .with_query(&self.query)
+            .with_removed_prefix(self.removed_prefix.as_deref())
     }
 }
 

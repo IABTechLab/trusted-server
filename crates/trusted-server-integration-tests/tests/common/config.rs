@@ -50,7 +50,12 @@ fn app_config_envelope(
             ))
         })?;
     let mut settings = app_config.into_settings();
-    settings.publisher.origin_url = origin_url;
+    let mut origin = settings.origin_source().ok_or_else(|| {
+        Report::new(TestError::ConfigGeneration)
+            .attach("the integration config should select the origin source")
+    })?;
+    origin.url = origin_url;
+    settings.set_origin_source(&origin);
     // The fixture selects modules a stock build ships, so validation needs
     // the stock list as the adapters and the `ts` tool have it.
     trusted_server_core::config::register_deploy_integrations(trusted_server_modules::builders());

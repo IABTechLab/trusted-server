@@ -123,7 +123,7 @@ pub fn wasm_binary_path() -> PathBuf {
 /// Get the fixed origin port used for Docker container port mapping.
 ///
 /// This must match the port baked into the WASM binary via
-/// `TRUSTED_SERVER__PUBLISHER__ORIGIN_URL` at build time.
+/// `TRUSTED_SERVER__SOURCE__ORIGIN__URL` at build time.
 pub fn origin_port() -> u16 {
     match std::env::var("INTEGRATION_ORIGIN_PORT") {
         Ok(value) => value
