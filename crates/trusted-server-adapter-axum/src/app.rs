@@ -290,6 +290,7 @@ impl AppState {
         if let Some(module) = self.registry.device_module() {
             services = services.with_device_module(module);
         }
+        services = services.with_identifier_modules(self.registry.identifier_modules());
         // The publisher this request resolved to names every key in a shared
         // store and every name the browser holds.
         let prefixes = self.registry.prefixes(

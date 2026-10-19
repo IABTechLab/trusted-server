@@ -56,11 +56,11 @@ sequenceDiagram
         Note over TS: Phase 2: Routing (organic only)<br/>generate_if_needed()
         TS->>TS: HMAC-SHA256(IP) + random suffix
         TS->>KV: Create entry (consent, geo, device)
-        Note over TS: Phase 3: Finalize<br/>Ingest Prebid EID cookies
+        Note over TS: Phase 3: Finalize<br/>Ingest the request's identifiers
         TS-->>B: Response + Set-Cookie: ts-ec=...
     else Return Visit (EC cookie present)
         Note over TS: Phase 2: Routing<br/>EC exists, skip generation
-        Note over TS: Phase 3: Finalize<br/>Ingest Prebid EID cookies
+        Note over TS: Phase 3: Finalize<br/>Ingest the request's identifiers
         TS-->>B: Response<br/>(no cookie refresh)
     end
 
@@ -82,8 +82,8 @@ flowchart TD
     ExplicitWithdrawal -- "No" --> HeaderOnly
 
     ConsentCheck -- "Yes" --> WasPresent{EC was present<br/>in request?}
-    WasPresent -- "Yes, not generated" --> Returning["Ingest Prebid EID cookies<br/>No cookie or KV TTL refresh"]
-    WasPresent -- "No, just generated" --> NewEc["Ingest Prebid EID cookies<br/>Set ts-ec cookie"]
+    WasPresent -- "Yes, not generated" --> Returning["Ingest the request's identifiers<br/>No cookie or KV TTL refresh"]
+    WasPresent -- "No, just generated" --> NewEc["Ingest the request's identifiers<br/>Set ts-ec cookie"]
 ```
 
 When the required permissions are not set for the current request (for example a location lookup that failed, or a baseline that requires a signal no module has answered), Trusted Server fails closed for EC use by stripping EC headers, but it does **not** treat that as authoritative revocation of an already-issued EC.
@@ -97,7 +97,7 @@ The Edge Cookie code never reads consent. It checks only whether the required **
 - **A country and region baseline.** The country, and an optional region such as a US state, that the geo module returns. A region rule takes precedence over its country, and when no country is identified, or neither the region nor the country has a rule, the baseline on the top node of the rules tree applies.
 - **Consent and privacy signals.** TCF, GPP, a US Privacy string, GPC and the Model Terms for Marketing preference (`euconsent-v2`, `__gpp` / `__gpp_sid`, `us_privacy`, `Sec-GPC`, `__mtm_pref`), each read by its own [permission signal module](/guide/permission-signals) and mapped onto permissions as a **grant or a revoke** on top of that baseline, in the configured order. There is no separate consent KV fallback.
 
-Every permission is resolved this way, and the Edge Cookie is created only when each permission its module requires is set. A location lookup that fails resolves at the requires-signal floor, so the cookie is not created unless a signal grants the permission. The core encodes no jurisdiction's law. The deployer brings the policy, and the per-country and per-region rules live in the policy file rather than in core logic. See the [permission model](/guide/permission-model) for the full list of permission sources and the resolution order. Writing browser-supplied Prebid EIDs into the identity graph, and server-side pull sync, additionally need the storage and personalised-ad permissions both set, the pair that also gates EIDs in the bid request. With storage alone the Edge Cookie stays first-party and partner sharing is withheld, so the EC ID is not sent to pull-sync partners. See [Prebid EID Flow](#prebid-eid-flow).
+Every permission is resolved this way, and the Edge Cookie is created only when each permission its module requires is set. A location lookup that fails resolves at the requires-signal floor, so the cookie is not created unless a signal grants the permission. The core encodes no jurisdiction's law. The deployer brings the policy, and the per-country and per-region rules live in the policy file rather than in core logic. See the [permission model](/guide/permission-model) for the full list of permission sources and the resolution order. Writing the identifiers a request carries into the identity graph, and server-side pull sync, additionally need the storage and personalised-ad permissions both set, the pair that also gates EIDs in the bid request. With storage alone the Edge Cookie stays first-party and partner sharing is withheld, so the EC ID is not sent to pull-sync partners. See [Identifier Flow](#identifier-flow).
 
 ```mermaid
 flowchart TD
@@ -159,7 +159,7 @@ Partner identities flow into the KV identity graph through three channels. Each 
 ```mermaid
 flowchart LR
     subgraph Browser-initiated
-        Prebid["Prebid EIDs<br/><i>/auction body + ts-eids + sharedId</i><br/>Response-time ingestion"]
+        Prebid["Request identifiers<br/><i>/auction body + identifier modules + sharedId</i><br/>Response-time ingestion"]
     end
 
     subgraph Server-initiated
@@ -172,17 +172,17 @@ flowchart LR
     Pull --> KV
 ```
 
-### Prebid EID Flow
+### Identifier Flow
 
-Browser-resolved Prebid EIDs reach the identity graph when Trusted Server finalizes a response. It collects matched partner UIDs from three request-local sources, applied in this order so that, when two sources carry the same partner, the later source's UID is the candidate offered to KV:
+The identifiers a request carries reach the identity graph when Trusted Server finalizes a response. Core asks each identifier module the build links what it learned for the request, once, when it reads the Edge Cookie state, and collects matched partner UIDs from three request-local sources, applied in this order so that, when two sources carry the same partner, the later source's UID is the candidate offered to KV:
 
-1. the `ts-eids` cookie,
+1. what the identifier modules learned, such as the Prebid module's `ts-eids` cookie,
 2. the `eids` array in the `/auction` request body,
 3. the `sharedId` cookie.
 
-The `/auction` body carries the full EID set Prebid.js resolved, so `/auction` ingestion is not limited by the size cap TSJS applies to the `ts-eids` cookie. The cookie still bridges Prebid user ID modules with the identity graph on requests that carry no EID body, such as `GET /_ts/page-bids` and page navigations.
+The `/auction` body carries the full EID set Prebid.js resolved, so `/auction` ingestion is not limited by the size cap the Prebid page script applies to its cookie. The cookie still bridges Prebid user ID modules with the identity graph on requests that carry no EID body, such as `GET /_ts/page-bids` and page navigations.
 
-These Prebid EID writes follow the same permission rule as bidstream EID forwarding: the storage and personalised-ad permissions must both be set. A reader who allows storage but not personalised ads keeps their EC, but no EIDs from the request are persisted.
+These writes follow the same permission rule as bidstream EID forwarding: the storage and personalised-ad permissions must both be set. A reader who allows storage but not personalised ads keeps their EC, but no EIDs from the request are persisted.
 
 ```mermaid
 sequenceDiagram
@@ -190,6 +190,7 @@ sequenceDiagram
     participant TSJS as TSJS Prebid Module
     participant B as Browser Cookie Jar
     participant TS as Trusted Server
+    participant PM as Prebid Module
     participant KV as KV Store
 
     Prebid->>Prebid: Auction completes
@@ -201,15 +202,18 @@ sequenceDiagram
 
     Note over B,TS: Next eligible EID-sync request
     B->>TS: Document navigation, POST /auction,<br/>or admitted GET /_ts/page-bids
-    TS->>TS: Base64 decode → parse OpenRTB-style EIDs<br/>match source domains to partners
+    TS->>PM: Identifiers for this request?
+    PM->>PM: Read ts-eids, base64 decode,<br/>parse OpenRTB-style EIDs
+    PM-->>TS: [{source, uids}]
+    TS->>TS: Match source domains to partners
     TS->>KV: Add missing partner IDs in one conditional write<br/>skip when UIDs already match<br/>(requires the storage and personalised-ad permissions)
 ```
 
-Current TSJS writers preserve the full OpenRTB-style `{source, uids:[...]}` shape in `ts-eids`. The server remains backward-compatible with earlier flattened `{source, id, atype}` cookies during rollout, but new cookies use the structured `uids[]` form.
+Core names no cookie here. The Prebid module, `crates/auction/prebid`, owns `ts-eids`, its two shapes and its size limit, and hands core what the cookie holds through the identifier module interface, `trusted_server_core::ec::identifiers::IdentifierModule`. The module reads the structured `{source, uids:[...]}` shape the script writes today and the earlier flattened `{source, id, atype}` shape, so a cookie written before the script changed is still read. Another module that learns identifiers for a request, from a cookie or a store of its own, offers itself the same way, and core syncs what it learns to the identity graph and carries it to the auction with no change to core.
 
 The `sharedId` cookie follows a similar path but is written directly by Prebid's SharedID module rather than by TSJS. The server reads it separately and maps it via the `sharedid.org` source domain.
 
-Returning-user cookie persistence runs only on publisher document navigations, `POST /auction`, and admitted `GET /_ts/page-bids` SPA navigations. Static assets, analytics, integration requests, filter short circuits, and other subresources do not decode or persist these cookies. New EC creation remains eligible regardless of route because its backing row must include the request's initial IDs.
+Returning-user persistence runs only on publisher document navigations, `POST /auction`, and admitted `GET /_ts/page-bids` SPA navigations. Static assets, analytics, integration requests, filter short circuits, and other subresources do not persist what the request carries. Core still asks the identifier modules on these requests wherever it reads the Edge Cookie state with an Edge Cookie module selected, so the Prebid module decodes its cookie on them too. New EC creation remains eligible regardless of route because its backing row must include the request's initial IDs.
 
 Each eligible request attempts at most one conditional cookie update. If another writer wins, Trusted Server reads the row once and does not write again from that request. A matching value completes the sync; an absent or different value is deferred.
 
@@ -251,7 +255,7 @@ sequenceDiagram
     DSP-->>PS: OpenRTB bid response
     PS-->>TS: OpenRTB seatbid response
     TS-->>B: Auction response + x-ts-eids header when available
-    TS->>KV: Add missing partner UIDs from request eids[]<br/>+ ts-eids/sharedId cookies (storage and personalised-ad permissions)
+    TS->>KV: Add missing partner UIDs from request eids[]<br/>+ what the Prebid module read from ts-eids and the sharedId cookie<br/>(storage and personalised-ad permissions)
 ```
 
 The relevant OpenRTB structure forwarded to Prebid Server and downstream partners is:
@@ -289,7 +293,7 @@ The relevant OpenRTB structure forwarded to Prebid Server and downstream partner
 }
 ```
 
-Server-resolved EIDs and current-request Prebid EIDs are deduplicated by `source + uid.id`. Browser-supplied EIDs, from the `/auction` request body, the `ts-eids` cookie, or the `sharedId` cookie, only fill partner UIDs that are missing from KV; a different stored UID is kept, as described in [Prebid EID Flow](#prebid-eid-flow).
+Server-resolved EIDs and current-request Prebid EIDs are deduplicated by `source + uid.id`. Browser-supplied EIDs, from the `/auction` request body, an identifier module such as the Prebid module reading its `ts-eids` cookie, or the `sharedId` cookie, only fill partner UIDs that are missing from KV; a different stored UID is kept, as described in [Identifier Flow](#identifier-flow).
 
 ### Pull-Sync Completeness Marker
 
