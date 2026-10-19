@@ -3929,68 +3929,6 @@ fn write_serve_middleware_headers(
     write_response_headers(response, headers);
 }
 
-/// Returns the `Location` that keeps a reader on the address they asked for
-/// when the origin redirects to itself, or `None` to leave the header as the
-/// origin wrote it.
-///
-/// A `Location` is the origin's own when it names `origin_host`, the `Host`
-/// the origin was sent, port included, and its path is `origin_path` or
-/// beneath it. The reader is sent to the same place on `request_scheme` and
-/// `request_host`, with `origin_path` taken off the path and the query and
-/// fragment kept. Relayed as written it would take the reader's browser off
-/// the deployment, and a missing trailing slash is enough to make an origin
-/// send one.
-///
-/// A `Location` naming another host is the origin sending the reader
-/// elsewhere, and one outside `origin_path` has no address on the request's
-/// host, so both are left alone. So is one that names no host, which the
-/// reader's browser resolves against the address it asked for.
-fn rewritten_origin_redirect(
-    location: &str,
-    origin_host: &str,
-    origin_path: &str,
-    request_scheme: &str,
-    request_host: &str,
-) -> Option<String> {
-    // A request that names no host has no address to send the reader to.
-    if request_host.is_empty() {
-        return None;
-    }
-    let target = match url::Url::parse(location) {
-        Ok(target) => target,
-        // `//host/path` names a host and takes the scheme of the request.
-        Err(url::ParseError::RelativeUrlWithoutBase) if location.starts_with("//") => {
-            url::Url::parse(&format!("{request_scheme}:{location}")).ok()?
-        }
-        Err(_) => return None,
-    };
-    if !matches!(target.scheme(), "http" | "https") {
-        return None;
-    }
-
-    // Compared with the port, because `origin.example` and
-    // `origin.example:8443` are different origins. The origin's name is read
-    // on the scheme of the `Location`, so a port that is the usual one for it
-    // counts as no port on both sides, as `url` writes the `Location`.
-    let origin = url::Url::parse(&format!("{}://{origin_host}", target.scheme())).ok()?;
-    if target.host_str()? != origin.host_str()? || target.port() != origin.port() {
-        return None;
-    }
-
-    // The origin path counts only where it ends at a separator, so `/site`
-    // does not come off the front of `/sitemap.xml`.
-    let path = target
-        .path()
-        .strip_prefix(origin_path.trim_end_matches('/'))
-        .filter(|rest| rest.is_empty() || rest.starts_with('/'))?;
-    let path = if path.is_empty() { "/" } else { path };
-    let query_and_fragment = &target[url::Position::AfterPath..];
-
-    Some(format!(
-        "{request_scheme}://{request_host}{path}{query_and_fragment}"
-    ))
-}
-
 /// Returns the status a publisher origin request is refused with before it is
 /// sent, or `None` when it may be sent.
 ///
@@ -6321,28 +6259,6 @@ pub async fn handle_publisher_request(
         response.headers().len()
     );
 
-    // Every route below returns this response, so a redirect the origin sent
-    // to itself is named for the reader here, once.
-    if response.status().is_redirection()
-        && let Some(rewritten) = response
-            .headers()
-            .get(header::LOCATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|location| {
-                rewritten_origin_redirect(
-                    location,
-                    &origin_host_header,
-                    parsed_origin.path(),
-                    request_scheme,
-                    request_host,
-                )
-            })
-        && let Ok(value) = HeaderValue::from_str(&rewritten)
-    {
-        log::debug!("Origin redirect named for the request's host");
-        response.headers_mut().insert(header::LOCATION, value);
-    }
-
     // A file the origin does not have is made, see `entry_making_the_document`.
     // Core runs no middleware for a request that names no host, so there the
     // made file would go out empty and the origin's answer stands instead.
@@ -6408,14 +6324,6 @@ pub async fn handle_publisher_request(
         enforce_terminal_private_cache_privacy(&mut response);
         return Ok(PublisherResponse::Buffered(response));
     }
-    write_serve_middleware_headers(
-        &mut response,
-        &header_reader,
-        &request_path,
-        settings,
-        integration_registry,
-    );
-
     // Map origin URLs in navigation, preload, and CSP headers to the serving host,
     // matching the body rewrite, on every route. Runs before the template-cache gate
     // so a stored template replays the rewritten policy headers; the cache key is
@@ -6425,12 +6333,22 @@ pub async fn handle_publisher_request(
         &OriginHeaderRewrite {
             origin_host: &origin_host,
             origin_host_header: &origin_host_header,
+            origin_path: parsed_origin.path(),
             request_host,
             request_scheme,
             origin_scheme: &origin_scheme,
             request_path_and_query: &request_path_and_query,
             request_is_get_or_head: is_get_or_head,
         },
+    );
+    // Asked after the rewrite, so a serve middleware sees the headers the
+    // reader receives and a header it sets is the one sent.
+    write_serve_middleware_headers(
+        &mut response,
+        &header_reader,
+        &request_path,
+        settings,
+        integration_registry,
     );
 
     let template_cache_policy = TemplateCachePolicy::from_settings(settings);
@@ -20068,7 +19986,7 @@ mod tests {
         location: &str,
     ) -> String {
         let mut settings = create_test_settings();
-        settings.publisher.origin_url = origin_url.to_string();
+        edit_origin(&mut settings, |origin| origin.url = origin_url.to_owned());
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response_with_headers(
             303,
@@ -20122,7 +20040,7 @@ mod tests {
 
     #[tokio::test]
     async fn cookieless_get_redirect_to_current_url_is_not_rewritten_into_a_loop() {
-        // A canonical-host redirect triggered by `origin_host_header_override`
+        // A canonical-host redirect triggered by `source.origin.host_header`
         // answers the retry through Trusted Server the same way, so it must leave.
         for method in [Method::GET, Method::HEAD] {
             let location = redirect_location_for_current_url(
@@ -20142,7 +20060,9 @@ mod tests {
     #[tokio::test]
     async fn overridden_host_redirect_with_cookie_is_not_rewritten_into_a_loop() {
         let mut settings = create_test_settings();
-        settings.publisher.origin_host_header_override = Some("publisher.example".to_string());
+        edit_origin(&mut settings, |origin| {
+            origin.host_header = Some("publisher.example".to_owned());
+        });
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response_with_headers(
             301,
@@ -26363,370 +26283,6 @@ mod tests {
         const STORAGE_URL: &str = "https://storage.example.com/bucket/site";
         const READER_HOST: &str = "publisher.example";
 
-        #[test]
-        fn a_redirect_naming_the_origin_is_named_for_the_reader() {
-            // (why, location, origin host, the rewritten location)
-            let cases = [
-                (
-                    "an absolute redirect to the origin comes back on the reader's host",
-                    "https://origin.example/news",
-                    "origin.example",
-                    "https://publisher.example/news",
-                ),
-                (
-                    "the path, the query and the fragment are kept",
-                    "https://origin.example/news/archive/?page=2&sort=new#latest",
-                    "origin.example",
-                    "https://publisher.example/news/archive/?page=2&sort=new#latest",
-                ),
-                (
-                    "a query alone is kept",
-                    "https://origin.example/news?utm_source=x&page=2",
-                    "origin.example",
-                    "https://publisher.example/news?utm_source=x&page=2",
-                ),
-                (
-                    "a fragment alone is kept",
-                    "https://origin.example/news#latest",
-                    "origin.example",
-                    "https://publisher.example/news#latest",
-                ),
-                (
-                    "a redirect to the origin's root is the reader's root",
-                    "https://origin.example",
-                    "origin.example",
-                    "https://publisher.example/",
-                ),
-                (
-                    "an origin reached over plain HTTP is named for a reader on HTTPS",
-                    "http://origin.example/news",
-                    "origin.example",
-                    "https://publisher.example/news",
-                ),
-                (
-                    "an origin on a port is named with that port",
-                    "https://origin.example:8443/news",
-                    "origin.example:8443",
-                    "https://publisher.example/news",
-                ),
-                (
-                    "a plain HTTP origin on a port is named with that port",
-                    "http://192.0.2.1:9000/news",
-                    "192.0.2.1:9000",
-                    "https://publisher.example/news",
-                ),
-                (
-                    "a scheme's own port written out is the same origin",
-                    "https://origin.example:443/news",
-                    "origin.example",
-                    "https://publisher.example/news",
-                ),
-                (
-                    "a Host header override is the origin's name when one is set",
-                    "https://www.example.com/news",
-                    "www.example.com",
-                    "https://publisher.example/news",
-                ),
-                (
-                    "a Host header override written with the scheme's own port is \
-                     the same name",
-                    "https://www.example.com/news",
-                    "www.example.com:443",
-                    "https://publisher.example/news",
-                ),
-                (
-                    "a Host header override is compared in any letter case",
-                    "https://www.example.com/news",
-                    "WWW.Example.COM",
-                    "https://publisher.example/news",
-                ),
-                (
-                    "an origin named by an address in brackets is named with them",
-                    "http://[::1]:3000/news",
-                    "[::1]:3000",
-                    "https://publisher.example/news",
-                ),
-                (
-                    "a host is the same host in any letter case, and the path keeps its own",
-                    "https://ORIGIN.Example/News",
-                    "origin.example",
-                    "https://publisher.example/News",
-                ),
-                (
-                    "a redirect that leaves the scheme off still names the origin",
-                    "//origin.example/news?page=2",
-                    "origin.example",
-                    "https://publisher.example/news?page=2",
-                ),
-            ];
-            for (why, location, origin_host, expected) in cases {
-                assert_eq!(
-                    rewritten_origin_redirect(location, origin_host, "", "https", READER_HOST)
-                        .as_deref(),
-                    Some(expected),
-                    "should rewrite `{location}`: {why}",
-                );
-            }
-        }
-
-        #[test]
-        fn the_reader_is_sent_to_the_scheme_and_host_they_asked_for() {
-            // (why, location, the reader's scheme, the reader's host, the
-            // rewritten location)
-            let cases = [
-                (
-                    "the reader's own scheme is used, so a deployment served over \
-                     plain HTTP is not sent to a scheme it does not answer",
-                    "https://origin.example/news",
-                    "http",
-                    "publisher.example",
-                    "http://publisher.example/news",
-                ),
-                (
-                    "the reader's host keeps its port",
-                    "https://origin.example/news",
-                    "http",
-                    "localhost:8080",
-                    "http://localhost:8080/news",
-                ),
-            ];
-            for (why, location, scheme, host, expected) in cases {
-                assert_eq!(
-                    rewritten_origin_redirect(location, "origin.example", "", scheme, host)
-                        .as_deref(),
-                    Some(expected),
-                    "should rewrite `{location}`: {why}",
-                );
-            }
-        }
-
-        #[test]
-        fn a_location_that_does_not_name_the_origin_is_left_alone() {
-            // (why, location, origin host)
-            let cases = [
-                (
-                    "a redirect anywhere else is the origin sending the reader off \
-                     site on purpose",
-                    "https://somewhere.else/news",
-                    "origin.example",
-                ),
-                (
-                    "a host beneath the origin's is another host",
-                    "https://www.origin.example/news",
-                    "origin.example",
-                ),
-                (
-                    "a host that only starts with the origin's is another host",
-                    "https://origin.example.elsewhere.test/news",
-                    "origin.example",
-                ),
-                (
-                    "a host that only ends with the origin's is another host",
-                    "https://notorigin.example/news",
-                    "origin.example",
-                ),
-                (
-                    "the origin's name written as a user name names another host",
-                    "https://origin.example@elsewhere.test/news",
-                    "origin.example",
-                ),
-                (
-                    "an origin on a port is a different origin from the same host \
-                     without one",
-                    "https://origin.example/news",
-                    "origin.example:8443",
-                ),
-                (
-                    "an origin without a port is a different origin from the same \
-                     host on one",
-                    "https://origin.example:8443/news",
-                    "origin.example",
-                ),
-                (
-                    "a port that is the usual one for another scheme is a port",
-                    "http://origin.example/news",
-                    "origin.example:443",
-                ),
-                (
-                    "with a Host header override set, the host connected to is not \
-                     the origin's name",
-                    "https://origin.example/news",
-                    "www.example.com",
-                ),
-                (
-                    "a path from the root names no host",
-                    "/news",
-                    "origin.example",
-                ),
-                (
-                    "a path beside the one asked for names no host",
-                    "news/latest",
-                    "origin.example",
-                ),
-                (
-                    "a path that climbs names no host",
-                    "../news",
-                    "origin.example",
-                ),
-                ("a query alone names no host", "?page=2", "origin.example"),
-                (
-                    "a fragment alone names no host",
-                    "#latest",
-                    "origin.example",
-                ),
-                ("an empty value names no host", "", "origin.example"),
-                (
-                    "a redirect that leaves the scheme off may name another host",
-                    "//somewhere.else/news",
-                    "origin.example",
-                ),
-                (
-                    "an address that is not a web address is not the origin's own",
-                    "ftp://origin.example/news",
-                    "origin.example",
-                ),
-                (
-                    "an address with no host is not the origin's own",
-                    "mailto:someone@origin.example",
-                    "origin.example",
-                ),
-                (
-                    "a value that is no address is left as written",
-                    "https://",
-                    "origin.example",
-                ),
-            ];
-            for (why, location, origin_host) in cases {
-                assert_eq!(
-                    rewritten_origin_redirect(location, origin_host, "", "https", READER_HOST),
-                    None,
-                    "should leave `{location}` alone: {why}",
-                );
-            }
-        }
-
-        #[test]
-        fn a_reader_with_no_host_is_sent_nowhere_new() {
-            assert_eq!(
-                rewritten_origin_redirect(
-                    "https://origin.example/news",
-                    "origin.example",
-                    "",
-                    "https",
-                    "",
-                ),
-                None,
-                "should leave the redirect alone when the request names no host"
-            );
-        }
-
-        #[test]
-        fn a_redirect_under_the_origin_path_loses_that_path() {
-            // (why, location, origin path, the rewritten location)
-            let cases = [
-                (
-                    "a path beneath the origin path is the reader's path without it",
-                    "https://storage.example.com/bucket/site/about/",
-                    "/bucket/site",
-                    "https://publisher.example/about/",
-                ),
-                (
-                    "the query and the fragment are kept",
-                    "https://storage.example.com/bucket/site/about/index.html?v=2#team",
-                    "/bucket/site",
-                    "https://publisher.example/about/index.html?v=2#team",
-                ),
-                (
-                    "the origin path itself is the reader's root",
-                    "https://storage.example.com/bucket/site",
-                    "/bucket/site",
-                    "https://publisher.example/",
-                ),
-                (
-                    "the origin path with a trailing slash is the reader's root",
-                    "https://storage.example.com/bucket/site/",
-                    "/bucket/site",
-                    "https://publisher.example/",
-                ),
-                (
-                    "an origin path written with a trailing slash is the same path",
-                    "https://storage.example.com/bucket/site/about/",
-                    "/bucket/site/",
-                    "https://publisher.example/about/",
-                ),
-                (
-                    "a dot segment that stays beneath the origin path is resolved first",
-                    "https://storage.example.com/bucket/site/about/../news/",
-                    "/bucket/site",
-                    "https://publisher.example/news/",
-                ),
-                (
-                    "an origin path of `/` keeps nothing, so nothing comes off",
-                    "https://storage.example.com/bucket/site/about/",
-                    "/",
-                    "https://publisher.example/bucket/site/about/",
-                ),
-            ];
-            for (why, location, origin_path, expected) in cases {
-                assert_eq!(
-                    rewritten_origin_redirect(
-                        location,
-                        "storage.example.com",
-                        origin_path,
-                        "https",
-                        READER_HOST,
-                    )
-                    .as_deref(),
-                    Some(expected),
-                    "should rewrite `{location}`: {why}",
-                );
-            }
-        }
-
-        #[test]
-        fn a_redirect_outside_the_origin_path_is_left_alone() {
-            // (why, location)
-            let cases = [
-                (
-                    "another folder of the same host is not the publisher's site",
-                    "https://storage.example.com/bucket/other/about/",
-                ),
-                (
-                    "the origin path counts only where it ends at a separator",
-                    "https://storage.example.com/bucket/sitemap.xml",
-                ),
-                (
-                    "a folder whose name starts with the origin path's last is another folder",
-                    "https://storage.example.com/bucket/site-two/about/",
-                ),
-                (
-                    "the host's root is above the origin path",
-                    "https://storage.example.com/",
-                ),
-                (
-                    "a dot segment that climbs out of the origin path is outside it",
-                    "https://storage.example.com/bucket/site/../other/about/",
-                ),
-                (
-                    "a path in another letter case is another path",
-                    "https://storage.example.com/Bucket/Site/about/",
-                ),
-            ];
-            for (why, location) in cases {
-                assert_eq!(
-                    rewritten_origin_redirect(
-                        location,
-                        "storage.example.com",
-                        "/bucket/site",
-                        "https",
-                        READER_HOST,
-                    ),
-                    None,
-                    "should leave `{location}` alone: {why}",
-                );
-            }
-        }
-
         fn settings_with_origin(origin_url: &str) -> Settings {
             let mut settings = create_test_settings();
             edit_origin(&mut settings, |origin| origin.url = origin_url.to_owned());
@@ -26923,7 +26479,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn the_host_header_override_is_the_origin_s_name_when_set() {
+        async fn under_a_host_override_the_host_of_origin_url_is_the_origin_s_name() {
             let mut settings = settings_with_origin(ORIGIN_URL);
             edit_origin(&mut settings, |origin| {
                 origin.host_header = Some("www.example.com".to_owned())
@@ -26931,12 +26487,12 @@ mod tests {
             // (the origin's `Location`, what the reader receives)
             let cases = [
                 (
-                    "https://www.example.com/news/",
+                    "https://origin.example/news/",
                     "https://publisher.example/news/",
                 ),
                 (
-                    "https://origin.example/news/",
-                    "https://origin.example/news/",
+                    "https://www.example.com/news/",
+                    "https://www.example.com/news/",
                 ),
             ];
             for (sent, expected) in cases {
@@ -26951,7 +26507,7 @@ mod tests {
                 assert_eq!(
                     location(&response),
                     Some(expected),
-                    "should treat the override as the origin's name for `{sent}`"
+                    "should treat the host of `origin_url` as the origin's name for `{sent}`"
                 );
             }
         }
@@ -27034,7 +26590,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn a_location_on_an_answer_that_is_no_redirect_is_unchanged() {
+        async fn a_location_on_an_answer_that_is_no_redirect_is_named_for_the_reader() {
             let settings = settings_with_origin(ORIGIN_URL);
             // (the origin's status, the origin's media type, the route the
             // answer takes)
@@ -27066,8 +26622,8 @@ mod tests {
                 );
                 assert_eq!(
                     location(&response),
-                    Some("https://origin.example/news/"),
-                    "should leave the `Location` of a {status} as the origin wrote it"
+                    Some("https://publisher.example/news/"),
+                    "should name the `Location` of a {status} for the reader"
                 );
             }
         }
