@@ -29,11 +29,11 @@ use brotli::Decompressor;
 use brotli::enc::BrotliEncoderParams;
 use brotli::enc::writer::CompressorWriter;
 use error_stack::{Report, ResultExt as _};
+use flate2::read::ZlibDecoder;
+use flate2::write::{GzEncoder, ZlibEncoder};
 use futures::future::LocalBoxFuture;
 
 use finish::{StreamFinish, StreamFinishError, StreamFinishInput};
-use flate2::read::ZlibDecoder;
-use flate2::write::{GzEncoder, ZlibEncoder};
 
 use crate::error::TrustedServerError;
 

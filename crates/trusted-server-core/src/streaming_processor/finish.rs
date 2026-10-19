@@ -7,6 +7,7 @@ use error_stack::Report;
 use http::StatusCode;
 use web_time::Instant;
 
+use crate::bounded_buffer::reserve_bounded;
 use crate::platform::RuntimeServices;
 
 /// Borrows un-emitted stage output and request services for optional EOF work.
@@ -86,28 +87,11 @@ impl StreamOutputWriter {
     /// input.replacement.append(b"<p>Example article</p>")?;
     /// ```
     pub fn append(&mut self, chunk: &[u8]) -> Result<(), Report<StreamFinishError>> {
-        let next = self
-            .bytes
-            .len()
-            .checked_add(chunk.len())
-            .filter(|length| *length <= self.limit);
-        let next = match next {
-            Some(next) if !self.poisoned => next,
-            _ => {
-                self.poisoned = true;
-                return Err(Report::new(StreamFinishError::OutputLimitExceeded {
-                    limit: self.limit,
-                }));
-            }
-        };
-        if next > self.bytes.capacity() {
-            let capacity = self
-                .bytes
-                .capacity()
-                .saturating_mul(2)
-                .max(next)
-                .min(self.limit);
-            self.bytes.reserve_exact(capacity - self.bytes.len());
+        if self.poisoned || reserve_bounded(&mut self.bytes, chunk.len(), self.limit).is_none() {
+            self.poisoned = true;
+            return Err(Report::new(StreamFinishError::OutputLimitExceeded {
+                limit: self.limit,
+            }));
         }
         self.bytes.extend_from_slice(chunk);
         Ok(())

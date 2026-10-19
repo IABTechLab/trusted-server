@@ -55,6 +55,7 @@ use crate::auction::telemetry::{
 use crate::auction::types::{
     AuctionContext, AuctionRequest, Bid, DeviceInfo, PublisherInfo, SiteInfo, UserInfo,
 };
+use crate::bounded_buffer::reserve_bounded;
 use crate::cache_policy::{
     CachePolicy, EdgeCacheHeader, cache_control_headers_are_private_or_no_store,
 };
@@ -3217,8 +3218,7 @@ pub async fn stream_publisher_body_async<W: Write>(
         && integration_registry.has_async_html_finish()
     {
         abandon_response_auction(params, services, "partial_response").await;
-        let mut source = BodyChunkSource::new(body, STREAM_CHUNK_SIZE)
-            .with_max_bytes(settings.publisher.max_buffered_body_bytes);
+        let mut source = BodyChunkSource::new(body, STREAM_CHUNK_SIZE);
         while let Some(bytes) = source.next_chunk().await? {
             output
                 .write_all(&bytes)
@@ -4191,21 +4191,7 @@ impl InlineBodyCloseSeam {
     fn push_bounded(&mut self, chunk: &[u8], limit: usize) -> std::io::Result<Vec<u8>> {
         let overflow = || std::io::Error::other("HTML auction suffix exceeds retained-byte limit");
         if self.found {
-            let next = self
-                .buffered
-                .len()
-                .checked_add(chunk.len())
-                .filter(|size| *size <= limit)
-                .ok_or_else(overflow)?;
-            if next > self.buffered.capacity() {
-                let capacity = self
-                    .buffered
-                    .capacity()
-                    .saturating_mul(2)
-                    .max(next)
-                    .min(limit);
-                self.buffered.reserve_exact(capacity - self.buffered.len());
-            }
+            reserve_bounded(&mut self.buffered, chunk.len(), limit).ok_or_else(overflow)?;
             self.buffered.extend_from_slice(chunk);
             return Ok(Vec::new());
         }
@@ -22011,21 +21997,32 @@ mod tests {
     #[test]
     fn html_finalization_direct_helpers_copy_encoded_ranges_without_optional_work() {
         for streamed in [false, true] {
-            let settings = crate::publisher::allow_eof_test_settings(create_test_settings());
+            let mut settings = crate::publisher::allow_eof_test_settings(create_test_settings());
+            settings.publisher.max_buffered_body_bytes = 4;
             let calls = Arc::new(AtomicUsize::new(0));
             let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
                 CountingTerminalFactory(Arc::clone(&calls)),
             )]);
             let encoded = gzip_encode(b"<p>Example partial response</p>");
+            assert!(
+                encoded.len() > settings.publisher.max_buffered_body_bytes,
+                "should exercise pass-through beyond the retained-body limit"
+            );
             let body = if streamed {
-                EdgeBody::stream(futures::stream::iter(vec![bytes::Bytes::from(
-                    encoded.clone(),
-                )]))
+                let chunks: Vec<_> = encoded
+                    .chunks(4)
+                    .map(bytes::Bytes::copy_from_slice)
+                    .collect();
+                EdgeBody::stream(futures::stream::iter(chunks))
             } else {
                 EdgeBody::from(encoded.clone())
             };
             let mut params = html_stream_params("gzip", None);
-            params.response_status = StatusCode::PARTIAL_CONTENT;
+            params.response_status = if streamed {
+                StatusCode::OK
+            } else {
+                StatusCode::PARTIAL_CONTENT
+            };
             params.range_associated = streamed;
             let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
             let mut output = Vec::new();
