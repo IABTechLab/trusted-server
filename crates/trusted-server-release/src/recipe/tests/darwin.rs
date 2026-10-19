@@ -285,6 +285,7 @@ fn exact_darwin_plan_binds_the_linker_debug_map_and_apple_tools() {
             format!("{developer}/{TOOLCHAIN_BIN}/ar"),
         ),
         ("ZERO_AR_DATE", "1".to_owned()),
+        ("OPENSSL_CONF", "/dev/null".to_owned()),
     ];
     for (name, value) in expected {
         assert_eq!(

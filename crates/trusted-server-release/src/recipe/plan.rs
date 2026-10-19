@@ -264,7 +264,7 @@ struct DarwinPlan {
     /// Extra `--config` pairs: the target linker.
     configs: Vec<String>,
     /// `DEVELOPER_DIR`, `SDKROOT`, `CC_<triple>`, `AR_<triple>` and
-    /// `ZERO_AR_DATE`.
+    /// `ZERO_AR_DATE` and the fixed Cargo OpenSSL configuration.
     environment: BTreeMap<String, String>,
     /// Execution path of the developer directory for the C path remap.
     developer: String,
@@ -318,6 +318,8 @@ fn darwin_plan(
             execution_text(paths, "Apple ar", apple.ar())?,
         ),
         (ZERO_AR_DATE_VARIABLE.to_owned(), "1".to_owned()),
+        // Cargo's LibreSSL initialization must not read ambient host configuration.
+        ("OPENSSL_CONF".to_owned(), "/dev/null".to_owned()),
     ]);
     Ok(DarwinPlan {
         rustflags: vec![format!("-Clink-arg=-Wl,-oso_prefix,{parent}/")],

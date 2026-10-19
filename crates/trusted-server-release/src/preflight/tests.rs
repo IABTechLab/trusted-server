@@ -196,7 +196,13 @@ fn rejects_sqlite_selectors() {
 fn rejects_ring_and_openssl_selectors() {
     assert_each_rejected(
         "crypto",
-        &["RING_PREGENERATE_ASM", "OPENSSL_DIR", "OPENSSL_STATIC"],
+        &[
+            "RING_PREGENERATE_ASM",
+            "OPENSSL_DIR",
+            "OPENSSL_STATIC",
+            "OPENSSL_CONF",
+            "OPENSSL_CONF_INCLUDE",
+        ],
     );
 }
 
