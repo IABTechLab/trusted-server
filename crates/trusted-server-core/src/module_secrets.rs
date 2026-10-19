@@ -131,14 +131,21 @@ pub(crate) fn clear_unused(data: &mut Value, builders: &[IntegrationBuilder]) {
 }
 
 /// The secret leaves the builders' modules declare, at each name a module's
-/// table can be written under.
+/// table can be written under, and the ones their origin signers declare, at
+/// each place an `auth` table can be written.
 ///
 /// Every level is optional, so a module that is not configured, or a setting
 /// [`clear_unused`] removed, is passed over.
 #[must_use]
 pub(crate) fn secret_fields(builders: &[IntegrationBuilder]) -> Vec<SecretField> {
     let optional = |name: &'static str| SecretPathSegment::OptionalField(Cow::Borrowed(name));
-    let mut fields = Vec::new();
+    let signers = crate::origin_auth::OriginSigners::new(
+        builders
+            .iter()
+            .filter_map(IntegrationBuilder::origin_signer)
+            .collect(),
+    );
+    let mut fields = crate::origin_auth::secret_fields(&signers);
     for builder in builders {
         let Some((section, forms)) = written_forms(builder) else {
             continue;

@@ -65,9 +65,9 @@ url = "https://assets-cdn.example.com"
 
 Both fields must be configured together. The rewritten path must start with `/`. When `url` has a path, the rewritten path is added under that folder.
 
-## Private S3 origins
+## Signed origins
 
-Add an auth block to the route's source when the asset origin is a private S3 bucket.
+Add an auth block to the route's source when the asset origin answers only signed reads. `type` names an origin signer a crate in the build offers, and the rest of the table is that signer's. A stock build offers `s3_sigv4`, from `crates/shared/aws`, for a private S3 bucket.
 
 ```toml
 [[proxy.asset_routes]]
@@ -91,7 +91,7 @@ secret_access_key = "s3_secret_access_key"
 ### S3 requirements
 
 - `url` must be the real S3 host that AWS validates in the SigV4 canonical request.
-- `url` must use `https` when the route signs. A signing table the signer cannot use, such as an empty or malformed `region`, is refused at startup naming the route, as in `proxy.asset_routes /.image/ source.origin.auth`.
+- `url` must use `https` when the route signs. A `type` no crate in the build offers is refused at startup naming the signers on offer, and a signing table the signer cannot use, such as an empty or malformed `region`, is refused at startup and by `ts config validate` naming the route, as in `proxy.asset_routes /.image/ source.origin.auth`.
 - S3 support is for `GET` and `HEAD` asset reads.
 - Signing uses header-based AWS SigV4, not presigned URLs.
 - The signer uses `x-amz-content-sha256: UNSIGNED-PAYLOAD`.
@@ -109,7 +109,7 @@ Credential fields contain secret key references:
 | `secret_access_key` | `secret_access_key` | AWS secret access key                |
 | `session_token`     | unset               | Optional AWS temporary session token |
 
-Place those values in the logical `trusted_server_secrets` store. Adapter configuration maps that logical ID to an environment-specific physical store such as Fastly `ts_secrets`. The legacy `secret_store` field is accepted for one migration release but ignored and omitted from newly pushed config.
+Place those values in the logical `trusted_server_secrets` store. Adapter configuration maps that logical ID to an environment-specific physical store such as Fastly `ts_secrets`. The legacy `secret_store` field is accepted by the signer and ignored.
 
 ## Origin query policy
 

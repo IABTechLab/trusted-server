@@ -363,6 +363,9 @@ pub fn shipped_module_builders() -> Vec<IntegrationBuilder> {
         // The loading cache a stock build caches with, offered whatever the
         // settings say, which no section selects either.
         trusted_server_loading_cache_51degrees::builder(),
+        // The origin signer a source's auth table can name, offered the same
+        // way.
+        trusted_server_shared_aws::builder(),
     ]
 }
 
@@ -1975,6 +1978,7 @@ mod tests {
                 "auction.aps",
                 "ad-server.iabtl",
                 "loading-cache.51degrees",
+                "shared.aws",
             ],
             "should offer the linked modules in the order their hooks run"
         );

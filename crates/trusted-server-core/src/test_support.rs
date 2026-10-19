@@ -29,7 +29,7 @@ pub mod tests {
     /// When `route` does not select core's `origin` source.
     pub fn set_route_auth(
         route: &mut crate::settings::ProxyAssetRoute,
-        auth: Option<crate::settings::AssetOriginAuth>,
+        auth: Option<crate::origin_auth::OriginAuth>,
     ) {
         let mut origin = route
             .origin_source()
@@ -46,10 +46,10 @@ pub mod tests {
     /// When `settings` do not select core's `origin` source.
     #[must_use]
     pub fn origin_host(settings: &Settings) -> String {
-        settings
+        let origin = settings
             .origin_source()
-            .expect("settings should select the origin source")
-            .location()
+            .expect("settings should select the origin source");
+        crate::source::SourceLocation::new(origin.url)
             .expect("the origin source should give a location")
             .host()
     }
