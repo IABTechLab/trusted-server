@@ -34,6 +34,8 @@ pub(crate) enum ReleaseError {
     Runtime,
     #[display("Artifact composition evidence is rejected")]
     Composition,
+    #[display("Release transfer collection is rejected")]
+    Collection,
 }
 
 impl core::error::Error for ReleaseError {}
