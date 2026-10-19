@@ -184,3 +184,52 @@ Failures:
 - `carries no EID source metadata`: `no entry should keep eidSources: expected [ 'connectIdSystem', …(10) ] to deeply equal []` (11 modules still carry `eidSources`)
 
 Green: after deleting `eidSources` and the resolver, `carries no EID source metadata` passes. The three targeted suites (`user_id_modules.test.ts`, `prebid-user-id-registry.test.mjs`, `build-prebid-external.test.mjs`) pass 81 of 81. `./scripts/test-cli.sh` exits 0. The full Vitest run under Node 24.12.0 passes 1249 of 1249 across 52 files.
+
+## Final review fixes
+
+### Fix 1: nothing fits clears the cookie (regression net)
+
+Revert proof: temporarily deleted the `clearPrebidEidsCookie();` call inside the `fitted.value === undefined` branch of `writePrebidEidsCookie`, then restored it.
+
+Command:
+
+```bash
+cd crates/trusted-server-js/lib && mise exec node@24.12.0 -- npx vitest run test/integrations/prebid/index.test.ts -t "no EID fits"
+```
+
+Failures:
+
+- `clears ts-eids when no EID fits the cookie budget but still sends the body`: `the cookie should be cleared: expected 'preset-value' to be undefined`
+
+Green: with the call restored, the test passes.
+
+### Fix 2: cookie writes must not throw out of buildRequests
+
+Command (against the unguarded `clearPrebidEidsCookie`):
+
+```bash
+cd crates/trusted-server-js/lib && mise exec node@24.12.0 -- npx vitest run test/integrations/prebid/index.test.ts -t "document.cookie writes throw"
+```
+
+Failures:
+
+- `still builds the request with the entry when the cookie write fails`: `Error: cookies blocked` thrown from `clearPrebidEidsCookie` through `buildRequests`
+- `still builds the request without eids when the cookie clear fails`: `Error: cookies blocked` thrown from `clearPrebidEidsCookie` through `buildRequests`
+
+Green: with the `try`/`catch` guard both pass; full Vitest passes 1252 of 1252.
+
+### Fix 3: non-array cookie JSON is a parse error
+
+Command (against the unchanged decoder):
+
+```bash
+cargo test-fastly -- parse_prebid_eids_cookie_rejects_non_array_json
+cargo test-fastly -- eids_lookup_reports_non_array
+```
+
+Failures:
+
+- `parse_prebid_eids_cookie_rejects_non_array_json`: test trapped, the `{"a":1}` cookie parsed as `Ok`
+- `eids_lookup_reports_non_array_cookie_as_parse_error`: test trapped, no `parse_error` reported
+
+Green: with the array check both pass.

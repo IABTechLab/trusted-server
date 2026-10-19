@@ -78,6 +78,9 @@ fn decode_prebid_eids_cookie(cookie_value: &str) -> Result<DecodedCookieEids, St
 
     let structured = serde_json::from_slice::<Box<RawValue>>(&bytes)
         .map_err(|e| format!("JSON parse failed: {e}"))?;
+    if !structured.get().trim_start().starts_with('[') {
+        return Err("JSON parse failed: ts-eids payload is not an array".to_owned());
+    }
     Ok(DecodedCookieEids::Structured(structured))
 }
 
@@ -523,6 +526,16 @@ mod tests {
         let encoded = BASE64.encode(b"not json");
         let result = parse_prebid_eids_cookie(&encoded);
         assert!(result.is_err(), "should reject invalid JSON");
+    }
+
+    #[test]
+    fn parse_prebid_eids_cookie_rejects_non_array_json() {
+        let result = parse_prebid_eids_cookie(&encode_json(&json!({"a": 1})));
+        let error = result.expect_err("should reject a JSON object");
+        assert!(
+            error.contains("not an array"),
+            "should explain that the payload is not an array"
+        );
     }
 
     #[test]
