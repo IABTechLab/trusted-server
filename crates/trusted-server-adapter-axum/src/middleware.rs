@@ -5,6 +5,8 @@ use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::Response;
 use edgezero_core::middleware::{Middleware, Next};
+use trusted_server_core::ec::finalize::ec_finalize_response;
+use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::http_util::{
     ROUTE_NAMESPACE, sanitize_trusted_client_ip_headers, strip_deployment_headers,
 };
@@ -14,6 +16,8 @@ use trusted_server_core::response_privacy::{
     enforce_uncacheable_cache_privacy,
 };
 use trusted_server_core::settings::Settings;
+
+use crate::app::EcFinalizeState;
 
 // ---------------------------------------------------------------------------
 // SanitizeRequestMiddleware
@@ -62,7 +66,8 @@ impl Middleware for SanitizeRequestMiddleware {
 ///
 /// Registered directly inside [`SanitizeRequestMiddleware`], so that every
 /// outgoing response carries a consistent set of headers. Once the response
-/// is finalized it applies the response effects the request filters left.
+/// is finalized it finalizes the Edge Cookie and then applies the response
+/// effects the request filters left.
 pub struct FinalizeResponseMiddleware {
     settings: Arc<Settings>,
 }
@@ -80,13 +85,47 @@ impl Middleware for FinalizeResponseMiddleware {
     async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
         let path = ctx.request().uri().path().to_owned();
         let mut response = next.run(ctx).await?;
+        let ec_state = response.extensions_mut().remove::<EcFinalizeState>();
         let request_filter_effects = response.extensions_mut().remove::<RequestFilterEffects>();
         // Before finalizing, so a header finalizing writes is kept.
         strip_deployment_headers(&path, ROUTE_NAMESPACE, &mut response);
         apply_finalize_headers(&self.settings, &mut response);
+        if let Some(mut ec_state) = ec_state {
+            finalize_edge_cookie(&self.settings, &mut ec_state, &mut response).await;
+        }
         apply_terminal_response_effects(&mut response, request_filter_effects.as_ref());
         Ok(response)
     }
+}
+
+/// Finalizes the Edge Cookie on a response with no identity graph, because
+/// this adapter opens none.
+///
+/// Core writes a created Edge Cookie without a graph as it does with one, for
+/// a request that passed the bot gate and whose permissions allow it. A
+/// partner registry that cannot be built skips finalizing.
+async fn finalize_edge_cookie(
+    settings: &Settings,
+    ec_state: &mut EcFinalizeState,
+    response: &mut Response,
+) {
+    let partner_registry = match PartnerRegistry::from_config(&settings.ec.partners) {
+        Ok(registry) => registry,
+        Err(report) => {
+            log::error!("EC finalize skipped: failed to build partner registry: {report:?}");
+            return;
+        }
+    };
+    ec_finalize_response(
+        settings,
+        &mut ec_state.ec_context,
+        None,
+        &partner_registry,
+        None,
+        response,
+        &ec_state.services,
+    )
+    .await;
 }
 
 /// Applies the request filters' response effects to a finalized response,

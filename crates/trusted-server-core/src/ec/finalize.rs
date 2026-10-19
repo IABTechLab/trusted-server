@@ -30,6 +30,13 @@ use super::{EcKvSnapshot, EidSyncSource, current_timestamp, log_id};
 /// ingestion of the identifiers the request carried, and cookie writes for
 /// new EC generation.
 ///
+/// A newly created Edge Cookie is written for a request that passed the bot
+/// gate and whose permissions allow it, whether or not `kv` holds an identity
+/// graph. The graph is one optional store of the data kept with the cookie,
+/// such as partner IDs. With one, the cookie's row is written first and the
+/// cookie only once that row is authoritative. Without one, the graph steps
+/// are skipped.
+///
 /// When the request carries an explicit withdrawal signal (a storage opt-out or
 /// a record refusing storage) and the client presented a cookie, the browser
 /// response clears the EC cookie immediately and the EC identity-graph KV
@@ -171,37 +178,69 @@ pub async fn ec_finalize_response(
         return;
     }
 
-    // Newly generated EC in this request. Do not emit a generated EC when
-    // there is no KV graph: that would mint a browser cookie with no backing
-    // identity-graph row, producing a phantom ID on later requests.
+    // Newly generated EC in this request.
     if ec_context.ec_generated() {
-        let (Some(graph), Some(kv_key)) = (kv, ec_context.ec_kv_key()) else {
-            log::info!(
-                "Skipping generated EC response write because the KV graph or the \
-                 identity-graph key is unavailable"
-            );
-            reconcile_pull_sync_marker(settings, registry, ec_context, response);
-            return;
-        };
-
-        let updates = gate_eid_updates_by_permissions(
-            collect_eid_updates(
-                ec_context.module_eids(),
-                sharedid_cookie,
-                ec_context.client_eids(),
-                registry,
-            ),
+        write_generated_ec(
+            settings,
             ec_context,
+            kv,
+            registry,
+            sharedid_cookie,
+            response,
         );
-        sync_eid_cookie_updates(graph, ec_context, &kv_key, &updates, EidSyncSource::NewEc);
-        if ec_context.kv_snapshot().entry_for(&kv_key).is_some() {
-            set_ec_cookie_on_response(settings, ec_context, response);
-        } else {
-            log::warn!("Skipping generated EC cookie because backing row is not authoritative");
-        }
     }
 
     reconcile_pull_sync_marker(settings, registry, ec_context, response);
+}
+
+/// Writes the Edge Cookie this request created, for a request that passed
+/// the bot gate.
+///
+/// With an identity graph, the identifiers the request carried are recorded
+/// on the cookie's row first, and the cookie is written only once that row is
+/// authoritative, so every cookie written with a graph has a row in it.
+/// Without one, the cookie is written with no row, because a missing graph
+/// does not stop the cookie.
+fn write_generated_ec(
+    settings: &Settings,
+    ec_context: &mut EcContext,
+    kv: Option<&KvIdentityGraph>,
+    registry: &PartnerRegistry,
+    sharedid_cookie: Option<&str>,
+    response: &mut Response<EdgeBody>,
+) {
+    if !ec_context.passed_bot_gate() {
+        log::info!(
+            "Skipping generated EC response write because the request did not pass the bot gate"
+        );
+        return;
+    }
+    let Some(graph) = kv else {
+        set_ec_cookie_on_response(settings, ec_context, response);
+        return;
+    };
+    let Some(kv_key) = ec_context.ec_kv_key() else {
+        log::info!(
+            "Skipping generated EC response write because the identity-graph key is unavailable"
+        );
+        return;
+    };
+
+    let updates = gate_eid_updates_by_permissions(
+        collect_eid_updates(
+            ec_context.module_eids(),
+            sharedid_cookie,
+            ec_context.client_eids(),
+            registry,
+        ),
+        ec_context,
+    );
+    sync_eid_cookie_updates(graph, ec_context, &kv_key, &updates, EidSyncSource::NewEc);
+    if ec_context.kv_snapshot().entry_for(&kv_key).is_some() {
+        set_ec_cookie_on_response(settings, ec_context, response);
+    } else {
+        log::warn!("Skipping generated EC cookie because backing row is not authoritative");
+    }
 }
 
 fn sync_eid_cookie_updates(
@@ -1184,39 +1223,149 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn finalize_generated_ec_without_kv_skips_cookie_and_header() {
+    async fn finalize_generated_ec_without_kv_writes_the_cookie_and_skips_the_graph() {
+        // The identity graph is one optional store of the data kept with the
+        // Edge Cookie, so a missing graph does not stop the cookie. The
+        // response gets what it gets with a graph, and the graph steps are
+        // skipped, so the partner ID a graph records is kept nowhere.
         let settings = create_test_settings();
         let generated_ec = sample_ec_id("gen123");
-        let mut ec_context = make_context(
-            Some(&generated_ec),
-            None,
-            false,
-            true,
-            Jurisdiction::NonRegulated,
-            true,
-        );
-        let mut response = empty_response();
+        let created_ec = || {
+            let mut ec_context = make_context(
+                Some(&generated_ec),
+                None,
+                false,
+                true,
+                Jurisdiction::NonRegulated,
+                true,
+            );
+            ec_context.set_device_signals(crate::ec::tests::browser_signals());
+            ec_context
+        };
+        let partners = vec![make_partner("sharedid.org")];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
 
-        let test_registry = PartnerRegistry::empty();
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let live = KvEntry::new(
+            &granting_consent(),
+            None,
+            current_timestamp(),
+            &settings.publisher.domain,
+        );
+        graph
+            .create(&generated_ec, &live)
+            .expect("should seed the generated identifier's row");
+        let mut with_graph = created_ec();
+        with_graph.set_kv_snapshot(graph.load_snapshot(&generated_ec));
+        let mut graph_response = empty_response();
+        ec_finalize_response(
+            &settings,
+            &mut with_graph,
+            Some(&graph),
+            &registry,
+            Some("shared-cookie-id"),
+            &mut graph_response,
+            &noop_services(),
+        )
+        .await;
+
+        let mut ec_context = created_ec();
+        let mut response = empty_response();
         ec_finalize_response(
             &settings,
             &mut ec_context,
             None,
-            &test_registry,
-            None,
+            &registry,
+            Some("shared-cookie-id"),
             &mut response,
             &noop_services(),
         )
         .await;
 
+        let set_cookie = get_header_str(&response, "set-cookie")
+            .expect("generated EC without KV should set the cookie");
         assert!(
-            get_header(&response, "x-ts-ec").is_none(),
-            "generated EC without KV should not set response header"
+            set_cookie.starts_with(&format!("ts-ec={generated_ec};")),
+            "generated EC without KV should write its identifier, got: {set_cookie}"
+        );
+        assert_eq!(
+            response.headers(),
+            graph_response.headers(),
+            "generated EC without KV should get the cookie and headers a graph gets"
         );
         assert!(
-            get_header(&response, "set-cookie").is_none(),
-            "generated EC without KV should not set cookie"
+            matches!(ec_context.kv_snapshot(), EcKvSnapshot::NotRead),
+            "generated EC without KV should run no graph step"
         );
+        let (row, _) = graph
+            .get(&generated_ec)
+            .expect("should read the graph")
+            .expect("the row should remain");
+        assert_eq!(
+            row.ids.get("sharedid.org").map(|id| id.uid.as_str()),
+            Some("shared-cookie-id"),
+            "with a graph the request's partner ID should be recorded on the row"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_generated_ec_is_written_only_for_a_request_that_passed_the_bot_gate() {
+        // The bot gate reads the request's device signals, so a crawler or a
+        // request with none gets no created Edge Cookie, with a graph or
+        // without, and a browser gets one either way.
+        let settings = create_test_settings();
+        for (case, signals, written) in [
+            ("a browser", Some(crate::ec::tests::browser_signals()), true),
+            (
+                "a crawler",
+                Some(crate::ec::tests::crawler_signals()),
+                false,
+            ),
+            ("a request with no device signals", None, false),
+        ] {
+            for with_graph in [true, false] {
+                let ec_id = sample_ec_id("botgt1");
+                let graph = KvIdentityGraph::in_memory("test_store");
+                graph
+                    .create(&ec_id, &live_entry())
+                    .expect("should seed the generated identifier's row");
+                let mut ec_context = make_context(
+                    Some(&ec_id),
+                    None,
+                    false,
+                    true,
+                    Jurisdiction::NonRegulated,
+                    true,
+                );
+                if let Some(signals) = signals.clone() {
+                    ec_context.set_device_signals(signals);
+                }
+                ec_context.set_kv_snapshot(EcKvSnapshot::Present {
+                    ec_id: ec_id.clone(),
+                    entry: Box::new(live_entry()),
+                    generation: None,
+                });
+                let mut response = empty_response();
+
+                ec_finalize_response(
+                    &settings,
+                    &mut ec_context,
+                    with_graph.then_some(&graph),
+                    &PartnerRegistry::empty(),
+                    None,
+                    &mut response,
+                    &noop_services(),
+                )
+                .await;
+
+                assert_eq!(
+                    get_header(&response, "set-cookie").is_some(),
+                    written,
+                    "{case}, with a graph {with_graph}: the created Edge Cookie should be \
+                     written only when the request passed the bot gate"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -1494,6 +1643,7 @@ mod tests {
             Jurisdiction::NonRegulated,
             true,
         );
+        ec_context.set_device_signals(crate::ec::tests::browser_signals());
         ec_context.set_kv_snapshot(graph.load_snapshot(&ec_id));
         let partners = vec![make_partner("sharedid.org")];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
@@ -2109,7 +2259,16 @@ mod tests {
         // the orphan's key, so nothing later treats the miss as authoritative.
         let settings = create_test_settings();
         let hmac_orphan = sample_ec_id("orphn2");
-        let cases: [(&str, EcContext, KvIdentityGraph); 3] = [
+        let cases: [(&str, EcContext, KvIdentityGraph); 4] = [
+            (
+                "a client-side module, which creates nothing at the edge",
+                orphan_context(
+                    "cfix~an-ec",
+                    Some("192.0.2.10"),
+                    std::sync::Arc::new(crate::ec::module::ClientFixedModule),
+                ),
+                KvIdentityGraph::in_memory("test_store"),
+            ),
             (
                 "the HMAC module with no client IP",
                 orphan_context(&hmac_orphan, None, crate::ec::tests::hmac_module()),
@@ -2278,6 +2437,7 @@ mod tests {
             Jurisdiction::NonRegulated,
             true,
         );
+        ec_context.set_device_signals(crate::ec::tests::browser_signals());
         ec_context.set_kv_snapshot(EcKvSnapshot::Missing {
             ec_id: generated_ec,
         });
@@ -2422,6 +2582,7 @@ mod tests {
                 Jurisdiction::NonRegulated,
                 gate_open,
             );
+            ec_context.set_device_signals(crate::ec::tests::browser_signals());
             ec_context.set_kv_snapshot(EcKvSnapshot::Present {
                 ec_id: ec_id.clone(),
                 entry: Box::new(live_entry()),
@@ -2610,6 +2771,7 @@ mod tests {
         };
         let mut ec_context = make_context_with_consent(None, None, false, false, consent, true)
             .with_module_for_test(std::sync::Arc::new(EvidenceHeaderModule));
+        ec_context.set_device_signals(crate::ec::tests::browser_signals());
         ec_context
             .generate_if_needed(&settings, Some(&graph), &noop_services())
             .await
