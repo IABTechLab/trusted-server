@@ -14,8 +14,11 @@ use sha2::{Digest as _, Sha256};
 use crate::documents::{Role, canonical_json, lower_hex, validate_spdx};
 use crate::error::ReleaseError;
 use crate::javascript::JsBuildCompleted;
+use crate::materials::CargoOrigin;
 use crate::policy::ReleaseTarget;
 use crate::recipe::RecipeCompleted;
+
+pub(crate) mod cargo;
 
 /// Validated bounded SPDX bytes, without a release-authorization capability.
 #[derive(Debug)]
@@ -94,11 +97,30 @@ enum ComponentRole {
 }
 
 enum Origin {
-    Source { commit: String, path: String },
-    Distribution { location: String, sha256: String },
-    StructuredTree { sha256: String },
-    Generated { producer: String, sha256: String },
-    RuntimeObservation { artifact_sha256: String },
+    CargoMaterial {
+        source: String,
+        original: CargoOrigin,
+        prepared_manifest_sha256: String,
+    },
+
+    Source {
+        commit: String,
+        path: String,
+    },
+    Distribution {
+        location: String,
+        sha256: String,
+    },
+    StructuredTree {
+        sha256: String,
+    },
+    Generated {
+        producer: String,
+        sha256: String,
+    },
+    RuntimeObservation {
+        artifact_sha256: String,
+    },
 }
 
 struct Dependency {
@@ -227,6 +249,28 @@ fn origin_fields(
     }
     let unknown_location = "NOASSERTION".to_owned();
     match origin {
+        Origin::CargoMaterial {
+            source,
+            original,
+            prepared_manifest_sha256,
+        } => {
+            cargo::validate_material(source, original)?;
+            if !lower_hex(prepared_manifest_sha256, 64) {
+                return Err(spdx_error("prepared Cargo manifest SHA-256 is invalid"));
+            }
+            let facts = serde_json::to_string(&json!({"locked_source":source,"original":original,"prepared_manifest_sha256":prepared_manifest_sha256})).map_err(spdx_error)?;
+            plain(&facts)?;
+            let checksum = match original {
+                CargoOrigin::Registry { archive_sha256 } => Some(archive_sha256.clone()),
+                CargoOrigin::Git { .. } => None,
+            };
+            let source_info = format!(
+                "Verified original Cargo facts {facts}; prepared manifest and Git object identities are provenance evidence, not raw package checksums."
+            );
+            plain(&source_info)?;
+            Ok((unknown_location, source_info, checksum))
+        }
+
         Origin::Source { commit, path } => {
             if !lower_hex(commit, 40) || commit != &inputs.source_commit {
                 return Err(spdx_error(
@@ -439,7 +483,7 @@ fn render(inputs: &SpdxInputs<'_>) -> Result<GeneratedSpdx, Report<ReleaseError>
             from,
             kind,
             to,
-            "Observed package dependency; exact compiler unit dependency DAG is not asserted.",
+            "Potential Cargo package relation between observed endpoints; exact compiler unit dependency DAG is not asserted.",
         ));
     }
     let relationships:Vec<_> = relationships.into_iter().map(|(from,kind,to,comment)| json!({"spdxElementId":from,"relationshipType":kind,"relatedSpdxElement":to,"comment":comment})).collect();

@@ -46,6 +46,53 @@ struct CompositionReceipt {
     platform: PlatformEvidence,
 }
 
+/// Borrowed sealed observations after their retained bytes have been rechecked.
+///
+/// This grants read access only. Potential graph membership and incomplete
+/// native, tool and platform coverage retain their existing meanings.
+pub(crate) struct CompositionView<'a> {
+    observations: &'a CargoObservations,
+    receipt: &'a CompositionReceipt,
+    receipt_sha256: &'a str,
+}
+
+impl CompositionView<'_> {
+    /// Returns the exact retained normalized receipt identity without reserialization.
+    pub(crate) fn receipt_sha256(&self) -> &str {
+        self.receipt_sha256
+    }
+
+    /// Returns actual compiler observations, including unit context and features.
+    pub(crate) fn observations(&self) -> &CargoObservations {
+        self.observations
+    }
+
+    /// Returns potential graph evidence separately from compiler observations.
+    pub(crate) fn graph(&self) -> &GraphEvidence {
+        &self.receipt.graph
+    }
+
+    /// Returns exact observed package IDs joined to verified originals.
+    pub(crate) fn package_origins(&self) -> &VerifiedPackageOrigins {
+        &self.receipt.package_origins
+    }
+
+    /// Returns candidate native measurements with their existing coverage gaps.
+    pub(crate) fn native(&self) -> &NativeInventory {
+        &self.receipt.native
+    }
+
+    /// Returns final-byte JavaScript module observations.
+    pub(crate) fn javascript(&self) -> &JsMembership {
+        &self.receipt.javascript
+    }
+
+    /// Returns candidate platform measurements without acquisition authority.
+    pub(crate) fn platform(&self) -> &PlatformEvidence {
+        &self.receipt.platform
+    }
+}
+
 /// Exact retained composition bytes, without a claim of complete coverage.
 ///
 /// Only the owning capture can construct this diagnostic export. It retains
@@ -85,6 +132,26 @@ impl core::fmt::Debug for CargoCapture {
 }
 
 impl CargoCapture {
+    /// Borrows sealed typed evidence after rechecking all retained observations.
+    ///
+    /// # Errors
+    ///
+    /// Rejects changed retained bytes or observations without sealed receipts.
+    pub(crate) fn view(
+        &self,
+        directory: &Path,
+    ) -> Result<CompositionView<'_>, Report<ReleaseError>> {
+        self.rehash(directory)?;
+        let receipt = self.receipt.as_ref().ok_or_else(|| {
+            composition_error("composition view requires actual sealed component receipts")
+        })?;
+        Ok(CompositionView {
+            observations: &self.observations,
+            receipt,
+            receipt_sha256: &self.digests[2],
+        })
+    }
+
     /// Normalizes a successful build and its same-boundary query output.
     ///
     /// # Errors

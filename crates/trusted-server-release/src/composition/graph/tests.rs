@@ -29,13 +29,17 @@ fn actual_cross_build_preserves_host_only_dependencies_and_observed_units() {
     let graph = reconcile(METADATA, TREE, &observed, ROOT)
         .expect("should reconcile actual cross-build graph");
     assert_eq!(
-        graph.observed_package_ids.len(),
+        graph.observed_package_ids().len(),
         3,
         "should retain observed membership"
     );
-    assert_eq!(graph.edges.len(), 2, "should retain actual package edges");
     assert_eq!(
-        graph.edges[0].kinds,
+        graph.potential_edges().len(),
+        2,
+        "should retain potential package edges"
+    );
+    assert_eq!(
+        graph.potential_edges()[0].kinds(),
         ["build"],
         "should record build dependency transition"
     );

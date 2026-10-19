@@ -39,6 +39,49 @@ const ACQUISITION: &str = "unauthenticated-ordinary-ci";
 pub(super) fn check_export_after_cleanup<T>(build: T, completed: fn(&T) -> &RecipeCompleted) {
     let completed = completed(&build);
     let artifact = completed.artifact().path().to_owned();
+    let view = completed
+        .composition_view()
+        .expect("should expose sealed typed receipts after working-root cleanup");
+    assert_eq!(
+        view.receipt_sha256(),
+        completed
+            .composition_export()
+            .expect("should export the same sealed receipt")
+            .sha256(),
+        "should bind the typed view to the exact original retained receipt bytes"
+    );
+    assert!(
+        !view.observations().units().is_empty(),
+        "should retain actual compiler units through the typed view"
+    );
+    for package in view.observations().packages() {
+        let origin = view
+            .package_origins()
+            .package(package.id())
+            .expect("should retain an exact verified origin for every observed package");
+        assert_eq!(
+            origin.name(),
+            package.name(),
+            "should retain the joined name"
+        );
+        assert_eq!(
+            origin.version(),
+            package.version(),
+            "should retain the joined version"
+        );
+    }
+    let projected = crate::spdx::cargo::CargoProjection::from_completed(completed)
+        .expect("should project verified Rust packages after working-root cleanup");
+    assert_eq!(
+        projected.component_count(),
+        view.observations().packages().len(),
+        "should project precisely the observed packages rather than the potential graph"
+    );
+    assert_eq!(
+        projected.observations().units().len(),
+        view.observations().units().len(),
+        "should retain the original per-unit feature and context evidence"
+    );
     let export = crate::collection::producer::CandidateBuildExport::from_completed(completed)
         .expect("should export actual candidate receipts before closing their owners");
     drop(build);

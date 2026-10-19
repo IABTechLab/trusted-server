@@ -510,3 +510,72 @@ fn rejects_an_spdx_document_exceeding_the_attestation_byte_limit() {
         "should exercise the 16 MiB serialization bound"
     );
 }
+
+#[test]
+fn verified_cargo_originals_render_without_inventing_download_locations() {
+    let mut inputs = fixture();
+    inputs.components = vec![
+        component(
+            "cargo:registry",
+            ComponentRole::ObservedRust,
+            Origin::CargoMaterial {
+                source: "registry+https://example.com/index".to_owned(),
+                original: CargoOrigin::Registry {
+                    archive_sha256: "b".repeat(64),
+                },
+                prepared_manifest_sha256: "c".repeat(64),
+            },
+        ),
+        component(
+            "cargo:git",
+            ComponentRole::BuildTool,
+            Origin::CargoMaterial {
+                source: format!("git+https://example.com/repo#{}", "a".repeat(40)),
+                original: CargoOrigin::Git {
+                    revision: "a".repeat(40),
+                    repository_tree: "b".repeat(40),
+                    package_tree: "c".repeat(40),
+                    package_path: String::new(),
+                    committed_manifest_blob: "d".repeat(40),
+                    committed_manifest_sha256: "e".repeat(64),
+                    normalized_manifest_sha256: None,
+                },
+                prepared_manifest_sha256: "f".repeat(64),
+            },
+        ),
+    ];
+    let rendered = render(&inputs).expect("should render schema-valid verified Cargo originals");
+    let document: Value =
+        serde_json::from_slice(rendered.bytes()).expect("should parse rendered document");
+    let packages = document["packages"]
+        .as_array()
+        .expect("should have packages");
+    let registry = packages
+        .iter()
+        .find(|package| package["name"] == "cargo:registry")
+        .expect("should include registry");
+    let git = packages
+        .iter()
+        .find(|package| package["name"] == "cargo:git")
+        .expect("should include Git");
+    assert_eq!(
+        registry["downloadLocation"], "NOASSERTION",
+        "should avoid treating index as archive URL"
+    );
+    assert_eq!(
+        registry["checksums"][0]["checksumValue"],
+        "b".repeat(64),
+        "should identify original archive only"
+    );
+    assert!(
+        git.get("checksums").is_none(),
+        "should not label Git object or manifest evidence as raw package SHA256"
+    );
+    assert!(
+        git["sourceInfo"]
+            .as_str()
+            .expect("should have source information")
+            .contains(&"d".repeat(40)),
+        "should preserve original Git facts"
+    );
+}

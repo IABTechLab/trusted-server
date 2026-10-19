@@ -20,7 +20,7 @@ use super::{
     AssetId, CheckedAmbient, ExactInvocationDigest, RecipeDefinitionIdentity, Role, recipe_error,
 };
 use crate::boundary::{DenialReceipt, DescendantCleanup};
-use crate::composition::{CargoCapture, RetainedCompositionExport};
+use crate::composition::{CargoCapture, CompositionView, RetainedCompositionExport};
 use crate::documents::hash_bounded_with_check;
 use crate::error::ReleaseError;
 use crate::source::CommitId;
@@ -267,6 +267,20 @@ impl RecipeCompleted {
             .as_ref()
             .ok_or_else(|| recipe_error("completed build has no retained composition"))?
             .export(self.retained.path())
+    }
+
+    /// Borrows sealed typed composition after rechecking this completed build.
+    ///
+    /// # Errors
+    ///
+    /// Rejects changed owned outputs or missing actual composition receipts.
+    pub(crate) fn composition_view(&self) -> Result<CompositionView<'_>, Report<ReleaseError>> {
+        self.rehash_for_handoff()?;
+        self.facts
+            .cargo_observations
+            .as_ref()
+            .ok_or_else(|| recipe_error("completed build has no retained composition"))?
+            .view(self.retained.path())
     }
 
     /// The copied artifact.

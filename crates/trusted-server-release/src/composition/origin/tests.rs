@@ -78,8 +78,31 @@ fn workspace_joins_exact_opaque_id_to_approved_measured_manifest() {
         .join()
         .expect("should join tracked workspace package");
     assert!(
-        result.packages.contains_key("opaque identity"),
+        result.package("opaque identity").is_some(),
         "should retain exact opaque identity"
+    );
+    assert!(
+        result.package("example").is_none(),
+        "should refuse name-only lookups for an exact observed identity"
+    );
+    let package = result
+        .package("opaque identity")
+        .expect("should retain package origin");
+    assert_eq!(package.name(), "example", "should retain checked name");
+    assert_eq!(package.version(), "1.0.0", "should retain checked version");
+    assert_eq!(
+        package.relative_manifest_path(),
+        Path::new("Cargo.toml"),
+        "should retain relative manifest"
+    );
+    assert_eq!(
+        package.prepared_manifest_sha256(),
+        fixture.workspace.manifests[Path::new("Cargo.toml")],
+        "should retain measured manifest identity"
+    );
+    assert!(
+        matches!(package.origin(), Original::Workspace { source_commit, path } if source_commit == &"a".repeat(40) && path == Path::new("Cargo.toml")),
+        "should retain approved original identity"
     );
     assert!(
         result.native_sources().is_empty(),

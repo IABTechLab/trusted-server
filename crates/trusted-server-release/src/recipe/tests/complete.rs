@@ -60,6 +60,10 @@ fn pure_completion_fixtures_cannot_export_candidate_transfers() {
         "should reject a fixture with no actual retained composition receipts"
     );
     assert!(
+        completed.composition_view().is_err(),
+        "should refuse a typed owner view without actual retained composition receipts"
+    );
+    assert!(
         crate::collection::producer::CandidateBuildExport::from_completed(&completed).is_err(),
         "should not manufacture a measured candidate transfer from a pure fixture"
     );

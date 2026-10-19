@@ -25,11 +25,51 @@ pub(crate) struct GraphEvidence {
     edges: Vec<GraphEdge>,
 }
 
+/// A potential metadata dependency edge, without compiled-unit authority.
 #[derive(Debug, Serialize)]
-struct GraphEdge {
+pub(crate) struct GraphEdge {
     parent: String,
     dependency: String,
     kinds: Vec<String>,
+}
+
+impl GraphEvidence {
+    /// Returns the exact selected binary's Cargo package identity.
+    pub(crate) fn selected_package_id(&self) -> &str {
+        &self.selected_package_id
+    }
+
+    /// Returns potential package membership from the reconciled Cargo tree.
+    pub(crate) fn tree_package_ids(&self) -> &[String] {
+        &self.tree_package_ids
+    }
+
+    /// Returns package membership proved by actual compiler messages.
+    pub(crate) fn observed_package_ids(&self) -> &[String] {
+        &self.observed_package_ids
+    }
+
+    /// Returns potential metadata edges, without claiming a compiled unit DAG.
+    pub(crate) fn potential_edges(&self) -> &[GraphEdge] {
+        &self.edges
+    }
+}
+
+impl GraphEdge {
+    /// Returns the exact potential parent package identity.
+    pub(crate) fn parent(&self) -> &str {
+        &self.parent
+    }
+
+    /// Returns the exact potential dependency package identity.
+    pub(crate) fn dependency(&self) -> &str {
+        &self.dependency
+    }
+
+    /// Returns declared dependency kinds without inferring embedded membership.
+    pub(crate) fn kinds(&self) -> &[String] {
+        &self.kinds
+    }
 }
 
 type Edges<'a> = BTreeMap<(&'a str, &'a str), BTreeSet<&'a str>>;

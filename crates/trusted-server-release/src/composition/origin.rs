@@ -79,8 +79,9 @@ pub(crate) struct VerifiedPackageOrigins {
     native_sources: BTreeMap<String, NativeSource>,
 }
 
+/// One exact observed package joined to an approved original.
 #[derive(Serialize)]
-struct PackageOrigin {
+pub(crate) struct PackageOrigin {
     name: String,
     version: String,
     manifest_path: PathBuf,
@@ -88,13 +89,16 @@ struct PackageOrigin {
     origin: Original,
 }
 
+/// The approved workspace or verified dependency original behind a package.
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-enum Original {
+pub(crate) enum Original {
+    /// A tracked package within the approved source commit.
     Workspace {
         source_commit: String,
         path: PathBuf,
     },
+    /// A registry archive or Git object closure verified by material preparation.
     Material {
         source: String,
         original: CargoOrigin,
@@ -102,9 +106,51 @@ enum Original {
 }
 
 impl VerifiedPackageOrigins {
+    /// Returns the approved source commit bound to these package origins.
+    pub(crate) fn source_commit(&self) -> &str {
+        &self.source_commit
+    }
+
+    /// Returns the measured prepared Cargo materials tree identity.
+    pub(crate) fn materials_sha256(&self) -> &str {
+        &self.materials_sha256
+    }
+
+    /// Looks up a verified origin by its exact observed Cargo package ID.
+    pub(crate) fn package(&self, package_id: &str) -> Option<&PackageOrigin> {
+        self.packages.get(package_id)
+    }
+
     /// Registry archives and prepared roots authorized by the exact-ID join.
     pub(crate) fn native_sources(&self) -> &BTreeMap<String, NativeSource> {
         &self.native_sources
+    }
+}
+
+impl PackageOrigin {
+    /// Returns the package name checked against its verified original.
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the package version checked against its verified original.
+    pub(crate) fn version(&self) -> &str {
+        &self.version
+    }
+
+    /// Returns the source-relative or prepared vendor-relative manifest path.
+    pub(crate) fn relative_manifest_path(&self) -> &Path {
+        &self.manifest_path
+    }
+
+    /// Returns the measured prepared manifest digest.
+    pub(crate) fn prepared_manifest_sha256(&self) -> &str {
+        &self.prepared_manifest_sha256
+    }
+
+    /// Returns the verified original without reconstructing it from a package name.
+    pub(crate) fn origin(&self) -> &Original {
+        &self.origin
     }
 }
 

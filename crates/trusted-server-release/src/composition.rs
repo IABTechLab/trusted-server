@@ -23,7 +23,7 @@ pub(crate) mod javascript;
 pub(crate) mod native;
 pub(crate) mod origin;
 pub(crate) mod platform;
-pub(crate) use capture::{CargoCapture, RetainedCompositionExport};
+pub(crate) use capture::{CargoCapture, CompositionView, RetainedCompositionExport};
 
 const MAX_PACKAGES: usize = 16_384;
 const MAX_MESSAGES: usize = 65_536;
@@ -183,6 +183,77 @@ pub(crate) struct CargoObservations {
     packages: Vec<RustPackage>,
     units: Vec<RustUnit>,
     build_scripts: Vec<BuildScriptObservation>,
+}
+
+impl CargoObservations {
+    /// Returns packages actually observed in compiler messages.
+    pub(crate) fn packages(&self) -> &[RustPackage] {
+        &self.packages
+    }
+
+    /// Returns actual units without promoting metadata feature unions.
+    pub(crate) fn units(&self) -> &[RustUnit] {
+        &self.units
+    }
+
+    /// Returns observed build-script executions.
+    pub(crate) fn build_scripts(&self) -> &[BuildScriptObservation] {
+        &self.build_scripts
+    }
+}
+
+impl RustPackage {
+    /// Returns the exact opaque Cargo package identity.
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Returns the checked package name.
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the checked package version.
+    pub(crate) fn version(&self) -> &str {
+        &self.version
+    }
+
+    /// Returns the metadata license declaration, without a license conclusion.
+    pub(crate) fn license(&self) -> Option<&str> {
+        self.license.as_deref()
+    }
+}
+
+impl RustUnit {
+    /// Returns the exact observed package identity.
+    pub(crate) fn package_id(&self) -> &str {
+        &self.package_id
+    }
+
+    /// Returns the compiler target name.
+    pub(crate) fn target_name(&self) -> &str {
+        &self.target_name
+    }
+
+    /// Returns compiler target kinds, including host proc macros and build scripts.
+    pub(crate) fn target_kind(&self) -> &[String] {
+        &self.target_kind
+    }
+
+    /// Returns the observed crate types.
+    pub(crate) fn crate_types(&self) -> &[String] {
+        &self.crate_types
+    }
+
+    /// Returns the observed host or selected target output context.
+    pub(crate) fn context(&self) -> UnitContext {
+        self.context
+    }
+
+    /// Returns effective features from this compiler message only.
+    pub(crate) fn features(&self) -> &[String] {
+        &self.features
+    }
 }
 
 fn package(value: &Value) -> Result<RustPackage, Report<ReleaseError>> {

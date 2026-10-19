@@ -89,14 +89,14 @@ fn host_and_target_units_keep_observed_features_instead_of_metadata_union() {
         ],
     );
     assert_eq!(
-        observed.units.len(),
+        observed.units().len(),
         2,
         "should retain both compilation contexts"
     );
     let features: Vec<_> = observed
-        .units
+        .units()
         .iter()
-        .map(|unit| unit.features.clone())
+        .map(|unit| unit.features().to_vec())
         .collect();
     assert!(
         features.contains(&vec!["host".to_owned()]),
@@ -108,13 +108,13 @@ fn host_and_target_units_keep_observed_features_instead_of_metadata_union() {
     );
     assert!(
         observed
-            .units
+            .units()
             .iter()
-            .all(|unit| !unit.features.contains(&"unused-union-feature".to_owned())),
+            .all(|unit| !unit.features().contains(&"unused-union-feature".to_owned())),
         "should not substitute package-union features"
     );
     assert_eq!(
-        observed.packages.len(),
+        observed.packages().len(),
         1,
         "should exclude uncompiled metadata packages"
     );
@@ -280,6 +280,10 @@ fn retained_raw_and_normalized_observations_are_rehashed_before_handoff() {
         capture.export(retained.path()).is_err(),
         "should not export summary-only observations as actual composition receipts"
     );
+    assert!(
+        capture.view(retained.path()).is_err(),
+        "should not expose a typed owner view without sealed receipts"
+    );
     for name in [
         "cargo-metadata.json",
         "cargo-tree.txt",
@@ -297,6 +301,14 @@ fn retained_raw_and_normalized_observations_are_rehashed_before_handoff() {
         assert!(
             capture.rehash(directory.path()).is_err(),
             "should reject changed {name}"
+        );
+        let error = match capture.view(directory.path()) {
+            Ok(_) => panic!("should refuse a typed owner view after changing {name}"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:?}").contains(&format!("retained {name} changed")),
+            "should rehash before checking receipt availability: {error:?}"
         );
     }
     assert_eq!(
