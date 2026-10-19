@@ -79,7 +79,7 @@ patterns = ["(?i)\\.(avi|flv|mka|mkv|mov|mp4|mpeg|mpg|mp3|flac|ogg|ogm|opus|wav|
 | `enable_protection`                    | boolean | `false`                          | Call the Protection API before route matching                           |
 | `server_side_key_secret_name`          | string  | none                             | Default-store secret reference required when protection is enabled      |
 | `protection_api_origin`                | string  | `https://api-fastly.datadome.co` | Protection API origin                                                   |
-| `timeout_ms`                           | integer | `1500`                           | Dynamic backend first-byte timeout for Protection API calls             |
+| `timeout_ms`                           | integer | `1500`                           | Protection API first-byte timeout, applied on the Fastly adapter only   |
 | `protection_excluded_methods`          | array   | `["OPTIONS"]`                    | HTTP methods skipped before the Protection API call                     |
 | `protection_excluded_asns`             | array   | `[]`                             | Client autonomous system numbers skipped before the Protection API call |
 | `protection_excluded_ip_cidrs`         | array   | `[]`                             | Inline client IP CIDR ranges skipped before the Protection API call     |
@@ -161,7 +161,7 @@ When `enable_protection = true`, Trusted Server calls DataDome before normal rou
 - **Challenge**: return the DataDome response directly without contacting the publisher origin.
 - **Fail-open condition**: continue routing without DataDome effects when the Protection API times out, returns malformed instructions, or returns an unexpected status.
 
-`server_side_key_secret_name` is a key reference in the logical `trusted_server_secrets` store. It must resolve to a non-empty value when server-side protection is enabled. Missing or invalid credentials fail startup before requests are served. Protection API transport and response failures continue to fail open per request.
+`server_side_key_secret_name` is a key reference in the logical `trusted_server_secrets` store. It must resolve to a non-empty value when server-side protection is enabled. Missing or invalid credentials fail startup before requests are served. Protection API transport and response failures continue to fail open per request. On Axum, Cloudflare and Spin nothing applies `timeout_ms`, so a slow Protection API holds each protected request until the adapter's HTTP client gives up, which is 30 seconds on Axum, before it fails open.
 
 ### Protected traffic
 
@@ -178,7 +178,7 @@ A request is protected when all of the following are true:
 
 Static assets are excluded by default using a case-insensitive file-extension regex. Trusted Server internal routes such as `/static/tsjs=`, `/integrations/`, `/first-party/`, discovery routes, and signature-verification routes are also excluded by default.
 
-Auction traffic at `/auction` is protected by default.
+Auction traffic at `/auction`, and `GET` on `/_ts/page-bids` and `/__ts/page-bids`, are protected by default.
 
 ### Staging test bypass
 
@@ -209,7 +209,7 @@ high-entropy material under the referenced key in `trusted_server_secrets`, conf
 only while needed, protect the site with an outer access control such as Basic
 Auth, and remove the section when testing finishes.
 
-Whenever the enabled DataDome request filter runs on the Fastly adapter, the
+Whenever the enabled DataDome request filter runs, on any adapter, the
 fixed `x-ts-datadome-bypass` header is removed before configuration or
 credential checks. It therefore cannot reach DataDome or the publisher origin
 through that path when the bypass is absent, disabled, inactive, or invalid.
@@ -230,10 +230,10 @@ await context.route('https://staging.example.com/**', async (route) => {
 
 ### Client-side tag suppression behavior
 
-On the Fastly adapter, a request that matches an IP-based DataDome exclusion
-or the configured test-bypass credential also omits Trusted Server's
-automatically injected client-side DataDome tag from processed HTML. This keeps
-the client-side layer consistent with the server-side Protection API skip.
+A request that matches an IP-based DataDome exclusion or the configured
+test-bypass credential also omits Trusted Server's automatically injected
+client-side DataDome tag from processed HTML. This keeps the client-side layer
+consistent with the server-side Protection API skip.
 
 This behavior applies to:
 

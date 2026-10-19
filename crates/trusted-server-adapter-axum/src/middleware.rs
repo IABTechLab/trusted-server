@@ -8,6 +8,11 @@ use edgezero_core::middleware::{Middleware, Next};
 use trusted_server_core::http_util::{
     ROUTE_NAMESPACE, sanitize_trusted_client_ip_headers, strip_deployment_headers,
 };
+use trusted_server_core::integrations::RequestFilterEffects;
+use trusted_server_core::response_privacy::{
+    TerminalPrivateResponse, enforce_private_no_store, enforce_set_cookie_cache_privacy,
+    enforce_uncacheable_cache_privacy,
+};
 use trusted_server_core::settings::Settings;
 
 // ---------------------------------------------------------------------------
@@ -56,7 +61,8 @@ impl Middleware for SanitizeRequestMiddleware {
 /// in a local dev context.
 ///
 /// Registered directly inside [`SanitizeRequestMiddleware`], so that every
-/// outgoing response carries a consistent set of headers.
+/// outgoing response carries a consistent set of headers. Once the response
+/// is finalized it applies the response effects the request filters left.
 pub struct FinalizeResponseMiddleware {
     settings: Arc<Settings>,
 }
@@ -74,11 +80,35 @@ impl Middleware for FinalizeResponseMiddleware {
     async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
         let path = ctx.request().uri().path().to_owned();
         let mut response = next.run(ctx).await?;
+        let request_filter_effects = response.extensions_mut().remove::<RequestFilterEffects>();
         // Before finalizing, so a header finalizing writes is kept.
         strip_deployment_headers(&path, ROUTE_NAMESPACE, &mut response);
         apply_finalize_headers(&self.settings, &mut response);
+        apply_terminal_response_effects(&mut response, request_filter_effects.as_ref());
         Ok(response)
     }
+}
+
+/// Applies the request filters' response effects to a finalized response,
+/// then restores the privacy guards a late header could loosen.
+fn apply_terminal_response_effects(
+    response: &mut Response,
+    request_filter_effects: Option<&RequestFilterEffects>,
+) {
+    let must_remain_private = response
+        .extensions()
+        .get::<TerminalPrivateResponse>()
+        .is_some();
+    if let Some(effects) = request_filter_effects {
+        effects.apply_to_response(response);
+    }
+    if must_remain_private {
+        enforce_private_no_store(response);
+    }
+    // A filter's header can add a per-user `Set-Cookie`, or a `private` or
+    // `no-store` directive, after the finalize headers ran.
+    enforce_set_cookie_cache_privacy(response);
+    enforce_uncacheable_cache_privacy(response);
 }
 
 // ---------------------------------------------------------------------------
