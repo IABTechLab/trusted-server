@@ -7,6 +7,6 @@ Run all CI checks locally, in order. Stop and report if any step fails.
 5. `cd crates/trusted-server-js/lib && npx vitest run`
 6. `cd crates/trusted-server-js/lib && npm run format`
 7. `cd docs && npm run format`
-8. `python3 scripts/check-ci-node-pin.py`
+8. `node --test scripts/check-ci-node-pin.test.mjs && node scripts/check-ci-node-pin.mjs`
 
 Report a summary of all results when done.

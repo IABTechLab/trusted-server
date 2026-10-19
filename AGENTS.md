@@ -364,7 +364,7 @@ Every PR must pass:
 8. Markdown format outside `docs/` (requires `cd docs && npm ci` first): `docs/node_modules/.bin/prettier --config docs/.prettierrc --check "*.md" ".claude/**/*.md" ".github/**/*.md" "crates/**/*.md" "scripts/**/*.md" "tinybird/**/*.md"`; fix with `--write` in place of `--check`
 9. Native core build-digest test and lint (`cargo test -p trusted-server-core --test template_build_digest` and `cargo clippy -p trusted-server-core --test template_build_digest -- -D warnings`)
 10. Wasm clock lint: `scripts/lint-wasm-clock.sh` (crates built into the Cloudflare Worker must use `web_time`, not the `std::time::{Instant,SystemTime}` `now`/`elapsed` methods, which panic there)
-11. CI Node pin guard: `python3 scripts/check-ci-node-pin.py` (every CI job that compiles Rust sets up the `.tool-versions` Node before its first cargo step)
+11. CI Node pin guard: `node --test scripts/check-ci-node-pin.test.mjs && node scripts/check-ci-node-pin.mjs` with the `.tool-versions` Node (every CI job that compiles Rust sets up the `.tool-versions` Node before its first cargo step)
 
 ---
 
