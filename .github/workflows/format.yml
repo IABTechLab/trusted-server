@@ -45,10 +45,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The guard's tests check the tree before the guard landed; fetch only
+      # that commit instead of the full history.
+      - name: Fetch the pre-guard commit
+        run: git fetch --no-tags --depth=1 origin 7a0ecb4cbfa39af3d83f7e1ed2733d7eabdc4cb1
+
+      - name: Use Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .tool-versions
+
+      - name: Test the guard
+        run: node --test scripts/check-ci-node-pin.test.mjs
+
       # Every job that compiles trusted-server-core also runs the TSJS build, so
       # it must set up the `.tool-versions` Node first (see issue #1204).
       - name: Verify jobs pin Node before compiling Rust
-        run: python3 scripts/check-ci-node-pin.py
+        run: node scripts/check-ci-node-pin.mjs
 
   format-rust:
     name: cargo fmt
