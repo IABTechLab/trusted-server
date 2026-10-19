@@ -14,13 +14,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Retrieve Rust version
-        id: rust-version
-        run: echo "rust-version=$(grep -oP 'channel = "\K[^"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
       - name: Set up Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: ${{ steps.rust-version.outputs.rust-version }}
           target: wasm32-unknown-unknown
+          cache-key: cargo-inspector
       - name: Build the inspector engine
         run: ./scripts/build-inspector-wasm.sh
