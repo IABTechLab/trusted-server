@@ -20,18 +20,14 @@ export interface AdRequestUnit {
   bids: Array<{ bidder: string; params: Record<string, unknown> }>;
 }
 
-/** A user identifier within an auction-level EID entry. */
-export interface AuctionUid {
-  id: string;
-  atype?: number;
-  ext?: Record<string, unknown>;
-}
-
-/** An auction-level EID entry forwarded to the server. */
-export interface AuctionEid {
-  source: string;
-  uids: AuctionUid[];
-}
+/**
+ * An auction-level EID entry forwarded to the server.
+ *
+ * TSJS forwards the entries Prebid placed in the `trustedServer` bidder
+ * request as plain data and the server validates each one, so the server
+ * defines the contract.
+ */
+export type AuctionEid = unknown;
 
 /** The payload POSTed to the /auction orchestrator. */
 export interface AdRequest {

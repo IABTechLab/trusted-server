@@ -103,3 +103,31 @@ Failures:
 - `fitEidCookie > drops whole tail sources until the cookie fits`: `TypeError: Cannot read properties of undefined (reading 'length')`
 - `fitEidCookie > returns no value when nothing fits`: `droppedSources` is `[]` instead of `['huge.example.com']`
 - `fitEidCookie > matches btoa output for ASCII payloads`, `fitEidCookie > produces exactly the ts-eids-cookie fixture for the fixture input`: `expected undefined to be '<base64>'`
+
+## Task 7: Adapter forwards the bidder request's EIDs and owns ts-eids
+
+Command (canary, helpers and new tests installed; adapter unchanged):
+
+```bash
+cd crates/trusted-server-js/lib && mise exec node@24.12.0 -- npx vitest run test/integrations/prebid/index.test.ts test/core/request.test.ts
+```
+
+Result: 175 failed, 132 passed. Besides the new tests, about 160 existing tests that build a `trustedServer` request or run `bidsBackHandler` fail in the shared `afterEach`, because the old collector forwards the `canary.example.com` EID from `getUserIdsAsEids()` (`the getUserIdsAsEids canary leaked into an /auction body`) or writes it to `ts-eids`.
+
+Failures:
+
+- `forwards an opaque LiveRamp envelope from the bidder request unchanged`: `expected [ { …(2) } ] to deeply equal [ { source: 'liveramp.com', …(1) } ]` (the canary arrives instead)
+- `forwards bidderRequest.ortb2 EIDs with EID-level fields, user.ext.eids first`: `should forward both paths as sent: expected [ { …(2) } ] to deeply equal [ …(2) ]`
+- `sends exactly the auction-body fixture for the fixture input`: `TSJS should produce the Rust fixture byte for byte`
+- `writes exactly the ts-eids fixture for the fixture input`: `expected undefined to be 'W3sic291cmNl…'`
+- `writes ts-eids from the body set without EID-level ext`: `the body keeps EID-level ext: expected [ { …(2) } ] to deeply equal [ { …(3) }, { …(2) } ]`
+- `clears ts-eids before the request when the bidder request holds no EIDs`: `the body should carry no eids: expected [ { …(2) } ] to be undefined`
+- `sends no eids and leaves ts-eids alone without a bidder request object`: `expected [ { …(2) } ] to be undefined`
+- `lets the later of two overlapping requests own ts-eids`: `expected undefined to deeply equal [ { …(2) } ]`
+- `forwards ortb2 EIDs and writes ts-eids without the User ID module`: `expected undefined to deeply equal [ { source: 'id5-sync.com', …(3) } ]`
+- `logs EID counts and the cookie decision at debug level, never values`: `expected "debug" to be called with arguments: [ …(2) ]`
+- `keeps the trim log when the cookie had to drop sources`: `the body keeps every entry: expected [ { …(2) } ] to deeply equal [ …(7) ]`
+- `clears ts-eids when tcf2Enforcement lists trustedServer in biddersBlocked` and `… in eidsBlocked`, and `leaves ts-eids alone when tcf2Enforcement lists only other bidders`: `the shim should listen for tcf2Enforcement: expected undefined to be defined`
+- `leaves ts-eids alone when an auction builds no trustedServer request`: `only buildRequests may write or clear the cookie: expected 'W3sic291cmNl…' to be 'preset-value'`
+- `exposes the getUserIdsAsEids canary on the pbjs the shim uses` and `sends no eids in the /auction body`: PASS (positive control and net)
+- Net proof: with `src/core/request.ts:45` changed to pass `{ eids: [{ source: 'net.example.com', … }] }` to `buildAdRequest`, `sends no eids in the /auction body` FAILS (`requestAds should leave EIDs to the ts-eids cookie: expected { adUnits: […], …(2) } to not have property "eids"`); line restored

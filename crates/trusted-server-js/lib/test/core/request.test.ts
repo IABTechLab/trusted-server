@@ -25,6 +25,36 @@ describe('request.requestAds', () => {
     vi.restoreAllMocks();
   });
 
+  it('sends no eids in the /auction body', async () => {
+    globalThis.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      headers: { get: () => 'application/json' },
+      json: async () => ({ seatbid: [] }),
+    });
+    const { addAdUnits } = await import('../../src/core/registry');
+    const { requestAds } = await import('../../src/core/request');
+    document.body.innerHTML = '<div id="slot1"></div>';
+    addAdUnits({ code: 'slot1', mediaTypes: { banner: { sizes: [[300, 250]] } } });
+
+    requestAds();
+    await flushRequestAds();
+
+    const [, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0] as [
+      string,
+      RequestInit,
+    ];
+    const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+    expect(body.adUnits, 'the body should carry the ad unit').toEqual([
+      {
+        code: 'slot1',
+        mediaTypes: { banner: { sizes: [[300, 250]] } },
+        bids: [],
+      },
+    ]);
+    expect(body, 'requestAds should leave EIDs to the ts-eids cookie').not.toHaveProperty('eids');
+  });
+
   it('sends fetch and renders creatives via iframe from response', async () => {
     // mock fetch - returns creative HTML inline in adm field
     const creativeHtml = '<div>Test Creative</div>';
