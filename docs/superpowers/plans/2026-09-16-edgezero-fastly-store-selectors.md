@@ -37,7 +37,7 @@ Use a bug title such as `Align Fastly staging store selectors with EdgeZero PR 3
 - the impact that staging cannot build application state;
 - the root cause that EdgeZero `v0.0.8` reads service-scoped selectors while the selected GitHub Environment supplies canonical selectors;
 - the expected canonical key `EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME=ts_secrets`;
-- the dependency on `https://github.com/stackpop/edgezero/pull/381`;
+- the dependency on `https://github.com/IABTechLab/edgezero/pull/381`;
 - acceptance criteria covering the branch dependency, Viceroy fixtures, documentation, and validation.
 
 - [ ] **Step 2: Create the issue and record its number**
