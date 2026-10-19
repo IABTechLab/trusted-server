@@ -1,0 +1,13 @@
+{
+  "overrides": [
+    {
+      "files": "*/*/js/{src,test}/**",
+      "options": {
+        "semi": true,
+        "singleQuote": true,
+        "trailingComma": "es5",
+        "printWidth": 100
+      }
+    }
+  ]
+}

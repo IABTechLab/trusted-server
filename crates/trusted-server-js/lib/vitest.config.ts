@@ -2,9 +2,20 @@ import path from 'node:path';
 
 import { defineConfig } from 'vitest/config';
 
+import { moduleAliases, sharedCodeAliases } from './build-module-options.mjs';
+
+const cratesDir = path.resolve(__dirname, '..', '..');
+
 export default defineConfig({
+  // Modules keep their scripts and tests in their own crates, outside this
+  // folder, so the test server may read the whole crates folder.
+  server: { fs: { allow: [cratesDir] } },
   resolve: {
     alias: {
+      ...sharedCodeAliases,
+      ...moduleAliases(),
+      // Test data more than one module's tests share.
+      '@tsjs/test': path.resolve(__dirname, 'test'),
       // prebid.js doesn't expose src/adapterManager.js via its package
       // "exports" map, but we need it for client-side bidder validation.
       // Map the specifier to the actual dist file.
@@ -19,6 +30,10 @@ export default defineConfig({
     },
   },
   test: {
+    // A module's tests live in its own crate, in `js/test/`, beside the
+    // script they test, so the tests are found from the crates folder.
+    dir: cratesDir,
+    include: ['trusted-server-js/lib/test/**/*.test.{ts,mjs}', '*/*/js/test/**/*.test.{ts,mjs}'],
     environment: 'jsdom',
     globals: true,
     // Run tests in the main thread to avoid spawning
@@ -34,7 +49,7 @@ export default defineConfig({
     // pre-existing errors elsewhere.
     typecheck: {
       enabled: true,
-      include: ['test/**/types.test.ts'],
+      include: ['trusted-server-js/lib/test/**/types.test.ts', '*/*/js/test/**/types.test.ts'],
       // Errors reported from files outside `include` are pre-existing and
       // unrelated; only the type assertions in the included files gate here.
       ignoreSourceErrors: true,

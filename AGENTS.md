@@ -450,7 +450,7 @@ IntegrationRegistration::builder(ID)
 
 ## JS Build Pipeline
 
-- `build-all.mjs` discovers `src/integrations/*/index.ts` and builds each as a separate IIFE.
+- `build-all.mjs` discovers `src/integrations/*/index.ts` and `crates/<type>/<crate>/js/src/*/index.ts`, and builds each as a separate IIFE.
 - Output: `dist/tsjs-core.js`, `dist/tsjs-{integration}.js` from `npm run build`. `build.rs` passes `--out-dir` to build the same files into a private `OUT_DIR/tsjs-dist`, validates the set, and never reads `dist/`.
 - `build.rs` auto-generates `tsjs_modules.rs` with `include_str!()` for each discovered file.
 - `bundle.rs` provides `concatenate_modules(ids)` and `concatenated_hash(ids)` APIs.

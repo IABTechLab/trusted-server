@@ -4,7 +4,7 @@
 //! depends only on `std`.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Module ID of the core bundle, which is always expected and ordered first.
 pub(crate) const CORE_MODULE_ID: &str = "core";
@@ -14,44 +14,88 @@ pub(crate) fn bundle_file_name(id: &str) -> String {
     format!("tsjs-{id}.js")
 }
 
-/// Return the module IDs `build-all.mjs` builds from `lib_src`.
+/// Return the module IDs `build-all.mjs` builds.
 ///
-/// Mirrors the discovery in `build-all.mjs`: `core` plus every
-/// `integrations/<name>/index.ts`. `core` comes first, integrations follow in
-/// alphabetical order.
+/// Finds module folders by the rule of `moduleSourceDirs` in
+/// `build-module-options.mjs`, `integrations/<name>` under `lib_src` and
+/// `<type>/<crate>/js/src/<name>` under `crates_dir`, and keeps those with an
+/// `index.ts` file, as `build-all.mjs` does. `core` comes first, the rest
+/// follow in alphabetical order.
 ///
 /// # Errors
 ///
-/// Returns a message when the integrations directory cannot be read.
-pub(crate) fn expected_module_ids(lib_src: &Path) -> Result<Vec<String>, String> {
-    let integrations_dir = lib_src.join("integrations");
-    let mut integrations = Vec::new();
-    if integrations_dir.exists() {
-        let entries = fs::read_dir(&integrations_dir).map_err(|err| {
-            format!(
-                "failed to read integrations directory {}: {err}",
-                integrations_dir.display()
-            )
-        })?;
-        for entry in entries {
-            let entry = entry.map_err(|err| {
-                format!(
-                    "failed to read an entry in {}: {err}",
-                    integrations_dir.display()
-                )
-            })?;
-            let path = entry.path();
-            if path.is_dir() && path.join("index.ts").is_file() {
-                integrations.push(entry.file_name().to_string_lossy().into_owned());
-            }
+/// Returns a message when a directory cannot be read, when two folders supply
+/// a module of the same name, or when a folder is named `core`, which is the
+/// shared core's bundle.
+pub(crate) fn expected_module_ids(
+    lib_src: &Path,
+    crates_dir: &Path,
+) -> Result<Vec<String>, String> {
+    let mut roots = vec![lib_src.join("integrations")];
+    for type_dir in folders_in(crates_dir)? {
+        for crate_dir in folders_in(&type_dir)? {
+            roots.push(crate_dir.join("js").join("src"));
         }
     }
+
+    let mut modules: Vec<(String, PathBuf)> = Vec::new();
+    for root in roots {
+        for dir in folders_in(&root)? {
+            let name = dir
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if name == CORE_MODULE_ID {
+                return Err(format!(
+                    "module name {CORE_MODULE_ID}, used by {}, is the shared core's bundle",
+                    dir.display()
+                ));
+            }
+            if let Some((_, earlier)) = modules.iter().find(|(known, _)| *known == name) {
+                return Err(format!(
+                    "module {name} is in both {} and {}",
+                    earlier.display(),
+                    dir.display()
+                ));
+            }
+            modules.push((name, dir));
+        }
+    }
+
+    let mut integrations: Vec<String> = modules
+        .into_iter()
+        .filter(|(_, dir)| dir.join("index.ts").is_file())
+        .map(|(name, _)| name)
+        .collect();
     integrations.sort();
 
     let mut ids = Vec::with_capacity(integrations.len() + 1);
     ids.push(CORE_MODULE_ID.to_owned());
     ids.extend(integrations);
     Ok(ids)
+}
+
+/// The folders directly inside `dir`, or none when it does not exist.
+///
+/// # Errors
+///
+/// Returns a message when `dir` exists but cannot be read.
+pub(crate) fn folders_in(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let entries = fs::read_dir(dir)
+        .map_err(|err| format!("failed to read directory {}: {err}", dir.display()))?;
+    let mut folders = Vec::new();
+    for entry in entries {
+        let entry =
+            entry.map_err(|err| format!("failed to read an entry in {}: {err}", dir.display()))?;
+        if entry.path().is_dir() {
+            folders.push(entry.path());
+        }
+    }
+    folders.sort();
+    Ok(folders)
 }
 
 /// List the `tsjs-<id>.js` bundles in `dir` as `(id, byte length)` pairs.
@@ -214,6 +258,78 @@ mod tests {
                 && err.contains(r#"empty bundles: ["core"]"#)
                 && err.contains(r#"unexpected bundles: ["extra"]"#),
             "should list missing, empty and unexpected bundles together: {err}"
+        );
+    }
+
+    /// A fresh folder for one test, removed when the guard drops.
+    struct TempTree(PathBuf);
+
+    impl TempTree {
+        fn new(name: &str) -> Self {
+            let root =
+                std::env::temp_dir().join(format!("tsjs-bundle-set-{}-{name}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).expect("should create the test folder");
+            Self(root)
+        }
+
+        fn file(&self, relative: &str) {
+            let path = self.0.join(relative);
+            fs::create_dir_all(path.parent().expect("should have a parent folder"))
+                .expect("should create the file's folder");
+            fs::write(&path, "").expect("should write the file");
+        }
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn finds_modules_here_and_in_the_crate_that_supplies_them() {
+        let tree = TempTree::new("finds");
+        tree.file("lib/src/integrations/zeta/index.ts");
+        tree.file("crates/kind/vendor/js/src/alpha/index.ts");
+        tree.file("crates/kind/vendor/js/src/helpers/shared.ts");
+
+        let ids = expected_module_ids(&tree.0.join("lib/src"), &tree.0.join("crates"))
+            .expect("should discover the modules");
+
+        assert_eq!(
+            ids,
+            ["core", "alpha", "zeta"],
+            "should list core first, then every folder with an index.ts in name order"
+        );
+    }
+
+    #[test]
+    fn rejects_a_module_name_two_folders_supply() {
+        let tree = TempTree::new("twice");
+        tree.file("lib/src/integrations/alpha/index.ts");
+        tree.file("crates/kind/vendor/js/src/alpha/index.ts");
+
+        let err = expected_module_ids(&tree.0.join("lib/src"), &tree.0.join("crates"))
+            .expect_err("should refuse a module name found twice");
+
+        assert!(
+            err.contains("module alpha is in both"),
+            "should name the module and both folders: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_a_module_named_core() {
+        let tree = TempTree::new("core");
+        tree.file("crates/kind/vendor/js/src/core/index.ts");
+
+        let err = expected_module_ids(&tree.0.join("lib/src"), &tree.0.join("crates"))
+            .expect_err("should refuse a module named core");
+
+        assert!(
+            err.contains("module name core"),
+            "should name the reserved name: {err}"
         );
     }
 

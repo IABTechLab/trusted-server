@@ -1,0 +1,7 @@
+{
+  "extends": "./trusted-server-js/lib/tsconfig.json",
+  "compilerOptions": {
+    "typeRoots": ["./trusted-server-js/lib/node_modules/@types", "./trusted-server-js/lib/node_modules"]
+  },
+  "include": ["*/*/js/src", "*/*/js/test"]
+}
