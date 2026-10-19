@@ -15,6 +15,9 @@ use crate::preparation::{JsAttempt, PreparedJsBuild, preparation_error};
 use crate::process::ProcessOutcome;
 use crate::source::join_inventory;
 
+pub(crate) mod contributions;
+pub(crate) use contributions::RetainedContributions;
+
 /// Exact retained module facts produced by the actual two-side comparison.
 struct Module {
     filename: String,
@@ -132,6 +135,16 @@ pub(crate) struct JsBuildCompleted {
 }
 
 impl JsBuildCompleted {
+    /// Exports conservative rendered origins from the checked original inventory.
+    ///
+    /// # Errors
+    ///
+    /// Rejects changed handoffs, expired attempts and inconsistent origin joins.
+    pub(crate) fn retained_contributions(
+        &self,
+    ) -> Result<RetainedContributions, Report<ReleaseError>> {
+        contributions::export(self)
+    }
     /// Exports module facts after checking the complete retained handoff.
     ///
     /// # Errors

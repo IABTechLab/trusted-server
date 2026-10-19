@@ -272,6 +272,14 @@ fn retained_raw_and_normalized_observations_are_rehashed_before_handoff() {
         ["a".repeat(64), "b".repeat(64)],
     )
     .expect("should capture checked observations");
+    let retained = tempfile::tempdir().expect("should create export storage");
+    capture
+        .retain(retained.path())
+        .expect("should retain the observations");
+    assert!(
+        capture.export(retained.path()).is_err(),
+        "should not export summary-only observations as actual composition receipts"
+    );
     for name in [
         "cargo-metadata.json",
         "cargo-tree.txt",

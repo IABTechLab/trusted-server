@@ -34,6 +34,23 @@ pub(super) enum FixtureHost {
 }
 /// How the fixture inputs were acquired.
 const ACQUISITION: &str = "unauthenticated-ordinary-ci";
+
+/// Checks that a real candidate export outlives all owned build storage.
+pub(super) fn check_export_after_cleanup<T>(build: T, completed: fn(&T) -> &RecipeCompleted) {
+    let completed = completed(&build);
+    let artifact = completed.artifact().path().to_owned();
+    let export = crate::collection::producer::CandidateBuildExport::from_completed(completed)
+        .expect("should export actual candidate receipts before closing their owners");
+    drop(build);
+    assert!(
+        !artifact.exists(),
+        "should remove the original artifact with its owning build storage"
+    );
+    export
+        .rehash_for_handoff()
+        .expect("should retain exact exported bytes after all original build storage is removed");
+}
+
 /// Every field `fixture.json` must hold, and nothing else.
 const FIXTURE_FIELDS: [&str; 10] = [
     "acquisition",

@@ -65,6 +65,7 @@ pub(crate) use ambient::{AmbientProfile, CheckedAmbient};
 pub(crate) use apple::{
     AppleDeveloperTools, AppleToolEvidence, AppleToolFacts, QualifiedAppleTools,
 };
+pub(crate) use artifact::copy_artifact;
 pub(crate) use cargo_output::successful_messages as observed_cargo_messages;
 pub(crate) use completed::RecipeCompleted;
 pub(crate) use identity::{ExactInvocationDigest, RecipeDefinitionIdentity};

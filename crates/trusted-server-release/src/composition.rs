@@ -23,7 +23,7 @@ pub(crate) mod javascript;
 pub(crate) mod native;
 pub(crate) mod origin;
 pub(crate) mod platform;
-pub(crate) use capture::CargoCapture;
+pub(crate) use capture::{CargoCapture, RetainedCompositionExport};
 
 const MAX_PACKAGES: usize = 16_384;
 const MAX_MESSAGES: usize = 65_536;

@@ -216,6 +216,19 @@ fn two_fresh_js_builds(
     completed
         .rehash_for_handoff()
         .expect("should rejoin retained A bytes before downstream handoff");
+    let contributors = completed
+        .retained_contributions()
+        .expect("should export actual collector origins after private-root cleanup");
+    assert_eq!(
+        contributors.inventory_sha256(),
+        completed.inventory_sha256(),
+        "should preserve the original collector inventory identity"
+    );
+    assert_eq!(
+        contributors.modules().len(),
+        module_count,
+        "should export every actual final module with its conservative origins"
+    );
     let measurement = json!({
         "schema_version": 1,
         "kind": "ordinary-ci-two-fresh-js-builds",

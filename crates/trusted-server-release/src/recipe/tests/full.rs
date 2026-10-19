@@ -445,6 +445,8 @@ fn fastly_canonical_and_reproduction_builds_are_byte_identical() {
         reproduction: &reproduction,
         checked: &checked,
     });
+    super::candidate::check_export_after_cleanup(canonical, |build| &build.completed);
+    super::candidate::check_export_after_cleanup(reproduction, |build| &build.completed);
 }
 
 /// Everything the chained runtime gate needs from the equality run.

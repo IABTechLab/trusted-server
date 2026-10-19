@@ -331,4 +331,8 @@ fn macos_cli_candidate_builds_inspects_and_starts_cleanly() {
     if let Some(error) = invariant {
         panic!("should pair builds over identical inputs: {error:?}");
     }
+    super::candidate::check_export_after_cleanup(canonical, |build| &build.completed);
+    if let Ok(reproduction) = reproduction_build {
+        super::candidate::check_export_after_cleanup(reproduction, |build| &build.completed);
+    }
 }

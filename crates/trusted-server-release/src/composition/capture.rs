@@ -46,6 +46,34 @@ struct CompositionReceipt {
     platform: PlatformEvidence,
 }
 
+/// Exact retained composition bytes, without a claim of complete coverage.
+///
+/// Only the owning capture can construct this diagnostic export. It retains
+/// sealed observations after working source and native output roots are removed.
+#[derive(Debug)]
+pub(crate) struct RetainedCompositionExport {
+    bytes: Vec<u8>,
+    sha256: String,
+    summary: Value,
+}
+
+impl RetainedCompositionExport {
+    /// Returns the original normalized receipt bytes without reserialization.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Returns the SHA-256 of these exact retained bytes.
+    pub(crate) fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    /// Returns observation counts and explicit incomplete coverage diagnostics.
+    pub(crate) fn summary(&self) -> &Value {
+        &self.summary
+    }
+}
+
 impl core::fmt::Debug for CargoCapture {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter
@@ -238,6 +266,30 @@ impl CargoCapture {
             }
         }
         Ok(())
+    }
+
+    /// Exports exact sealed composition bytes after checking every retained input.
+    ///
+    /// # Errors
+    ///
+    /// Rejects changed retained files or observations without actual graph,
+    /// origin, native, JavaScript and platform receipts. Existing coverage gaps
+    /// remain explicit; this cannot construct complete or qualified evidence.
+    pub(crate) fn export(
+        &self,
+        directory: &Path,
+    ) -> Result<RetainedCompositionExport, Report<ReleaseError>> {
+        self.rehash(directory)?;
+        if self.receipt.is_none() {
+            return Err(composition_error(
+                "composition export requires actual sealed component receipts",
+            ));
+        }
+        Ok(RetainedCompositionExport {
+            bytes: self.normalized.clone(),
+            sha256: self.digests[2].clone(),
+            summary: self.summary(),
+        })
     }
 
     /// Describes internal observations without claiming complete native/material coverage.

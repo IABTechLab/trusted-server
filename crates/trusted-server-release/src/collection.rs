@@ -14,6 +14,7 @@ use crate::documents::{Role, lower_hex, parse_json};
 use crate::error::ReleaseError;
 
 mod archive;
+pub(crate) mod producer;
 mod records;
 pub(crate) use records::CollectionDiagnostic;
 #[cfg(test)]

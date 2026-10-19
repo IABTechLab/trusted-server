@@ -47,6 +47,24 @@ fn pure_completion_fixtures_cannot_export_measured_socket_receipts() {
     );
 }
 
+#[test]
+fn pure_completion_fixtures_cannot_export_candidate_transfers() {
+    let bytes = wasm_with(&[(".debug_info", b"i"), (".debug_line", b"l")]);
+    let mut build = built("trusted-server-fastly.wasm", Role::Canonical, &bytes);
+    let stdout = build.stdout(|_| {});
+    let completed = build
+        .finish(stdout)
+        .expect("should complete the accepted fixture artifact");
+    assert!(
+        completed.composition_export().is_err(),
+        "should reject a fixture with no actual retained composition receipts"
+    );
+    assert!(
+        crate::collection::producer::CandidateBuildExport::from_completed(&completed).is_err(),
+        "should not manufacture a measured candidate transfer from a pure fixture"
+    );
+}
+
 pub(super) fn wasm_with(customs: &[(&str, &[u8])]) -> Vec<u8> {
     let mut out = b"\0asm\x01\0\0\0".to_vec();
     for (name, data) in customs
