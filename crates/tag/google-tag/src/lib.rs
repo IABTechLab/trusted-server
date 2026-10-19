@@ -57,6 +57,14 @@ const GOOGLE_TAG_INTEGRATION_ID: &str = "google_tag";
 /// The name this module is selected by, in `[tag]`.
 pub const MODULE: &str = "tag.google-tag";
 
+/// The page change the module supplies, as an entry names it.
+const SUPPLIED_MIDDLEWARE: &[trusted_server_core::integrations::SuppliedMiddleware] = &[
+    trusted_server_core::integrations::SuppliedMiddleware::on_html(
+        MODULE,
+        trusted_server_core::middleware::MiddlewarePhase::Serve,
+    ),
+];
+
 /// The name a module's builder gives as its source, this crate's package.
 const SOURCE: &str = "trusted-server-tag-google-tag";
 
@@ -65,6 +73,7 @@ const SOURCE: &str = "trusted-server-tag-google-tag";
 pub fn builder() -> IntegrationBuilder {
     IntegrationBuilder::new(GOOGLE_TAG_INTEGRATION_ID, SOURCE, register, validate)
         .with_module_name(MODULE)
+        .with_middleware(SUPPLIED_MIDDLEWARE)
 }
 
 /// Google's own address for the tag loader.
@@ -1941,5 +1950,19 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The builder describes the middleware the registration supplies, so a
+    /// tool that writes a configuration places what the module registers.
+    #[test]
+    fn the_builder_describes_the_middleware_the_module_registers() {
+        let settings = trusted_server_core::html_processor::test_support::page_settings(
+            include_str!("fixtures/page-change.settings.toml"),
+        );
+        trusted_server_core::test_support::middleware::assert_described_middleware_is_registered(
+            &settings,
+            &[super::builder()],
+            super::builder().id(),
+        );
     }
 }

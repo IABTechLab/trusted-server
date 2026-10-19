@@ -15,7 +15,9 @@ use validator::{Validate, ValidationErrors};
 
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::geo::GeoInfo;
-use trusted_server_core::integrations::{IntegrationBuilder, IntegrationRegistration};
+use trusted_server_core::integrations::{
+    IntegrationBuilder, IntegrationRegistration, SuppliedMiddleware,
+};
 use trusted_server_core::middleware::{
     Middleware, MiddlewareAction, MiddlewareContext, MiddlewarePhase, Preparation, ResponseHeader,
     is_dispatched_media_type,
@@ -109,11 +111,16 @@ pub fn register(
     ))
 }
 
+/// The page change the module supplies, as an entry names it.
+const SUPPLIED_MIDDLEWARE: &[SuppliedMiddleware] =
+    &[SuppliedMiddleware::on_html(MODULE, MiddlewarePhase::Serve)];
+
 /// The builder a deployment installs to offer this module.
 #[must_use]
 pub fn builder() -> IntegrationBuilder {
     IntegrationBuilder::new(INTEGRATION_ID, env!("CARGO_PKG_NAME"), register, validate)
         .with_module_name(MODULE)
+        .with_middleware(SUPPLIED_MIDDLEWARE)
 }
 
 /// The middleware, which writes the location the request resolved.
@@ -608,5 +615,16 @@ mod tests {
             geo_headers_on(&response)
         );
         assert_eq!(calls, 1, "should still resolve the request's location once");
+    }
+
+    /// The builder describes the middleware the registration supplies, so a
+    /// tool that writes a configuration places what the module registers.
+    #[test]
+    fn the_builder_describes_the_middleware_the_module_registers() {
+        trusted_server_core::test_support::middleware::assert_described_middleware_is_registered(
+            &page_settings(PLACED),
+            &[super::builder()],
+            super::builder().id(),
+        );
     }
 }
