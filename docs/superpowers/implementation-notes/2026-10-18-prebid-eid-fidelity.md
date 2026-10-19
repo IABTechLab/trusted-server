@@ -53,3 +53,19 @@ Failures (against the unchanged body and cookie readers):
 - `structured_cookie_diagnostics_report_raw_uid_strings`: also FAILS on unchanged code (the strict cookie parser keeps the 513-byte UID), so it is a red-first test, not a regression net; no revert proof needed
 - `auction_uses_the_cookie_when_no_body_entry_is_valid`: passes against unchanged code (regression net)
 - Revert proof: with `.filter(|eids| !eids.is_empty())` removed from `resolve_client_auction_eids`, `auction_uses_the_cookie_when_no_body_entry_is_valid` FAILS (`left: Some(Null)`); line restored
+
+## Task 4: Forward browser entries as sent; KV fills absent sources
+
+Command (each test run alone, because a failed assertion aborts the wasm test binary):
+
+```bash
+cargo test-fastly -- <module path>::<name> --exact
+```
+
+Failures (against the old merge):
+
+- `merge_case_1_forwards_a_browser_entry_with_its_fields`, `merge_case_2_keeps_the_browser_atype_for_a_shared_uid`, `merge_case_3_drops_the_stale_kv_uid_for_a_browser_source`, `merge_case_4_appends_kv_sources_the_browser_did_not_send`, `merge_case_5_keeps_same_source_entries_with_different_fields_apart`, `merge_case_6_matches_sources_as_the_registry_normalizes_them`, `merge_auction_eids_does_not_union_kv_uids_into_a_browser_source`, `merge_auction_eids_keeps_browser_metadata_on_conflict`, `publisher::tests::body_less_auction_eids_put_cookie_entries_first_and_kv_only_sources_after`: assertion panic (wasm abort); the old merge drops EID-level fields, puts KV first, unions UIDs and lets KV's atype and ext win
+- `tsjs_auction_body_fixture_drops_only_the_unparsable_entry`, `tsjs_cookie_fixture_drops_only_the_unparsable_entry`, `auction_body_eid_level_fields_reach_the_auction_request` (deferred from Task 3): assertion panic (wasm abort); the old merge rebuilds entries without EID-level fields
+- `merge_case_7_forwards_kv_entries_when_the_browser_sent_none`, `merge_drops_entries_without_uids`, `merge_auction_eids_deduplicates_client_and_resolved_ids`: pass against the old merge (regression nets)
+- Revert proof: with `merged.push(eid);` replaced by `let _ = eid;`, `merge_case_7_forwards_kv_entries_when_the_browser_sent_none` FAILS (wasm abort); line restored
+- Revert proof: with `.filter(|eid| !eid.uids.is_empty())` removed from the browser branch, `merge_drops_entries_without_uids` FAILS (wasm abort); line restored

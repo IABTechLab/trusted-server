@@ -1,6 +1,6 @@
 //! HTTP endpoint handlers for auction requests.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
@@ -17,7 +17,7 @@ use crate::ec::EcKvSnapshot;
 use crate::ec::client_eids::parse_client_eids;
 use crate::ec::eids::{resolve_partner_ids, to_eids};
 use crate::ec::kv::KvIdentityGraph;
-use crate::ec::kv_types::MAX_UID_LENGTH;
+use crate::ec::partner::normalize_partner_source_domain;
 use crate::ec::prebid_eids::parse_prebid_eids_cookie;
 use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
@@ -339,8 +339,8 @@ pub async fn handle_auction(
         geo,
     )?;
 
-    // Merge current-request client EIDs with KV-resolved EIDs, then apply
-    // consent gating before attaching them to the auction request.
+    // Forward the browser entries as sent, append KV entries for registered
+    // sources the browser did not send, then apply consent gating.
     let merged_eids = merge_auction_eids(client_eids, eids);
     let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
     auction_request.user.eids =
@@ -492,55 +492,40 @@ fn parse_cookie_auction_eids(cookie_value: Option<&str>) -> Option<Vec<Eid>> {
     }
 }
 
+/// Merges the request's browser EIDs with KV-resolved partner EIDs.
+///
+/// Browser entries are forwarded as parsed, in wire order, never altered or
+/// combined: they are what Prebid sent the `trustedServer` adapter, and a
+/// source may repeat with different EID-level fields. KV entries are appended
+/// after them, only for registered sources no browser entry carries. Sources
+/// are compared as the partner registry normalizes them (lowercase, trailing
+/// dot removed). For a source the browser sends, KV's UIDs, `atype` and `ext`
+/// are not used: KV keeps the first value it stored, so it is the staler copy.
+/// Entries without UIDs are dropped.
 pub(crate) fn merge_auction_eids(
     client_eids: Option<Vec<Eid>>,
     resolved_eids: Option<Vec<Eid>>,
 ) -> Option<Vec<Eid>> {
-    let mut merged = Vec::new();
-
-    for eid in resolved_eids
+    let mut merged: Vec<Eid> = client_eids
         .into_iter()
         .flatten()
-        .chain(client_eids.into_iter().flatten())
-    {
-        if eid.source.is_empty() {
+        .filter(|eid| !eid.uids.is_empty())
+        .collect();
+    let browser_sources: HashSet<String> = merged
+        .iter()
+        .filter_map(|eid| normalize_partner_source_domain(&eid.source).ok())
+        .collect();
+
+    for eid in resolved_eids.into_iter().flatten() {
+        if eid.uids.is_empty() {
             continue;
         }
-
-        let source_index = match merged
-            .iter()
-            .position(|existing: &Eid| existing.source == eid.source)
-        {
-            Some(index) => index,
-            None => {
-                merged.push(Eid::new(eid.source.clone(), Vec::new()));
-                merged.len() - 1
-            }
-        };
-
-        for uid in eid.uids {
-            if uid.id.trim().is_empty() || uid.id.len() > MAX_UID_LENGTH {
-                continue;
-            }
-
-            if let Some(existing_uid) = merged[source_index]
-                .uids
-                .iter_mut()
-                .find(|existing| existing.id == uid.id)
-            {
-                if existing_uid.atype.is_none() {
-                    existing_uid.atype = uid.atype;
-                }
-                if existing_uid.ext.is_none() {
-                    existing_uid.ext = uid.ext;
-                }
-            } else {
-                merged[source_index].uids.push(uid);
-            }
+        let carried_by_browser = normalize_partner_source_domain(&eid.source)
+            .is_ok_and(|source| browser_sources.contains(&source));
+        if !carried_by_browser {
+            merged.push(eid);
         }
     }
-
-    merged.retain(|eid| !eid.uids.is_empty());
 
     if merged.is_empty() {
         None
@@ -1224,6 +1209,11 @@ mod tests {
         }
     }
 
+    const AUCTION_BODY_FIXTURE: &str =
+        include_str!("../../../trusted-server-js/lib/test/fixtures/auction-body-eids.txt");
+    const TS_EIDS_COOKIE_FIXTURE: &str =
+        include_str!("../../../trusted-server-js/lib/test/fixtures/ts-eids-cookie.txt");
+
     /// Provider that records the full EID set its auction request carried,
     /// then fails its launch so no real transport handle is needed.
     struct EidRecordingProvider {
@@ -1311,6 +1301,84 @@ mod tests {
         .await;
 
         recorded.lock().expect("should lock recorded eids").clone()
+    }
+
+    /// The two parsable entries of the fixture input, as providers receive
+    /// them. The cookie copy has no EID-level `ext` on the last entry.
+    fn fixture_good_entries(with_eid_ext: bool) -> JsonValue {
+        let mut last = json!({
+            "source": "last.example.com",
+            "uids": [{ "id": "last-uid", "atype": 3 }]
+        });
+        if with_eid_ext {
+            last["ext"] = json!({ "segments": ["s1"] });
+        }
+        json!([
+            {
+                "source": "first.example.com",
+                "inserter": "inserter-€.example.com",
+                "matcher": "first.example.com",
+                "mm": 3,
+                "uids": [{ "id": "first-uid", "atype": 1, "ext": { "label": "日本" } }]
+            },
+            last
+        ])
+    }
+
+    #[tokio::test]
+    async fn tsjs_auction_body_fixture_drops_only_the_unparsable_entry() {
+        let recorded =
+            recorded_auction_eids(AUCTION_BODY_FIXTURE.trim_end().as_bytes().to_vec(), None).await;
+
+        assert_eq!(
+            recorded,
+            Some(fixture_good_entries(true)),
+            "the request should be accepted and carry the two good entries unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn tsjs_cookie_fixture_drops_only_the_unparsable_entry() {
+        let recorded = recorded_auction_eids(
+            ad_units_only_body(),
+            Some(TS_EIDS_COOKIE_FIXTURE.trim_end()),
+        )
+        .await;
+
+        assert_eq!(
+            recorded,
+            Some(fixture_good_entries(false)),
+            "the cookie's good entries should reach the provider without the bad one"
+        );
+    }
+
+    #[tokio::test]
+    async fn auction_body_eid_level_fields_reach_the_auction_request() {
+        let eids = json!([{
+            "source": "adserver.org",
+            "inserter": "adserver.org",
+            "matcher": "adserver.org",
+            "mm": 4,
+            "uids": [{ "id": "fictional-tdid", "atype": 1, "ext": { "rtiPartner": "TDID" } }]
+        }]);
+        let body = serde_json::to_vec(&json!({
+            "adUnits": [{ "code": "div-gpt-1", "mediaTypes": { "banner": { "sizes": [[300, 250]] } } }],
+            "eids": eids
+        }))
+        .expect("should serialize body");
+
+        assert_eq!(
+            recorded_auction_eids(body, None).await,
+            Some(eids),
+            "EID-level fields from the body should reach the provider unchanged"
+        );
+    }
+
+    fn ad_units_only_body() -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "adUnits": [{ "code": "div-gpt-1", "mediaTypes": { "banner": { "sizes": [[300, 250]] } } }]
+        }))
+        .expect("should serialize body")
     }
 
     #[tokio::test]
@@ -1545,103 +1613,270 @@ mod tests {
         );
     }
 
+    const SOURCE_S: &str = "ids.example.com";
+    const SOURCE_T: &str = "other.example.com";
+
+    fn kv_eid(source: &str, id: &str, atype: i32) -> Eid {
+        Eid::new(
+            source.to_owned(),
+            vec![Uid {
+                id: id.to_owned(),
+                atype: Some(atype),
+                ext: None,
+            }],
+        )
+    }
+
+    /// A browser entry, every field spelled out (spec 7.1 rule 9).
+    fn browser_eid(
+        source: &str,
+        id: &str,
+        atype: Option<i32>,
+        inserter: Option<&str>,
+        mm: Option<i32>,
+    ) -> Eid {
+        Eid {
+            source: source.to_owned(),
+            uids: vec![Uid {
+                id: id.to_owned(),
+                atype,
+                ext: None,
+            }],
+            inserter: inserter.map(str::to_owned),
+            matcher: None,
+            mm,
+            ext: None,
+        }
+    }
+
+    fn merged_json(client: Option<Vec<Eid>>, kv: Option<Vec<Eid>>) -> JsonValue {
+        serde_json::to_value(merge_auction_eids(client, kv)).expect("should serialize merged EIDs")
+    }
+
+    #[test]
+    fn merge_case_1_forwards_a_browser_entry_with_its_fields() {
+        let merged = merged_json(
+            Some(vec![browser_eid(
+                SOURCE_S,
+                "u1",
+                None,
+                Some("inserter-1.example.com"),
+                Some(1),
+            )]),
+            None,
+        );
+
+        assert_eq!(
+            merged,
+            json!([{ "source": SOURCE_S, "inserter": "inserter-1.example.com", "mm": 1, "uids": [{ "id": "u1" }] }]),
+            "a browser entry should go out with its EID-level fields"
+        );
+    }
+
+    #[test]
+    fn merge_case_2_keeps_the_browser_atype_for_a_shared_uid() {
+        let merged = merged_json(
+            Some(vec![browser_eid(
+                SOURCE_S,
+                "u1",
+                Some(1),
+                Some("inserter-1.example.com"),
+                Some(1),
+            )]),
+            Some(vec![kv_eid(SOURCE_S, "u1", 3)]),
+        );
+
+        assert_eq!(
+            merged,
+            json!([{ "source": SOURCE_S, "inserter": "inserter-1.example.com", "mm": 1, "uids": [{ "id": "u1", "atype": 1 }] }]),
+            "KV's operator-configured atype should not override the browser's"
+        );
+    }
+
+    #[test]
+    fn merge_case_3_drops_the_stale_kv_uid_for_a_browser_source() {
+        let merged = merged_json(
+            Some(vec![browser_eid(
+                SOURCE_S,
+                "u1",
+                None,
+                Some("inserter-1.example.com"),
+                Some(1),
+            )]),
+            Some(vec![kv_eid(SOURCE_S, "u0", 3)]),
+        );
+
+        assert_eq!(
+            merged,
+            json!([{ "source": SOURCE_S, "inserter": "inserter-1.example.com", "mm": 1, "uids": [{ "id": "u1" }] }]),
+            "KV's value for a source the browser sends should not be forwarded"
+        );
+    }
+
+    #[test]
+    fn merge_case_4_appends_kv_sources_the_browser_did_not_send() {
+        let merged = merged_json(
+            Some(vec![browser_eid(SOURCE_S, "u1", None, None, None)]),
+            Some(vec![kv_eid(SOURCE_T, "t1", 3)]),
+        );
+
+        assert_eq!(
+            merged,
+            json!([
+                { "source": SOURCE_S, "uids": [{ "id": "u1" }] },
+                { "source": SOURCE_T, "uids": [{ "id": "t1", "atype": 3 }] }
+            ]),
+            "browser entries should come first and KV-only sources after"
+        );
+    }
+
+    #[test]
+    fn merge_case_5_keeps_same_source_entries_with_different_fields_apart() {
+        let merged = merged_json(
+            Some(vec![
+                browser_eid(
+                    SOURCE_S,
+                    "u1",
+                    None,
+                    Some("inserter-1.example.com"),
+                    Some(1),
+                ),
+                browser_eid(
+                    SOURCE_S,
+                    "u1",
+                    None,
+                    Some("inserter-2.example.com"),
+                    Some(2),
+                ),
+            ]),
+            None,
+        );
+
+        assert_eq!(
+            merged,
+            json!([
+                { "source": SOURCE_S, "inserter": "inserter-1.example.com", "mm": 1, "uids": [{ "id": "u1" }] },
+                { "source": SOURCE_S, "inserter": "inserter-2.example.com", "mm": 2, "uids": [{ "id": "u1" }] }
+            ]),
+            "two browser entries for one source should stay two entries"
+        );
+    }
+
+    #[test]
+    fn merge_case_6_matches_sources_as_the_registry_normalizes_them() {
+        let merged = merged_json(
+            Some(vec![browser_eid(
+                "IDS.Example.com.",
+                "u1",
+                None,
+                None,
+                None,
+            )]),
+            Some(vec![kv_eid(SOURCE_S, "u0", 3)]),
+        );
+
+        assert_eq!(
+            merged,
+            json!([{ "source": "IDS.Example.com.", "uids": [{ "id": "u1" }] }]),
+            "a browser source differing only in case or a trailing dot should suppress KV's"
+        );
+    }
+
+    #[test]
+    fn merge_case_7_forwards_kv_entries_when_the_browser_sent_none() {
+        let merged = merged_json(
+            None,
+            Some(vec![kv_eid(SOURCE_S, "u0", 3), kv_eid(SOURCE_T, "t1", 3)]),
+        );
+
+        assert_eq!(
+            merged,
+            json!([
+                { "source": SOURCE_S, "uids": [{ "id": "u0", "atype": 3 }] },
+                { "source": SOURCE_T, "uids": [{ "id": "t1", "atype": 3 }] }
+            ]),
+            "KV entries should be forwarded unchanged without browser EIDs"
+        );
+    }
+
+    #[test]
+    fn merge_drops_entries_without_uids() {
+        let empty_browser = Eid::new(SOURCE_S.to_owned(), Vec::new());
+        let empty_kv = Eid::new(SOURCE_T.to_owned(), Vec::new());
+
+        assert_eq!(
+            merged_json(Some(vec![empty_browser]), Some(vec![empty_kv])),
+            JsonValue::Null,
+            "entries without UIDs should be dropped, leaving no EIDs"
+        );
+    }
+
     #[test]
     fn merge_auction_eids_deduplicates_client_and_resolved_ids() {
-        let client_eids = Some(vec![Eid::new(
-            "id5-sync.com".to_string(),
-            vec![Uid {
-                id: "ID5_abc".to_string(),
-                atype: Some(1),
-                ext: None,
-            }],
-        )]);
-        let resolved_eids = Some(vec![
-            Eid::new(
-                "id5-sync.com".to_string(),
-                vec![Uid {
-                    id: "ID5_abc".to_string(),
-                    atype: Some(1),
-                    ext: None,
-                }],
-            ),
-            Eid::new(
-                "liveramp.com".to_string(),
-                vec![Uid {
-                    id: "LR_xyz".to_string(),
-                    atype: Some(3),
-                    ext: None,
-                }],
-            ),
-        ]);
+        let merged = merged_json(
+            Some(vec![kv_eid("id5-sync.com", "ID5_abc", 1)]),
+            Some(vec![
+                kv_eid("id5-sync.com", "ID5_abc", 1),
+                kv_eid("liveramp.com", "LR_xyz", 3),
+            ]),
+        );
 
-        let merged = merge_auction_eids(client_eids, resolved_eids).expect("should merge EIDs");
-
-        assert_eq!(merged.len(), 2, "should retain distinct EID sources");
-        assert_eq!(merged[0].source, "id5-sync.com");
-        assert_eq!(merged[0].uids.len(), 1, "should deduplicate matching UIDs");
-        assert_eq!(merged[1].source, "liveramp.com");
-        assert_eq!(merged[1].uids[0].id, "LR_xyz");
+        assert_eq!(
+            merged,
+            json!([
+                { "source": "id5-sync.com", "uids": [{ "id": "ID5_abc", "atype": 1 }] },
+                { "source": "liveramp.com", "uids": [{ "id": "LR_xyz", "atype": 3 }] }
+            ]),
+            "the browser's id5 entry should go out once, followed by KV's liveramp"
+        );
     }
 
     #[test]
-    fn merge_auction_eids_preserves_multiple_uids_per_source() {
-        let client_eids = Some(vec![Eid::new(
-            "sharedid.org".to_string(),
-            vec![Uid {
-                id: "shared_client".to_string(),
-                atype: None,
-                ext: None,
-            }],
-        )]);
-        let resolved_eids = Some(vec![Eid::new(
-            "sharedid.org".to_string(),
-            vec![Uid {
-                id: "shared_server".to_string(),
-                atype: Some(3),
-                ext: None,
-            }],
-        )]);
+    fn merge_auction_eids_does_not_union_kv_uids_into_a_browser_source() {
+        let merged = merged_json(
+            Some(vec![browser_eid(
+                "sharedid.org",
+                "shared_client",
+                None,
+                None,
+                None,
+            )]),
+            Some(vec![kv_eid("sharedid.org", "shared_server", 3)]),
+        );
 
-        let merged = merge_auction_eids(client_eids, resolved_eids).expect("should merge EIDs");
-
-        assert_eq!(merged.len(), 1, "should merge same-source entries");
-        assert_eq!(merged[0].uids.len(), 2, "should preserve distinct UIDs");
-        assert_eq!(merged[0].uids[0].id, "shared_server");
-        assert_eq!(merged[0].uids[1].id, "shared_client");
+        assert_eq!(
+            merged,
+            json!([{ "source": "sharedid.org", "uids": [{ "id": "shared_client" }] }]),
+            "KV's UID for a source the browser sends should not be added to it"
+        );
     }
 
     #[test]
-    fn merge_auction_eids_prefers_server_resolved_metadata_on_conflict() {
-        let client_eids = Some(vec![Eid::new(
-            "adserver.org".to_string(),
+    fn merge_auction_eids_keeps_browser_metadata_on_conflict() {
+        let client = Eid::new(
+            "adserver.org".to_owned(),
             vec![Uid {
-                id: "shared_uid".to_string(),
+                id: "shared_uid".to_owned(),
                 atype: Some(1),
                 ext: Some(json!({ "provider": "client" })),
             }],
-        )]);
-        let resolved_eids = Some(vec![Eid::new(
-            "adserver.org".to_string(),
+        );
+        let resolved = Eid::new(
+            "adserver.org".to_owned(),
             vec![Uid {
-                id: "shared_uid".to_string(),
+                id: "shared_uid".to_owned(),
                 atype: Some(3),
                 ext: Some(json!({ "provider": "server" })),
             }],
-        )]);
-
-        let merged = merge_auction_eids(client_eids, resolved_eids).expect("should merge EIDs");
-
-        assert_eq!(merged.len(), 1, "should merge duplicate source");
-        assert_eq!(merged[0].uids.len(), 1, "should deduplicate duplicate uid");
-        assert_eq!(
-            merged[0].uids[0].atype,
-            Some(3),
-            "should prefer resolved atype"
         );
+
         assert_eq!(
-            merged[0].uids[0].ext,
-            Some(json!({ "provider": "server" })),
-            "should prefer resolved ext"
+            merged_json(Some(vec![client]), Some(vec![resolved])),
+            json!([{
+                "source": "adserver.org",
+                "uids": [{ "id": "shared_uid", "atype": 1, "ext": { "provider": "client" } }]
+            }]),
+            "the browser's atype and ext should win over KV's"
         );
     }
 
