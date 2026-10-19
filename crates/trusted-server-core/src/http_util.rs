@@ -53,9 +53,9 @@ pub const SPOOFABLE_FORWARDED_HEADERS: &[&str] = &[
 
 /// Remove the configured client-IP trust headers before routing.
 ///
-/// Only the Fastly adapter consumes these values, but every adapter removes
-/// them so a shared configuration cannot expose an authentication secret to
-/// publisher or integration request handling.
+/// Fastly request handling and trace metadata across adapters consume these
+/// values before sanitation. Every adapter removes them so a shared configuration
+/// cannot expose an authentication secret to publisher or integration handling.
 pub fn sanitize_trusted_client_ip_headers(
     req: &mut Request<EdgeBody>,
     config: Option<&TrustedClientIpConfig>,

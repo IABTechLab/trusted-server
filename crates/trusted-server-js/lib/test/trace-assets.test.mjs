@@ -9,6 +9,7 @@ import { describe, expect, it } from 'vitest';
 import { traceSourceDigest } from '../trace-asset-sources.mjs';
 
 const library = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const traceBuild = path.join(library, '..', 'dist', 'trace');
 const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
 
 describe('versioned trace assets', () => {
@@ -24,11 +25,23 @@ describe('versioned trace assets', () => {
     ]);
     for (const asset of manifest.assets) {
       const frozen = fs.readFileSync(path.join(library, 'trace-assets', asset.file));
-      const built = fs.readFileSync(path.join(library, '..', 'dist', 'trace', asset.file));
-      expect(built).toEqual(frozen);
       expect(sha256(frozen)).toBe(asset.sha256);
       expect(asset.sha256).toMatch(/^[a-f\d]{64}$/);
     }
     expect(fs.existsSync(path.join(library, '..', 'dist', 'tsjs-trace.js'))).toBe(false);
   });
+
+  it.skipIf(!fs.existsSync(traceBuild))(
+    'matches dist/trace when node build-all.mjs has run',
+    () => {
+      const manifest = JSON.parse(
+        fs.readFileSync(path.join(library, 'trace-assets-manifest.json'), 'utf8')
+      );
+      for (const asset of manifest.assets) {
+        const frozen = fs.readFileSync(path.join(library, 'trace-assets', asset.file));
+        const built = fs.readFileSync(path.join(traceBuild, asset.file));
+        expect(built).toEqual(frozen);
+      }
+    }
+  );
 });
