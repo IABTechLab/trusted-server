@@ -19,6 +19,14 @@
 
 Closes #
 
+## Spec
+
+<!-- Feature PRs need a spec, written with the superpowers brainstorming skill and reviewed with an AI coding agent over at least two rounds. -->
+<!-- Link it here. For a bug fix, docs, dependency, CI, or behavior-preserving refactor, write "Not a feature" instead. When in doubt, write a spec. -->
+<!-- Feature PRs without a spec go back to draft. Details: https://github.com/IABTechLab/trusted-server/blob/main/CONTRIBUTING.md#features-start-with-a-spec -->
+
+Spec:
+
 ## Test plan
 
 <!-- How did you verify this works? Check all that apply -->
@@ -35,6 +43,7 @@ Closes #
 
 ## Checklist
 
+- [ ] Feature PRs: spec linked above, ending in a review log of two or more agent review rounds
 - [ ] Changes follow [AGENTS.md](/AGENTS.md) conventions
 - [ ] No `unwrap()` in production code — use `expect("should ...")`
 - [ ] Uses `log` macros (not `println!`)
