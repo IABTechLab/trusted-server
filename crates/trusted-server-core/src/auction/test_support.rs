@@ -92,14 +92,14 @@ pub(crate) fn canonical_parity_auction_request() -> AuctionRequest {
                 raw_ac_string: Some("fictional-ac".to_string()),
                 ..Default::default()
             }),
-            eids: Some(vec![Eid {
-                source: "identity.example".to_string(),
-                uids: vec![Uid {
+            eids: Some(vec![Eid::new(
+                "identity.example".to_string(),
+                vec![Uid {
                     id: "fictional-uid".to_string(),
                     atype: Some(1),
                     ext: None,
                 }],
-            }]),
+            )]),
         },
         device: Some(DeviceInfo {
             user_agent: Some("Fictional Browser".to_string()),
@@ -118,4 +118,57 @@ pub(crate) fn canonical_parity_auction_request() -> AuctionRequest {
         site: None,
         context: HashMap::new(),
     }
+}
+
+/// Two entries for one source with different EID-level fields, the way
+/// Prebid sends them (spec 3.2), for outbound serialization tests.
+pub(crate) fn repeated_source_provenance_eids() -> Vec<Eid> {
+    vec![
+        Eid {
+            source: "ids.example.com".to_string(),
+            uids: vec![Uid {
+                id: "fictional-uid".to_string(),
+                atype: Some(1),
+                ext: None,
+            }],
+            inserter: Some("inserter-a.example.com".to_string()),
+            matcher: Some("ids.example.com".to_string()),
+            mm: Some(4),
+            ext: None,
+        },
+        Eid {
+            source: "ids.example.com".to_string(),
+            uids: vec![Uid {
+                id: "fictional-uid".to_string(),
+                atype: Some(1),
+                ext: None,
+            }],
+            inserter: Some("inserter-b.example.com".to_string()),
+            matcher: Some("matcher-b.example.com".to_string()),
+            mm: Some(2),
+            ext: Some(json!({ "segments": ["s1"] })),
+        },
+    ]
+}
+
+/// [`repeated_source_provenance_eids`] as the JSON every outbound path must
+/// emit in `user.ext.eids`.
+pub(crate) fn repeated_source_provenance_eids_json() -> serde_json::Value {
+    json!([
+        {
+            "source": "ids.example.com",
+            "uids": [{ "id": "fictional-uid", "atype": 1 }],
+            "inserter": "inserter-a.example.com",
+            "matcher": "ids.example.com",
+            "mm": 4
+        },
+        {
+            "source": "ids.example.com",
+            "uids": [{ "id": "fictional-uid", "atype": 1 }],
+            "inserter": "inserter-b.example.com",
+            "matcher": "matcher-b.example.com",
+            "mm": 2,
+            "ext": { "segments": ["s1"] }
+        }
+    ])
 }

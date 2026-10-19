@@ -530,7 +530,7 @@ fn parse_client_auction_eids(raw: Option<&JsonValue>) -> Option<Vec<Eid>> {
             continue;
         }
 
-        eids.push(Eid { source, uids });
+        eids.push(Eid::new(source, uids));
     }
 
     if eids.is_empty() { None } else { Some(eids) }
@@ -582,10 +582,7 @@ pub(crate) fn merge_auction_eids(
         {
             Some(index) => index,
             None => {
-                merged.push(Eid {
-                    source: eid.source.clone(),
-                    uids: Vec::new(),
-                });
+                merged.push(Eid::new(eid.source.clone(), Vec::new()));
                 merged.len() - 1
             }
         };
@@ -1654,31 +1651,31 @@ mod tests {
 
     #[test]
     fn merge_auction_eids_deduplicates_client_and_resolved_ids() {
-        let client_eids = Some(vec![Eid {
-            source: "id5-sync.com".to_string(),
-            uids: vec![Uid {
+        let client_eids = Some(vec![Eid::new(
+            "id5-sync.com".to_string(),
+            vec![Uid {
                 id: "ID5_abc".to_string(),
                 atype: Some(1),
                 ext: None,
             }],
-        }]);
+        )]);
         let resolved_eids = Some(vec![
-            Eid {
-                source: "id5-sync.com".to_string(),
-                uids: vec![Uid {
+            Eid::new(
+                "id5-sync.com".to_string(),
+                vec![Uid {
                     id: "ID5_abc".to_string(),
                     atype: Some(1),
                     ext: None,
                 }],
-            },
-            Eid {
-                source: "liveramp.com".to_string(),
-                uids: vec![Uid {
+            ),
+            Eid::new(
+                "liveramp.com".to_string(),
+                vec![Uid {
                     id: "LR_xyz".to_string(),
                     atype: Some(3),
                     ext: None,
                 }],
-            },
+            ),
         ]);
 
         let merged = merge_auction_eids(client_eids, resolved_eids).expect("should merge EIDs");
@@ -1692,22 +1689,22 @@ mod tests {
 
     #[test]
     fn merge_auction_eids_preserves_multiple_uids_per_source() {
-        let client_eids = Some(vec![Eid {
-            source: "sharedid.org".to_string(),
-            uids: vec![Uid {
+        let client_eids = Some(vec![Eid::new(
+            "sharedid.org".to_string(),
+            vec![Uid {
                 id: "shared_client".to_string(),
                 atype: None,
                 ext: None,
             }],
-        }]);
-        let resolved_eids = Some(vec![Eid {
-            source: "sharedid.org".to_string(),
-            uids: vec![Uid {
+        )]);
+        let resolved_eids = Some(vec![Eid::new(
+            "sharedid.org".to_string(),
+            vec![Uid {
                 id: "shared_server".to_string(),
                 atype: Some(3),
                 ext: None,
             }],
-        }]);
+        )]);
 
         let merged = merge_auction_eids(client_eids, resolved_eids).expect("should merge EIDs");
 
@@ -1719,22 +1716,22 @@ mod tests {
 
     #[test]
     fn merge_auction_eids_prefers_server_resolved_metadata_on_conflict() {
-        let client_eids = Some(vec![Eid {
-            source: "adserver.org".to_string(),
-            uids: vec![Uid {
+        let client_eids = Some(vec![Eid::new(
+            "adserver.org".to_string(),
+            vec![Uid {
                 id: "shared_uid".to_string(),
                 atype: Some(1),
                 ext: Some(json!({ "provider": "client" })),
             }],
-        }]);
-        let resolved_eids = Some(vec![Eid {
-            source: "adserver.org".to_string(),
-            uids: vec![Uid {
+        )]);
+        let resolved_eids = Some(vec![Eid::new(
+            "adserver.org".to_string(),
+            vec![Uid {
                 id: "shared_uid".to_string(),
                 atype: Some(3),
                 ext: Some(json!({ "provider": "server" })),
             }],
-        }]);
+        )]);
 
         let merged = merge_auction_eids(client_eids, resolved_eids).expect("should merge EIDs");
 

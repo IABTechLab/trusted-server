@@ -1569,3 +1569,18 @@ fn malformed_top_level_standard_response_is_error() {
     assert_eq!(response.status, BidStatus::Error);
     assert_eq!(response.metadata["error_type"], "parse_response");
 }
+
+#[test]
+fn standard_profile_forwards_eid_provenance_fields_and_repeated_sources() {
+    let mut request = canonical_parity_auction_request();
+    request.user.eids = Some(crate::auction::test_support::repeated_source_provenance_eids());
+
+    let built = build_with_request("standard", json!({}), request, None);
+
+    let serialized = serde_json::to_value(&built).expect("should serialize request");
+    assert_eq!(
+        serialized["user"]["ext"]["eids"],
+        crate::auction::test_support::repeated_source_provenance_eids_json(),
+        "config-first providers should receive both entries with their own EID-level fields"
+    );
+}
