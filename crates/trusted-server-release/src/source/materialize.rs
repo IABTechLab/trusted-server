@@ -25,6 +25,19 @@ pub(crate) struct FreshSource {
     cancellation: Cancellation,
 }
 
+/// Creates an owned checkout whose path agrees with canonical boundary roots.
+///
+/// Resolve the parent before allocation so `TempDir` retains cleanup ownership
+/// under the same path, including on macOS where `/var` aliases `/private/var`.
+///
+/// # Errors
+///
+/// Rejects an inaccessible parent or a failed private directory allocation.
+pub(super) fn fresh_directory(parent: &Path) -> Result<TempDir, Report<ReleaseError>> {
+    let parent = fs::canonicalize(parent).map_err(|error| source_error(error.to_string()))?;
+    tempfile::tempdir_in(parent).map_err(|error| source_error(error.to_string()))
+}
+
 impl FreshSource {
     /// Removes the owned tree and reports cleanup failure to the recipe.
     ///
@@ -119,7 +132,7 @@ impl ApprovedSource {
             &[],
             check,
         )?;
-        let directory = tempfile::tempdir().map_err(|error| source_error(error.to_string()))?;
+        let directory = fresh_directory(&std::env::temp_dir())?;
         for (relative, (mode, expected)) in &self.snapshot.records {
             check()?;
             let destination = directory.path().join(relative);

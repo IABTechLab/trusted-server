@@ -21,6 +21,34 @@ use crate::process::Cancellation;
 const EPOCH: u64 = 1_700_000_000;
 
 #[test]
+fn fresh_directory_canonicalizes_an_aliased_parent_and_preserves_cleanup() {
+    let directory = tempdir().expect("should create parent fixture");
+    let base = fs::canonicalize(directory.path()).expect("should canonicalize fixture");
+    let parent = base.join("real-parent");
+    let alias = base.join("alias-parent");
+    fs::create_dir(&parent).expect("should create real parent");
+    symlink(&parent, &alias).expect("should create parent alias");
+    let owned =
+        super::materialize::fresh_directory(&alias).expect("should create private checkout");
+    let path = owned.path().to_owned();
+    assert_eq!(
+        path,
+        fs::canonicalize(&path).expect("should resolve checkout"),
+        "should expose the canonical owning path"
+    );
+    assert_eq!(
+        path.parent(),
+        Some(parent.as_path()),
+        "should allocate under the resolved parent"
+    );
+    owned.close().expect("should remove owned checkout");
+    assert!(
+        !path.exists(),
+        "should clean up the exact canonical checkout"
+    );
+}
+
+#[test]
 fn fresh_source_attempt_controls_reject_cancelled_and_expired_work() {
     let fixture = Fixture::new();
     let approved = fixture.authenticate().expect("should authenticate source");
@@ -308,6 +336,13 @@ fn fresh_source_copies_share_no_files_and_reject_changed_inputs() {
             &Cancellation::default(),
         )
         .expect("should materialize second source");
+    for fresh in [&first, &second] {
+        assert_eq!(
+            fresh.root(),
+            fs::canonicalize(fresh.root()).expect("should resolve materialized checkout"),
+            "should expose the same path that boundary roots bind"
+        );
+    }
     assert_ne!(
         first.root(),
         second.root(),
