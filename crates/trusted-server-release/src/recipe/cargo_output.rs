@@ -48,6 +48,9 @@ fn output_error(detail: impl std::fmt::Display) -> Report<ReleaseError> {
 
 /// Splits `stdout` into strict JSON objects, one per newline-terminated line.
 fn messages(stdout: &[u8]) -> Result<Vec<Value>, Report<ReleaseError>> {
+    if stdout.len() > 16 * 1024 * 1024 {
+        return Err(output_error("Cargo stream exceeds the build output bound"));
+    }
     if stdout.is_empty() {
         return Ok(Vec::new());
     }
@@ -166,8 +169,7 @@ pub(crate) fn locate_binary(
     stdout: &[u8],
     expected: &ExpectedBinary<'_>,
 ) -> Result<PathBuf, Report<ReleaseError>> {
-    let messages = messages(stdout)?;
-    require_success(&messages)?;
+    let messages = successful_messages(stdout)?;
     let artifacts: Vec<&Value> = messages
         .iter()
         .filter(|message| is_artifact(message))
@@ -190,6 +192,17 @@ pub(crate) fn locate_binary(
         return Err(output_error("unexpected additional binary artifact"));
     }
     executable_of(requested, expected)
+}
+
+/// Parses bounded strict JSONL ending in one successful build completion.
+///
+/// # Errors
+///
+/// Returns an error for malformed, oversized, duplicate-key or incomplete output.
+pub(crate) fn successful_messages(stdout: &[u8]) -> Result<Vec<Value>, Report<ReleaseError>> {
+    let messages = messages(stdout)?;
+    require_success(&messages)?;
+    Ok(messages)
 }
 
 /// Parses the build stream and maps the executable into a writable host root.

@@ -18,6 +18,7 @@ use sha2::{Digest as _, Sha256};
 use super::artifact::{CopiedArtifact, EXECUTABLE_LIMIT};
 use super::{AssetId, CheckedAmbient, Role, recipe_error};
 use crate::boundary::DescendantCleanup;
+use crate::composition::CargoCapture;
 use crate::documents::hash_bounded_with_check;
 use crate::error::ReleaseError;
 use crate::source::CommitId;
@@ -48,6 +49,7 @@ pub(super) struct SuccessFacts {
     pub(super) output_dir: PathBuf,
     pub(super) normalized_manifest_digests: std::collections::BTreeMap<String, String>,
     pub(super) derived_manifest_digests: std::collections::BTreeMap<String, String>,
+    pub(super) cargo_observations: Option<CargoCapture>,
 }
 
 /// A built, copied and bound artifact.
@@ -90,6 +92,9 @@ impl RecipeCompleted {
             .and_then(|()| file.sync_all())
             .map_err(|error| recipe_error(format!("cannot retain Cargo output: {error}")))?;
         let stdout_sha256 = hex::encode(Sha256::digest(&facts.stdout));
+        if let Some(captured) = &facts.cargo_observations {
+            captured.retain(retained.path())?;
+        }
         Ok(Self {
             facts,
             stdout_sha256,
@@ -197,6 +202,14 @@ impl RecipeCompleted {
         &self.facts.stderr_sha256
     }
 
+    /// Supporting Cargo observations; absent only in pure completion fixtures.
+    pub(crate) fn cargo_observations_summary(&self) -> Option<serde_json::Value> {
+        self.facts
+            .cargo_observations
+            .as_ref()
+            .map(CargoCapture::summary)
+    }
+
     /// The copied artifact.
     pub(crate) fn artifact(&self) -> &CopiedArtifact {
         &self.facts.artifact
@@ -240,6 +253,9 @@ impl RecipeCompleted {
         .map_err(|error| error.change_context(ReleaseError::Recipe))?;
         if stream.sha256 != self.stdout_sha256 {
             return Err(recipe_error("retained Cargo output changed"));
+        }
+        if let Some(captured) = &self.facts.cargo_observations {
+            captured.rehash(self.retained.path())?;
         }
         Ok(&self.facts.output_dir)
     }

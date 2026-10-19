@@ -335,6 +335,7 @@ pub(super) fn cargo_measurement(completed: &RecipeCompleted) -> Value {
         "descendant_cleanup": completed.descendant_cleanup().to_string(),
         "stdout_sha256": completed.stdout_sha256(),
         "stderr_sha256": completed.stderr_sha256(),
+        "cargo_observations": completed.cargo_observations_summary(),
         "elapsed_seconds": completed.elapsed().as_secs(),
         "normalized_manifest_count": completed.normalized_manifest_digests().len(),
         "normalized_manifest_digests": completed.normalized_manifest_digests(),

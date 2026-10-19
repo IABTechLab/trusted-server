@@ -157,6 +157,7 @@ impl Built {
             started_at_seconds: 1_700_000_000,
             elapsed: Duration::from_secs(42),
             cleanup: self.cleanup,
+            queries: super::super::execute::CargoQueryOutput::Fixture,
         }
     }
 

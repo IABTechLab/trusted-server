@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use super::super::paths::PrefixPaths;
+use super::super::plan::CargoQuery;
 use super::fixture::*;
 use super::*;
 use crate::policy::FIXED_ARTIFACTS;
@@ -29,6 +30,61 @@ fn expected_replacement() -> Vec<String> {
 
 /// Execution path of the fictional Apple clang in the fixture layout.
 const FIXTURE_CLANG: &str = "/boundary/system/0/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang";
+
+#[test]
+fn composition_queries_keep_selected_tools_environment_and_source_replacement() {
+    for artifact in FIXED_ARTIFACTS {
+        let fixture = Fixture::new(COMMIT);
+        let prepared = fixture
+            .bind(artifact.name, Role::Canonical)
+            .expect("should bind the selected recipe");
+        let plan = prepared
+            .plan(&fixture.paths(Role::Canonical))
+            .expect("should derive the selected plan");
+        for kind in [CargoQuery::Metadata, CargoQuery::Tree] {
+            let query = plan
+                .observation_query(kind)
+                .expect("should derive the bounded query");
+            assert_eq!(query.program, plan.program, "should use the selected Cargo");
+            assert_eq!(
+                query.environment, plan.environment,
+                "should retain the sanitized build environment"
+            );
+            assert_eq!(
+                query.working_directory, plan.working_directory,
+                "should retain the source root"
+            );
+            assert_eq!(query.umask, plan.umask, "should retain the selected umask");
+            let configs = |arguments: &[String]| {
+                arguments
+                    .windows(2)
+                    .filter(|pair| pair[0] == "--config")
+                    .map(|pair| pair[1].clone())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                configs(&query.arguments),
+                configs(&plan.arguments),
+                "should retain every source/tool/remap config"
+            );
+            assert!(
+                query.arguments.iter().any(|value| value == "--frozen"),
+                "should prohibit new resolution"
+            );
+            assert!(
+                query
+                    .arguments
+                    .iter()
+                    .any(|value| value == artifact.target.triple()),
+                "should select the explicit target"
+            );
+            assert_ne!(
+                query.digest().expect("should hash the query"),
+                plan.digest().expect("should hash the build")
+            );
+        }
+    }
+}
 
 /// The exact target path remap for the fixture's mount layout, with the
 /// Darwin debug-map prefix and target linker for a Darwin target.

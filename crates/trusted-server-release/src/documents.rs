@@ -37,6 +37,8 @@ pub(crate) enum Role {
     Executable,
     /// One Cargo `--message-format=json` line.
     CargoMessage,
+    /// Internal Cargo observations; never a published metadata contract.
+    CargoObservation,
 }
 
 impl Role {
@@ -45,7 +47,7 @@ impl Role {
             Self::Metadata | Self::CargoMessage => 1024 * 1024,
             Self::Source => 64 * 1024 * 1024,
             Self::Companion | Self::Bundle => 32 * 1024 * 1024,
-            Self::Spdx => 16 * 1024 * 1024,
+            Self::Spdx | Self::CargoObservation => 16 * 1024 * 1024,
             Self::Executable => 512 * 1024 * 1024,
         }
     }

@@ -60,6 +60,7 @@ pub(crate) use ambient::{AmbientProfile, CheckedAmbient};
     reason = "the qualified Apple selection has no production caller yet"
 )]
 pub(crate) use apple::{AppleDeveloperTools, AppleToolFacts, QualifiedAppleTools};
+pub(crate) use cargo_output::successful_messages as observed_cargo_messages;
 pub(crate) use completed::RecipeCompleted;
 pub(crate) use paths::ExecutionPaths;
 pub(crate) use plan::CargoPlan;

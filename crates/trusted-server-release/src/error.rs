@@ -32,6 +32,8 @@ pub(crate) enum ReleaseError {
     Recipe,
     #[display("Final Fastly runtime acceptance rejected the executable")]
     Runtime,
+    #[display("Artifact composition evidence is rejected")]
+    Composition,
 }
 
 impl core::error::Error for ReleaseError {}

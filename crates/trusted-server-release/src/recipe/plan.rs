@@ -41,7 +41,7 @@ const SDKROOT_VARIABLE: &str = "SDKROOT";
 const ZERO_AR_DATE_VARIABLE: &str = "ZERO_AR_DATE";
 
 /// The exact Cargo invocation of one recipe.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CargoPlan {
     pub(super) asset: AssetId,
     pub(super) program: PathBuf,
@@ -53,7 +53,76 @@ pub(crate) struct CargoPlan {
     pub(super) apple_identity_sha256: Option<String>,
 }
 
+/// Fixed supporting observations of the selected explicit-target build.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum CargoQuery {
+    /// Versioned package identities and package-level graph evidence.
+    Metadata,
+    /// Selected package's non-dev dependency tree, retained as raw evidence.
+    Tree,
+}
+
 impl CargoPlan {
+    /// Derives supporting queries without changing tools, inputs or the boundary.
+    ///
+    /// Compiler messages remain the authority for effective unit features.
+    /// Metadata/tree features are only package-level graph observations.
+    ///
+    /// # Errors
+    ///
+    /// Rejects incomplete config/feature argument pairs in the selected plan.
+    pub(super) fn observation_query(&self, kind: CargoQuery) -> Result<Self, Report<ReleaseError>> {
+        let artifact = self.asset.artifact();
+        let arguments: &[&str] = match kind {
+            CargoQuery::Metadata => &[
+                "metadata",
+                "--format-version",
+                "1",
+                "--filter-platform",
+                artifact.target.triple(),
+                "--frozen",
+            ],
+            CargoQuery::Tree => &[
+                "tree",
+                "--package",
+                artifact.package,
+                "--target",
+                artifact.target.triple(),
+                "--edges",
+                "normal,build",
+                "--prefix",
+                "depth",
+                "--format",
+                "{p}",
+                "--charset",
+                "ascii",
+                "--no-dedupe",
+                "--frozen",
+            ],
+        };
+        let mut query = self.clone();
+        query.arguments = arguments
+            .iter()
+            .map(|argument| (*argument).to_owned())
+            .collect();
+        let mut selected = self.arguments.iter();
+        while let Some(argument) = selected.next() {
+            match argument.as_str() {
+                "--config" | "--features" => {
+                    let value = selected.next().ok_or_else(|| {
+                        recipe_error("incomplete selected Cargo config or features")
+                    })?;
+                    query.arguments.extend([argument.clone(), value.clone()]);
+                }
+                "--all-features" | "--no-default-features" => {
+                    query.arguments.push(argument.clone())
+                }
+                _ => {}
+            }
+        }
+        Ok(query)
+    }
+
     /// Describes the plan as a confined command running under the role's umask.
     ///
     /// # Errors

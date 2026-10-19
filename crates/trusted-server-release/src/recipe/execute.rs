@@ -14,8 +14,10 @@ use super::apple::AppleDeveloperTools;
 use super::artifact::{EXECUTABLE_LIMIT, copy_artifact};
 use super::cargo_output::{ExpectedBinary, locate_host_binary};
 use super::completed::SuccessFacts;
+use super::plan::CargoQuery;
 use super::{Authority, ExecutionPaths, PreparedRecipe, RecipeCompleted, recipe_error};
 use crate::boundary::{Boundary, DenialProof, DescendantCleanup};
+use crate::composition::{CargoCapture, CargoLayout};
 use crate::documents::{Role as DocumentRole, read_bounded};
 use crate::error::ReleaseError;
 use crate::inspect::{ElfPolicy, MachoCpu, MachoPolicy, inspect_elf, inspect_macho, inspect_wasm};
@@ -45,6 +47,21 @@ pub(super) struct RunOutput {
     pub(super) elapsed: Duration,
     /// The descendant cleanup of the boundary that ran the build.
     pub(super) cleanup: DescendantCleanup,
+    /// Supporting output captured by this same denied recipe invocation.
+    pub(super) queries: CargoQueryOutput,
+}
+
+/// Supporting observations from execution, or an explicit pure-test fixture.
+pub(super) enum CargoQueryOutput {
+    /// Raw metadata and tree output from the selected Cargo under the proof.
+    Captured {
+        metadata: Vec<u8>,
+        tree: Vec<u8>,
+        plan_digests: [String; 2],
+    },
+    /// Pure completion tests never execute Cargo and cannot supply real observations.
+    #[cfg(test)]
+    Fixture,
 }
 
 /// Admits a boundary's descendant cleanup for a selection.
@@ -194,12 +211,37 @@ impl PreparedRecipe {
         }
         self.check_inputs()?;
         self.check_no_fetched_sources()?;
-        let started_at_seconds = unix_seconds()?;
-        let run = boundary.run_confined(&command, proof);
+        let run: Result<_, Report<ReleaseError>> = (|| {
+            let query = |kind| {
+                let plan = self.plan(boundary)?.observation_query(kind)?;
+                let limits = ProcessLimits {
+                    wall: Duration::from_secs(120),
+                    ..build_limits()
+                };
+                let digest = plan.digest()?;
+                let stdout = boundary
+                    .run_confined(&plan.confined_command(limits)?, proof)?
+                    .require_success()?;
+                Ok::<_, Report<ReleaseError>>((stdout, digest))
+            };
+            let (metadata, metadata_plan) = query(CargoQuery::Metadata)?;
+            let (tree, tree_plan) = query(CargoQuery::Tree)?;
+            let started_at_seconds = unix_seconds()?;
+            let result = boundary.run_confined(&command, proof)?;
+            Ok((
+                CargoQueryOutput::Captured {
+                    metadata,
+                    tree,
+                    plan_digests: [metadata_plan, tree_plan],
+                },
+                result,
+                started_at_seconds,
+            ))
+        })();
         let after = self
             .check_inputs()
             .and_then(|()| self.check_no_fetched_sources());
-        let result = match (run, after) {
+        let (queries, result, started_at_seconds) = match (run, after) {
             (Ok(result), Ok(())) => result,
             (Ok(_), Err(changed)) => return Err(changed),
             (Err(run), Ok(())) => return Err(run),
@@ -220,6 +262,7 @@ impl PreparedRecipe {
             started_at_seconds,
             elapsed,
             cleanup,
+            queries,
         };
         self.complete(output, boundary.execution_fingerprint(), boundary)
     }
@@ -271,6 +314,25 @@ impl PreparedRecipe {
             },
             paths,
         )?;
+        let cargo_observations = match run.queries {
+            CargoQueryOutput::Captured {
+                metadata,
+                tree,
+                plan_digests,
+            } => {
+                let layout = CargoLayout::new(
+                    artifact.target,
+                    paths.execution_path(&self.request.target_dir)?,
+                    paths.execution_path(self.ambient.checkout_root())?,
+                )?;
+                let captured =
+                    CargoCapture::new(metadata, tree, &run.stdout, &layout, plan_digests)?;
+                captured.require_binary(&manifest, artifact.bin, &located.execution)?;
+                Some(captured)
+            }
+            #[cfg(test)]
+            CargoQueryOutput::Fixture => None,
+        };
         let copied = copy_artifact(
             &located.host,
             &self.request.target_dir,
@@ -316,6 +378,7 @@ impl PreparedRecipe {
             output_dir: self.request.output.clone(),
             normalized_manifest_digests: self.materials.normalized_manifest_digests().clone(),
             derived_manifest_digests: self.materials.derived_manifest_digests().clone(),
+            cargo_observations,
         })
     }
 }

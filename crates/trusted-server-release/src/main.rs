@@ -1,6 +1,8 @@
 // consumed by Task 7 preparation and Task 9 recipes
 #[allow(dead_code)]
 mod boundary;
+#[allow(dead_code, reason = "Task 10 composition capture is being integrated")]
+mod composition;
 // Atomic output and schema helpers are consumed by later producer stages.
 #[allow(dead_code)]
 mod documents;
