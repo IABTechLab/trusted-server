@@ -455,19 +455,24 @@ Apply these changes to trusted-server.toml? [y/N]
 ```
 
 Only `y` or `yes` (any case) applies the change. Anything else — an empty line,
-`n`, or end of input — leaves the file untouched and exits successfully. With
-`--replace`, a warning that unobserved slots and hand-written slot fields will
-be discarded appears before the question. The preview, warning, and prompt all
-go to stderr, so stdout carries only the final `Wrote ...` line.
+`n`, or end of input — leaves the file untouched and exits with an error, so a
+chained step such as `&& ts config push` does not run against a config that was
+not regenerated. With `--replace`, a warning that unobserved slots and
+hand-written slot fields will be discarded appears before the question. The
+preview, warning, and prompt all go to stderr, so stdout carries only the final
+`Wrote ...` line. Page-supplied text in the preview is shown with control and
+bidirectional-override characters escaped, so they cannot reorder or hide lines
+of the diff you are approving. The `{section}` deploy-order note is printed
+only once such a config is written (or previewed with `--dry-run`).
 
-| Situation                                       | Result                                                       |
-| ----------------------------------------------- | ------------------------------------------------------------ |
-| Managed fields unchanged                        | Says so on stderr; no prompt, and the file is not rewritten. |
-| `--dry-run`                                     | Prints the diff on stdout; never prompts or writes.          |
-| stdin and stderr are terminals                  | Previews the diff and asks; the default answer is no.        |
-| stdin or stderr is not a terminal, no `--yes`   | Previews the diff on stderr, then fails without writing.     |
-| `--yes`                                         | Previews the diff on stderr and writes without asking.       |
-| The file changed during the crawl or the prompt | Refuses to overwrite it; re-run against the current file.    |
+| Situation                                       | Result                                                                                   |
+| ----------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| Managed fields unchanged                        | Says so on stderr; no prompt, and the file is not rewritten.                             |
+| `--dry-run`                                     | Prints the diff on stdout; never prompts or writes.                                      |
+| stdin and stderr are terminals                  | Previews the diff and asks; the default answer is no, and a decline exits with an error. |
+| stdin or stderr is not a terminal, no `--yes`   | Previews the diff on stderr, then fails without writing.                                 |
+| `--yes`                                         | Previews the diff on stderr and writes without asking.                                   |
+| The file changed during the crawl or the prompt | Refuses to overwrite it; re-run against the current file.                                |
 
 `--yes` is the opt-in for automation and cannot be combined with `--dry-run`.
 A useful pattern is to review a `--dry-run` first, then apply it:

@@ -1130,16 +1130,11 @@ pub(crate) fn run_update_slots(
     notes.extend(validate::check_candidate(&updated, &existing)?);
 
     emit_notes(err, &mut notes)?;
-    if policy.is_some() {
-        writeln!(
-            err,
-            "note: this config now uses a {{section}} ad-unit template. Deploy a \
-             template-aware binary BEFORE pushing it, and do not roll that binary \
-             back while this config is live — an older binary rejects the whole \
-             config and serves an error on every route."
-        )
-        .map_err(|error| report_error(format!("failed to write command output: {error}")))?;
-    }
+    // The deploy-order note describes the config as written, so it is held
+    // back until the candidate is the config (or is only being previewed);
+    // a declined or refused write must not tell the operator to roll out a
+    // template-aware binary for a file that did not change.
+    let uses_template = policy.is_some();
 
     let old_managed = managed_creative_projection(&existing)?;
     let new_managed = managed_creative_projection(&updated)?;
@@ -1158,10 +1153,11 @@ pub(crate) fn run_update_slots(
         };
         writeln!(err, "{message}")
             .map_err(|error| report_error(format!("failed to write preview output: {error}")))?;
-        return Ok(());
+        return emit_template_note(err, uses_template);
     }
     let diff = managed_diff(&old_managed, &new_managed);
     if request.dry_run {
+        emit_template_note(err, uses_template)?;
         writeln!(out, "{diff}")
             .map_err(|error| report_error(format!("failed to write preview diff: {error}")))?;
         return Ok(());
@@ -1169,9 +1165,7 @@ pub(crate) fn run_update_slots(
     // Checked before asking too, so the operator is not asked to approve a
     // write that is already certain to be refused.
     ensure_config_unchanged(request.config_path, &existing)?;
-    if !confirm_config_write(request, &diff, err, input)? {
-        return Ok(());
-    }
+    confirm_config_write(request, &diff, err, input)?;
     ensure_config_unchanged(request.config_path, &existing)?;
     // A writer could still land between this check and the rename below. That
     // window is microseconds against a browser crawl's minutes, and the rename
@@ -1184,6 +1178,7 @@ pub(crate) fn run_update_slots(
             request.config_path.display()
         ))
     })?;
+    emit_template_note(err, uses_template)?;
     writeln!(
         out,
         "Wrote {} slot(s) to {} ({} slot(s) seen across {} page(s))",
@@ -1191,6 +1186,26 @@ pub(crate) fn run_update_slots(
         request.config_path.display(),
         table.slot_count(),
         table.pages().len(),
+    )
+    .map_err(|error| report_error(format!("failed to write command output: {error}")))
+}
+
+/// Warns that a `{section}` template config needs a template-aware binary
+/// deployed first, when `uses_template` is set.
+///
+/// # Errors
+///
+/// Returns an error when the note cannot be written.
+fn emit_template_note(err: &mut dyn Write, uses_template: bool) -> CliResult<()> {
+    if !uses_template {
+        return Ok(());
+    }
+    writeln!(
+        err,
+        "note: this config now uses a {{section}} ad-unit template. Deploy a \
+         template-aware binary BEFORE pushing it, and do not roll that binary \
+         back while this config is live — an older binary rejects the whole \
+         config and serves an error on every route."
     )
     .map_err(|error| report_error(format!("failed to write command output: {error}")))
 }
@@ -1229,30 +1244,43 @@ fn ensure_config_unchanged(config_path: &Path, existing: &str) -> CliResult<()> 
     Ok(())
 }
 
-/// Previews a changed candidate on `err` and decides whether to write it.
+/// Previews a changed candidate on `err` and requires approval to write it.
 ///
 /// `--yes` approves without reading `input`. Otherwise an operator at a
 /// terminal must answer `y` or `yes`; any other answer, including an empty
-/// line or EOF, declines. Without a terminal the run fails instead of guessing.
+/// line, bytes that are not UTF-8, or EOF, declines. Without a terminal the run
+/// fails instead of guessing.
 ///
 /// # Errors
 ///
-/// Returns an error when the run is not interactive and `--yes` was not given,
-/// or when the preview or the answer cannot be written or read.
+/// Returns an error when the operator declines, when the run is not interactive
+/// and `--yes` was not given, or when the preview or the answer cannot be
+/// written or read.
 fn confirm_config_write(
     request: &UpdateSlotsRequest<'_>,
     diff: &str,
     err: &mut dyn Write,
     input: &mut dyn BufRead,
-) -> CliResult<bool> {
+) -> CliResult<()> {
     let path = request.config_path.display();
     let write_error =
         |error: std::io::Error| report_error(format!("failed to write confirmation: {error}"));
     writeln!(
         err,
-        "Changes to managed creative-opportunity fields in {path}:\n{diff}"
+        "Changes to managed creative-opportunity fields in {path}:"
     )
     .map_err(write_error)?;
+    // Slot ids, div ids and unit paths come from the audited page. Escaped
+    // per line (the helper would also escape the newlines), so bidi overrides
+    // and control sequences cannot reorder or hide what is being approved.
+    for line in diff.lines() {
+        writeln!(
+            err,
+            "{}",
+            crate::ad_templates::output::escape_terminal_text(line)
+        )
+        .map_err(write_error)?;
+    }
     if request.replace {
         writeln!(
             err,
@@ -1262,7 +1290,7 @@ fn confirm_config_write(
         .map_err(write_error)?;
     }
     if request.yes {
-        return Ok(true);
+        return Ok(());
     }
     if !request.interactive {
         return cli_error(format!(
@@ -1271,15 +1299,17 @@ fn confirm_config_write(
     }
     write!(err, "Apply these changes to {path}? [y/N] ").map_err(write_error)?;
     err.flush().map_err(write_error)?;
-    let mut answer = String::new();
+    // Bytes rather than a `String`, so an answer that is not UTF-8 is a
+    // decline instead of a read failure.
+    let mut answer = Vec::new();
     input
-        .read_line(&mut answer)
+        .read_until(b'\n', &mut answer)
         .map_err(|error| report_error(format!("failed to read confirmation: {error}")))?;
-    let approved = matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
-    if !approved {
-        writeln!(err, "Not applied; {path} left unchanged.").map_err(write_error)?;
+    let answer = answer.trim_ascii().to_ascii_lowercase();
+    if answer != b"y" && answer != b"yes" {
+        return cli_error(format!("not applied; {path} left unchanged"));
     }
-    Ok(approved)
+    Ok(())
 }
 
 /// Renders only fields managed by ad-template generation, excluding secrets and
@@ -3959,17 +3989,11 @@ mod tests {
             )
     }
 
-    #[test]
-    fn a_crawl_writes_a_section_template_and_per_section_patterns() {
-        // The end-to-end payoff: crawl sections, reconcile the slot across them,
-        // infer `{section}`, and write a config the runtime loads.
-        let temp = TempDir::new().expect("should create temp dir");
-        let config_path = temp.path().join("trusted-server.toml");
-        let original = loadable_config();
-        fs::write(&config_path, &original).expect("should write config");
-
+    /// A three-page site whose header ad unit tracks the section, so the crawl
+    /// infers a `{section}` template.
+    fn templated_site_collector() -> SiteCollector {
         let nav = ["/news", "/deals"];
-        let collector = SiteCollector::new(vec![
+        SiteCollector::new(vec![
             (
                 "https://publisher.example/",
                 site_page(
@@ -3994,7 +4018,19 @@ mod tests {
                     &nav,
                 ),
             ),
-        ]);
+        ])
+    }
+
+    #[test]
+    fn a_crawl_writes_a_section_template_and_per_section_patterns() {
+        // The end-to-end payoff: crawl sections, reconcile the slot across them,
+        // infer `{section}`, and write a config the runtime loads.
+        let temp = TempDir::new().expect("should create temp dir");
+        let config_path = temp.path().join("trusted-server.toml");
+        let original = loadable_config();
+        fs::write(&config_path, &original).expect("should write config");
+
+        let collector = templated_site_collector();
         let mut out = Vec::new();
         let mut err = Vec::new();
 
@@ -4590,8 +4626,8 @@ mod tests {
         );
         WriteGateRun {
             result,
-            stdout: String::from_utf8(out).expect("stdout should be UTF-8"),
-            stderr: String::from_utf8(err).expect("stderr should be UTF-8"),
+            stdout: String::from_utf8(out).expect("should decode stdout as UTF-8"),
+            stderr: String::from_utf8(err).expect("should decode stderr as UTF-8"),
         }
     }
 
@@ -4638,6 +4674,18 @@ mod tests {
         (config_path, original)
     }
 
+    /// Asserts the run declined: a non-zero outcome that says the file was kept.
+    fn assert_declined(run: &WriteGateRun, case: &str) {
+        let error = run
+            .result
+            .as_ref()
+            .expect_err(&format!("should fail a declined update ({case})"));
+        assert!(
+            format!("{error:?}").contains("left unchanged"),
+            "a decline ({case}) should say the config was left alone, got {error:?}"
+        );
+    }
+
     fn read_config(config_path: &Path) -> String {
         fs::read_to_string(config_path).expect("should read config")
     }
@@ -4650,7 +4698,7 @@ mod tests {
 
         let run = run_write_gate(&config_path, &interactive_gate(), &mut input);
 
-        run.result.expect("a confirmed update should succeed");
+        run.result.expect("should apply a confirmed update");
         let written = read_config(&config_path);
         assert_ne!(
             written, original,
@@ -4702,7 +4750,7 @@ mod tests {
 
             let run = run_write_gate(&config_path, &interactive_gate(), &mut input);
 
-            run.result.expect("an accepted update should succeed");
+            run.result.expect("should apply an accepted update");
             assert_ne!(
                 read_config(&config_path),
                 original,
@@ -4724,7 +4772,7 @@ mod tests {
 
             let run = run_write_gate(&config_path, &interactive_gate(), &mut input);
 
-            run.result.expect("a declined update is not an error");
+            assert_declined(&run, "a declined update");
             assert_eq!(
                 read_config(&config_path),
                 original,
@@ -4741,7 +4789,7 @@ mod tests {
 
         let run = run_write_gate(&config_path, &interactive_gate(), &mut input);
 
-        run.result.expect("a declined update is not an error");
+        assert_declined(&run, "a declined update");
         assert_eq!(
             read_config(&config_path),
             original,
@@ -4750,11 +4798,6 @@ mod tests {
         assert!(
             run.stderr.contains(APPLY_PROMPT),
             "should have asked, got {:?}",
-            run.stderr
-        );
-        assert!(
-            run.stderr.contains("left unchanged"),
-            "should say the config was left alone, got {:?}",
             run.stderr
         );
         assert!(
@@ -4775,17 +4818,11 @@ mod tests {
 
         let run = run_write_gate(&config_path, &interactive_gate(), &mut io::empty());
 
-        run.result
-            .expect("EOF at the prompt is a decline, not an error");
+        assert_declined(&run, "EOF");
         assert_eq!(
             read_config(&config_path),
             original,
             "EOF should leave the config untouched"
-        );
-        assert!(
-            run.stderr.contains("left unchanged"),
-            "should say the config was left alone, got {:?}",
-            run.stderr
         );
     }
 
@@ -4803,7 +4840,7 @@ mod tests {
 
         let error = run
             .result
-            .expect_err("a non-interactive run without --yes should fail");
+            .expect_err("should refuse a non-interactive run without --yes");
         let message = format!("{error:?}");
         assert!(
             message.contains("--yes") && message.contains("--dry-run"),
@@ -4845,7 +4882,7 @@ mod tests {
 
             let run = run_write_gate(&config_path, &gate, &mut input);
 
-            run.result.expect("--yes should apply the update");
+            run.result.expect("should apply the update with --yes");
             assert_ne!(
                 read_config(&config_path),
                 original,
@@ -4880,7 +4917,7 @@ mod tests {
 
         let run = run_write_gate(&config_path, &gate, &mut input);
 
-        run.result.expect("a declined replace is not an error");
+        assert_declined(&run, "a declined --replace");
         assert_eq!(
             read_config(&config_path),
             original,
@@ -4920,7 +4957,7 @@ mod tests {
 
         let run = run_write_gate(&config_path, &interactive_gate(), &mut io::empty());
 
-        run.result.expect("a declined update is not an error");
+        assert_declined(&run, "a declined update");
         assert!(
             !run.stderr.contains("--replace discards"),
             "a merge must not carry the --replace warning, got {:?}",
@@ -4949,7 +4986,7 @@ mod tests {
             let run = run_write_gate(&config_path, &gate, &mut input);
 
             run.result
-                .expect("an unchanged candidate should succeed without --yes");
+                .expect("should succeed for an unchanged candidate without --yes");
             assert_eq!(
                 read_config(&config_path),
                 original,
@@ -4989,7 +5026,7 @@ mod tests {
 
         let run = run_write_gate(&config_path, &gate, &mut input);
 
-        run.result.expect("dry run should succeed");
+        run.result.expect("should render the dry run");
         assert_eq!(
             read_config(&config_path),
             original,
@@ -5059,7 +5096,7 @@ mod tests {
         assert!(input.edited, "the prompt should have read an answer");
         let error = run
             .result
-            .expect_err("an update confirmed against a stale file should be refused");
+            .expect_err("should refuse an update confirmed against a stale file");
         assert!(
             format!("{error:?}").contains("changed"),
             "the refusal should say the file changed, got {error:?}"
@@ -5068,6 +5105,116 @@ mod tests {
             read_config(&config_path),
             replacement,
             "the edit made during the prompt must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn update_slots_prompt_treats_a_non_utf8_answer_as_a_decline() {
+        let temp = TempDir::new().expect("should create temp dir");
+        let (config_path, original) = write_changing_config(&temp);
+        let mut input = io::Cursor::new(b"\xffyes\n".to_vec());
+
+        let run = run_write_gate(&config_path, &interactive_gate(), &mut input);
+
+        assert_declined(&run, "a non-UTF-8 answer");
+        assert_eq!(
+            read_config(&config_path),
+            original,
+            "a non-UTF-8 answer should leave the config untouched"
+        );
+    }
+
+    #[test]
+    fn update_slots_prompt_escapes_page_controlled_text_in_the_preview() {
+        let temp = TempDir::new().expect("should create temp dir");
+        let (config_path, original) = write_changing_config(&temp);
+        let mut collected = collected_page_with_header_slot();
+        collected.gpt_slots[0].div_id = "div-gpt-ad-\u{202e}redaeh".to_string();
+        let collector = FakeCollector::new(collected);
+        let mut err = Vec::new();
+
+        let result = run_update_slots(
+            &UpdateSlotsRequest {
+                url: "https://publisher.example/",
+                config_path: &config_path,
+                existing_creative: None,
+                page_patterns: &[],
+                replace: false,
+                cookies: &[],
+                dry_run: false,
+                yes: false,
+                interactive: true,
+                scroll: false,
+                budget: CrawlBudget::default(),
+            },
+            &[("desktop", &collector)],
+            &mut io::sink(),
+            &mut err,
+            &mut io::empty(),
+        );
+
+        let stderr = String::from_utf8(err).expect("should decode stderr as UTF-8");
+        assert!(
+            stderr.contains("+++ generated creative opportunities"),
+            "the run should reach the preview, got {result:?} with {stderr:?}"
+        );
+        assert!(
+            !stderr.contains('\u{202e}'),
+            "a page-supplied bidi override must not reach the terminal, got {stderr:?}"
+        );
+        assert!(
+            stderr.contains("\\u{202E}"),
+            "the override should be shown escaped, got {stderr:?}"
+        );
+        assert_eq!(
+            read_config(&config_path),
+            original,
+            "EOF at the prompt should leave the config untouched"
+        );
+    }
+
+    #[test]
+    fn update_slots_declined_template_omits_the_deploy_order_note() {
+        let temp = TempDir::new().expect("should create temp dir");
+        let (config_path, original) = write_changing_config(&temp);
+        let collector = templated_site_collector();
+        let mut input = io::Cursor::new(b"n\n".to_vec());
+        let mut err = Vec::new();
+
+        let result = run_update_slots(
+            &UpdateSlotsRequest {
+                url: "https://publisher.example/",
+                config_path: &config_path,
+                existing_creative: None,
+                page_patterns: &[],
+                replace: false,
+                cookies: &[],
+                dry_run: false,
+                yes: false,
+                interactive: true,
+                scroll: false,
+                budget: CrawlBudget::default(),
+            },
+            &[("desktop", &collector)],
+            &mut io::sink(),
+            &mut err,
+            &mut input,
+        );
+
+        let stderr = String::from_utf8(err).expect("should decode stderr as UTF-8");
+        result.expect_err("should fail a declined update");
+        assert!(
+            stderr.contains("{section}"),
+            "the preview should show the templated candidate, got {stderr:?}"
+        );
+        assert!(
+            !stderr.contains("template-aware binary"),
+            "a declined write must not claim the config now uses a template, got {stderr:?}"
+        );
+        assert_eq!(
+            read_config(&config_path),
+            original,
+            "a declined template should leave the config untouched"
         );
     }
 }

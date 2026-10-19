@@ -369,7 +369,9 @@ pub(crate) fn run_audit(args: &AuditArgs) -> Result<RunOutcome, String> {
             // The prompt is written to stderr and answered on stdin, so both
             // must reach a person for an answer to mean anything.
             let interactive = stdin.is_terminal() && stderr.is_terminal();
-            let mut input = stdin.lock();
+            // Locks stdin per read rather than for the whole crawl; only the
+            // confirmation prompt reads it.
+            let mut input = std::io::BufReader::new(stdin);
             generate::run_update_slots(
                 &generate::UpdateSlotsRequest {
                     url: gen_args.url.as_str(),
