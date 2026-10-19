@@ -395,6 +395,64 @@ fn duplicate_metadata_targets_and_uncompiled_or_duplicate_scripts_are_rejected()
 }
 
 #[test]
+fn actual_cross_build_needs_unfiltered_identities_for_host_only_dependencies() {
+    let metadata =
+        include_bytes!("../../tests/fixtures/composition/cargo-1.95-cross-host-metadata.json");
+    let filtered = include_bytes!(
+        "../../tests/fixtures/composition/cargo-1.95-cross-target-filtered-metadata.json"
+    );
+    let messages =
+        include_bytes!("../../tests/fixtures/composition/cargo-1.95-cross-messages.jsonl");
+    let rejected = observe_cargo(filtered, messages, &layout()).expect_err(
+        "should reproduce target-filtered metadata omitting a compiled host dependency",
+    );
+    assert!(
+        format!("{rejected:?}").contains("example-host-unix"),
+        "should identify the missing compiled dependency"
+    );
+    let observed = observe_cargo(metadata, messages, &layout())
+        .expect("should join actual cross-build units to the complete identity catalog");
+    let host = observed
+        .packages
+        .iter()
+        .find(|package| package.name == "example-host-unix")
+        .expect("should retain observed host-only dependency");
+    assert!(
+        observed
+            .units
+            .iter()
+            .any(|unit| unit.package_id == host.id && unit.context == UnitContext::Host),
+        "should classify host-only dependency from actual compiler output"
+    );
+    assert_eq!(
+        observed.packages.len(),
+        3,
+        "should record the three actually compiled packages"
+    );
+    assert_eq!(
+        observed.units.len(),
+        4,
+        "should retain distinct app host build-script and target binary units"
+    );
+    let tree = include_bytes!("../../tests/fixtures/composition/cargo-1.95-cross-tree.txt");
+    let captured = CargoCapture::new(
+        metadata.to_vec(),
+        tree.to_vec(),
+        messages,
+        &layout(),
+        ["a".repeat(64), "b".repeat(64)],
+    )
+    .expect("should retain the catalog with actual explicit-target tree and build observations");
+    captured
+        .require_binary(
+            Path::new("/build/source/app/Cargo.toml"),
+            "example-app",
+            Path::new("/build/target/wasm32-wasip1/release/example-app.wasm"),
+        )
+        .expect("should bind the exact selected cross-build executable");
+}
+
+#[test]
 fn internal_metadata_and_stream_observation_bounds_are_enforced() {
     let oversized = vec![b' '; 16 * 1024 * 1024 + 1];
     let meta = serde_json::to_vec(&metadata()).expect("should encode metadata");

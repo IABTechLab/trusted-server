@@ -56,7 +56,7 @@ pub(crate) struct CargoPlan {
 /// Fixed supporting observations of the selected explicit-target build.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum CargoQuery {
-    /// Versioned package identities and package-level graph evidence.
+    /// Unfiltered identities, including host-only build dependencies.
     Metadata,
     /// Selected package's non-dev dependency tree, retained as raw evidence.
     Tree,
@@ -74,14 +74,7 @@ impl CargoPlan {
     pub(super) fn observation_query(&self, kind: CargoQuery) -> Result<Self, Report<ReleaseError>> {
         let artifact = self.asset.artifact();
         let arguments: &[&str] = match kind {
-            CargoQuery::Metadata => &[
-                "metadata",
-                "--format-version",
-                "1",
-                "--filter-platform",
-                artifact.target.triple(),
-                "--frozen",
-            ],
+            CargoQuery::Metadata => &["metadata", "--format-version", "1", "--frozen"],
             CargoQuery::Tree => &[
                 "tree",
                 "--package",

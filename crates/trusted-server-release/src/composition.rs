@@ -367,9 +367,12 @@ pub(crate) fn observe_cargo(
         match message["reason"].as_str() {
             Some("compiler-artifact") => {
                 let id = text(&message["package_id"], "unit package ID")?;
-                let package = packages
-                    .get(id)
-                    .ok_or_else(|| composition_error("compiled package is absent from metadata"))?;
+                let package = packages.get(id).ok_or_else(|| {
+                    composition_error(format!(
+                        "compiled package {id:?} is absent from metadata catalog ({} packages)",
+                        packages.len()
+                    ))
+                })?;
                 let unit = unit(message, package, layout)?;
                 let key = serde_json::to_vec(&json!([
                     unit.package_id,

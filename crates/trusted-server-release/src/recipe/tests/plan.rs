@@ -71,13 +71,22 @@ fn composition_queries_keep_selected_tools_environment_and_source_replacement() 
                 query.arguments.iter().any(|value| value == "--frozen"),
                 "should prohibit new resolution"
             );
-            assert!(
-                query
-                    .arguments
-                    .iter()
-                    .any(|value| value == artifact.target.triple()),
-                "should select the explicit target"
-            );
+            match kind {
+                CargoQuery::Metadata => assert!(
+                    !query
+                        .arguments
+                        .iter()
+                        .any(|value| value == "--filter-platform" || value == "--target"),
+                    "should retain host-only package identities in the metadata catalog"
+                ),
+                CargoQuery::Tree => assert!(
+                    query
+                        .arguments
+                        .windows(2)
+                        .any(|pair| pair == ["--target", artifact.target.triple()]),
+                    "should select the exact target for graph observations"
+                ),
+            }
             assert_ne!(
                 query.digest().expect("should hash the query"),
                 plan.digest().expect("should hash the build")
