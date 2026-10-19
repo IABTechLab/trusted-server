@@ -19875,7 +19875,7 @@ mod tests {
             .method(Method::GET)
             .uri("https://publisher.example/redirect")
             .header(header::HOST, "publisher.example")
-            .header("fastly-ssl", "1")
+            .header("x-forwarded-proto", "https")
             .body(EdgeBody::empty())
             .expect("should build request")
     }
