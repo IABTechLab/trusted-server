@@ -593,7 +593,7 @@ mod tests {
         let Command::Config(ConfigCommand::Push(push)) = args.command else {
             panic!("expected config push command");
         };
-        assert!(push.staging, "should target the derived staging key");
+        assert!(push.staging, "should target the staging publication flow");
 
         Args::try_parse_from([
             "ts",
@@ -616,7 +616,7 @@ mod tests {
         };
         assert!(
             diff.staging,
-            "should compare against the derived staging key"
+            "should compare against the staging publication flow"
         );
 
         Args::try_parse_from([

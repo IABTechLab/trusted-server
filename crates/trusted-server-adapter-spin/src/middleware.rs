@@ -19,8 +19,8 @@ use trusted_server_core::settings::Settings;
 ///
 /// Must stay the first middleware registered in [`crate::app`]. Registering
 /// another middleware ahead of it would re-expose the shared-secret
-/// authentication header to request handling. Only the Fastly adapter consumes
-/// these headers for client-IP resolution; every other adapter removes them so
+/// authentication header to request handling. Trace metadata consumes these
+/// headers in the pre-dispatch hook; ordinary request handling removes them so
 /// a shared configuration cannot leak the secret into publisher or integration
 /// request handling.
 pub struct SanitizeRequestMiddleware {
@@ -173,6 +173,8 @@ pub(crate) fn apply_finalize_headers(
         HEADER_X_GEO_INFO_AVAILABLE,
         HeaderValue::from_static(if geo_available { "true" } else { "false" }),
     );
+
+    trusted_server_core::version_header::apply_git_version_header(response);
 
     // Cookie-bearing responses stay private to shared caches and operator
     // headers cannot re-enable caching for uncacheable per-user payloads.
@@ -345,6 +347,24 @@ mod tests {
             *observed.lock().expect("should lock observation"),
             Some((false, false)),
             "should remove both configured trust headers before the handler"
+        );
+    }
+
+    #[test]
+    fn emits_git_version_header() {
+        let mut response = empty_response();
+        apply_finalize_headers(
+            &settings_with_response_headers(vec![]),
+            false,
+            &mut response,
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-ts-version")
+                .and_then(|v| v.to_str().ok()),
+            trusted_server_core::constants::TS_GIT_VERSION,
+            "should report the compiled-in git version as x-ts-version"
         );
     }
 }

@@ -132,7 +132,8 @@ pull_sync_concurrency = 3
 # the matching shared secret. The front door must set both headers on requests
 # it sends here and remove client-supplied copies on its other routes.
 # `shared_secret` is a key in trusted_server_secrets, not the credential itself.
-# Fastly-only; see docs/guide/fastly.md for the required front-door setup.
+# Used by Fastly request handling and trace metadata on every adapter.
+# See docs/guide/fastly.md for the required Fastly front-door setup.
 # [trusted_client_ip]
 # ip_header = "x-ts-client-ip"
 # auth_header = "x-ts-client-ip-auth"
@@ -149,8 +150,10 @@ pull_sync_concurrency = 3
 
 # Tester-cookie endpoints: GET /_ts/set-tester sets ts-tester=true and
 # GET /_ts/clear-tester clears it on publisher.cookie_domain.
+# max_age_seconds is the cookie lifetime; it defaults to 30 days.
 # [tester_cookie]
 # enabled = false
+# max_age_seconds = 2592000
 
 # Consent forwarding. All values below are the defaults — uncomment to override.
 # [consent]
