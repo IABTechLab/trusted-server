@@ -537,16 +537,23 @@ fn check_tables(
     tables: &Map<String, Value>,
     prefix: &str,
 ) -> Result<(), String> {
+    // A module may be written with its type folder or without it, as
+    // `analytics.tinybird` or `tinybird` in `[analytics]`, and its table is
+    // keyed by the name without it.
+    let written: Vec<&str> = selected
+        .iter()
+        .map(|name| crate::module_name::short_form(section, name))
+        .collect();
     for (name, value) in tables {
         let path = if prefix.is_empty() {
             name.clone()
         } else {
             format!("{prefix}.{name}")
         };
-        if selected.contains(&path) {
+        if written.contains(&path.as_str()) {
             continue;
         }
-        let leads_to_one = selected
+        let leads_to_one = written
             .iter()
             .any(|written| written.starts_with(&format!("{path}.")));
         match value {

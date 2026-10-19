@@ -1,9 +1,14 @@
 # Auction Telemetry
 
-Trusted Server can emit bounded auction observations directly to Tinybird.
-Emission is currently wired only by the Fastly adapter. Other adapters use the
-core no-op sink even if they can parse the shared settings, and log a warning
-at startup when `[analytics]` selects a module.
+Trusted Server can emit bounded auction observations to an analytics module.
+`[analytics] module` selects the module, and core hands each settled auction's
+rows to the sink that module supplies. Without the section nothing is sent,
+through core's no-op sink. The one module a stock build ships is Tinybird,
+`crates/analytics/tinybird`, which each adapter lists among the modules it
+links. Only the Fastly adapter hands that sink to the auction. The Axum,
+Cloudflare and Spin adapters link the module and check its settings, and use
+core's no-op sink, so they send nothing, and log a warning at startup when
+`[analytics]` selects a module.
 
 ## Adapter support
 
@@ -20,14 +25,14 @@ The request entry point derives coarse `DeviceSignals`. Auction execution
 combines those signals with request and navigation facts in an
 `AuctionObservationContext`. The terminal auction outcome is converted into
 an `AuctionEventBatch` containing summary, provider-call, and bid rows.
-Fastly serializes the batch as NDJSON and starts one Tinybird Events API
+The Tinybird module serializes the batch as NDJSON and starts one Events API
 request to the configured auction datasource.
 
 Emission is best effort. Failure to construct or start telemetry is logged and
 must not change the customer response. The sink drops the in-flight handle
 after dispatch; it does not wait for Tinybird's response. Each batch is limited
-to 512 rows and `analytics.tinybird.max_body_bytes` bytes. The Fastly backend
-uses two-second first-byte and between-byte timeouts.
+to 512 rows and `analytics.tinybird.max_body_bytes` bytes. The backend the
+module registers uses two-second first-byte and between-byte timeouts.
 
 ## Privacy boundary
 

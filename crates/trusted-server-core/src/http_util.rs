@@ -368,7 +368,7 @@ pub fn serve_static_with_etag(
             .header(header::VARY, "Accept-Encoding")
             .body(EdgeBody::empty())
             .expect("should build 304 static response");
-        short_policy.apply_to_headers(response.headers_mut(), edge_header);
+        short_policy.apply_to_response(&mut response, edge_header);
         return response;
     }
 
@@ -379,7 +379,7 @@ pub fn serve_static_with_etag(
         .header(header::VARY, "Accept-Encoding")
         .body(EdgeBody::from(body.as_bytes()))
         .expect("should build static response");
-    short_policy.apply_to_headers(response.headers_mut(), edge_header);
+    short_policy.apply_to_response(&mut response, edge_header);
     response
 }
 

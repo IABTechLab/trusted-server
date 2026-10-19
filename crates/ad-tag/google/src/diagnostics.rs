@@ -676,8 +676,7 @@ mod tests {
             .header(header::ETAG, "\"origin\"")
             .header(header::LAST_MODIFIED, "Wed, 12 Aug 2026 00:00:00 GMT")
             .header("surrogate-control", "max-age=60")
-            .header("fastly-surrogate-control", "max-age=60")
-            .header("cloudflare-cdn-cache-control", "public, max-age=60")
+            .header("cdn-cache-control", "public, max-age=60")
             .body(EdgeBody::empty())
             .expect("should build response");
 
@@ -690,12 +689,7 @@ mod tests {
         );
         assert_eq!(response.headers()[header::SET_COOKIE], SET_CONSOLE_COOKIE);
         assert!(!response.headers().contains_key("surrogate-control"));
-        assert!(!response.headers().contains_key("fastly-surrogate-control"));
-        assert!(
-            !response
-                .headers()
-                .contains_key("cloudflare-cdn-cache-control")
-        );
+        assert!(!response.headers().contains_key("cdn-cache-control"));
         assert!(
             !response.headers().contains_key(header::ETAG),
             "should drop the origin validator with the shared-cache policy"

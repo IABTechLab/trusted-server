@@ -20,6 +20,7 @@ members = [
     "crates/cmp/didomi",
     "crates/cmp/inmobi",
     "crates/ads-txt/iabtl",
+    "crates/analytics/tinybird",
     "crates/headers/geo",
     "crates/loading-cache/51degrees",
     "crates/shared/51degrees",
@@ -172,6 +173,7 @@ trusted-server-cmp-sourcepoint = { path = "crates/cmp/sourcepoint" }
 trusted-server-cmp-didomi = { path = "crates/cmp/didomi" }
 trusted-server-cmp-inmobi = { path = "crates/cmp/inmobi" }
 trusted-server-ads-txt-iabtl = { path = "crates/ads-txt/iabtl" }
+trusted-server-analytics-tinybird = { path = "crates/analytics/tinybird" }
 trusted-server-headers-geo = { path = "crates/headers/geo" }
 trusted-server-loading-cache-51degrees = { path = "crates/loading-cache/51degrees" }
 trusted-server-shared-51degrees = { path = "crates/shared/51degrees" }
