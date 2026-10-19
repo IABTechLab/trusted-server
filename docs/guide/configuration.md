@@ -574,23 +574,16 @@ kept. With no path, the request path is sent as it arrived. When `url` has a
 path, a request path with a `.` or `..` segment, in any percent-encoded
 spelling, is refused with `400` so no request reaches outside the folder.
 
-**Redirects**: When the origin answers with a redirect whose `Location` names
-the origin itself, the reader is sent to the same path, query and fragment on
-the scheme and host they asked for, so their browser stays on the deployment.
-An origin asked for `/news` that answers `Location:
-https://origin.publisher.com/news/` sends a reader of `www.publisher.com` to
-`https://www.publisher.com/news/`. The origin is named by the host in `url`,
-with its port, or by `host_header` where one is set. When `url` has a path, a
-`Location` under that path comes back without it, and one outside it is left
-as the origin wrote it. A `Location` naming any other host, one that names no
-host (such as `/news/`), and the `Location` of a response that is not a
-redirect are also left as the origin wrote them. An origin reached over
-plain HTTP that redirects each request to the same address on `https`, and
-one that redirects its `directory_index` file back to its folder, make the
-reader's browser loop. Where a request addressing hook removes a path
-prefix, the reader is sent to an address without the prefix, which a Fastly
-service whose `__KEY` selector carries `{host}` answers `421` if every
-selector value misses (see One blob for each path).
+**Response headers**: When `url` has a path, a URL in a response header that
+names the origin is mapped to the serving host only when it is in that folder,
+and it loses the folder. With the folder above, `Location:
+https://storage.publisher.com/bucket/site/news/` reaches a reader of
+`www.publisher.com` as `https://www.publisher.com/news/`, and a URL outside
+the folder is left as the origin wrote it (see Origin URLs in proxied response
+headers). Where a request addressing hook removes a path prefix, the reader is
+sent to an address without the prefix, which a Fastly service whose `__KEY`
+selector carries `{host}` answers `421` if every selector value misses (see
+One blob for each path).
 
 #### `host_header`
 
@@ -601,8 +594,6 @@ selector value misses (see One blob for each path).
 
 - Connects, uses SNI, and checks certificates against the host in `url`
 - Sends the configured value as the outbound HTTP `Host` header
-- Is the name a redirect from the origin is compared with (see Redirects under
-  `url`)
 - Useful when the origin endpoint expects a canonical publisher hostname
 
 **Format**: Hostname with optional port, without protocol, path, query, or fragment
@@ -1280,15 +1271,24 @@ Location: https://www.example.com/landing.html
 Content-Security-Policy: img-src https://origin.example.com https://www.example.com data:
 ```
 
+When `source.origin.url` has a path, such as a folder of object storage,
+only a URL in that folder is mapped, and it loses the folder. With
+`url = "https://storage.example.com/bucket/site"`,
+`https://storage.example.com/bucket/site/news/` becomes
+`https://www.example.com/news/`, and `https://storage.example.com/bucket/other/`
+is unchanged, because no address on the serving host leads there. A CSP source
+with no path still gains the serving host beside it, and the two exceptions
+below compare the path without the folder.
+
 Two exceptions prevent a redirect loop. Rewriting either target would send the
 browser back to the same URL, and the origin would redirect again:
 
 - When the origin redirects to the URL being requested but under a different
-  scheme from `publisher.origin_url` (for example, an `http://` origin forcing
+  scheme from `source.origin.url` (for example, an `http://` origin forcing
   HTTPS), the `Location` or `Refresh` target is left unchanged.
 - When the origin answers a `GET` or `HEAD` with a `Location` to the URL being
   requested, the target is left unchanged if the response sets no cookie, or
-  whatever cookies it sets when `publisher.origin_host_header_override` sends a
+  whatever cookies it sets when `source.origin.host_header` sends a
   different `Host`. The origin is redirecting because of something Trusted
   Server sends unchanged on every retry, such as that `Host`.
 
