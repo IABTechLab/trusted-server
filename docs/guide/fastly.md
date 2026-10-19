@@ -230,7 +230,9 @@ headers before forwarding the request.
 
 ### Verify before trusting it
 
-Geolocation response headers are the observable signal. From a client whose
+Geolocation response headers are the observable signal, on a page the
+`headers.geo` middleware is placed on (see
+[Geo Configuration](/guide/configuration#geo-configuration)). From a client whose
 real location differs from the fronting POP, compare a request through the
 front door against one sent directly to the Compute service, and confirm
 `x-geo-city` and `x-geo-coordinates` agree.

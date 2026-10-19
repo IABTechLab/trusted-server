@@ -11626,7 +11626,10 @@ mod tests {
                 .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
                 .backend(Arc::new(StubBackend))
                 .http_client(http_client)
-                .geo(Arc::new(NoopGeo))
+                .geo(Arc::new(crate::platform::PlatformGeoModule::new(
+                    "noop",
+                    Arc::new(NoopGeo),
+                )))
                 .client_info(ClientInfo::default())
                 .template_cache(cache)
                 .build()
@@ -11658,7 +11661,10 @@ mod tests {
                 .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
                 .backend(Arc::new(StubBackend))
                 .http_client(http_client)
-                .geo(Arc::new(NoopGeo))
+                .geo(Arc::new(crate::platform::PlatformGeoModule::new(
+                    "noop",
+                    Arc::new(NoopGeo),
+                )))
                 .client_info(ClientInfo::default())
                 .template_cache(cache)
                 .auction_telemetry_sink(telemetry_sink)
@@ -12296,7 +12302,10 @@ mod tests {
                 .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
                 .backend(Arc::new(StubBackend))
                 .http_client(http_client)
-                .geo(Arc::new(NoopGeo))
+                .geo(Arc::new(crate::platform::PlatformGeoModule::new(
+                    "noop",
+                    Arc::new(NoopGeo),
+                )))
                 .client_info(ClientInfo {
                     client_ip: Some(READER_IP.parse().expect("should parse the reader's IP")),
                     tls_protocol: Some("TLSv1.3".to_owned()),
@@ -14898,7 +14907,10 @@ mod tests {
                 .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
                 .backend(Arc::new(StubBackend))
                 .http_client(Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>)
-                .geo(Arc::new(StubGeo(user.geo_marker)))
+                .geo(Arc::new(crate::platform::PlatformGeoModule::new(
+                    "stub",
+                    Arc::new(StubGeo(user.geo_marker)),
+                )))
                 .client_info(ClientInfo::default())
                 .template_cache(
                     Arc::clone(&cache) as Arc<dyn crate::platform::PlatformTemplateCache>
@@ -18940,7 +18952,10 @@ mod tests {
                 .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
                 .backend(Arc::new(StubBackend))
                 .http_client(http_client)
-                .geo(Arc::new(NoopGeo))
+                .geo(Arc::new(crate::platform::PlatformGeoModule::new(
+                    "noop",
+                    Arc::new(NoopGeo),
+                )))
                 .auction_telemetry_sink(telemetry_sink)
                 .client_info(ClientInfo::default())
                 .build()
@@ -29775,7 +29790,10 @@ mod tests {
                 .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
                 .backend(Arc::new(StubBackend))
                 .http_client(http_client)
-                .geo(Arc::new(NoopGeo))
+                .geo(Arc::new(crate::platform::PlatformGeoModule::new(
+                    "noop",
+                    Arc::new(NoopGeo),
+                )))
                 .auction_telemetry_sink(telemetry_sink)
                 .client_info(ClientInfo::default())
                 .build()

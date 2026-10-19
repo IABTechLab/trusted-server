@@ -12,6 +12,24 @@ pub fn integration_app_config_envelope(origin_port: u16) -> TestResult<String> {
     app_config_envelope(origin_port, |_| Ok(()))
 }
 
+/// Builds the integration app-config envelope for the Axum dev server.
+///
+/// The fixture selects the host's geo lookup, which Viceroy answers and the
+/// Axum dev server, having none, refuses at startup. With `[geo] module`
+/// unset and single-jurisdiction operation acknowledged, the dev server
+/// locates no request, as its own lookup did.
+pub fn axum_app_config_envelope(origin_port: u16) -> TestResult<String> {
+    app_config_envelope(origin_port, |table| {
+        let geo = table_mut(table, "geo")?;
+        geo.remove("module");
+        geo.insert(
+            "assume_single_jurisdiction".to_string(),
+            toml::Value::Boolean(true),
+        );
+        Ok(())
+    })
+}
+
 /// Builds the integration app-config envelope after `customize` edits the
 /// parsed fixture.
 fn app_config_envelope(
