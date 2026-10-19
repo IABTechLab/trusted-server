@@ -211,6 +211,7 @@ impl Fixture {
             build_child_for_tests(&audited(), &commit, 1_700_000_000, &child_request(&request))
                 .expect("should build the fixture child environment");
         PreparedRecipe::bind(BindInputs {
+            workspace: WorkspaceSelection::Fixture,
             commit: &commit,
             child,
             completed: &self.completed,

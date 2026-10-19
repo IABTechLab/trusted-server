@@ -28,7 +28,8 @@ pub(crate) use archive::VerifiedOriginal;
 pub(crate) use cargo_vendor::resolution_differences;
 #[allow(unused_imports, reason = "consumed by the Task 9 recipe")]
 pub(crate) use cargo_vendor::{
-    GitSourceConfig, GitVendorInput, PreparedCargoMaterials, VendorInputs,
+    CargoOrigin, GitSourceConfig, GitVendorInput, PreparedCargoMaterials, VendorInputs,
+    VerifiedCargoPackage,
 };
 pub(crate) use extract::ExtractedOriginal;
 use locked::{CargoMaterials, NpmMaterial, parse_cargo, parse_npm};

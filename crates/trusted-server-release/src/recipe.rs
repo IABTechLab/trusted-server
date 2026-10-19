@@ -21,9 +21,11 @@ use error_stack::Report;
 use sha2::{Digest as _, Sha256};
 
 use crate::boundary::BoundaryRoots;
+use crate::composition::origin::WorkspaceOrigins;
 use crate::documents::Role as DocumentRole;
 use crate::error::ReleaseError;
 use crate::javascript::JsBuildCompleted;
+use crate::javascript::RetainedJsModule;
 use crate::materials::PreparedCargoMaterials;
 #[cfg(test)]
 use crate::policy::ReleaseTarget;
@@ -392,11 +394,20 @@ struct JsFacts {
     inventory_sha256: String,
     settings_sha256: String,
     tools_sha256: String,
+    modules: Vec<RetainedJsModule>,
+}
+
+/// Source authority of one recipe; bypass exists only in explicit test fixtures.
+enum WorkspaceSelection {
+    Approved(WorkspaceOrigins),
+    #[cfg(test)]
+    Fixture,
 }
 
 /// Everything [`PreparedRecipe::bind`] cross-checks before a recipe may run.
 struct BindInputs<'a> {
     commit: &'a CommitId,
+    workspace: WorkspaceSelection,
     child: ChildEnvironment,
     completed: &'a JsBuildCompleted,
     tools: SelectedRustTools,
@@ -416,6 +427,7 @@ pub(crate) struct PreparedRecipe {
     retained_root: PathBuf,
     retained_digest: String,
     js: JsFacts,
+    workspace: WorkspaceSelection,
 }
 
 impl PreparedRecipe {
@@ -473,6 +485,7 @@ impl PreparedRecipe {
         let child = child_environment(audited, source, &child_request(&request))?;
         Self::bind(BindInputs {
             commit: source.commit(),
+            workspace: WorkspaceSelection::Approved(WorkspaceOrigins::bind(source, fresh)?),
             child,
             completed,
             tools,
@@ -499,6 +512,7 @@ impl PreparedRecipe {
         check_commits(&inputs)?;
         check_parts(&inputs)?;
         let BindInputs {
+            workspace,
             child,
             completed,
             tools,
@@ -518,6 +532,7 @@ impl PreparedRecipe {
                 inventory_sha256: completed.inventory_sha256().to_owned(),
                 settings_sha256: completed.settings_sha256().to_owned(),
                 tools_sha256: completed.tools_sha256().to_owned(),
+                modules: completed.retained_modules()?,
             },
             request,
             tools,
@@ -527,6 +542,7 @@ impl PreparedRecipe {
             child,
             retained_root,
             retained_digest,
+            workspace,
         })
     }
 

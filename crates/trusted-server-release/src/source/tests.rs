@@ -21,6 +21,117 @@ use crate::process::Cancellation;
 const EPOCH: u64 = 1_700_000_000;
 
 #[test]
+fn bound_workspace_origins_recheck_nonmanifest_source_and_unexpected_files() {
+    for mutation in ["rust", "other", "extra", "git", "cancel"] {
+        let fixture = Fixture::new();
+        let approved = fixture.authenticate().expect("should authenticate source");
+        let cancellation = Cancellation::default();
+        let fresh = approved
+            .materialize(Instant::now() + Duration::from_secs(30), &cancellation)
+            .expect("should materialize source");
+        let origins = crate::composition::origin::WorkspaceOrigins::bind(&approved, &fresh)
+            .expect("should bind source origins");
+        origins
+            .verify_unchanged()
+            .expect("should accept unchanged source");
+        match mutation {
+            "rust" => write(
+                fresh.root(),
+                "crates/trusted-server-release/src/main.rs",
+                b"fn main() { panic!(); }\n",
+            ),
+            "other" => write(fresh.root(), "AGENTS.md", b"changed source\n"),
+            "extra" => write(fresh.root(), "unexpected.txt", b"unexpected\n"),
+            "git" => write(fresh.root(), ".git/config", b"unexpected\n"),
+            "cancel" => cancellation.cancel(),
+            _ => unreachable!(),
+        }
+        assert!(
+            origins.verify_unchanged().is_err(),
+            "should reject {mutation} after binding"
+        );
+    }
+}
+
+#[test]
+fn bound_source_verification_preserves_original_deadline() {
+    let fixture = Fixture::new();
+    let approved = fixture.authenticate().expect("should authenticate source");
+    let fresh = approved
+        .materialize(
+            Instant::now() + Duration::from_secs(30),
+            &Cancellation::default(),
+        )
+        .expect("should materialize source");
+    let mut verification = fresh.verification();
+    verification.expire_for_tests();
+    assert!(
+        verification.verify_unchanged(&[]).is_err(),
+        "should reject an expired source attempt"
+    );
+}
+
+#[test]
+fn workspace_origins_require_an_unchanged_approved_materialization() {
+    let fixture = Fixture::new();
+    let approved = fixture
+        .authenticate()
+        .expect("should authenticate fixture source");
+    let fresh = approved
+        .materialize(
+            Instant::now() + Duration::from_secs(30),
+            &Cancellation::default(),
+        )
+        .expect("should materialize independent source");
+    crate::composition::origin::WorkspaceOrigins::bind(&approved, &fresh)
+        .expect("should bind exact approved checkout and manifest identities");
+    let other = ApprovedSource::in_memory_for_tests(
+        &CommitId::parse(&"b".repeat(40)).expect("should parse different source"),
+        &["Cargo.toml"],
+    );
+    assert!(
+        crate::composition::origin::WorkspaceOrigins::bind(&other, &fresh).is_err(),
+        "should reject another approved source identity"
+    );
+    fs::write(fresh.root().join("AGENTS.md"), b"changed").expect("should change private source");
+    assert!(
+        crate::composition::origin::WorkspaceOrigins::bind(&approved, &fresh).is_err(),
+        "should reject changed checkout before issuing origin authority"
+    );
+}
+
+#[test]
+fn cargo_manifest_catalog_contains_only_approved_regular_manifests() {
+    let commit = CommitId::parse(&"a".repeat(40)).expect("should parse approved commit");
+    let mut approved = ApprovedSource::in_memory_for_tests(
+        &commit,
+        &[
+            "Cargo.toml",
+            "crates/example/Cargo.toml",
+            "README.md",
+            "notCargo.toml",
+        ],
+    );
+    approved.snapshot.records.insert(
+        "crates/alias/Cargo.toml".to_owned(),
+        (Mode::Symlink, "b".repeat(64)),
+    );
+    let manifests = approved.cargo_manifest_digests();
+    assert_eq!(
+        manifests.keys().map(PathBuf::as_path).collect::<Vec<_>>(),
+        [
+            Path::new("Cargo.toml"),
+            Path::new("crates/example/Cargo.toml")
+        ],
+        "should expose only approved regular Cargo manifests for origin joining"
+    );
+    assert!(
+        manifests.values().all(|digest| digest == &"0".repeat(64)),
+        "should preserve approved content identities"
+    );
+}
+
+#[test]
 fn fresh_directory_canonicalizes_an_aliased_parent_and_preserves_cleanup() {
     let directory = tempdir().expect("should create parent fixture");
     let base = fs::canonicalize(directory.path()).expect("should canonicalize fixture");

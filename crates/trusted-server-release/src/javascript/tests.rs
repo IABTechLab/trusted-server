@@ -103,6 +103,44 @@ fn retained_fixture() -> JsBuildCompleted {
 }
 
 #[test]
+fn retained_module_facts_are_derived_from_the_rehashed_owned_handoff() {
+    let completed = retained_fixture();
+    let modules = completed
+        .retained_modules()
+        .expect("should derive checked module facts");
+    assert_eq!(modules.len(), 1, "should retain the exact module set");
+    assert_eq!(
+        modules[0].id(),
+        "core",
+        "should preserve checked module identity"
+    );
+    assert_eq!(
+        modules[0].filename(),
+        "tsjs-core.js",
+        "should preserve checked filename"
+    );
+    assert_eq!(
+        modules[0].size(),
+        b"fictional module".len() as u64,
+        "should preserve complete module length"
+    );
+    assert_eq!(
+        modules[0].sha256(),
+        hex::encode(Sha256::digest(b"fictional module")),
+        "should preserve complete module digest"
+    );
+    fs::write(
+        completed.directory.path().join("bundles/tsjs-core.js"),
+        b"changed",
+    )
+    .expect("should change retained module");
+    assert!(
+        completed.retained_modules().is_err(),
+        "should reject changed bytes before exporting facts"
+    );
+}
+
+#[test]
 fn retained_handoff_rejects_extra_root_files() {
     let completed = retained_fixture();
     completed

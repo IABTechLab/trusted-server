@@ -336,13 +336,17 @@ fn actual_cargo_195_observations_join_after_only_root_path_relocation() {
         ["a".repeat(64), "b".repeat(64)],
     )
     .expect("should bind actual observed membership");
-    captured
+    let selected = captured
         .require_binary(
             std::path::Path::new("/build/source/crates/control/Cargo.toml"),
             "control",
             std::path::Path::new("/build/target/wasm32-wasip1/release/control.wasm"),
         )
         .expect("should name the exact selected target binary");
+    assert_eq!(
+        selected, observed.units[0].package_id,
+        "should return the exact observed package identity for graph selection"
+    );
 }
 
 #[test]

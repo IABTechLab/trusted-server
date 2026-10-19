@@ -94,6 +94,7 @@ impl RecipeCompleted {
         let stdout_sha256 = hex::encode(Sha256::digest(&facts.stdout));
         if let Some(captured) = &facts.cargo_observations {
             captured.retain(retained.path())?;
+            captured.rehash(retained.path())?;
         }
         Ok(Self {
             facts,

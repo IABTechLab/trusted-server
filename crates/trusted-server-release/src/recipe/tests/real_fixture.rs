@@ -185,6 +185,7 @@ pub(super) fn bind_denial_case(
     )
     .expect("should build the child environment");
     let prepared = PreparedRecipe::bind(BindInputs {
+        workspace: WorkspaceSelection::Fixture,
         commit: &commit,
         child,
         completed: &completed,

@@ -3,7 +3,7 @@
 use serde::Serialize;
 
 /// Original material behind one prepared Cargo directory-source package.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum CargoOrigin {
     /// A distribution verified against the approved lock checksum.
@@ -35,7 +35,7 @@ pub(crate) enum CargoOrigin {
 /// Membership is authoritative only through its owning
 /// [`PreparedCargoMaterials`](super::PreparedCargoMaterials), whose whole tree
 /// must be rehashed before any observed compiler identity is joined to it.
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub(crate) struct VerifiedCargoPackage {
     /// Name checked against the approved lock identity.
     pub(super) name: String,
@@ -73,5 +73,36 @@ impl VerifiedCargoPackage {
     /// Original archive or committed Git package material identity.
     pub(crate) fn origin(&self) -> &CargoOrigin {
         &self.origin
+    }
+}
+
+#[cfg(test)]
+impl VerifiedCargoPackage {
+    /// Creates an origin fixture whose prepared bytes are measured separately.
+    pub(crate) fn registry_for_tests(
+        name: &str,
+        version: &str,
+        source: &str,
+        manifest_sha256: &str,
+        archive_sha256: &str,
+    ) -> Self {
+        Self {
+            name: name.to_owned(),
+            version: version.to_owned(),
+            source: source.to_owned(),
+            prepared_manifest_sha256: manifest_sha256.to_owned(),
+            origin: CargoOrigin::Registry {
+                archive_sha256: archive_sha256.to_owned(),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+impl VerifiedCargoPackage {
+    /// Replaces a fictional original identity for exact-source join tests.
+    pub(crate) fn with_origin_for_tests(mut self, origin: CargoOrigin) -> Self {
+        self.origin = origin;
+        self
     }
 }

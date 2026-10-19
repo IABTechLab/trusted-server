@@ -32,6 +32,28 @@ fn expected_replacement() -> Vec<String> {
 const FIXTURE_CLANG: &str = "/boundary/system/0/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang";
 
 #[test]
+fn recipe_binding_keeps_checked_module_facts_and_explicit_fixture_source() {
+    let fixture = Fixture::new(COMMIT);
+    let prepared = fixture
+        .bind(FIXED_ARTIFACTS[0].name, Role::Canonical)
+        .expect("should bind pure recipe fixture");
+    assert!(
+        matches!(prepared.workspace, WorkspaceSelection::Fixture),
+        "should label the source authority bypass as test-only"
+    );
+    assert_eq!(
+        prepared.js.modules.len(),
+        1,
+        "should bind the exact prepared JS module facts"
+    );
+    assert_eq!(
+        prepared.js.modules[0].id(),
+        "core",
+        "should derive module identity from the owned handoff"
+    );
+}
+
+#[test]
 fn composition_queries_keep_selected_tools_environment_and_source_replacement() {
     for artifact in FIXED_ARTIFACTS {
         let fixture = Fixture::new(COMMIT);
@@ -381,6 +403,7 @@ fn child_home_and_cargo_home_must_be_the_request_state() {
         crate::preflight::child::build_child_for_tests(&audited(), &commit, 1_700_000_000, &forged)
             .expect("should build a child with another HOME");
     let error = PreparedRecipe::bind(BindInputs {
+        workspace: WorkspaceSelection::Fixture,
         commit: &commit,
         child,
         completed: &fixture.completed,

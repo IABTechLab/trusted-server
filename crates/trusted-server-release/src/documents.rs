@@ -42,7 +42,8 @@ pub(crate) enum Role {
 }
 
 impl Role {
-    fn limit(self) -> u64 {
+    /// Maximum bytes permitted for this document role.
+    pub(crate) fn limit(self) -> u64 {
         match self {
             Self::Metadata | Self::CargoMessage => 1024 * 1024,
             Self::Source => 64 * 1024 * 1024,

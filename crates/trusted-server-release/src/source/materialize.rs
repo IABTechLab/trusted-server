@@ -4,7 +4,7 @@ use std::fs;
 use std::io::Write as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{PermissionsExt as _, symlink};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use error_stack::Report;
@@ -25,6 +25,36 @@ pub(crate) struct FreshSource {
     cancellation: Cancellation,
 }
 
+/// A source integrity check that preserves the owning preparation attempt.
+pub(crate) struct FreshSourceVerification {
+    root: PathBuf,
+    records: Records,
+    deadline: Instant,
+    cancellation: Cancellation,
+}
+
+impl FreshSourceVerification {
+    /// Rechecks the complete tracked source and permitted output exclusions.
+    ///
+    /// # Errors
+    /// Rejects changed or unexpected files, aliases and expired attempts.
+    pub(crate) fn verify_unchanged(&self, outputs: &[&str]) -> Result<(), Report<ReleaseError>> {
+        verify_source(
+            &self.root,
+            &self.records,
+            self.deadline,
+            &self.cancellation,
+            outputs,
+        )
+    }
+
+    /// Expires the original attempt without waiting in deadline regression tests.
+    #[cfg(test)]
+    pub(crate) fn expire_for_tests(&mut self) {
+        self.deadline = Instant::now();
+    }
+}
+
 /// Creates an owned checkout whose path agrees with canonical boundary roots.
 ///
 /// Resolve the parent before allocation so `TempDir` retains cleanup ownership
@@ -39,6 +69,16 @@ pub(super) fn fresh_directory(parent: &Path) -> Result<TempDir, Report<ReleaseEr
 }
 
 impl FreshSource {
+    /// Captures the original source records and shared preparation controls.
+    pub(crate) fn verification(&self) -> FreshSourceVerification {
+        FreshSourceVerification {
+            root: self.root().to_owned(),
+            records: self.records.clone(),
+            deadline: self.deadline,
+            cancellation: self.cancellation.clone(),
+        }
+    }
+
     /// Removes the owned tree and reports cleanup failure to the recipe.
     ///
     /// # Errors
@@ -73,27 +113,37 @@ impl FreshSource {
     /// overlapping approved tracked paths. Output trees are checked separately
     /// by preparation; this method grants no authority to their contents.
     pub(crate) fn verify_unchanged(&self, outputs: &[&str]) -> Result<(), Report<ReleaseError>> {
-        let check = || check_attempt(self.deadline, &self.cancellation);
-        check()?;
-        let root =
-            fs::symlink_metadata(self.root()).map_err(|error| source_error(error.to_string()))?;
-        if !root.is_dir() {
-            return Err(source_error(
-                "fresh source root changed type or became an alias",
-            ));
-        }
-        if fs::symlink_metadata(self.root().join(".git")).is_ok() {
-            return Err(source_error(
-                "fresh source must not acquire repository configuration",
-            ));
-        }
-        super::worktree::compare_with_outputs_controlled(
+        verify_source(
             self.root(),
             &self.records,
+            self.deadline,
+            &self.cancellation,
             outputs,
-            &check,
         )
     }
+}
+
+fn verify_source(
+    root: &Path,
+    records: &Records,
+    deadline: Instant,
+    cancellation: &Cancellation,
+    outputs: &[&str],
+) -> Result<(), Report<ReleaseError>> {
+    let check = || check_attempt(deadline, cancellation);
+    check()?;
+    let metadata = fs::symlink_metadata(root).map_err(|error| source_error(error.to_string()))?;
+    if !metadata.is_dir() {
+        return Err(source_error(
+            "fresh source root changed type or became an alias",
+        ));
+    }
+    if fs::symlink_metadata(root.join(".git")).is_ok() {
+        return Err(source_error(
+            "fresh source must not acquire repository configuration",
+        ));
+    }
+    super::worktree::compare_with_outputs_controlled(root, records, outputs, &check)
 }
 
 impl ApprovedSource {

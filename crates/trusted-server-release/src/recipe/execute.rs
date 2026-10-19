@@ -15,8 +15,13 @@ use super::artifact::{EXECUTABLE_LIMIT, copy_artifact};
 use super::cargo_output::{ExpectedBinary, locate_host_binary};
 use super::completed::SuccessFacts;
 use super::plan::CargoQuery;
-use super::{Authority, ExecutionPaths, PreparedRecipe, RecipeCompleted, recipe_error};
+use super::{
+    Authority, ExecutionPaths, PreparedRecipe, RecipeCompleted, WorkspaceSelection, recipe_error,
+};
 use crate::boundary::{Boundary, DenialProof, DescendantCleanup};
+use crate::composition::javascript::{JsInputs, JsRetentionPolicy, collect_js};
+use crate::composition::native::{self, NativeInputs};
+use crate::composition::origin::join_origins;
 use crate::composition::{CargoCapture, CargoLayout};
 use crate::documents::{Role as DocumentRole, read_bounded};
 use crate::error::ReleaseError;
@@ -124,11 +129,21 @@ impl PreparedRecipe {
         Ok(())
     }
 
-    /// Rehashes the JS handoff, the tools and the materials.
+    /// Rechecks source and rehashes the JS handoff, tools and materials.
     pub(super) fn check_inputs(&self) -> Result<(), Report<ReleaseError>> {
+        self.check_source()?;
         self.check_js_handoff()?;
         self.check_tools()?;
         self.check_materials()
+    }
+
+    /// Rechecks source while its working root still exists, before receipt sealing.
+    fn check_source(&self) -> Result<(), Report<ReleaseError>> {
+        match &self.workspace {
+            WorkspaceSelection::Approved(workspace) => workspace.verify_unchanged(),
+            #[cfg(test)]
+            WorkspaceSelection::Fixture => Ok(()),
+        }
     }
 
     /// Requires Cargo's private home to hold no registry or Git cache.
@@ -314,7 +329,7 @@ impl PreparedRecipe {
             },
             paths,
         )?;
-        let cargo_observations = match run.queries {
+        let mut cargo_observations = match run.queries {
             CargoQueryOutput::Captured {
                 metadata,
                 tree,
@@ -327,8 +342,9 @@ impl PreparedRecipe {
                 )?;
                 let captured =
                     CargoCapture::new(metadata, tree, &run.stdout, &layout, plan_digests)?;
-                captured.require_binary(&manifest, artifact.bin, &located.execution)?;
-                Some(captured)
+                let selected_package_id =
+                    captured.require_binary(&manifest, artifact.bin, &located.execution)?;
+                Some((captured, selected_package_id))
             }
             #[cfg(test)]
             CargoQueryOutput::Fixture => None,
@@ -349,6 +365,50 @@ impl PreparedRecipe {
         }
         inspect_copied(artifact.target, &raw.bytes, self.tools.apple())?;
         self.check_final_paths(&raw.bytes, paths)?;
+
+        let cargo_observations = if let Some((captured, selected_package_id)) =
+            cargo_observations.take()
+        {
+            Some(match &self.workspace {
+                WorkspaceSelection::Approved(workspace) => {
+                    let origins =
+                        join_origins(captured.observations(), workspace, &self.materials, paths)?;
+                    let plan = self.plan(paths)?;
+                    let native = native::collect(
+                        captured.observations(),
+                        &NativeInputs {
+                            origins: origins.native_sources(),
+                            execution_output_root: &paths
+                                .execution_path(&self.request.target_dir)?,
+                            host_output_root: &self.request.target_dir,
+                            target: artifact.target,
+                            environment: &plan.environment,
+                            check: &|| Ok(()),
+                        },
+                    )?;
+                    let javascript = collect_js(
+                        &raw.bytes,
+                        copied.sha256(),
+                        &JsInputs {
+                            retained_root: &self.retained_root,
+                            modules: &self.js.modules,
+                            inventory_sha256: &self.js.inventory_sha256,
+                            policy: if artifact.target == ReleaseTarget::Wasm32Wasip1 {
+                                JsRetentionPolicy::FastlyAll
+                            } else {
+                                JsRetentionPolicy::ObserveCli
+                            },
+                        },
+                    )?;
+                    self.check_source()?;
+                    captured.with_evidence(&selected_package_id, origins, native, javascript)?
+                }
+                #[cfg(test)]
+                WorkspaceSelection::Fixture => captured,
+            })
+        } else {
+            None
+        };
 
         if self.tools.authority() == Authority::Qualified
             && !self.materials.derived_manifest_digests().is_empty()

@@ -9,6 +9,10 @@ use error_stack::Report;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
+use super::graph::{self, GraphEvidence};
+use super::javascript::JsMembership;
+use super::native::NativeInventory;
+use super::origin::VerifiedPackageOrigins;
 use super::{CargoLayout, CargoObservations, composition_error, observe_cargo};
 use crate::documents::{hash_bounded_with_check, lower_hex};
 use crate::error::ReleaseError;
@@ -22,7 +26,6 @@ const NORMALIZED: &str = "cargo-observations.json";
 ///
 /// This records observations only; verified material/native coverage remains
 /// a separate requirement before a build composition can be attested.
-#[derive(Debug)]
 pub(crate) struct CargoCapture {
     metadata: Vec<u8>,
     tree: Vec<u8>,
@@ -30,6 +33,25 @@ pub(crate) struct CargoCapture {
     digests: [String; 3],
     observations: CargoObservations,
     query_plan_digests: [String; 2],
+    receipt: Option<CompositionReceipt>,
+}
+
+#[derive(serde::Serialize)]
+struct CompositionReceipt {
+    graph: GraphEvidence,
+    package_origins: VerifiedPackageOrigins,
+    native: NativeInventory,
+    javascript: JsMembership,
+}
+
+impl core::fmt::Debug for CargoCapture {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("CargoCapture")
+            .field("digests", &self.digests)
+            .field("has_composition_receipt", &self.receipt.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl CargoCapture {
@@ -85,10 +107,63 @@ impl CargoCapture {
             digests,
             observations,
             query_plan_digests,
+            receipt: None,
         })
     }
 
-    /// Requires the unit inventory to name the exact executable accepted by the recipe.
+    /// The observed units whose inputs must be joined before sealing evidence.
+    pub(crate) fn observations(&self) -> &CargoObservations {
+        &self.observations
+    }
+
+    /// Seals checked component receipts while their working inputs still exist.
+    ///
+    /// Native sources and archives are rehashed here. Later handoffs verify the
+    /// retained receipt bytes, allowing completed working roots to be cleaned.
+    /// Graph and tool/platform qualification remain separate coverage gates.
+    ///
+    /// # Errors
+    ///
+    /// Rejects changed native inputs or oversized serialized evidence.
+    pub(crate) fn with_evidence(
+        mut self,
+        selected_package_id: &str,
+        package_origins: VerifiedPackageOrigins,
+        native: NativeInventory,
+        javascript: JsMembership,
+    ) -> Result<Self, Report<ReleaseError>> {
+        let graph = graph::reconcile(
+            &self.metadata,
+            &self.tree,
+            &self.observations,
+            selected_package_id,
+        )?;
+        native.rehash(&|| Ok(()))?;
+        let receipt = CompositionReceipt {
+            graph,
+            package_origins,
+            native,
+            javascript,
+        };
+        let normalized = serde_json::to_vec(&json!({
+            "metadata_plan_sha256": self.query_plan_digests[0],
+            "tree_plan_sha256": self.query_plan_digests[1],
+            "observations": self.observations,
+            "composition": receipt,
+        }))
+        .map_err(composition_error)?;
+        if normalized.len() as u64 > LIMIT {
+            return Err(composition_error(
+                "normalized composition exceeds its bound",
+            ));
+        }
+        self.digests[2] = hex::encode(Sha256::digest(&normalized));
+        self.normalized = normalized;
+        self.receipt = Some(receipt);
+        Ok(self)
+    }
+
+    /// Returns the exact package identity of the binary accepted by the recipe.
     ///
     /// # Errors
     ///
@@ -98,7 +173,7 @@ impl CargoCapture {
         manifest: &Path,
         bin: &str,
         executable: &Path,
-    ) -> Result<(), Report<ReleaseError>> {
+    ) -> Result<String, Report<ReleaseError>> {
         let matching = self
             .observations
             .units
@@ -112,13 +187,13 @@ impl CargoCapture {
                         package.id == unit.package_id && package.manifest_path == manifest
                     })
             })
-            .count();
-        if matching != 1 {
+            .collect::<Vec<_>>();
+        if matching.len() != 1 {
             return Err(composition_error(
                 "composition does not name the exact accepted binary",
             ));
         }
-        Ok(())
+        Ok(matching[0].package_id.clone())
     }
 
     /// Retains every raw/normalized observation as a new private file.
@@ -171,6 +246,7 @@ impl CargoCapture {
             "observed_packages": self.observations.packages.len(),
             "observed_units": self.observations.units.len(),
             "build_script_executions": self.observations.build_scripts.len(),
+            "composition_receipts_retained": self.receipt.is_some(),
             "material_native_coverage_complete": false,
         })
     }

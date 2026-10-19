@@ -614,3 +614,16 @@ fn vendor_git(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+impl PreparedCargoMaterials {
+    /// Adds an identity fixture without bypassing whole-tree rehashing.
+    pub(crate) fn with_package_for_tests(
+        mut self,
+        directory: &str,
+        package: VerifiedCargoPackage,
+    ) -> Self {
+        self.packages.insert(directory.to_owned(), package);
+        self
+    }
+}

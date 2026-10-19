@@ -31,7 +31,7 @@ mod materialize;
 mod tree;
 mod worktree;
 
-pub(crate) use materialize::FreshSource;
+pub(crate) use materialize::{FreshSource, FreshSourceVerification};
 
 /// Repository channels that rewrite history, objects or checkout attributes.
 const FORBIDDEN_GIT_PATHS: [&str; 7] = [
@@ -210,6 +210,22 @@ impl ApprovedSource {
             .records
             .get(path)
             .map(|(_, sha256)| sha256.as_str())
+    }
+
+    /// Approved regular Cargo manifests, keyed by source-relative path.
+    ///
+    /// Symlink identities describe link targets rather than manifest bytes and
+    /// therefore cannot authorize a workspace package's composition origin.
+    pub(crate) fn cargo_manifest_digests(&self) -> BTreeMap<PathBuf, String> {
+        self.snapshot
+            .records
+            .iter()
+            .filter(|(path, (mode, _))| {
+                matches!(mode, Mode::Regular | Mode::Executable)
+                    && (path.as_str() == "Cargo.toml" || path.ends_with("/Cargo.toml"))
+            })
+            .map(|(path, (_, digest))| (PathBuf::from(path), digest.clone()))
+            .collect()
     }
 
     /// Reads bounded tracked bytes and checks their approved object digest.

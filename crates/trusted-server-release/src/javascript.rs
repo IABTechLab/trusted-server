@@ -22,6 +22,34 @@ struct Module {
     sha256: String,
 }
 
+/// Complete module identity exported only from a rehashed owned JS handoff.
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct RetainedJsModule {
+    id: String,
+    filename: String,
+    size: u64,
+    sha256: String,
+}
+
+impl RetainedJsModule {
+    /// The approved discovered module identity.
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+    /// The checked flat bundle filename.
+    pub(crate) fn filename(&self) -> &str {
+        &self.filename
+    }
+    /// Complete final bundle length.
+    pub(crate) fn size(&self) -> u64 {
+        self.size
+    }
+    /// SHA-256 of complete final bundle bytes.
+    pub(crate) fn sha256(&self) -> &str {
+        &self.sha256
+    }
+}
+
 /// Captured immediately after the collector exits, before later writable stages.
 struct CapturedInventory {
     raw: RawBytes,
@@ -104,6 +132,25 @@ pub(crate) struct JsBuildCompleted {
 }
 
 impl JsBuildCompleted {
+    /// Exports module facts after checking the complete retained handoff.
+    ///
+    /// # Errors
+    ///
+    /// Rejects changed files, aliases or expired preparation attempts.
+    pub(crate) fn retained_modules(&self) -> Result<Vec<RetainedJsModule>, Report<ReleaseError>> {
+        self.rehash_for_handoff()?;
+        Ok(self
+            .modules
+            .iter()
+            .map(|(id, module)| RetainedJsModule {
+                id: id.clone(),
+                filename: module.filename.clone(),
+                size: module.size,
+                sha256: module.sha256.clone(),
+            })
+            .collect())
+    }
+
     /// Returns the approved source bound to the executed build.
     pub(crate) fn source_commit(&self) -> &str {
         &self.source_commit
