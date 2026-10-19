@@ -272,6 +272,19 @@ impl CacheDirectives {
     fn has_unqualified(&self, directive: &str) -> bool {
         self.unqualified.contains(directive)
     }
+
+    /// Whether these directives forbid shared-cache storage outright, in
+    /// unqualified form (`no-store` / `private` / `no-cache`). A single
+    /// predicate shared by every path that asks "will the CDN cache this?",
+    /// so the CDN-TTL and disables-caching checks cannot drift apart. Built on
+    /// [`has_unqualified`] because the qualified form (`private="Set-Cookie"`)
+    /// restricts only the named header field and leaves the body shareable
+    /// (RFC 9111 §5.2.2.7), so it does not forbid caching.
+    fn forbids_caching(&self) -> bool {
+        self.has_unqualified("no-store")
+            || self.has_unqualified("private")
+            || self.has_unqualified("no-cache")
+    }
 }
 
 /// Whether a `Vary` value contains a hit-ratio-destroying token.
@@ -486,7 +499,12 @@ fn evaluate_cdn_ttl(headers: &ResponseHeaders) -> Option<HeaderVerdict> {
 
     // `Surrogate-Control` wins outright over `s-maxage` at the CDN, so the
     // `s-maxage` fallback applies only when no `Surrogate-Control` is present.
+    // A `Surrogate-Control` that forbids caching emits NO CDN-TTL verdict
+    // whatever number it also carries: `no-store, max-age=86400` means the CDN
+    // stores nothing, so affirming "the edge TTL is adequate" would be a
+    // false Pass. The disables-caching Warn covers that case instead.
     let cdn_ttl = match surrogate_directives.as_ref() {
+        Some(directives) if directives.forbids_caching() => None,
         Some(directives) => directives.max_age.or(directives.s_maxage),
         None => cache_control
             .as_ref()
@@ -563,7 +581,11 @@ fn evaluate_surrogate_no_store(
 ) -> Option<HeaderVerdict> {
     let value = headers.surrogate_control.as_deref()?;
     let directives = CacheDirectives::parse(value);
-    let safe = directives.has("no-store") || directives.has("private");
+    // Require the UNQUALIFIED form: `private="Set-Cookie"` restricts only the
+    // named header field and leaves the body shareable (RFC 9111 §5.2.2.7), so
+    // the qualified form must not satisfy the body-safety check for
+    // personalized HTML/RTB.
+    let safe = directives.has_unqualified("no-store") || directives.has_unqualified("private");
     Some(if safe {
         HeaderVerdict::pass(
             "Surrogate-Control",
@@ -589,8 +611,7 @@ fn evaluate_surrogate_no_store(
 fn evaluate_surrogate_disables_caching(headers: &ResponseHeaders) -> Option<HeaderVerdict> {
     let value = headers.surrogate_control.as_deref()?;
     let directives = CacheDirectives::parse(value);
-    let disables =
-        directives.has("no-store") || directives.has("private") || directives.has("no-cache");
+    let disables = directives.forbids_caching();
     if disables {
         Some(HeaderVerdict::flagged(
             "Surrogate-Control",
@@ -753,6 +774,46 @@ mod tests {
             verdict_for(&verdicts, "Cache-Control"),
             Verdict::Fail,
             "publicly cacheable HTML should fail"
+        );
+    }
+
+    #[test]
+    fn html_qualified_surrogate_private_is_not_body_safe() {
+        // Blocker (round 3): a qualified `private="Set-Cookie"` on
+        // Surrogate-Control restricts only that header field (RFC 9111
+        // §5.2.2.7); the HTML body stays storable and shareable, so it must NOT
+        // satisfy the Surrogate-Control body-safety check for personalized HTML.
+        let verdicts = evaluate(
+            ContentTypeGroup::Html,
+            &ResponseHeaders {
+                content_type: Some("text/html".to_owned()),
+                cache_control: Some("no-store".to_owned()),
+                surrogate_control: Some("max-age=600, private=\"Set-Cookie\"".to_owned()),
+                ..ResponseHeaders::default()
+            },
+        );
+        assert_eq!(
+            verdict_for(&verdicts, "Surrogate-Control"),
+            Verdict::Fail,
+            "qualified private=\"...\" must not pass the Surrogate-Control body-safety check"
+        );
+    }
+
+    #[test]
+    fn html_unqualified_surrogate_private_is_body_safe() {
+        let verdicts = evaluate(
+            ContentTypeGroup::Html,
+            &ResponseHeaders {
+                content_type: Some("text/html".to_owned()),
+                cache_control: Some("no-store".to_owned()),
+                surrogate_control: Some("private".to_owned()),
+                ..ResponseHeaders::default()
+            },
+        );
+        assert_eq!(
+            verdict_for(&verdicts, "Surrogate-Control"),
+            Verdict::Pass,
+            "unqualified private should satisfy the Surrogate-Control body-safety check"
         );
     }
 
@@ -1205,19 +1266,52 @@ mod tests {
         // fully-immutable JS bundle. Guards the three regressions that lived in
         // the {present, token-only} cell.
         let base_cc = "public, max-age=31536000, immutable";
-        let cases: &[(Option<&str>, Verdict)] = &[
+        // Each row: (Surrogate-Control, expected group rollup, expected
+        // (expected-label, verdict) that the Surrogate-Control header must
+        // carry -- asserting the verdict VALUE, not just the rollup, so a wrong
+        // Pass hiding inside a Warn rollup is caught).
+        type Row<'a> = (Option<&'a str>, Verdict, Option<(&'a str, Verdict)>);
+        let cases: &[Row] = &[
             // No Surrogate-Control: bundle is fully cacheable -> Pass.
-            (None, Verdict::Pass),
+            (None, Verdict::Pass, None),
             // Token-only that disables edge caching -> Warn (disables-caching).
-            (Some("no-store"), Verdict::Warn),
-            (Some("private"), Verdict::Warn),
-            (Some("no-cache"), Verdict::Warn),
+            (
+                Some("no-store"),
+                Verdict::Warn,
+                Some(("should allow CDN caching", Verdict::Warn)),
+            ),
+            (
+                Some("private"),
+                Verdict::Warn,
+                Some(("should allow CDN caching", Verdict::Warn)),
+            ),
+            (
+                Some("no-cache"),
+                Verdict::Warn,
+                Some(("should allow CDN caching", Verdict::Warn)),
+            ),
             // Numeric zero TTL -> Warn (CDN undercuts browser).
-            (Some("max-age=0"), Verdict::Warn),
+            (
+                Some("max-age=0"),
+                Verdict::Warn,
+                Some(("CDN TTL >= browser TTL", Verdict::Warn)),
+            ),
             // Numeric TTL that meets the browser TTL -> Pass.
-            (Some("max-age=31536000"), Verdict::Pass),
+            (
+                Some("max-age=31536000"),
+                Verdict::Pass,
+                Some(("CDN TTL >= browser TTL", Verdict::Pass)),
+            ),
+            // Token-plus-number: the exact cell the round-3 regression lived in.
+            // `no-store` forbids caching, so NO passing CDN-TTL verdict may be
+            // emitted; only the disables-caching Warn.
+            (
+                Some("no-store, max-age=31536000"),
+                Verdict::Warn,
+                Some(("should allow CDN caching", Verdict::Warn)),
+            ),
         ];
-        for (surrogate, expected) in cases {
+        for (surrogate, expected, expected_verdict) in cases {
             let verdicts = evaluate(
                 ContentTypeGroup::JavaScript,
                 &ResponseHeaders {
@@ -1233,6 +1327,27 @@ mod tests {
                 *expected,
                 "Surrogate-Control {surrogate:?} should roll up to {expected:?}"
             );
+            if let Some((label, verdict)) = expected_verdict {
+                let found: Vec<(&str, Verdict)> = verdicts
+                    .iter()
+                    .filter(|v| v.header == "Surrogate-Control")
+                    .map(|v| (v.expected.as_str(), v.verdict))
+                    .collect();
+                assert!(
+                    found.contains(&(label, *verdict)),
+                    "Surrogate-Control {surrogate:?} must carry verdict ({label:?}, {verdict:?}), got {found:?}"
+                );
+                // A forbids-caching surrogate (the disables-caching rows, incl.
+                // the token-plus-number regression cell) must never also emit a
+                // passing CDN-TTL verdict -- that was the round-3 false Pass.
+                // Numeric-TTL rows legitimately may, so scope the check.
+                if *label == "should allow CDN caching" {
+                    assert!(
+                        !found.contains(&("CDN TTL >= browser TTL", Verdict::Pass)),
+                        "forbids-caching Surrogate-Control {surrogate:?} must not emit a passing CDN-TTL verdict, got {found:?}"
+                    );
+                }
+            }
         }
     }
 }

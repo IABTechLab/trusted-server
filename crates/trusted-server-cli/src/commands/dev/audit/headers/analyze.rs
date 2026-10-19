@@ -302,36 +302,52 @@ mod tests {
 
     #[test]
     fn distinct_surrogate_control_findings_are_not_collapsed() {
-        // One image response emits two Surrogate-Control verdicts: the CDN-TTL
-        // comparison (max-age=30 < browser 86400) and disables-caching
-        // (no-store). Keying the merge on header name alone dropped the second;
-        // keying on (header, expected) must keep both.
-        let response = FetchedResponse {
-            url: Url::parse("https://origin.example/logo.png").expect("should parse test url"),
+        // Two image responses in the same group each emit ONE distinct
+        // Surrogate-Control verdict: response A the CDN-TTL comparison
+        // (max-age=30 < browser 86400 -> Warn), response B disables-caching
+        // (no-store -> Warn). They are legitimately distinct postures now that
+        // `no-store` no longer also borrows a numeric TTL. Keying the merge on
+        // header name alone dropped the second; keying on (header, expected)
+        // must keep both, and keep their verdict values intact.
+        let response_a = FetchedResponse {
+            url: Url::parse("https://origin.example/a.png").expect("should parse test url"),
             headers: ResponseHeaders {
                 content_type: Some("image/png".to_owned()),
                 cache_control: Some("public, max-age=86400".to_owned()),
-                surrogate_control: Some("no-store, max-age=30".to_owned()),
+                surrogate_control: Some("max-age=30".to_owned()),
                 surrogate_key: Some("img".to_owned()),
                 ..ResponseHeaders::default()
             },
         };
-        let report = run_analysis("https://origin.example", &[response]);
+        let response_b = FetchedResponse {
+            url: Url::parse("https://origin.example/b.png").expect("should parse test url"),
+            headers: ResponseHeaders {
+                content_type: Some("image/png".to_owned()),
+                cache_control: Some("public, max-age=86400".to_owned()),
+                surrogate_control: Some("no-store".to_owned()),
+                surrogate_key: Some("img".to_owned()),
+                ..ResponseHeaders::default()
+            },
+        };
+        let report = run_analysis("https://origin.example", &[response_a, response_b]);
         let image = report
             .groups
             .iter()
             .find(|group| matches!(group.content_type, ContentTypeGroup::Image))
             .expect("should have an image group");
-        let surrogate_verdicts: Vec<&str> = image
+        let surrogate: Vec<(&str, Verdict)> = image
             .verdicts
             .iter()
             .filter(|verdict| verdict.header == "Surrogate-Control")
-            .map(|verdict| verdict.expected.as_str())
+            .map(|verdict| (verdict.expected.as_str(), verdict.verdict))
             .collect();
         assert!(
-            surrogate_verdicts.contains(&"CDN TTL >= browser TTL")
-                && surrogate_verdicts.contains(&"should allow CDN caching"),
-            "both Surrogate-Control findings must survive the merge, got {surrogate_verdicts:?}"
+            surrogate.contains(&("CDN TTL >= browser TTL", Verdict::Warn)),
+            "CDN-TTL finding must survive as a Warn, got {surrogate:?}"
+        );
+        assert!(
+            surrogate.contains(&("should allow CDN caching", Verdict::Warn)),
+            "disables-caching finding must survive as a Warn, got {surrogate:?}"
         );
     }
 }
