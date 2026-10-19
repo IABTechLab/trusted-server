@@ -7360,7 +7360,7 @@ mod tests {
         fn identifiers(
             &self,
             _call: crate::module_context::ModuleCall<'_>,
-        ) -> Result<Vec<crate::openrtb::Eid>, crate::module_context::Withheld> {
+        ) -> Result<Vec<crate::ec::eids::Eid>, crate::module_context::Withheld> {
             Ok(Vec::new())
         }
     }

@@ -1,18 +1,22 @@
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+//! The `OpenRTB` 2.6 wire types the driver writes and reads, and the
+//! extension objects this project adds to them.
 
-use crate::auction::types::{BidRenderer, OrchestratorExt};
-
-pub type OpenRtbRequest = trusted_server_openrtb::BidRequest;
-pub type OpenRtbResponse = trusted_server_openrtb::BidResponse;
-pub type OpenRtbBid = trusted_server_openrtb::Bid;
+use serde::Serialize;
 
 pub use trusted_server_openrtb::{
-    Banner, Bid, BidResponse, Device, Format, Geo, Imp, Publisher, Regs, SeatBid, Site, ToExt, User,
+    Banner, Bid, BidRequest, BidResponse, Device, Eid, Format, Geo, Imp, Object, Publisher, Regs,
+    SeatBid, Site, ToExt, Uid, User,
 };
 
-/// Convert a `u32` value to `i32` for `OpenRTB` fields, logging a warning and
-/// returning `None` if the value exceeds `i32::MAX`.
+/// The request the driver sends.
+pub type OpenRtbRequest = BidRequest;
+/// The response an exchange answers with.
+pub type OpenRtbResponse = BidResponse;
+/// One bid in a response.
+pub type OpenRtbBid = Bid;
+
+/// Converts a `u32` to the `i32` an `OpenRTB` field holds, logging and
+/// returning `None` when the value does not fit.
 #[must_use]
 pub fn to_openrtb_i32(value: u32, field_name: &str, context: &str) -> Option<i32> {
     if let Ok(converted) = i32::try_from(value) {
@@ -25,24 +29,44 @@ pub fn to_openrtb_i32(value: u32, field_name: &str, context: &str) -> Option<i32
     }
 }
 
-// ============================================================================
-// Extension types (project-specific, not part of the OpenRTB spec)
-// ============================================================================
+/// Formats the identifiers an auction request carries as the `eids` array
+/// of the request's user object.
+#[must_use]
+pub fn format_eids(eids: &[trusted_server_core::ec::eids::Eid]) -> Vec<Eid> {
+    eids.iter()
+        .map(|eid| Eid {
+            source: Some(eid.source.clone()),
+            uids: eid
+                .uids
+                .iter()
+                .map(|uid| Uid {
+                    id: Some(uid.id.clone()),
+                    atype: uid.atype,
+                    ext: uid.ext.as_ref().and_then(|ext| match ext {
+                        serde_json::Value::Object(object) => Some(object.clone()),
+                        _ => None,
+                    }),
+                })
+                .collect(),
+            ..Default::default()
+        })
+        .collect()
+}
 
+/// The `user.ext` object.
 #[derive(Debug, Serialize)]
 pub struct UserExt {
-    /// TCF v2 consent string (Prebid reads `user.ext.consent`).
+    /// TCF v2 consent string, which Prebid reads from `user.ext.consent`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub consent: Option<String>,
-    /// Google Additional Consent settings for Ad Manager / `AdX` demand.
+    /// Google Additional Consent settings for Ad Manager and `AdX` demand.
     #[serde(
         rename = "ConsentedProvidersSettings",
         skip_serializing_if = "Option::is_none"
     )]
     pub consented_providers_settings: Option<ConsentedProvidersSettings>,
-    /// Extended User IDs from identity providers.
-    ///
-    /// Gated by TCF Purpose 1 (storage) and Purpose 4 (personalized ads).
+    /// The identifiers the request carries, already gated by the permissions
+    /// the auction resolved.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub eids: Option<Vec<Eid>>,
 }
@@ -64,35 +88,10 @@ pub struct ConsentedProvidersSettings {
     pub consented_providers: Option<String>,
 }
 
-/// An Extended User ID entry from an identity provider.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Eid {
-    /// Identity provider domain (e.g. `"id5-sync.com"`).
-    pub source: String,
-    /// One or more user IDs from this provider.
-    pub uids: Vec<Uid>,
-}
-
-/// A single user identifier within an [`Eid`] entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Uid {
-    /// The identifier value.
-    pub id: String,
-    /// `OpenRTB` agent type, including vendor-specific values such as PAIR's `571187`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub atype: Option<i32>,
-    /// Provider-specific extension data.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ext: Option<Value>,
-}
-
 /// Prebid-compatible `regs.ext` consent fields.
 ///
 /// Prebid Server reads consent signals from `regs.ext.*` rather than the
-/// `OpenRTB` 2.6 top-level locations. We populate both to maximise
-/// compatibility (see proposal Key Decision #2 — Dual-Placement).
+/// `OpenRTB` 2.6 top-level locations, so the driver writes both.
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct RegsExt {
     /// GDPR applicability flag (mirrors `regs.gdpr`).
@@ -111,6 +110,8 @@ pub struct RegsExt {
 
 impl ToExt for RegsExt {}
 
+/// The `ext.trusted_server` object the driver writes on every request it
+/// signs, and on an unsigned one whose source keeps the request identity.
 #[derive(Debug, Serialize)]
 pub struct TrustedServerExt {
     /// Version of the signing protocol (e.g., "1.1")
@@ -129,99 +130,9 @@ pub struct TrustedServerExt {
     pub ts: Option<u64>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct BidExt<'a> {
-    pub trusted_server: BidTrustedServerExt<'a>,
-}
-
-impl ToExt for BidExt<'_> {}
-
-#[derive(Debug, Serialize)]
-pub struct BidTrustedServerExt<'a> {
-    pub renderer: &'a BidRenderer,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ResponseExt {
-    pub orchestrator: OrchestratorExt,
-}
-
-impl ToExt for ResponseExt {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auction::types::OrchestratorExt;
-
-    #[test]
-    fn openrtb_response_round_trips_with_struct_literals() {
-        let bid = OpenRtbBid {
-            id: Some("bidder-a-slot-1".to_owned()),
-            impid: Some("slot-1".to_owned()),
-            price: Some(1.25),
-            adm: Some("<div>Test Creative HTML</div>".to_owned()),
-            crid: Some("bidder-a-creative".to_owned()),
-            w: Some(300),
-            h: Some(250),
-            adomain: vec!["example.com".to_owned()],
-            ..Default::default()
-        };
-
-        let seatbid = SeatBid {
-            seat: Some("bidder-a".to_owned()),
-            bid: vec![bid],
-            ..Default::default()
-        };
-
-        let ext = ResponseExt {
-            orchestrator: OrchestratorExt {
-                strategy: "parallel_only".to_owned(),
-                providers: 2,
-                total_bids: 3,
-                time_ms: 12,
-                provider_details: vec![],
-                dropped_winner_count: 0,
-                dropped_winner_reasons: Default::default(),
-            },
-        }
-        .to_ext();
-
-        let response = OpenRtbResponse {
-            id: Some("auction-1".to_owned()),
-            seatbid: vec![seatbid],
-            ext,
-            ..Default::default()
-        };
-
-        let serialized = serde_json::to_value(&response).expect("should serialize");
-        let expected = serde_json::json!({
-            "id": "auction-1",
-            "seatbid": [{
-                "seat": "bidder-a",
-                "bid": [{
-                    "id": "bidder-a-slot-1",
-                    "impid": "slot-1",
-                    "price": 1.25,
-                    "adm": "<div>Test Creative HTML</div>",
-                    "crid": "bidder-a-creative",
-                    "w": 300,
-                    "h": 250,
-                    "adomain": ["example.com"]
-                }]
-            }],
-            "ext": {
-                "orchestrator": {
-                    "strategy": "parallel_only",
-                    "providers": 2,
-                    "total_bids": 3,
-                    "time_ms": 12,
-                    "provider_details": []
-                }
-            }
-        });
-
-        assert_eq!(serialized, expected);
-    }
 
     #[test]
     fn regs_serializes_dual_placement_consent_fields() {
@@ -246,7 +157,6 @@ mod tests {
         };
 
         let serialized = serde_json::to_value(&regs).expect("should serialize");
-        // Top-level fields
         assert_eq!(serialized["gdpr"], 1, "top-level gdpr should be 1");
         assert_eq!(
             serialized["us_privacy"], "1YNN",
@@ -261,7 +171,6 @@ mod tests {
             serde_json::json!([2, 6]),
             "top-level gpp_sid should match"
         );
-        // ext-based fields (Prebid reads these)
         let ext = &serialized["ext"];
         assert_eq!(ext["gdpr"], 1, "ext gdpr should mirror top-level");
         assert_eq!(
@@ -350,45 +259,24 @@ mod tests {
     }
 
     #[test]
-    fn eid_serializes_correctly() {
-        let eid = Eid {
-            source: "id5-sync.com".to_owned(),
-            uids: vec![Uid {
-                id: "ID5-abc123".to_owned(),
-                atype: Some(1),
-                ext: None,
-            }],
-        };
-
-        let serialized = serde_json::to_value(&eid).expect("should serialize");
-        assert_eq!(serialized["source"], "id5-sync.com", "source should match");
-        assert_eq!(
-            serialized["uids"][0]["id"], "ID5-abc123",
-            "uid id should match"
-        );
-        assert_eq!(serialized["uids"][0]["atype"], 1, "atype should be 1");
-        assert!(
-            serialized["uids"][0].get("ext").is_none(),
-            "ext should be omitted when None"
-        );
-    }
-
-    #[test]
-    fn eid_serializes_vendor_specific_atype() {
-        let eid = Eid {
+    fn identifiers_are_formatted_as_eids_with_their_agent_type() {
+        let eids = format_eids(&[trusted_server_core::ec::eids::Eid {
             source: "google.com".to_owned(),
-            uids: vec![Uid {
+            uids: vec![trusted_server_core::ec::eids::Uid {
                 id: "pair-id".to_owned(),
                 atype: Some(571187),
-                ext: None,
+                ext: Some(serde_json::json!({"linkType": 1})),
             }],
-        };
+        }]);
 
-        let serialized = serde_json::to_value(&eid).expect("should serialize");
-
+        let serialized = serde_json::to_value(&eids).expect("should serialize");
         assert_eq!(
-            serialized["uids"][0]["atype"], 571187,
-            "should preserve PAIR's vendor-specific atype"
+            serialized,
+            serde_json::json!([{
+                "source": "google.com",
+                "uids": [{"id": "pair-id", "atype": 571187, "ext": {"linkType": 1}}]
+            }]),
+            "should carry the source, the identifier, the vendor's agent type and the extension"
         );
     }
 }
