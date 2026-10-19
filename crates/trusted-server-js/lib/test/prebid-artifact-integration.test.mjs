@@ -307,10 +307,13 @@ describe('tsjs-prebid production artifacts', () => {
     expect(analyticsArtifact.bundleCode.length).toBeGreaterThan(200_000);
     // A value-import of Prebid or a private rendering helper would multiply
     // the shim size. The bound sits just above the normal compact shim output,
-    // which is roughly 40 KB: tight enough that material growth has to be
+    // which is roughly 42 KB: it carries the bidder-request EID collector, the
+    // ts-eids cookie fitting and encoding, and the tcf2Enforcement listener,
+    // which replaced the getUserIdsAsEids collector and the bidsBackHandler
+    // cookie sync. The bound is tight enough that material growth has to be
     // noticed and re-justified here, and far enough below a multiplication
     // that one still fails loudly. The bundle beside it is 200 KB and up.
-    expect(shimCode.length).toBeLessThan(41_000);
+    expect(shimCode.length).toBeLessThan(42_500);
     expect(shimCode).toContain('markWinningBidAsUsed');
   });
 
