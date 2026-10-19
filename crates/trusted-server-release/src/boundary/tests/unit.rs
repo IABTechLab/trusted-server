@@ -188,6 +188,27 @@ pub(super) fn sample_roots(base: &Path) -> BoundaryRoots {
 }
 
 #[test]
+fn sbpl_profile_hides_ambient_openssl_configuration_after_root_grants() {
+    let (_directory, base) = canonical_tempdir();
+    let profile = MacProfile::generate(&sample_roots(&base)).expect("should generate profile");
+    let rule = "(deny file-read* (with errno ENOENT)\n  (literal \"/private/etc/ssl/openssl.cnf\")\n  (literal \"/etc/ssl/openssl.cnf\"))";
+    let denial = profile
+        .text()
+        .find(rule)
+        .expect("should hide both exact aliases");
+    let grant = profile
+        .text()
+        .rfind("(allow file-read*")
+        .expect("should have root grants");
+    assert!(denial > grant, "should override every file read grant");
+    assert!(
+        !profile.text().contains("(subpath \"/private/etc/ssl\")")
+            && !profile.text().contains("(subpath \"/etc/ssl\")"),
+        "should not grant access to ambient SSL configuration"
+    );
+}
+
+#[test]
 fn sbpl_profile_carries_paths_only_as_defines() {
     let (_directory, base) = canonical_tempdir();
     let roots = sample_roots(&base);

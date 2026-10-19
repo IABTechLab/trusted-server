@@ -78,6 +78,82 @@ fn path_text(path: &Path) -> &str {
 }
 
 #[test]
+fn selected_cargo_starts_without_reading_ambient_openssl_configuration() {
+    let directory = tempdir().expect("should create startup fixture");
+    let base = fs::canonicalize(directory.path()).expect("should canonicalize startup fixture");
+    let immutable = base.join("source");
+    let writable = base.join("private");
+    fs::create_dir(&immutable).expect("should create source");
+    fs::create_dir(&writable).expect("should create private state");
+    let cargo = fs::canonicalize(env!("CARGO")).expect("should locate selected Cargo");
+    let roots = BoundaryRoots::new(
+        &[immutable],
+        std::slice::from_ref(&cargo),
+        std::slice::from_ref(&writable),
+    )
+    .expect("should bind startup roots");
+    let profile = MacProfile::generate(&roots).expect("should generate actual profile");
+    let run = RunIdentity::new(&profile).expect("should create private run markers");
+    // These direct version/read commands create no descendants. Use the actual
+    // profile without the global survivor scan exercised by separate tests.
+    let execute = |program: &Path, arguments: &[&str]| {
+        let command = ConfinedCommand::new(program, &writable, limits())
+            .expect("should describe harmless command")
+            .arguments(arguments.iter().map(OsString::from))
+            .environment("OPENSSL_CONF", "/dev/null")
+            .expect("should normalize optional OpenSSL configuration")
+            .environment("LC_ALL", "C")
+            .expect("should normalize diagnostic locale")
+            .environment("HOME", &writable)
+            .expect("should use private home")
+            .environment("CARGO_HOME", &writable)
+            .expect("should use private Cargo home");
+        profile
+            .wrap(&command, &run)
+            .expect("should wrap command")
+            .run()
+            .expect("should finish bounded command")
+    };
+    let version = execute(&cargo, &["--version"])
+        .require_success()
+        .expect("should initialize selected Cargo without ambient configuration");
+    assert!(
+        version.starts_with(b"cargo "),
+        "should run actual selected Cargo"
+    );
+    for alias in ["/private/etc/ssl/openssl.cnf", "/etc/ssl/openssl.cnf"] {
+        let denied = execute(Path::new("/bin/cat"), &[alias]);
+        assert_ne!(
+            denied.outcome(),
+            ProcessOutcome::Exited { code: 0 },
+            "should deny configuration contents"
+        );
+        assert!(
+            denied.stdout().is_empty(),
+            "should expose no configuration bytes"
+        );
+        assert!(
+            String::from_utf8_lossy(denied.stderr()).contains("No such file or directory"),
+            "should report optional configuration as absent"
+        );
+    }
+    let unrelated = execute(Path::new("/bin/cat"), &["/private/etc/hosts"]);
+    assert_ne!(
+        unrelated.outcome(),
+        ProcessOutcome::Exited { code: 0 },
+        "should retain unrelated read denial"
+    );
+    assert!(
+        unrelated.stdout().is_empty(),
+        "should expose no unrelated host input"
+    );
+    assert!(
+        String::from_utf8_lossy(unrelated.stderr()).contains("Operation not permitted"),
+        "should retain ordinary denial outside the exact aliases"
+    );
+}
+
+#[test]
 fn confined_probe_is_denied_with_eperm_and_no_accept() {
     let fixture = Fixture::new();
     let proof = fixture.prove();

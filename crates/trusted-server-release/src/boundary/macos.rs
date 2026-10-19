@@ -86,6 +86,12 @@ const PROFILE_HEADER: &str = r#"(version 1)
 "#;
 /// Network denial; later SBPL rules take precedence over earlier ones.
 const NETWORK_DENIAL: &str = "(deny network*)\n";
+/// Cargo's macOS `LibreSSL` initialization ignores `OPENSSL_CONF` and exits on
+/// EPERM for its optional system configuration. Hide only that ambient input
+/// as absent instead of granting it access. Apply after every root read grant.
+const OPENSSL_CONFIGURATION_DENIAL: &str = "(deny file-read* (with errno ENOENT)\n  \
+    (literal \"/private/etc/ssl/openssl.cnf\")\n  \
+    (literal \"/etc/ssl/openssl.cnf\"))\n";
 /// Tools no build step may start, even though `/usr/bin` is executable: the
 /// Xcode selection shims (`xcrun`, `xcodebuild`, `xcode-select`), which
 /// would pick a developer directory outside the bound record, and the
@@ -195,6 +201,7 @@ impl MacProfile {
             defines.push(define(&name, path)?);
         }
         text.push_str(&denials);
+        text.push_str(OPENSSL_CONFIGURATION_DENIAL);
         for path in DENIED_EXECUTABLES {
             text.push_str(&execution_denial(path));
         }
