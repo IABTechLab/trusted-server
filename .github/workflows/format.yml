@@ -39,6 +39,19 @@ jobs:
             exit 1
           fi
 
+  check-core-platform-names:
+    name: core platform names guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Core is built on EdgeZero and names no hosting platform or platform
+      # domain, in code, comments, tests, documents or file names, so one
+      # platform's change is never a change in core. Each adapter names its
+      # own platform.
+      - name: Check that crates/trusted-server-core names no hosting platform
+        run: python3 scripts/lint-core-platform-names.py
+
   format-rust:
     name: cargo fmt
     runs-on: ubuntu-latest

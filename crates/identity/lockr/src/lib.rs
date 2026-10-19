@@ -30,7 +30,7 @@ use http::{Method, StatusCode};
 use serde::Deserialize;
 use validator::Validate;
 
-use trusted_server_core::constants::INTERNAL_HEADERS;
+use trusted_server_core::constants::is_internal_header;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::integrations::{
     AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationEndpoint, IntegrationProxy,
@@ -322,7 +322,7 @@ impl LockrIntegration {
 
         for (name, value) in from {
             let name_str = name.as_str();
-            if name_str.starts_with("x-") && !INTERNAL_HEADERS.contains(&name_str) {
+            if name_str.starts_with("x-") && !is_internal_header(name_str) {
                 to.append(name.clone(), value.clone());
             }
         }

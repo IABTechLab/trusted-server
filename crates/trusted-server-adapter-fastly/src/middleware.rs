@@ -11,7 +11,7 @@ use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderValue, Response};
 use edgezero_core::middleware::{Middleware, Next};
 use edgezero_core::response::IntoResponse;
-use trusted_server_core::constants::{ENV_FASTLY_IS_STAGING, HEADER_X_TS_ENV};
+use trusted_server_core::constants::HEADER_X_TS_ENV;
 use trusted_server_core::http_util::{ROUTE_NAMESPACE, strip_deployment_headers};
 use trusted_server_core::settings::Settings;
 
@@ -91,7 +91,7 @@ impl Middleware for FinalizeResponseMiddleware {
 /// 4. `X-Robots-Tag: noindex, nofollow` when `[robots-txt] modules` selects
 ///    `refuse_all`
 pub(crate) fn apply_finalize_headers(settings: &Settings, response: &mut Response) {
-    if std::env::var(ENV_FASTLY_IS_STAGING).as_deref() == Ok("1") {
+    if crate::app::fastly_is_staging() {
         response
             .headers_mut()
             .insert(HEADER_X_TS_ENV, HeaderValue::from_static("staging"));

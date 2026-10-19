@@ -1,6 +1,6 @@
 //! KV identity graph schema types.
 //!
-//! These types define the JSON schema stored in the Fastly KV Store for the
+//! These types define the JSON schema stored in the platform's KV store for the
 //! EC identity graph. Each EC ID (`{64hex}.{6alnum}`) maps to a [`KvEntry`]
 //! containing consent state, geo location, and accumulated partner IDs.
 //!
@@ -202,8 +202,10 @@ pub struct KvNetwork {
 
 /// Compact metadata stored alongside the KV entry body.
 ///
-/// Fastly KV metadata is limited to 2048 bytes and can be read without
-/// streaming the full body. Used by batch sync for fast consent checks.
+/// Metadata can be read without streaming the full body, and a platform's
+/// store may bound its size, so it stays small. An adapter whose store bounds
+/// it tests that the largest value fits. Used by batch sync for fast consent
+/// checks.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KvMetadata {
     /// Mirrors [`KvConsent::ok`] — `false` means tombstone.
@@ -667,25 +669,6 @@ mod tests {
         let meta: KvMetadata = serde_json::from_str(json).expect("should deserialize old metadata");
 
         assert!(meta.cluster_size.is_none(), "should default to None");
-    }
-
-    #[test]
-    fn metadata_fits_in_2048_bytes() {
-        // Worst case: all fields populated.
-        let meta = KvMetadata {
-            ok: false,
-            country: "XX".to_owned(),
-            v: SCHEMA_VERSION,
-            cluster_size: Some(u32::MAX),
-            is_mobile: Some(2),
-            known_browser: Some(true),
-        };
-        let json = serde_json::to_string(&meta).expect("should serialize KvMetadata");
-        assert!(
-            json.len() <= 2048,
-            "metadata must fit in Fastly's 2048-byte limit, got {} bytes",
-            json.len()
-        );
     }
 
     #[test]

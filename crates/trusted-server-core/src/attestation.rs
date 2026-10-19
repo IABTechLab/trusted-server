@@ -81,7 +81,6 @@ pub const ORIGIN_ASSET_PREFIXES: &[&str] = &[
     "_framework",
     "_next",
     "_nuxt",
-    "_vercel",
 ];
 
 /// The signature algorithm, as JOSE names it.

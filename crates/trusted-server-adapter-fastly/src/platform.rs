@@ -26,9 +26,10 @@ use trusted_server_core::settings::TrustedClientIpConfig;
 
 /// Fastly [`ConfigStore`]-backed implementation of [`PlatformConfigStore`].
 ///
-/// Reads take the store name on each call. The service never writes to a
-/// config store, so `put` and `delete` are refused. Signing keys are written
-/// by `ts keys`.
+/// Reads take the store name on each call, and a document stored in chunks
+/// because it is longer than an entry is read back whole, see
+/// [`crate::config_chunks`]. The service never writes to a config store, so
+/// `put` and `delete` are refused. Signing keys are written by `ts keys`.
 pub struct FastlyPlatformConfigStore;
 
 impl PlatformConfigStore for FastlyPlatformConfigStore {
@@ -38,17 +39,8 @@ impl PlatformConfigStore for FastlyPlatformConfigStore {
             Report::new(PlatformError::ConfigStore)
                 .attach(format!("failed to open config store '{name}': {e}"))
         })?;
-        store
-            .try_get(key)
-            .map_err(|e| {
-                Report::new(PlatformError::ConfigStore).attach(format!(
-                    "lookup for key '{key}' in config store '{name}' failed: {e}"
-                ))
-            })?
-            .ok_or_else(|| {
-                Report::new(PlatformError::ConfigStore)
-                    .attach(format!("key '{key}' not found in config store '{name}'"))
-            })
+        let value = read_entry(&store, name, key)?;
+        crate::config_chunks::whole_entry(value, |chunk| read_entry(&store, name, chunk))
     }
 
     fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
@@ -60,6 +52,21 @@ impl PlatformConfigStore for FastlyPlatformConfigStore {
         Err(Report::new(PlatformError::ConfigStore)
             .attach("the service does not write to config stores"))
     }
+}
+
+/// The value at `key` in the open config store `store`, named `name`.
+fn read_entry(store: &ConfigStore, name: &str, key: &str) -> Result<String, Report<PlatformError>> {
+    store
+        .try_get(key)
+        .map_err(|e| {
+            Report::new(PlatformError::ConfigStore).attach(format!(
+                "lookup for key '{key}' in config store '{name}' failed: {e}"
+            ))
+        })?
+        .ok_or_else(|| {
+            Report::new(PlatformError::ConfigStore)
+                .attach(format!("key '{key}' not found in config store '{name}'"))
+        })
 }
 
 // ---------------------------------------------------------------------------

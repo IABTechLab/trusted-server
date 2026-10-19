@@ -8,11 +8,11 @@
 //! request.
 //!
 //! These traits are the service interfaces. Concrete implementations live with
-//! the host or vendor that supplies them (for example `FastlyHostSignals` in
-//! `trusted-server-device-fastly`). An injected service outlives the borrow of
-//! the live request, so an implementation owns its data ([`OwnedRequestInfo`] is
-//! the built-in owned snapshot, while [`BorrowedRequestInfo`] is the borrowed
-//! view core builds on the request path and must not outlive the request).
+//! the host or vendor that supplies them, in an adapter or a device crate. An
+//! injected service outlives the borrow of the live request, so an
+//! implementation owns its data ([`OwnedRequestInfo`] is the built-in owned
+//! snapshot, while [`BorrowedRequestInfo`] is the borrowed view core builds on
+//! the request path and must not outlive the request).
 //!
 //! [`RequestInfo`] describes what a request carries, not what code in this
 //! repository happens to read today, so it carries the whole of it whether or
@@ -24,8 +24,8 @@ use http::HeaderMap;
 
 /// Host-computed client signals that are not carried in request headers.
 ///
-/// A host that can compute them supplies an implementation (Fastly exposes the
-/// TLS JA4 and HTTP/2 signals). A module that needs them takes
+/// A host that can compute them, such as a platform exposing a connection's
+/// TLS and HTTP/2 signals, supplies an implementation. A module that needs them takes
 /// `Arc<dyn HostSignals>` in its constructor, and on a host that supplies none
 /// the module cannot be built and the request stops.
 pub trait HostSignals: Send + Sync + core::fmt::Debug {

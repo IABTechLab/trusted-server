@@ -380,9 +380,9 @@ pub struct CreativeOpportunitiesConfig {
     /// [`Self::origin_is_cookie_independent`], which only ever applies to cookie-bearing
     /// requests, readthrough admits *cookieless* requests — first-time visitors, which is
     /// exactly when an origin issues a session cookie. There is no response-side guard on
-    /// this path: the decision is made before the origin replies, and no post-response
-    /// hook is reachable on the Fastly adapter. Safety therefore rests on the origin's own
-    /// `Cache-Control` plus an operator's verification, so enabling it must be a
+    /// this path: the decision is made before the origin replies, and the platform's cache
+    /// stores the reply before any hook of core's runs. Safety therefore rests on the
+    /// origin's own `Cache-Control` plus an operator's verification, so enabling it must be a
     /// deliberate act rather than a consequence of deploying.
     ///
     /// Configured [`Self::template_cache_key_cookies`] disable readthrough because

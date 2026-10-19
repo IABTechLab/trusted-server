@@ -192,10 +192,11 @@ pull_sync_concurrency = 3
 # Device-detection module. Selects how a request is classified into device
 # signals (browser/bot gating). Default "builtin" classifies from the User-Agent
 # alone and makes no host call, so a default deployment stays host-neutral. The
-# opt-in "fastly" module adds the host's TLS/H2 signals to the gate.
+# opt-in "platform" module adds the host's TLS/H2 signals to the gate, where the
+# adapter's platform supplies them.
 # Override at deployment with TRUSTED_SERVER__device__module.
 # [device]
-# module = "builtin"   # or "fastly" to add TLS/H2 signal evidence
+# module = "builtin"   # or "platform" to add TLS/H2 signal evidence
 
 [geo]
 # Geo / IP intelligence module. No module is the default: Trusted Server

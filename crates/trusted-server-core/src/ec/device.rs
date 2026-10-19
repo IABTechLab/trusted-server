@@ -1,7 +1,7 @@
 //! Device signal derivation for bot detection and browser classification.
 //!
 //! The [`DeviceSignals`] derivation here is pure computation, with no KV I/O or
-//! Fastly SDK calls. A [`DeviceModule`] is handed the request's module context
+//! platform SDK calls. A [`DeviceModule`] is handed the request's module context
 //! when `detect` is called and names what it reads from it, the
 //! [`RequestInfo`] for the User-Agent among them. On a host that supplies
 //! them, it also reads the [`HostSignals`](crate::evidence::HostSignals) for
@@ -131,9 +131,10 @@ fn kept_text(module: &str, field: &str, value: Option<String>) -> Option<String>
 
 /// Device signals derived from a single request.
 ///
-/// Computed in the Fastly adapter from raw TLS/H2/UA data, then passed to
-/// core for storage and gating decisions. This type lives in core so it
-/// can be used in [`KvDevice`] construction and tested without Fastly.
+/// Computed by the device module from the User-Agent, and from the raw TLS
+/// and HTTP/2 signals where the platform supplies them, then passed to core
+/// for storage and gating decisions. This type lives in core so it can be
+/// used in [`KvDevice`] construction and tested without any platform.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DeviceSignals {
     /// `0` = desktop, `1` = mobile, `2` = unknown.
@@ -149,8 +150,8 @@ pub struct DeviceSignals {
     pub known_browser: Option<bool>,
     /// Whether the request looks like a real browser, used to gate Edge Cookie
     /// writes. Computed by the producing module: the built-in module uses a
-    /// User-Agent-only heuristic, while the Fastly module strengthens it with
-    /// the TLS and HTTP/2 signals.
+    /// User-Agent-only heuristic, while the platform's own module strengthens
+    /// it with the TLS and HTTP/2 signals.
     ///
     /// [`human_confidence`](Self::human_confidence) is the module's answer
     /// about a person, which nothing reads yet.
@@ -202,7 +203,7 @@ impl DeviceSignals {
     /// Derives device signals from the User-Agent alone, with no
     /// host-specific TLS or HTTP/2 evidence.
     ///
-    /// This is the default path. It touches no Fastly-specific API, so device
+    /// This is the default path. It touches no platform-specific API, so device
     /// classification stays host-neutral by default. `ja4_class` and
     /// `h2_fp_hash` are left absent, and the browser/bot decision uses a
     /// User-Agent-only heuristic (`looks_like_browser_from_ua`).
@@ -226,11 +227,11 @@ impl DeviceSignals {
     /// Derives device signals from the User-Agent strengthened with the
     /// host's TLS and HTTP/2 signals.
     ///
-    /// `ua` is the `User-Agent` header value. `ja4` is the full JA4 hash
-    /// from `req.get_tls_ja4()`. `h2_fp` is the raw H2 SETTINGS string
-    /// from `req.get_client_h2_fingerprint()`. These signals are
-    /// host-specific (Fastly), so only the opt-in Fastly device module
-    /// uses this path, and the browser/bot gate then requires a TLS signal.
+    /// `ua` is the `User-Agent` header value. `ja4` is the full JA4 hash and
+    /// `h2_fp` the raw H2 SETTINGS string, as the platform reports them.
+    /// These signals are host-specific, so only the platform's own device
+    /// module, selected with `platform`, uses this path, and the browser/bot
+    /// gate then requires a TLS signal.
     #[must_use]
     pub fn derive(ua: &str, ja4: Option<&str>, h2_fp: Option<&str>) -> Self {
         let is_mobile = parse_is_mobile(ua);
@@ -372,13 +373,13 @@ impl DeviceModule for BuiltinDeviceModule {
 /// The device module core or the adapter supplies for the `[device] module`
 /// selector.
 ///
-/// Returns the built-in User-Agent-only module unless the `fastly` selector is
-/// set, in which case it builds the host-specific module through the
-/// `build_fastly` factory the adapter supplies. The factory runs only when that
-/// module is selected, so device classification itself reads no host signals
-/// by default (see [`BuiltinDeviceModule`] for the host-neutral default). The
-/// Fastly entry point still reads the TLS and HTTP/2 signals on every request to
-/// build the host-signal service and client info.
+/// Returns the built-in User-Agent-only module unless the `platform` selector
+/// is set, in which case it builds the host platform's own module through the
+/// `build_platform` factory the adapter supplies. The factory runs only when
+/// that module is selected, so device classification itself reads no host
+/// signals by default (see [`BuiltinDeviceModule`] for the host-neutral
+/// default). An adapter's entry point may still read its platform's signals
+/// on every request for other uses, such as the client info.
 ///
 /// A module a registration supplies is resolved by the integration registry,
 /// which refuses a name no module supplies when it is built. A caller uses
@@ -387,10 +388,10 @@ impl DeviceModule for BuiltinDeviceModule {
 #[must_use]
 pub fn build_device_module(
     settings: &Settings,
-    build_fastly: impl FnOnce() -> Box<dyn DeviceModule>,
+    build_platform: impl FnOnce() -> Box<dyn DeviceModule>,
 ) -> Box<dyn DeviceModule> {
     match settings.device.module_key() {
-        "fastly" => build_fastly(),
+        "platform" => build_platform(),
         _ => Box::new(BuiltinDeviceModule::new()),
     }
 }
@@ -456,8 +457,9 @@ fn parse_platform_class(ua: &str) -> Option<String> {
 ///
 /// This is the default, host-neutral gate. It filters obvious non-browser
 /// traffic but does not resist a bot that forges a complete browser
-/// User-Agent. The opt-in Fastly device module strengthens the gate with the
-/// TLS and HTTP/2 signals for deployments that need it.
+/// User-Agent. The platform's own device module, selected with `platform`,
+/// strengthens the gate with the TLS and HTTP/2 signals for deployments that
+/// need it.
 #[must_use]
 fn looks_like_browser_from_ua(ua: &str, platform_class: Option<&str>) -> bool {
     platform_class.is_some() && ua.contains("Mozilla/") && !looks_like_bot_ua(ua)
@@ -525,7 +527,7 @@ fn compute_h2_fp_hash(raw_h2_fp: &str) -> String {
 /// `h2_fp_prefix` is the raw H2 SETTINGS string (not the hash) — we
 /// compare against the hash computed from it.
 ///
-/// Empirically derived from Fastly Compute production responses (2026-04-03).
+/// Empirically derived from production traffic at the edge (2026-04-03).
 const KNOWN_BROWSERS: &[(&str, &str, bool)] = &[
     // Chrome/Mac v146
     ("t13d1516h2", "1:65536;2:0;4:6291456;6:262144", true),
@@ -1086,14 +1088,14 @@ mod tests {
         OwnedRequestInfo::new(String::new(), headers)
     }
 
-    /// A stand-in for the host-specific module the adapter injects, so the
-    /// selection logic can be tested in core without the Fastly module crate.
-    struct StubFastlyModule;
+    /// A stand-in for the platform's own module the adapter injects, so the
+    /// selection logic can be tested in core without a platform's module crate.
+    struct StubPlatformModule;
 
     #[async_trait::async_trait(?Send)]
-    impl DeviceModule for StubFastlyModule {
+    impl DeviceModule for StubPlatformModule {
         fn id(&self) -> &'static str {
-            "fastly"
+            "stub-platform-module"
         }
 
         async fn detect(&self, _call: ModuleCall<'_>) -> DeviceSignals {
@@ -1115,20 +1117,21 @@ mod tests {
         // injected candidate.
         let settings = crate::settings::Settings::default();
         let default = build_device_module(&settings, || {
-            Box::new(StubFastlyModule) as Box<dyn DeviceModule>
+            Box::new(StubPlatformModule) as Box<dyn DeviceModule>
         });
         assert_eq!(default.id(), "builtin", "no selector should be UA-only");
 
-        // The `fastly` selector returns the module the adapter's factory builds.
-        let mut fastly = crate::settings::Settings::default();
-        fastly.device.module = Some("fastly".to_owned());
-        let selected = build_device_module(&fastly, || {
-            Box::new(StubFastlyModule) as Box<dyn DeviceModule>
+        // The `platform` selector returns the module the adapter's factory
+        // builds.
+        let mut platform = crate::settings::Settings::default();
+        platform.device.module = Some("platform".to_owned());
+        let selected = build_device_module(&platform, || {
+            Box::new(StubPlatformModule) as Box<dyn DeviceModule>
         });
         assert_eq!(
             selected.id(),
-            "fastly",
-            "the fastly selector should use the injected module"
+            "stub-platform-module",
+            "the platform selector should use the injected module"
         );
     }
 }
