@@ -25,14 +25,16 @@ use super::cli_candidate::{
     CliCandidateFacts, CliFixture, OPERATOR_SENTINELS, ReproductionOutcome, check_build_budget,
     cli_candidate_measurement, finish_cleanup, new_startup_client, reproduction_result,
 };
-use super::full::{
-    cargo_fixture, path_text, try_ordinary_ci_ambient, try_prepare_vendor, try_proven_boundary,
+use super::full::try_proven_boundary;
+use super::real_fixture::{
+    cargo_fixture, environment_with_operator_values, path_text, try_ordinary_ci_ambient,
+    try_prepare_vendor,
 };
 use super::*;
 use crate::boundary::{Boundary, BoundaryRoots, ConfinedCommand, ImageSelection, ProbeProgram};
 use crate::documents::{parse_json, read_bounded};
 use crate::inspect::{ElfPolicy, inspect_elf};
-use crate::preflight::{AuditedEnvironment, audit_environment};
+use crate::preflight::AuditedEnvironment;
 use crate::preparation::tests::full::{JsFixtureRun, run_two_fresh_js_builds};
 use crate::process::{Cancellation, ProcessLimits};
 
@@ -48,25 +50,6 @@ fn cli_fixture() -> (PathBuf, CliFixture) {
         parse_json(&raw.bytes, DocumentRole::Metadata).expect("should parse the description");
     let fixture = CliFixture::parse(&document).expect("should accept the CLI fixture description");
     (root, fixture)
-}
-
-/// Audits an inherited environment carrying the planted operator values and
-/// requires preflight to remove every one of them.
-fn environment_with_operator_values() -> (AuditedEnvironment, Vec<String>) {
-    let mut snapshot = vec![(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))];
-    snapshot.extend(
-        OPERATOR_SENTINELS
-            .iter()
-            .map(|(name, value)| (OsString::from(name), OsString::from(value))),
-    );
-    let audited = audit_environment(&snapshot).expect("should remove, not reject, operator values");
-    let removed = audited.removed_names().to_vec();
-    assert_eq!(
-        removed.len(),
-        OPERATOR_SENTINELS.len(),
-        "should remove every planted operator variable"
-    );
-    (audited, removed)
 }
 
 /// Everything shared by both CLI builds.

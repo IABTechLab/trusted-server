@@ -4,6 +4,11 @@
  * This is unauthenticated ordinary CI acquisition: it copies the runner's
  * rustup toolchain and downloads crates and Git objects over the network. It
  * does not authenticate or qualify any release tool, image or input.
+ *
+ * On Linux the fixture also names a locally built container image. On macOS
+ * it names none (`image_id: null`), requires the host Darwin standard
+ * library instead of the Wasm one, and retains a fresh `source/` clone of
+ * HEAD for the candidate run to authenticate.
  */
 import crypto from 'node:crypto'
 import fs from 'node:fs'
@@ -13,6 +18,10 @@ import { execFileSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
 const WASM_TARGET = 'wasm32-wasip1'
+const DARWIN_TARGETS = {
+  arm64: 'aarch64-apple-darwin',
+  x64: 'x86_64-apple-darwin',
+}
 const CRATES_IO = 'registry+https://github.com/rust-lang/crates.io-index'
 const MAXIMUM_CRATE = 64 * 1024 * 1024
 
@@ -41,8 +50,9 @@ function pinnedRustVersion() {
 }
 const RUST_VERSION = pinnedRustVersion()
 const [destinationArgument, producerArgument] = process.argv.slice(2)
-if (process.platform !== 'linux')
-  throw new Error('Cargo fixture requires Linux')
+const darwin = process.platform === 'darwin'
+if (process.platform !== 'linux' && !darwin)
+  throw new Error('Cargo fixture requires Linux or macOS')
 if (!destinationArgument || !producerArgument || process.argv.length !== 4)
   throw new Error(
     'Expected fresh fixture destination and source-built producer'
@@ -100,14 +110,26 @@ if (!rustcVersion.startsWith(`rustc ${RUST_VERSION} `))
   throw new Error(
     `Fixture requires Rust ${RUST_VERSION}, found ${rustcVersion}`
   )
-const wasmStd = path.join(sysroot, 'lib/rustlib', WASM_TARGET, 'lib')
+/** The target whose standard library the fixture's builds need. */
+function requiredStdTarget() {
+  if (!darwin) return WASM_TARGET
+  const expected = DARWIN_TARGETS[process.arch]
+  const host = /^host: (\S+)$/m.exec(
+    text(path.join(sysroot, 'bin/rustc'), ['-vV'])
+  )?.[1]
+  if (!expected || host !== expected)
+    throw new Error(
+      `Darwin fixture requires a native ${expected ?? process.arch} toolchain, found ${host}`
+    )
+  return host
+}
+const stdTarget = requiredStdTarget()
+const targetStd = path.join(sysroot, 'lib/rustlib', stdTarget, 'lib')
 if (
-  !fs.existsSync(wasmStd) ||
-  !fs.readdirSync(wasmStd).some((name) => name.startsWith('libstd-'))
+  !fs.existsSync(targetStd) ||
+  !fs.readdirSync(targetStd).some((name) => name.startsWith('libstd-'))
 )
-  throw new Error(
-    `Selected toolchain lacks the ${WASM_TARGET} standard library`
-  )
+  throw new Error(`Selected toolchain lacks the ${stdTarget} standard library`)
 fs.cpSync(sysroot, tools, {
   recursive: true,
   dereference: false,
@@ -300,33 +322,59 @@ for (const record of gitPackages) {
   })
 }
 
-// 7. The ordinary CI image with a host linker, identified only by its ID.
-const dockerConfig = path.join(work, 'docker-config')
-fs.mkdirSync(dockerConfig, { mode: 0o700 })
-const imageFile = path.join(work, 'image-id')
-run('/usr/bin/docker', [
-  '--config',
-  dockerConfig,
-  '--host',
-  'unix:///var/run/docker.sock',
-  'build',
-  '--pull',
-  '--iidfile',
-  imageFile,
-  '--file',
-  path.join(source, 'scripts/release/tests/cargo-fixture.Dockerfile'),
-  path.join(source, 'scripts/release/tests'),
-])
-const image = fs.readFileSync(imageFile, 'utf8').trim()
-if (!/^sha256:[a-f0-9]{64}$/.test(image))
-  throw new Error('Expected actual local fixture image identity')
+/** The ordinary CI image with a host linker, identified only by its ID. */
+function buildLinuxImage() {
+  const dockerConfig = path.join(work, 'docker-config')
+  fs.mkdirSync(dockerConfig, { mode: 0o700 })
+  const imageFile = path.join(work, 'image-id')
+  run('/usr/bin/docker', [
+    '--config',
+    dockerConfig,
+    '--host',
+    'unix:///var/run/docker.sock',
+    'build',
+    '--pull',
+    '--iidfile',
+    imageFile,
+    '--file',
+    path.join(source, 'scripts/release/tests/cargo-fixture.Dockerfile'),
+    path.join(source, 'scripts/release/tests'),
+  ])
+  const image = fs.readFileSync(imageFile, 'utf8').trim()
+  if (!/^sha256:[a-f0-9]{64}$/.test(image))
+    throw new Error('Expected actual local fixture image identity')
+  return image
+}
+
+/**
+ * A fresh clone of HEAD retained for source authentication, never the clone
+ * Cargo fetched and vendored in, with the minimal Git configuration the JS
+ * fixture also uses.
+ */
+function retainDarwinSource() {
+  const retained = path.join(destination, 'source')
+  run('git', ['clone', '--no-hardlinks', '--no-checkout', '--', root, retained])
+  run('git', ['checkout', '--detach', '--force', 'HEAD'], { cwd: retained })
+  fs.writeFileSync(
+    path.join(retained, '.git/config'),
+    '[core]\nrepositoryformatversion = 0\nbare = false\nfilemode = true\n'
+  )
+  if (text('git', ['rev-parse', 'HEAD'], { cwd: retained }) !== commit)
+    throw new Error('Retained source is not the fixture commit')
+}
+
+// 7. Linux: the builder image. macOS: no image, and a retained source clone.
+const image = darwin ? null : buildLinuxImage()
+if (darwin) retainDarwinSource()
 
 fs.rmSync(work, { recursive: true, force: true })
 fs.writeFileSync(
   path.join(destination, 'fixture.json'),
   JSON.stringify({
     schema_version: 1,
-    kind: 'ordinary-ci-cargo-fixture',
+    kind: darwin
+      ? 'ordinary-ci-macos-cargo-fixture'
+      : 'ordinary-ci-cargo-fixture',
     acquisition: 'unauthenticated-ordinary-ci',
     source_commit: commit,
     cargo_lock_sha256: sha256(lockBytes),

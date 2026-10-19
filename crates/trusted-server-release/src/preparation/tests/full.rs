@@ -231,6 +231,33 @@ fn two_fresh_js_builds(
     (completed, measurement)
 }
 
+/// Runs the two fresh JS builds and exports the retained handoff and its
+/// measurement into the fresh directory named by
+/// `TS_RELEASE_JS_HANDOFF_EXPORT`, for the macOS candidate jobs to adopt.
+///
+/// The export is an unauthenticated ordinary CI artifact; adoption labels it
+/// so, and nothing here is release qualification.
+#[test]
+#[ignore = "requires explicit original-only fixture, an export destination and Linux Docker; run separately in producer CI"]
+fn export_js_handoff_for_candidates() {
+    let destination = std::env::var_os("TS_RELEASE_JS_HANDOFF_EXPORT")
+        .map(PathBuf::from)
+        .expect("should explicitly supply the JS handoff export destination");
+    let run = run_two_fresh_js_builds();
+    run.completed
+        .export_ordinary_ci_handoff_for_tests(&run.measurement, &destination)
+        .expect("should export the rehashed handoff and its measurement");
+    let (handoff, measurement) =
+        JsBuildCompleted::read_exported_ordinary_ci_handoff_for_tests(&destination)
+            .expect("should read back exactly the exported handoff and measurement");
+    JsBuildCompleted::adopt_ordinary_ci_handoff_for_tests(&run.source, &handoff, &measurement)
+        .expect("should adopt the export as the macOS jobs will");
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&run.measurement).expect("should encode the JS measurement")
+    );
+}
+
 #[test]
 #[ignore = "requires explicit original-only fixture and Linux Docker; run separately in producer CI"]
 fn real_two_fresh_js_builds() {

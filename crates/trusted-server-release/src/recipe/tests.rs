@@ -343,8 +343,15 @@ mod darwin;
 mod fixture;
 #[cfg(target_os = "linux")]
 mod full;
+#[cfg(target_os = "macos")]
+mod full_macos;
+mod macos_candidate;
+#[cfg(target_os = "macos")]
+mod macos_cli;
 mod native;
 mod plan;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod real_fixture;
 mod remap;
 mod runtime;
 mod sources;

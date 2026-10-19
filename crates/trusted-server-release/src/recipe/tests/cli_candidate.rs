@@ -206,7 +206,7 @@ pub(super) enum ReproductionOutcome<'a> {
 }
 
 /// The reproduction outcome the measurement records.
-fn reproduction_measurement(outcome: &ReproductionOutcome<'_>) -> Value {
+pub(super) fn reproduction_measurement(outcome: &ReproductionOutcome<'_>) -> Value {
     match outcome {
         ReproductionOutcome::NotAttempted => {
             json!({"status": "not-attempted", "gate": "measurement-only"})

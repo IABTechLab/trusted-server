@@ -8,10 +8,13 @@
 //! uses, and requires every module digest and the measurement's inventory
 //! digest to match. The artifact itself is not authenticated, and the
 //! returned measurement says so.
+//!
+//! The Linux job exports the artifact as a root holding exactly the
+//! retained handoff directory and its measurement beside it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use error_stack::Report;
@@ -19,7 +22,7 @@ use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
 use super::super::{JsBuildCompleted, Module, filenames, inventory_modules};
-use crate::documents::{Role, read_bounded};
+use crate::documents::{Role, parse_json, read_bounded};
 use crate::error::ReleaseError;
 use crate::preparation::{JsAttempt, preparation_error};
 use crate::process::Cancellation;
@@ -33,6 +36,10 @@ pub(crate) const ADOPTED_ORIGIN: &str = "linux-ordinary-ci-artifact";
 const ADOPTED_LIFETIME: Duration = Duration::from_secs(4 * 60 * 60);
 /// The exact entries of a retained handoff.
 const HANDOFF_ENTRIES: [&str; 3] = ["bundles", "npm-observation.json", "tsjs-inventory.json"];
+/// Directory of an exported root holding the three retained entries.
+const EXPORTED_HANDOFF: &str = "handoff";
+/// The Linux job's JS measurement beside the exported handoff.
+const EXPORTED_MEASUREMENT: &str = "js-execution-measurement.json";
 
 fn lower_hex_64(value: &Value) -> Option<&str> {
     value.as_str().filter(|text| {
@@ -116,6 +123,70 @@ fn read_modules(
 }
 
 impl JsBuildCompleted {
+    /// Exports the retained handoff and its ordinary CI `measurement` into
+    /// the fresh `destination` for the macOS candidate jobs.
+    ///
+    /// The source handoff is rehashed before and after the copy. The caller
+    /// must read and adopt the export to verify its copied bytes against the
+    /// measurement before transferring or using it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the retained root no longer rehashes,
+    /// `destination` exists or its parent does not, or a copy or the
+    /// measurement cannot be written.
+    pub(crate) fn export_ordinary_ci_handoff_for_tests(
+        &self,
+        measurement: &Value,
+        destination: &Path,
+    ) -> Result<(), Report<ReleaseError>> {
+        let retained = self.rehash_for_handoff()?;
+        fs::create_dir(destination).map_err(preparation_error)?;
+        let handoff = destination.join(EXPORTED_HANDOFF);
+        fs::create_dir_all(handoff.join("bundles")).map_err(preparation_error)?;
+        for name in ["tsjs-inventory.json", "npm-observation.json"] {
+            fs::copy(retained.join(name), handoff.join(name)).map_err(preparation_error)?;
+        }
+        for module in self.modules.values() {
+            fs::copy(
+                retained.join("bundles").join(&module.filename),
+                handoff.join("bundles").join(&module.filename),
+            )
+            .map_err(preparation_error)?;
+        }
+        let encoded = serde_json::to_vec_pretty(measurement).map_err(preparation_error)?;
+        fs::write(destination.join(EXPORTED_MEASUREMENT), encoded).map_err(preparation_error)?;
+        self.rehash_for_handoff()?;
+        Ok(())
+    }
+
+    /// Reads a root the Linux job exported: exactly the handoff directory and
+    /// the measurement file, nothing else.
+    ///
+    /// Returns the handoff directory and the parsed measurement; neither is
+    /// authenticated, and [`Self::adopt_ordinary_ci_handoff_for_tests`]
+    /// checks both.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the root holds any other entry, or the
+    /// measurement cannot be read or parsed as JSON.
+    pub(crate) fn read_exported_ordinary_ci_handoff_for_tests(
+        root: &Path,
+    ) -> Result<(PathBuf, Value), Report<ReleaseError>> {
+        let expected: BTreeSet<String> = [EXPORTED_HANDOFF, EXPORTED_MEASUREMENT]
+            .map(str::to_owned)
+            .into();
+        if filenames(root, expected.len()).ok() != Some(expected) {
+            return Err(preparation_error(
+                "exported JS root holds entries beyond the handoff and its measurement",
+            ));
+        }
+        let raw = read_bounded(&root.join(EXPORTED_MEASUREMENT), Role::Metadata)?;
+        let measurement = parse_json(&raw.bytes, Role::Metadata)?;
+        Ok((root.join(EXPORTED_HANDOFF), measurement))
+    }
+
     /// Adopts a Linux ordinary CI JS handoff for a macOS candidate run.
     ///
     /// Returns the private copy and a measurement labelling its origin as
@@ -288,6 +359,75 @@ mod tests {
         adopted
             .rehash_for_handoff()
             .expect("should not depend on the original artifact");
+    }
+
+    #[test]
+    fn exported_handoff_reads_back_and_adopts_unchanged() {
+        let (directory, measurement) = handoff(COMMIT);
+        let (adopted, _) = JsBuildCompleted::adopt_ordinary_ci_handoff_for_tests(
+            &source(COMMIT),
+            directory.path(),
+            &measurement,
+        )
+        .expect("should adopt the original handoff");
+        let scratch = tempfile::tempdir().expect("should create the export parent");
+        let exported = scratch.path().join("js-handoff");
+
+        adopted
+            .export_ordinary_ci_handoff_for_tests(&measurement, &exported)
+            .expect("should export the retained handoff");
+        let (handoff_root, read_measurement) =
+            JsBuildCompleted::read_exported_ordinary_ci_handoff_for_tests(&exported)
+                .expect("should read the exported root");
+
+        assert_eq!(handoff_root, exported.join("handoff"));
+        assert_eq!(
+            read_measurement, measurement,
+            "should carry the measurement unchanged"
+        );
+        let (readopted, label) = JsBuildCompleted::adopt_ordinary_ci_handoff_for_tests(
+            &source(COMMIT),
+            &handoff_root,
+            &read_measurement,
+        )
+        .expect("should adopt the exported handoff");
+        assert_eq!(readopted.inventory_sha256(), adopted.inventory_sha256());
+        assert_eq!(label["js_handoff"]["authenticated"], false);
+        assert!(
+            adopted
+                .export_ordinary_ci_handoff_for_tests(&measurement, &exported)
+                .is_err(),
+            "should refuse an existing destination"
+        );
+    }
+
+    #[test]
+    fn exported_roots_with_extra_or_missing_entries_are_rejected() {
+        let scratch = tempfile::tempdir().expect("should create the export root");
+        let root = scratch.path();
+        fs::create_dir(root.join("handoff")).expect("should create the handoff");
+        assert!(
+            JsBuildCompleted::read_exported_ordinary_ci_handoff_for_tests(root).is_err(),
+            "should reject a root without its measurement"
+        );
+        fs::write(root.join("js-execution-measurement.json"), b"{}")
+            .expect("should write the measurement");
+        JsBuildCompleted::read_exported_ordinary_ci_handoff_for_tests(root)
+            .expect("should read an exact root");
+        fs::write(root.join("extra.json"), b"{}").expect("should add an entry");
+        let error = JsBuildCompleted::read_exported_ordinary_ci_handoff_for_tests(root)
+            .expect_err("should reject an extra entry");
+        assert!(
+            format!("{error:?}").contains("beyond the handoff and its measurement"),
+            "should name the unexpected entry: {error:?}"
+        );
+        fs::remove_file(root.join("extra.json")).expect("should remove the extra entry");
+        fs::write(root.join("js-execution-measurement.json"), b"not json")
+            .expect("should corrupt the measurement");
+        assert!(
+            JsBuildCompleted::read_exported_ordinary_ci_handoff_for_tests(root).is_err(),
+            "should reject a measurement that is not JSON"
+        );
     }
 
     #[test]

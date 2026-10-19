@@ -673,6 +673,286 @@ jobs:
             done
           fi
 
+  # Decides whether the macOS candidate jobs and their Linux JS handoff run.
+  # It fails open: any error, a new branch or an unknown event selects them.
+  # Skipped jobs report success, so nothing else depends on this filter.
+  changes:
+    name: Detect release candidate changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      release: ${{ steps.filter.outputs.release }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0 (Node 24)
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Match changed paths against the release candidate inputs
+        id: filter
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PULL_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PULL_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          PUSH_AFTER_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          node --test scripts/release/tests/candidate-changes.test.mjs
+          select_release() {
+            echo "release=$1" >> "$GITHUB_OUTPUT"
+            echo "Release candidate jobs selected: $1 ($2)"
+            exit 0
+          }
+          case "$EVENT_NAME" in
+            pull_request) RANGE="$PULL_BASE_SHA...$PULL_HEAD_SHA" ;;
+            push) RANGE="$PUSH_BEFORE_SHA..$PUSH_AFTER_SHA" ;;
+            *) select_release true "event $EVENT_NAME" ;;
+          esac
+          if [[ "$RANGE" == *0000000000000000000000000000000000000000* || "$RANGE" == ...* || "$RANGE" == *... || "$RANGE" == ..* ]]; then
+            select_release true "no comparable base"
+          fi
+          if ! SELECTED="$(bash scripts/release/tests/candidate-changes.sh "$RANGE")"; then
+            select_release true "cannot classify $RANGE"
+          fi
+          case "$SELECTED" in
+            true|false) select_release "$SELECTED" "comparison $RANGE" ;;
+            *) select_release true "unexpected classifier result" ;;
+          esac
+
+  # Exports the Linux two-fresh JS handoff for the macOS candidate jobs,
+  # which cannot run the Linux-only JS build. The artifact is unauthenticated
+  # ordinary CI evidence; the adopting job labels it so.
+  test-release-js-handoff:
+    name: cargo test (export Linux JS handoff for macOS candidates)
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.release == 'true') }}
+    runs-on: ubuntu-24.04
+    # Fixture preparation (~3 min, including the JS fixture image) and the
+    # two fresh JS builds (~12 min).
+    timeout-minutes: 30
+    env:
+      # Optimize repeated whole-input hashes with test safety checks retained.
+      CARGO_PROFILE_TEST_OPT_LEVEL: '2'
+      CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: 'true'
+      CARGO_PROFILE_TEST_OVERFLOW_CHECKS: 'true'
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0 (Node 24)
+        with:
+          persist-credentials: false
+          # Full history: the fixture clones this checkout, and source
+          # authentication rejects a shallow repository (`.git/shallow`).
+          fetch-depth: 0
+
+      - name: Read pinned tool versions
+        id: tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "rust=$(awk '$1 == "rust" { print $2 }' .tool-versions)"
+            echo "node=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Use pinned Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0 (Node 24)
+        with:
+          node-version: ${{ steps.tools.outputs.node }}
+          cache: npm
+          cache-dependency-path: crates/trusted-server-js/lib/package-lock.json
+
+      # The runner's installed rustup bootstraps ordinary CI, not the release producer.
+      - name: Install pinned native Rust toolchain
+        env:
+          RUST_VERSION: ${{ steps.tools.outputs.rust }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup override set "$RUST_VERSION"
+          HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+          test "$HOST_TARGET" = x86_64-unknown-linux-gnu
+          echo "HOST_TARGET=$HOST_TARGET" >> "$GITHUB_ENV"
+
+      - name: Prepare original-only full JS fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p trusted-server-release --target "$HOST_TARGET" --locked
+          FIXTURE_ROOT="$RUNNER_TEMP/release-js-original-fixture"
+          EXPORT_ROOT="$RUNNER_TEMP/release-js-handoff"
+          test ! -e "$EXPORT_ROOT"
+          node scripts/release/tests/prepare-js-fixture.mjs "$FIXTURE_ROOT" "target/$HOST_TARGET/debug/trusted-server-release"
+          {
+            echo "TS_RELEASE_JS_FIXTURE_ROOT=$FIXTURE_ROOT"
+            echo "TS_RELEASE_JS_HANDOFF_EXPORT=$EXPORT_ROOT"
+          } >> "$GITHUB_ENV"
+
+      - name: Run two fresh offline JS builds and export the retained handoff
+        shell: bash
+        run: |
+          set -euo pipefail
+          TEST_NAME=preparation::tests::full::export_js_handoff_for_candidates
+          TEST_LIST="$(mktemp)"
+          trap 'rm -f "$TEST_LIST"' EXIT
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --list > "$TEST_LIST"
+          awk '/: test$/ { count++ } END { if (count != 1) { print "Expected exactly one JS handoff export fixture"; exit 1 } }' "$TEST_LIST"
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --nocapture
+          find "$TS_RELEASE_JS_HANDOFF_EXPORT" -type f | sort
+
+      - name: Upload the unauthenticated JS handoff for the macOS candidates
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0 (Node 24)
+        with:
+          name: release-js-handoff
+          path: ${{ env.TS_RELEASE_JS_HANDOFF_EXPORT }}
+          if-no-files-found: error
+          retention-days: 1
+          # A re-run of this job replaces its own earlier upload.
+          overwrite: true
+
+  # Ordinary CI candidate evidence of the Darwin ts on native arm64 and Intel
+  # macOS 15; not release qualification (every measurement reports it). The
+  # unqualified sandbox only reaps descendants after each run, the Xcode is
+  # the runner's, and the JS handoff is the Linux job's unauthenticated
+  # artifact.
+  test-release-macos-cli-candidate:
+    name: cargo test (macOS ts CLI release candidate, ${{ matrix.os }})
+    needs: test-release-js-handoff
+    if: ${{ !cancelled() && needs.test-release-js-handoff.result == 'success' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    # Fixture preparation (~5 min), four denial builds (~5 min), then the
+    # canonical and the measured reproduction confined CLI builds (~10-20 min
+    # each; the Intel runners are the slower) and one native startup.
+    timeout-minutes: 90
+    env:
+      # Optimize repeated whole-input hashes with test safety checks retained.
+      CARGO_PROFILE_TEST_OPT_LEVEL: '2'
+      CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: 'true'
+      CARGO_PROFILE_TEST_OVERFLOW_CHECKS: 'true'
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0 (Node 24)
+        with:
+          persist-credentials: false
+          # Full history: the fixture clones this checkout, and source
+          # authentication rejects a shallow repository (`.git/shallow`).
+          fetch-depth: 0
+
+      - name: Read pinned tool versions
+        id: tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "rust=$(awk '$1 == "rust" { print $2 }' .tool-versions)"
+            echo "node=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Use pinned Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0 (Node 24)
+        with:
+          node-version: ${{ steps.tools.outputs.node }}
+
+      # The runner's installed rustup bootstraps ordinary CI, not the release
+      # producer. The copied toolchain keeps only its host Darwin standard
+      # library, which both the CLI and the denial fixture target.
+      - name: Install pinned native Rust toolchain and check the native host
+        env:
+          RUST_VERSION: ${{ steps.tools.outputs.rust }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup override set "$RUST_VERSION"
+          HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+          case "$(uname -m)" in
+            arm64) EXPECTED_TARGET=aarch64-apple-darwin ;;
+            x86_64) EXPECTED_TARGET=x86_64-apple-darwin ;;
+            *) echo "Unsupported macOS machine $(uname -m)" >&2; exit 1 ;;
+          esac
+          test "$HOST_TARGET" = "$EXPECTED_TARGET"
+          # Absent on Intel hardware; 1 would mean a Rosetta-translated shell.
+          TRANSLATED="$(sysctl -n sysctl.proc_translated 2>/dev/null || echo absent)"
+          echo "sysctl.proc_translated=$TRANSLATED"
+          test "$TRANSLATED" != 1
+          echo "Selected Xcode developer directory: $(xcode-select -p)"
+          echo "HOST_TARGET=$HOST_TARGET" >> "$GITHUB_ENV"
+
+      - name: Prepare ordinary CI Darwin Cargo fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p trusted-server-release --target "$HOST_TARGET" --locked
+          CARGO_FIXTURE_ROOT="$RUNNER_TEMP/release-cargo-fixture"
+          JS_HANDOFF_ROOT="$RUNNER_TEMP/release-js-handoff"
+          test ! -e "$JS_HANDOFF_ROOT"
+          node scripts/release/tests/prepare-cargo-fixture.mjs "$CARGO_FIXTURE_ROOT" "target/$HOST_TARGET/debug/trusted-server-release"
+          {
+            echo "TS_RELEASE_CARGO_FIXTURE_ROOT=$CARGO_FIXTURE_ROOT"
+            echo "TS_RELEASE_JS_HANDOFF_ROOT=$JS_HANDOFF_ROOT"
+          } >> "$GITHUB_ENV"
+          df -h "$RUNNER_TEMP"
+
+      - name: Download the Linux JS handoff into a fresh directory
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0 (Node 24)
+        with:
+          name: release-js-handoff
+          path: ${{ env.TS_RELEASE_JS_HANDOFF_ROOT }}
+
+      - name: Prove Cargo build scripts and proc macros inherit denial (macOS)
+        shell: bash
+        run: |
+          set -euo pipefail
+          TEST_NAME=recipe::tests::full_macos::cargo_children_inherit_denial_macos
+          TEST_LIST="$(mktemp)"
+          trap 'rm -f "$TEST_LIST"' EXIT
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --list > "$TEST_LIST"
+          awk '/: test$/ { count++ } END { if (count != 1) { print "Expected exactly one macOS Cargo denial fixture"; exit 1 } }' "$TEST_LIST"
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --nocapture
+          cat "$TS_RELEASE_CARGO_FIXTURE_ROOT/cargo-denial-measurement.json"
+
+      # The canonical build is gated: Mach-O acceptance with the measured SDK
+      # and a relative debug map, the remap and final-path scans, planted
+      # operator values absent and a native `ts --version` on the reviewed
+      # host. The reproduction build is recorded, never a gate.
+      - name: Build, inspect and start the macOS ts candidate and measure its reproduction (macOS)
+        shell: bash
+        run: |
+          set -euo pipefail
+          TEST_NAME=recipe::tests::macos_cli::macos_cli_candidate_builds_inspects_and_starts_cleanly
+          TEST_LIST="$(mktemp)"
+          trap 'rm -f "$TEST_LIST"' EXIT
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --list > "$TEST_LIST"
+          awk '/: test$/ { count++ } END { if (count != 1) { print "Expected exactly one macOS CLI candidate fixture"; exit 1 } }' "$TEST_LIST"
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --nocapture
+          cat "$TS_RELEASE_CARGO_FIXTURE_ROOT/macos-cli-candidate-measurement.json"
+          df -h "$RUNNER_TEMP"
+
+      - name: Preserve available macOS candidate measurements in the job log
+        if: always()
+        shell: bash
+        run: |
+          if [[ -n "${TS_RELEASE_CARGO_FIXTURE_ROOT:-}" ]]; then
+            for report in cargo-denial-measurement.json macos-cli-candidate-measurement.json; do
+              if [[ -f "$TS_RELEASE_CARGO_FIXTURE_ROOT/$report" ]]; then
+                cat "$TS_RELEASE_CARGO_FIXTURE_ROOT/$report"
+              fi
+            done
+          fi
+
+      # Bounded: two minutes of wall time and the last 400 lines at most.
+      - name: Show recent sandbox denials on failure
+        if: failure()
+        shell: bash
+        run: |
+          perl -e 'alarm 120; exec @ARGV or die "cannot run log: $!"' \
+            /usr/bin/log show --last 15m --style compact --predicate 'sender=="Sandbox"' \
+            | tail -n 400 || true
+
   test-typescript:
     name: vitest
     runs-on: ubuntu-latest
