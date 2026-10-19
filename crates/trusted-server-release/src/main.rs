@@ -30,6 +30,11 @@ mod recipe;
 mod process;
 #[allow(dead_code)]
 mod source;
+#[allow(
+    dead_code,
+    reason = "complete SPDX composition inputs remain unavailable"
+)]
+mod spdx;
 mod tool_tree;
 
 use std::ffi::OsString;

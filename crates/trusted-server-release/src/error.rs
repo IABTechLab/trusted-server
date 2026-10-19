@@ -36,6 +36,8 @@ pub(crate) enum ReleaseError {
     Composition,
     #[display("Release transfer collection is rejected")]
     Collection,
+    #[display("SPDX generation inputs or document are rejected")]
+    Spdx,
 }
 
 impl core::error::Error for ReleaseError {}

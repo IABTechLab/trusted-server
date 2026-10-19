@@ -482,6 +482,18 @@ fn schema_accepts(
     Ok(validator.is_valid(value))
 }
 
+/// Validates SPDX document structure against the retained, pinned SPDX 2.3 schema.
+///
+/// Schema validity establishes no artifact identity, contributor coverage or
+/// release authority; the producer and consumer check those separately.
+///
+/// # Errors
+///
+/// Rejects a changed retained schema or a structurally invalid document.
+pub(crate) fn validate_spdx(value: &Value) -> Result<(), Report<ReleaseError>> {
+    validate_schema(KnownSchema::Spdx, value)
+}
+
 fn validate_schema(schema: KnownSchema, value: &Value) -> Result<(), Report<ReleaseError>> {
     let retained = if matches!(schema, KnownSchema::Spdx) {
         parse_pinned_spdx_schema(schema.bytes())?

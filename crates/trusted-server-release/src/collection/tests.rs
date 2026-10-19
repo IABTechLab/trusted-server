@@ -866,6 +866,38 @@ fn raw_deflate_zip(body: &[u8], compressed: &[u8], descriptor: bool) -> Vec<u8> 
 }
 
 #[test]
+fn unix_zip32_deflate_upload_profile_accepts_flat_files_and_rejects_nested_names() {
+    let body = b"x";
+    let compressed = b"\x01\x01\x00\xfe\xffx";
+    let mut bytes = raw_deflate_zip(body, compressed, true);
+    let end = bytes.len() - 22;
+    let central = u32::from_le_bytes(
+        bytes[end + 16..end + 20]
+            .try_into()
+            .expect("should hold the central directory offset"),
+    ) as usize;
+    bytes[central + 4..central + 6].copy_from_slice(&0x032d_u16.to_le_bytes());
+    let attributes = (0o100644_u32 << 16) | 0x20;
+    bytes[central + 38..central + 42].copy_from_slice(&attributes.to_le_bytes());
+    let declared = BTreeMap::from([("artifact".to_owned(), body.len() as u64)]);
+
+    assert_eq!(
+        archive::read(&bytes, &declared)
+            .expect("should accept regular Unix files with ZIP32 signed streaming descriptors")["artifact"],
+        body,
+        "should retain exact fictional member bytes"
+    );
+
+    bytes[30..38].copy_from_slice(b"a/binary");
+    bytes[central + 46..central + 54].copy_from_slice(b"a/binary");
+    let nested = BTreeMap::from([("a/binary".to_owned(), body.len() as u64)]);
+    assert!(
+        archive::read(&bytes, &nested).is_err(),
+        "should reject nested member names without relaxing the flat-file policy"
+    );
+}
+
+#[test]
 fn zip_requires_deflate_stream_end_even_when_crc_size_and_consumption_match() {
     for descriptor in [false, true] {
         for (body, nonfinal) in [

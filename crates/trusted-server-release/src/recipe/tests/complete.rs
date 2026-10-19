@@ -14,6 +14,25 @@ use crate::inspect::tests::builders::{ElfSpec, MachoSpec, elf, macho};
 
 const FINGERPRINT: [u8; 32] = [7; 32];
 
+#[test]
+fn a_completed_candidate_without_complete_composition_cannot_generate_spdx() {
+    let bytes = wasm_with(&[(".debug_info", b"i"), (".debug_line", b"l")]);
+    let mut build = built("trusted-server-fastly.wasm", Role::Canonical, &bytes);
+    let stdout = build.stdout(|_| {});
+    let completed = build
+        .finish(stdout)
+        .expect("should complete the accepted candidate artifact");
+    build
+        .fixture
+        .completed
+        .rehash_for_handoff()
+        .expect("should retain an unchanged owned JS handoff");
+    assert!(
+        crate::spdx::generate_from_completed(&completed, &build.fixture.completed).is_err(),
+        "should reject SPDX generation without complete owning composition inputs"
+    );
+}
+
 pub(super) fn wasm_with(customs: &[(&str, &[u8])]) -> Vec<u8> {
     let mut out = b"\0asm\x01\0\0\0".to_vec();
     for (name, data) in customs

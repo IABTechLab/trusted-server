@@ -56,12 +56,12 @@ qualification. There are **8 complete tasks and 14 open tasks**. One open task
 has its implementation finished; nine tasks therefore have completed code.
 Task counts do not measure remaining effort.
 
-| Status                                         | Count | Tasks                     | Remaining exit work                                                                                                                                                                      |
-| ---------------------------------------------- | ----- | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Complete                                       | 8     | 2, 4, 5, 6, 7, 17, 18, 20 | Implementation, local verification, real pinned-verifier public-fixture validation where required, and independent review completed                                                      |
-| Implementation complete; qualification pending | 1     | 19                        | Official Trusted Server signed-release first-use verification; upstream provenance/SPDX format compatibility has been measured                                                           |
-| Partial or prerequisite approval pending       | 6     | 1, 3, 8, 9, 10, 12        | Maintainer scope approval; authenticated bootstrap/tool selection; platform qualification; full Rust recipes/runtime acceptance; composition coverage and qualified transfer integration |
-| Pending implementation                         | 7     | 11, 13–16, 21–22          | SPDX, evidence collector, trusted workflows, immutable publication, manual Fastly route and final qualification                                                                          |
+| Status                                         | Count | Tasks                     | Remaining exit work                                                                                                                                                                           |
+| ---------------------------------------------- | ----- | ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Complete                                       | 8     | 2, 4, 5, 6, 7, 17, 18, 20 | Implementation, local verification, real pinned-verifier public-fixture validation where required, and independent review completed                                                           |
+| Implementation complete; qualification pending | 1     | 19                        | Official Trusted Server signed-release first-use verification; upstream provenance/SPDX format compatibility has been measured                                                                |
+| Partial or prerequisite approval pending       | 7     | 1, 3, 8, 9, 10, 11, 12    | Maintainer scope approval; authenticated bootstrap/tool selection; platform qualification; full Rust recipes/runtime acceptance; complete composition/SPDX and qualified transfer integration |
+| Pending implementation                         | 6     | 13–16, 21–22              | Evidence collector, trusted workflows, immutable publication, manual Fastly route and final qualification                                                                                     |
 
 Task 7's Linux JS exit (M3) passed: an actual ordinary-CI run completed both
 fresh offline installations, lifecycle observations, missing-tool and download
@@ -359,6 +359,8 @@ Candidate platform receipts additionally retain the measured installed Rust tree
 - [ ] Generate full real Fastly and all three CLI SBOMs; schema-valid toy fixtures are not sufficient. Validate size <=16 MiB and document equality semantics: reject duplicate keys, ignore object order, preserve array order.
 - [ ] Re-run fixtures plus actual coverage inspection. Commit `Generate validated per-artifact SPDX evidence`.
 
+Progress (2026-10-19, partial renderer foundation): a private pure renderer validates executable root identity, component origins and roles, stable package/relationship identities, license declarations and bounded output against the existing pinned SPDX 2.3 schema. Structured-tree evidence stays in explanatory source information rather than raw-file checksums. Fictional fixtures exercise structural/semantic acceptance; schema validity supplies no signing or qualification authority. The actual-build entry point deliberately rejects every current candidate because complete owning composition integration is unavailable. There is no functioning generation command, no caller-controlled completeness flag and no JSON constructor for complete inputs. Typed Cargo/JS contributor export, complete native/tool coverage, producer/consumer contract fixtures and full real Fastly/three-platform CLI SBOMs remain required; the renderer does not satisfy those exits.
+
 ### Task 12: Bind transfers and enforce selected comparisons
 
 **Create:** release tool `src/collection.rs`, private `collection::tests` and exact transfer fixture data.
@@ -371,6 +373,8 @@ Candidate platform receipts additionally retain the measured installed Rust tree
 - [ ] Preserve A as canonical only after all mandatory requirements pass. Add explicit tests that optional B failure cannot hide any A/composition/JS failure. Commit `Validate release transfers and comparison outcomes`.
 
 Progress (2026-10-19, partial candidate implementation): 18 focused tests cover trusted exact-ID transfer tuples, raw artifact REST corroboration, complete mandatory A/Fastly B records, bounded optional native B outcomes, ambient/runtime/composition bindings and adversarial ZIP32 inputs. The in-memory ZIP reader checks declared flat members, exact lengths/digests, CRCs, central/local agreement and complete DEFLATE stream termination. Independent spec and quality review passed after fixing a truncated-stream acceptance finding. Imported records remain diagnostic data and cannot construct local recipe, confinement, runtime or signing capabilities. A qualified dependency constructor is deliberately uninhabited. The actual bounded transport, typed producer exports, trusted workflow dependency adapter, upload-action ZIP format and hosted qualification remain required before this task can close.
+
+A subsequent exact-ID, read-only audit checked one actual ordinary-CI upload archive (242,907 bytes; SHA-256 `ef2714df5e38c09a011cf25fb37268830de2f03426b81ee646b7b287989401cc`) against unchanged REST metadata and its archive digest. Its 16 regular files use version-needed 2.0, DEFLATE, signed ZIP32 descriptors, Unix regular-file mode and no extras/comments/ZIP64. These observed header properties now have a synthetic regression, bringing collection tests to 19. The current JS handoff's nested bundle/inventory paths still violate the intentional flat-member policy; a future typed producer must export the declared flat layout. One small archive's format compatibility does not authenticate its producing job, qualify the trusted dependency adapter or prove every upload size/profile.
 
 ### Task 13: Assemble and validate the exact evidence graph
 
