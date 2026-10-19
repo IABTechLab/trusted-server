@@ -709,8 +709,10 @@ impl Rewrite {
         // host proxied and receiving `ts-ec`. Rejecting it would stop existing
         // blobs from loading, so warn once per entry and keep it.
         for pattern in &self.exclude_domains {
-            if Self::check_exclude_domain(pattern).is_err() {
-                log::warn!("rewrite.exclude_domains: found an entry that never matches a URL host");
+            if let Err(reason) = Self::check_exclude_domain(pattern) {
+                log::warn!(
+                    "rewrite.exclude_domains: entry `{pattern}` never matches a URL host ({reason})"
+                );
             }
         }
     }
