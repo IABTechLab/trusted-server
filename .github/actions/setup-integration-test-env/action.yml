@@ -34,11 +34,6 @@ outputs:
 runs:
   using: composite
   steps:
-    - name: Retrieve Rust version
-      id: rust-version
-      shell: bash
-      run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
-
     - name: Retrieve Node.js version
       id: node-version
       shell: bash
@@ -52,11 +47,15 @@ runs:
       run: echo "viceroy-version=$(grep '^viceroy ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
 
     - name: Set up Rust toolchain
-      uses: actions-rust-lang/setup-rust-toolchain@v1
+      uses: ./.github/actions/setup-rust
       with:
-        toolchain: ${{ steps.rust-version.outputs.rust-version }}
         target: wasm32-wasip1
-        cache-shared-key: cargo-${{ runner.os }}
+        # Restore the axum job's main cache: it builds the same axum debug and
+        # Fastly release WASM artifacts. Restore only: test-axum owns this key,
+        # and rust-cache never replaces an exact-match key, so a partial cache
+        # saved by a workflow_dispatch run on main would stick.
+        cache-key: cargo-axum
+        save-cache: "false"
 
     - name: Cache Viceroy binary
       if: ${{ inputs.install-viceroy == 'true' }}
