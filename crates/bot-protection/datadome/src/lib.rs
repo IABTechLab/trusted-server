@@ -2167,7 +2167,9 @@ mod tests {
         trusted_server_core::test_support::middleware::assert_described_middleware_is_registered(
             &settings,
             &[super::builder()],
-            super::builder().id(),
+            // The constant, because code scanning treats a value read from a
+            // builder that declares secret settings as a secret.
+            super::DATADOME_INTEGRATION_ID,
         );
     }
 }
