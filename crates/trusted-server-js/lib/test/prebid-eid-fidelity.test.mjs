@@ -277,6 +277,7 @@ describe('trustedServer EIDs with real Prebid.js', () => {
     });
     try {
       page.install();
+      expect(page.pageWindow.document.readyState, 'install runs before load').toBe('loading');
       page.pageWindow.pbjs.setConfig({
         userSync: {
           auctionDelay: 300,
@@ -292,6 +293,7 @@ describe('trustedServer EIDs with real Prebid.js', () => {
       });
 
       await requestBids(page.pageWindow, trustedServerAdUnits());
+      expect(page.pageWindow.document.readyState, 'the auction runs before load').toBe('loading');
 
       expect(
         page.pageWindow.pbjs.getUserIdsAsEids().map((eid) => eid.source),
@@ -327,11 +329,13 @@ describe('trustedServer EIDs with real Prebid.js', () => {
     const page = createPage();
     try {
       page.install();
+      expect(page.pageWindow.document.readyState, 'install runs before load').toBe('loading');
       page.pageWindow.pbjs.setConfig({
         ortb2: { user: { ext: { eids: [first, second] } } },
       });
 
       await requestBids(page.pageWindow, trustedServerAdUnits());
+      expect(page.pageWindow.document.readyState, 'the auction runs before load').toBe('loading');
 
       expect(page.auctionBodies.map((body) => body.eids)).toEqual([[first, second]]);
       const { ext: _eidExt, ...firstWithoutExt } = first;
@@ -415,6 +419,7 @@ describe('trustedServer EIDs with real Prebid.js', () => {
       vendorConsents: { [IDENTITY_LINK_GVL_ID]: true },
     });
     page.install();
+    expect(page.pageWindow.document.readyState, 'install runs before load').toBe('loading');
     expect(readTsEidsCookie(page.pageWindow), 'precondition: ts-eids is preset').toEqual(
       PRESET_COOKIE_EIDS
     );
@@ -439,6 +444,7 @@ describe('trustedServer EIDs with real Prebid.js', () => {
       ortb2: { user: { ext: { eids: [CONTROL_EID] } } },
     });
     await requestBids(page.pageWindow, clientBidderAdUnits());
+    expect(page.pageWindow.document.readyState, 'the auction runs before load').toBe('loading');
     return page;
   }
 
