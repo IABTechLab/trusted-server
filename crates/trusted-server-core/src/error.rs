@@ -30,14 +30,6 @@ pub enum TrustedServerError {
     #[display("Auction error: {message}")]
     Auction { message: String },
 
-    /// GDPR consent handling error.
-    ///
-    /// **Note:** Unlike [`BadRequest`](Self::BadRequest), the detail `message`
-    /// is intentionally suppressed in client-facing responses because consent
-    /// strings may contain user data. Only the category name is returned.
-    #[display("GDPR consent error: {message}")]
-    GdprConsent { message: String },
-
     /// Invalid UTF-8 data encountered.
     #[display("Invalid UTF-8 data: {message}")]
     InvalidUtf8 { message: String },
@@ -111,7 +103,6 @@ impl IntoHttpResponse for TrustedServerError {
             Self::Auction { .. } => StatusCode::BAD_GATEWAY,
             Self::BadRequest { .. } => StatusCode::BAD_REQUEST,
             Self::Configuration { .. } | Self::Settings { .. } => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::GdprConsent { .. } => StatusCode::BAD_REQUEST,
             Self::InvalidHeaderValue { .. } => StatusCode::BAD_REQUEST,
             Self::InvalidUtf8 { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::KvStore { .. } => StatusCode::SERVICE_UNAVAILABLE,
@@ -130,8 +121,6 @@ impl IntoHttpResponse for TrustedServerError {
         match self {
             // Selected client errors with safe details to surface.
             Self::BadRequest { message } => format!("Bad request: {message}"),
-            // Consent strings may contain user data; return category only.
-            Self::GdprConsent { .. } => "GDPR consent error".to_string(),
             Self::InvalidHeaderValue { .. } => "Invalid header value".to_string(),
             // Server/integration errors (5xx/502/503) — generic message only.
             // Full details are already logged via log::error! in to_error_response.
@@ -164,12 +153,6 @@ mod tests {
                     message: String::from("bid timeout"),
                 },
                 StatusCode::BAD_GATEWAY,
-            ),
-            (
-                TrustedServerError::GdprConsent {
-                    message: String::from("missing consent string"),
-                },
-                StatusCode::BAD_REQUEST,
             ),
             (
                 TrustedServerError::InvalidUtf8 {
@@ -259,7 +242,6 @@ mod tests {
                     StatusCode::INTERNAL_SERVER_ERROR
                 }
                 TrustedServerError::Auction { .. } => StatusCode::BAD_GATEWAY,
-                TrustedServerError::GdprConsent { .. } => StatusCode::BAD_REQUEST,
                 TrustedServerError::InvalidUtf8 { .. } => StatusCode::INTERNAL_SERVER_ERROR,
                 TrustedServerError::RequestTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
                 TrustedServerError::InvalidHeaderValue { .. } => StatusCode::BAD_REQUEST,
@@ -360,11 +342,6 @@ mod tests {
         };
         assert_eq!(error.user_message(), "Bad request: missing field");
 
-        let error = TrustedServerError::GdprConsent {
-            message: "no consent string".into(),
-        };
-        assert_eq!(error.user_message(), "GDPR consent error");
-
         let error = TrustedServerError::InvalidHeaderValue {
             message: "non-ascii".into(),
         };
@@ -379,7 +356,6 @@ mod tests {
             TrustedServerError::BadRequest { .. }
             | TrustedServerError::Configuration { .. }
             | TrustedServerError::Auction { .. }
-            | TrustedServerError::GdprConsent { .. }
             | TrustedServerError::InvalidUtf8 { .. }
             | TrustedServerError::InvalidHeaderValue { .. }
             | TrustedServerError::KvStore { .. }
@@ -398,12 +374,6 @@ mod tests {
             (
                 TrustedServerError::BadRequest {
                     message: "bad input".to_string(),
-                },
-                StatusCode::BAD_REQUEST,
-            ),
-            (
-                TrustedServerError::GdprConsent {
-                    message: "missing consent".to_string(),
                 },
                 StatusCode::BAD_REQUEST,
             ),

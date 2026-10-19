@@ -8,7 +8,7 @@
 //! - [`constants`]: Application-wide constants and configuration values
 //! - [`cookies`]: Cookie parsing and generation utilities
 //! - [`error`]: Error types and error handling utilities
-//! - [`consent`]: Consent signal extraction and logging
+//! - [`consent`]: The consent context the permission signal modules fill
 //! - [`geo`]: Geographic location utilities and DMA code extraction
 //! - [`settings`]: Configuration management and validation
 //! - [`streaming_replacer`]: Streaming URL replacement for large responses

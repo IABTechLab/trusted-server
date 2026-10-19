@@ -6566,6 +6566,9 @@ dependencies = [
  "serde",
  "serde_json",
  "trusted-server-core",
+ "trusted-server-permission-signal-gpp",
+ "trusted-server-permission-signal-tcf",
+ "trusted-server-permission-signal-us-privacy",
  "url",
  "validator",
 ]
@@ -6730,6 +6733,10 @@ dependencies = [
  "serde_json",
  "tokio",
  "trusted-server-core",
+ "trusted-server-permission-signal-gpc",
+ "trusted-server-permission-signal-gpp",
+ "trusted-server-permission-signal-tcf",
+ "trusted-server-permission-signal-us-privacy",
  "url",
  "validator",
 ]
@@ -6771,7 +6778,11 @@ dependencies = [
  "serde_json",
  "tokio",
  "trusted-server-core",
+ "trusted-server-permission-signal-gpc",
+ "trusted-server-permission-signal-gpp",
  "trusted-server-permission-signal-mtm",
+ "trusted-server-permission-signal-tcf",
+ "trusted-server-permission-signal-us-privacy",
  "url",
  "validator",
  "web-time",
@@ -6969,7 +6980,6 @@ dependencies = [
  "hmac",
  "http",
  "httpdate",
- "iab_gpp",
  "jose-jwk",
  "log",
  "lol_html",
@@ -7186,6 +7196,7 @@ dependencies = [
 name = "trusted-server-permission-signal-gpc"
 version = "0.1.0"
 dependencies = [
+ "http",
  "trusted-server-core",
 ]
 
@@ -7193,6 +7204,11 @@ dependencies = [
 name = "trusted-server-permission-signal-gpp"
 version = "0.1.0"
 dependencies = [
+ "derive_more",
+ "error-stack",
+ "http",
+ "iab_gpp",
+ "log",
  "trusted-server-core",
 ]
 
@@ -7208,14 +7224,30 @@ dependencies = [
 name = "trusted-server-permission-signal-tcf"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "derive_more",
+ "error-stack",
+ "http",
+ "log",
+ "serde",
+ "serde_json",
  "trusted-server-core",
+ "trusted-server-permission-signal-gpp",
+ "web-time",
 ]
 
 [[package]]
 name = "trusted-server-permission-signal-us-privacy"
 version = "0.1.0"
 dependencies = [
+ "derive_more",
+ "error-stack",
+ "http",
+ "log",
+ "serde",
+ "serde_json",
  "trusted-server-core",
+ "trusted-server-permission-signal-gpc",
 ]
 
 [[package]]
