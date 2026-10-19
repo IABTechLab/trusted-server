@@ -26,9 +26,6 @@
 //! whitespace by `str::trim`. "Integer" means a JSON number with no fractional
 //! part, so `4`, `4.0` and `4e0` are the same value.
 
-// The auction body and cookie readers call this parser from the next change.
-#![allow(dead_code)]
-
 use serde_json::Value as JsonValue;
 use serde_json::value::RawValue;
 

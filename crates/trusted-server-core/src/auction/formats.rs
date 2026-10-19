@@ -9,6 +9,7 @@ use error_stack::{Report, ResultExt, ensure};
 use http::{HeaderValue, Request, Response, StatusCode, header};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
+use serde_json::value::RawValue;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use url::Url;
 use uuid::Uuid;
@@ -43,7 +44,10 @@ use super::types::{
 pub struct AdRequest {
     pub ad_units: Vec<AdUnit>,
     pub config: Option<JsonValue>,
-    pub eids: Option<JsonValue>,
+    /// Browser EIDs, captured as raw JSON so a malformed entry (for example a
+    /// lone surrogate escape) cannot fail the whole body. Each entry is
+    /// validated on its own by the shared client EID parser.
+    pub eids: Option<Box<RawValue>>,
 }
 
 /// A single ad placement in an [`AdRequest`].

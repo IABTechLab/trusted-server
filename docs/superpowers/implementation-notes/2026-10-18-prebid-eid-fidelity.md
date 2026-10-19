@@ -37,3 +37,19 @@ Failures (the stub `parse_client_eids` returns no entries, so each assertion on 
 
 - `keeps_a_valid_entry_with_every_field`, `drops_only_the_entry_that_does_not_parse`, `drops_entries_that_are_not_objects`, `validates_source`, `drops_an_entry_without_a_valid_uid`, `validates_uid_ids`, `keeps_the_first_32_valid_uids`, `reads_atype_and_mm_as_integers_in_range`, `validates_ext_objects_and_their_size`, `validates_inserter_and_matcher`, `drops_duplicates_before_the_entry_cap`, `keeps_the_first_64_entries`, `keeps_order_and_repeated_sources_and_ignores_unknown_keys`, `logs_dropped_entries_and_fields_by_name_and_source_without_values`: `assert_eq!` or `assert!` on the empty stub output panics (wasm abort)
 - `yields_nothing_for_a_payload_that_is_not_an_array`: passes against the stub, as expected (regression net)
+
+## Task 3: Body and cookie go through the shared parser
+
+Command (each test run alone, because a failed assertion aborts the wasm test binary):
+
+```bash
+cargo test-fastly -- <module path>::<name> --exact
+```
+
+Failures (against the unchanged body and cookie readers):
+
+- `tsjs_auction_body_fixture_drops_only_the_unparsable_entry` (body rejected, provider saw `None`), `tsjs_cookie_fixture_drops_only_the_unparsable_entry` (cookie rejected, provider saw `Some(Null)`), `auction_body_eid_level_fields_reach_the_auction_request` (EID-level fields dropped): wasm abort on assertion. Moved to Task 4: they also depend on the merge rewrite; the old merge drops EID-level fields.
+- `structured_cookie_keeps_eid_level_fields`, `structured_cookie_drops_a_mistyped_field_instead_of_the_whole_cookie`, `structured_cookie_isolates_an_unparsable_entry`, `structured_cookie_applies_the_entry_cap`: assertion panic (wasm abort)
+- `structured_cookie_diagnostics_report_raw_uid_strings`: also FAILS on unchanged code (the strict cookie parser keeps the 513-byte UID), so it is a red-first test, not a regression net; no revert proof needed
+- `auction_uses_the_cookie_when_no_body_entry_is_valid`: passes against unchanged code (regression net)
+- Revert proof: with `.filter(|eids| !eids.is_empty())` removed from `resolve_client_auction_eids`, `auction_uses_the_cookie_when_no_body_entry_is_valid` FAILS (`left: Some(Null)`); line restored

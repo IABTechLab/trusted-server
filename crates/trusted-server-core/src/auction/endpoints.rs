@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use http::{Request, Response, StatusCode, header};
-use serde_json::Value as JsonValue;
+use serde_json::value::RawValue;
 
 use crate::auction::formats::AdRequest;
 use crate::auction::orchestrator::OrchestrationResult;
@@ -14,13 +14,14 @@ use crate::constants::COOKIE_TS_EIDS;
 use crate::cookies::extract_cookie_value;
 use crate::ec::EcContext;
 use crate::ec::EcKvSnapshot;
+use crate::ec::client_eids::parse_client_eids;
 use crate::ec::eids::{resolve_partner_ids, to_eids};
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::kv_types::MAX_UID_LENGTH;
 use crate::ec::prebid_eids::parse_prebid_eids_cookie;
 use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
-use crate::openrtb::{Eid, Uid};
+use crate::openrtb::Eid;
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 
@@ -34,10 +35,6 @@ use super::telemetry::{
     emit_auction_events_best_effort_lazy,
 };
 use super::types::AuctionContext;
-
-const MAX_CLIENT_EID_SOURCES: usize = 64;
-const MAX_CLIENT_UIDS_PER_SOURCE: usize = 32;
-const MAX_CLIENT_EID_SOURCE_BYTES: usize = 255;
 
 /// Maximum accepted JSON body size for `/auction`. Picked to comfortably fit
 /// the largest realistic Prebid-derived auction request (hundreds of ad units
@@ -292,7 +289,7 @@ pub async fn handle_auction(
     // `ec_id.is_some()`.
     let client_eids = if ec_id.is_some() {
         resolve_client_auction_eids(
-            body.eids.as_ref(),
+            body.eids.as_deref(),
             extract_cookie_value(&http_req, COOKIE_TS_EIDS).as_deref(),
         )
     } else {
@@ -469,11 +466,18 @@ pub(crate) fn resolve_auction_eids(
     Some(to_eids(&resolved))
 }
 
+/// Resolves the request's browser EIDs: the `/auction` body when it has a
+/// valid entry, else the `ts-eids` cookie.
+///
+/// Both go through the shared client EID parser, so the same rules and caps
+/// apply to each, and a malformed entry costs only itself.
 pub(crate) fn resolve_client_auction_eids(
-    raw: Option<&JsonValue>,
+    raw: Option<&RawValue>,
     cookie_value: Option<&str>,
 ) -> Option<Vec<Eid>> {
-    parse_client_auction_eids(raw).or_else(|| parse_cookie_auction_eids(cookie_value))
+    raw.map(parse_client_eids)
+        .filter(|eids| !eids.is_empty())
+        .or_else(|| parse_cookie_auction_eids(cookie_value))
 }
 
 fn parse_cookie_auction_eids(cookie_value: Option<&str>) -> Option<Vec<Eid>> {
@@ -486,79 +490,6 @@ fn parse_cookie_auction_eids(cookie_value: Option<&str>) -> Option<Vec<Eid>> {
             None
         }
     }
-}
-
-fn parse_client_auction_eids(raw: Option<&JsonValue>) -> Option<Vec<Eid>> {
-    let Some(JsonValue::Array(entries)) = raw else {
-        return None;
-    };
-
-    let mut eids = Vec::new();
-
-    for entry in entries {
-        if eids.len() >= MAX_CLIENT_EID_SOURCES {
-            log::debug!(
-                "Auction EIDs: reached max client EID source count ({MAX_CLIENT_EID_SOURCES})"
-            );
-            break;
-        }
-        let JsonValue::Object(entry) = entry else {
-            log::debug!("Auction EIDs: dropping malformed client EID entry");
-            continue;
-        };
-
-        let Some(source) = entry
-            .get("source")
-            .and_then(JsonValue::as_str)
-            .filter(|source| !source.trim().is_empty())
-            .filter(|source| source.len() <= MAX_CLIENT_EID_SOURCE_BYTES)
-            .map(str::to_owned)
-        else {
-            continue;
-        };
-
-        let Some(JsonValue::Array(raw_uids)) = entry.get("uids") else {
-            continue;
-        };
-
-        let uids: Vec<_> = raw_uids
-            .iter()
-            .filter_map(parse_client_auction_uid)
-            .take(MAX_CLIENT_UIDS_PER_SOURCE)
-            .collect();
-        if uids.is_empty() {
-            continue;
-        }
-
-        eids.push(Eid::new(source, uids));
-    }
-
-    if eids.is_empty() { None } else { Some(eids) }
-}
-
-fn parse_client_auction_uid(raw: &JsonValue) -> Option<Uid> {
-    let JsonValue::Object(uid) = raw else {
-        return None;
-    };
-
-    let id = uid
-        .get("id")
-        .and_then(JsonValue::as_str)
-        .filter(|id| !id.trim().is_empty())
-        .filter(|id| id.len() <= MAX_UID_LENGTH)?
-        .to_owned();
-
-    let atype = uid
-        .get("atype")
-        .and_then(JsonValue::as_u64)
-        .and_then(|atype| i32::try_from(atype).ok());
-
-    let ext = match uid.get("ext") {
-        Some(JsonValue::Object(_)) => uid.get("ext").cloned(),
-        _ => None,
-    };
-
-    Some(Uid { id, atype, ext })
 }
 
 pub(crate) fn merge_auction_eids(
@@ -637,6 +568,7 @@ mod tests {
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64;
+    use serde_json::Value as JsonValue;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
 
@@ -1292,6 +1224,114 @@ mod tests {
         }
     }
 
+    /// Provider that records the full EID set its auction request carried,
+    /// then fails its launch so no real transport handle is needed.
+    struct EidRecordingProvider {
+        eids: Arc<Mutex<Option<JsonValue>>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl AuctionProvider for EidRecordingProvider {
+        fn provider_name(&self) -> &str {
+            "eid_recording_provider"
+        }
+
+        async fn request_bids(
+            &self,
+            request: &AuctionRequest,
+            _context: &AuctionContext<'_>,
+        ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
+            *self.eids.lock().expect("should lock recorded eids") = Some(
+                serde_json::to_value(&request.user.eids).expect("should serialize recorded eids"),
+            );
+            Err(Report::new(TrustedServerError::Auction {
+                message: "record only".to_string(),
+            }))
+        }
+
+        async fn parse_response(
+            &self,
+            _response: PlatformResponse,
+            _response_time_ms: u64,
+        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            panic!("parse_response must not run when the launch fails");
+        }
+
+        fn timeout_ms(&self) -> u32 {
+            100
+        }
+
+        fn backend_name(&self, _services: &RuntimeServices, _timeout_ms: u32) -> Option<String> {
+            Some("record-backend".to_string())
+        }
+    }
+
+    /// Runs `/auction` with an allowed EC and returns the EIDs the provider
+    /// received: `None` when no provider was called (the request was
+    /// rejected), `Some(Value::Null)` when it carried no EIDs.
+    async fn recorded_auction_eids(
+        body: Vec<u8>,
+        ts_eids_cookie: Option<&str>,
+    ) -> Option<JsonValue> {
+        let settings = create_test_settings();
+        let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
+            enabled: true,
+            providers: AuctionConfig::legacy_provider_map(&["eid_recording_provider"]),
+            timeout_ms: 2000,
+            mediator: None,
+            ..Default::default()
+        });
+        let recorded = Arc::new(Mutex::new(None));
+        orchestrator.register_provider(Arc::new(EidRecordingProvider {
+            eids: Arc::clone(&recorded),
+        }));
+        let ec_id = format!("{}.fixtur", "a".repeat(64));
+        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("https://test-publisher.com/auction");
+        if let Some(cookie) = ts_eids_cookie {
+            builder = builder.header(header::COOKIE, format!("{COOKIE_TS_EIDS}={cookie}"));
+        }
+        let req = builder
+            .body(EdgeBody::from(body))
+            .expect("should build auction request");
+
+        // The recording provider fails its launch; the assertion is on what
+        // it received, not on the auction result.
+        let _ = handle_auction(
+            &settings,
+            &orchestrator,
+            None,
+            None,
+            &mut ec_context,
+            &noop_services(),
+            req,
+        )
+        .await;
+
+        recorded.lock().expect("should lock recorded eids").clone()
+    }
+
+    #[tokio::test]
+    async fn auction_uses_the_cookie_when_no_body_entry_is_valid() {
+        let cookie_entries =
+            json!([{ "source": "cookie.example.com", "uids": [{ "id": "cookie-uid" }] }]);
+        let cookie =
+            BASE64.encode(serde_json::to_vec(&cookie_entries).expect("should serialize cookie"));
+        let body = serde_json::to_vec(&json!({
+            "adUnits": [{ "code": "div-gpt-1", "mediaTypes": { "banner": { "sizes": [[300, 250]] } } }],
+            "eids": [{ "source": "", "uids": [{ "id": "body-uid" }] }]
+        }))
+        .expect("should serialize body");
+
+        assert_eq!(
+            recorded_auction_eids(body, Some(&cookie)).await,
+            Some(cookie_entries),
+            "a body whose entries are all invalid should count as absent"
+        );
+    }
+
     #[tokio::test]
     async fn auction_strips_client_eids_when_ec_identity_denied() {
         // US-state opt-out via GPC: the server-side auction consent gate still
@@ -1479,12 +1519,13 @@ mod tests {
 
     #[test]
     fn resolve_client_auction_eids_prefers_request_body_over_cookie() {
-        let raw = json!([
+        let raw = serde_json::value::to_raw_value(&json!([
             {
                 "source": "id5-sync.com",
                 "uids": [{ "id": "body_uid", "atype": 1 }]
             }
-        ]);
+        ]))
+        .expect("should capture raw EIDs");
         let cookie_payload = json!([
             {
                 "source": "sharedid.org",
@@ -1494,158 +1535,13 @@ mod tests {
         let encoded = BASE64
             .encode(serde_json::to_vec(&cookie_payload).expect("should serialize cookie payload"));
 
-        let resolved = resolve_client_auction_eids(Some(&raw), Some(&encoded))
+        let resolved = resolve_client_auction_eids(Some(raw.as_ref()), Some(&encoded))
             .expect("should prefer request body EIDs");
 
-        assert_eq!(resolved.len(), 1, "should use request body when present");
-        assert_eq!(resolved[0].source, "id5-sync.com");
-        assert_eq!(resolved[0].uids[0].id, "body_uid");
-    }
-
-    #[test]
-    fn parse_client_auction_eids_ignores_malformed_entries() {
-        let raw = json!([
-            {
-                "source": "id5-sync.com",
-                "uids": [{ "id": "ID5_abc", "atype": 1 }]
-            },
-            {
-                "source": "broken.example",
-                "uids": "not-an-array"
-            },
-            {
-                "source": "sharedid.org",
-                "uids": [{ "id": "shared_123" }, { "id": "" }]
-            }
-        ]);
-
-        let parsed = parse_client_auction_eids(Some(&raw)).expect("should parse valid EIDs");
-
-        assert_eq!(parsed.len(), 2, "should keep only valid EID entries");
-        assert_eq!(parsed[0].source, "id5-sync.com");
-        assert_eq!(parsed[0].uids.len(), 1, "should keep valid UID");
-        assert_eq!(parsed[1].source, "sharedid.org");
-        assert_eq!(parsed[1].uids.len(), 1, "should drop empty UID values");
-    }
-
-    #[test]
-    fn parse_client_auction_eids_caps_sources_and_uids() {
-        let entries: Vec<_> = (0..(MAX_CLIENT_EID_SOURCES + 5))
-            .map(|source_index| {
-                let uids: Vec<_> = (0..(MAX_CLIENT_UIDS_PER_SOURCE + 5))
-                    .map(|uid_index| json!({ "id": format!("uid-{source_index}-{uid_index}") }))
-                    .collect();
-                json!({
-                    "source": format!("source-{source_index}.example.com"),
-                    "uids": uids,
-                })
-            })
-            .collect();
-        let raw = JsonValue::Array(entries);
-
-        let parsed = parse_client_auction_eids(Some(&raw)).expect("should parse capped EIDs");
-
         assert_eq!(
-            parsed.len(),
-            MAX_CLIENT_EID_SOURCES,
-            "should cap client EID sources"
-        );
-        assert!(
-            parsed
-                .iter()
-                .all(|eid| eid.uids.len() == MAX_CLIENT_UIDS_PER_SOURCE),
-            "should cap UIDs per source"
-        );
-    }
-
-    #[test]
-    fn parse_client_auction_eids_drops_whitespace_and_oversized_uids() {
-        let raw = json!([
-            {
-                "source": "id5-sync.com",
-                "uids": [
-                    { "id": "   " },
-                    { "id": "x".repeat(MAX_UID_LENGTH + 1) },
-                    { "id": "valid" }
-                ]
-            }
-        ]);
-
-        let parsed = parse_client_auction_eids(Some(&raw)).expect("should parse valid UID");
-
-        assert_eq!(parsed.len(), 1, "should retain source with valid UID");
-        assert_eq!(parsed[0].uids.len(), 1, "should drop invalid UIDs");
-        assert_eq!(parsed[0].uids[0].id, "valid", "should keep valid UID");
-    }
-
-    #[test]
-    fn parse_client_auction_eids_preserves_pair_atype() {
-        let raw = json!([
-            {
-                "source": "google.com",
-                "uids": [{ "id": "pair-id", "atype": 571187 }]
-            }
-        ]);
-
-        let parsed = parse_client_auction_eids(Some(&raw)).expect("should parse PAIR EID");
-
-        assert_eq!(
-            parsed[0].uids[0].atype,
-            Some(571187),
-            "should preserve PAIR's vendor-specific atype"
-        );
-    }
-
-    #[test]
-    fn parse_client_auction_eids_preserves_uid_ext_and_sanitizes_invalid_atype() {
-        let raw = json!([
-            {
-                "source": "adserver.org",
-                "uids": [
-                    {
-                        "id": "uid-with-ext",
-                        "atype": 1,
-                        "ext": { "provider": "liveintent.com", "rtiPartner": "TDID" }
-                    },
-                    {
-                        "id": "uid-bad-atype",
-                        "atype": 2_147_483_648_u64,
-                        "ext": { "keep": true }
-                    },
-                    {
-                        "id": "uid-float-atype",
-                        "atype": 1.5
-                    }
-                ]
-            }
-        ]);
-
-        let parsed = parse_client_auction_eids(Some(&raw)).expect("should parse valid EIDs");
-
-        assert_eq!(parsed.len(), 1, "should keep valid source");
-        assert_eq!(parsed[0].uids.len(), 3, "should keep valid UIDs");
-        assert_eq!(
-            parsed[0].uids[0].atype,
-            Some(1),
-            "should preserve valid atype"
-        );
-        assert_eq!(
-            parsed[0].uids[0].ext,
-            Some(json!({ "provider": "liveintent.com", "rtiPartner": "TDID" })),
-            "should preserve uid ext"
-        );
-        assert_eq!(
-            parsed[0].uids[1].atype, None,
-            "should drop out-of-range atype without dropping uid"
-        );
-        assert_eq!(
-            parsed[0].uids[1].ext,
-            Some(json!({ "keep": true })),
-            "should preserve ext when atype is invalid"
-        );
-        assert_eq!(
-            parsed[0].uids[2].atype, None,
-            "should drop non-integer atype without dropping uid"
+            serde_json::to_value(&resolved).expect("should serialize resolved EIDs"),
+            json!([{ "source": "id5-sync.com", "uids": [{ "id": "body_uid", "atype": 1 }] }]),
+            "should use the request body when it has valid entries"
         );
     }
 
