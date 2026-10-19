@@ -19960,7 +19960,7 @@ mod tests {
         location: &str,
     ) -> String {
         let mut settings = create_test_settings();
-        settings.publisher.origin_url = origin_url.to_string();
+        edit_origin(&mut settings, |origin| origin.url = origin_url.to_owned());
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response_with_headers(
             303,
@@ -20014,7 +20014,7 @@ mod tests {
 
     #[tokio::test]
     async fn cookieless_get_redirect_to_current_url_is_not_rewritten_into_a_loop() {
-        // A canonical-host redirect triggered by `origin_host_header_override`
+        // A canonical-host redirect triggered by `source.origin.host_header`
         // answers the retry through Trusted Server the same way, so it must leave.
         for method in [Method::GET, Method::HEAD] {
             let location = redirect_location_for_current_url(
@@ -20034,7 +20034,9 @@ mod tests {
     #[tokio::test]
     async fn overridden_host_redirect_with_cookie_is_not_rewritten_into_a_loop() {
         let mut settings = create_test_settings();
-        settings.publisher.origin_host_header_override = Some("publisher.example".to_string());
+        edit_origin(&mut settings, |origin| {
+            origin.host_header = Some("publisher.example".to_owned());
+        });
         let stub = Arc::new(StubHttpClient::new());
         stub.push_response_with_headers(
             301,

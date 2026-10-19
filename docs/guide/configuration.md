@@ -1271,7 +1271,7 @@ Location: https://www.example.com/landing.html
 Content-Security-Policy: img-src https://origin.example.com https://www.example.com data:
 ```
 
-When `[source.origin] url` has a path, such as a folder of object storage,
+When `source.origin.url` has a path, such as a folder of object storage,
 only a URL in that folder is mapped, and it loses the folder. With
 `url = "https://storage.example.com/bucket/site"`,
 `https://storage.example.com/bucket/site/news/` becomes
@@ -1284,11 +1284,11 @@ Two exceptions prevent a redirect loop. Rewriting either target would send the
 browser back to the same URL, and the origin would redirect again:
 
 - When the origin redirects to the URL being requested but under a different
-  scheme from `publisher.origin_url` (for example, an `http://` origin forcing
+  scheme from `source.origin.url` (for example, an `http://` origin forcing
   HTTPS), the `Location` or `Refresh` target is left unchanged.
 - When the origin answers a `GET` or `HEAD` with a `Location` to the URL being
   requested, the target is left unchanged if the response sets no cookie, or
-  whatever cookies it sets when `publisher.origin_host_header_override` sends a
+  whatever cookies it sets when `source.origin.host_header` sends a
   different `Host`. The origin is redirecting because of something Trusted
   Server sends unchanged on every retry, such as that `Host`.
 
