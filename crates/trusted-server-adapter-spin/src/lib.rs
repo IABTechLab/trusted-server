@@ -1,6 +1,7 @@
 //! Fermyon Spin adapter for Trusted Server.
 
 pub mod app;
+pub mod logging;
 pub mod middleware;
 pub mod platform;
 
@@ -13,5 +14,6 @@ use spin_sdk::http_service;
 #[http_service]
 // FORCED: edgezero_adapter_spin::run_app returns anyhow::Result — EdgeZero SDK constraint, not a project choice.
 async fn handle(req: Request) -> anyhow::Result<impl IntoResponse> {
+    logging::init_logger();
     edgezero_adapter_spin::run_app::<app::TrustedServerApp>(req).await
 }

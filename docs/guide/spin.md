@@ -46,6 +46,26 @@ sentinel, rewrite its origin URL to the Spin listener, and omit the original
 URL. The exit trap stops Spin and the stub origin and removes the isolated
 manifest, SQLite store, response captures, and logs.
 
+## Logging
+
+The component installs its own logger, because EdgeZero installs none on
+Spin. Each line goes to standard error with its level and module first, such
+as `WARN [trusted_server_adapter_spin::app] ...`.
+[`spin up`](https://spinframework.dev/v4/running-apps) prints a component's
+standard error in its console and, for an application run from a local
+manifest, keeps a copy in the `.spin/logs` folder beside the manifest, or in
+the folder `--log-dir` names. A host that runs the component another way
+decides where its standard error goes. The component writes `info` and above,
+and no setting changes the level.
+
+A warning the component logs once, such as the one about a route that
+enables the Image Optimizer, is logged once for each instance of the
+component. Spin can serve several requests from one instance, one after
+another and at the same time, to a degree it does not guarantee
+([HTTP trigger](https://spinframework.dev/v4/http-trigger),
+`spin up --max-instance-reuse-count`), so the warning appears each time Spin
+starts an instance, which is every request when an instance serves only one.
+
 ## Runtime boundaries
 
 Use the same store mapping and encoded variables in the deployment provider;
@@ -65,6 +85,15 @@ refused at startup. The modules' request filters and the device module
 classifies from the `User-Agent`, because Spin supplies no TLS or HTTP/2
 signals. An Edge Cookie module creates and writes its cookie with no identity
 graph behind it, and `POST /_ts/api/v1/ec/resolve` sets one the same way.
+`[[proxy.asset_routes]]` are served from each route's own source with the
+asset body held whole, up to 8 MiB, and a larger one answers `502`. Spin has
+no Image Optimizer, so the component warns about each route that enables one,
+once for each instance (see [Logging](#logging)), and each request such a
+route would optimize answers `502` (see [Asset Routes](./asset-routes)). Spin
+sends the address's own host as the `Host`, so a request to a source whose
+`host_header` names another host, a route's or the publisher's, answers `502`
+before its origin is asked, and the component logs the refusal as an error
+that names both hosts.
 
 Spin sends no [auction telemetry](./telemetry#adapter-support), and warns at
 startup when `[analytics]` selects a module.

@@ -9,6 +9,7 @@ compile_error!(
 );
 
 pub mod app;
+pub mod logging;
 pub mod middleware;
 pub mod platform;
 
@@ -17,13 +18,15 @@ use worker::{Context, Env, Request, Response, Result, event};
 
 #[cfg(target_arch = "wasm32")]
 #[event(fetch)]
-/// Dispatches an incoming Cloudflare Worker fetch event.
+/// Installs the Worker's logger and dispatches an incoming Cloudflare Worker
+/// fetch event.
 ///
 /// # Errors
 ///
 /// Returns a Workers runtime error when the fallback error response cannot be
 /// constructed.
 pub async fn main(req: Request, env: Env, ctx: Context) -> Result<Response> {
+    logging::init_logger();
     if let Ok(config) = env.var("TRUSTED_SERVER_CONFIG") {
         app::set_cloudflare_config_json(config.to_string());
     }
