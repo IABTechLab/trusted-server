@@ -146,11 +146,19 @@ impl OriginHeaderRewrite<'_> {
             && (host_redirect || !response_sets_cookie)
             && self.targets_current_request(url)
         {
-            log::warn!(
-                "Keeping origin redirect to the current request URL; the browser leaves \
-                 the serving host. Check what the origin expects from the request, such \
-                 as `publisher.origin_host_header_override`"
-            );
+            if host_redirect {
+                log::warn!(
+                    "Keeping origin redirect to the current request URL under a `Host` \
+                     override; the browser leaves the serving host. Check that the origin \
+                     accepts the `Host` from `publisher.origin_host_header_override`"
+                );
+            } else {
+                log::warn!(
+                    "Keeping cookieless origin redirect to the current request URL; the \
+                     browser leaves the serving host. Check why the origin redirects this \
+                     request to itself"
+                );
+            }
             return None;
         }
         Some(rewritten)

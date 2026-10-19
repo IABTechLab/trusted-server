@@ -822,7 +822,8 @@ browser back to the same URL, and the origin would redirect again:
   Server sends unchanged on every retry, such as that `Host`.
 
 Other same-scheme redirects to the current URL, such as after a form POST or
-one that sets a cookie without a `Host` override, are rewritten as usual, as is a `Refresh` reload.
+one that sets a cookie without a `Host` override, are rewritten as usual, as
+is a `Refresh` reload.
 
 `Set-Cookie` headers are not rewritten. If the origin sets a cookie with a
 `Domain` attribute that does not cover the serving host (for example,
