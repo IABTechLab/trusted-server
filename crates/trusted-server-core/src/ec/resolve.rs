@@ -69,11 +69,12 @@ const MAX_BODY_SIZE: usize = 64 * 1024;
 /// [`reserved_response_effect`](crate::ec::module::reserved_response_effect)).
 /// A payload that is merely unverified or absent yields a `204` rather than an
 /// error.
-pub fn handle_ec_resolve(
+pub async fn handle_ec_resolve(
     settings: &Settings,
     req: Request<EdgeBody>,
     ec_context: &EcContext,
     kv: Option<&KvIdentityGraph>,
+    services: &crate::platform::RuntimeServices,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     // This endpoint sets identity state from a page script, so the posted
     // request must originate from the publisher's own site. Browsers always
@@ -121,7 +122,7 @@ pub fn handle_ec_resolve(
         consent: Some(ec_context.consent()),
     };
 
-    let generated = module.resolve_from_client(&input)?;
+    let generated = module.resolve_from_client(&input, services).await?;
     log::debug!(
         "EC resolve handled (module={}): id {}",
         module.id(),
@@ -506,6 +507,7 @@ mod tests {
     #[derive(Debug)]
     struct TestIdModule;
 
+    #[async_trait::async_trait(?Send)]
     impl EdgeCookieModule for TestIdModule {
         fn id(&self) -> &'static str {
             "testid"
@@ -515,18 +517,20 @@ mod tests {
             crate::module_code!("t0id")
         }
 
-        fn generate(
+        async fn generate(
             &self,
             _request_info: &dyn RequestInfo,
             _input: &IdentityInput<'_>,
+            _services: &crate::platform::RuntimeServices,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             // The identifier is created in the browser, so the edge derives nothing.
             Ok(GeneratedEdgeCookie::default())
         }
 
-        fn resolve_from_client(
+        async fn resolve_from_client(
             &self,
             input: &ClientResolveInput<'_>,
+            _services: &crate::platform::RuntimeServices,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             // The page posts the identifier it generated. Accept a well-formed UUID.
             let value = core::str::from_utf8(input.payload)
@@ -564,6 +568,7 @@ mod tests {
         id: Option<&'static str>,
     }
 
+    #[async_trait::async_trait(?Send)]
     impl EdgeCookieModule for ResolveHeaderModule {
         fn id(&self) -> &'static str {
             "resolve-header"
@@ -573,17 +578,19 @@ mod tests {
             crate::module_code!("t0rh")
         }
 
-        fn generate(
+        async fn generate(
             &self,
             _request_info: &dyn RequestInfo,
             _input: &IdentityInput<'_>,
+            _services: &crate::platform::RuntimeServices,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             Ok(GeneratedEdgeCookie::default())
         }
 
-        fn resolve_from_client(
+        async fn resolve_from_client(
             &self,
             _input: &ClientResolveInput<'_>,
+            _services: &crate::platform::RuntimeServices,
         ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
             Ok(GeneratedEdgeCookie {
                 id: self.id.map(str::to_owned),
@@ -612,17 +619,17 @@ mod tests {
 
     /// Drives one resolve request through [`ResolveHeaderModule`], returning
     /// whatever the handler produced.
-    fn resolve_with_header_module(
+    async fn resolve_with_header_module(
         headers: &'static [(&'static str, &'static str)],
         id: Option<&'static str>,
         graph: Option<&crate::ec::kv::KvIdentityGraph>,
     ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-        resolve_request_with_header_module(headers, id, post(HEADER_MODULE_ID), graph)
+        resolve_request_with_header_module(headers, id, post(HEADER_MODULE_ID), graph).await
     }
 
     /// Drives `request` through [`ResolveHeaderModule`], threaded the way a
     /// composition root threads a module.
-    fn resolve_request_with_header_module(
+    async fn resolve_request_with_header_module(
         headers: &'static [(&'static str, &'static str)],
         id: Option<&'static str>,
         request: Request<EdgeBody>,
@@ -638,17 +645,18 @@ mod tests {
             .expect("should build organic request");
         let ec = EcContext::read_from_request(&settings, &organic, &services)
             .expect("should read EC context");
-        handle_ec_resolve(&settings, request, &ec, graph)
+        handle_ec_resolve(&settings, request, &ec, graph, &services).await
     }
 
-    #[test]
-    fn resolve_rejects_a_reserved_response_effect_when_nothing_is_created() {
+    #[tokio::test]
+    async fn resolve_rejects_a_reserved_response_effect_when_nothing_is_created() {
         // The 204 path applies module headers too, so without the check a
         // browser-side module could set the managed identity cookie while
         // returning no identifier, walking past the identifier bounds, the
         // conflict check and the row-before-cookie rule.
         let outcome =
-            resolve_with_header_module(&[("set-cookie", "ts-ec=forged-value; Path=/")], None, None);
+            resolve_with_header_module(&[("set-cookie", "ts-ec=forged-value; Path=/")], None, None)
+                .await;
 
         let err = outcome.expect_err("a managed cookie effect should fail the request");
         assert!(
@@ -657,8 +665,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolve_rejects_a_reserved_response_effect_on_the_created_path() {
+    #[tokio::test]
+    async fn resolve_rejects_a_reserved_response_effect_on_the_created_path() {
         // The same check has to cover the 200 path, where the module does
         // create and core is about to write its own cookie and headers.
         let graph = in_memory_graph();
@@ -666,7 +674,8 @@ mod tests {
             &[("x-ts-ec", "forged-value")],
             Some(HEADER_MODULE_ID),
             Some(&graph),
-        );
+        )
+        .await;
 
         let err = outcome.expect_err("a reserved header effect should fail the request");
         assert!(
@@ -675,8 +684,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolve_accumulates_module_response_headers_with_its_own() {
+    #[tokio::test]
+    async fn resolve_accumulates_module_response_headers_with_its_own() {
         // The module's own cookies must add to what the handler already set,
         // never replace it. Replacing would keep only the last of a module's
         // own cookies, and would drop the `Cache-Control: no-store` core writes
@@ -691,6 +700,7 @@ mod tests {
             Some(HEADER_MODULE_ID),
             Some(&graph),
         )
+        .await
         .expect("should handle resolve");
 
         assert_eq!(
@@ -728,12 +738,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolve_rejects_an_identifier_outside_the_cookie_bounds() {
+    #[tokio::test]
+    async fn resolve_rejects_an_identifier_outside_the_cookie_bounds() {
         // An identifier the cookie cannot carry is refused, never rewritten,
         // and leaves neither a cookie nor an identity-graph row behind.
         let graph = in_memory_graph();
         let response = resolve_with_header_module(&[], Some("has a space"), Some(&graph))
+            .await
             .expect("should handle resolve");
         assert_eq!(
             response.status(),
@@ -753,13 +764,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolve_answers_503_when_the_identity_graph_write_fails() {
+    #[tokio::test]
+    async fn resolve_answers_503_when_the_identity_graph_write_fails() {
         // The row is written before the cookie, so when the write fails no
         // cookie is set, because withdrawal could not reach an identity with
         // no row.
         let graph = crate::ec::kv::KvIdentityGraph::failing("test-ec-store");
         let response = resolve_with_header_module(&[], Some(HEADER_MODULE_ID), Some(&graph))
+            .await
             .expect("should handle resolve");
         assert_eq!(
             response.status(),
@@ -772,8 +784,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolve_refuses_an_advertised_oversized_body_before_reading_it() {
+    #[tokio::test]
+    async fn resolve_refuses_an_advertised_oversized_body_before_reading_it() {
         // A `Content-Length` over the limit is refused before the body is read,
         // whatever the body turns out to hold.
         let mut request = post(HEADER_MODULE_ID);
@@ -783,6 +795,7 @@ mod tests {
         let graph = in_memory_graph();
         let response =
             resolve_request_with_header_module(&[], Some(HEADER_MODULE_ID), request, Some(&graph))
+                .await
                 .expect("should handle resolve");
         assert_eq!(
             response.status(),
@@ -795,8 +808,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn client_set_value_round_trips_through_the_ec_scenario() {
+    #[tokio::test]
+    async fn client_set_value_round_trips_through_the_ec_scenario() {
         // A client-generated first-party UUID, the value the browser posts back.
         const TEST_ID: &str = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
 
@@ -818,7 +831,8 @@ mod tests {
             ec.ec_value().is_none(),
             "no EC should exist on the first visit"
         );
-        ec.generate_if_needed(&settings, None)
+        ec.generate_if_needed(&settings, None, &services)
+            .await
             .expect("should run generation");
         assert!(
             ec.ec_value().is_none(),
@@ -830,7 +844,8 @@ mod tests {
         //    value as the EC cookie.
         const CODED_TEST_ID: &str = "t0id~3f2504e0-4f89-41d3-9a0c-0305e82c3301";
         let graph = in_memory_graph();
-        let response = handle_ec_resolve(&settings, post(TEST_ID), &ec, Some(&graph))
+        let response = handle_ec_resolve(&settings, post(TEST_ID), &ec, Some(&graph), &services)
+            .await
             .expect("should handle resolve");
         assert_eq!(
             response.status(),
@@ -873,8 +888,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolve_sets_cookie_marker_and_no_store_when_word_matches_and_allowed() {
+    #[tokio::test]
+    async fn resolve_sets_cookie_marker_and_no_store_when_word_matches_and_allowed() {
         let settings = settings_with_client_fixed();
         let graph = in_memory_graph();
         let response = handle_ec_resolve(
@@ -882,7 +897,9 @@ mod tests {
             post(FIXED_WORD),
             &gated(&settings, true),
             Some(&graph),
+            &noop_services(),
         )
+        .await
         .expect("should handle resolve");
 
         assert_eq!(
@@ -939,8 +956,8 @@ mod tests {
 
     /// A resolve that creates nothing answers 204 and sets no cookie, whatever
     /// stopped it.
-    #[test]
-    fn resolve_answers_204_with_no_cookie_when_it_creates_nothing() {
+    #[tokio::test]
+    async fn resolve_answers_204_with_no_cookie_when_it_creates_nothing() {
         let mut no_module = create_test_settings();
         no_module.ec.module = None;
         for (case, settings, body, allowed, has_graph) in [
@@ -974,7 +991,9 @@ mod tests {
                 post(body),
                 &gated(&settings, allowed),
                 has_graph.then_some(&graph),
+                &noop_services(),
             )
+            .await
             .expect("should handle resolve");
 
             assert_eq!(response.status(), StatusCode::NO_CONTENT, "{case}");
@@ -988,7 +1007,7 @@ mod tests {
     /// A context read the way a composition root builds one, with the selected
     /// built-in module threaded through the services, at a location whose
     /// rules set storage without a signal so the gate is open.
-    fn resolve_with_threaded_module(settings: &Settings, body: &str) -> Response<EdgeBody> {
+    async fn resolve_with_threaded_module(settings: &Settings, body: &str) -> Response<EdgeBody> {
         let module = crate::ec::module::build_reusable_module(&settings.ec, None, None)
             .expect("should build the selected module")
             .expect("a built-in module is reusable");
@@ -1015,13 +1034,20 @@ mod tests {
             "the gate must be open for this to test anything"
         );
 
-        handle_ec_resolve(settings, post(body), &ec, Some(&in_memory_graph()))
-            .expect("a valid selection should not be an error")
+        handle_ec_resolve(
+            settings,
+            post(body),
+            &ec,
+            Some(&in_memory_graph()),
+            &services,
+        )
+        .await
+        .expect("a valid selection should not be an error")
     }
 
-    #[test]
-    fn resolve_answers_204_for_a_threaded_module_that_creates_nothing() {
-        let response = resolve_with_threaded_module(&create_test_settings(), FIXED_WORD);
+    #[tokio::test]
+    async fn resolve_answers_204_for_a_threaded_module_that_creates_nothing() {
+        let response = resolve_with_threaded_module(&create_test_settings(), FIXED_WORD).await;
 
         assert_eq!(
             response.status(),
@@ -1030,9 +1056,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn resolve_sets_the_cookie_for_a_threaded_client_fixed_module() {
-        let response = resolve_with_threaded_module(&settings_with_client_fixed(), FIXED_WORD);
+    #[tokio::test]
+    async fn resolve_sets_the_cookie_for_a_threaded_client_fixed_module() {
+        let response =
+            resolve_with_threaded_module(&settings_with_client_fixed(), FIXED_WORD).await;
 
         assert_eq!(
             response.status(),
@@ -1052,8 +1079,8 @@ mod tests {
     }
 
     /// A request the endpoint cannot take is refused, and sets no cookie.
-    #[test]
-    fn resolve_refuses_a_request_it_cannot_take() {
+    #[tokio::test]
+    async fn resolve_refuses_a_request_it_cannot_take() {
         let settings = settings_with_client_fixed();
         let oversized = "x".repeat(MAX_BODY_SIZE + 1);
         let own = Some("https://test-publisher.com");
@@ -1115,7 +1142,9 @@ mod tests {
                 post_with(origin, content_type, body),
                 &gated(&settings, true),
                 Some(&graph),
+                &noop_services(),
             )
+            .await
             .expect("should handle resolve");
 
             assert_eq!(response.status(), status, "{case}");
@@ -1126,8 +1155,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn resolve_accepts_a_configured_extra_origin() {
+    #[tokio::test]
+    async fn resolve_accepts_a_configured_extra_origin() {
         let mut settings = settings_with_client_fixed();
         settings
             .ec
@@ -1139,8 +1168,15 @@ mod tests {
             Some("text/plain"),
             FIXED_WORD,
         );
-        let response = handle_ec_resolve(&settings, request, &gated(&settings, true), Some(&graph))
-            .expect("should handle resolve");
+        let response = handle_ec_resolve(
+            &settings,
+            request,
+            &gated(&settings, true),
+            Some(&graph),
+            &noop_services(),
+        )
+        .await
+        .expect("should handle resolve");
         assert_eq!(
             response.status(),
             StatusCode::OK,
@@ -1205,8 +1241,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn resolve_conflicts_when_a_different_identity_already_exists() {
+    #[tokio::test]
+    async fn resolve_conflicts_when_a_different_identity_already_exists() {
         let settings = settings_with_client_fixed();
         let graph = in_memory_graph();
         let existing = format!("{}.ABC123", "e".repeat(64));
@@ -1214,8 +1250,15 @@ mod tests {
             &settings,
             EcContext::new_for_test_gated(Some(existing), ConsentContext::default(), true),
         );
-        let response = handle_ec_resolve(&settings, post(FIXED_WORD), &ec_context, Some(&graph))
-            .expect("should handle resolve");
+        let response = handle_ec_resolve(
+            &settings,
+            post(FIXED_WORD),
+            &ec_context,
+            Some(&graph),
+            &noop_services(),
+        )
+        .await
+        .expect("should handle resolve");
         assert_eq!(
             response.status(),
             StatusCode::CONFLICT,
@@ -1314,7 +1357,7 @@ mod tests {
     /// One page view as the publisher path handles it: the context is read,
     /// organic generation runs, and the response is finalized before the
     /// browser stores what it sets.
-    fn view_page(
+    async fn view_page(
         settings: &Settings,
         services: &RuntimeServices,
         graph: &KvIdentityGraph,
@@ -1328,7 +1371,8 @@ mod tests {
         send_cookies(&mut req, jar);
         let mut ec =
             EcContext::read_from_request(settings, &req, services).expect("should read EC context");
-        ec.generate_if_needed(settings, Some(graph))
+        ec.generate_if_needed(settings, Some(graph), services)
+            .await
             .expect("should run organic generation");
         let mut response = Response::builder()
             .status(StatusCode::OK)
@@ -1342,7 +1386,9 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            services,
+        )
+        .await;
         store_cookies(jar, &response);
         ec
     }
@@ -1350,7 +1396,7 @@ mod tests {
     /// The demo page script's post as the adapter handles it: the context is
     /// read from the post, the handler answers, and the response is
     /// finalized before the browser stores what it sets.
-    fn post_fixed_word(
+    async fn post_fixed_word(
         settings: &Settings,
         services: &RuntimeServices,
         graph: &KvIdentityGraph,
@@ -1360,8 +1406,9 @@ mod tests {
         send_cookies(&mut req, jar);
         let mut ec =
             EcContext::read_from_request(settings, &req, services).expect("should read EC context");
-        let mut response =
-            handle_ec_resolve(settings, req, &ec, Some(graph)).expect("should handle resolve");
+        let mut response = handle_ec_resolve(settings, req, &ec, Some(graph), services)
+            .await
+            .expect("should handle resolve");
         ec_finalize_response(
             settings,
             &mut ec,
@@ -1370,20 +1417,22 @@ mod tests {
             None,
             None,
             &mut response,
-        );
+            services,
+        )
+        .await;
         store_cookies(jar, &response);
         response.status()
     }
 
-    #[test]
-    fn the_demo_identity_is_recognized_and_keeps_its_marker() {
+    #[tokio::test]
+    async fn the_demo_identity_is_recognized_and_keeps_its_marker() {
         let settings = settings_with_client_fixed();
         let services = services_with_record(StorageRecord::Grant);
         let graph = in_memory_graph();
         let mut jar = Jar::new();
 
         assert_eq!(
-            post_fixed_word(&settings, &services, &graph, &mut jar),
+            post_fixed_word(&settings, &services, &graph, &mut jar).await,
             StatusCode::OK,
             "the first post should create the identity"
         );
@@ -1393,7 +1442,7 @@ mod tests {
             "the resolve should set the marker"
         );
 
-        let ec = view_page(&settings, &services, &graph, &mut jar);
+        let ec = view_page(&settings, &services, &graph, &mut jar).await;
 
         assert_eq!(
             ec.ec_value(),
@@ -1407,8 +1456,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_demo_page_does_not_post_again_on_the_next_view() {
+    #[tokio::test]
+    async fn the_demo_page_does_not_post_again_on_the_next_view() {
         let settings = settings_with_client_fixed();
         let services = services_with_record(StorageRecord::Grant);
         let graph = in_memory_graph();
@@ -1416,32 +1465,32 @@ mod tests {
         let mut posts = 0;
 
         for _view in 0..3 {
-            view_page(&settings, &services, &graph, &mut jar);
+            view_page(&settings, &services, &graph, &mut jar).await;
             // The page script posts only when it finds no marker, which its
             // own tests pin in `ec_client_fixed/index.test.ts`.
             if !jar.contains_key(COOKIE_TS_EC_RESOLVED) {
                 posts += 1;
-                post_fixed_word(&settings, &services, &graph, &mut jar);
+                post_fixed_word(&settings, &services, &graph, &mut jar).await;
             }
         }
 
         assert_eq!(posts, 1, "the page should post on the first view only");
     }
 
-    #[test]
-    fn a_withdrawal_tombstones_the_demo_identity() {
+    #[tokio::test]
+    async fn a_withdrawal_tombstones_the_demo_identity() {
         let settings = settings_with_client_fixed();
         let graph = in_memory_graph();
         let mut jar = Jar::new();
         let granted = services_with_record(StorageRecord::Grant);
         assert_eq!(
-            post_fixed_word(&settings, &granted, &graph, &mut jar),
+            post_fixed_word(&settings, &granted, &graph, &mut jar).await,
             StatusCode::OK,
             "the first post should create the identity"
         );
 
         let withdrawn = services_with_record(StorageRecord::Withdraw);
-        let ec = view_page(&settings, &withdrawn, &graph, &mut jar);
+        let ec = view_page(&settings, &withdrawn, &graph, &mut jar).await;
 
         assert!(
             ec.storage_withdrawn(),

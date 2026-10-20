@@ -12,9 +12,9 @@ There are 12 integration source modules: `creative`, `datadome`, `didomi`,
 13 named bundles because it also emits `core`.
 
 Those counts do not mean a page downloads 13 scripts. The server computes one
-content-addressed unified bundle from `core` plus the enabled immediate
-modules. Its URL includes the exact module-set hash, so different enabled sets
-do not share incorrect browser or edge-cache bytes.
+content-addressed unified bundle from `core` plus the immediate modules of the
+integrations the settings select. Its URL includes the exact module-set hash,
+so different selections do not share incorrect browser or edge-cache bytes.
 
 ## Loading modes
 

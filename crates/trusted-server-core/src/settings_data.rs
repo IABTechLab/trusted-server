@@ -4,8 +4,9 @@ use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
 pub use crate::config_payload::DEFAULT_CONFIG_STORE_ID;
-use crate::config_payload::{DEFAULT_SECRET_STORE_ID, settings_from_config_blob};
+use crate::config_payload::{DEFAULT_SECRET_STORE_ID, settings_from_config_blob_with};
 use crate::error::TrustedServerError;
+use crate::integrations::IntegrationBuilder;
 use crate::platform::{PlatformConfigStore, PlatformSecretStore, StoreName};
 use crate::settings::Settings;
 
@@ -68,7 +69,13 @@ pub fn default_secret_store_name() -> StoreName {
     StoreName::from(EnvConfig::from_env().store_name("secrets", DEFAULT_SECRET_STORE_ID))
 }
 
-/// Loads [`Settings`] from a platform config store and key.
+/// Loads [`Settings`] from a platform config store and key, validating
+/// against the built-in integrations only.
+///
+/// A deployment that composes builders of its own calls
+/// [`get_settings_from_config_store_with`] instead, because validation runs
+/// during the load and refuses a `[demand]` or `[ad-server]` name it cannot
+/// see a builder for.
 ///
 /// # Errors
 ///
@@ -82,9 +89,40 @@ pub fn get_settings_from_config_store(
     key: &str,
     default_secret_store_name: &StoreName,
 ) -> Result<Settings, Report<TrustedServerError>> {
+    get_settings_from_config_store_with(
+        config_store,
+        secret_store,
+        store_name,
+        key,
+        default_secret_store_name,
+        &[],
+    )
+}
+
+/// Loads [`Settings`] from a platform config store and key, validating
+/// against the built-in integrations followed by `extra_integrations`.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] when the config blob is
+/// missing, cannot be read, fails envelope verification, secret resolution,
+/// or Trusted Server settings validation.
+pub fn get_settings_from_config_store_with(
+    config_store: &dyn PlatformConfigStore,
+    secret_store: &dyn PlatformSecretStore,
+    store_name: &StoreName,
+    key: &str,
+    default_secret_store_name: &StoreName,
+    extra_integrations: &[IntegrationBuilder],
+) -> Result<Settings, Report<TrustedServerError>> {
     let raw_value = read_config_entry(config_store, store_name, key)?;
     let envelope_json = resolve_fastly_chunk_pointer(config_store, store_name, &raw_value)?;
-    settings_from_config_blob(&envelope_json, secret_store, default_secret_store_name)
+    settings_from_config_blob_with(
+        &envelope_json,
+        secret_store,
+        default_secret_store_name,
+        extra_integrations,
+    )
 }
 
 fn read_config_entry(
