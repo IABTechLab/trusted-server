@@ -947,33 +947,12 @@ pub fn register(
     ))
 }
 
-#[async_trait(?Send)]
-impl IntegrationProxy for GoogleTagManagerIntegration {
-    fn integration_name(&self) -> &'static str {
-        GTM_INTEGRATION_ID
-    }
-
-    fn routes(&self) -> Vec<IntegrationEndpoint> {
-        vec![
-            // Proxy for the main GTM script
-            self.get("/gtm.js"),
-            // Proxy for the gtag script (if used)
-            self.get("/gtag/js"),
-            self.get("/gtag.js"),
-            // Analytics beacons (GA4/UA)
-            // The GTM script is rewritten to point these beacons to our proxy.
-            self.get("/collect"),
-            self.post("/collect"),
-            self.get("/g/collect"),
-            self.post("/g/collect"),
-        ]
-    }
-
-    async fn handle(
+impl GoogleTagManagerIntegration {
+    async fn route(
         &self,
+        req: http::Request<EdgeBody>,
         settings: &Settings,
         services: &RuntimeServices,
-        req: http::Request<EdgeBody>,
     ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
         let mut req = req;
         let path = req.uri().path().to_string();
@@ -1019,6 +998,37 @@ impl IntegrationProxy for GoogleTagManagerIntegration {
         }
 
         Ok(response)
+    }
+}
+
+#[async_trait(?Send)]
+impl IntegrationProxy for GoogleTagManagerIntegration {
+    fn integration_name(&self) -> &'static str {
+        GTM_INTEGRATION_ID
+    }
+
+    fn routes(&self) -> Vec<IntegrationEndpoint> {
+        vec![
+            // Proxy for the main GTM script
+            self.get("/gtm.js"),
+            // Proxy for the gtag script (if used)
+            self.get("/gtag/js"),
+            self.get("/gtag.js"),
+            // Analytics beacons (GA4/UA)
+            // The GTM script is rewritten to point these beacons to our proxy.
+            self.get("/collect"),
+            self.post("/collect"),
+            self.get("/g/collect"),
+            self.post("/g/collect"),
+        ]
+    }
+
+    async fn handle(
+        &self,
+        call: trusted_server_core::module_context::ModuleCall<'_>,
+        req: http::Request<EdgeBody>,
+    ) -> Result<http::Response<EdgeBody>, Report<TrustedServerError>> {
+        call.inject_with(self, req, Self::route)?.await
     }
 }
 
@@ -1771,7 +1781,7 @@ mod tests {
             );
 
             integration
-                .handle(&settings, &services, req)
+                .route(req, &settings, &services)
                 .await
                 .expect("should handle the GTM request")
         })
@@ -2111,7 +2121,7 @@ mod tests {
             );
 
             integration
-                .handle(&settings, &services, req)
+                .route(req, &settings, &services)
                 .await
                 .expect("should handle the GTM request")
         })
@@ -2879,7 +2889,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
 
             let settings = make_settings();
             let response = integration
-                .handle(&settings, &noop_services(), req)
+                .route(req, &settings, &noop_services())
                 .await
                 .expect("handle should not return error");
 
@@ -2913,7 +2923,7 @@ j=d.createElement(s),dl=l!='dataLayer'?'&l='+l:'';j.async=true;j.src=
 
             let settings = make_settings();
             let response = integration
-                .handle(&settings, &noop_services(), req)
+                .route(req, &settings, &noop_services())
                 .await
                 .expect("handle should not return error");
 

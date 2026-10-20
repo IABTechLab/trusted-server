@@ -11,6 +11,7 @@ use trusted_server_core::consent::build_context_from_signals;
 use trusted_server_core::consent::types::RawConsentSignals;
 use trusted_server_core::ec::consent::{GeoStatus, assemble_permissions};
 use trusted_server_core::evidence::OwnedRequestInfo;
+use trusted_server_core::module_context::ModuleContext;
 use trusted_server_core::permission_signal::PermissionSignalModule;
 use trusted_server_core::permissions::{Permission, PermissionMaps};
 use trusted_server_core::platform::GeoInfo;
@@ -58,15 +59,20 @@ fn eval_json(input: &str) -> String {
     // request evidence, so empty evidence changes none of their answers. A
     // module that read a header or a cookie would need real evidence here.
     let evidence = OwnedRequestInfo::default();
+    // The page stands for no request, so the modules are asked in the empty
+    // context with the signals entered.
+    let context = ModuleContext::empty()
+        .with_consent(&ctx)
+        .with_evidence(&evidence);
     let modules = modules();
     let maps = PermissionMaps::standard();
     let (state, jurisdiction) = match input.geo.as_str() {
         "failed" => {
-            let state = assemble_permissions(&ctx, &evidence, GeoStatus::Failed, &modules);
+            let state = assemble_permissions(&context, GeoStatus::Failed, &modules);
             (state, "unknown".to_string())
         }
         "none" => {
-            let state = assemble_permissions(&ctx, &evidence, GeoStatus::NoLocation, &modules);
+            let state = assemble_permissions(&context, GeoStatus::NoLocation, &modules);
             (state, jurisdiction_name(maps.default_jurisdiction()))
         }
         _ => {
@@ -80,8 +86,7 @@ fn eval_json(input: &str) -> String {
                 region: input.region.clone().filter(|r| !r.is_empty()),
                 asn: None,
             };
-            let state =
-                assemble_permissions(&ctx, &evidence, GeoStatus::Located(&info), &modules);
+            let state = assemble_permissions(&context, GeoStatus::Located(&info), &modules);
             let jurisdiction = jurisdiction_name(
                 maps.jurisdiction_for(input.country.as_deref(), input.region.as_deref()),
             );

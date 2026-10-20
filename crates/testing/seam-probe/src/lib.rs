@@ -36,15 +36,14 @@ use trusted_server_core::auction::demand::{
 use trusted_server_core::auction::provider::{AuctionProvider, ProviderRequestOutcome};
 use trusted_server_core::auction::types::{AuctionContext, AuctionRequest, AuctionResponse};
 use trusted_server_core::ec::device::{DeviceModule, DeviceSignals};
-use trusted_server_core::ec::module::{
-    EdgeCookieModule, GeneratedEdgeCookie, IdentityInput, ModuleCode,
-};
+use trusted_server_core::ec::module::{EdgeCookieModule, GeneratedEdgeCookie, ModuleCode};
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::evidence::RequestInfo;
 use trusted_server_core::integrations::{
     CarriedJsModule, IntegrationBuilder, IntegrationEndpoint, IntegrationProxy,
     IntegrationRegistration,
 };
+use trusted_server_core::module_context::ModuleCall;
 use trusted_server_core::platform::{
     GeoInfo, PlatformError, PlatformGeo, PlatformResponse, RuntimeServices,
 };
@@ -206,6 +205,20 @@ pub struct SeamProbeEc;
 /// The four-character code core stamps on identifiers this module owns.
 const SEAM_PROBE_EC_CODE: ModuleCode = trusted_server_core::module_code!("sprb");
 
+impl SeamProbeEc {
+    /// An identifier derived from the client IP in the request's evidence.
+    fn derive(&self, request_info: &dyn RequestInfo) -> GeneratedEdgeCookie {
+        // Derived from evidence so the test can prove this ran rather than the
+        // built-in module, and prove the evidence actually arrived.
+        let ip = request_info.client_ip();
+        let id = format!("seam-probe-{}", if ip.is_empty() { "no-ip" } else { ip });
+        GeneratedEdgeCookie {
+            id: Some(id),
+            response_headers: Vec::new(),
+        }
+    }
+}
+
 #[async_trait::async_trait(?Send)]
 impl EdgeCookieModule for SeamProbeEc {
     fn id(&self) -> &'static str {
@@ -218,18 +231,9 @@ impl EdgeCookieModule for SeamProbeEc {
 
     async fn generate(
         &self,
-        request_info: &dyn RequestInfo,
-        _input: &IdentityInput<'_>,
-        _services: &trusted_server_core::platform::RuntimeServices,
+        call: ModuleCall<'_>,
     ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
-        // Derived from evidence so the test can prove this ran rather than the
-        // built-in module, and prove the evidence actually arrived.
-        let ip = request_info.client_ip();
-        let id = format!("seam-probe-{}", if ip.is_empty() { "no-ip" } else { ip });
-        Ok(GeneratedEdgeCookie {
-            id: Some(id),
-            response_headers: Vec::new(),
-        })
+        Ok(call.inject(self, Self::derive).unwrap_or_default())
     }
 
     fn accepts_id(&self, value: &str) -> bool {
@@ -247,11 +251,7 @@ impl DeviceModule for SeamProbeDevice {
         module_name()
     }
 
-    async fn detect(
-        &self,
-        _request_info: &dyn RequestInfo,
-        _services: &trusted_server_core::platform::RuntimeServices,
-    ) -> DeviceSignals {
+    async fn detect(&self, _call: ModuleCall<'_>) -> DeviceSignals {
         DeviceSignals {
             is_mobile: 1,
             platform_class: Some("seam-probe".to_owned()),
@@ -415,21 +415,11 @@ impl AuctionProvider for SeamProbeAdServer {
 /// Proxy that reports what the seam delivered to this request.
 pub struct SeamProbeProxy;
 
-#[async_trait(?Send)]
-impl IntegrationProxy for SeamProbeProxy {
-    fn integration_name(&self) -> &'static str {
-        SEAM_PROBE_ID
-    }
-
-    fn routes(&self) -> Vec<IntegrationEndpoint> {
-        vec![self.get(REPORT_ROUTE_SUFFIX)]
-    }
-
-    async fn handle(
+impl SeamProbeProxy {
+    async fn route(
         &self,
-        _settings: &Settings,
-        services: &RuntimeServices,
         req: Request<EdgeBody>,
+        services: &RuntimeServices,
     ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
         let country = match services
             .geo()
@@ -457,6 +447,25 @@ impl IntegrationProxy for SeamProbeProxy {
             HeaderValue::from_static("application/json"),
         );
         Ok(response)
+    }
+}
+
+#[async_trait(?Send)]
+impl IntegrationProxy for SeamProbeProxy {
+    fn integration_name(&self) -> &'static str {
+        SEAM_PROBE_ID
+    }
+
+    fn routes(&self) -> Vec<IntegrationEndpoint> {
+        vec![self.get(REPORT_ROUTE_SUFFIX)]
+    }
+
+    async fn handle(
+        &self,
+        call: trusted_server_core::module_context::ModuleCall<'_>,
+        req: Request<EdgeBody>,
+    ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+        call.inject_with(self, req, Self::route)?.await
     }
 }
 

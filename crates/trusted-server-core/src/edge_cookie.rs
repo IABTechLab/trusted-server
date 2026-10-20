@@ -15,12 +15,12 @@ use crate::cookies::handle_request_cookies;
 use crate::ec::cookies::ec_id_has_only_allowed_chars;
 #[cfg(test)]
 use crate::ec::generation::normalize_ip;
-#[cfg(test)]
-use crate::ec::module::IdentityInput;
 use crate::ec::module::{module_owns_id, request_module};
 use crate::error::TrustedServerError;
 #[cfg(test)]
 use crate::evidence::BorrowedRequestInfo;
+#[cfg(test)]
+use crate::module_context::{ModuleContext, test_support};
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 
@@ -65,10 +65,13 @@ pub async fn generate_ec_id(
     // than from this request info.
     let request_info = BorrowedRequestInfo::new(&client_ip, request_headers);
     // This helper skips the permission gate, and the built-in module reads
-    // neither the resolved permissions nor the consent context, so they are
-    // not threaded here.
+    // neither the resolved permissions nor the consent context, so the
+    // context carries the request's evidence and the services alone.
+    let context = ModuleContext::new(test_support::request("/"))
+        .with_evidence(&request_info)
+        .with_services(services);
     let generated = module
-        .generate(&request_info, &IdentityInput::default(), services)
+        .generate(context.call(module.id(), module.required_permissions()))
         .await?;
     let generated = crate::ec::module::GeneratedEdgeCookie {
         id: generated

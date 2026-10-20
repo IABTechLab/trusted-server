@@ -7,8 +7,10 @@ Axum, or Spin SDK types.
 
 ## Choose the narrowest hook
 
-- `IntegrationProxy` owns explicit method/path endpoints and receives
-  `Settings`, `RuntimeServices`, and an EdgeZero-neutral request.
+- `IntegrationProxy` owns explicit method/path endpoints and receives an
+  EdgeZero-neutral request and its call into the request's module context,
+  from which it names the `Settings`, the `RuntimeServices` and whatever
+  else it needs.
 - `IntegrationAttributeRewriter` inspects selected HTML attributes.
 - `IntegrationScriptRewriter` handles one declared selector.
 - `IntegrationHeadInjector` inserts deterministic head markup.
@@ -193,12 +195,21 @@ is omitted, so adapter startup must construct the complete service graph.
 
 ## Proxy implementation rules
 
-An `IntegrationProxy::handle` implementation receives the complete runtime
-service graph. Register or predict backends through `services.backend()`,
-send through `services.http_client()`, bound request and response bodies, and
-return `Report<TrustedServerError>` with integration context. The registry
-strips internal identity headers before dispatch; an integration must opt into
-any explicit forwarding behavior.
+An `IntegrationProxy::handle` implementation receives the request and its
+`ModuleCall`. It hands a function of its own to `call.inject_with`, with the
+request as that function's own argument, and names what else it needs as
+parameters, such as `&Settings` and `&RuntimeServices`, which is the complete
+runtime service graph. Register or predict backends through
+`services.backend()`, send through `services.http_client()`, bound request and
+response bodies, and return `Report<TrustedServerError>` with the route's
+context. The registry strips internal identity headers before dispatch, and a
+route must opt into any explicit forwarding behavior.
+
+A route that names a value whose use needs a permission, such as the Edge
+Cookie identifier, declares that permission in `required_permissions` and is
+passed the value only on a request that grants it. Nothing gates the route
+itself, so a route that must not run without a permission reads the
+`&PermissionState` and refuses.
 
 Streaming support is an adapter capability. Request
 `PlatformHttpRequest::with_stream_response()` only when the caller has
@@ -330,6 +341,82 @@ selected with `[geo] module = "testing.seam-probe"`. A `[geo] module` or
 startup. The message lists the modules of that type the deployment runs, and
 says when the name is a module no section selects or one that supplies no
 module of that type.
+
+### What a module is handed
+
+Core builds one module context for a request and hands each module it calls
+a `ModuleCall`, which is that context together with the permissions the
+module declares. The module hands a function of its own to `call.inject`,
+and that function names what it needs as parameters. Each is passed in from
+the context, which borrows what the request already holds.
+
+```rust
+impl ExampleProxy {
+    /// Answers with the country the request came from, when the location
+    /// may be passed to this route.
+    async fn route(
+        &self,
+        _req: Request<EdgeBody>,
+        settings: &Settings,
+        geo: Option<&GeoInfo>,
+    ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+        let country = geo.map_or("unknown", |geo| geo.country.as_str());
+        let body = format!("{} {country}", settings.publisher.domain);
+        Ok(Response::new(EdgeBody::from(body)))
+    }
+}
+
+#[async_trait(?Send)]
+impl IntegrationProxy for ExampleProxy {
+    fn integration_name(&self) -> &'static str {
+        "example"
+    }
+
+    fn routes(&self) -> Vec<IntegrationEndpoint> {
+        vec![self.get("/country")]
+    }
+
+    async fn handle(
+        &self,
+        call: ModuleCall<'_>,
+        req: Request<EdgeBody>,
+    ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+        call.inject_with(self, req, Self::route)?.await
+    }
+}
+```
+
+The values a function may name, and where each is absent, are listed in the
+documentation of `trusted_server_core::module_context`. A parameter may be an
+`Option` of one of them, which is `None` where the value is absent or
+withheld, or a tuple of several. A function that names a value itself is not
+called when the value cannot be passed, and the reason goes to the debug log.
+The module decides what that means. A device module answers the unknown
+device, an Edge Cookie module creates no identifier, and a route's `?` answers
+`403` for a value the request's permissions withhold and `500` for one absent
+where the route runs. `call.inject_with` passes one argument of the caller's
+own after the module, which is how a route takes its request and how an Edge
+Cookie module takes the value a page posted.
+
+The location, the device signals and the Edge Cookie identifier each carry
+the permissions that the module which produced them declares. One of them is
+passed only to a module that declares every one of those permissions in its
+`required_permissions` and is granted them on this request. A value whose
+producer declares no permission is passed to every module.
+
+What a context carries depends on where the module is called.
+
+| Module            | Called through                                         | What its context carries                                                                                                                                                            |
+| ----------------- | ------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Device            | `DeviceModule::detect`                                 | The request, the evidence, the settings and the services. No permission is resolved yet, so nothing whose use needs one                                                             |
+| Permission signal | `SignalInput::call`, `valid_signal` and `tdls`         | The request, the evidence, the connection, the consent, the settings and the services, and the location when its use needs no permission. The permissions are what the run produces |
+| Edge Cookie       | `EdgeCookieModule::generate` and `resolve_from_client` | Every row of the table above                                                                                                                                                        |
+| Route             | `IntegrationProxy::handle`                             | Every row of the table above except the evidence, because the route holds the request itself                                                                                        |
+
+A request preparer and a response finalizer are plain functions on the
+builder and are not handed the context. A preparer changes the request before
+anything about it is resolved, and a finalizer is handed only what its own
+module left for the request.
 
 ### Acting on one request
 

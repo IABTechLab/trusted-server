@@ -18,12 +18,12 @@ use tower::{Service as _, ServiceExt as _};
 use trusted_server_adapter_axum::app::TrustedServerApp;
 use trusted_server_core::auction::compile_auction_plan;
 use trusted_server_core::config::validate_settings_for_deploy_with;
-use trusted_server_core::ec::module::IdentityInput;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::evidence::OwnedRequestInfo;
 use trusted_server_core::integrations::{
     IntegrationBuilder, IntegrationRegistration, IntegrationRegistry,
 };
+use trusted_server_core::module_context::{ModuleContext, ModuleRequest};
 use trusted_server_core::platform::{
     BackendNamingPolicy, ClientInfo, DisabledGeo, PlatformBackend, PlatformBackendSpec,
     PlatformConfigStore, PlatformError, PlatformSecretStore, RuntimeServices, StoreId, StoreName,
@@ -697,8 +697,18 @@ async fn ec_module_generates_an_identifier_with_the_modules_prefix() {
         .expect("`[ec] module = \"testing.seam-probe\"` should resolve the module's module");
 
     let request_info = OwnedRequestInfo::new("192.0.2.1".to_owned(), HeaderMap::new());
+    let services = stub_services();
+    let method = axum::http::Method::GET;
+    let context = ModuleContext::new(ModuleRequest::new(
+        &method,
+        "publisher.example",
+        "https",
+        "/",
+    ))
+    .with_evidence(&request_info)
+    .with_services(&services);
     let generated = module
-        .generate(&request_info, &IdentityInput::default(), &stub_services())
+        .generate(context.call(module.id(), module.required_permissions()))
         .await
         .expect("the module's module should generate an identifier");
 

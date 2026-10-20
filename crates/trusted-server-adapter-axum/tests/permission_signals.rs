@@ -23,6 +23,7 @@ use trusted_server_core::consent::types::{GppConsent, TcfConsent, UsPrivacy};
 use trusted_server_core::consent::{ConsentContext, PrivacyFlag};
 use trusted_server_core::ec::consent::{GeoStatus, assemble_permissions};
 use trusted_server_core::evidence::OwnedRequestInfo;
+use trusted_server_core::module_context::{ModuleContext, test_support};
 use trusted_server_core::permission_signal::{
     PermissionSignalModule, build_permission_signal_modules,
 };
@@ -89,7 +90,21 @@ fn assembled(
     geo: GeoStatus<'_>,
     modules: &[Arc<dyn PermissionSignalModule>],
 ) -> PermissionState {
-    assemble_permissions(consent, &no_evidence(), geo, modules)
+    assembled_with(consent, &no_evidence(), geo, modules)
+}
+
+/// The permissions assembled for a request carrying `consent` and `evidence`,
+/// with the modules handed the request's module context.
+fn assembled_with(
+    consent: &ConsentContext,
+    evidence: &OwnedRequestInfo,
+    geo: GeoStatus<'_>,
+    modules: &[Arc<dyn PermissionSignalModule>],
+) -> PermissionState {
+    let context = ModuleContext::new(test_support::request("/"))
+        .with_consent(consent)
+        .with_evidence(evidence);
+    assemble_permissions(&context, geo, modules)
 }
 
 /// Builds a minimal decoded TCF record consenting to the given 1-indexed
@@ -618,7 +633,7 @@ fn a_pmp_answer_in_the_eu_settles_what_the_model_terms_cover_and_declares_them()
         );
         OwnedRequestInfo::new(String::new(), headers)
     };
-    let standard = assemble_permissions(
+    let standard = assembled_with(
         &ConsentContext::default(),
         &evidence("standard"),
         GeoStatus::Located(&geo),
@@ -647,7 +662,7 @@ fn a_pmp_answer_in_the_eu_settles_what_the_model_terms_cover_and_declares_them()
         vec!["https://m4ow.uk/mtm/2.txt"],
         "an answer is given under the versioned Model Terms"
     );
-    let personalized = assemble_permissions(
+    let personalized = assembled_with(
         &ConsentContext::default(),
         &evidence("personalized"),
         GeoStatus::Located(&geo),
@@ -657,7 +672,7 @@ fn a_pmp_answer_in_the_eu_settles_what_the_model_terms_cover_and_declares_them()
         personalized.is_set(Permission::SelectPersonalisedAds),
         "personalized grants targeting too"
     );
-    let unanswered = assemble_permissions(
+    let unanswered = assembled_with(
         &ConsentContext::default(),
         &no_evidence(),
         GeoStatus::Located(&geo),

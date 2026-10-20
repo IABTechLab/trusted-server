@@ -10,7 +10,7 @@
 //! scheme. Why is set out once, in `permission_signal/README.md` in core.
 
 use trusted_server_core::consent::ConsentContext;
-use trusted_server_core::evidence::RequestInfo;
+use trusted_server_core::module_context::ModuleCall;
 use trusted_server_core::permission_signal::{PermissionSignalModule, SignalInput};
 use trusted_server_core::permissions::{ConsentSignal, OptOutSource, Permission, ValidSignal};
 
@@ -40,6 +40,12 @@ impl GpcModule {
     pub const fn new() -> Self {
         Self
     }
+
+    /// The signal this scheme reads from the request's consent record, when
+    /// it can use one.
+    fn read_signal(&self, consent: &ConsentContext) -> Option<ValidSignal> {
+        consent.gpc.then(|| ValidSignal::new(short(), "gpc", "1"))
+    }
 }
 
 impl PermissionSignalModule for GpcModule {
@@ -65,12 +71,8 @@ impl PermissionSignalModule for GpcModule {
 
     /// The header's one value, when it was sent. There is nothing to
     /// decode, so a sent header is always valid.
-    fn valid_signal(
-        &self,
-        consent: &ConsentContext,
-        _evidence: &dyn RequestInfo,
-    ) -> Option<ValidSignal> {
-        consent.gpc.then(|| ValidSignal::new(short(), "gpc", "1"))
+    fn valid_signal(&self, call: ModuleCall<'_>) -> Option<ValidSignal> {
+        call.inject(self, Self::read_signal).ok().flatten()
     }
 }
 
@@ -107,14 +109,13 @@ mod tests {
 
     #[test]
     fn vouches_for_the_header_only_when_it_was_sent() {
-        let evidence = OwnedRequestInfo::default();
         assert_eq!(
-            GpcModule::new().valid_signal(&with_header(true), &evidence),
+            GpcModule::new().read_signal(&with_header(true)),
             Some(ValidSignal::new(short(), "gpc", "1")),
             "a sent header is the one value it can carry"
         );
         assert_eq!(
-            GpcModule::new().valid_signal(&with_header(false), &evidence),
+            GpcModule::new().read_signal(&with_header(false)),
             None,
             "no header is no signal"
         );

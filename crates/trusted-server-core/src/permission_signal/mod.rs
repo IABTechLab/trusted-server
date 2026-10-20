@@ -7,6 +7,7 @@ use error_stack::Report;
 use crate::consent::ConsentContext;
 use crate::error::TrustedServerError;
 use crate::evidence::RequestInfo;
+use crate::module_context::{ModuleCall, ModuleContext};
 use crate::permissions::{
     Acquisition, ConsentSignal, Permission, PermissionSet, SignalPolicy, ValidSignal,
 };
@@ -16,7 +17,11 @@ use crate::tdl::Tdl;
 /// What a signal module may read about a request.
 ///
 /// A struct rather than a parameter list, so a module needing something new
-/// does not change every implementation.
+/// does not change every implementation. The fields are what the signal run
+/// is deciding. Anything else in the request's module context, such as what
+/// the request resolved to or the settings, a module names through
+/// [`call`](Self::call). The permissions are what the run produces, so none
+/// are resolved yet and no value whose use needs one is passed here.
 pub struct SignalInput<'a> {
     /// The decoded consent record for this request.
     ///
@@ -54,10 +59,13 @@ pub struct SignalInput<'a> {
     /// False while answering a consultation, which is what stops two modules
     /// that consult each other from looping.
     may_ask: bool,
+    /// The request's module context.
+    context: &'a ModuleContext<'a>,
 }
 
 impl<'a> SignalInput<'a> {
-    /// An input for a module asked on its own, outside an ordered run.
+    /// An input for a module asked on its own, outside an ordered run, in a
+    /// context carrying nothing, see [`ModuleContext::empty`].
     #[must_use]
     pub fn new(
         consent: &'a ConsentContext,
@@ -74,6 +82,26 @@ impl<'a> SignalInput<'a> {
             modules: &[],
             position: 0,
             may_ask: true,
+            context: ModuleContext::empty(),
+        }
+    }
+
+    /// The same input in the request's module context.
+    #[must_use]
+    pub fn with_context(self, context: &'a ModuleContext<'a>) -> Self {
+        Self { context, ..self }
+    }
+
+    /// The module's call into the request's module context, which it hands
+    /// its own function to, naming what it needs. A module asked on its own
+    /// is called by no name and declares nothing.
+    #[must_use]
+    pub fn call(&self) -> ModuleCall<'a> {
+        match self.modules.get(self.position) {
+            Some(module) => self
+                .context
+                .call(module.id(), module.required_permissions()),
+            None => self.context.call("", PermissionSet::none()),
         }
     }
 
@@ -129,6 +157,7 @@ impl<'a> SignalInput<'a> {
             modules: self.modules,
             position,
             may_ask: false,
+            context: self.context,
         };
         Some(module.signal(permission, &input))
     }
@@ -166,6 +195,13 @@ pub trait PermissionSignalModule: Send + Sync {
     /// [`crate::module_name!`], such as `permission-signal.example`, which
     /// `[permission-signal] modules` may write as `example`.
     fn id(&self) -> &'static str;
+
+    /// The permissions this module declares, which decide whether a gated
+    /// value is passed to it. None by default. Signal modules run before the
+    /// permissions are resolved, so a declaration here passes nothing yet.
+    fn required_permissions(&self) -> PermissionSet {
+        PermissionSet::none()
+    }
 
     /// How this module would amend `permission` for this request.
     fn signal(&self, permission: Permission, input: &SignalInput<'_>) -> ConsentSignal;
@@ -216,12 +252,9 @@ pub trait PermissionSignalModule: Send + Sync {
     /// taken silently. Core carries what every module vouched for on the
     /// permission state, and a signal nobody vouched for is dropped from
     /// everything Trusted Server sends on, so a corrupt record never reaches
-    /// a page or a bid request.
-    fn valid_signal(
-        &self,
-        _consent: &ConsentContext,
-        _evidence: &dyn RequestInfo,
-    ) -> Option<ValidSignal> {
+    /// a page or a bid request. See [`crate::module_context`] for what an
+    /// implementation may name.
+    fn valid_signal(&self, _call: ModuleCall<'_>) -> Option<ValidSignal> {
         None
     }
 
@@ -239,7 +272,7 @@ pub trait PermissionSignalModule: Send + Sync {
     ///
     /// A locator must point at a document that is never edited once
     /// published, which [`Tdl`] documents and cannot enforce.
-    fn tdls(&self, _consent: &ConsentContext, _evidence: &dyn RequestInfo) -> Vec<Tdl> {
+    fn tdls(&self, _call: ModuleCall<'_>) -> Vec<Tdl> {
         Vec::new()
     }
 }
@@ -252,6 +285,7 @@ pub trait PermissionSignalModule: Send + Sync {
 pub(crate) fn combine(
     modules: &[Arc<dyn PermissionSignalModule>],
     permission: Permission,
+    context: &ModuleContext<'_>,
     consent: &ConsentContext,
     evidence: &dyn RequestInfo,
     policy: &SignalPolicy,
@@ -268,6 +302,7 @@ pub(crate) fn combine(
             modules,
             position,
             may_ask: true,
+            context,
         };
         // Every module is asked, because a later one may amend what an
         // earlier one settled. Stopping at the first answer would make the
@@ -296,6 +331,7 @@ pub(crate) fn combine(
 pub(crate) fn withdrawn(
     modules: &[Arc<dyn PermissionSignalModule>],
     permission: Permission,
+    context: &ModuleContext<'_>,
     consent: &ConsentContext,
     evidence: &dyn RequestInfo,
     policy: &SignalPolicy,
@@ -314,6 +350,7 @@ pub(crate) fn withdrawn(
             modules,
             position,
             may_ask: true,
+            context,
         };
         module.withdraws(permission, &input)
     })
@@ -328,12 +365,11 @@ pub(crate) fn withdrawn(
 #[must_use]
 pub(crate) fn tdls(
     modules: &[Arc<dyn PermissionSignalModule>],
-    consent: &ConsentContext,
-    evidence: &dyn RequestInfo,
+    context: &ModuleContext<'_>,
 ) -> Arc<[Tdl]> {
     let mut declared: Vec<Tdl> = Vec::new();
     for module in modules {
-        for tdl in module.tdls(consent, evidence) {
+        for tdl in module.tdls(context.call(module.id(), module.required_permissions())) {
             if !declared.contains(&tdl) {
                 declared.push(tdl);
             }
@@ -365,12 +401,13 @@ pub fn answerable(
 #[must_use]
 pub(crate) fn signals(
     modules: &[Arc<dyn PermissionSignalModule>],
-    consent: &ConsentContext,
-    evidence: &dyn RequestInfo,
+    context: &ModuleContext<'_>,
 ) -> Arc<[ValidSignal]> {
     modules
         .iter()
-        .filter_map(|module| module.valid_signal(consent, evidence))
+        .filter_map(|module| {
+            module.valid_signal(context.call(module.id(), module.required_permissions()))
+        })
         .collect()
 }
 
@@ -502,6 +539,7 @@ mod tests {
 
     use super::*;
     use crate::evidence::OwnedRequestInfo;
+    use crate::module_context::test_support;
 
     /// A module that always answers the same thing, for testing the rule
     /// rather than any particular scheme.
@@ -552,7 +590,7 @@ mod tests {
             ConsentSignal::Neutral
         }
 
-        fn tdls(&self, _consent: &ConsentContext, _evidence: &dyn RequestInfo) -> Vec<Tdl> {
+        fn tdls(&self, _call: ModuleCall<'_>) -> Vec<Tdl> {
             vec![Tdl::new(self.1).expect("should accept the test locator")]
         }
     }
@@ -576,6 +614,31 @@ mod tests {
 
     fn no_evidence() -> OwnedRequestInfo {
         OwnedRequestInfo::new(String::new(), HeaderMap::new())
+    }
+
+    /// The signals `modules` vouch for, asked in a context carrying `consent`
+    /// and no evidence.
+    fn signals_for(
+        modules: &[Arc<dyn PermissionSignalModule>],
+        consent: &ConsentContext,
+    ) -> Arc<[ValidSignal]> {
+        let evidence = no_evidence();
+        let context = ModuleContext::new(test_support::request("/"))
+            .with_consent(consent)
+            .with_evidence(&evidence);
+        signals(modules, &context)
+    }
+
+    /// The terms `modules` declare, asked as [`signals_for`] asks.
+    fn tdls_for(
+        modules: &[Arc<dyn PermissionSignalModule>],
+        consent: &ConsentContext,
+    ) -> Arc<[Tdl]> {
+        let evidence = no_evidence();
+        let context = ModuleContext::new(test_support::request("/"))
+            .with_consent(consent)
+            .with_evidence(&evidence);
+        tdls(modules, &context)
     }
 
     fn fixed(id: &'static str, signal: ConsentSignal) -> Arc<dyn PermissionSignalModule> {
@@ -643,11 +706,7 @@ mod tests {
             ConsentSignal::Neutral
         }
 
-        fn valid_signal(
-            &self,
-            _consent: &ConsentContext,
-            _evidence: &dyn RequestInfo,
-        ) -> Option<ValidSignal> {
+        fn valid_signal(&self, _call: ModuleCall<'_>) -> Option<ValidSignal> {
             Some(ValidSignal::new(self.0, self.0, self.1))
         }
     }
@@ -660,7 +719,7 @@ mod tests {
             fixed("silent", ConsentSignal::Revoke),
             Arc::new(Vouching("second", "two")),
         ];
-        let valid = signals(&modules, &consent, &no_evidence());
+        let valid = signals_for(&modules, &consent);
         assert_eq!(
             &*valid,
             &[
@@ -670,12 +729,7 @@ mod tests {
             "should carry what was vouched for, in configured order, and nothing else"
         );
         assert!(
-            signals(
-                &[fixed("silent", ConsentSignal::Grant)],
-                &consent,
-                &no_evidence()
-            )
-            .is_empty(),
+            signals_for(&[fixed("silent", ConsentSignal::Grant)], &consent).is_empty(),
             "a module vouches for nothing unless it says otherwise"
         );
     }
@@ -683,11 +737,7 @@ mod tests {
     #[test]
     fn a_module_declaring_no_terms_leaves_the_list_empty() {
         let consent = ConsentContext::default();
-        let declared = tdls(
-            &[fixed("quiet", ConsentSignal::Grant)],
-            &consent,
-            &no_evidence(),
-        );
+        let declared = tdls_for(&[fixed("quiet", ConsentSignal::Grant)], &consent);
         assert!(
             declared.is_empty(),
             "should declare nothing, because the IAB schemes carry no terms"
@@ -702,7 +752,7 @@ mod tests {
             fixed("quiet", ConsentSignal::Neutral),
             Arc::new(Declaring("second", "https://terms.example.com/b/1.txt")),
         ];
-        let declared = tdls(&modules, &consent, &no_evidence());
+        let declared = tdls_for(&modules, &consent);
         let addresses: Vec<&str> = declared.iter().map(Tdl::as_str).collect();
         assert_eq!(
             addresses,
@@ -721,7 +771,7 @@ mod tests {
             Arc::new(Declaring("first", "https://terms.example.com/a/1.txt")),
             Arc::new(Declaring("second", "https://terms.example.com/a/1.txt")),
         ];
-        let declared = tdls(&modules, &consent, &no_evidence());
+        let declared = tdls_for(&modules, &consent);
         assert_eq!(
             declared.len(),
             1,
@@ -736,7 +786,7 @@ mod tests {
             Arc::new(Declaring("first", "https://terms.example.com/a/1.txt")),
             Arc::new(Declaring("second", "https://terms.example.com/a/2.txt")),
         ];
-        let declared = tdls(&modules, &consent, &no_evidence());
+        let declared = tdls_for(&modules, &consent);
         assert_eq!(
             declared.len(),
             2,
@@ -748,7 +798,7 @@ mod tests {
     fn no_modules_declare_nothing() {
         let consent = ConsentContext::default();
         assert!(
-            tdls(&[], &consent, &no_evidence()).is_empty(),
+            tdls_for(&[], &consent).is_empty(),
             "should declare nothing when no module runs, rather than implying terms"
         );
     }
@@ -759,6 +809,7 @@ mod tests {
         combine(
             modules,
             Permission::StoreOnDevice,
+            ModuleContext::empty(),
             &consent,
             &no_evidence(),
             &policy,
@@ -781,6 +832,7 @@ mod tests {
         withdrawn(
             modules,
             Permission::StoreOnDevice,
+            ModuleContext::empty(),
             &consent,
             &no_evidence(),
             &policy,

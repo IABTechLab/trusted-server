@@ -14,10 +14,10 @@ use edgezero_core::http::{HeaderMap, Method, Response, request_builder};
 use edgezero_core::router::RouterService;
 use error_stack::Report;
 use futures::executor::block_on;
-use trusted_server_core::ec::module::IdentityInput;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::evidence::OwnedRequestInfo;
 use trusted_server_core::integrations::{IntegrationBuilder, IntegrationRegistration};
+use trusted_server_core::module_context::{ModuleContext, ModuleRequest};
 use trusted_server_core::settings::Settings;
 use trusted_server_core::tsjs::tsjs_script_src;
 use trusted_server_core::tsjs_bundle::{JsModulePart, compile_time_parts};
@@ -439,8 +439,18 @@ fn ec_and_device_selectors_naming_a_module_resolve_the_modules_it_declares() {
 
     let services = build_finalize_services(&state.settings, Arc::clone(&state.default_kv_store));
     let request_info = OwnedRequestInfo::new("192.0.2.1".to_owned(), HeaderMap::new());
-    let generated = block_on(module.generate(&request_info, &IdentityInput::default(), &services))
-        .expect("the module's Edge Cookie module should generate an identifier");
+    let method = Method::GET;
+    let context = ModuleContext::new(ModuleRequest::new(
+        &method,
+        "publisher.example",
+        "https",
+        "/",
+    ))
+    .with_evidence(&request_info)
+    .with_services(&services);
+    let generated =
+        block_on(module.generate(context.call(module.id(), module.required_permissions())))
+            .expect("the module's Edge Cookie module should generate an identifier");
 
     assert_eq!(
         generated.id.as_deref(),

@@ -288,12 +288,35 @@ impl PermissionSet {
         Self(self.0 | other.0)
     }
 
+    /// The permissions in this set and not in `other`.
+    #[must_use]
+    pub const fn difference(self, other: PermissionSet) -> Self {
+        Self(self.0 & !other.0)
+    }
+
     /// Iterates the permissions in the set, in bit-index order.
     ///
     /// The built-ins read nothing from the full set; this serves a module or
     /// diagnostic path that enumerates what is present.
     pub fn iter(self) -> impl Iterator<Item = Permission> {
         Permission::all().filter(move |p| self.contains(*p))
+    }
+}
+
+/// The Data Use identifiers in the set, in bit-index order, separated by
+/// `, `, or `nothing` for the empty set.
+impl core::fmt::Display for PermissionSet {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.is_empty() {
+            return f.write_str("nothing");
+        }
+        for (index, permission) in self.iter().enumerate() {
+            if index > 0 {
+                f.write_str(", ")?;
+            }
+            f.write_str(permission.as_str())?;
+        }
+        Ok(())
     }
 }
 
