@@ -245,7 +245,7 @@ impl PlatformLoadingCache for NoLoadingCache {
 /// through [`NoLoadingCache`].
 #[derive(Default)]
 pub struct LoadingCaches {
-    by_feature: HashMap<&'static str, Arc<dyn PlatformLoadingCache>>,
+    by_feature: HashMap<String, Arc<dyn PlatformLoadingCache>>,
     /// What a cache whose table selected nothing loads through, when a test
     /// gives every caller one cache.
     unselected: Option<Arc<dyn PlatformLoadingCache>>,
@@ -262,8 +262,8 @@ impl LoadingCaches {
     }
 
     /// Keeps `cache` as the one the table `name` selected.
-    pub fn insert(&mut self, name: &'static str, cache: Arc<dyn PlatformLoadingCache>) {
-        self.by_feature.insert(name, cache);
+    pub fn insert(&mut self, name: &str, cache: Arc<dyn PlatformLoadingCache>) {
+        self.by_feature.insert(name.to_owned(), cache);
     }
 
     /// The cache named `name` loads through.
@@ -284,7 +284,7 @@ impl LoadingCaches {
 
 impl fmt::Debug for LoadingCaches {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut selected: Vec<&&str> = self.by_feature.keys().collect();
+        let mut selected: Vec<&str> = self.by_feature.keys().map(String::as_str).collect();
         selected.sort();
         f.debug_struct("LoadingCaches")
             .field("selected", &selected)
