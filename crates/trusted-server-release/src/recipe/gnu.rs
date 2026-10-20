@@ -231,9 +231,7 @@ pub(crate) fn helper_measurement() -> Result<Vec<u8>, Report<ReleaseError>> {
     }
     compiler_queries.insert("-print-file-name=include".to_owned(), include);
     let sysroot = compiler_query("-print-sysroot", &working)?;
-    if !matches!(sysroot.as_str(), "\n" | "/\n") {
-        return Err(recipe_error("GNU profile requires the image-root sysroot"));
-    }
+    check_image_sysroot(&sysroot)?;
     compiler_queries.insert("-print-sysroot".to_owned(), sysroot);
     compiler_queries.insert(
         "-print-search-dirs".to_owned(),
@@ -252,6 +250,17 @@ pub(crate) fn helper_measurement() -> Result<Vec<u8>, Report<ReleaseError>> {
         Role::Metadata,
     )
     .map_err(|error| error.change_context(ReleaseError::Recipe))
+}
+
+fn check_image_sysroot(value: &str) -> Result<(), Report<ReleaseError>> {
+    // GCC prints no bytes when no alternate target sysroot was configured.
+    if !matches!(value, "" | "\n" | "/\n") {
+        let observed = value.chars().take(256).collect::<String>();
+        return Err(recipe_error(format!(
+            "GNU profile requires the image-root sysroot; compiler reported {observed:?}"
+        )));
+    }
+    Ok(())
 }
 
 impl GnuEvidence {

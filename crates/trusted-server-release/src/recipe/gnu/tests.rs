@@ -3,6 +3,22 @@ use std::os::unix::fs::symlink;
 
 use super::*;
 
+#[test]
+fn compiler_default_sysroot_can_have_no_output() {
+    for output in ["", "\n", "/\n"] {
+        assert!(
+            check_image_sysroot(output).is_ok(),
+            "should accept GCC's default or explicit image-root sysroot response"
+        );
+    }
+    for output in ["/other\n", "relative\n", " /\n", "/\r\n", "\n\n"] {
+        assert!(
+            check_image_sysroot(output).is_err(),
+            "should reject an unreviewed sysroot response {output:?}"
+        );
+    }
+}
+
 pub(super) fn projection_fixture() -> GnuEvidence {
     GnuEvidence {
         measurement: Measurement {
