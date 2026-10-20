@@ -38,6 +38,8 @@ pub(crate) enum ReleaseError {
     Collection,
     #[display("SPDX generation inputs or document are rejected")]
     Spdx,
+    #[display("Candidate release distribution evidence is rejected")]
+    Distribution,
 }
 
 impl core::error::Error for ReleaseError {}

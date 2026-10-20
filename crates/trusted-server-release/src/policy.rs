@@ -27,8 +27,12 @@ pub(crate) const TOOLS_PATH: &str = "scripts/release/release-tools.json";
 pub(crate) const CLI_POLICY_PATH: &str = "crates/trusted-server-cli/release-policy.json";
 /// Branches whose tips may supply release sources; candidates cannot extend it.
 pub(crate) const ELIGIBLE_BRANCHES: [&str; 1] = ["main"];
-
-const COHORT_ID: &str = "phase1-fastly-cli";
+/// Version of the tracked consumer release policy the compiled contract accepts.
+pub(crate) const CLI_POLICY_VERSION: u64 = 1;
+/// Fixed release cohort identity named by every release index.
+pub(crate) const COHORT_ID: &str = "phase1-fastly-cli";
+/// Official repository named by every release index.
+pub(crate) const REPOSITORY: &str = "IABTechLab/trusted-server";
 const SCHEMA_VERSION: u64 = 1;
 const GH_VERSION: &str = "2.97.0";
 const ATTEST_VERSION: &str = "4.2.2";
@@ -111,6 +115,32 @@ pub(crate) struct FixedArtifact {
     minimum_version: &'static str,
     runtime: &'static str,
     recipe_environment: &'static str,
+}
+
+impl FixedArtifact {
+    /// Renders this asset's fixed release-index identity fields.
+    ///
+    /// The result is exactly the governing schema's per-asset `oneOf` row: the
+    /// name, role, kind, package, target, default variant, assurance profile,
+    /// the single compiled capability and the compatibility triple. Nothing in
+    /// it comes from JSON input, so it can never add `fastly-staging`.
+    pub(crate) fn index_identity(&self) -> Value {
+        json!({
+            "name": self.name,
+            "role": self.role,
+            "kind": self.kind,
+            "package": self.package,
+            "target": self.target.triple(),
+            "variant": "default",
+            "assurance_profile": self.assurance_profile,
+            "capabilities": [self.capability],
+            "compatibility": {
+                "runtime": self.runtime,
+                "minimum_version": self.minimum_version,
+                "architecture": self.architecture,
+            },
+        })
+    }
 }
 
 /// The complete phase-one cohort. Every asset uses default features only.
@@ -640,14 +670,14 @@ fn compiled_consumer_policy() -> Value {
             "source_dependency": "git+https://github.com/IABTechLab/trusted-server@refs/tags/<tag>",
             "source_ref": "refs/tags/<tag>",
         },
-        "policy_version": 1,
+        "policy_version": CLI_POLICY_VERSION,
         "predicates": {
             "build_type": "https://actions.github.io/buildtypes/workflow/v1",
             "provenance": "https://slsa.dev/provenance/v1",
             "sbom": "https://spdx.dev/Document/v2.3",
         },
         "public_actions": READONLY_ACTIONS,
-        "repository": "IABTechLab/trusted-server",
+        "repository": REPOSITORY,
         "repository_id": "950860906",
         "repository_owner_id": "82903538",
         "tool_versions": {

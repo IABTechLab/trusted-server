@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde::de::{DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde::ser::{SerializeMap as _, SerializeSeq as _};
-use serde_json::{Map, Number, Value};
+use serde_json::{Map, Number, Value, json};
 use sha2::{Digest as _, Sha256};
 
 use crate::error::ReleaseError;
@@ -241,6 +241,14 @@ fn stamp(metadata: &std::fs::Metadata) -> (u64, u64, u64, u64, i64, i64, i64, i6
 }
 
 struct FlatName<'a>(&'a str);
+
+/// Returns whether `name` is a safe flat release asset name.
+///
+/// Rejects path separators, `..`, empty segments, control characters
+/// (including newlines) and anything outside the governing schema pattern.
+pub(crate) fn is_safe_flat_name(name: &str) -> bool {
+    safe_name(name).is_ok()
+}
 
 fn safe_name(name: &str) -> Result<FlatName<'_>, Report<ReleaseError>> {
     let mut parts = name.split('.');
@@ -492,6 +500,37 @@ fn schema_accepts(
 /// Rejects a changed retained schema or a structurally invalid document.
 pub(crate) fn validate_spdx(value: &Value) -> Result<(), Report<ReleaseError>> {
     validate_schema(KnownSchema::Spdx, value)
+}
+
+/// Validates a release index against the retained governing v1 schema.
+///
+/// Also applies the index role checks: safe integer tokens, safe flat and
+/// case-insensitively unique file names, role byte bounds and role-derived
+/// companion names. Schema validity grants no signing or release authority.
+///
+/// # Errors
+///
+/// Rejects a structurally invalid index or a failed role check.
+pub(crate) fn validate_release_index(value: &Value) -> Result<(), Report<ReleaseError>> {
+    validate_schema(KnownSchema::ReleaseIndex, value)
+}
+
+/// Validates one index artifact entry against the retained schema's
+/// `#/$defs/artifact` definition, built from the same retained raw bytes.
+///
+/// # Errors
+///
+/// Rejects an entry outside its fixed per-asset identity row, an unknown
+/// field or capability, or a non-safe integer token.
+pub(crate) fn validate_release_index_artifact(value: &Value) -> Result<(), Report<ReleaseError>> {
+    let retained = parse_json(KnownSchema::ReleaseIndex.bytes(), Role::Metadata)?;
+    let schema = json!({"$defs": retained["$defs"], "$ref": "#/$defs/artifact"});
+    if !schema_accepts(&schema, Draft::Draft202012, value)? {
+        return Err(invalid(
+            "index artifact does not match the retained artifact definition",
+        ));
+    }
+    validate_safe_integers(value)
 }
 
 fn validate_schema(schema: KnownSchema, value: &Value) -> Result<(), Report<ReleaseError>> {

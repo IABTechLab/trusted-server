@@ -333,6 +333,7 @@ fn checked_reproduction() -> CheckedAmbient {
 mod ambient;
 mod bind;
 mod candidate;
+mod candidate_index;
 #[cfg(target_os = "linux")]
 mod cli;
 mod cli_candidate;

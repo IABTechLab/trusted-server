@@ -201,6 +201,14 @@ controls. Positive IPv4 loopback operations MUST succeed, every confined INET
 operation MUST return EPERM/EACCES, and private Unix exchange MUST succeed. A
 socket helper is only boundary evidence; full recipe success is a separate gate.
 
+The Task 13 candidate release index (`src/distribution.rs`) is candidate
+evidence only. Its tag is the sentinel `v0.0.0-unqualified-candidate`, its bytes
+are named only `candidate-release-index.json`, and both signature bundle records
+of every artifact are empty-file records. Every unsigned companion declares
+`"release_qualification": false` and lists its gaps. The CLI verifier rejects
+size-0 bundle records, so a candidate index can never verify. It does not
+qualify an environment, and no command writes, signs or publishes it.
+
 ## Reviewable hosted resource proposal
 
 The adjacent `hosted-workflow.proposal.yml` is inert outside `.github/workflows`.

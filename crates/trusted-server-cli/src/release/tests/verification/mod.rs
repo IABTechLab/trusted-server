@@ -97,6 +97,57 @@ fn consistent_graph_verifies() {
 }
 
 #[test]
+fn rejects_empty_signature_bundle_records() {
+    for bundle in ["provenance", "sbom"] {
+        let mut built = Graph::new().build();
+        if bundle == "provenance" {
+            built.documents.provenance_bundle.clear();
+        } else {
+            built.documents.sbom_bundle.clear();
+        }
+        built.reindex();
+        let error = built
+            .sign()
+            .verify()
+            .expect_err("should reject a size-0 signature bundle record");
+        assert_eq!(
+            *error.current_context(),
+            ReleaseError::Evidence,
+            "should fail closed for an empty {bundle} bundle"
+        );
+        assert!(
+            format!("{error:?}").contains("is empty"),
+            "should name the empty {bundle} bundle: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn rejects_empty_bundle_records_of_an_unconsumed_index_artifact() {
+    let mut built = Graph::new().build();
+    let other = built.index["artifacts"]
+        .as_array_mut()
+        .expect("should hold artifacts")
+        .iter_mut()
+        .find(|artifact| artifact["name"] != ASSET)
+        .expect("should index another cohort artifact");
+    other["companions"]["sbom_attestation"]["size"] = json!(0);
+    let error = built
+        .sign()
+        .verify()
+        .expect_err("should reject an index naming an empty bundle");
+    assert_eq!(
+        *error.current_context(),
+        ReleaseError::Evidence,
+        "should fail closed before consuming any artifact"
+    );
+    assert!(
+        format!("{error:?}").contains(".sbom.sigstore.json` is empty"),
+        "should name the unconsumed artifact's empty bundle: {error:?}"
+    );
+}
+
+#[test]
 fn rejects_index_subject_digest() {
     let mut signed = consistent();
     statement_mut(&mut signed.proofs.index)["subject"][0]["digest"]["sha256"] = json!(ZERO_DIGEST);

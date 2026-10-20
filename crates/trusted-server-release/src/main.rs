@@ -5,6 +5,11 @@ mod boundary;
 mod collection;
 #[allow(dead_code, reason = "Task 10 composition capture is being integrated")]
 mod composition;
+#[allow(
+    dead_code,
+    reason = "the candidate release index has no command, writer or signer yet"
+)]
+mod distribution;
 // Atomic output and schema helpers are consumed by later producer stages.
 #[allow(dead_code)]
 mod documents;

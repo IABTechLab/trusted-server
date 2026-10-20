@@ -156,6 +156,11 @@ impl FastlyRuntimeAccepted {
         &self.source_commit
     }
 
+    /// The build role whose final output was accepted.
+    pub(crate) fn role(&self) -> Role {
+        self.role
+    }
+
     /// What the gate run observed.
     pub(crate) fn observed(&self) -> &GateObservation {
         &self.observed

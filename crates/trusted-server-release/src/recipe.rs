@@ -68,6 +68,7 @@ pub(crate) use apple::{
 };
 pub(crate) use artifact::copy_artifact;
 pub(crate) use cargo_output::successful_messages as observed_cargo_messages;
+pub(crate) use compare::FastlyEqualityChecked;
 pub(crate) use completed::RecipeCompleted;
 pub(crate) use identity::{ExactInvocationDigest, RecipeDefinitionIdentity};
 pub(crate) use paths::ExecutionPaths;

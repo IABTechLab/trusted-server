@@ -32,6 +32,8 @@
 mod joins;
 
 #[cfg(test)]
+mod candidate_fixture_tests;
+#[cfg(test)]
 mod upstream_format_tests;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -446,6 +448,7 @@ pub(crate) fn verify_index(
     let claims = proof.for_inputs(release, PredicateKind::Provenance, &measurement, bundle)?;
     check_provenance_proof(claims, &Expected::new(release), &subjects)?;
     let index = parse_release_index(bytes, policy, release)?;
+    index.artifacts.iter().try_for_each(check_bundle_records)?;
     accept_producer_policy(&index, source, &AcceptanceRules::compiled(policy))?;
     Ok(index)
 }
@@ -485,6 +488,9 @@ pub(crate) fn verify_build_evidence(
     )?;
     let run = check_provenance_proof(index_proof, &expected, &index_subject)?;
     let index = parse_release_index(inputs.index_bytes, inputs.consumer_policy, inputs.release)?;
+    // Every indexed artifact, consumed or not, must name non-empty bundles:
+    // an unsigned candidate index is rejected as a whole.
+    index.artifacts.iter().try_for_each(check_bundle_records)?;
     let producer_policy = accept_producer_policy(
         &index,
         inputs.source_policy,
@@ -554,6 +560,7 @@ impl ArtifactContext<'_> {
                     consumed.name
                 ))
             })?;
+        check_bundle_records(entry)?;
         check_companion_bytes(entry, consumed)?;
         joins::parse_informational(consumed.build_recipe)?;
         let provenance_subjects = provenance_subjects(entry);
@@ -597,6 +604,30 @@ impl ArtifactContext<'_> {
             .ok_or_else(|| evidence_error("SPDX statement has no predicate"))?;
         joins::check_spdx(predicate, consumed.spdx, &entry.sha256)
     }
+}
+
+/// Requires both signature bundle records to name non-empty files.
+///
+/// An unsigned candidate index records each awaiting-signature bundle as the
+/// true empty-file record (size 0). Provenance and SBOM sigstore bundles must
+/// exist, so a size-0 record fails closed before any byte or proof
+/// comparison. Verification applies this to every indexed artifact right
+/// after parsing the index, and again to each consumed artifact.
+///
+/// # Errors
+///
+/// Returns [`ReleaseError::Evidence`] when either bundle record has size 0.
+fn check_bundle_records(entry: &IndexArtifact) -> Result<(), Report<ReleaseError>> {
+    let companions = &entry.companions;
+    for record in [&companions.provenance, &companions.sbom_attestation] {
+        if record.size == 0 {
+            return Err(evidence_error(format!(
+                "signature bundle `{}` is empty; an unsigned candidate index cannot be verified",
+                record.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Index → executable and companions: exact actual lengths and digests.
