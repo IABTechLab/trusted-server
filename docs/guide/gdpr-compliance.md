@@ -7,9 +7,11 @@ Consent signal handling in Trusted Server.
 Trusted Server reads consent signals from each request, decodes them,
 and applies built-in enforcement rules to consent-gated activities
 such as EC creation and EID forwarding. The publisher configures how
-signals are interpreted: which countries and US states map to each
-jurisdiction's rules, how Global Privacy Control is read, how
-conflicting signals are resolved, and when stored signals expire.
+signals are interpreted, meaning how Global Privacy Control is read,
+how conflicting signals are resolved, and when stored signals expire.
+Which countries and US states fall under which jurisdiction's rules is
+not set here, because the `permissions.yaml` rules tree states it. See
+the [Permission Model](/guide/permission-model).
 The per-activity gates and their fail-closed defaults are built in.
 
 ## Policy Posture
@@ -96,12 +98,6 @@ Configure consent handling in the `[consent]` section of
 mode = "interpreter"           # or "proxy" (forward raw strings without decoding)
 max_consent_age_days = 365     # expiration check for dated signals
 
-[consent.gdpr]
-applies_in = ["DE", "FR"]      # countries mapped to the GDPR rules
-
-[consent.us_states]
-privacy_states = ["CA", "CO"]  # US states mapped to the US state rules
-
 [consent.us_privacy_defaults]
 gpc_implies_optout = true      # how the Sec-GPC header is interpreted
 
@@ -112,6 +108,17 @@ mode = "restrictive"           # or "newest" / "permissive"
 Each field tunes how signals are interpreted. The per-jurisdiction
 gates and their fail-closed defaults are built in.
 
+Which jurisdiction applies to a visitor is not configured here. The
+`[consent.gdpr] applies_in` and `[consent.us_states] privacy_states`
+lists are retired, and a `jurisdiction` attribute on the
+`permissions.yaml` rules tree does their job. Every node of that tree
+may name the jurisdiction for the places it covers, a node that names
+none inherits the nearest one above it, and the top of the tree answers
+a visitor whose country cannot be resolved. One file therefore carries
+the permission baselines and the jurisdiction assignment together. The
+[Permission Model](/guide/permission-model) documents the tree, so this
+page does not repeat it.
+
 ## Operational Behavior
 
 - Consent checks run before consent-gated activities (EC creation,
@@ -120,7 +127,8 @@ gates and their fail-closed defaults are built in.
   Resolution of conflicting signals is configurable (restrictive,
   newest, or permissive).
 - Audit logging records the consent decision per gated activity.
-- Regional rules are applied per detected jurisdiction.
+- Regional rules are applied per detected jurisdiction, which the rules
+  tree assigns from the visitor's country and region.
 
 ## Best Practices
 
@@ -136,6 +144,7 @@ gates and their fail-closed defaults are built in.
 
 ## Next Steps
 
+- [Permission Model](/guide/permission-model)
 - [Configuration Reference](/guide/configuration)
 - [Edge Cookies](/guide/edge-cookies)
 - [Architecture](/guide/architecture)

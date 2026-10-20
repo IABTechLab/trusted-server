@@ -530,6 +530,9 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
 pub fn build_runtime_services(
     ctx: &edgezero_core::context::RequestContext,
     settings: &trusted_server_core::settings::Settings,
+    permission_signal_modules: &Arc<
+        [Arc<dyn trusted_server_core::permission_signal::PermissionSignalModule>],
+    >,
 ) -> RuntimeServices {
     static KV_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     KV_WARNED.get_or_init(|| {
@@ -578,6 +581,10 @@ pub fn build_runtime_services(
             settings,
             Arc::clone(GEO.get_or_init(|| Arc::new(AxumPlatformGeo) as Arc<dyn PlatformGeo>)),
         ))
+        // The signal modules were selected once at startup from the scheme
+        // crates this adapter links, so every request asks exactly the ones
+        // configuration named, in that order.
+        .permission_signal_modules(Arc::clone(permission_signal_modules))
         .client_info(ClientInfo {
             client_ip,
             tls_protocol: None,

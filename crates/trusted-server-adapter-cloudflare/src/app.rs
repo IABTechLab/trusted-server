@@ -84,6 +84,12 @@ pub struct AppState {
     /// rather than resolved again on the request path.
     /// `None` for a deployment that selects no module.
     ec_module: Option<Arc<dyn EdgeCookieModule>>,
+    /// The permission signal modules `[permission-signal] modules` selects
+    /// from the scheme crates this adapter links, in the order they run.
+    /// Selected once here so a name no crate answers to fails startup rather
+    /// than the first request, and handed to every request's services.
+    permission_signal_modules:
+        Arc<[Arc<dyn trusted_server_core::permission_signal::PermissionSignalModule>]>,
     /// Services a caller supplied for every request, rather than services built
     /// from the request context. `None` in a deployment.
     services: Option<RuntimeServices>,
@@ -234,26 +240,54 @@ fn build_state_with_services(
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Cloudflare)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
+    let permission_signal_modules =
+        trusted_server_core::permission_signal::build_permission_signal_modules(
+            &settings,
+            &shipped_signal_modules(),
+        )?;
 
     Ok(Arc::new(AppState {
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
         ec_module,
+        permission_signal_modules,
         services,
     }))
+}
+
+/// The permission signal modules this adapter links, in the order they run
+/// when configuration names none. Global Privacy Control is first because it
+/// is a browser setting with no interface of its own, and the three that
+/// carry a choice someone made through an interface follow, so an answer
+/// given at a prompt amends the header the visitor arrived with.
+///
+/// Core supplies no module of its own, so this is where a deployment's
+/// schemes are decided. A scheme is added by linking its crate here, and a
+/// scheme core has never heard of plugs in the same way.
+fn shipped_signal_modules()
+-> Vec<Arc<dyn trusted_server_core::permission_signal::PermissionSignalModule>> {
+    vec![
+        Arc::new(trusted_server_permission_signal_gpc::GpcModule::new()),
+        Arc::new(trusted_server_permission_signal_gpp::GppSaleOptOutModule::new()),
+        Arc::new(trusted_server_permission_signal_us_privacy::UsPrivacyModule::new()),
+        Arc::new(trusted_server_permission_signal_tcf::TcfModule::new()),
+        Arc::new(trusted_server_permission_signal_mtm::MtmModule::new()),
+    ]
 }
 
 impl AppState {
     /// Builds the per-request services, carrying the Edge Cookie module the
     /// composition root already resolved so the request path does not resolve
-    /// `[ec] module` a second time.
-    /// Nothing is carried when the composition root found nothing safe to keep,
-    /// and the request path resolves for itself.
+    /// `[ec] module` a second time. Nothing is carried when the composition
+    /// root found nothing safe to keep, and the request path resolves for
+    /// itself.
     fn services_for_request(&self, ctx: &RequestContext) -> RuntimeServices {
         self.services
             .clone()
-            .unwrap_or_else(|| build_runtime_services(ctx, &self.settings))
+            .unwrap_or_else(|| {
+                build_runtime_services(ctx, &self.settings, &self.permission_signal_modules)
+            })
             .with_resolved_ec_module(self.ec_module.clone())
     }
 }
@@ -265,8 +299,12 @@ impl AppState {
 /// Builds the geo-aware [`EcContext`] for consent-gated endpoints (`/auction`,
 /// `/_ts/page-bids`, and the publisher fallback).
 ///
-/// Geo comes from the Workers `cf` object when deployed, and a geo lookup
-/// failure is logged and treated as no location.
+/// The geo lookup runs inside
+/// [`EcContext::read_from_request_resolving_geo`], so every adapter reports the
+/// same distinction: no location falls back to the top of the
+/// `permissions.yaml` rules tree, while a failed lookup resolves every
+/// permission at the requires-signal floor and is logged at error level.
+/// Geo comes from the Workers `cf` object when deployed.
 ///
 /// Mirrors the Fastly entry point, which keeps the report and answers with an
 /// error response: when the Edge Cookie context cannot be read the request
@@ -284,14 +322,7 @@ fn build_ec_context(
     services: &RuntimeServices,
     req: &Request,
 ) -> Result<EcContext, Report<TrustedServerError>> {
-    let geo_info = services
-        .geo()
-        .lookup(services.client_info().client_ip)
-        .unwrap_or_else(|e| {
-            log::warn!("geo lookup failed: {e}");
-            None
-        });
-    EcContext::read_from_request_with_geo(settings, req, services, geo_info.as_ref())
+    EcContext::read_from_request_resolving_geo(settings, req, services)
 }
 
 // ---------------------------------------------------------------------------
@@ -849,6 +880,11 @@ mod tests {
 
         [ec.acme]
         endpoint = "https://ec.acme.example.com"
+
+        # An Edge Cookie module is configured, so single-jurisdiction
+        # operation is acknowledged because no geo module is selected.
+        [geo]
+        assume_single_jurisdiction = true
     "#;
 
     /// The per-request Edge Cookie read must return its error rather than a
@@ -873,7 +909,7 @@ mod tests {
         // No resolved module is threaded here, so the request path resolves
         // the selection itself, which is what an embedder driving core
         // directly does and where the loud failure has to stay.
-        let services = build_runtime_services(&ctx, &settings);
+        let services = build_runtime_services(&ctx, &settings, &Arc::default());
         let req = ctx.into_request();
 
         let error = build_ec_context(&settings, &services, &req)
@@ -901,6 +937,9 @@ mod tests {
 
                 [ec]
                 passphrase = "fictional-secret-key-32-bytes-minimum"
+
+                [geo]
+                assume_single_jurisdiction = true
             "#,
         )
         .expect("should parse startup test settings");
@@ -963,6 +1002,9 @@ mod tests {
 
                 [ec]
                 passphrase = "fictional-secret-key-32-bytes-minimum"
+
+                [geo]
+                assume_single_jurisdiction = true
             "#,
         )
         .expect("should parse startup test settings");
@@ -1007,6 +1049,9 @@ mod tests {
 
                 [ec]
                 passphrase = "fictional-secret-key-32-bytes-minimum"
+
+                [geo]
+                assume_single_jurisdiction = true
             "#,
         )
         .expect("should parse startup test settings");

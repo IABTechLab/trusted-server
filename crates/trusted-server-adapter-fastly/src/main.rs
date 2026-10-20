@@ -925,6 +925,9 @@ mod tests {
             origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
 
+            [geo]
+            assume_single_jurisdiction = true
+
             [ec]
             module = "hmac"
 
@@ -1155,6 +1158,9 @@ mod tests {
             cookie_domain = ".test-publisher.com"
             origin_url = "https://origin.test-publisher.com"
             proxy_secret = "unit-test-proxy-secret"
+
+            [geo]
+            assume_single_jurisdiction = true
 
             [ec]
             passphrase = "test-secret-key-32-bytes-minimum"

@@ -640,6 +640,7 @@ mod tests {
             max_buffered_body_bytes: 16 * 1024 * 1024,
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
+            permissions_script: None,
         });
         let pipeline_config = PipelineConfig {
             input_compression: Compression::None,
@@ -1050,6 +1051,9 @@ mod tests {
 
             [ec]
             passphrase = "test-secret-key-32-bytes-minimum"
+
+            [geo]
+            assume_single_jurisdiction = true
 
             [request_signing]
             config_store_id = "test-config-store-id"
