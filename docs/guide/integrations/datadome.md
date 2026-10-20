@@ -176,7 +176,7 @@ A request is protected when all of the following are true:
 7. No `protection_exclusion_rules` match.
 8. The request does not contain a matching enabled `protection_test_bypass` credential while `FASTLY_IS_STAGING=1`.
 
-Static assets are excluded by default using a case-insensitive file-extension regex. Trusted Server internal routes such as `/static/tsjs=`, `/integrations/`, `/first-party/`, admin routes, discovery routes, and signature-verification routes are also excluded by default.
+Static assets are excluded by default using a case-insensitive file-extension regex. Trusted Server internal routes such as `/static/tsjs=`, `/integrations/`, `/first-party/`, discovery routes, and signature-verification routes are also excluded by default.
 
 Auction traffic at `/auction` is protected by default.
 

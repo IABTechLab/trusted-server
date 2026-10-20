@@ -6,15 +6,14 @@
 # `trusted-server.toml`. Copy it (`ts config init`), fill in the required
 # values, and push it (`ts config push`) as an EdgeZero app-config blob.
 #
-# Only two sections are REQUIRED for the server to start and pass validation:
-#   1. [[handlers]] covering /_ts/admin  (admin authentication)
-#   2. [publisher]                       (domain + origin)
+# Only one section is REQUIRED for the server to start and pass validation,
+# which is [publisher] (domain + origin).
 #
 # Edge Cookie identity is optional and stays off until an [ec] module is
 # selected, so no identity secret is needed to start. See the Edge Cookie
 # section below.
 #
-# Everything below those is OPTIONAL. Most optional blocks are commented out, so
+# Everything below it is OPTIONAL. Most optional blocks are commented out, so
 # uncomment and edit one to switch it on. All example hosts use `example.com`,
 # so replace them with your real endpoints in your private config, not in this
 # template.
@@ -41,28 +40,6 @@
 # deployed runtime reads the pushed config blob, so these env vars do not change
 # live behavior on their own.
 # =============================================================================
-
-
-# -----------------------------------------------------------------------------
-# REQUIRED - Admin authentication
-# -----------------------------------------------------------------------------
-# HTTP Basic-auth handler(s). At least one handler whose `path` regex covers
-# the /_ts/admin endpoints is mandatory; startup fails without it. Each handler
-# needs a non-placeholder username/password (deploy validation rejects the
-# sample password below).
-[[handlers]]
-# Regex matched against the request path. This one guards the admin surface.
-path = "^/_ts/admin"
-username = "admin"
-password = "handler_password"
-
-# You can add more handlers to basic-auth-protect other path prefixes. The
-# sample password below is a known placeholder that deploy validation rejects,
-# so it forces a real secret before push:
-# [[handlers]]
-# path = "^/secure"
-# username = "user"
-# password = "replace-with-admin-password"
 
 
 # -----------------------------------------------------------------------------
@@ -208,17 +185,11 @@ pull_sync_concurrency = 3
 # [response_headers]
 # X-Robots-Tag = "noindex"
 
-# Sign outbound OpenRTB/API requests. These are platform management-API store
-# IDs used for key-rotation WRITES; the runtime reads keys from fixed store names
-# (`jwks_store` / `signing_keys`), not these. To keep signing OFF, leave this
-# whole block commented out. If you uncomment it - even with `enabled = false` -
-# both store IDs are required and must be REAL values: the key rotate/deactivate
-# admin routes read them regardless of `enabled`, so deploy validation rejects
-# the placeholders below (replace them before pushing).
+# Sign outbound OpenRTB/API requests. The runtime reads its keys from fixed
+# store names (`jwks_store` / `signing_keys`), and `ts keys` writes them. To keep
+# signing OFF, leave this whole block commented out.
 # [request_signing]
 # enabled = false
-# config_store_id = "<management-config-store-id>"
-# secret_store_id = "<management-secret-store-id>"
 
 # First-party HTML/CSS rewriting controls.
 # [rewrite]

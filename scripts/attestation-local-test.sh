@@ -141,10 +141,6 @@ data = "fictional-local-proxy-secret-for-this-harness"
 [[local_server.secret_stores.trusted_server_secrets]]
 key = "ec_passphrase"
 data = "fictional-local-ec-passphrase-secret-value"
-
-[[local_server.secret_stores.trusted_server_secrets]]
-key = "handler_password"
-data = "fictional-local-handler-password-secret-value"
 SECRETSEOF
 
 "$TS" config init --app-config "$WORK/app.toml" >/dev/null

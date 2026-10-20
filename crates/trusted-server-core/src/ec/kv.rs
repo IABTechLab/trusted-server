@@ -20,7 +20,7 @@ use error_stack::{Report, ResultExt};
 use crate::error::TrustedServerError;
 
 use super::generation::ec_hash;
-use super::kv_backend::{EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome};
+use super::kv_backend::{EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome};
 use super::kv_types::{KvEntry, KvMetadata, KvNetwork};
 use super::{EcKvSnapshot, checked_current_timestamp, current_timestamp, log_id};
 
@@ -291,25 +291,6 @@ impl KvIdentityGraph {
                 message: "Failed to serialize KV entry metadata".to_owned(),
             })?;
         Ok((body, meta_str))
-    }
-
-    /// Reads the raw stored body, metadata, and generation for an EC ID key.
-    ///
-    /// Unlike [`Self::get`], the entry body is returned without
-    /// deserialization or validation, so corrupt or legacy-schema records can
-    /// still be inspected instead of failing closed. Used by the admin EC
-    /// lookup endpoint.
-    ///
-    /// Returns `Ok(None)` when the key does not exist.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TrustedServerError::KvStore`] on store open or read failure.
-    pub fn lookup_raw(
-        &self,
-        ec_id: &str,
-    ) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
-        self.store.lookup(ec_id)
     }
 
     /// Reads the full entry and its generation marker for CAS writes.
@@ -1625,6 +1606,7 @@ impl KvIdentityGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ec::kv_backend::EcKvLookup;
     use crate::ec::kv_backend::test_support::InMemoryEcKv;
 
     /// [`EcKvStore`] wrapper whose first CAS write both fails the precondition
@@ -4649,7 +4631,8 @@ mod tests {
         kv.create(&ec_id, &live_entry())
             .expect("should issue an identity");
         assert!(
-            kv.lookup_raw(&ec_id)
+            kv.store
+                .lookup(&ec_id)
                 .expect("should read lagging replica")
                 .is_none(),
             "should model the issuance replication gap"

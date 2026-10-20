@@ -33,7 +33,6 @@ a store the runtime never reads. Local push writes the temporary
 Spin encodes `v_<store>_v_<key>` names. The smoke supplies these exact
 variables:
 
-- `v_trusted_x5fserver_x5fsecrets_v_handler_x5fpassword`
 - `v_trusted_x5fserver_x5fsecrets_v_publisher_x5fproxy_x5fsecret`
 - `v_trusted_x5fserver_x5fsecrets_v_ec_x5fpassphrase`
 
@@ -51,9 +50,8 @@ manifest, SQLite store, response captures, and logs.
 
 Use the same store mapping and encoded variables in the deployment provider;
 empty variable defaults fail closed. Spin's request-time store registry is
-currently unwired, so EC KV lookup, request-signing key variables, and key
-rotation are unavailable. The read-only `/_ts/admin/eids` diagnostic remains
-available. Forwarded client-IP headers are sanitized, and Spin derives its
+currently unwired, so EC KV lookup and request-signing key variables are
+unavailable. Forwarded client-IP headers are sanitized, and Spin derives its
 runtime authority, scheme, and client-address headers in the innermost
 normalization layer.
 

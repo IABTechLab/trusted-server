@@ -24,17 +24,9 @@ use trusted_server_core::settings::TrustedClientIpConfig;
 
 /// Fastly [`ConfigStore`]-backed implementation of [`PlatformConfigStore`].
 ///
-/// Stateless — the store name is supplied per call, matching the trait
-/// signature. This replaces the store-name-at-construction pattern of
-/// the legacy `FastlyConfigStore` (removed).
-///
-/// # Write cost
-///
-/// `put` and `delete` each perform a synchronous outbound HTTPS request to the
-/// Fastly management API (`api.fastly.com`). Callers that issue many writes in
-/// one request pay one round-trip per call. The `"api-keys"` secret store is
-/// opened per call to read the management token; the Fastly Compute SDK caches
-/// the open handle so that cost is negligible.
+/// Reads take the store name on each call. The service never writes to a
+/// config store, so `put` and `delete` are refused. Signing keys are written
+/// by `ts keys`.
 pub struct FastlyPlatformConfigStore;
 
 impl PlatformConfigStore for FastlyPlatformConfigStore {
@@ -57,14 +49,14 @@ impl PlatformConfigStore for FastlyPlatformConfigStore {
             })
     }
 
-    fn put(&self, store_id: &StoreId, key: &str, value: &str) -> Result<(), Report<PlatformError>> {
-        let client = crate::management_api::FastlyManagementApiClient::new()?;
-        client.update_config_item(store_id.as_ref(), key, value)
+    fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::ConfigStore)
+            .attach("the service does not write to config stores"))
     }
 
-    fn delete(&self, store_id: &StoreId, key: &str) -> Result<(), Report<PlatformError>> {
-        let client = crate::management_api::FastlyManagementApiClient::new()?;
-        client.delete_config_item(store_id.as_ref(), key)
+    fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::ConfigStore)
+            .attach("the service does not write to config stores"))
     }
 }
 
@@ -74,15 +66,9 @@ impl PlatformConfigStore for FastlyPlatformConfigStore {
 
 /// Fastly [`SecretStore`]-backed implementation of [`PlatformSecretStore`].
 ///
-/// Stateless — the store name is supplied per call. This replaces the
-/// store-name-at-construction pattern of the legacy `FastlySecretStore`
-/// (removed).
-///
-/// # Write cost
-///
-/// `create` and `delete` have the same per-call
-/// [`crate::management_api::FastlyManagementApiClient`] cost described on
-/// [`FastlyPlatformConfigStore`].
+/// Reads take the store name on each call. The service never writes to a
+/// secret store, so `create` and `delete` are refused. Signing keys are
+/// written by `ts keys`.
 pub struct FastlyPlatformSecretStore;
 
 impl PlatformSecretStore for FastlyPlatformSecretStore {
@@ -118,19 +104,14 @@ impl PlatformSecretStore for FastlyPlatformSecretStore {
             })
     }
 
-    fn create(
-        &self,
-        store_id: &StoreId,
-        name: &str,
-        value: &str,
-    ) -> Result<(), Report<PlatformError>> {
-        let client = crate::management_api::FastlyManagementApiClient::new()?;
-        client.create_secret(store_id.as_ref(), name, value)
+    fn create(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::SecretStore)
+            .attach("the service does not write to secret stores"))
     }
 
-    fn delete(&self, store_id: &StoreId, name: &str) -> Result<(), Report<PlatformError>> {
-        let client = crate::management_api::FastlyManagementApiClient::new()?;
-        client.delete_secret(store_id.as_ref(), name)
+    fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
+        Err(Report::new(PlatformError::SecretStore)
+            .attach("the service does not write to secret stores"))
     }
 }
 

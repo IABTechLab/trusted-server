@@ -460,8 +460,7 @@ mod tests {
             "should preserve numeric fields"
         );
         assert_eq!(
-            reconstructed.handlers.len(),
-            original.handlers.len(),
+            reconstructed.proxy.allowed_domains, original.proxy.allowed_domains,
             "should preserve arrays"
         );
     }
@@ -980,7 +979,9 @@ mod tests {
             HMAC_MODULE_KEY,
             "12345678901234567890123456789012",
         );
-        original.handlers[0].password = Redacted::new("true".to_string());
+        original
+            .response_headers
+            .insert("x-example".to_string(), "true".to_string());
 
         let reconstructed =
             load_settings(&envelope_json(&original)).expect("should reconstruct settings");
@@ -996,9 +997,9 @@ mod tests {
             "numeric-looking passphrase should remain a string"
         );
         assert_eq!(
-            reconstructed.handlers[0].password.expose(),
-            original.handlers[0].password.expose(),
-            "boolean-looking handler password should remain a string"
+            reconstructed.response_headers.get("x-example"),
+            Some(&"true".to_string()),
+            "boolean-looking header value should remain a string"
         );
     }
 

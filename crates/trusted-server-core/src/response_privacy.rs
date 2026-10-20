@@ -234,11 +234,6 @@ mod tests {
     fn settings_with_response_headers(headers: &[(&str, &str)]) -> Settings {
         let mut s = Settings::from_toml(
             r#"
-                [[handlers]]
-                path = "^/_ts/admin"
-                username = "admin"
-                password = "admin-pass"
-
                 [publisher]
                 domain = "test-publisher.example.com"
                 cookie_domain = ".test-publisher.example.com"

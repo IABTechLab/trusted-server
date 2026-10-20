@@ -66,11 +66,6 @@ fn settings_with(extra: &str) -> Settings {
     };
     Settings::from_toml(&format!(
         r#"
-        [[handlers]]
-        path = "^/_ts/admin"
-        username = "admin"
-        password = "admin-pass"
-
         [publisher]
         domain = "test-publisher.com"
         cookie_domain = ".test-publisher.com"
@@ -222,15 +217,14 @@ fn a_named_route_and_the_fallback_each_prepare_the_request_exactly_once() {
         &[seam_probe::builder()],
     );
 
-    // `/admin/keys/rotate` is a named route that answers with a local 404,
-    // and the `^/_ts/admin` handler does not cover it, so the request reaches
-    // the preparer rather than being turned back with a 401.
-    let named = get(&router, "/admin/keys/rotate", Some("fastly-named-route"));
+    // `/first-party/proxy` is a named route whose handler refuses a request
+    // naming no target, so the request reaches the preparer and no backend.
+    let named = get(&router, "/first-party/proxy", Some("fastly-named-route"));
 
     assert_eq!(
         named.status().as_u16(),
-        404,
-        "the named route should serve the local deny"
+        502,
+        "the named route should refuse a request that names no target"
     );
     assert_eq!(
         seam_probe::prepare_runs_for("fastly-named-route"),

@@ -1,8 +1,3 @@
-[[handlers]]
-path = "^/_ts/admin"
-username = "admin"
-password = "integration_admin_password"
-
 [publisher]
 domain = "localhost"
 cookie_domain = "localhost"
@@ -37,8 +32,6 @@ api_token = "integration_partner_token_bravo"
 
 [request_signing]
 enabled = false
-config_store_id = "app_config"
-secret_store_id = "secrets"
 
 # Only the GPT diagnostics overlay runs, which is what the browser tests need.
 # A settings table its section does not select refuses startup, so no other

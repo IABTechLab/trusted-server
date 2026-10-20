@@ -59,10 +59,6 @@
             key = "placeholder"
             data = "placeholder"
 
-        [[local_server.kv_stores.opid_store]]
-            key = "placeholder"
-            data = "placeholder"
-
         [[local_server.kv_stores.creative_store]]
             key = "placeholder"
             data = "placeholder"
@@ -108,13 +104,6 @@
             key = "ts-2025-10-A"
             data = "NVnTYrw5xoyTJDOwoUWoPJO3A6UCCXOJJUzgGTxxx7k="
 
-        [[local_server.secret_stores.api-keys]]
-            key = "api_key"
-            data = "test-api-key"
-
-        [[local_server.secret_stores.trusted_server_secrets]]
-            key = "integration_admin_password"
-            data = "integration-admin-password-32-bytes-ok"
         [[local_server.secret_stores.trusted_server_secrets]]
             key = "integration_proxy_secret"
             data = "integration-test-proxy-secret-32-bytes-ok"

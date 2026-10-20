@@ -462,9 +462,9 @@ pub fn module_kv_key(module: &dyn EdgeCookieModule, full: &str) -> String {
     }
 }
 
-/// The modules whose identifiers a partner or diagnostic path accepts.
+/// The modules whose identifiers a partner path accepts.
 ///
-/// Pull sync, batch sync, and the admin lookup each take an identifier from
+/// Pull sync and batch sync each take an identifier from
 /// outside the organic request path and have to decide whether Trusted Server
 /// issued it. The answer is in two parts. The **global cookie bounds** (the
 /// length cap and the cookie-safe alphabet, see `ec_id_has_only_allowed_chars`)
@@ -475,11 +475,11 @@ pub fn module_kv_key(module: &dyn EdgeCookieModule, full: &str) -> String {
 /// second module's identifiers can never be adopted or written under this
 /// deployment's keys.
 ///
-/// All three look rows up under the key
+/// Both look rows up under the key
 /// [`canonical_kv_key`](Self::canonical_kv_key) returns rather than under the
-/// identifier as given, and pull sync and batch sync also write under that
+/// identifier as given, and write under that
 /// key, so a module whose canonical form differs from the cookie value still
-/// reaches the row it created. Batch sync and the admin lookup call
+/// reaches the row it created. Batch sync calls
 /// `canonical_kv_key` directly. Pull sync calls `canonical_kv_key` through
 /// `EcContext::kv_key_for` and still sends partners the identifier as issued.
 ///

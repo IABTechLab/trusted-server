@@ -995,11 +995,6 @@ pub mod test_support {
     /// The least a deployment's settings must say, which a module's own
     /// settings are written after.
     const BASE_SETTINGS: &str = r#"
-[[handlers]]
-path = "^/_ts/admin"
-username = "admin"
-password = "page-recording-password"
-
 [publisher]
 domain = "publisher.example.com"
 cookie_domain = ".publisher.example.com"

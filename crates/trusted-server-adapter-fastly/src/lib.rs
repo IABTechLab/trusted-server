@@ -50,7 +50,6 @@ mod config_selection;
 mod ec_kv;
 mod esi_assembly;
 mod logging;
-mod management_api;
 mod middleware;
 mod platform;
 mod rate_limiter;
@@ -1162,11 +1161,6 @@ mod tests {
     fn test_settings() -> Settings {
         Settings::from_toml(
             r#"
-            [[handlers]]
-            path = "^/_ts/admin"
-            username = "admin"
-            password = "admin-pass"
-
             [publisher]
             domain = "test-publisher.com"
             cookie_domain = ".test-publisher.com"
@@ -1184,8 +1178,6 @@ mod tests {
 
             [request_signing]
             enabled = false
-            config_store_id = "test-config-store-id"
-            secret_store_id = "test-secret-store-id"
             "#,
         )
         .expect("should parse test settings")
