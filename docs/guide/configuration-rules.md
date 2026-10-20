@@ -23,7 +23,8 @@ setting = "value"
 
 1. **The type is the job.** Each type is one top-level table, named for what
    its modules do: `ec`, `geo`, `device`, `permission-signal`, `demand`,
-   `ad-server`, `robots-txt` and `analytics`, and the section of each module
+   `ad-server`, `robots-txt`, `ads-txt` and `analytics`, and the section of each
+   module
    type, such as `cmp` or `tag`.
 2. **The selector chooses what runs.** A type that runs one module takes
    `module`, a string. A type that runs several takes `modules`, a list.
@@ -53,7 +54,8 @@ setting = "value"
 | `permission-signal` | several, in order | `modules`, a list  | `gpc`, `gpp`, `us-privacy`, `tcf`                                                                       |
 | `demand`            | several           | `modules`, a list  | `auction-protocol.openrtb`, `auction.prebid-server`, `auction.aps`                                      |
 | `ad-server`         | one               | `module`, a string | `mock`                                                                                                  |
-| `robots-txt`        | several, in order | `modules`, a list  | `refuse_all`, `allow_all`, or a module that supplies robots.txt rules                                   |
+| `robots-txt`        | several, in order | `modules`, a list  | `refuse_all`, `allow_all`, or an integration that supplies robots.txt rules                             |
+| `ads-txt`           | several           | `modules`, a list  | `sellers`                                                                                               |
 | `analytics`         | one               | `module`, a string | `tinybird`                                                                                              |
 | `cmp`               | one               | `module`, a string | `didomi`, `sourcepoint`, `osano`                                                                        |
 | `tag`               | several           | `modules`, a list  | `google-tag-manager`                                                                                    |

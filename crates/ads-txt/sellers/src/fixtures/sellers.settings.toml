@@ -1,0 +1,10 @@
+[ads-txt]
+modules = ["sellers"]
+
+[ads-txt.sellers]
+lines = ["ssp.example, 12345, DIRECT, f08c47fec0942fa0", "CONTACT=ads@publisher.example"]
+
+[[fetch]]
+media_type = "text/plain"
+path = "/ads.txt"
+middleware = ["ads-txt.sellers"]
