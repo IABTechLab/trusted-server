@@ -73,9 +73,9 @@ pub(crate) enum ImageSelection {
 }
 
 impl ImageSelection {
-    fn id(&self) -> &str {
+    fn into_id(self) -> String {
         match self {
-            Self::Qualified(image) => match *image {},
+            Self::Qualified(image) => match image {},
             #[cfg(test)]
             Self::Test { id } => id,
         }
@@ -440,7 +440,8 @@ fn aggregate(mut failures: Vec<Report<ReleaseError>>) -> Result<(), Report<Relea
 pub(crate) struct DockerBoundary {
     client: DockerClient,
     settings: DockerSettings,
-    image: ImageSelection,
+    /// Content ID of the [`ImageSelection`] this boundary was configured with.
+    image_id: String,
     mounts: Vec<Mount>,
 }
 
@@ -458,8 +459,18 @@ impl DockerBoundary {
         image: ImageSelection,
         state_parent: &Path,
     ) -> Result<Self, Report<ReleaseError>> {
+        Self::configure(roots, settings, image.into_id(), state_parent)
+    }
+
+    /// Configures a boundary for an image ID taken from an [`ImageSelection`].
+    fn configure(
+        roots: &BoundaryRoots,
+        settings: DockerSettings,
+        image_id: String,
+        state_parent: &Path,
+    ) -> Result<Self, Report<ReleaseError>> {
         settings.validate()?;
-        validate_image_id(image.id())?;
+        validate_image_id(&image_id)?;
         check_daemon_socket(Path::new(DOCKER_SOCKET))?;
         let mounts = mounts(roots)?;
         let mounted: Vec<&Path> = mounts.iter().map(|mount| mount.source.as_path()).collect();
@@ -469,13 +480,41 @@ impl DockerBoundary {
             &mounted,
             settings.host_limits,
         )?;
-        client.require_no_image_volumes(image.id())?;
+        client.require_no_image_volumes(&image_id)?;
         Ok(Self {
             client,
             settings,
-            image,
+            image_id,
             mounts,
         })
+    }
+
+    /// Configures a sibling container with the same image and settings over
+    /// `roots`, with fresh host inputs beside this boundary's inputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReleaseError::Boundary`] as [`Self::new`] does, or when the
+    /// sibling pinned a different client or seccomp profile.
+    pub(crate) fn sibling(&self, roots: &BoundaryRoots) -> Result<Self, Report<ReleaseError>> {
+        let state_parent = self
+            .client
+            .inputs()
+            .directory()
+            .parent()
+            .ok_or_else(|| docker_error("Docker host input directory has no parent"))?;
+        let sibling = Self::configure(
+            roots,
+            self.settings.clone(),
+            self.image_id.clone(),
+            state_parent,
+        )?;
+        if sibling.client.inputs().digests() != self.client.inputs().digests() {
+            return Err(docker_error(
+                "sibling container pinned another Docker client or seccomp profile",
+            ));
+        }
+        Ok(sibling)
     }
 
     /// Returns the configuration fingerprint (before the instance nonce).
@@ -485,7 +524,7 @@ impl DockerBoundary {
             config: self.client.inputs().config(),
             seccomp: self.client.inputs().effective_profile(),
             name: "",
-            image: self.image.id(),
+            image: &self.image_id,
             mounts: &self.mounts,
             environment: &[],
             working_directory: Path::new("/"),
@@ -527,7 +566,7 @@ impl DockerBoundary {
             config: self.client.inputs().config(),
             seccomp: self.client.inputs().effective_profile(),
             name: &name,
-            image: self.image.id(),
+            image: &self.image_id,
             mounts: &self.mounts,
             environment: &command.environment,
             working_directory: &working_directory,

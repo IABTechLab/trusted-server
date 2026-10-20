@@ -202,7 +202,8 @@ pub(super) fn projection_fixture() -> GnuEvidence {
         },
         profile_sha256: profile_digest(),
         helper_sha256: "d".repeat(64),
-        boundary_fingerprint: hex::encode([1; 32]),
+        build_boundary_fingerprint: hex::encode([1; 32]),
+        measurement_boundary_fingerprint: hex::encode([3; 32]),
         plan_sha256: "b".repeat(64),
         identity_scope: "fictional_projection_fixture",
         acquisition: "unqualified_candidate_measurement",
@@ -306,7 +307,8 @@ fn helper_observations_must_agree_and_match_boundary_and_plan() {
         },
         profile_sha256: profile_digest(),
         helper_sha256: "b".repeat(64),
-        boundary_fingerprint: hex::encode([1; 32]),
+        build_boundary_fingerprint: hex::encode([1; 32]),
+        measurement_boundary_fingerprint: hex::encode([3; 32]),
         plan_sha256: "c".repeat(64),
         identity_scope: "fixture",
         acquisition: "unqualified",
@@ -334,6 +336,108 @@ fn helper_observations_must_agree_and_match_boundary_and_plan() {
     assert!(
         first.verify_binding(&[1; 32], &"d".repeat(64)).is_err(),
         "should reject another completed plan"
+    );
+    assert!(
+        first.verify_binding(&[3; 32], &"c".repeat(64)).is_err(),
+        "should not accept the measurement sandbox as the build boundary"
+    );
+}
+
+#[test]
+fn binding_requires_a_separate_well_formed_measurement_sandbox() {
+    let mut evidence = GnuEvidence::projection_fixture();
+    let plan = "b".repeat(64);
+    assert_eq!(
+        serde_json::to_value(&evidence).expect("should serialize the receipt")["measurement_boundary_fingerprint"],
+        hex::encode([3; 32]),
+        "should record the measurement sandbox fingerprint"
+    );
+    assert!(
+        evidence.verify_binding(&[1; 32], &plan).is_ok(),
+        "should accept a distinct measurement sandbox"
+    );
+
+    evidence.measurement_boundary_fingerprint = hex::encode([1; 32]);
+    assert!(
+        evidence.verify_binding(&[1; 32], &plan).is_err(),
+        "should reject measurements recorded as the build boundary itself"
+    );
+    evidence.measurement_boundary_fingerprint = "not-a-fingerprint".to_owned();
+    assert!(
+        evidence.verify_binding(&[1; 32], &plan).is_err(),
+        "should reject a malformed measurement sandbox fingerprint"
+    );
+}
+
+/// Ordinary CI tools, a fictional GNU plan and a sandbox with `parent`.
+struct DerivationFixture {
+    _directory: tempfile::TempDir,
+    tools: SelectedRustTools,
+    plan: CargoPlan,
+    sandbox: MeasurementSandbox,
+}
+
+fn derivation_fixture(parent: Option<[u8; 32]>) -> DerivationFixture {
+    let directory = tempfile::tempdir().expect("should create fixture");
+    let base = fs::canonicalize(directory.path()).expect("should canonicalize fixture");
+    let target = crate::policy::ReleaseTarget::X86_64UnknownLinuxGnu;
+    let libraries = base.join(format!("tools/lib/rustlib/{}/lib", target.triple()));
+    fs::create_dir_all(&libraries).expect("should create tool libraries");
+    fs::create_dir_all(base.join("tools/bin")).expect("should create tool binaries");
+    for file in ["tools/bin/cargo", "tools/bin/rustc"] {
+        fs::write(base.join(file), b"fictional").expect("should write tool");
+    }
+    fs::write(libraries.join("libstd-example.rlib"), b"fictional").expect("should write std");
+    for root in ["checkout", "cargo-state"] {
+        fs::create_dir(base.join(root)).expect("should create root");
+    }
+    let roots = crate::boundary::BoundaryRoots::new(
+        &[base.join("checkout")],
+        &[base.join("tools")],
+        &[base.join("cargo-state")],
+    )
+    .expect("should build sandbox roots");
+    let asset = super::super::AssetId::parse(crate::policy::FIXED_ARTIFACTS[0].name)
+        .expect("should select a fixed asset");
+    DerivationFixture {
+        tools: SelectedRustTools::for_tests(&base.join("tools"), target)
+            .expect("should select fictional tools"),
+        plan: CargoPlan {
+            asset,
+            program: base.join("tools/bin/cargo"),
+            arguments: linker_arguments(),
+            environment: environment(),
+            working_directory: base.join("checkout"),
+            umask: crate::boundary::Umask::new(0o022).expect("should accept fixture umask"),
+            apple_identity_sha256: None,
+        },
+        sandbox: MeasurementSandbox {
+            boundary: Boundary::derivation_fixture_for_tests(roots, parent)
+                .expect("should build the derivation fixture"),
+            proof: DenialProof::for_tests(),
+        },
+        _directory: directory,
+    }
+}
+
+#[test]
+fn measurements_require_a_sandbox_derived_from_the_build_boundary() {
+    for parent in [None, Some([9; 32])] {
+        let fixture = derivation_fixture(parent);
+        let error = GnuEvidence::measure(&fixture.tools, &fixture.plan, &[1; 32], &fixture.sandbox)
+            .expect_err("should reject a sandbox from another build");
+        assert!(
+            format!("{error:?}").contains("not derived from the build boundary"),
+            "should name the derivation rule for parent {parent:?}"
+        );
+    }
+
+    let fixture = derivation_fixture(Some([1; 32]));
+    let error = GnuEvidence::measure(&fixture.tools, &fixture.plan, &[1; 32], &fixture.sandbox)
+        .expect_err("should still require a container-owned sandbox");
+    assert!(
+        format!("{error:?}").contains("requires the selected Docker boundary"),
+        "should pass derivation and reach the container gate"
     );
 }
 

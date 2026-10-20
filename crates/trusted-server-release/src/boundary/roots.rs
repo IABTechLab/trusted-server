@@ -191,6 +191,46 @@ impl BoundaryRoots {
         Ok(())
     }
 
+    /// Returns these roots without the last writable root, which must be
+    /// `excluded`.
+    ///
+    /// Only the last writable root may be dropped, so every remaining root
+    /// keeps its role, per-role index and therefore its execution path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReleaseError::Boundary`] when `excluded` cannot be resolved,
+    /// is not the last writable root, or is the only writable root.
+    pub(crate) fn without_last_writable(
+        &self,
+        excluded: &Path,
+    ) -> Result<Self, Report<ReleaseError>> {
+        let excluded = fs::canonicalize(excluded).map_err(|error| {
+            boundary_error(format!(
+                "cannot resolve the excluded writable root: {error}"
+            ))
+        })?;
+        let Some((last, remaining)) = self.writable.split_last() else {
+            return Err(boundary_error("a boundary needs a private writable root"));
+        };
+        if *last != excluded {
+            return Err(boundary_error(
+                "only the last writable root may be excluded without shifting root indices",
+            ));
+        }
+        if remaining.is_empty() {
+            return Err(boundary_error(
+                "excluding the only writable root leaves no private writable root",
+            ));
+        }
+        Ok(Self {
+            immutable: self.immutable.clone(),
+            tools: self.tools.clone(),
+            writable: remaining.to_vec(),
+            system: self.system.clone(),
+        })
+    }
+
     /// Returns every root with its role and per-role index.
     pub(crate) fn entries(&self) -> impl Iterator<Item = (RootRole, usize, &Path)> {
         fn tag(

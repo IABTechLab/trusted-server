@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::{CargoPlan, SelectedRustTools, recipe_error};
-use crate::boundary::{Boundary, ConfinedCommand, DenialProof};
+use crate::boundary::{Boundary, ConfinedCommand, DenialProof, ProbeProgram};
 use crate::documents::{Role, canonical_json, hash_bounded_with_check, lower_hex, parse_json};
 use crate::error::ReleaseError;
 use crate::process::{BoundedCommand, ProcessLimits};
@@ -83,7 +83,11 @@ pub(crate) struct GnuEvidence {
     measurement: Measurement,
     profile_sha256: String,
     helper_sha256: String,
-    boundary_fingerprint: String,
+    /// The boundary that ran the Cargo build this receipt belongs to.
+    build_boundary_fingerprint: String,
+    /// The sibling sandbox, derived from the build boundary without its target
+    /// root, that ran both measurements.
+    measurement_boundary_fingerprint: String,
     plan_sha256: String,
     identity_scope: &'static str,
     acquisition: &'static str,
@@ -95,6 +99,61 @@ fn limits() -> ProcessLimits {
         wall: Duration::from_secs(180),
         stdout_max: MEASUREMENT_LIMIT,
         stderr_max: MEASUREMENT_LIMIT,
+    }
+}
+
+/// Limits of the measurement sandbox's denial probe.
+fn probe_limits() -> ProcessLimits {
+    ProcessLimits {
+        wall: Duration::from_secs(60),
+        stdout_max: 4096,
+        stderr_max: 4096,
+    }
+}
+
+/// Selects the staged tool-root release helper as the denial probe.
+#[cfg(test)]
+fn measurement_probe(tools: &SelectedRustTools) -> Result<ProbeProgram, Report<ReleaseError>> {
+    ProbeProgram::from_staged_release_binary(&tools.root().join("probe"))
+}
+
+/// No production selection runs a candidate build, so none selects a probe.
+#[cfg(not(test))]
+fn measurement_probe(_tools: &SelectedRustTools) -> Result<ProbeProgram, Report<ReleaseError>> {
+    Err(Report::new(ReleaseError::Unqualified)
+        .attach("GNU measurement sandbox has no qualified denial probe"))
+}
+
+/// The sandbox that runs both GNU measurements, separate from the build.
+///
+/// It is a sibling of the build boundary without the recipe target root:
+/// after the build that root legitimately holds Cargo's in-root hard links,
+/// which the unchanged pre-run single-link scan rejects. Both measurements
+/// run in this one instance, so their receipts stay byte-identical, and the
+/// sandbox carries its own denial proof.
+pub(super) struct MeasurementSandbox {
+    boundary: Boundary,
+    proof: DenialProof,
+}
+
+impl MeasurementSandbox {
+    /// Derives the sibling of `build` without `target_dir` and proves denial
+    /// in it with the staged tool-root probe.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the sibling cannot be derived (see
+    /// [`Boundary::sibling_without_writable`]), no probe is selectable, or
+    /// denial is not established.
+    pub(super) fn establish(
+        build: &Boundary,
+        tools: &SelectedRustTools,
+        target_dir: &Path,
+    ) -> Result<Self, Report<ReleaseError>> {
+        let boundary = build.sibling_without_writable(target_dir)?;
+        let probe = measurement_probe(tools)?;
+        let proof = boundary.establish_denial(&probe, probe_limits())?;
+        Ok(Self { boundary, proof })
     }
 }
 
@@ -311,17 +370,27 @@ impl GnuEvidence {
             .iter()
             .map(|(role, file)| (role.as_str(), file.sha256.as_str()))
     }
-    /// Requires this receipt's boundary and exact plan at completion sealing.
+    /// Requires this receipt's build boundary and exact plan at completion
+    /// sealing.
+    ///
+    /// `build_boundary` is the boundary that ran the Cargo build. The
+    /// measurement sandbox was required to be derived from that boundary when
+    /// the receipt was measured; here its recorded fingerprint must be a
+    /// distinct well-formed instance fingerprint. This relies on in-process
+    /// construction through [`GnuEvidence::measure`]: a receipt read back from
+    /// serialized data cannot prove that derivation.
     ///
     /// # Errors
     ///
-    /// Rejects another boundary, invocation or source-owned GNU profile.
+    /// Rejects another build boundary, invocation or source-owned GNU
+    /// profile, or a malformed measurement sandbox fingerprint.
     pub(crate) fn verify_binding(
         &self,
-        boundary: &[u8; 32],
+        build_boundary: &[u8; 32],
         plan: &str,
     ) -> Result<(), Report<ReleaseError>> {
-        if self.boundary_fingerprint != hex::encode(boundary)
+        let build = hex::encode(build_boundary);
+        if self.build_boundary_fingerprint != build
             || self.plan_sha256 != plan
             || self.profile_sha256 != profile_digest()
         {
@@ -329,20 +398,35 @@ impl GnuEvidence {
                 "GNU receipt differs from the completed boundary or plan",
             ));
         }
+        if !lower_hex(&self.measurement_boundary_fingerprint, 64)
+            || self.measurement_boundary_fingerprint == build
+        {
+            return Err(recipe_error(
+                "GNU receipt lacks a separate measurement sandbox fingerprint",
+            ));
+        }
         Ok(())
     }
-    /// Measures through the staged helper under the actual Docker denial proof.
+    /// Measures through the staged helper in the sandbox derived from the
+    /// build boundary `build_boundary`, under that sandbox's denial proof.
     ///
     /// # Errors
     ///
-    /// Rejects another boundary type, missing helper, changed profile/plan or
-    /// malformed, unsupported or failed in-image measurements.
+    /// Rejects a sandbox not derived from `build_boundary`, another boundary
+    /// type, missing helper, changed profile/plan or malformed, unsupported or
+    /// failed in-image measurements.
     pub(super) fn measure(
         tools: &SelectedRustTools,
         plan: &CargoPlan,
-        boundary: &Boundary,
-        proof: &DenialProof,
+        build_boundary: &[u8; 32],
+        sandbox: &MeasurementSandbox,
     ) -> Result<Self, Report<ReleaseError>> {
+        let boundary = &sandbox.boundary;
+        if boundary.derived_from() != Some(*build_boundary) {
+            return Err(recipe_error(
+                "GNU measurement sandbox was not derived from the build boundary",
+            ));
+        }
         if !boundary.has_owned_descendant_cleanup() {
             return Err(recipe_error(
                 "GNU profile requires the selected Docker boundary",
@@ -376,7 +460,9 @@ impl GnuEvidence {
                     .ok_or_else(|| recipe_error("GNU measurement environment is incomplete"))?,
             )?;
         }
-        let raw = boundary.run_confined(&command, proof)?.require_success()?;
+        let raw = boundary
+            .run_confined(&command, &sandbox.proof)?
+            .require_success()?;
         let value = parse_json(&raw, Role::Metadata)
             .map_err(|error| error.change_context(ReleaseError::Recipe))?;
         let measurement: Measurement = serde_json::from_value(value)
@@ -406,7 +492,8 @@ impl GnuEvidence {
             measurement,
             profile_sha256: profile_digest(),
             helper_sha256: helper_hash.sha256,
-            boundary_fingerprint: hex::encode(boundary.execution_fingerprint()),
+            build_boundary_fingerprint: hex::encode(build_boundary),
+            measurement_boundary_fingerprint: hex::encode(boundary.execution_fingerprint()),
             plan_sha256: plan.digest()?,
             identity_scope: "selected_and_configured_files_in_read_only_image",
             acquisition: "unqualified_candidate_measurement",

@@ -14,6 +14,7 @@ use super::apple::AppleDeveloperTools;
 use super::artifact::{EXECUTABLE_LIMIT, copy_artifact};
 use super::cargo_output::{ExpectedBinary, locate_host_binary};
 use super::completed::SuccessFacts;
+use super::gnu::{GnuEvidence, MeasurementSandbox};
 use super::plan::CargoQuery;
 use super::{
     Authority, ExactInvocationDigest, ExecutionPaths, PreparedRecipe, RecipeCompleted,
@@ -49,7 +50,7 @@ fn build_limits() -> ProcessLimits {
 
 /// What a successful confined run produced, as the run path reports it.
 pub(super) struct RunOutput {
-    pub(super) gnu: Option<super::gnu::GnuEvidence>,
+    pub(super) gnu: Option<GnuEvidence>,
     pub(super) stdout: Vec<u8>,
     pub(super) stderr_sha256: String,
     pub(super) started_at_seconds: u64,
@@ -231,16 +232,30 @@ impl PreparedRecipe {
         }
         self.check_inputs()?;
         self.check_no_fetched_sources()?;
-        let gnu = if self.request.asset.artifact().target == ReleaseTarget::X86_64UnknownLinuxGnu {
-            Some(super::gnu::GnuEvidence::measure(
-                &self.tools,
-                &self.plan(boundary)?,
-                boundary,
-                proof,
-            )?)
-        } else {
-            None
-        };
+        // GNU measurements run in a sibling sandbox without the target root:
+        // after the build that root holds Cargo's in-root hard links, which
+        // the build boundary's pre-run single-link scan rejects.
+        let gnu_sandbox =
+            if self.request.asset.artifact().target == ReleaseTarget::X86_64UnknownLinuxGnu {
+                Some(MeasurementSandbox::establish(
+                    boundary,
+                    &self.tools,
+                    &self.request.target_dir,
+                )?)
+            } else {
+                None
+            };
+        let gnu = gnu_sandbox
+            .as_ref()
+            .map(|sandbox| {
+                GnuEvidence::measure(
+                    &self.tools,
+                    &self.plan(boundary)?,
+                    &boundary.execution_fingerprint(),
+                    sandbox,
+                )
+            })
+            .transpose()?;
         let denial = proof.receipt_for(&boundary.execution_fingerprint())?;
         let run: Result<_, Report<ReleaseError>> = (|| {
             let query = |kind| {
@@ -274,12 +289,12 @@ impl PreparedRecipe {
             .check_inputs()
             .and_then(|()| self.check_no_fetched_sources())
             .and_then(|()| {
-                if let Some(before) = &gnu {
-                    let after = super::gnu::GnuEvidence::measure(
+                if let (Some(before), Some(sandbox)) = (&gnu, &gnu_sandbox) {
+                    let after = GnuEvidence::measure(
                         &self.tools,
                         &self.plan(boundary)?,
-                        boundary,
-                        proof,
+                        &boundary.execution_fingerprint(),
+                        sandbox,
                     )?;
                     before.verify_after(&after)?;
                 }

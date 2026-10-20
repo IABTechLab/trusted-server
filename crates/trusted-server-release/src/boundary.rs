@@ -44,6 +44,14 @@
 //!   [`DescendantCleanup::ReapedAfterRun`], which only a selection that
 //!   explicitly permits it may accept.
 //!
+//! # Sibling boundaries
+//!
+//! [`Boundary::sibling_without_writable`] derives a Linux container with the
+//! same image, settings and roots minus the last writable root. It lets a
+//! step that must not see a build's output root (whose legitimate Cargo hard
+//! links the pre-run single-link scan rejects) run under its own proof, while
+//! the scan policy itself stays unchanged.
+//!
 //! # System roots
 //!
 //! A host system tool directory (the Apple developer directory) is a
@@ -153,6 +161,8 @@ pub(crate) struct Boundary {
     roots: BoundaryRoots,
     platform: Platform,
     fingerprint: [u8; 32],
+    /// The fingerprint of the boundary this sibling was derived from.
+    derived_from: Option<[u8; 32]>,
 }
 
 /// Reports whether `path` equals its rebuilt components, so it has no `.`,
@@ -285,6 +295,7 @@ impl Boundary {
             fingerprint: instance_fingerprint(&profile.fingerprint())?,
             platform: Platform::MacSandbox(profile),
             roots,
+            derived_from: None,
         })
     }
 
@@ -313,7 +324,75 @@ impl Boundary {
             fingerprint: instance_fingerprint(&container.fingerprint())?,
             platform: Platform::LinuxContainer(Box::new(container)),
             roots,
+            derived_from: None,
         })
+    }
+
+    /// Derives a sibling Linux container boundary without the writable root
+    /// `excluded`.
+    ///
+    /// The sibling keeps this boundary's image, Docker settings, immutable,
+    /// tool and system roots, and every writable root except `excluded`,
+    /// which must be the last one, so every remaining root keeps its index
+    /// and execution path. It gets fresh host inputs and a fresh instance
+    /// fingerprint, so it needs its own [`DenialProof`]; this boundary's
+    /// fingerprint is recorded as [`Self::derived_from`]. A sibling is never
+    /// derived again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReleaseError::Boundary`] for a macOS or already-derived
+    /// boundary, an exclusion that is not the last of at least two writable
+    /// roots, or as [`docker::DockerBoundary::new`] does.
+    pub(crate) fn sibling_without_writable(
+        &self,
+        excluded: &Path,
+    ) -> Result<Self, Report<ReleaseError>> {
+        let Platform::LinuxContainer(container) = &self.platform else {
+            return Err(boundary_error(
+                "only a Linux container boundary derives a sibling",
+            ));
+        };
+        if self.derived_from.is_some() {
+            return Err(boundary_error(
+                "a derived sibling boundary is never derived again",
+            ));
+        }
+        let roots = self.roots.without_last_writable(excluded)?;
+        let sibling = container.sibling(&roots)?;
+        Ok(Self {
+            fingerprint: instance_fingerprint(&sibling.fingerprint())?,
+            platform: Platform::LinuxContainer(Box::new(sibling)),
+            roots,
+            derived_from: Some(self.fingerprint),
+        })
+    }
+
+    /// Builds an unrunnable profile-only boundary with a chosen parent for
+    /// pure derivation checks.
+    ///
+    /// Its platform owns no descendant cleanup, so container-only gates still
+    /// reject it.
+    ///
+    /// # Errors
+    ///
+    /// As [`macos::MacProfile::generate`].
+    #[cfg(test)]
+    pub(crate) fn derivation_fixture_for_tests(
+        roots: BoundaryRoots,
+        derived_from: Option<[u8; 32]>,
+    ) -> Result<Self, Report<ReleaseError>> {
+        Ok(Self {
+            platform: Platform::MacSandbox(macos::MacProfile::generate(&roots)?),
+            roots,
+            fingerprint: [2; 32],
+            derived_from,
+        })
+    }
+
+    /// Returns the fingerprint of the boundary this sibling was derived from.
+    pub(crate) fn derived_from(&self) -> Option<[u8; 32]> {
+        self.derived_from
     }
 
     /// Runs the unconfined control and the confined probe for this instance
@@ -439,3 +518,5 @@ impl Boundary {
 mod cleanup_and_system_root_tests;
 #[cfg(test)]
 mod selector_placement_tests;
+#[cfg(test)]
+mod sibling_tests;
