@@ -57,6 +57,8 @@ const MEASUREMENT_LIMIT: u64 = 64 * 1024;
 struct Measurement {
     profile: String,
     installed_files_sha256: String,
+    /// Image files recorded by metadata only because the helper cannot read them.
+    content_unmeasured_files: Vec<String>,
     roots: Vec<String>,
     selected_files: BTreeMap<String, SelectedFile>,
     compiler_queries: BTreeMap<String, String>,
@@ -237,9 +239,11 @@ pub(crate) fn helper_measurement() -> Result<Vec<u8>, Report<ReleaseError>> {
         "-print-search-dirs".to_owned(),
         compiler_query("-print-search-dirs", &working)?,
     );
+    let installed = installed_snapshot(Path::new("/"))?;
     let measurement = Measurement {
         profile: PROFILE.to_owned(),
-        installed_files_sha256: installed_snapshot(Path::new("/"))?,
+        installed_files_sha256: installed.sha256,
+        content_unmeasured_files: installed.content_unmeasured,
         roots: image::ROOTS.iter().map(|root| (*root).to_owned()).collect(),
         selected_files,
         compiler_queries,
@@ -250,6 +254,14 @@ pub(crate) fn helper_measurement() -> Result<Vec<u8>, Report<ReleaseError>> {
         Role::Metadata,
     )
     .map_err(|error| error.change_context(ReleaseError::Recipe))
+}
+
+/// Requires a strictly sorted subset of the reviewed unreadable image paths.
+fn valid_content_unmeasured(files: &[String]) -> bool {
+    files.windows(2).all(|pair| pair[0] < pair[1])
+        && files
+            .iter()
+            .all(|file| image::REVIEWED_UNREADABLE.contains(&file.as_str()))
 }
 
 fn check_image_sysroot(value: &str) -> Result<(), Report<ReleaseError>> {
@@ -287,6 +299,10 @@ impl GnuEvidence {
     /// Returns the conservative installed-image tree identity.
     pub(crate) fn installed_files_sha256(&self) -> &str {
         &self.measurement.installed_files_sha256
+    }
+    /// Lists image files covered by metadata only, never by content.
+    pub(crate) fn content_unmeasured_files(&self) -> &[String] {
+        &self.measurement.content_unmeasured_files
     }
     /// Borrows selected/configured raw-file identities without private paths.
     pub(crate) fn measured_files(&self) -> impl Iterator<Item = (&str, &str)> {
@@ -367,6 +383,7 @@ impl GnuEvidence {
             .map_err(|error| recipe_error(format!("invalid GNU measurement: {error}")))?;
         if measurement.profile != PROFILE
             || !lower_hex(&measurement.installed_files_sha256, 64)
+            || !valid_content_unmeasured(&measurement.content_unmeasured_files)
             || measurement.roots != image::ROOTS
             || measurement.sysroot != "/"
             || measurement.selected_files.len() != 9

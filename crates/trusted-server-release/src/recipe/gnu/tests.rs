@@ -1,7 +1,154 @@
 use std::fs;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt as _, symlink};
 
 use super::*;
+
+/// Writes an image file with the given permission bits.
+fn image_file(root: &std::path::Path, relative: &str, mode: u32) {
+    let path = root.join(relative);
+    fs::create_dir_all(path.parent().expect("should have a parent"))
+        .expect("should create image directory");
+    fs::write(&path, b"privileged").expect("should write image file");
+    fs::set_permissions(&path, fs::Permissions::from_mode(mode)).expect("should set mode");
+}
+
+/// Reports whether mode bits deny this process; root bypasses them.
+fn mode_bits_apply() -> bool {
+    // SAFETY: `geteuid` has no preconditions.
+    unsafe { libc::geteuid() != 0 }
+}
+
+#[test]
+fn only_reviewed_unreadable_image_files_are_recorded_by_metadata() {
+    if !mode_bits_apply() {
+        return;
+    }
+    let temporary = tempfile::tempdir().expect("should create image fixture");
+    let root = temporary.path();
+    // SAFETY: `geteuid` has no preconditions.
+    let owner_uid = unsafe { libc::geteuid() };
+    let paths = ["/usr/sbin/userhelper"];
+    let policy = image::UnreadablePolicy {
+        paths: &paths,
+        owner_uid,
+    };
+    image_file(root, "usr/sbin/userhelper", 0o111);
+    let first = image::installed_snapshot_with(root, &policy)
+        .expect("should record the reviewed helper by metadata");
+    assert_eq!(
+        first.content_unmeasured,
+        vec!["/usr/sbin/userhelper".to_owned()],
+        "should name the file whose content was not measured"
+    );
+    fs::set_permissions(
+        root.join("usr/sbin/userhelper"),
+        fs::Permissions::from_mode(0o100),
+    )
+    .expect("should change helper mode");
+    assert_ne!(
+        first.sha256,
+        image::installed_snapshot_with(root, &policy)
+            .expect("should remeasure")
+            .sha256,
+        "should bind the unmeasured file's mode"
+    );
+    fs::set_permissions(
+        root.join("usr/sbin/userhelper"),
+        fs::Permissions::from_mode(0o121),
+    )
+    .expect("should add a group write bit");
+    assert!(
+        image::installed_snapshot_with(root, &policy).is_err(),
+        "should reject a group-writable reviewed helper"
+    );
+    fs::set_permissions(
+        root.join("usr/sbin/userhelper"),
+        fs::Permissions::from_mode(0o111),
+    )
+    .expect("should restore helper mode");
+    let other_owner = image::UnreadablePolicy {
+        paths: &paths,
+        owner_uid: owner_uid.wrapping_add(1),
+    };
+    assert!(
+        image::installed_snapshot_with(root, &other_owner).is_err(),
+        "should reject a reviewed path with another owner"
+    );
+    image_file(root, "usr/libexec/gcc/example/lto-wrapper", 0o111);
+    let rejected = image::installed_snapshot_with(root, &policy)
+        .expect_err("should reject an unreviewed execute-only helper");
+    assert!(
+        format!("{rejected:?}").contains("/usr/libexec/gcc/example/lto-wrapper"),
+        "should name the rejected file: {rejected:?}"
+    );
+}
+
+#[test]
+fn production_policy_reviews_only_the_known_root_owned_helpers() {
+    assert_eq!(
+        image::PRODUCTION_UNREADABLE.paths,
+        image::REVIEWED_UNREADABLE.as_slice(),
+        "should use exactly the reviewed paths"
+    );
+    assert_eq!(
+        image::PRODUCTION_UNREADABLE.owner_uid,
+        0,
+        "should require root ownership"
+    );
+    assert!(
+        image::REVIEWED_UNREADABLE
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]),
+        "should keep the reviewed paths sorted"
+    );
+}
+
+#[test]
+fn content_unmeasured_lists_must_be_sorted_reviewed_paths() {
+    assert!(
+        valid_content_unmeasured(&[]),
+        "should accept no unmeasured files"
+    );
+    assert!(
+        valid_content_unmeasured(&[
+            "/usr/libexec/utempter/utempter".to_owned(),
+            "/usr/sbin/unix_update".to_owned(),
+            "/usr/sbin/userhelper".to_owned(),
+        ]),
+        "should accept the sorted reviewed paths"
+    );
+    for files in [
+        vec![
+            "/usr/sbin/userhelper".to_owned(),
+            "/usr/sbin/unix_update".to_owned(),
+        ],
+        vec![
+            "/usr/sbin/userhelper".to_owned(),
+            "/usr/sbin/userhelper".to_owned(),
+        ],
+        vec!["/usr/libexec/gcc/example/lto-wrapper".to_owned()],
+        vec!["/usr//sbin/userhelper".to_owned()],
+    ] {
+        assert!(
+            !valid_content_unmeasured(&files),
+            "should reject unsorted, duplicate or unreviewed lists {files:?}"
+        );
+    }
+}
+
+#[test]
+fn selected_tools_must_be_readable_even_when_executable() {
+    if !mode_bits_apply() {
+        return;
+    }
+    let temporary = tempfile::tempdir().expect("should create image fixture");
+    let root = temporary.path();
+    image_file(root, "usr/bin/gcc", 0o111);
+    assert!(
+        file_identity_at(root, std::path::Path::new("/usr/bin/gcc")).is_err(),
+        "should refuse to select an execute-only compiler without hashing it"
+    );
+}
 
 #[test]
 fn compiler_default_sysroot_can_have_no_output() {
@@ -24,6 +171,7 @@ pub(super) fn projection_fixture() -> GnuEvidence {
         measurement: Measurement {
             profile: PROFILE.to_owned(),
             installed_files_sha256: "a".repeat(64),
+            content_unmeasured_files: Vec::new(),
             roots: image::ROOTS.iter().map(|root| (*root).to_owned()).collect(),
             selected_files: [
                 ("compiler", "/usr/bin/gcc"),
@@ -150,6 +298,7 @@ fn helper_observations_must_agree_and_match_boundary_and_plan() {
         measurement: Measurement {
             profile: PROFILE.to_owned(),
             installed_files_sha256: "a".repeat(64),
+            content_unmeasured_files: Vec::new(),
             roots: vec![],
             selected_files: BTreeMap::new(),
             compiler_queries: BTreeMap::new(),

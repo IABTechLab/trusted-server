@@ -183,7 +183,10 @@ fn project(
             owner.target,
             "gnu-installed-image-tree",
             sha256,
-            "Measured GNU installed image files".to_owned(),
+            format!(
+                "Measured GNU installed image files; {} reviewed privileged helpers bound by metadata only",
+                gnu.content_unmeasured_files().len()
+            ),
             vec![ComponentRole::BuildMaterial],
             Origin::StructuredTree {
                 sha256: sha256.to_owned(),

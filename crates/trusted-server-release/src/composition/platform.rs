@@ -32,7 +32,7 @@ enum NativeToolCoverage {
         full_closure_measured: bool,
     },
     ExplicitGnuImage {
-        evidence: crate::recipe::gnu::GnuEvidence,
+        evidence: Box<crate::recipe::gnu::GnuEvidence>,
     },
 }
 
@@ -56,7 +56,7 @@ impl PlatformEvidence {
     /// Borrows the owning GNU measurement, when actually captured.
     pub(crate) fn gnu(&self) -> Option<&crate::recipe::gnu::GnuEvidence> {
         match &self.native_tools {
-            NativeToolCoverage::ExplicitGnuImage { evidence } => Some(evidence),
+            NativeToolCoverage::ExplicitGnuImage { evidence } => Some(evidence.as_ref()),
             _ => None,
         }
     }
@@ -79,7 +79,9 @@ impl PlatformEvidence {
                 "GNU image evidence belongs to another target",
             ));
         }
-        self.native_tools = NativeToolCoverage::ExplicitGnuImage { evidence };
+        self.native_tools = NativeToolCoverage::ExplicitGnuImage {
+            evidence: Box::new(evidence),
+        };
         Ok(self)
     }
     /// Binds measured selected tools to requirements from the accepted artifact.

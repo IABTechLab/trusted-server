@@ -31,17 +31,65 @@ pub(super) const ROOTS: [&str; 10] = [
 const MAX_ENTRIES: usize = 250_000;
 const MAX_FILE: u64 = 512 * 1024 * 1024;
 const MAX_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// Reviewed root-only privileged helpers in the ordinary UBI 9 builder image.
+///
+/// Observed in `registry.access.redhat.com/ubi9/ubi:9.6` with gcc, glibc-devel
+/// and git-core: the setgid `utempter`, the PAM `unix_update` and the setuid
+/// `userhelper`. None is a compiler, linker or build helper. Their content is
+/// not hashed; it is bound only through the image identity itself.
+pub(super) const REVIEWED_UNREADABLE: [&str; 3] = [
+    "/usr/libexec/utempter/utempter",
+    "/usr/sbin/unix_update",
+    "/usr/sbin/userhelper",
+];
+
+/// Which unreadable image files may be recorded by metadata only.
+pub(super) struct UnreadablePolicy<'a> {
+    /// Exact absolute image paths, sorted.
+    pub(super) paths: &'a [&'a str],
+    /// The owner every such file must have.
+    pub(super) owner_uid: u32,
+}
+
+/// The production policy: the reviewed paths, owned by root.
+pub(super) const PRODUCTION_UNREADABLE: UnreadablePolicy<'static> = UnreadablePolicy {
+    paths: &REVIEWED_UNREADABLE,
+    owner_uid: 0,
+};
+
+/// The installed-image identity and the files whose content it could not read.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct InstalledSnapshot {
+    /// Digest of every recorded name and fact.
+    pub(super) sha256: String,
+    /// Sorted absolute image paths recorded by metadata only, never by content.
+    pub(super) content_unmeasured: Vec<String>,
+}
+
+/// Opens one image file without following a final alias.
+fn open_image_file(path: &Path) -> std::io::Result<fs::File> {
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+}
 
 /// Hashes one held no-follow regular file from the read-only image namespace.
 ///
 /// Unlike host document handling, image hardlinks are permitted. Only the
 /// confined GNU helper uses this policy to construct production measurements.
 pub(super) fn image_file_hash(path: &Path) -> Result<(String, u64), Report<ReleaseError>> {
-    let mut file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-        .map_err(|error| recipe_error(format!("cannot open image file: {error}")))?;
+    let file = open_image_file(path).map_err(|error| {
+        recipe_error(format!(
+            "cannot open image file {}: {error}",
+            path.display()
+        ))
+    })?;
+    hash_open_file(file)
+}
+
+/// Hashes an opened image file, requiring unchanged identity while reading.
+fn hash_open_file(mut file: fs::File) -> Result<(String, u64), Report<ReleaseError>> {
     let before = file
         .metadata()
         .map_err(|error| recipe_error(error.to_string()))?;
@@ -107,9 +155,27 @@ pub(super) fn image_path(path: &Path) -> Result<(), Report<ReleaseError>> {
 /// a read-only image filesystem; this function must never authorize host tools.
 /// Missing optional roots are explicit facts. Docker-generated host/network
 /// files and pseudo filesystems are outside the listed scope.
-pub(super) fn installed_snapshot(root: &Path) -> Result<String, Report<ReleaseError>> {
+///
+/// Only the exact reviewed paths in [`PRODUCTION_UNREADABLE`] may be recorded
+/// by mode, owner and size instead of content when the unprivileged helper
+/// cannot open them; they are listed in
+/// [`InstalledSnapshot::content_unmeasured`]. Any other unreadable file, or a
+/// reviewed path with another owner, a group/other write bit or other-read
+/// permission, is rejected. Execute-only files outside that list therefore
+/// fail closed. Selected build tools are hashed separately and never take
+/// this path.
+pub(super) fn installed_snapshot(root: &Path) -> Result<InstalledSnapshot, Report<ReleaseError>> {
+    installed_snapshot_with(root, &PRODUCTION_UNREADABLE)
+}
+
+/// [`installed_snapshot`] with an explicit unreadable-file policy.
+pub(super) fn installed_snapshot_with(
+    root: &Path,
+    unreadable: &UnreadablePolicy<'_>,
+) -> Result<InstalledSnapshot, Report<ReleaseError>> {
     let mut pending: Vec<PathBuf> = ROOTS.iter().map(|path| root.join(&path[1..])).collect();
     let mut facts = BTreeMap::new();
+    let mut content_unmeasured = Vec::new();
     let mut bytes = 0_u64;
     while let Some(path) = pending.pop() {
         let name = path
@@ -142,12 +208,34 @@ pub(super) fn installed_snapshot(root: &Path) -> Result<String, Report<ReleaseEr
                 }
                 format!("directory:{mode}")
             } else if metadata.is_file() {
-                let (sha256, size) = image_file_hash(&path)?;
-                bytes = bytes
-                    .checked_add(size)
-                    .filter(|bytes| *bytes <= MAX_BYTES)
-                    .ok_or_else(|| recipe_error("GNU image inventory exceeds byte limit"))?;
-                format!("file:{mode}:{size}:{sha256}")
+                match open_image_file(&path) {
+                    Ok(file) => {
+                        let (sha256, size) = hash_open_file(file)?;
+                        bytes = bytes
+                            .checked_add(size)
+                            .filter(|bytes| *bytes <= MAX_BYTES)
+                            .ok_or_else(|| {
+                                recipe_error("GNU image inventory exceeds byte limit")
+                            })?;
+                        format!("file:{mode}:{size}:{sha256}")
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                        let absolute = format!("/{name}");
+                        check_reviewed_unreadable(&absolute, &path, &metadata, unreadable)?;
+                        content_unmeasured.push(absolute);
+                        format!(
+                            "unmeasured-file:{mode}:{}:{}:{}",
+                            metadata.uid(),
+                            metadata.gid(),
+                            metadata.len()
+                        )
+                    }
+                    Err(error) => {
+                        return Err(recipe_error(format!(
+                            "cannot open image file /{name}: {error}"
+                        )));
+                    }
+                }
             } else if metadata.file_type().is_symlink() {
                 let target =
                     fs::read_link(&path).map_err(|error| recipe_error(error.to_string()))?;
@@ -169,12 +257,52 @@ pub(super) fn installed_snapshot(root: &Path) -> Result<String, Report<ReleaseEr
         }
     }
     let mut digest = Sha256::new();
-    digest.update(b"trusted-server-gnu-installed-image-v1\n");
+    digest.update(b"trusted-server-gnu-installed-image-v2\n");
     for (name, fact) in facts {
         for value in [name, fact] {
             digest.update((value.len() as u64).to_be_bytes());
             digest.update(value.as_bytes());
         }
     }
-    Ok(hex::encode(digest.finalize()))
+    content_unmeasured.sort();
+    Ok(InstalledSnapshot {
+        sha256: hex::encode(digest.finalize()),
+        content_unmeasured,
+    })
+}
+
+/// Accepts a permission-denied file only at a reviewed path with expected
+/// ownership and permissions, unchanged since it was first inspected.
+fn check_reviewed_unreadable(
+    absolute: &str,
+    path: &Path,
+    metadata: &fs::Metadata,
+    unreadable: &UnreadablePolicy<'_>,
+) -> Result<(), Report<ReleaseError>> {
+    let mode = metadata.mode();
+    if !unreadable.paths.contains(&absolute)
+        || metadata.uid() != unreadable.owner_uid
+        || mode & 0o022 != 0
+        || mode & 0o004 != 0
+    {
+        return Err(recipe_error(format!(
+            "image file {absolute} cannot be read and is not a reviewed privileged helper"
+        )));
+    }
+    let after = fs::symlink_metadata(path).map_err(|error| recipe_error(error.to_string()))?;
+    let facts = |metadata: &fs::Metadata| {
+        (
+            metadata.mode(),
+            metadata.uid(),
+            metadata.gid(),
+            metadata.len(),
+            metadata.is_file(),
+        )
+    };
+    if facts(metadata) != facts(&after) {
+        return Err(recipe_error(format!(
+            "image file {absolute} changed during measurement"
+        )));
+    }
+    Ok(())
 }
