@@ -428,11 +428,11 @@ mappings are accepted even though the second A appears after B in the input.
 
 Resolve endpoint for client-side Edge Cookie modules. The page posts a value that the module verifies and creates the Edge Cookie value. Used only when a client-side module is selected (for example the `client_fixed` demo). Server-side modules such as HMAC do not use it.
 
-**Auth:** None. This is a first-party POST from the page. The module is responsible for verifying the posted value before trusting it.
+**Auth:** None, but the request must carry an `Origin` on the publisher's own domain (a foreign or missing `Origin` answers `403`). This is a first-party POST from the page. The module is responsible for verifying the posted value before trusting it.
 
 **Request Body:** the module's value, opaque to the core. For the `client_fixed` demo this is the fixed known word sent as `text/plain`.
 
-**Behavior:** gated by the [permission model](/guide/permission-model) exactly like organic generation. On success the EC cookie is set on this response (`HttpOnly`, `Secure`, `SameSite=Lax`) and the status is `200`. When the gate is closed, no client-side module is configured, or the module produces no identifier, the response is `204` with no cookie. An oversized body is rejected with `413`.
+**Behavior:** gated by the [permission model](/guide/permission-model) exactly like organic generation. On success the identifier is written to the identity graph first, then the EC cookie is set on this response (`HttpOnly`, `Secure`, `SameSite=Lax`) together with the `ts-ecr` marker cookie the page script can read, and the status is `200`. When the gate is closed, no client-side module is configured, no identity graph is available, or the module produces no identifier, the response is `204` with no cookie. Rejections: `403` for a missing or foreign `Origin`, `415` for a content type other than `text/plain` or `application/json`, `413` for an oversized body, `400` when the created identifier is outside the identifier bounds, `409` when the request already carries a different identity, and `503` when the identity-graph write fails. Every response the handler builds carries `Cache-Control: no-store`.
 
 ---
 
@@ -913,7 +913,7 @@ curl -u 'admin:<resolved-admin-password>' \
 
 ### GET /\_ts/admin/eids
 
-Parses the request's `ts-eids` and `sharedId` cookies and previews which configured partner IDs cookie ingestion would match or drop. It performs request inspection only: it does not read or write KV and is available on every adapter. The preview lists candidate matches from the cookies alone; it does not apply the TCF Purpose 1 + 4 consent gate on identity-graph writes, does not see `/auction` request-body EIDs, and does not account for partner UIDs already stored in KV.
+Parses the request's `ts-eids` and `sharedId` cookies and previews which configured partner IDs cookie ingestion would match or drop. It performs request inspection only: it does not read or write KV and is available on every adapter. The preview lists candidate matches from the cookies alone; it does not apply the permission gate on identity-graph writes, does not see `/auction` request-body EIDs, and does not account for partner UIDs already stored in KV.
 
 After successful authentication this endpoint always returns `200 OK`; missing or malformed cookies are represented by `cookie_present`, `sharedid_present`, and `parse_error`. The `ingest.matched` and `ingest.unmatched` arrays show the ingestion preview. Each unmatched entry contains its `source` and either a `no_partner` reason when no configured partner recognizes it or `no_valid_uid` when the partner exists but every supplied UID is empty or exceeds the storage limit.
 
