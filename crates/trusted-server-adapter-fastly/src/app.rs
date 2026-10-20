@@ -1395,10 +1395,9 @@ impl Hooks for TrustedServerApp {
                 default: DEFAULT_CONFIG_STORE_ID,
                 ids: &[DEFAULT_CONFIG_STORE_ID],
             }),
-            kv: Some(StoreMetadata {
-                default: "trusted_server_kv",
-                ids: &["trusted_server_kv"],
-            }),
+            // Generic KV remains unavailable in TS RuntimeServices. EC uses its
+            // existing dedicated backend, not this unused logical registry.
+            kv: None,
             secrets: Some(StoreMetadata {
                 default: DEFAULT_SECRET_STORE_ID,
                 ids: &[DEFAULT_SECRET_STORE_ID],
@@ -1461,13 +1460,20 @@ mod tests {
             .and_then(toml::Value::as_table)
             .expect("manifest should declare stores");
         let metadata = TrustedServerApp::stores();
+        assert!(
+            metadata.kv.is_none(),
+            "unused generic KV must not be prepared"
+        );
+        assert!(
+            manifest_stores.get("kv").is_none(),
+            "manifest must not require unused generic KV"
+        );
 
         for (kind, runtime_store) in [
             (
                 "config",
                 metadata.config.expect("should declare config stores"),
             ),
-            ("kv", metadata.kv.expect("should declare KV stores")),
             (
                 "secrets",
                 metadata.secrets.expect("should declare secret stores"),

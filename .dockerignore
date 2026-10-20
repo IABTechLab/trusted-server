@@ -20,6 +20,8 @@
 **/target
 **/node_modules
 **/dist
+crates/trusted-server-adapter-cloudflare/build
+crates/trusted-server-adapter-cloudflare/pkg
 **/.env
 **/.env.*
 **/*.pem

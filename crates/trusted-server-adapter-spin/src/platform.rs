@@ -392,19 +392,6 @@ fn is_wasi_forbidden_outbound_header(name: &str) -> bool {
         || name.eq_ignore_ascii_case("proxy-connection")
 }
 
-#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-async fn buffer_request_body(
-    body: edgezero_core::body::Body,
-    maximum: u64,
-) -> Result<Bytes, Report<PlatformError>> {
-    let maximum = usize::try_from(maximum).map_err(|_| {
-        Report::new(PlatformError::HttpClient).attach("Spin upload byte limit is not representable")
-    })?;
-    body.into_bytes_bounded(maximum)
-        .await
-        .change_context(PlatformError::HttpClient)
-}
-
 /// Carries a completed response through `send_async` → `select`.
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 struct SpinPendingResponse {
@@ -446,6 +433,7 @@ impl SpinPlatformHttpClient {
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
         reject_unsupported_request_contracts(&request)?;
+        let request = request.buffer_body().await?;
 
         let method = request.request.method().clone();
         let uri = request.request.uri().to_string();
@@ -477,7 +465,9 @@ impl SpinPlatformHttpClient {
         // SDK7 ingress is lazy even for an empty GET body. Buffer uploads at
         // this owned boundary under the caller's finite cap, rather than reject
         // ordinary requests merely because their carrier is a managed stream.
-        let body_bytes = buffer_request_body(body, request.max_request_body_bytes).await?;
+        let body_bytes = body.into_bytes().ok_or_else(|| {
+            Report::new(PlatformError::HttpClient).attach("Spin buffered upload invariant was lost")
+        })?;
         let spin_request = builder
             .body(spin_sdk::http::FullBody::new(body_bytes))
             .map_err(|error| {
@@ -715,29 +705,6 @@ mod tests {
     };
     use edgezero_core::time::{Deadline, MonotonicClock};
     use trusted_server_core::platform::AuctionTargetId;
-
-    #[test]
-    fn managed_stream_uploads_are_buffered_under_the_caller_limit() {
-        futures::executor::block_on(async {
-            let upload = || {
-                Body::stream(futures::stream::iter([
-                    Bytes::from_static(b"a"),
-                    Bytes::from_static(b"bc"),
-                ]))
-            };
-            assert_eq!(
-                buffer_request_body(upload(), 3)
-                    .await
-                    .expect("should accept exact upload limit")
-                    .as_ref(),
-                b"abc"
-            );
-            assert!(
-                buffer_request_body(upload(), 2).await.is_err(),
-                "should reject an oversized upload before sending"
-            );
-        });
-    }
 
     #[test]
     fn auction_http_capabilities_are_explicit() {

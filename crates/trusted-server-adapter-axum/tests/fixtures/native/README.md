@@ -45,7 +45,8 @@ cp crates/trusted-server-adapter-axum/tests/fixtures/native/nextjs/next.config.m
 npm ci --prefix "$NEXT_FIXTURE_ROOT" --ignore-scripts
 NATIVE_NEXTJS_PORT=$(node -e \
   'const s=require("node:net").createServer(); s.listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close()})')
-export NATIVE_NEXTJS_ORIGIN="http://127.0.0.1:$NATIVE_NEXTJS_PORT"
+NATIVE_NEXTJS_ORIGIN=http://127.0.0.1
+export NATIVE_NEXTJS_ORIGIN="$NATIVE_NEXTJS_ORIGIN:$NATIVE_NEXTJS_PORT"
 (
   cd "$NEXT_FIXTURE_ROOT"
   NEXT_TELEMETRY_DISABLED=1 timeout --signal=TERM --kill-after=3s 180s \

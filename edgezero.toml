@@ -20,10 +20,6 @@ version = "0.1.0"
 # Spin via its runtime config, Cloudflare via bindings), so the ids here do not
 # have to match any one platform's names. `default` is the primary logical id.
 
-[stores.kv]
-ids = ["trusted_server_kv"]
-default = "trusted_server_kv"
-
 [stores.config]
 ids = ["trusted_server_config"]
 default = "trusted_server_config"

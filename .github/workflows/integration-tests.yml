@@ -96,7 +96,10 @@ jobs:
           node-version: ${{ steps.shared-setup.outputs.node-version }}
 
       - name: Install wrangler
-        run: npm install -g wrangler
+        run: |
+          version=$(awk '$1 == "wrangler" { print $2 }' .tool-versions)
+          test -n "$version"
+          npm install -g "wrangler@$version"
 
       - name: Run integration tests
         run: >-

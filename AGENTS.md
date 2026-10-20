@@ -36,10 +36,11 @@ Supporting files: `edgezero.toml`, `fastly.toml`,
 | Rust        | 1.98.1 (pinned in `rust-toolchain.toml`)     |
 | WASM target | Fastly `wasm32-wasip1`; Spin `wasm32-wasip2` |
 | Node        | 24.12.0 (from `.tool-versions`)              |
-| Fastly CLI  | 15.1.0 (from `.tool-versions`)               |
+| Fastly CLI  | 16.0.0 (from `.tool-versions`)               |
 | Viceroy     | 0.21.0 (from `.tool-versions`)               |
 | Wasmtime    | 48.0.2 (from `.tool-versions`)               |
 | Spin        | 4.1.0 (from `.tool-versions`)                |
+| Wrangler    | 4.151.3 (from `.tool-versions`)              |
 | AWS CLI     | 2.36.45 (from `.tool-versions`)              |
 | Terraform   | 1.16.2 (from `.tool-versions`)               |
 

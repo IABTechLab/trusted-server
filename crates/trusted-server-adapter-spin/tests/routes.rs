@@ -63,15 +63,9 @@ fn edgezero_manifest_loads_and_resolves_spin_stores() {
         manifest.stores.config.is_some(),
         "Spin EdgeZero manifest must enable config store injection"
     );
-    assert_eq!(
-        manifest
-            .stores
-            .kv
-            .as_ref()
-            .expect("should declare a KV store")
-            .default_id(),
-        "trusted_server_kv",
-        "Spin KV declaration must expose its default logical store id"
+    assert!(
+        manifest.stores.kv.is_none(),
+        "unused generic KV must not become a required provider; Spin config retains its dedicated default-store bootstrap"
     );
     assert!(
         manifest.secret_store_enabled(edgezero_core::app::SPIN_ADAPTER),

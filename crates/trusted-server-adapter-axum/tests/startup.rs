@@ -310,10 +310,8 @@ fn handwritten_store_metadata_matches_the_manifest() {
         DEFAULT_SECRET_STORE_ID
     );
     assert!(stores.kv.is_none(), "should not prepare unused generic KV");
-    // The portable manifest is the union of adapter stores. Fastly still
-    // declares generic KV; native deliberately prepares only config/secrets.
     assert!(
-        manifest.contains("\n[stores.kv]"),
-        "should preserve the existing Fastly KV declaration in the portable manifest"
+        !manifest.contains("\n[stores.kv]"),
+        "should not declare unused generic KV and accidentally require a local or remote provider"
     );
 }

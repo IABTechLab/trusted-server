@@ -310,6 +310,7 @@ impl CloudflareHttpClient {
             ));
         }
 
+        let request = request.buffer_body().await?;
         let cache_mode = outbound_cache_mode(&request.cache_intent);
 
         let uri = request.request.uri().to_string();

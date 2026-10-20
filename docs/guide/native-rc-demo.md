@@ -76,11 +76,13 @@ Secrets Manager supplies each whole secret value, not an arbitrary JSON field.
 
 ## Native launch inputs
 
-Native declares only `trusted_server_config` and `trusted_server_secrets`. The
-portable manifest retains `trusted_server_kv` for Fastly; native intentionally
-does not prepare it. A metadata test checks both native IDs against the manifest.
-The default configuration key is `trusted_server_config`. No EC graph or
-DynamoDB persistence is added.
+The portable manifest and native Hooks declare only `trusted_server_config`
+and `trusted_server_secrets`. A metadata test checks both native IDs against the
+manifest. The unused generic `trusted_server_kv` declaration is removed, because
+the RC correctly treats a declared ID as required. Remove obsolete
+`trusted_server_kv` mappings from native binding files. Existing Fastly EC storage
+continues through its separate backend. The default configuration key is
+`trusted_server_config`. No EC graph or DynamoDB persistence is added.
 
 Set these before launch:
 
