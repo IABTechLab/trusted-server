@@ -23,6 +23,9 @@ modules it links. The settings, what each one accepts and what is refused are
 in the configuration guide under "Analytics Configuration", and the data path
 in the telemetry guide.
 
+The Tinybird project the module sends to, its datasources, pipes, fixtures
+and tests, is in [`project/`](project/README.md).
+
 Build and test from the repository root:
 
 ```bash

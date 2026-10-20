@@ -23,12 +23,11 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { build } from 'vite';
 
-import { moduleBuildOptions } from './build-module-options.mjs';
+import { moduleBuildOptions, moduleEntry, moduleSourceDirs } from './build-module-options.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const srcDir = path.resolve(__dirname, 'src');
 const distDir = resolveOutDir(process.argv.slice(2));
-const integrationsDir = path.join(srcDir, 'integrations');
 
 /** Resolve `--out-dir <dir>` (relative to the cwd), defaulting to ../dist. */
 function resolveOutDir(args) {
@@ -52,18 +51,14 @@ for (const name of fs.readdirSync(distDir)) {
   }
 }
 
-// Discover integration modules: directories in src/integrations/ with index.ts
-const integrationModules = fs.existsSync(integrationsDir)
-  ? fs
-      .readdirSync(integrationsDir)
-      .filter((name) => {
-        const fullPath = path.join(integrationsDir, name);
-        return (
-          fs.statSync(fullPath).isDirectory() && fs.existsSync(path.join(fullPath, 'index.ts'))
-        );
-      })
-      .sort()
-  : [];
+// Discover modules: every module folder with an index.ts, here or in the
+// crate that supplies it (see moduleSourceDirs).
+const moduleEntries = new Map(
+  [...moduleSourceDirs()]
+    .map(([name, dir]) => [name, moduleEntry(dir)])
+    .filter(([, entryPath]) => entryPath !== null)
+);
+const integrationModules = [...moduleEntries.keys()].sort();
 
 console.log('[build-all] Discovered integrations:', integrationModules);
 
@@ -80,9 +75,7 @@ async function buildModule(name, entryPath) {
 // Build core first (synchronously), then all integrations in parallel
 await buildModule('core', path.join(srcDir, 'core', 'index.ts'));
 
-await Promise.all(
-  integrationModules.map((name) => buildModule(name, path.join(integrationsDir, name, 'index.ts')))
-);
+await Promise.all(integrationModules.map((name) => buildModule(name, moduleEntries.get(name))));
 
 // List all built files
 const builtFiles = fs

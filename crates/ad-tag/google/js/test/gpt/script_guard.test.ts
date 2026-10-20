@@ -1,0 +1,344 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { installGptGuard, isGuardInstalled, resetGuardState } from '../../src/gpt/script_guard';
+
+describe('GPT script guard', () => {
+  let originalDocumentWrite: typeof document.write;
+  let originalDocumentWriteln: typeof document.writeln;
+  let originalSetAttribute: typeof HTMLScriptElement.prototype.setAttribute;
+  let originalCreateElement: typeof document.createElement;
+  let originalAppendChild: typeof Element.prototype.appendChild;
+  let originalInsertBefore: typeof Element.prototype.insertBefore;
+
+  beforeEach(() => {
+    resetGuardState();
+    originalDocumentWrite = document.write;
+    originalDocumentWriteln = document.writeln;
+    originalSetAttribute = HTMLScriptElement.prototype.setAttribute;
+    originalCreateElement = document.createElement;
+    originalAppendChild = Element.prototype.appendChild;
+    originalInsertBefore = Element.prototype.insertBefore;
+  });
+
+  afterEach(() => {
+    resetGuardState();
+    document.write = originalDocumentWrite;
+    document.writeln = originalDocumentWriteln;
+    HTMLScriptElement.prototype.setAttribute = originalSetAttribute;
+    document.createElement = originalCreateElement;
+  });
+
+  it('restores patched globals on reset', () => {
+    installGptGuard();
+    expect(isGuardInstalled()).toBe(true);
+    expect(document.write).not.toBe(originalDocumentWrite);
+    expect(document.writeln).not.toBe(originalDocumentWriteln);
+    expect(HTMLScriptElement.prototype.setAttribute).not.toBe(originalSetAttribute);
+    expect(document.createElement).not.toBe(originalCreateElement);
+    expect(Element.prototype.appendChild).not.toBe(originalAppendChild);
+    expect(Element.prototype.insertBefore).not.toBe(originalInsertBefore);
+
+    resetGuardState();
+
+    expect(isGuardInstalled()).toBe(false);
+    expect(document.write).toBe(originalDocumentWrite);
+    expect(document.writeln).toBe(originalDocumentWriteln);
+    expect(HTMLScriptElement.prototype.setAttribute).toBe(originalSetAttribute);
+    expect(document.createElement).toBe(originalCreateElement);
+    expect(Element.prototype.appendChild).toBe(originalAppendChild);
+    expect(Element.prototype.insertBefore).toBe(originalInsertBefore);
+  });
+
+  it('reinstalls without recursive document.write calls', () => {
+    installGptGuard();
+    resetGuardState();
+    installGptGuard();
+
+    expect(() => {
+      document.write('<script src="https://example.com/loader.js"></script>');
+    }).not.toThrow();
+  });
+
+  it('rewrites document.write script URLs by hostname', () => {
+    const nativeWriteSpy = vi.fn<(...args: string[]) => void>();
+    document.write = nativeWriteSpy as unknown as typeof document.write;
+
+    installGptGuard();
+
+    document.write(
+      '<script src="https://securepubads.g.doubleclick.net/pagead/managed/js/gpt/m202603020101/pubads_impl.js?foo=bar"></script>'
+    );
+
+    expect(nativeWriteSpy).toHaveBeenCalledTimes(1);
+    const [writtenHtml] = nativeWriteSpy.mock.calls[0] ?? [];
+    expect(writtenHtml).toContain(window.location.host);
+    expect(writtenHtml).toContain(
+      '/integrations/gpt/pagead/managed/js/gpt/m202603020101/pubads_impl.js?foo=bar'
+    );
+  });
+
+  it('does not rewrite document.write URLs that only mention GPT domains in query text', () => {
+    const nativeWriteSpy = vi.fn<(...args: string[]) => void>();
+    document.write = nativeWriteSpy as unknown as typeof document.write;
+
+    installGptGuard();
+
+    const originalHtml =
+      '<script src="https://cdn.example.com/loader.js?ref=securepubads.g.doubleclick.net/tag/js/gpt.js"></script>';
+
+    document.write(originalHtml);
+
+    expect(nativeWriteSpy).toHaveBeenCalledTimes(1);
+    expect(nativeWriteSpy).toHaveBeenCalledWith(originalHtml);
+  });
+
+  it('rewrites through instance patch when src descriptor install is unavailable', () => {
+    const nativeGetOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+    const descriptorSpy = vi
+      .spyOn(Object, 'getOwnPropertyDescriptor')
+      .mockImplementation(
+        (target: object, property: PropertyKey): PropertyDescriptor | undefined => {
+          if (target === HTMLScriptElement.prototype && property === 'src') {
+            return undefined;
+          }
+          return nativeGetOwnPropertyDescriptor(target, property);
+        }
+      );
+
+    try {
+      installGptGuard();
+
+      const script = document.createElement('script');
+      script.src =
+        'https://securepubads.g.doubleclick.net/pagead/managed/js/gpt/m202603020101/pubads_impl.js';
+
+      expect(script.getAttribute('src')).toContain(
+        '/integrations/gpt/pagead/managed/js/gpt/m202603020101/pubads_impl.js'
+      );
+    } finally {
+      descriptorSpy.mockRestore();
+    }
+  });
+
+  it('does not rewrite URLs that only mention GPT domains in query text', () => {
+    installGptGuard();
+
+    const container = document.createElement('div');
+    const script = document.createElement('script');
+    const originalUrl =
+      'https://cdn.example.com/loader.js?ref=securepubads.g.doubleclick.net/tag/js/gpt.js';
+
+    script.src = originalUrl;
+    container.appendChild(script);
+
+    expect(script.src).toBe(originalUrl);
+  });
+
+  it('rewrites GPT URLs by hostname', () => {
+    installGptGuard();
+
+    const container = document.createElement('div');
+    const script = document.createElement('script');
+
+    script.src =
+      'https://securepubads.g.doubleclick.net/pagead/managed/js/gpt/m202603020101/pubads_impl.js?foo=bar';
+    container.appendChild(script);
+
+    expect(script.src).toContain(window.location.host);
+    expect(script.src).toContain(
+      '/integrations/gpt/pagead/managed/js/gpt/m202603020101/pubads_impl.js?foo=bar'
+    );
+  });
+
+  // -----------------------------------------------------------------------
+  // document.write edge-cases (DOMParser-based rewriting)
+  // -----------------------------------------------------------------------
+
+  it('rewrites document.write script src with single-quoted attribute', () => {
+    const nativeWriteSpy = vi.fn<(...args: string[]) => void>();
+    document.write = nativeWriteSpy as unknown as typeof document.write;
+
+    installGptGuard();
+
+    document.write(
+      "<script src='https://securepubads.g.doubleclick.net/pagead/managed/js/gpt/current/pubads_impl.js'></script>"
+    );
+
+    expect(nativeWriteSpy).toHaveBeenCalledTimes(1);
+    const [writtenHtml] = nativeWriteSpy.mock.calls[0] ?? [];
+    expect(writtenHtml).toContain(window.location.host);
+    expect(writtenHtml).toContain('/integrations/gpt/pagead/managed/js/gpt/current/pubads_impl.js');
+    expect(writtenHtml).not.toContain('securepubads.g.doubleclick.net');
+  });
+
+  it('rewrites document.write script src with extra whitespace around =', () => {
+    const nativeWriteSpy = vi.fn<(...args: string[]) => void>();
+    document.write = nativeWriteSpy as unknown as typeof document.write;
+
+    installGptGuard();
+
+    document.write(
+      '<script  src  =  "https://securepubads.g.doubleclick.net/pagead/managed/js/gpt/current/pubads_impl.js" ></script>'
+    );
+
+    expect(nativeWriteSpy).toHaveBeenCalledTimes(1);
+    const [writtenHtml] = nativeWriteSpy.mock.calls[0] ?? [];
+    expect(writtenHtml).toContain(window.location.host);
+    expect(writtenHtml).toContain('/integrations/gpt/pagead/managed/js/gpt/current/pubads_impl.js');
+    expect(writtenHtml).not.toContain('securepubads.g.doubleclick.net');
+  });
+
+  it('rewrites multiple script tags in a single document.write call', () => {
+    const nativeWriteSpy = vi.fn<(...args: string[]) => void>();
+    document.write = nativeWriteSpy as unknown as typeof document.write;
+
+    installGptGuard();
+
+    document.write(
+      '<script src="https://securepubads.g.doubleclick.net/pagead/a.js"></script>' +
+        '<script src="https://securepubads.g.doubleclick.net/pagead/b.js"></script>'
+    );
+
+    expect(nativeWriteSpy).toHaveBeenCalledTimes(1);
+    const [writtenHtml] = nativeWriteSpy.mock.calls[0] ?? [];
+    expect(writtenHtml).toContain('/integrations/gpt/pagead/a.js');
+    expect(writtenHtml).toContain('/integrations/gpt/pagead/b.js');
+    expect(writtenHtml).not.toContain('securepubads.g.doubleclick.net');
+  });
+
+  it('rewrites document.writeln the same as document.write', () => {
+    const nativeWritelnSpy = vi.fn<(...args: string[]) => void>();
+    document.writeln = nativeWritelnSpy as unknown as typeof document.writeln;
+
+    installGptGuard();
+
+    document.writeln(
+      '<script src="https://securepubads.g.doubleclick.net/pagead/managed/js/gpt/current/pubads_impl.js"></script>'
+    );
+
+    expect(nativeWritelnSpy).toHaveBeenCalledTimes(1);
+    const [writtenHtml] = nativeWritelnSpy.mock.calls[0] ?? [];
+    expect(writtenHtml).toContain(window.location.host);
+    expect(writtenHtml).toContain('/integrations/gpt/pagead/managed/js/gpt/current/pubads_impl.js');
+    expect(writtenHtml).not.toContain('securepubads.g.doubleclick.net');
+  });
+
+  it('passes through HTML with no GPT domain reference unchanged', () => {
+    const nativeWriteSpy = vi.fn<(...args: string[]) => void>();
+    document.write = nativeWriteSpy as unknown as typeof document.write;
+
+    installGptGuard();
+
+    const html = '<script src="https://example.com/tracker.js"></script>';
+    document.write(html);
+
+    expect(nativeWriteSpy).toHaveBeenCalledWith(html);
+  });
+
+  it('rewrites protocol-relative GPT URLs in document.write', () => {
+    const nativeWriteSpy = vi.fn<(...args: string[]) => void>();
+    document.write = nativeWriteSpy as unknown as typeof document.write;
+
+    installGptGuard();
+
+    document.write(
+      '<script src="//securepubads.g.doubleclick.net/pagead/managed/js/gpt/current/pubads_impl.js"></script>'
+    );
+
+    expect(nativeWriteSpy).toHaveBeenCalledTimes(1);
+    const [writtenHtml] = nativeWriteSpy.mock.calls[0] ?? [];
+    expect(writtenHtml).toContain(window.location.host);
+    expect(writtenHtml).toContain('/integrations/gpt/pagead/managed/js/gpt/current/pubads_impl.js');
+    expect(writtenHtml).not.toContain('securepubads.g.doubleclick.net');
+  });
+
+  // -----------------------------------------------------------------------
+  // Fail-closed behaviour
+  // -----------------------------------------------------------------------
+
+  it('fails closed when DOMParser is unavailable', () => {
+    const nativeWriteSpy = vi.fn<(...args: string[]) => void>();
+    document.write = nativeWriteSpy as unknown as typeof document.write;
+
+    const originalDOMParser = globalThis.DOMParser;
+    // @ts-expect-error — simulating an environment without DOMParser
+    delete globalThis.DOMParser;
+
+    try {
+      installGptGuard();
+
+      document.write('<script src="https://securepubads.g.doubleclick.net/pagead/a.js"></script>');
+
+      expect(nativeWriteSpy).toHaveBeenCalledTimes(1);
+      expect(nativeWriteSpy).toHaveBeenCalledWith('');
+    } finally {
+      globalThis.DOMParser = originalDOMParser;
+    }
+  });
+
+  it('fails closed when DOMParser throws', () => {
+    const nativeWriteSpy = vi.fn<(...args: string[]) => void>();
+    document.write = nativeWriteSpy as unknown as typeof document.write;
+
+    const originalDOMParser = globalThis.DOMParser;
+    // @ts-expect-error — injecting a broken DOMParser
+    globalThis.DOMParser = class {
+      parseFromString() {
+        throw new Error('boom');
+      }
+    };
+
+    try {
+      installGptGuard();
+
+      document.write('<script src="https://securepubads.g.doubleclick.net/pagead/a.js"></script>');
+
+      expect(nativeWriteSpy).toHaveBeenCalledTimes(1);
+      expect(nativeWriteSpy).toHaveBeenCalledWith('');
+    } finally {
+      globalThis.DOMParser = originalDOMParser;
+    }
+  });
+
+  it('passes non-GPT HTML through unchanged when DOMParser is unavailable', () => {
+    const nativeWriteSpy = vi.fn<(...args: string[]) => void>();
+    document.write = nativeWriteSpy as unknown as typeof document.write;
+
+    const originalDOMParser = globalThis.DOMParser;
+    // @ts-expect-error — simulating an environment without DOMParser
+    delete globalThis.DOMParser;
+
+    try {
+      installGptGuard();
+
+      const html = '<p>Hello, world!</p>';
+      document.write(html);
+
+      expect(nativeWriteSpy).toHaveBeenCalledTimes(1);
+      expect(nativeWriteSpy).toHaveBeenCalledWith(html);
+    } finally {
+      globalThis.DOMParser = originalDOMParser;
+    }
+  });
+
+  // -----------------------------------------------------------------------
+  // HTML-entity-encoded URLs
+  // -----------------------------------------------------------------------
+
+  it('rewrites GPT URLs that contain HTML-escaped entities like &amp;', () => {
+    const nativeWriteSpy = vi.fn<(...args: string[]) => void>();
+    document.write = nativeWriteSpy as unknown as typeof document.write;
+
+    installGptGuard();
+
+    document.write(
+      '<script src="https://securepubads.g.doubleclick.net/pagead/managed/js/gpt/current/pubads_impl.js?x=1&amp;y=2"></script>'
+    );
+
+    expect(nativeWriteSpy).toHaveBeenCalledTimes(1);
+    const [writtenHtml] = nativeWriteSpy.mock.calls[0] ?? [];
+    expect(writtenHtml).toContain(window.location.host);
+    expect(writtenHtml).toContain('/integrations/gpt/pagead/managed/js/gpt/current/pubads_impl.js');
+    expect(writtenHtml).not.toContain('securepubads.g.doubleclick.net');
+  });
+});

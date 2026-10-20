@@ -3,28 +3,29 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   installDataDomeGuard,
   resetGuardState as resetDataDomeGuardState,
-} from '../../src/integrations/datadome/script_guard';
+} from '@tsjs/module/datadome/script_guard';
 import {
   installGptGuard,
   resetGuardState as resetGptGuardState,
-} from '../../src/integrations/gpt/script_guard';
+} from '@tsjs/module/gpt/script_guard';
 import {
   installGtmGuard,
   resetGuardState as resetGtmGuardState,
-} from '../../src/integrations/google_tag_manager/script_guard';
+} from '@tsjs/module/google_tag_manager/script_guard';
 import {
   installLockrGuard,
   resetGuardState as resetLockrGuardState,
-} from '../../src/integrations/lockr/script_guard';
+} from '@tsjs/module/lockr/script_guard';
 import {
   installPermutiveGuard,
   resetGuardState as resetPermutiveGuardState,
-} from '../../src/integrations/permutive/script_guard';
+} from '@tsjs/module/permutive/script_guard';
+
+import { createScriptGuard } from '../../src/shared/script_guard';
 import {
   registerDomInsertionHandler,
   resetDomInsertionDispatcherForTests,
 } from '../../src/shared/dom_insertion_dispatcher';
-import { createScriptGuard } from '../../src/shared/script_guard';
 
 function resetAllScriptGuards(): void {
   resetDataDomeGuardState();

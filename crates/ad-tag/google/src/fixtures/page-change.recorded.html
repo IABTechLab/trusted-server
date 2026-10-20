@@ -5,7 +5,7 @@
 // This is the minimal `window.tsjs.adInit` that runs on first page load
 // before the TSJS bundle has had a chance to install its richer
 // idempotent implementation. The bundle in
-// crates/trusted-server-js/lib/src/integrations/gpt/index.ts overwrites `tsjs.adInit`
+// crates/ad-tag/google/js/src/gpt/index.ts overwrites `tsjs.adInit`
 // once it loads.
 //
 // Contract with the bundle:
@@ -315,7 +315,7 @@
 
   // Minimal fallback for tsjs.scheduleInitialAdInit, mirroring the bundle's
   // hydration-safe scheduler in
-  // crates/trusted-server-js/lib/src/integrations/gpt/index.ts: the </body>
+  // crates/ad-tag/google/js/src/gpt/index.ts: the </body>
   // bids script hands the SSR bids payload to this scheduler, which applies
   // it and runs adInit only while the page is still on navigation
   // generation 0 (the SSR document), after window load plus a double
@@ -971,7 +971,7 @@
         // server-side targeting to GAM. If slim-Prebid has already wrapped
         // refresh(), it must pass this call straight through — not clear the
         // targeting and run a duplicate client-side auction. Mirrors the
-        // bundle's adInit() in crates/trusted-server-js/lib/src/integrations/gpt/index.ts.
+        // bundle's adInit() in crates/ad-tag/google/js/src/gpt/index.ts.
         ts.adInitRefreshInProgress = true;
         try {
           runHandoffInternal(function () {
