@@ -28,6 +28,7 @@ import { buildAdRequest, parseAuctionResponse } from '../../core/auction';
 import { registerApsPrebidRenderer, validateApsRenderer } from '../aps/render';
 import type { AuctionBid, AuctionEid } from '../../core/auction';
 import type { AuctionSlot, TsjsApi } from '../../core/types';
+import { viewportBandSizes } from '../../core/viewport_sizes';
 
 import {
   PREBID_USER_ID_MODULE_REGISTRY,
@@ -1134,9 +1135,30 @@ function bannerSizesFromGptSlot(slot: RefreshGptSlot): BannerSize[] | undefined 
   return parsedSizes.length > 0 ? parsedSizes : undefined;
 }
 
-function bannerSizesFromInjectedSlot(slot: AuctionSlot | undefined): BannerSize[] | undefined {
-  const parsedSizes = slot?.formats?.map(parseBannerSize).filter(isDefined) ?? [];
+/**
+ * The sizes of the viewport band a GPT slot asks the ad server for at the
+ * current width, or `undefined` for a slot TS did not define with its bands as
+ * a size mapping, which asks for the sizes it was defined with.
+ */
+function mappedBandSizes(
+  slot: RefreshGptSlot,
+  injectedSlot: AuctionSlot | undefined
+): Array<[number, number]> | undefined {
+  return window.tsjs?.viewportMappedSlots?.has(slot) ? viewportBandSizes(injectedSlot) : undefined;
+}
+
+function bannerSizesFromInjectedSlot(
+  slot: RefreshGptSlot,
+  injectedSlot: AuctionSlot | undefined
+): BannerSize[] | undefined {
+  const sizes = mappedBandSizes(slot, injectedSlot) ?? injectedSlot?.formats;
+  const parsedSizes = sizes?.map(parseBannerSize).filter(isDefined) ?? [];
   return parsedSizes.length > 0 ? parsedSizes : undefined;
+}
+
+/** Whether the slot's viewport band asks the ad server for no size at the current width. */
+function asksForNoSizeAtThisWidth(slot: RefreshGptSlot): boolean {
+  return mappedBandSizes(slot, findInjectedSlotForRefresh(slot))?.length === 0;
 }
 
 function refreshSlotElementId(slot: RefreshGptSlot): string | undefined {
@@ -2701,7 +2723,9 @@ export function installRefreshHandler(timeoutMs = 1500): void {
         getInjectedConfig()?.excludedGamAdUnitPathSuffixes
       );
       const auctionSlots = independentSlots.filter(
-        (slot) => !isExcludedFromRefreshAuction(slot, excludedGamAdUnitPathSuffixes)
+        (slot) =>
+          !isExcludedFromRefreshAuction(slot, excludedGamAdUnitPathSuffixes) &&
+          !asksForNoSizeAtThisWidth(slot)
       );
       if (!auctionSlots.length) {
         const immediateSlotCodes = new Map<RefreshGptSlot, string>();
@@ -2742,7 +2766,7 @@ export function installRefreshHandler(timeoutMs = 1500): void {
           publisherZoneForRefresh(candidateCodes);
         const banner: TrustedServerBanner = {
           sizes:
-            bannerSizesFromInjectedSlot(injectedSlot) ??
+            bannerSizesFromInjectedSlot(slot, injectedSlot) ??
             bannerSizesFromGptSlot(slot) ??
             DEFAULT_REFRESH_SIZES,
           ...(zone ? { name: zone } : {}),
