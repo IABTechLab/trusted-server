@@ -272,7 +272,11 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
                 false,
             ),
             field(
-                vec![optional_object("tinybird"), object("auction_token_secret")],
+                vec![
+                    optional_object("analytics"),
+                    optional_object("tinybird"),
+                    object("auction_token_secret"),
+                ],
                 true,
             ),
             field(
@@ -498,15 +502,6 @@ fn validate_secret_key_references(
         )?;
     }
 
-    if settings.tinybird.enabled {
-        let token = settings
-            .tinybird
-            .auction_token_secret
-            .as_ref()
-            .ok_or_else(|| missing_secret_key_reference("tinybird.auction_token_secret"))?;
-        validate_secret_key_reference("tinybird.auction_token_secret", token.expose())?;
-    }
-
     // Each setting a selected module declares as naming a secret, where the
     // module's table puts it to use.
     for builder in crate::integrations::all_builders(extra_integrations) {
@@ -584,7 +579,10 @@ mod tests {
     use crate::integrations::IntegrationRegistration;
     use crate::integrations::js_asset_proxy::JS_ASSET_PROXY_INTEGRATION_ID;
     use crate::redacted::Redacted;
-    use crate::settings::{ProxyAssetRoute, S3SigV4AuthConfig, TrustedClientIpConfig};
+    use crate::settings::{
+        AnalyticsConfig, ProxyAssetRoute, S3SigV4AuthConfig, TinybirdSettings,
+        TrustedClientIpConfig,
+    };
     use crate::test_support::template::{template_with_resolved_required_secrets, uncomment_block};
     use crate::test_support::tests::{
         crate_test_settings_str, crate_test_settings_str_with_ec_section, select_hmac_module,
@@ -730,13 +728,15 @@ formats = [{ width = 300, height = 250 }]
     }
 
     #[test]
-    fn documented_tinybird_block_validates_when_uncommented() {
-        let toml = uncomment_block(&template_with_resolved_required_secrets(), "[tinybird]");
+    fn documented_analytics_block_validates_when_uncommented() {
+        let toml = uncomment_block(&template_with_resolved_required_secrets(), "[analytics]");
         let settings = Settings::from_toml(&toml)
-            .expect("uncommented [tinybird] with documented api_host should parse and validate");
+            .expect("uncommented [analytics] with documented api_host should parse and validate");
         assert!(
-            settings.tinybird.enabled && !settings.tinybird.api_host.is_empty(),
-            "tinybird should be enabled with a non-empty api_host"
+            settings
+                .analytics_module()
+                .is_some_and(|module| !module.api_host.is_empty()),
+            "the selected analytics module should have a non-empty api_host"
         );
     }
 
@@ -1010,7 +1010,7 @@ formats = [{ width = 300, height = 250 }]
                 ("ec.partners[*].api_token".to_owned(), true),
                 ("ec.partners[*].ts_pull_token".to_owned(), true),
                 ("trusted_client_ip.shared_secret".to_owned(), false),
-                ("tinybird.auction_token_secret".to_owned(), true),
+                ("analytics.tinybird.auction_token_secret".to_owned(), true),
                 ("proxy.asset_routes[*].auth.access_key_id".to_owned(), true),
                 (
                     "proxy.asset_routes[*].auth.secret_access_key".to_owned(),
@@ -1059,10 +1059,21 @@ formats = [{ width = 300, height = 250 }]
         assert_eq!(serialized["secret_access_key"], "secret_access_key");
     }
 
+    /// An `[analytics]` section selecting the analytics module with `settings`.
+    fn analytics_selecting(settings: TinybirdSettings) -> AnalyticsConfig {
+        AnalyticsConfig {
+            module: Some("analytics.tinybird".to_string()),
+            tinybird: Some(settings),
+        }
+    }
+
     #[test]
     fn legacy_static_secret_store_selectors_are_accepted_but_not_serialized() {
         let mut settings = valid_settings();
-        settings.tinybird.secret_store = Some("legacy-tinybird-store".to_string());
+        settings.analytics = Some(analytics_selecting(TinybirdSettings {
+            secret_store: Some("legacy-tinybird-store".to_string()),
+            ..TinybirdSettings::default()
+        }));
         let mut route = ProxyAssetRoute::new(
             "/assets/",
             "https://examplebucket.s3.us-east-1.amazonaws.com",
@@ -1093,8 +1104,10 @@ formats = [{ width = 300, height = 250 }]
     #[test]
     fn settings_debug_redacts_resolved_static_credentials() {
         let mut settings = valid_settings();
-        settings.tinybird.auction_token_secret =
-            Some(Redacted::new("resolved-tinybird-secret".to_string()));
+        settings.analytics = Some(analytics_selecting(TinybirdSettings {
+            auction_token_secret: Some(Redacted::new("resolved-tinybird-secret".to_string())),
+            ..TinybirdSettings::default()
+        }));
         settings
             .insert_module_config(
                 "testing",
@@ -1233,6 +1246,50 @@ gam_network_id = "99999"
             err.to_string().contains("publisher.proxy_secret"),
             "error should identify the whitespace-only secret reference: {err:?}"
         );
+    }
+
+    /// The analytics module's token is a secret reference like every other,
+    /// so an empty or absent one is refused for deploy, by its path.
+    #[test]
+    fn app_config_new_rejects_an_analytics_secret_key_reference_that_is_empty_or_absent() {
+        for (case, reference) in [
+            ("an empty reference", Some(Redacted::new(String::new()))),
+            (
+                "a whitespace reference",
+                Some(Redacted::new(" 	 ".to_owned())),
+            ),
+            ("no reference", None),
+        ] {
+            let mut settings = valid_settings();
+            settings.analytics = Some(analytics_selecting(TinybirdSettings {
+                api_host: "api.tinybird.co".to_owned(),
+                auction_token_secret: reference,
+                ..TinybirdSettings::default()
+            }));
+
+            let err = TrustedServerAppConfig::new(settings)
+                .err()
+                .unwrap_or_else(|| panic!("{case}: should refuse the telemetry secret reference"));
+
+            assert!(
+                err.to_string()
+                    .contains("analytics.tinybird.auction_token_secret"),
+                "{case}: the error should identify the telemetry secret reference: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn app_config_new_accepts_an_analytics_secret_key_reference() {
+        let mut settings = valid_settings();
+        settings.analytics = Some(analytics_selecting(TinybirdSettings {
+            api_host: "api.tinybird.co".to_owned(),
+            auction_token_secret: Some(Redacted::new("tinybird_auction_token".to_owned())),
+            ..TinybirdSettings::default()
+        }));
+
+        TrustedServerAppConfig::new(settings)
+            .expect("should validate the token's key name without treating it as the value");
     }
 
     #[test]

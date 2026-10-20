@@ -10,7 +10,8 @@ request, and why the file is built this way.
 Everything Trusted Server can switch on is a module, selected the same way:
 the Edge Cookie identity, the location and device lookups, the permission
 signals, the demand sources in an auction, the ad server that picks the
-winner, the rules in `robots.txt`, and the page integrations.
+winner, the rules in `robots.txt`, where auction telemetry is sent, and the
+page integrations.
 
 ```toml
 [<type>]
@@ -22,8 +23,8 @@ setting = "value"
 
 1. **The type is the job.** Each type is one top-level table, named for what
    its modules do: `ec`, `geo`, `device`, `permission-signal`, `demand`,
-   `ad-server` and `robots-txt`, and the section of each module type, such as
-   `cmp` or `tag`.
+   `ad-server`, `robots-txt` and `analytics`, and the section of each module
+   type, such as `cmp` or `tag`.
 2. **The selector chooses what runs.** A type that runs one module takes
    `module`, a string. A type that runs several takes `modules`, a list.
 3. **`[<type>.<name>]` holds the settings.** A name with nothing to set
@@ -53,6 +54,7 @@ setting = "value"
 | `demand`            | several           | `modules`, a list  | `auction-protocol.openrtb`, `auction.prebid-server`, `auction.aps`                                      |
 | `ad-server`         | one               | `module`, a string | `mock`                                                                                                  |
 | `robots-txt`        | several, in order | `modules`, a list  | `refuse_all`, `allow_all`, or a module that supplies robots.txt rules                                   |
+| `analytics`         | one               | `module`, a string | `tinybird`                                                                                              |
 | `cmp`               | one               | `module`, a string | `didomi`, `sourcepoint`, `osano`                                                                        |
 | `tag`               | several           | `modules`, a list  | `google-tag-manager`                                                                                    |
 | `ad-tag`            | several           | `modules`, a list  | `google`, `google.diagnostics`                                                                          |
@@ -168,7 +170,7 @@ They keep their own keys and have no selector.
 | `[creative_opportunities]`                 | server-rendered ad slots                                              |
 | `[proxy]`, `[cache]`, `[rewrite]`          | first-party proxying, caching and URL rewriting                       |
 | `[request_signing]`, `[trusted_client_ip]` | signing and client addresses                                          |
-| `[debug]`, `[tinybird]`                    | diagnostics and telemetry                                             |
+| `[debug]`                                  | diagnostics                                                           |
 
 ## Why the file works this way
 
@@ -296,6 +298,7 @@ endpoint = "https://house.example.com/openrtb2/auction"
 | `profile = "standard"`                                                               | `implementation = "auction-protocol.openrtb"`                                                      |
 | `profile = "prebid-server"` and `profile = "aps"`                                    | `implementation = "auction.prebid-server"` and `implementation = "auction.aps"`                    |
 | `[auction] mediator = "adserver_mock"` and `[integrations.adserver_mock]`            | `[ad-server] module = "mock"` and `[ad-server.mock]`                                               |
+| `[tinybird]` with `enabled = true`                                                   | `[analytics] module = "tinybird"` and `[analytics.tinybird]`                                       |
 | `[integrations.aps] rendering_mode`                                                  | `rendering_mode` in the `[demand.<name>]` table of the `auction.aps` implementation                |
 | `[debug.auction_html_comment_options] include_mediator_response`                     | `include_adserver_response`                                                                        |
 

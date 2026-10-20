@@ -234,10 +234,12 @@ fn documents_holding_every_declared_secret() -> Vec<(&'static str, Value)> {
             "session_token": "route-session",
         },
     }]);
-    main["tinybird"] = json!({
-        "enabled": true,
-        "api_host": "api.tinybird.example.com",
-        "auction_token_secret": "telemetry",
+    main["analytics"] = json!({
+        "module": "tinybird",
+        "tinybird": {
+            "api_host": "api.tinybird.example.com",
+            "auction_token_secret": "telemetry",
+        },
     });
 
     let mut host_signals = document("");
