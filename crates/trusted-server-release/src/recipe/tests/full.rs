@@ -24,6 +24,7 @@ use super::real_fixture::{
     ATTEMPTS, DenialCase, DenialSelection, bind_denial_case, cargo_fixture, ordinary_ci_ambient,
     path_text, try_prepare_vendor,
 };
+use super::spdx_candidate::{candidate_spdx_measurement, check_real_candidate};
 use super::*;
 use crate::boundary::{Boundary, DenialProof, ImageSelection, ProbeProgram};
 use crate::materials::{LockedMaterials, resolution_differences};
@@ -429,6 +430,10 @@ fn fastly_canonical_and_reproduction_builds_are_byte_identical() {
         "forbidden": ["/boundary/", "host build roots", "fixture root", "RUNNER_TEMP"],
         "found": scan.found(),
     });
+    let canonical_candidate = check_real_candidate(&canonical.completed, &js.source);
+    let reproduction_candidate = check_real_candidate(&reproduction.completed, &js.source);
+    measurement["candidate_spdx"] =
+        candidate_spdx_measurement(&canonical_candidate, Some(&reproduction_candidate));
     let text = serde_json::to_string_pretty(&measurement).expect("should encode the measurement");
     println!("{text}");
     fs::write(

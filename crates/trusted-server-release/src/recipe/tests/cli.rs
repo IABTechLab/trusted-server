@@ -28,6 +28,7 @@ use super::real_fixture::{
     cargo_fixture, environment_with_operator_values, path_text, try_ordinary_ci_ambient,
     try_prepare_vendor,
 };
+use super::spdx_candidate::{candidate_spdx_measurement, check_real_candidate};
 use super::*;
 use crate::boundary::{Boundary, BoundaryRoots, ConfinedCommand, ImageSelection, ProbeProgram};
 use crate::documents::{parse_json, read_bounded};
@@ -289,7 +290,12 @@ fn linux_cli_candidate_builds_inspects_and_starts_cleanly() {
             .expect("should encode the canonical measurement"),
     )
     .expect("should retain accepted canonical evidence before optional reproduction");
+    let canonical_candidate = check_real_candidate(&canonical.completed, &js.source);
     let reproduction_build = build_cli(&inputs, Role::Reproduction);
+    let reproduction_candidate = reproduction_build
+        .as_ref()
+        .ok()
+        .map(|reproduction| check_real_candidate(&reproduction.completed, &js.source));
 
     let (measured, invariant) = reproduction_result(
         reproduction_build
@@ -302,7 +308,7 @@ fn linux_cli_candidate_builds_inspects_and_starts_cleanly() {
         Err(error) if invariant.is_some() => ReproductionOutcome::InvariantFailed(error.clone()),
         Err(error) => ReproductionOutcome::BuildFailed(error.clone()),
     };
-    let measurement = cli_candidate_measurement(&CliCandidateFacts {
+    let mut measurement = cli_candidate_measurement(&CliCandidateFacts {
         canonical: &canonical.completed,
         builder: &cli,
         elf: &elf,
@@ -313,6 +319,8 @@ fn linux_cli_candidate_builds_inspects_and_starts_cleanly() {
             .expect("should retain actual Linux startup runs"),
         reproduction,
     });
+    measurement["candidate_spdx"] =
+        candidate_spdx_measurement(&canonical_candidate, reproduction_candidate.as_ref());
     let text = serde_json::to_string_pretty(&measurement).expect("should encode the measurement");
     fs::write(cli_root.join("linux-cli-candidate-measurement.json"), text)
         .expect("should retain the Linux CLI candidate measurement");

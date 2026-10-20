@@ -355,6 +355,7 @@ mod real_fixture;
 mod remap;
 mod runtime;
 mod sources;
+mod spdx_candidate;
 mod tools;
 
 #[test]

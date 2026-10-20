@@ -33,6 +33,7 @@ use super::real_fixture::{
     environment_with_operator_values, minimal_environment, path_text, try_ordinary_ci_ambient,
     try_prepare_vendor,
 };
+use super::spdx_candidate::{candidate_spdx_measurement, check_real_candidate};
 use super::*;
 use crate::boundary::DescendantCleanup;
 use crate::inspect::{MachoCpu, MachoPolicy, inspect_macho};
@@ -224,8 +225,14 @@ fn start_natively(build: &MacosBuild) -> NativeStartupAccepted {
 }
 
 /// Encodes, prints and retains the measurement beside the Cargo fixture.
-fn retain_measurement(fixture: &CargoFixture, facts: &MacosCliCandidateFacts<'_>) {
-    let measurement = macos_cli_candidate_measurement(facts);
+/// Writes and prints the measurement; `candidate_spdx` is null until rendered.
+fn retain_measurement(
+    fixture: &CargoFixture,
+    facts: &MacosCliCandidateFacts<'_>,
+    candidate_spdx: serde_json::Value,
+) {
+    let mut measurement = macos_cli_candidate_measurement(facts);
+    measurement["candidate_spdx"] = candidate_spdx;
     let text = serde_json::to_string_pretty(&measurement).expect("should encode the measurement");
     println!("{text}");
     fs::write(fixture.root.join(MEASUREMENT_FILE), text)
@@ -314,9 +321,18 @@ fn macos_cli_candidate_builds_inspects_and_starts_cleanly() {
         startup_stdout: startup.macos_stdout(),
         reproduction,
     };
-    retain_measurement(&fixture, &facts(ReproductionOutcome::NotAttempted));
+    retain_measurement(
+        &fixture,
+        &facts(ReproductionOutcome::NotAttempted),
+        serde_json::Value::Null,
+    );
+    let canonical_candidate = check_real_candidate(&canonical.completed, &source);
 
     let reproduction_build = build_macos_cli(&inputs, Role::Reproduction);
+    let reproduction_candidate = reproduction_build
+        .as_ref()
+        .ok()
+        .map(|reproduction| check_real_candidate(&reproduction.completed, &source));
     let (measured, invariant) = reproduction_result(
         reproduction_build
             .as_ref()
@@ -328,7 +344,11 @@ fn macos_cli_candidate_builds_inspects_and_starts_cleanly() {
         Err(error) if invariant.is_some() => ReproductionOutcome::InvariantFailed(error.clone()),
         Err(error) => ReproductionOutcome::BuildFailed(error.clone()),
     };
-    retain_measurement(&fixture, &facts(reproduction));
+    retain_measurement(
+        &fixture,
+        &facts(reproduction),
+        candidate_spdx_measurement(&canonical_candidate, reproduction_candidate.as_ref()),
+    );
     if let Some(error) = invariant {
         panic!("should pair builds over identical inputs: {error:?}");
     }
