@@ -951,3 +951,95 @@ jobs:
         env:
           TRUSTED_SERVER__RELEASE_JS_TESTS: '1'
         run: npm test -- --run
+
+  # Four inert files exercise actual upload/REST/original-ZIP interoperability.
+  # This is ordinary CI diagnostics and supplies no release qualification.
+  test-release-transfer-upload:
+    name: Upload fictional release transfer fixture
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
+      artifact-name: ${{ steps.fixture.outputs.name }}
+    steps:
+      - name: Create four fixed fictional members
+        id: fixture
+        shell: bash
+        env:
+          FIXTURE_NAME: release-transfer-interop-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          FIXTURE_DIRECTORY="$RUNNER_TEMP/release-transfer-fixture"
+          mkdir "$FIXTURE_DIRECTORY"
+          printf '%s\n' 'fictional transfer executable bytes' > "$FIXTURE_DIRECTORY/artifact"
+          printf '%s\n' '{"kind":"fictional-build-record","release_qualification":false}' > "$FIXTURE_DIRECTORY/build-record.json"
+          printf '%s\n' '{"kind":"fictional-composition","complete":false}' > "$FIXTURE_DIRECTORY/composition.json"
+          printf '%s\n' '{"kind":"fictional-javascript-inventory","modules":[]}' > "$FIXTURE_DIRECTORY/tsjs-inventory.json"
+          echo "name=$FIXTURE_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the fictional archive with the selected action
+        id: upload
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0 (Node 24)
+        with:
+          name: ${{ steps.fixture.outputs.name }}
+          path: ${{ runner.temp }}/release-transfer-fixture
+          if-no-files-found: error
+          retention-days: 1
+
+  test-release-transfer-receive:
+    name: Retrieve exact ordinary-CI upload through bounded HTTP
+    needs: test-release-transfer-upload
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0 (Node 24)
+        with:
+          persist-credentials: false
+
+      - name: Install the source-pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUST_VERSION="$(awk '$1 == "rust" { print $2 }' .tool-versions)"
+          test -n "$RUST_VERSION"
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          HOST_TARGET="$(rustup run "$RUST_VERSION" rustc -vV | sed -n 's/^host: //p')"
+          test -n "$HOST_TARGET"
+          {
+            echo "RUST_VERSION=$RUST_VERSION"
+            echo "HOST_TARGET=$HOST_TARGET"
+          } >> "$GITHUB_ENV"
+
+      - name: Compile and require exactly one ignored interoperability fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          TEST_NAME=collection::transfer::ordinary::real_uploaded_archive
+          TEST_LIST="$(mktemp)"
+          trap 'rm -f "$TEST_LIST"' EXIT
+          cargo +"$RUST_VERSION" test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --list > "$TEST_LIST"
+          awk '/: test$/ { count++ } END { if (count != 1) { print "Expected exactly one ordinary transfer fixture"; exit 1 } }' "$TEST_LIST"
+
+      - name: Download and check the exact selected original archive twice
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TS_RELEASE_TRANSFER_RUN_ID: ${{ github.run_id }}
+          # REST identifies the PR head; checkout may hold its synthetic merge.
+          # Neither identity grants approved-source or release authority here.
+          TS_RELEASE_TRANSFER_RUN_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          TS_RELEASE_TRANSFER_ARTIFACT_ID: ${{ needs.test-release-transfer-upload.outputs.artifact-id }}
+          TS_RELEASE_TRANSFER_ARTIFACT_NAME: ${{ needs.test-release-transfer-upload.outputs.artifact-name }}
+          TS_RELEASE_TRANSFER_ARCHIVE_SHA256: ${{ needs.test-release-transfer-upload.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          TEST_NAME=collection::transfer::ordinary::real_uploaded_archive
+          cargo +"$RUST_VERSION" test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --nocapture

@@ -13,9 +13,12 @@ use sha2::{Digest as _, Sha256};
 use crate::documents::{Role, lower_hex, parse_json};
 use crate::error::ReleaseError;
 
+const ARCHIVE_LIMIT: usize = 768 * 1024 * 1024;
+
 mod archive;
 pub(crate) mod producer;
 mod records;
+pub(crate) mod transfer;
 pub(crate) use records::CollectionDiagnostic;
 #[cfg(test)]
 mod tests;
@@ -208,7 +211,7 @@ pub(crate) fn validate_transfers(
         }
         let downloaded = source.download(&invocation.repository, upload.artifact_id)?;
         if downloaded.transfer_warning
-            || downloaded.archive.len() > 768 * 1024 * 1024
+            || downloaded.archive.len() > ARCHIVE_LIMIT
             || digest(&downloaded.archive) != upload.archive_sha256
         {
             return Err(collection_error(

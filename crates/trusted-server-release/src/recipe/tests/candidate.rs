@@ -46,13 +46,38 @@ pub(super) fn check_fastly_export_after_cleanup<T>(
     completed: fn(&T) -> &RecipeCompleted,
     accepted: &super::super::runtime::FastlyRuntimeAccepted,
 ) {
-    check_owned_export_after_cleanup(build, completed, Some(accepted));
+    check_owned_export_after_cleanup(build, completed, Some(RuntimeAcceptance::Fastly(accepted)));
+}
+
+/// Checks retained canonical native startup evidence after every build root is removed.
+pub(super) fn check_native_export_after_cleanup<T>(
+    build: T,
+    completed: fn(&T) -> &RecipeCompleted,
+    accepted: &super::super::NativeStartupAccepted,
+) {
+    check_owned_export_after_cleanup(build, completed, Some(RuntimeAcceptance::Native(accepted)));
+}
+
+#[derive(Clone, Copy)]
+enum RuntimeAcceptance<'a> {
+    Fastly(&'a super::super::FastlyRuntimeAccepted),
+    Native(&'a super::super::NativeStartupAccepted),
+}
+
+impl RuntimeAcceptance<'_> {
+    fn diagnostic_for(&self, completed: &RecipeCompleted) -> Value {
+        match self {
+            Self::Fastly(accepted) => accepted.diagnostic_for(completed),
+            Self::Native(accepted) => accepted.diagnostic_for(completed),
+        }
+        .expect("should retain exact owning runtime observations")
+    }
 }
 
 fn check_owned_export_after_cleanup<T>(
     build: T,
     completed: fn(&T) -> &RecipeCompleted,
-    accepted: Option<&super::super::runtime::FastlyRuntimeAccepted>,
+    accepted: Option<RuntimeAcceptance<'_>>,
 ) {
     let completed = completed(&build);
     let artifact = completed.artifact().path().to_owned();
@@ -129,10 +154,18 @@ fn check_owned_export_after_cleanup<T>(
         view.receipt_sha256(),
         "should project the exact retained composition receipt"
     );
+    let expected_runtime = accepted.map(|accepted| accepted.diagnostic_for(completed));
     let export = match accepted {
-        Some(runtime) => crate::collection::producer::CandidateBuildExport::with_fastly_runtime(
-            completed, runtime,
-        ),
+        Some(RuntimeAcceptance::Fastly(runtime)) => {
+            crate::collection::producer::CandidateBuildExport::with_fastly_runtime(
+                completed, runtime,
+            )
+        }
+        Some(RuntimeAcceptance::Native(startup)) => {
+            crate::collection::producer::CandidateBuildExport::with_native_startup(
+                completed, startup,
+            )
+        }
         None => crate::collection::producer::CandidateBuildExport::from_completed(completed),
     }
     .expect("should export actual candidate receipts before closing their owners");
@@ -158,12 +191,11 @@ fn check_owned_export_after_cleanup<T>(
     let gaps = record["gaps"]
         .as_array()
         .expect("should list remaining gaps");
-    match accepted {
+    match expected_runtime {
         Some(runtime) => {
             assert_eq!(
-                record["runtime_acceptance"]["artifact"]["sha256"],
-                runtime.observed().artifact_sha256(),
-                "should retain final-byte runtime evidence after working-root cleanup"
+                record["runtime_acceptance"], runtime,
+                "should retain exact final-byte runtime observations after working-root cleanup"
             );
             assert!(
                 !gaps

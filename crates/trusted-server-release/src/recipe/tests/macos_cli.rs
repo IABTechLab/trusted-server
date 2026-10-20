@@ -17,7 +17,7 @@ use super::super::compare::read_artifact;
 use super::super::native::{check_operator_values_absent, measure_native_repeatability};
 use super::super::remap::scan_remapped_bytes;
 use super::super::startup::native::{NativeStartupLayout, measure_host_identity};
-use super::super::startup::{StartupCopy, expected_version_output};
+use super::super::startup::{NativeStartupAccepted, StartupCopy};
 use super::candidate::CargoFixture;
 use super::cli_candidate::{
     OPERATOR_SENTINELS, ReproductionOutcome, check_build_budget, finish_cleanup,
@@ -192,7 +192,7 @@ fn scan_final_bytes(bytes: &[u8], build: &MacosBuild, fixture_root: &Path) -> Ve
 
 /// Starts a read-only copy of the exact final bytes natively as
 /// `ts --version`, outside every build root, and removes the copy.
-fn start_natively(build: &MacosBuild, target: ReleaseTarget, expected: &str) -> String {
+fn start_natively(build: &MacosBuild) -> NativeStartupAccepted {
     let scratch = tempfile::tempdir().expect("should create startup scratch space");
     let base = fs::canonicalize(scratch.path()).expect("should resolve startup scratch space");
     let copy_directory = base.join("startup-copy");
@@ -204,18 +204,18 @@ fn start_natively(build: &MacosBuild, target: ReleaseTarget, expected: &str) -> 
     let copy = StartupCopy::create_native(&build.completed, &copy_directory)
         .expect("should copy the final bytes read-only");
     let build_roots: Vec<&Path> = build.host_roots.iter().map(Path::new).collect();
-    let started = copy.start_native(
+    let started = NativeStartupAccepted::accept_macos(
+        &build.completed,
+        copy,
         &NativeStartupLayout {
             copy_directory: &copy_directory,
             home: &home,
             tmpdir: &tmpdir,
             build_roots: &build_roots,
         },
-        target,
-        expected,
     );
-    let started = finish_cleanup(started, copy.remove())
-        .expect("should start the copy natively on the reviewed host and remove it");
+    let started =
+        started.expect("should start the copy natively on the reviewed host and remove it");
     build
         .completed
         .rehash_for_handoff()
@@ -302,8 +302,7 @@ fn macos_cli_candidate_builds_inspects_and_starts_cleanly() {
     let planted: Vec<&str> = OPERATOR_SENTINELS.iter().map(|(_, value)| *value).collect();
     check_operator_values_absent(&bytes, &planted)
         .expect("should embed none of the planted operator values");
-    let expected = expected_version_output(source.commit(), target);
-    let startup = start_natively(&canonical, target, &expected);
+    let startup = start_natively(&canonical);
     let facts = |reproduction| MacosCliCandidateFacts {
         canonical: &canonical.completed,
         macho: &macho,
@@ -312,7 +311,7 @@ fn macos_cli_candidate_builds_inspects_and_starts_cleanly() {
         js_handoff: &js_handoff,
         remap_found: &remap_found,
         operator_values_removed: &removed,
-        startup_stdout: Some(startup.as_str()),
+        startup_stdout: startup.macos_stdout(),
         reproduction,
     };
     retain_measurement(&fixture, &facts(ReproductionOutcome::NotAttempted));
@@ -333,7 +332,11 @@ fn macos_cli_candidate_builds_inspects_and_starts_cleanly() {
     if let Some(error) = invariant {
         panic!("should pair builds over identical inputs: {error:?}");
     }
-    super::candidate::check_export_after_cleanup(canonical, |build| &build.completed);
+    super::candidate::check_native_export_after_cleanup(
+        canonical,
+        |build| &build.completed,
+        &startup,
+    );
     if let Ok(reproduction) = reproduction_build {
         super::candidate::check_export_after_cleanup(reproduction, |build| &build.completed);
     }

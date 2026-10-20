@@ -12,7 +12,9 @@
 //! argument parsing. The copy must still hash to the accepted digest after
 //! every run.
 
+mod accepted;
 mod lifecycle;
+pub(crate) use accepted::NativeStartupAccepted;
 pub(crate) mod native;
 
 use std::ffi::OsString;
@@ -259,9 +261,10 @@ fn cleanup_filter(identity: Option<&ContainerId>, name: &str) -> String {
     )
 }
 
-/// Returns the exact `--version` output of the owning build facts.
+/// Formats fixture version output using the current producer's workspace version.
 ///
-/// The CLI and this producer share the workspace package version.
+/// Owning [`NativeStartupAccepted`] gates derive the CLI version from their
+/// sealed selected-package observations instead of this fixture formatter.
 pub(crate) fn expected_version_output(commit: &CommitId, target: ReleaseTarget) -> String {
     format!(
         "ts package={} source={} target={} variant=default\n",

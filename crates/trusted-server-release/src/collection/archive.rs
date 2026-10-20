@@ -5,11 +5,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use error_stack::Report;
 use flate2::{Crc, Decompress, FlushDecompress, Status};
 
-use super::collection_error;
+use super::{ARCHIVE_LIMIT, collection_error};
 
 use crate::error::ReleaseError;
 
-const ARCHIVE_LIMIT: usize = 768 * 1024 * 1024;
 const MEMBER_LIMIT: u64 = 512 * 1024 * 1024;
 const TOTAL_LIMIT: u64 = 768 * 1024 * 1024;
 const MEMBER_COUNT: usize = 32;

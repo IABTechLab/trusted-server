@@ -17,9 +17,7 @@ use std::time::{Duration, Instant};
 use super::super::compare::read_artifact;
 use super::super::native::{check_operator_values_absent, measure_native_repeatability};
 use super::super::remap::scan_remapped_bytes;
-use super::super::startup::{
-    LINUX_CLI_ASSET, StartupCopy, StartupObserved, expected_version_output,
-};
+use super::super::startup::{LINUX_CLI_ASSET, NativeStartupAccepted, StartupCopy};
 use super::candidate::{CargoFixture, cargo_docker_settings};
 use super::cli_candidate::{
     CliCandidateFacts, CliFixture, OPERATOR_SENTINELS, ReproductionOutcome, check_build_budget,
@@ -221,11 +219,7 @@ fn scan_final_bytes(bytes: &[u8], build: &CliBuild, fixture_roots: &[&Path]) -> 
 }
 
 /// Starts the exact final bytes as `ts --version` in every clean image.
-fn start_everywhere(
-    completed: &RecipeCompleted,
-    cli: &CliFixture,
-    expected: &str,
-) -> Vec<StartupObserved> {
+fn start_everywhere(completed: &RecipeCompleted, cli: &CliFixture) -> NativeStartupAccepted {
     let scratch = tempfile::tempdir().expect("should create startup scratch space");
     let base = fs::canonicalize(scratch.path()).expect("should resolve startup scratch space");
     let copy_directory = base.join("startup-copy");
@@ -233,13 +227,9 @@ fn start_everywhere(
         .expect("should copy the final bytes read-only");
     let observed = (|| {
         let (_state, client) = new_startup_client(Path::new("/usr/bin/docker"), &copy_directory)?;
-        cli.startup_images
-            .iter()
-            .map(|image| copy.start(&client, image, expected))
-            .collect()
+        NativeStartupAccepted::accept_linux(completed, copy, &client, &cli.startup_images)
     })();
-    let observed = finish_cleanup(observed, copy.remove())
-        .expect("should start every clean image and remove the startup copy");
+    let observed = observed.expect("should start every clean image and remove the startup copy");
     completed
         .rehash_for_handoff()
         .expect("should leave the accepted artifact unchanged");
@@ -281,16 +271,16 @@ fn linux_cli_candidate_builds_inspects_and_starts_cleanly() {
     let planted: Vec<&str> = OPERATOR_SENTINELS.iter().map(|(_, value)| *value).collect();
     check_operator_values_absent(&bytes, &planted)
         .expect("should embed none of the planted operator values");
-    let expected =
-        expected_version_output(js.source.commit(), ReleaseTarget::X86_64UnknownLinuxGnu);
-    let startup = start_everywhere(&canonical.completed, &cli, &expected);
+    let startup = start_everywhere(&canonical.completed, &cli);
     let canonical_measurement = cli_candidate_measurement(&CliCandidateFacts {
         canonical: &canonical.completed,
         builder: &cli,
         elf: &elf,
         remap_found: &remap_found,
         operator_values_removed: &removed,
-        startup: &startup,
+        startup: startup
+            .linux_runs()
+            .expect("should retain actual Linux startup runs"),
         reproduction: ReproductionOutcome::NotAttempted,
     });
     fs::write(
@@ -318,7 +308,9 @@ fn linux_cli_candidate_builds_inspects_and_starts_cleanly() {
         elf: &elf,
         remap_found: &remap_found,
         operator_values_removed: &removed,
-        startup: &startup,
+        startup: startup
+            .linux_runs()
+            .expect("should retain actual Linux startup runs"),
         reproduction,
     });
     let text = serde_json::to_string_pretty(&measurement).expect("should encode the measurement");
@@ -327,7 +319,11 @@ fn linux_cli_candidate_builds_inspects_and_starts_cleanly() {
     if let Some(error) = invariant {
         panic!("should pair builds over identical inputs: {error:?}");
     }
-    super::candidate::check_export_after_cleanup(canonical, |build| &build.completed);
+    super::candidate::check_native_export_after_cleanup(
+        canonical,
+        |build| &build.completed,
+        &startup,
+    );
     if let Ok(reproduction) = reproduction_build {
         super::candidate::check_export_after_cleanup(reproduction, |build| &build.completed);
     }

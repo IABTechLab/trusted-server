@@ -18,11 +18,14 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use error_stack::Report;
+#[cfg(target_os = "macos")]
+use sha2::{Digest as _, Sha256};
 
 use super::super::fresh::{disjoint, normal_absolute};
 use super::super::{RecipeCompleted, recipe_error};
 use super::StartupCopy;
 use crate::error::ReleaseError;
+use crate::inspect::MacosVersion;
 use crate::policy::ReleaseTarget;
 #[cfg(target_os = "macos")]
 use crate::process::{BoundedCommand, ProcessLimits, ProcessOutcome};
@@ -35,7 +38,7 @@ const STARTUP_PATH: &str = "/usr/bin:/bin";
 const EXECUTABLE_NAME: &str = "ts";
 
 /// Host facts measured before the startup runs.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub(crate) struct HostIdentity {
     /// `kern.osproductversion`, such as `15.5`.
     pub(crate) product_version: String,
@@ -45,6 +48,15 @@ pub(crate) struct HostIdentity {
     pub(crate) proc_translated: Option<i32>,
     /// `hw.optional.arm64`, or `None` when the name is absent.
     pub(crate) hw_optional_arm64: Option<i32>,
+}
+
+/// Facts retained from the same actual native host and successful startup run.
+#[derive(Debug)]
+pub(crate) struct NativeStartupObserved {
+    pub(super) host: HostIdentity,
+    pub(super) stdout: String,
+    pub(super) stderr_sha256: String,
+    pub(super) elapsed: std::time::Duration,
 }
 
 /// Returns the major version of dotted decimal `text`.
@@ -96,6 +108,24 @@ pub(crate) fn check_host_identity(
             "startup host {host:?} is not a native {} machine",
             target.triple()
         )));
+    }
+    Ok(())
+}
+
+/// Requires the actual host to satisfy the accepted artifact's deployment floor.
+fn check_host_minimum(
+    target: ReleaseTarget,
+    host: &HostIdentity,
+    minimum: MacosVersion,
+) -> Result<(), Report<ReleaseError>> {
+    check_host_identity(target, host)?;
+    let current = MacosVersion::parse(&host.product_version).ok_or_else(|| {
+        recipe_error("native startup host version cannot be compared to the artifact minimum")
+    })?;
+    if current < minimum {
+        return Err(recipe_error(
+            "native startup host is below the accepted deployment minimum",
+        ));
     }
     Ok(())
 }
@@ -207,8 +237,10 @@ impl StartupCopy {
         layout: &NativeStartupLayout<'_>,
         target: ReleaseTarget,
         expected: &str,
-    ) -> Result<String, Report<ReleaseError>> {
-        check_host_identity(target, &measure_host_identity()?)?;
+        minimum: MacosVersion,
+    ) -> Result<NativeStartupObserved, Report<ReleaseError>> {
+        let host = measure_host_identity()?;
+        check_host_minimum(target, &host, minimum)?;
         let command = native_startup_command(layout)?;
         if command.program != self.directory.join(EXECUTABLE_NAME) {
             return Err(recipe_error("startup command does not run this copy"));
@@ -242,7 +274,12 @@ impl StartupCopy {
                 String::from_utf8_lossy(result.stdout())
             )));
         }
-        Ok(expected.to_owned())
+        Ok(NativeStartupObserved {
+            host,
+            stdout: expected.to_owned(),
+            stderr_sha256: hex::encode(Sha256::digest(result.stderr())),
+            elapsed: result.elapsed(),
+        })
     }
 }
 
@@ -430,6 +467,35 @@ mod tests {
                 "should decide the {label} host"
             );
         }
+    }
+
+    #[test]
+    fn startup_host_must_satisfy_the_accepted_artifact_minimum_before_execution() {
+        let host = host("15.5", "aarch64", Some(0), Some(1));
+        check_host_minimum(
+            crate::policy::ReleaseTarget::Aarch64AppleDarwin,
+            &host,
+            crate::inspect::MacosVersion::new(13, 0),
+        )
+        .expect("should accept native host above artifact minimum");
+        assert!(
+            check_host_minimum(
+                crate::policy::ReleaseTarget::Aarch64AppleDarwin,
+                &host,
+                crate::inspect::MacosVersion::new(15, 6)
+            )
+            .is_err(),
+            "should reject host below accepted artifact minimum"
+        );
+        assert!(
+            check_host_minimum(
+                crate::policy::ReleaseTarget::X86_64AppleDarwin,
+                &host,
+                crate::inspect::MacosVersion::new(13, 0)
+            )
+            .is_err(),
+            "should still reject another target CPU"
+        );
     }
 
     #[test]

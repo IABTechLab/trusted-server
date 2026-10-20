@@ -1,8 +1,8 @@
 //! Flat diagnostic exports from owning build results, without release authority.
 //!
 //! This candidate format deliberately differs from the strict collector's build
-//! record. Pair claims, native startup acceptance and qualified workflow
-//! identity have not yet been joined to these owners.
+//! record. Runtime acceptance is retained only from its actual owning run;
+//! pair claims and qualified workflow identity remain unavailable.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -16,7 +16,7 @@ use serde_json::json;
 use super::{collection_error, digest};
 use crate::documents::hash_bounded_with_check;
 use crate::error::ReleaseError;
-use crate::recipe::{FastlyRuntimeAccepted, RecipeCompleted, copy_artifact};
+use crate::recipe::{FastlyRuntimeAccepted, NativeStartupAccepted, RecipeCompleted, copy_artifact};
 
 const RECORD: &str = "candidate-build-record.json";
 const COMPOSITION: &str = "composition.json";
@@ -36,6 +36,23 @@ pub(crate) struct CandidateBuildExport {
 struct Member {
     size: u64,
     sha256: String,
+}
+
+enum RuntimeAcceptance<'a> {
+    Fastly(&'a FastlyRuntimeAccepted),
+    Native(&'a NativeStartupAccepted),
+}
+
+impl RuntimeAcceptance<'_> {
+    fn diagnostic_for(
+        &self,
+        completed: &RecipeCompleted,
+    ) -> Result<serde_json::Value, Report<ReleaseError>> {
+        match self {
+            Self::Fastly(accepted) => accepted.diagnostic_for(completed),
+            Self::Native(accepted) => accepted.diagnostic_for(completed),
+        }
+    }
 }
 
 impl CandidateBuildExport {
@@ -66,12 +83,25 @@ impl CandidateBuildExport {
         completed: &RecipeCompleted,
         accepted: &FastlyRuntimeAccepted,
     ) -> Result<Self, Report<ReleaseError>> {
-        Self::from_owned(completed, Some(accepted))
+        Self::from_owned(completed, Some(RuntimeAcceptance::Fastly(accepted)))
+    }
+
+    /// Copies a candidate with its actual role-bound native startup acceptance.
+    ///
+    /// # Errors
+    ///
+    /// Rejects another source, role, selected CLI package or final artifact,
+    /// missing build evidence, changed owned files or oversized diagnostics.
+    pub(crate) fn with_native_startup(
+        completed: &RecipeCompleted,
+        accepted: &NativeStartupAccepted,
+    ) -> Result<Self, Report<ReleaseError>> {
+        Self::from_owned(completed, Some(RuntimeAcceptance::Native(accepted)))
     }
 
     fn from_owned(
         completed: &RecipeCompleted,
-        accepted: Option<&FastlyRuntimeAccepted>,
+        accepted: Option<RuntimeAcceptance<'_>>,
     ) -> Result<Self, Report<ReleaseError>> {
         let definition = completed.recipe_definition()?;
         let denial = completed.denial_receipt()?;
