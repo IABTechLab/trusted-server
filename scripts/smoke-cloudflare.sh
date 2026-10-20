@@ -52,6 +52,9 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# Build a missing CLI with the caller's Cargo/rustup homes before isolating Wrangler.
+smoke_resolve_ts_binary "$REPO_ROOT"
+
 # Local-only Wrangler must not inherit operator credentials or configuration.
 while IFS= read -r name; do
     case "$name" in
@@ -68,7 +71,6 @@ ACTUAL_WRANGLER=$(wrangler --version | sed -nE 's/^([0-9]+\.[0-9]+\.[0-9]+)$/\1/
 [ "$ACTUAL_WRANGLER" = "$EXPECTED_WRANGLER" ] ||
     smoke_die "Wrangler $EXPECTED_WRANGLER is required; found ${ACTUAL_WRANGLER:-unknown}"
 
-smoke_resolve_ts_binary "$REPO_ROOT"
 CLOUDFLARE_ROOT="$REPO_ROOT/crates/trusted-server-adapter-cloudflare"
 [ -f "$CLOUDFLARE_ROOT/build/index.js" ] ||
     smoke_die "Cloudflare Worker bundle not found: $CLOUDFLARE_ROOT/build/index.js"
