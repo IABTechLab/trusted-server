@@ -36,6 +36,9 @@ fn test_router() -> RouterService {
             proxy_secret = "route-test-proxy-secret"
 
             [ec]
+            module = "hmac"
+
+            [ec.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
         "#,
     )
@@ -85,6 +88,9 @@ fn make_router() -> RouterService {
             proxy_secret = "integration-test-proxy-secret"
 
             [ec]
+            module = "hmac"
+
+            [ec.hmac]
             passphrase = "test-secret-key-32-bytes-minimum"
         "#,
     )
@@ -673,6 +679,57 @@ async fn tsjs_route_prefix_is_handled_not_5xx() {
     assert!(
         status < 500,
         "tsjs catch-all handler must not return 5xx: got {status}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Edge Cookie module availability
+// ---------------------------------------------------------------------------
+
+/// Test settings selecting a vendor Edge Cookie module this adapter does not
+/// inject, with the `[ec.acme]` block that module's settings live in.
+/// `acme` is a fictional vendor key.
+const UNINJECTED_MODULE_TOML: &str = r#"
+    [[handlers]]
+    path = "^/_ts/admin"
+    username = "admin"
+    password = "admin-pass"
+
+    [publisher]
+    domain = "test-publisher.example.com"
+    cookie_domain = ".test-publisher.example.com"
+    origin_url = "https://origin.test-publisher.example.com"
+    proxy_secret = "route-test-proxy-secret"
+
+    [ec]
+    module = "acme"
+
+    [ec.acme]
+    endpoint = "https://ec.acme.example.com"
+"#;
+
+/// A module selection this adapter can never supply must fail while the
+/// application state is built, before any request is served.
+///
+/// Configuration validation accepts this selection, because only the adapter
+/// that injects a module knows what that module needs, and this adapter
+/// injects no vendor Edge Cookie module, so only the composition root can
+/// catch it. Without the startup check the deployment would come up and answer
+/// every request.
+#[test]
+fn selecting_a_module_this_adapter_cannot_supply_fails_at_startup() {
+    let settings = Settings::from_toml(UNINJECTED_MODULE_TOML)
+        .expect("should parse settings selecting an uninjected module");
+
+    // `RouterService` is not `Debug`, so take the error side directly rather
+    // than through `expect_err`.
+    let error = TrustedServerApp::routes_with_settings(settings)
+        .err()
+        .expect("building state with an uninjected module should fail");
+
+    assert!(
+        error.to_string().contains("acme"),
+        "the startup error should name the selected module, got: {error}"
     );
 }
 
