@@ -70,6 +70,7 @@ fn reader(request_state: &IntegrationRequestState) -> ReaderDocument<'_> {
         platform: test_support::platform(),
         request_state,
         max_buffered_script_bytes: 16 * 1024 * 1024,
+        prepared: super::test_support::nothing_prepared(),
     }
 }
 
@@ -1906,6 +1907,351 @@ fn the_making_entry_is_for_the_request_path_and_names_a_middleware() {
         entries.making("/robots.txt").is_none(),
         "should make nothing where no entry is for the request path, whatever covers every path"
     );
+}
+
+#[test]
+fn what_is_prepared_is_taken_once_by_name_and_as_its_type() {
+    let prepared = Prepared::default();
+    assert!(prepared.is_empty());
+    let fetch = MiddlewarePhase::Fetch;
+    prepared.insert(fetch, "example.one", Box::new(String::from("one")));
+    prepared.insert(fetch, "example.two", Box::new(7_u32));
+
+    assert_eq!(
+        prepared.take::<u32>(fetch, "example.one"),
+        None,
+        "should leave a value of another type where it is"
+    );
+    assert_eq!(
+        prepared.take::<String>(fetch, "example.one").as_deref(),
+        Some("one")
+    );
+    assert_eq!(
+        prepared.take::<String>(fetch, "example.one"),
+        None,
+        "should give what was prepared once"
+    );
+    assert_eq!(prepared.take::<u32>(fetch, "example.two"), Some(7));
+    assert!(prepared.is_empty());
+}
+
+/// Prepares the name it is called as, and writes it into the head.
+struct Prepares;
+
+impl Middleware for Prepares {
+    fn middleware_id(&self) -> &'static str {
+        "example.prepares"
+    }
+
+    fn phases(&self) -> &[MiddlewarePhase] {
+        &[MiddlewarePhase::Fetch]
+    }
+
+    fn prepare<'a>(
+        &'a self,
+        call: ModuleCall<'a>,
+        _context: &'a MiddlewareContext<'a>,
+    ) -> Option<Preparation<'a>> {
+        Some(Box::pin(async move {
+            Ok(Box::new(call.module().to_owned()) as Box<dyn Any + Send>)
+        }))
+    }
+
+    fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction {
+        let prepared: String = context
+            .take_prepared("example.prepares")
+            .unwrap_or_else(|| "nothing prepared".to_owned());
+        MiddlewareAction {
+            head_inserts: vec![prepared],
+            ..MiddlewareAction::pass()
+        }
+    }
+}
+
+/// Prepares nothing.
+struct Plain;
+
+impl Middleware for Plain {
+    fn middleware_id(&self) -> &'static str {
+        "example.plain"
+    }
+
+    fn phases(&self) -> &[MiddlewarePhase] {
+        &[MiddlewarePhase::Fetch]
+    }
+
+    fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+        MiddlewareAction::pass()
+    }
+}
+
+/// Refuses every request.
+struct Refuses;
+
+impl Middleware for Refuses {
+    fn middleware_id(&self) -> &'static str {
+        "example.refuses"
+    }
+
+    fn phases(&self) -> &[MiddlewarePhase] {
+        &[MiddlewarePhase::Fetch]
+    }
+
+    fn prepare<'a>(
+        &'a self,
+        _call: ModuleCall<'a>,
+        _context: &'a MiddlewareContext<'a>,
+    ) -> Option<Preparation<'a>> {
+        Some(Box::pin(async {
+            Err(Refusal::service_unavailable(
+                Duration::from_secs(5),
+                "later",
+            ))
+        }))
+    }
+
+    fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+        MiddlewareAction::pass()
+    }
+}
+
+#[tokio::test]
+async fn a_chain_keeps_what_each_middleware_prepares_under_its_name() {
+    let chain = MiddlewareChain::new(
+        MiddlewarePhase::Fetch,
+        HTML_MEDIA_TYPE,
+        vec![Arc::new(Plain), Arc::new(Prepares)],
+    );
+    let document_state = IntegrationDocumentState::default();
+    let prepared = Prepared::default();
+    let context = MiddlewareContext {
+        prepared: &prepared,
+        ..test_support::context(MiddlewarePhase::Fetch, &document_state)
+    };
+
+    chain
+        .prepare(ModuleContext::empty(), &context)
+        .await
+        .expect("should prepare");
+    let plan = chain.plan(&context).expect("should plan");
+
+    assert_eq!(
+        plan.head_inserts,
+        vec!["example.prepares".to_owned()],
+        "should hand create what the middleware prepared, called as its own name"
+    );
+    assert!(
+        prepared.is_empty(),
+        "should have given the preparation to create"
+    );
+}
+
+/// Prepares the phase it is called in, and writes it into the head.
+struct PreparesItsPhase;
+
+impl Middleware for PreparesItsPhase {
+    fn middleware_id(&self) -> &'static str {
+        "example.both"
+    }
+
+    fn phases(&self) -> &[MiddlewarePhase] {
+        &MiddlewarePhase::ALL
+    }
+
+    fn prepare<'a>(
+        &'a self,
+        _call: ModuleCall<'a>,
+        context: &'a MiddlewareContext<'a>,
+    ) -> Option<Preparation<'a>> {
+        let phase = context.phase.to_string();
+        Some(Box::pin(async move {
+            Ok(Box::new(phase) as Box<dyn Any + Send>)
+        }))
+    }
+
+    fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction {
+        MiddlewareAction {
+            head_inserts: vec![
+                context
+                    .take_prepared::<String>("example.both")
+                    .unwrap_or_else(|| "nothing prepared".to_owned()),
+            ],
+            ..MiddlewareAction::pass()
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_middleware_preparing_in_both_phases_keeps_what_each_phase_prepared() {
+    let prepared = Prepared::default();
+    let document_state = IntegrationDocumentState::default();
+    let chains: Vec<(MiddlewarePhase, MiddlewareChain)> = MiddlewarePhase::ALL
+        .into_iter()
+        .map(|phase| {
+            (
+                phase,
+                MiddlewareChain::new(phase, HTML_MEDIA_TYPE, vec![Arc::new(PreparesItsPhase)]),
+            )
+        })
+        .collect();
+    // A document that is not stored is prepared in both phases before
+    // either phase is planned, so both preparations share one store.
+    for (phase, chain) in &chains {
+        let context = MiddlewareContext {
+            prepared: &prepared,
+            ..test_support::context(*phase, &document_state)
+        };
+        chain
+            .prepare(ModuleContext::empty(), &context)
+            .await
+            .expect("should prepare");
+    }
+    let mut plans = Vec::new();
+    for (phase, chain) in &chains {
+        let context = MiddlewareContext {
+            prepared: &prepared,
+            ..test_support::context(*phase, &document_state)
+        };
+        plans.push(chain.plan(&context).expect("should plan").head_inserts);
+    }
+
+    assert_eq!(
+        plans,
+        vec![vec!["fetch".to_owned()], vec!["serve".to_owned()]],
+        "should hand each phase what was prepared in it"
+    );
+    assert!(prepared.is_empty(), "should have given every preparation");
+}
+
+#[tokio::test]
+async fn the_first_refusal_ends_the_preparation() {
+    let chain = MiddlewareChain::new(
+        MiddlewarePhase::Fetch,
+        HTML_MEDIA_TYPE,
+        vec![Arc::new(Refuses), Arc::new(Prepares)],
+    );
+    let document_state = IntegrationDocumentState::default();
+    let prepared = Prepared::default();
+    let context = MiddlewareContext {
+        prepared: &prepared,
+        ..test_support::context(MiddlewarePhase::Fetch, &document_state)
+    };
+
+    let refusal = chain
+        .prepare(ModuleContext::empty(), &context)
+        .await
+        .expect_err("should refuse");
+
+    assert_eq!(refusal.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(refusal.retry_after, Some(Duration::from_secs(5)));
+    assert_eq!(refusal.message, "later");
+    assert!(
+        prepared.is_empty(),
+        "should prepare nothing after the refusal"
+    );
+}
+
+/// Refuses every request with the status it holds.
+struct RefusesWith(StatusCode);
+
+impl Middleware for RefusesWith {
+    fn middleware_id(&self) -> &'static str {
+        "example.refuses-with"
+    }
+
+    fn phases(&self) -> &[MiddlewarePhase] {
+        &[MiddlewarePhase::Fetch]
+    }
+
+    fn prepare<'a>(
+        &'a self,
+        _call: ModuleCall<'a>,
+        _context: &'a MiddlewareContext<'a>,
+    ) -> Option<Preparation<'a>> {
+        let status = self.0;
+        Some(Box::pin(async move {
+            Err(Refusal {
+                status,
+                retry_after: None,
+                message: "refused".to_owned(),
+            })
+        }))
+    }
+
+    fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+        MiddlewareAction::pass()
+    }
+}
+
+/// The refusal a fetch chain of `first` and then [`Prepares`] answers, and
+/// what it logs at warning level or above.
+async fn refusal_and_log(first: Arc<dyn Middleware>) -> (Refusal, Vec<String>) {
+    let chain = MiddlewareChain::new(
+        MiddlewarePhase::Fetch,
+        HTML_MEDIA_TYPE,
+        vec![first, Arc::new(Prepares)],
+    );
+    let document_state = IntegrationDocumentState::default();
+    let prepared = Prepared::default();
+    let context = MiddlewareContext {
+        prepared: &prepared,
+        ..test_support::context(MiddlewarePhase::Fetch, &document_state)
+    };
+
+    let (refused, logged) =
+        crate::test_support::logs::logged_by(chain.prepare(ModuleContext::empty(), &context)).await;
+    (refused.expect_err("should refuse"), logged)
+}
+
+#[tokio::test]
+async fn a_refusal_is_logged_once_as_a_warning_naming_the_middleware() {
+    let (refusal, logged) = refusal_and_log(Arc::new(Refuses)).await;
+
+    assert_eq!(refusal.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(logged.len(), 1, "should log the refusal once: {logged:?}");
+    assert!(
+        logged[0].starts_with("WARN ")
+            && logged[0].contains("`example.refuses`")
+            && logged[0].contains("fetch phase")
+            && logged[0].contains("503 Service Unavailable"),
+        "should warn, naming the middleware, the phase and the status: {}",
+        logged[0]
+    );
+}
+
+#[tokio::test]
+async fn a_refusal_answers_with_a_client_or_server_error_alone() {
+    let fault = StatusCode::INTERNAL_SERVER_ERROR;
+    for (given, answered) in [
+        (StatusCode::CONTINUE, fault),
+        (StatusCode::OK, fault),
+        (StatusCode::NO_CONTENT, fault),
+        (StatusCode::MOVED_PERMANENTLY, fault),
+        (StatusCode::NOT_MODIFIED, fault),
+        (StatusCode::NOT_FOUND, StatusCode::NOT_FOUND),
+        (StatusCode::TOO_MANY_REQUESTS, StatusCode::TOO_MANY_REQUESTS),
+        (StatusCode::BAD_GATEWAY, StatusCode::BAD_GATEWAY),
+    ] {
+        let (refusal, logged) = refusal_and_log(Arc::new(RefusesWith(given))).await;
+
+        assert_eq!(
+            refusal.status, answered,
+            "should answer a refusal with {given} as {answered}"
+        );
+        assert_eq!(
+            logged.len(),
+            1,
+            "should log the refusal with {given} once: {logged:?}"
+        );
+        assert!(
+            logged[0].starts_with("WARN ")
+                && logged[0].contains("`example.refuses-with`")
+                && logged[0].contains(&given.to_string())
+                && logged[0].contains(&answered.to_string()),
+            "should warn, naming the middleware, the status given and the status answered: {}",
+            logged[0]
+        );
+    }
 }
 
 #[test]
