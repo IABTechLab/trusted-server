@@ -1,6 +1,6 @@
 # Disposable release qualification framework
 
-Status: **Rust migration pending; Tasks 8–9 qualification remains incomplete**. No tool,
+Status: **Rust migration in progress; candidate recipes for all four assets pass ordinary CI, but Tasks 8–9 qualification remains incomplete**. No tool,
 SDK, OCI image or recipe has become qualified. `release-tools.json` retains null
 measurement slots. A source checksum and a successful unit test cannot supply
 hosted execution or acquisition authenticity.
@@ -13,12 +13,19 @@ publishes no tag, signs no release and deploys no publisher service.
 
 Introduced Python qualification/recipe tooling and validator requirements are removed. Historical local socket/Cargo/tiny Mach-O probes are not selected macOS 15/GNU qualification. The [Rust migration addendum](../../../docs/superpowers/specs/2026-10-14-release-tooling-rust-migration.md) and [primary plan](../../../docs/superpowers/plans/2026-10-13-attested-release-implementation.md#rust-migration-and-current-execution-boundary) define the host-only `crates/trusted-server-release` tool. Strict document/policy checks, local source authentication, helper-closure fingerprinting, bounded Git/process execution and final-artifact inspection are implemented. Authenticated bootstrap/acquisition and actual qualification remain pending.
 
-The experimental macOS sandbox denies network access but does not establish
-complete descendant cleanup: `posix_spawn` can escape the supervised group,
-and a child that scrubs its tracking environment can survive the run. Socket
-denial and successful utility tests do not qualify that lifecycle boundary.
-The production macOS and Linux selectors remain unconstructible until their
-required controls and independently authenticated inputs are established.
+The experimental macOS sandbox denies network access but does not own
+descendant cleanup the way a container does. Commit `60fafa717` supersedes the
+earlier finding that a `posix_spawn` escape, or a child that scrubs its
+tracking environment, could survive the run: the boundary now identifies the
+run's sandbox instance, finds, kills and rejects every process of that
+instance after the run, and reports `descendant_cleanup: "post-run-reaped"`
+(Linux containers report `owned-by-container`). Survivors exist until that
+reap, so this is weaker than ownership and remains unqualified. Only the
+`cfg(test)` ordinary-CI candidate selection accepts post-run-reaped cleanup
+(approved 2026-10-19). Socket denial and successful utility tests do not
+qualify the lifecycle boundary. The production macOS and Linux selectors remain
+unconstructible until their required controls and independently authenticated
+inputs are established.
 
 Current wrappers fail closed until the independently approved native Rust
 bootstrap and source-owned authenticated selections are implemented. Neither
@@ -27,7 +34,12 @@ Private typed source/acquisition approval and actual JS completion are construct
 only by the corresponding successful verification/execution path; no serialized
 authorization boolean is accepted. The tool has no core/CLI/JS crate dependency.
 
-Task 9 remains incomplete. Rust MUST compose original-material preparation, actual
+Task 9 is candidate-implemented, with qualification pending. Candidate recipes for
+all four canonical assets (Fastly Wasm, Linux x86-64 `ts`, Apple ARM `ts`, Apple
+Intel `ts`) build, inspect and start in ordinary PR CI with
+`release_qualification: false`; see the dated reports in this directory. The
+closed `build.sh` interface, the production reproduction profile, authenticated
+acquisition/tool selections and hosted qualification remain open. Rust MUST compose original-material preparation, actual
 whole-product Cargo compilation, final-byte acceptance and output copying. Task 10
 MUST collect explicit-target metadata/tree, effective unit features, native archive
 and sysroot evidence through the same boundary before hosted measurement. Native
@@ -141,7 +153,7 @@ The AF_UNIX layer is required because this contract denies INET sockets includin
 loopback; `--network none` alone permits loopback. Preserve reviewed syscalls
 rather than introducing an unchecked custom allowlist.
 
-The pending Rust container adapter MUST combine `--network none` with that
+The Rust container adapter (`boundary/docker.rs`, implemented; unqualified) MUST combine `--network none` with that
 seccomp profile, drop all capabilities, set no-new-privileges, use private IPC
 and Docker's default private PID namespace (no invalid `--pid=private`), a
 read-only root and UID 65532 with prepared writable ownership. Memory, CPU and
@@ -156,14 +168,19 @@ TTY, plugins, alternate contexts and inherited Docker overrides. Read-only
 anchors MUST remain outside the writable root. Test escaping/dangling aliases
 in the CONTAINER namespace, not only their host interpretation.
 
-A local Docker CLIENT exists, but the daemon is unusable; no actual Linux
-execution proof follows. Rust MUST execute positive, denied and full-recipe
+The earlier local-only finding (a Docker client without a usable daemon, so no
+actual Linux execution proof) is superseded: ordinary Ubuntu 24.04 CI runs the
+real container boundary and the Linux candidate recipes, recorded in the
+[confined Cargo candidate](2026-10-16-confined-cargo-candidate.md) and
+[Linux CLI candidate](2026-10-16-linux-cli-candidate.md) reports and the
+[GNU follow-up](2026-10-20-linux-cli-gnu-follow-up.md). That is candidate
+evidence, not qualification. Rust MUST execute positive, denied and full-recipe
 controls with the same selected native probe and OCI image, not merely compare
 command arguments. Controls map approved workspace inputs to `/work`, with
 shared tools/source read-only. Scan sockets and aliases before use; this does
 not claim protection against an adversarial mutable host mount.
 
-The pending macOS Rust adapter MUST enforce private-path/AF_UNIX rules, denying
+The macOS Rust adapter (`boundary/macos.rs`, implemented; unqualified) MUST enforce private-path/AF_UNIX rules, denying
 INET, arbitrary Mach lookup and AppleEvent delegation. The same generated
 profile wraps positive/denied probes and the full Cargo/compiler/proc-macro/
 build-script/native-tool invocation; Task 7's lifecycle/JS boundary needs the
