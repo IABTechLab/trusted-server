@@ -183,13 +183,43 @@ fn load(ask: Ask, kept: StoreKey) -> Loader {
             let contribution = contributor
                 .contribute(context.call(id, contributor.required_permissions()))
                 .await
-                .map_err(|report| LoadError::new(format!("{report:?}")))?;
+                .map_err(|report| {
+                    LoadError::new(addresses_cut_to_their_host(&format!("{report:?}")))
+                })?;
             let bytes = serde_json::to_vec(&contribution)
                 .map_err(|error| LoadError::new(format!("the answer cannot be held: {error}")))?;
             keep_answer(&services, &kept, &bytes).await;
             Ok(LoadedValue::new(bytes).with_lifetime(contributor.refresh()))
         })
     })
+}
+
+/// `text` with every address in it cut to its scheme and host, because what
+/// a contributor reports is written to the log, and the path, query or user
+/// part of an address it names may carry a key.
+fn addresses_cut_to_their_host(text: &str) -> String {
+    let mut cut = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("://") {
+        let (before, address) = rest.split_at(at + "://".len());
+        cut.push_str(before);
+        // An address ends where white space or a quote does, so whatever
+        // else follows the host is dropped with it.
+        let end = address
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | '`' | '\\'))
+            .unwrap_or(address.len());
+        let authority = address[..end]
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or_default();
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, host)| host);
+        cut.push_str(host);
+        rest = &address[end..];
+    }
+    cut.push_str(rest);
+    cut
 }
 
 /// The key one contributor's answer for one host and one fingerprint is held
@@ -896,6 +926,40 @@ pub(crate) mod tests {
 
         assert_eq!(answer, rules("User-Agent: LateBot\nDisallow: /"));
         assert_eq!(scripted.times_asked(), 2);
+    }
+
+    /// What a contributor reports when it fails is written to the log, so an
+    /// address it names keeps only its scheme and host, and a key in the
+    /// path, the query or the user part is not written.
+    #[tokio::test]
+    async fn a_failure_gives_only_the_host_of_an_address_it_names() {
+        let scripted = Arc::new(Scripted::new(vec![Err(
+            "GET https://user:xyzzy-password@rules.example:8443/v1/xyzzy-in-path/rules\
+             ?licence=xyzzy-in-query#xyzzy-in-fragment failed, and \"http://other.example/\
+             xyzzy-in-quotes\" too"
+                .to_owned(),
+        )]));
+        let services = services_with(Arc::default(), Arc::default());
+
+        let error = contribution_for(
+            "a",
+            &contributor(&scripted),
+            &request(),
+            &services,
+            &settings(),
+        )
+        .await
+        .expect_err("with nothing kept the failure is an error");
+        let logged = format!("{error:?}");
+
+        assert!(
+            logged.contains("GET https://rules.example:8443 failed, and"),
+            "{logged}"
+        );
+        assert!(logged.contains("http://other.example"), "{logged}");
+        // A word no function name holds, because the report carries a
+        // backtrace when one is captured.
+        assert!(!logged.contains("xyzzy"), "{logged}");
     }
 
     /// A held copy that no longer reads is removed and the contributor asked

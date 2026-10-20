@@ -41,7 +41,6 @@ use trusted_server_core::publisher::{
 use trusted_server_core::request_signing::{
     handle_trusted_server_discovery, handle_verify_signature,
 };
-use trusted_server_core::robots_txt::{ROBOTS_TXT_PATH, handle_robots_txt};
 use trusted_server_core::settings::Settings;
 use trusted_server_core::settings_data::{
     default_config_key, default_config_store_name, get_settings_from_config_store_with,
@@ -467,7 +466,6 @@ enum NamedRouteHandler {
     FirstPartyClick,
     FirstPartySign,
     FirstPartyProxyRebuild,
-    RobotsTxt,
 }
 
 struct NamedRoute {
@@ -476,7 +474,7 @@ struct NamedRoute {
     handler: NamedRouteHandler,
 }
 
-fn named_routes() -> [NamedRoute; 15] {
+fn named_routes() -> [NamedRoute; 14] {
     [
         NamedRoute {
             path: "/.well-known/trusted-server.json",
@@ -561,21 +559,7 @@ fn named_routes() -> [NamedRoute; 15] {
             primary_methods: &[Method::GET, Method::POST],
             handler: NamedRouteHandler::FirstPartyProxyRebuild,
         },
-        // Only when the settings carry `[robots-txt]`.
-        NamedRoute {
-            path: ROBOTS_TXT_PATH,
-            primary_methods: &[Method::GET, Method::HEAD],
-            handler: NamedRouteHandler::RobotsTxt,
-        },
     ]
-}
-
-/// Whether a named route is served for these settings.
-fn named_route_is_served(settings: &Settings, handler: NamedRouteHandler) -> bool {
-    match handler {
-        NamedRouteHandler::RobotsTxt => settings.robots_txt.is_some(),
-        _ => true,
-    }
 }
 
 fn named_route_handler(
@@ -651,9 +635,6 @@ fn named_route_handler(
                     }
                     NamedRouteHandler::FirstPartyProxyRebuild => {
                         handle_first_party_proxy_rebuild(&state.settings, &services, req).await
-                    }
-                    NamedRouteHandler::RobotsTxt => {
-                        handle_robots_txt(&state.settings, &services, &state.registry, req).await
                     }
                 }
             },
@@ -793,6 +774,25 @@ impl TrustedServerApp {
         let state = build_state_with_services(settings, Some(services))?;
         Ok(build_router(&state))
     }
+
+    /// Build the full router as
+    /// [`TrustedServerApp::routes_with_registrations`] does, with every
+    /// request handed a clone of `services`, as
+    /// [`TrustedServerApp::routes_with_settings_and_services`] hands them.
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors [`TrustedServerApp::routes_with_registrations`]
+    /// returns.
+    pub fn routes_with_registrations_and_services(
+        settings: Settings,
+        integrations: &[IntegrationBuilder],
+        services: RuntimeServices,
+    ) -> Result<RouterService, Report<TrustedServerError>> {
+        let state =
+            build_state_with_registrations_and_services(settings, integrations, Some(services))?;
+        Ok(build_router(&state))
+    }
 }
 
 /// Answers the attestation pages without the request preparers, because
@@ -834,9 +834,6 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
     });
 
     for route in named_routes() {
-        if !named_route_is_served(&state.settings, route.handler) {
-            continue;
-        }
         for method in route.primary_methods {
             router = router.route(
                 route.path,
