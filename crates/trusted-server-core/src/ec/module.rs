@@ -128,6 +128,17 @@ pub const HMAC_MODULE_KEY: &str = "hmac";
 /// arm when the host-signal module becomes a module of its own.
 pub const HOST_SIGNALS_MODULE_KEY: &str = "host_signals";
 
+/// The implementation id of the `client_fixed` demonstration module.
+///
+/// Defined in every build, though the module is compiled in only under the
+/// `client-fixed-demo` cargo feature, so a build without it still recognizes
+/// the name and refuses the selection at startup. The resolution in
+/// [`build_module`] matches it, as does its startup counterpart
+/// `check_named_module_configuration`, and the integration registry adds the
+/// client-cycle page-script module when the name is selected. It is also
+/// `ClientFixedModule`'s `id`.
+pub const CLIENT_FIXED_MODULE_KEY: &str = "client_fixed";
+
 /// The type folder of every Edge Cookie crate, which a name written in
 /// `[ec] module` or an `implementation` line may leave off.
 pub const MODULE_TYPE: &str = "edgecookie";
@@ -136,8 +147,14 @@ pub const MODULE_TYPE: &str = "edgecookie";
 /// [`resolve_named_module`].
 ///
 /// [`build_module`] refuses an injected module under one of these ids
-/// rather than picking one of the two.
-const BUILTIN_MODULE_KEYS: &[&str] = &[HMAC_MODULE_KEY, HOST_SIGNALS_MODULE_KEY];
+/// rather than picking one of the two. [`CLIENT_FIXED_MODULE_KEY`] is listed
+/// whether or not the demonstration module is compiled in, because a build
+/// without it still owns the name.
+const BUILTIN_MODULE_KEYS: &[&str] = &[
+    HMAC_MODULE_KEY,
+    HOST_SIGNALS_MODULE_KEY,
+    CLIENT_FIXED_MODULE_KEY,
+];
 
 /// The registry code of the built-in HMAC module.
 ///
@@ -166,6 +183,31 @@ pub struct IdentityInput<'a> {
     /// The request's consent context, when available, for module-specific
     /// logic. The core gates on permissions, not consent, so a module reads
     /// this only to forward or record consent. [`HmacModule`] ignores it.
+    pub consent: Option<&'a ConsentContext>,
+}
+
+/// Inputs available to [`EdgeCookieModule::resolve_from_client`].
+///
+/// Carries the value a client produced and posted to the Edge Cookie resolve
+/// endpoint, alongside the same gating context as [`IdentityInput`]. The posted
+/// value reaches the module as [`payload`](Self::payload), not through
+/// anything injected into the module. Unlike trusted edge-derived
+/// data, [`payload`](Self::payload) arrives from the browser, so an
+/// implementation must verify it before deriving an identifier from it.
+pub struct ClientResolveInput<'a> {
+    /// The raw body the client posted to the resolve endpoint. For a vendor
+    /// module this is its own JSON envelope; for the built-in
+    /// `ClientFixedModule` demo it is the fixed known word the page script
+    /// posts.
+    pub payload: &'a [u8],
+
+    /// The permissions resolved for the resolve request. The endpoint has
+    /// already confirmed the module's required permissions are set, so a
+    /// module reads this only for behavior beyond gating.
+    pub permissions: Option<&'a PermissionState>,
+
+    /// The resolve request's consent context, for module-specific logic. The
+    /// core gates on permissions, not consent.
     pub consent: Option<&'a ConsentContext>,
 }
 
@@ -565,6 +607,12 @@ impl<'a> AcceptedModules<'a> {
 /// - **Server-side** (for example [`HmacModule`]): derives the identifier at
 ///   the edge in [`generate`](Self::generate), and the page response sets the
 ///   cookie. Nothing client-side is involved.
+/// - **Client-side** (for example `ClientFixedModule`): defers in
+///   [`generate`](Self::generate) (returns `id: None`), runs its own JavaScript
+///   in the browser, and creates the identifier from the value the page posts
+///   back in
+///   [`resolve_from_client`](Self::resolve_from_client), whose response sets the
+///   cookie.
 ///
 /// A module that cannot derive an identifier at the edge returns a
 /// [`GeneratedEdgeCookie`] whose [`id`](GeneratedEdgeCookie::id) is `None`, so
@@ -608,6 +656,10 @@ pub trait EdgeCookieModule: Send + Sync + core::fmt::Debug {
     /// Derives an Edge Cookie identifier from the request evidence in
     /// `request_info` and the gating context in `input`.
     ///
+    /// A server-side module creates here. A client-side module defers here
+    /// (returns `id: None`) and creates later in
+    /// [`resolve_from_client`](Self::resolve_from_client) from the value the page
+    /// posts back.
     ///
     /// # Errors
     ///
@@ -669,6 +721,30 @@ pub trait EdgeCookieModule: Send + Sync + core::fmt::Debug {
     /// signal rules can gate it.
     fn required_permissions(&self) -> PermissionSet {
         PermissionSet::none()
+    }
+
+    /// Derives an Edge Cookie identifier from a value the client produced and
+    /// posted to the resolve endpoint (`POST /_ts/api/v1/ec/resolve`).
+    ///
+    /// This is the client-side counterpart to [`generate`](Self::generate). A
+    /// module that cannot derive an identifier at the edge defers from
+    /// `generate` (returning `id: None`, optionally with response headers that
+    /// trigger client-side work), and the page posts its result back here. The
+    /// payload arrives from the browser, so an implementation MUST verify it
+    /// (for example checking a signature) before trusting it. The default
+    /// returns no identifier, so a module that creates entirely server-side
+    /// (such as [`HmacModule`]) need not implement it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::EdgeCookie`] when processing the payload
+    /// fails. A payload that is merely unverified or absent yields `id: None`
+    /// rather than an error, so the request proceeds without an Edge Cookie.
+    fn resolve_from_client(
+        &self,
+        _input: &ClientResolveInput<'_>,
+    ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+        Ok(GeneratedEdgeCookie::default())
     }
 }
 
@@ -801,6 +877,99 @@ impl EdgeCookieModule for HostSignalModule {
     fn required_permissions(&self) -> PermissionSet {
         // Writes the Edge Cookie to the device, so it requires necessary.operations.storage
         // (TCF Purpose 1), the same gate as the HMAC module.
+        PermissionSet::none().with(Permission::StoreOnDevice)
+    }
+}
+
+/// The fixed, known word shared by [`ClientFixedModule`] and its page script.
+///
+/// Kept cookie-safe (no characters [`set_ec_cookie`] would reject) so
+/// it can be used as the Edge Cookie value verbatim. The page script posts this
+/// exact string; the module creates only when the posted value matches. The
+/// client copy lives in
+/// `crates/trusted-server-js/lib/src/integrations/ec_client_fixed`.
+///
+/// [`set_ec_cookie`]: super::cookies::set_ec_cookie
+#[cfg(any(test, feature = "client-fixed-demo"))]
+const EXPECTED_VALUE: &str = "an-ec";
+
+/// A demonstration client-side module, with no vendor coupling.
+///
+/// Client and server share one fixed, known word (`EXPECTED_VALUE`). When no
+/// Edge Cookie is present the page script (delivered through the tsjs bundle)
+/// posts that word to `POST /_ts/api/v1/ec/resolve`, and this module creates the
+/// Edge Cookie only when the posted value matches. It defers from
+/// [`generate`](EdgeCookieModule::generate) so the page renders with no Edge
+/// Cookie until the client reports back, then verifies and creates in
+/// [`resolve_from_client`](EdgeCookieModule::resolve_from_client).
+///
+/// The value is verifiable precisely because it is a known constant, which is
+/// the point of the demo: it exercises verify-before-create. It is useless in
+/// production, because a fixed value is not an identity and every client posts
+/// the same word, so it is for demonstration and testing only. A real
+/// client-side module verifies a real payload (for example an OWID signature)
+/// instead of a shared constant.
+#[derive(Debug, Clone)]
+#[cfg(any(test, feature = "client-fixed-demo"))]
+pub struct ClientFixedModule;
+
+#[cfg(any(test, feature = "client-fixed-demo"))]
+impl EdgeCookieModule for ClientFixedModule {
+    fn id(&self) -> &'static str {
+        CLIENT_FIXED_MODULE_KEY
+    }
+
+    fn code(&self) -> ModuleCode {
+        crate::module_code!("cfix")
+    }
+
+    fn generate(
+        &self,
+        _request_info: &dyn RequestInfo,
+        _input: &IdentityInput<'_>,
+    ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+        // No identifier is derived at the edge: the value comes from the page
+        // script, which posts it to the resolve endpoint.
+        Ok(GeneratedEdgeCookie::default())
+    }
+
+    fn resolve_from_client(
+        &self,
+        input: &ClientResolveInput<'_>,
+    ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+        // Verify the posted value against the known shared word, then create it as
+        // the Edge Cookie. A value that does not match yields no Edge Cookie.
+        // This stands in for a real module's verification (for example
+        // checking a signature) before it trusts a client-supplied value.
+        let matches = core::str::from_utf8(input.payload)
+            .map(str::trim)
+            .is_ok_and(|value| value == EXPECTED_VALUE);
+
+        Ok(GeneratedEdgeCookie {
+            id: matches.then(|| EXPECTED_VALUE.to_owned()),
+            response_headers: Vec::new(),
+        })
+    }
+
+    fn accepts_id(&self, value: &str) -> bool {
+        // The built-in default accepts only the HMAC `<hash>.<suffix>` shape,
+        // so the fixed word would never be read back, keyed or withdrawn. The
+        // fixed word is the only identifier this module creates, so it is the
+        // only one it owns.
+        value == EXPECTED_VALUE
+    }
+
+    fn normalize_id_for_kv(&self, value: &str) -> String {
+        // The fixed word has no dot separator, so the built-in default (which
+        // normalizes the HMAC `<hash>.<suffix>` shape) would corrupt it as a
+        // KV key. Like any opaque-identifier module, the value is the key.
+        value.to_owned()
+    }
+
+    fn required_permissions(&self) -> PermissionSet {
+        // The module writes the resolved value to the device as the Edge
+        // Cookie, so it requires necessary.operations.storage (TCF Purpose 1), the same gate
+        // as the HMAC module.
         PermissionSet::none().with(Permission::StoreOnDevice)
     }
 }
@@ -955,6 +1124,24 @@ fn resolve_named_module(
         )));
     }
 
+    // The `client_fixed` demonstration module takes no configuration block and
+    // no services, so it is built whenever it is selected. A fixed shared word
+    // is not an identity, so it is compiled only into test and demonstration
+    // builds and a build without it refuses the name rather than substituting
+    // anything. `check_named_module_configuration` refuses the same name at
+    // startup, so reaching this error means the two have drifted apart.
+    if implementation == CLIENT_FIXED_MODULE_KEY {
+        #[cfg(any(test, feature = "client-fixed-demo"))]
+        return Ok(Box::new(ClientFixedModule));
+        #[cfg(not(any(test, feature = "client-fixed-demo")))]
+        return Err(Report::new(TrustedServerError::EdgeCookie {
+            message: "The `client_fixed` demo Edge Cookie module is not compiled into this \
+                      build. It is for demonstration and testing only; enable the \
+                      trusted-server-core `client-fixed-demo` cargo feature to use it"
+                .to_owned(),
+        }));
+    }
+
     let known = known_implementations(injected.as_deref());
     injected
         .filter(|module| {
@@ -970,6 +1157,52 @@ fn resolve_named_module(
                 ),
             })
         })
+}
+
+/// Checks that `implementation` names a module this build compiles in, as
+/// far as the configuration on its own can answer.
+///
+/// The startup counterpart to [`resolve_named_module`], and the reason
+/// configuration validation does not decide on its own whether every selection
+/// can be honored. Whether a name is compiled into this build is the
+/// resolution's knowledge, not the settings', because a build that does not
+/// compile the `client_fixed` demonstration module in cannot honor that name
+/// however it is configured. The arm lives here beside the resolution it
+/// belongs to, and goes with it when that module becomes a module.
+///
+/// Whether a selection needs a settings block is answered by
+/// [`Ec::validate_module_selection`], which knows which implementations
+/// built into core take settings. The demonstration module takes none, so it
+/// is configured correctly with no block at all.
+///
+/// Whether the host supplies a capability a module needs is not answerable
+/// from configuration, so it is not asked here. [`ensure_module_available`]
+/// asks that, with the services the adapter injects.
+///
+/// # Errors
+///
+/// Returns [`TrustedServerError::Configuration`] when `implementation` is not
+/// compiled into this build.
+pub(crate) fn check_named_module_configuration(
+    implementation: &str,
+) -> Result<(), Report<TrustedServerError>> {
+    // The one name a production build does not supply at all, which no amount
+    // of configuration can fix. Rejecting it here rather than when the
+    // module is built means an operator finds out at startup instead of on
+    // the first request.
+    if implementation == CLIENT_FIXED_MODULE_KEY {
+        #[cfg(any(test, feature = "client-fixed-demo"))]
+        return Ok(());
+        #[cfg(not(any(test, feature = "client-fixed-demo")))]
+        return Err(Report::new(TrustedServerError::Configuration {
+            message: "[ec] module = \"client_fixed\" selects the demonstration module, \
+                      which is not compiled into this build. Enable the trusted-server-core \
+                      `client-fixed-demo` cargo feature for demonstrations"
+                .to_owned(),
+        }));
+    }
+
+    Ok(())
 }
 
 /// The implementations this deployment could build, for an error that has just
@@ -1148,6 +1381,13 @@ impl EdgeCookieModule for SharedModule {
 
     fn required_permissions(&self) -> PermissionSet {
         self.0.required_permissions()
+    }
+
+    fn resolve_from_client(
+        &self,
+        input: &ClientResolveInput<'_>,
+    ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+        self.0.resolve_from_client(input)
     }
 }
 
@@ -1913,7 +2153,127 @@ mod tests {
     }
 
     #[test]
-    fn host_signal_module_defers_without_signals() {
+    fn client_fixed_defers_in_generate() {
+        let request_info = test_request_info();
+        let generated = ClientFixedModule
+            .generate(&request_info, &IdentityInput::default())
+            .expect("should generate");
+        assert!(
+            generated.id.is_none(),
+            "`client_fixed` should defer in generate, deriving no edge identifier"
+        );
+    }
+
+    #[test]
+    fn resolve_from_client_creates_only_from_a_verified_payload() {
+        // `client_fixed` creates the Edge Cookie only from the known shared
+        // word. `HmacModule` does not override `resolve_from_client`, so it
+        // inherits the no-op default, because a server-side module takes no
+        // part in the client cycle.
+        /// One case: its name, the module, the posted payload and the
+        /// identifier the module should create.
+        type Case<'a> = (&'a str, &'a dyn EdgeCookieModule, &'a [u8], Option<&'a str>);
+
+        let hmac = HmacModule::new(test_passphrase());
+        let cases: [Case<'_>; 3] = [
+            (
+                "client_fixed with the known word",
+                &ClientFixedModule,
+                EXPECTED_VALUE.as_bytes(),
+                Some(EXPECTED_VALUE),
+            ),
+            (
+                "client_fixed with another word",
+                &ClientFixedModule,
+                b"not-the-word",
+                None,
+            ),
+            ("hmac with any payload", &hmac, b"anything", None),
+        ];
+        for (case, module, payload, expected) in cases {
+            let input = ClientResolveInput {
+                payload,
+                permissions: None,
+                consent: None,
+            };
+            let generated = module
+                .resolve_from_client(&input)
+                .unwrap_or_else(|err| panic!("{case}: should resolve, got: {err}"));
+            assert_eq!(
+                generated.id.as_deref(),
+                expected,
+                "{case}: should create exactly what the module verifies"
+            );
+        }
+    }
+
+    #[test]
+    fn client_fixed_owns_the_one_identifier_it_creates() {
+        // Read-back, the identity-graph key and withdrawal all ask the
+        // selected module whether it owns the cookie that came back.
+        let coded = format!("cfix~{EXPECTED_VALUE}");
+        assert!(
+            module_owns_id(&ClientFixedModule, &coded),
+            "`client_fixed` should own the coded fixed word it creates"
+        );
+        let hmac_shaped = format!("cfix~{}.ABC123", "a".repeat(64));
+        for other in [
+            "cfix~another-word",
+            EXPECTED_VALUE,
+            "hmac~an-ec",
+            hmac_shaped.as_str(),
+        ] {
+            assert!(
+                !module_owns_id(&ClientFixedModule, other),
+                "`client_fixed` should not own {other}"
+            );
+        }
+    }
+
+    #[test]
+    fn client_fixed_requires_store_on_device() {
+        assert!(
+            ClientFixedModule
+                .required_permissions()
+                .contains(Permission::StoreOnDevice),
+            "`client_fixed` writes a cookie, so it requires necessary.operations.storage"
+        );
+    }
+
+    #[test]
+    fn the_fixed_word_and_marker_name_match_the_page_script() {
+        // The demo page script and this module share the fixed word by
+        // convention; the resolved-marker cookie name is likewise shared with
+        // the script. Assert against the script source so a rename on either
+        // side fails this test instead of silently breaking the round trip.
+        let script = include_str!(
+            "../../../trusted-server-js/lib/src/integrations/ec_client_fixed/index.ts"
+        );
+        assert!(
+            script.contains(&format!("const FIXED_WORD = '{EXPECTED_VALUE}'")),
+            "the page script's FIXED_WORD should match EXPECTED_VALUE"
+        );
+        assert!(
+            script.contains(&format!(
+                "const MARKER_COOKIE_NAME = '{}'",
+                crate::constants::COOKIE_TS_EC_RESOLVED
+            )),
+            "the page script's marker cookie name should match COOKIE_TS_EC_RESOLVED"
+        );
+        // The page module declares the same permission the server-side
+        // module requires, and checks it against the state the page is
+        // handed, so the two declarations must name the same Data Use.
+        assert!(
+            script.contains(&format!(
+                "const REQUIRED_PERMISSION = '{}'",
+                Permission::StoreOnDevice.as_str()
+            )),
+            "the page script's REQUIRED_PERMISSION should match the module's declaration"
+        );
+    }
+
+    #[test]
+    fn host_signal_module_defers_without_fingerprints() {
         let signals = Arc::new(TestHostSignals {
             ja4: None,
             h2: None,
@@ -2134,6 +2494,67 @@ mod tests {
         });
         ensure_module_available(&selected, Some(signals), None).expect(
             "should pass on a host that injects host signals, whatever this request's signals are",
+        );
+    }
+
+    #[test]
+    fn the_configuration_check_and_the_resolution_agree_on_a_module_with_no_block() {
+        // The demonstration module is configured correctly with no
+        // `[ec.<name>]` block at all, so a check that demanded a block for
+        // every selection rejected a valid deployment. The settings ask for a
+        // block only from the implementations they know take settings, and
+        // that has to agree with the resolution, because a startup check that
+        // passes what the construction then refuses leaves the deployment
+        // failing on its first request.
+        let ec = Ec {
+            module: Some(EcModuleSelection::from(CLIENT_FIXED_MODULE_KEY)),
+            ..Ec::default()
+        };
+
+        ec.validate_module_selection()
+            .expect("`client_fixed` should validate with no configuration block");
+
+        let built = build_module(&ec, None, None)
+            .expect("`client_fixed` should build with no configuration and no services")
+            .expect("`client_fixed` should yield a module");
+        assert_eq!(
+            built.id(),
+            CLIENT_FIXED_MODULE_KEY,
+            "the built module should be the one the selector names"
+        );
+    }
+
+    #[test]
+    fn a_name_that_needs_a_block_still_fails_without_one() {
+        // Taking the block question out of the settings must not weaken it for
+        // the names that do need a block.
+        let ec = Ec {
+            module: Some(EcModuleSelection::from(HMAC_MODULE_KEY)),
+            ..Ec::default()
+        };
+
+        let err = ec
+            .validate_module_selection()
+            .expect_err("hmac with no block should still fail at startup");
+        assert!(
+            err.to_string().contains("[ec.hmac]"),
+            "the error should name the missing block, got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_block_left_configured_alongside_a_blockless_module_is_still_rejected() {
+        // The unreferenced-block rule does not soften for a module that
+        // needs no block of its own, because a stale block is still a mistake.
+        let mut ec = selected_hmac(HMAC_MODULE_KEY);
+        ec.module = Some(EcModuleSelection::from(CLIENT_FIXED_MODULE_KEY));
+
+        let err = ec
+            .validate_module_selection()
+            .expect_err("a stray hmac block should still be rejected");
+        assert!(
+            err.to_string().contains("hmac"),
+            "the error should name the unreferenced block, got: {err}"
         );
     }
 }
