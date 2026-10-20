@@ -161,6 +161,8 @@ pub(crate) fn geo_allowed_for_response(response: &Response) -> bool {
 /// 5. `settings.response_headers` — operator-configured overrides, except the
 ///    cache-controlling headers are skipped on uncacheable (`private`/`no-store`)
 ///    responses so operators cannot re-enable shared caching for per-user payloads
+/// 6. `X-Robots-Tag: noindex, nofollow` when `[robots-txt] modules` selects
+///    `refuse_all`
 pub(crate) fn apply_finalize_headers(
     settings: &Settings,
     geo_info: Option<&GeoInfo>,
@@ -196,6 +198,10 @@ pub(crate) fn apply_finalize_headers(
     trusted_server_core::response_privacy::apply_response_headers_with_cache_privacy(
         settings, response,
     );
+
+    // Last, so that nothing an origin or an operator's header set can loosen
+    // a site taken out of search.
+    trusted_server_core::robots_txt::apply_response_robots_tag(settings, response);
 }
 
 /// Forces cookie-bearing responses to stay private to shared caches.
