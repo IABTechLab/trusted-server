@@ -1205,3 +1205,21 @@ async fn nextjs_auction_output_holds_until_the_structural_body_close() {
         "should not leak generated placeholders: {html}"
     );
 }
+
+/// Every route registered beneath an underscore prefix is one of the
+/// addresses an attestation endpoint may not take, so a new fixed route
+/// cannot leave an endpoint free to register its address twice.
+#[test]
+fn every_fixed_route_beneath_an_underscore_prefix_is_reserved() {
+    use trusted_server_core::attestation::RESERVED_PATHS;
+
+    for route in test_router().routes() {
+        let path = route.path();
+        if path.starts_with("/_") {
+            assert!(
+                RESERVED_PATHS.contains(&path),
+                "{path} should be listed in attestation::RESERVED_PATHS"
+            );
+        }
+    }
+}

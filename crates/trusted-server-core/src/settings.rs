@@ -4057,6 +4057,15 @@ pub struct Settings {
         skip_serializing_if = "crate::inspect::config::InspectConfig::is_default"
     )]
     pub inspect: crate::inspect::config::InspectConfig,
+    /// The attestation endpoint, which serves evidence signed with the
+    /// operator's key at the address its `endpoint` names. See
+    /// [`crate::attestation`].
+    ///
+    /// `None` leaves the address to the publisher's origin, and stays out of
+    /// serialized config blobs for the reason given on `trusted_client_ip`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(nested)]
+    pub attestation: Option<crate::attestation::AttestationConfig>,
     /// The page changes run on a document fetched from the origin, written
     /// as `[[fetch]]` entries. See [`crate::middleware`].
     #[serde(default, skip_serializing_if = "PhaseEntries::is_empty")]
@@ -4856,8 +4865,9 @@ fn validation_error_summary(errors: &validator::ValidationErrors) -> String {
             };
             match kind {
                 validator::ValidationErrorsKind::Field(validations) => {
-                    // A validator's message, where it gives one, says why the
-                    // value was refused, which the code alone does not.
+                    // A validator's message, where it gives one, says what the
+                    // code cannot, such as which address an endpoint clashed
+                    // with.
                     for validation in validations {
                         messages.push(match &validation.message {
                             Some(message) => format!("{path}: {} ({message})", validation.code),

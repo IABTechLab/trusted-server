@@ -708,6 +708,37 @@ show = ["publisher.origin_url"]
 hide = ["response_headers"]
 ```
 
+## Attestation Configuration
+
+A deployment can serve evidence of who operates it and which build it runs,
+signed with a key that only the operator's build carries. Without this section
+the deployment serves no evidence and the address belongs to the publisher's
+origin. [Attestation](/guide/attestation) describes the evidence, the signing
+keys and how a relying party checks it.
+
+### `[attestation]`
+
+| Field        | Type   | Required | Description                                                                                                                                                                                                                                                                                                                                                                                          |
+| ------------ | ------ | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `endpoint`   | String | No       | Where the page answers, with the JSON form at the same path plus `.json`. Default `/_ts/attestation`. An absolute path of two or more segments, 64 characters at most, of lower case letters, digits, `_` and `-`, the first segment starting with `_`, not ending `.json`, not an address the deployment already answers and not under a prefix a framework serves its assets from, such as `_next` |
+| `operator`   | String | Yes      | Who the evidence says operates the deployment, 1 to 64 characters                                                                                                                                                                                                                                                                                                                                    |
+| `context`    | String | Yes      | The text signed ahead of the evidence, 1 to 64 characters with no control characters. A verifier must use exactly the same text                                                                                                                                                                                                                                                                      |
+| `verify_url` | String | Yes      | An `https` address with a host, where the page sends a reader to check the claim                                                                                                                                                                                                                                                                                                                     |
+
+The section refuses any other field, so a configuration naming a signing key
+is refused. Keys are compiled into the build from the file the build input
+`TRUSTED_SERVER_ATTESTATION_KEYS` names, and a build given none answers `503`
+at the endpoint and nothing else changes.
+
+**Example**:
+
+```toml
+[attestation]
+operator = "Example Operator"
+context = "example-attestation:v1"
+verify_url = "https://verifier.example/verify?host=publisher.example"
+```
+
 ## EC Configuration
 
 Settings for generating privacy-preserving Edge Cookie identifiers. The `ec_store` KV store is the only KV-backed EC lifecycle store; it holds identity graph state, minimal consent metadata, source-domain keyed partner UIDs, and withdrawal tombstones. Live consent is interpreted from request cookies, headers, geolocation, and policy defaults, not separate KV persistence.
