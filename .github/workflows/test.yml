@@ -8,6 +8,15 @@ on:
     branches: [main]
   pull_request:
 
+# Each author runs one pull request at a time per workflow, so one person
+# pushing many PRs cannot fill the runner queue ahead of everyone else. Their
+# other runs wait in order instead of being cancelled. Other events get their
+# own group from the run ID and are never held back.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.actor || github.run_id }}
+  cancel-in-progress: false
+  queue: max
+
 jobs:
   test-rust:
     name: cargo test
