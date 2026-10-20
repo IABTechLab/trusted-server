@@ -38,34 +38,54 @@ pub(crate) fn expected_module_ids(
         }
     }
 
-    let mut modules: Vec<(String, PathBuf)> = Vec::new();
+    let mut folders = Vec::new();
     for root in roots {
         for dir in folders_in(&root)? {
-            let name = dir
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            if name == CORE_MODULE_ID {
-                return Err(format!(
-                    "module name {CORE_MODULE_ID}, used by {}, is the shared core's bundle",
-                    dir.display()
-                ));
-            }
-            if let Some((_, earlier)) = modules.iter().find(|(known, _)| *known == name) {
-                return Err(format!(
-                    "module {name} is in both {} and {}",
-                    earlier.display(),
-                    dir.display()
-                ));
-            }
-            modules.push((name, dir));
+            let has_entry = dir.join("index.ts").is_file();
+            folders.push((dir, has_entry));
         }
     }
+    module_ids(&folders)
+}
 
-    let mut integrations: Vec<String> = modules
+/// Return the module IDs for module folders in the order they were found,
+/// each with whether it holds an `index.ts` file.
+///
+/// Kept apart from the folder walk so its rules are tested without a file
+/// system, which the WebAssembly test run does not have.
+///
+/// # Errors
+///
+/// Returns a message when two folders supply a module of the same name, or
+/// when a folder is named `core`, which is the shared core's bundle.
+pub(crate) fn module_ids(folders: &[(PathBuf, bool)]) -> Result<Vec<String>, String> {
+    let mut seen: Vec<(String, &Path)> = Vec::new();
+    for (dir, _) in folders {
+        let name = dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if name == CORE_MODULE_ID {
+            return Err(format!(
+                "module name {CORE_MODULE_ID}, used by {}, is the shared core's bundle",
+                dir.display()
+            ));
+        }
+        if let Some((_, earlier)) = seen.iter().find(|(known, _)| *known == name) {
+            return Err(format!(
+                "module {name} is in both {} and {}",
+                earlier.display(),
+                dir.display()
+            ));
+        }
+        seen.push((name, dir.as_path()));
+    }
+
+    let mut integrations: Vec<String> = seen
         .into_iter()
-        .filter(|(_, dir)| dir.join("index.ts").is_file())
-        .map(|(name, _)| name)
+        .zip(folders)
+        .filter(|(_, (_, has_entry))| *has_entry)
+        .map(|((name, _), _)| name)
         .collect();
     integrations.sort();
 
@@ -261,41 +281,24 @@ mod tests {
         );
     }
 
-    /// A fresh folder for one test, removed when the guard drops.
-    struct TempTree(PathBuf);
-
-    impl TempTree {
-        fn new(name: &str) -> Self {
-            let root =
-                std::env::temp_dir().join(format!("tsjs-bundle-set-{}-{name}", std::process::id()));
-            let _ = fs::remove_dir_all(&root);
-            fs::create_dir_all(&root).expect("should create the test folder");
-            Self(root)
-        }
-
-        fn file(&self, relative: &str) {
-            let path = self.0.join(relative);
-            fs::create_dir_all(path.parent().expect("should have a parent folder"))
-                .expect("should create the file's folder");
-            fs::write(&path, "").expect("should write the file");
-        }
-    }
-
-    impl Drop for TempTree {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
-        }
+    /// Module folders as the folder walk finds them, each with whether it
+    /// holds an `index.ts` file.
+    fn folders(entries: &[(&str, bool)]) -> Vec<(PathBuf, bool)> {
+        entries
+            .iter()
+            .map(|(dir, has_entry)| (PathBuf::from(dir), *has_entry))
+            .collect()
     }
 
     #[test]
-    fn finds_modules_here_and_in_the_crate_that_supplies_them() {
-        let tree = TempTree::new("finds");
-        tree.file("lib/src/integrations/zeta/index.ts");
-        tree.file("crates/kind/vendor/js/src/alpha/index.ts");
-        tree.file("crates/kind/vendor/js/src/helpers/shared.ts");
+    fn lists_core_then_each_folder_with_an_entry_in_name_order() {
+        let found = folders(&[
+            ("lib/src/integrations/zeta", true),
+            ("crates/kind/vendor/js/src/alpha", true),
+            ("crates/kind/vendor/js/src/helpers", false),
+        ]);
 
-        let ids = expected_module_ids(&tree.0.join("lib/src"), &tree.0.join("crates"))
-            .expect("should discover the modules");
+        let ids = module_ids(&found).expect("should list the modules");
 
         assert_eq!(
             ids,
@@ -306,12 +309,12 @@ mod tests {
 
     #[test]
     fn rejects_a_module_name_two_folders_supply() {
-        let tree = TempTree::new("twice");
-        tree.file("lib/src/integrations/alpha/index.ts");
-        tree.file("crates/kind/vendor/js/src/alpha/index.ts");
+        let found = folders(&[
+            ("lib/src/integrations/alpha", true),
+            ("crates/kind/vendor/js/src/alpha", true),
+        ]);
 
-        let err = expected_module_ids(&tree.0.join("lib/src"), &tree.0.join("crates"))
-            .expect_err("should refuse a module name found twice");
+        let err = module_ids(&found).expect_err("should refuse a module name found twice");
 
         assert!(
             err.contains("module alpha is in both"),
@@ -321,11 +324,9 @@ mod tests {
 
     #[test]
     fn rejects_a_module_named_core() {
-        let tree = TempTree::new("core");
-        tree.file("crates/kind/vendor/js/src/core/index.ts");
+        let found = folders(&[("crates/kind/vendor/js/src/core", true)]);
 
-        let err = expected_module_ids(&tree.0.join("lib/src"), &tree.0.join("crates"))
-            .expect_err("should refuse a module named core");
+        let err = module_ids(&found).expect_err("should refuse a module named core");
 
         assert!(
             err.contains("module name core"),
