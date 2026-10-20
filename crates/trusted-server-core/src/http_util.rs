@@ -58,9 +58,17 @@ pub fn sanitize_trusted_client_ip_headers(
     req: &mut Request<EdgeBody>,
     config: Option<&TrustedClientIpConfig>,
 ) {
+    sanitize_trusted_client_ip_header_map(req.headers_mut(), config);
+}
+
+/// Removes configured client-IP trust headers without accessing the request body.
+pub fn sanitize_trusted_client_ip_header_map(
+    headers: &mut http::HeaderMap,
+    config: Option<&TrustedClientIpConfig>,
+) {
     if let Some(config) = config {
-        req.headers_mut().remove(config.ip_header.as_str());
-        req.headers_mut().remove(config.auth_header.as_str());
+        headers.remove(config.ip_header.as_str());
+        headers.remove(config.auth_header.as_str());
     }
 }
 
@@ -152,6 +160,9 @@ impl RequestInfo {
     /// [`sanitize_forwarded_headers`] at the edge, so `Host` and
     /// [`ClientInfo`] TLS detection are the only sources that fire.
     pub fn from_request(req: &Request<EdgeBody>, client_info: &ClientInfo) -> Self {
+        if let Some(info) = req.extensions().get::<Self>() {
+            return info.clone();
+        }
         let host = extract_request_host(req);
         let scheme = detect_request_scheme(
             req,

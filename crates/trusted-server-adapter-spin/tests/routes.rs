@@ -14,9 +14,7 @@ use trusted_server_core::settings::Settings;
 
 /// Build the full application router from explicit test settings.
 ///
-/// The settings baked into the binary contain placeholder secrets that
-/// `get_settings()` rejects by design, which would turn every route into a
-/// startup error page (and its route table into the fallback-only set).
+/// Production settings arrive through async invocation-local bootstrap.
 /// The handler regex is the production-shaped `^/_ts/admin`, matching
 /// `Settings::ADMIN_ENDPOINTS` and the default config, so the canonical
 /// `/_ts/admin/keys/*` routes are auth-gated exactly as in production.
@@ -50,8 +48,7 @@ async fn route(router: RouterService, req: Request) -> Response {
 
 #[test]
 fn routes_build_without_panic() {
-    // build_state() may fail (no real settings in CI) — startup_error_router
-    // is the fallback. Either way, routes() must not panic.
+    // Route construction performs no provider reads and does not fabricate readiness.
     let _router = TrustedServerApp::routes();
 }
 

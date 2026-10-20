@@ -74,6 +74,14 @@ pub struct PlatformHttpRequest {
     /// Adapters that cannot preserve streaming response bodies should return an
     /// error rather than silently buffering large asset responses.
     pub stream_response: bool,
+    /// Maximum encoded outbound request bytes accepted by managed transports.
+    pub max_request_body_bytes: u64,
+    /// Maximum response bytes accepted by managed transports.
+    pub max_response_body_bytes: u64,
+    /// Absolute deadline on the application's monotonic clock, when supplied.
+    pub deadline: Option<edgezero_core::time::Deadline>,
+    /// Finite total transport budget, independent of first-byte progress.
+    pub timeout: Option<std::time::Duration>,
 }
 
 impl PlatformHttpRequest {
@@ -86,7 +94,37 @@ impl PlatformHttpRequest {
             image_optimizer: None,
             cache_intent: PlatformCacheIntent::Default,
             stream_response: false,
+            max_request_body_bytes: 8 * 1024 * 1024,
+            max_response_body_bytes: 16 * 1024 * 1024,
+            deadline: None,
+            timeout: Some(std::time::Duration::from_secs(30)),
         }
+    }
+
+    /// Sets the response byte ceiling without changing streaming selection.
+    #[must_use]
+    pub fn with_response_limit(mut self, max_bytes: u64) -> Self {
+        self.max_response_body_bytes = max_bytes;
+        self
+    }
+
+    /// Sets the total transport budget, including connection and body reads.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Sets an absolute application deadline and a finite transport budget.
+    #[must_use]
+    pub fn with_deadline(
+        mut self,
+        deadline: edgezero_core::time::Deadline,
+        timeout: std::time::Duration,
+    ) -> Self {
+        self.deadline = Some(deadline);
+        self.timeout = Some(timeout);
+        self
     }
 
     /// Attach Image Optimizer metadata to the request.

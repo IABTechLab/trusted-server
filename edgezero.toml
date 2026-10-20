@@ -92,11 +92,11 @@ manifest = "crates/trusted-server-adapter-spin/spin.toml"
 component = "trusted-server"
 
 [adapters.spin.build]
-target = "wasm32-wasip1"
+target = "wasm32-wasip2"
 profile = "release"
 features = ["spin"]
 
 [adapters.spin.commands]
-build = "cargo build --package trusted-server-adapter-spin --target wasm32-wasip1 --features spin --release"
+build = "cargo build --package trusted-server-adapter-spin --target wasm32-wasip2 --features spin --release"
 serve = "spin up --from crates/trusted-server-adapter-spin"
 deploy = "spin deploy --from crates/trusted-server-adapter-spin"

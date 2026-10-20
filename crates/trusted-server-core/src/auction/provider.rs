@@ -381,7 +381,15 @@ impl GenericOpenRtbProvider {
         }
         let pending = services
             .http_client()
-            .send_async(PlatformHttpRequest::new(outbound, backend_name.clone()))
+            .send_async(
+                PlatformHttpRequest::new(outbound, backend_name.clone())
+                    .with_response_limit(
+                        crate::integrations::UPSTREAM_RTB_MAX_RESPONSE_BYTES as u64,
+                    )
+                    .with_timeout(std::time::Duration::from_millis(u64::from(
+                        transport_timeout_ms,
+                    ))),
+            )
             .await
             .change_context(TrustedServerError::Auction {
                 message: format!("Provider {} request launch failed", self.provider_name()),

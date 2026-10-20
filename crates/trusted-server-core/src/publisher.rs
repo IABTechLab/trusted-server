@@ -28,7 +28,7 @@ use brotli::Decompressor;
 use brotli::enc::BrotliEncoderParams;
 use brotli::enc::writer::CompressorWriter;
 use cookie::CookieJar;
-use edgezero_core::body::Body as EdgeBody;
+use edgezero_core::body::{Body as EdgeBody, BodyContent};
 use error_stack::{Report, ResultExt};
 use flate2::read::ZlibDecoder;
 use flate2::write::{GzEncoder, ZlibEncoder};
@@ -175,7 +175,7 @@ fn body_as_reader(
 }
 
 struct BodyChunkSource {
-    body: Option<EdgeBody>,
+    body: Option<BodyContent>,
     chunk_size: usize,
     max_bytes: usize,
     bytes_seen: usize,
@@ -185,7 +185,7 @@ struct BodyChunkSource {
 impl BodyChunkSource {
     fn new(body: EdgeBody, chunk_size: usize) -> Self {
         Self {
-            body: Some(body),
+            body: Some(body.into_content()),
             chunk_size,
             max_bytes: usize::MAX,
             bytes_seen: 0,
@@ -204,7 +204,7 @@ impl BodyChunkSource {
         // silently reporting end-of-stream on the next call.
         let pulled = match &mut self.body {
             None => Ok(None),
-            Some(EdgeBody::Once(bytes)) => {
+            Some(BodyContent::Once(bytes)) => {
                 let end = (self.once_offset + self.chunk_size).min(bytes.len());
                 if self.once_offset >= end {
                     Ok(None)
@@ -214,7 +214,7 @@ impl BodyChunkSource {
                     Ok(Some(chunk))
                 }
             }
-            Some(EdgeBody::Stream(stream)) => match stream.next().await {
+            Some(BodyContent::Stream(stream)) => match stream.next().await {
                 Some(Ok(chunk)) => Ok(Some(chunk)),
                 Some(Err(err)) => Err(Report::new(TrustedServerError::Proxy {
                     message: format!("Failed to read publisher origin body stream: {err}"),
@@ -2530,7 +2530,7 @@ pub async fn publisher_response_into_streaming_response(
                     yield bytes::Bytes::from(trailer);
                 }
             };
-            *response.body_mut() = EdgeBody::from_stream::<_, std::io::Error>(stream);
+            *response.body_mut() = EdgeBody::from_external_stream::<_, std::io::Error>(stream);
             Ok(response)
         }
         PublisherResponse::PassThrough { mut response, body } => {
@@ -2740,7 +2740,7 @@ pub async fn publisher_response_into_streaming_response(
                     }
                 }
             };
-            *response.body_mut() = EdgeBody::from_stream::<_, std::io::Error>(stream);
+            *response.body_mut() = EdgeBody::from_external_stream::<_, std::io::Error>(stream);
             Ok(response)
         }
     }
@@ -10583,18 +10583,15 @@ mod tests {
         /// can be stored, and one it refused keeps streaming exactly like `inline`. A
         /// helper that assumed either would silently only ever test one of them.
         async fn body_of(response: Response<EdgeBody>) -> Vec<u8> {
-            match response.into_body() {
-                EdgeBody::Stream(mut stream) => {
+            match response.into_body().into_content() {
+                BodyContent::Stream(mut stream) => {
                     let mut out = Vec::new();
                     while let Some(chunk) = stream.next().await {
                         out.extend_from_slice(&chunk.expect("stream chunk should read"));
                     }
                     out
                 }
-                other => other
-                    .into_bytes()
-                    .expect("a non-stream body has its bytes in hand")
-                    .to_vec(),
+                BodyContent::Once(bytes) => bytes.to_vec(),
             }
         }
 
@@ -14586,7 +14583,7 @@ mod tests {
             // So pull exactly one chunk and prove the auction has not been collected
             // yet — `ad_bids_state` is only written by the collector. No timing
             // involved, so nothing to be flaky about.
-            let EdgeBody::Stream(mut stream) = warm.into_body() else {
+            let BodyContent::Stream(mut stream) = warm.into_body().into_content() else {
                 panic!("a cache hit must stream, not buffer");
             };
             let first = stream
@@ -19919,7 +19916,7 @@ mod tests {
             gpt_diagnostics: None,
             suppress_datadome_client_side_tag: false,
         };
-        let body = EdgeBody::from_stream(futures::stream::iter(vec![Ok::<_, io::Error>(
+        let body = EdgeBody::from_external_stream(futures::stream::iter(vec![Ok::<_, io::Error>(
             bytes::Bytes::from_static(b"<html><body>live</body></html>"),
         )]));
         let mut output = Vec::new();
@@ -19953,6 +19950,45 @@ mod tests {
                 source.next_chunk().await.expect("should read").is_none(),
                 "should end after buffered bytes are exhausted"
             );
+        });
+    }
+
+    #[test]
+    fn body_chunk_source_reads_managed_content_with_explicit_cap() {
+        futures::executor::block_on(async {
+            for streaming in [false, true] {
+                let body = if streaming {
+                    EdgeBody::stream(futures::stream::iter([
+                        bytes::Bytes::from_static(b"abc"),
+                        bytes::Bytes::from_static(b"def"),
+                    ]))
+                } else {
+                    EdgeBody::from("abcdef")
+                }
+                .with_buffered_json_policy(
+                    std::num::NonZeroUsize::new(1).expect("should be positive"),
+                    true,
+                );
+                let mut source = BodyChunkSource::new(body, 3).with_max_bytes(5);
+
+                assert_eq!(
+                    source
+                        .next_chunk()
+                        .await
+                        .expect("should read first chunk")
+                        .as_deref(),
+                    Some(&b"abc"[..]),
+                    "should read managed content without applying context JSON policy"
+                );
+                let error = source
+                    .next_chunk()
+                    .await
+                    .expect_err("should reject cumulative overflow");
+                assert!(
+                    format!("{error:?}").contains("publisher origin body exceeded"),
+                    "should enforce the publisher limit for managed buffered and streamed bodies"
+                );
+            }
         });
     }
 
@@ -20498,46 +20534,56 @@ mod tests {
     #[test]
     fn body_chunk_source_resumes_after_cancelled_poll() {
         futures::executor::block_on(async {
-            let mut pending_once = true;
-            let mut yielded = false;
-            let stream = futures::stream::poll_fn(move |cx| {
-                if pending_once {
-                    pending_once = false;
-                    cx.waker().wake_by_ref();
-                    return std::task::Poll::Pending;
-                }
-                if yielded {
-                    return std::task::Poll::Ready(None);
-                }
-                yielded = true;
-                std::task::Poll::Ready(Some(Ok::<_, io::Error>(bytes::Bytes::from_static(
-                    b"chunk",
-                ))))
-            });
-            let body = EdgeBody::from_stream(stream);
-            let mut source = BodyChunkSource::new(body, STREAM_CHUNK_SIZE);
+            for managed in [false, true] {
+                let mut pending_once = true;
+                let mut yielded = false;
+                let stream = futures::stream::poll_fn(move |cx| {
+                    if pending_once {
+                        pending_once = false;
+                        cx.waker().wake_by_ref();
+                        return std::task::Poll::Pending;
+                    }
+                    if yielded {
+                        return std::task::Poll::Ready(None);
+                    }
+                    yielded = true;
+                    std::task::Poll::Ready(Some(Ok::<_, io::Error>(bytes::Bytes::from_static(
+                        b"chunk",
+                    ))))
+                });
+                let body = EdgeBody::from_external_stream(stream);
+                let body = if managed {
+                    body.with_buffered_json_policy(
+                        std::num::NonZeroUsize::new(1).expect("should be positive"),
+                        true,
+                    )
+                } else {
+                    body
+                };
+                let mut source = BodyChunkSource::new(body, STREAM_CHUNK_SIZE);
 
-            {
-                // Poll the pull future once (Pending), then drop it —
-                // simulating a cancelled await (select/timeout wrapper).
-                let mut pull = Box::pin(source.next_chunk());
-                let waker = futures::task::noop_waker();
-                let mut context = std::task::Context::from_waker(&waker);
-                assert!(
-                    pull.as_mut().poll(&mut context).is_pending(),
-                    "first poll should be pending"
+                {
+                    // Poll the pull future once (Pending), then drop it —
+                    // simulating a cancelled await (select/timeout wrapper).
+                    let mut pull = Box::pin(source.next_chunk());
+                    let waker = futures::task::noop_waker();
+                    let mut context = std::task::Context::from_waker(&waker);
+                    assert!(
+                        pull.as_mut().poll(&mut context).is_pending(),
+                        "first poll should be pending"
+                    );
+                }
+
+                let chunk = source
+                    .next_chunk()
+                    .await
+                    .expect("should read after cancelled poll");
+                assert_eq!(
+                    chunk.as_deref(),
+                    Some(&b"chunk"[..]),
+                    "cancelled pull must not lose the origin stream"
                 );
             }
-
-            let chunk = source
-                .next_chunk()
-                .await
-                .expect("should read after cancelled poll");
-            assert_eq!(
-                chunk.as_deref(),
-                Some(&b"chunk"[..]),
-                "cancelled pull must not lose the origin stream"
-            );
         });
     }
 
@@ -20853,7 +20899,7 @@ mod tests {
     /// the document head but not yet finished the response.
     fn origin_chunk_then_pending(chunk: bytes::Bytes) -> EdgeBody {
         let mut sent = false;
-        EdgeBody::from_stream(futures::stream::poll_fn(move |_cx| {
+        EdgeBody::from_external_stream(futures::stream::poll_fn(move |_cx| {
             if sent {
                 return std::task::Poll::Pending;
             }

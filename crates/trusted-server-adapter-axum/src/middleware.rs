@@ -5,10 +5,22 @@ use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderValue, Response};
 use edgezero_core::middleware::{Middleware, Next};
-use trusted_server_core::auth::enforce_basic_auth;
+use trusted_server_core::auth::enforce_basic_auth_parts;
 use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
-use trusted_server_core::http_util::sanitize_trusted_client_ip_headers;
+use trusted_server_core::http_util::sanitize_trusted_client_ip_header_map;
 use trusted_server_core::settings::Settings;
+
+use crate::app::AppState;
+
+fn request_settings(
+    explicit: &Option<Arc<Settings>>,
+    ctx: &RequestContext,
+) -> Result<Arc<Settings>, EdgeError> {
+    match explicit {
+        Some(settings) => Ok(Arc::clone(settings)),
+        None => Ok(Arc::clone(&AppState::from_request(ctx)?.settings)),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // SanitizeRequestMiddleware
@@ -24,23 +36,32 @@ use trusted_server_core::settings::Settings;
 /// a shared configuration cannot leak the secret into publisher or integration
 /// request handling.
 pub struct SanitizeRequestMiddleware {
-    settings: Arc<Settings>,
+    settings: Option<Arc<Settings>>,
 }
 
 impl SanitizeRequestMiddleware {
-    /// Creates a new [`SanitizeRequestMiddleware`] with the given settings.
+    /// Creates an explicit-settings middleware for tests.
     #[must_use]
     pub fn new(settings: Arc<Settings>) -> Self {
-        Self { settings }
+        Self {
+            settings: Some(settings),
+        }
+    }
+
+    /// Reads initialized typed application state from each request.
+    #[must_use]
+    pub fn from_request() -> Self {
+        Self { settings: None }
     }
 }
 
 #[async_trait(?Send)]
 impl Middleware for SanitizeRequestMiddleware {
     async fn handle(&self, mut ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
-        sanitize_trusted_client_ip_headers(
-            ctx.request_mut(),
-            self.settings.trusted_client_ip.as_ref(),
+        let settings = request_settings(&self.settings, &ctx)?;
+        sanitize_trusted_client_ip_header_map(
+            ctx.headers_mut(),
+            settings.trusted_client_ip.as_ref(),
         );
         next.run(ctx).await
     }
@@ -61,22 +82,31 @@ impl Middleware for SanitizeRequestMiddleware {
 /// [`AuthMiddleware`] so that every outgoing response — including auth-rejected
 /// ones — carries a consistent set of headers.
 pub struct FinalizeResponseMiddleware {
-    settings: Arc<Settings>,
+    settings: Option<Arc<Settings>>,
 }
 
 impl FinalizeResponseMiddleware {
-    /// Creates a new [`FinalizeResponseMiddleware`] with the given settings.
+    /// Creates an explicit-settings middleware for tests.
     #[must_use]
     pub fn new(settings: Arc<Settings>) -> Self {
-        Self { settings }
+        Self {
+            settings: Some(settings),
+        }
+    }
+
+    /// Reads initialized typed application state from each request.
+    #[must_use]
+    pub fn from_request() -> Self {
+        Self { settings: None }
     }
 }
 
 #[async_trait(?Send)]
 impl Middleware for FinalizeResponseMiddleware {
     async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
+        let settings = request_settings(&self.settings, &ctx)?;
         let mut response = next.run(ctx).await?;
-        apply_finalize_headers(&self.settings, &mut response);
+        apply_finalize_headers(&settings, &mut response);
         Ok(response)
     }
 }
@@ -87,26 +117,35 @@ impl Middleware for FinalizeResponseMiddleware {
 
 /// Inner middleware: enforces basic-auth before the handler runs.
 ///
-/// - `Ok(Some(response))` from [`enforce_basic_auth`] → auth failed; return the
+/// - `Ok(Some(response))` from [`enforce_basic_auth_parts`] → auth failed; return the
 ///   challenge response (bubbles through [`FinalizeResponseMiddleware`] for header injection).
 /// - `Ok(None)` → no auth required or credentials accepted; continue the chain.
 /// - `Err(report)` → internal error; log and convert to a 500 HTTP response.
 pub struct AuthMiddleware {
-    settings: Arc<Settings>,
+    settings: Option<Arc<Settings>>,
 }
 
 impl AuthMiddleware {
-    /// Creates a new [`AuthMiddleware`] with the given settings.
+    /// Creates an explicit-settings middleware for tests.
     #[must_use]
     pub fn new(settings: Arc<Settings>) -> Self {
-        Self { settings }
+        Self {
+            settings: Some(settings),
+        }
+    }
+
+    /// Reads initialized typed application state from each request.
+    #[must_use]
+    pub fn from_request() -> Self {
+        Self { settings: None }
     }
 }
 
 #[async_trait(?Send)]
 impl Middleware for AuthMiddleware {
     async fn handle(&self, mut ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
-        match enforce_basic_auth(&self.settings, ctx.request_mut()) {
+        let settings = request_settings(&self.settings, &ctx)?;
+        match enforce_basic_auth_parts(&settings, ctx.parts_mut()) {
             Ok(Some(response)) => return Ok(response),
             Ok(None) => {}
             Err(report) => {
@@ -275,8 +314,8 @@ mod tests {
             let handler_observed = Arc::clone(&handler_observed);
             async move {
                 *handler_observed.lock().expect("should lock observation") = Some((
-                    ctx.request().headers().contains_key("x-reader-ip"),
-                    ctx.request().headers().contains_key("x-reader-ip-auth"),
+                    ctx.headers().contains_key("x-reader-ip"),
+                    ctx.headers().contains_key("x-reader-ip-auth"),
                 ));
                 Ok::<Response, EdgeError>(empty_response())
             }

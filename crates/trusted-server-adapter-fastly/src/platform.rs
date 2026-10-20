@@ -327,13 +327,13 @@ fn edge_request_to_fastly(
             fastly_req.append_header(name.as_str(), value.as_bytes());
         }
     }
-    match body {
-        edgezero_core::body::Body::Once(bytes) => {
+    match body.into_content() {
+        edgezero_core::body::BodyContent::Once(bytes) => {
             if !bytes.is_empty() {
                 fastly_req.set_body(bytes.to_vec());
             }
         }
-        edgezero_core::body::Body::Stream(_) => {
+        edgezero_core::body::BodyContent::Stream(_) => {
             return Err(Report::new(PlatformError::HttpClient)
                 .attach("streaming request body is not supported by Fastly request conversion"));
         }
@@ -363,7 +363,7 @@ fn fastly_body_to_edge_stream(body: fastly::Body) -> edgezero_core::body::Body {
         }
     });
 
-    edgezero_core::body::Body::from_stream(stream)
+    edgezero_core::body::Body::from_external_stream(stream)
 }
 
 /// Return whether a response is allowed to carry a body.
@@ -1446,7 +1446,7 @@ mod tests {
         let request = request_builder()
             .method("POST")
             .uri("https://example.com/")
-            .body(Body::from_stream(futures::stream::empty::<
+            .body(Body::from_external_stream(futures::stream::empty::<
                 Result<_, io::Error>,
             >()))
             .expect("should build streaming test request");
@@ -1521,7 +1521,7 @@ mod tests {
         let request = request_builder()
             .method("POST")
             .uri("https://example.com/")
-            .body(Body::from_stream(futures::stream::empty::<
+            .body(Body::from_external_stream(futures::stream::empty::<
                 Result<_, io::Error>,
             >()))
             .expect("should build streaming test request");

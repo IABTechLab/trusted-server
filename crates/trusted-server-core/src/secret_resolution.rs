@@ -4,6 +4,8 @@
 //! public `EdgeZero` metadata contract and replaces those names only in the
 //! in-memory value used to build runtime [`crate::settings::Settings`].
 
+use std::collections::BTreeSet;
+
 use edgezero_core::app_config::{AppConfigMeta, SecretField, SecretKind, SecretPathSegment};
 use error_stack::Report;
 use serde_json::Value;
@@ -27,20 +29,57 @@ pub fn resolve_secret_references<C: AppConfigMeta>(
     default_store_name: &StoreName,
 ) -> Result<(), Report<TrustedServerError>> {
     let mut resolved_data = data.clone();
+    visit_secret_references::<C>(&mut resolved_data, &mut |key, path| {
+        let resolved = secret_store
+            .get_string(default_store_name, key)
+            .map_err(|_| {
+                configuration_error(format!(
+                    "failed to resolve secret reference at `{path}` from secret store \
+                 `{default_store_name}`"
+                ))
+            })?;
+        if resolved.is_empty() {
+            return Err(configuration_error(format!(
+                "resolved secret at `{path}` must not be empty"
+            )));
+        }
+        Ok(resolved)
+    })?;
+    *data = resolved_data;
+    Ok(())
+}
+
+/// Collect the finite, deduplicated keys required by an app-config value.
+///
+/// Uses the same metadata and structural checks as runtime resolution without
+/// reading a store or changing the supplied value.
+///
+/// # Errors
+/// Returns a configuration error for missing or malformed secret references.
+pub fn secret_reference_keys<C: AppConfigMeta>(
+    data: &Value,
+) -> Result<BTreeSet<String>, Report<TrustedServerError>> {
+    let mut keys = BTreeSet::new();
+    visit_secret_references::<C>(&mut data.clone(), &mut |key, _path| {
+        keys.insert(key.to_owned());
+        Ok(key.to_owned())
+    })?;
+    Ok(keys)
+}
+
+type ResolveReference<'a> =
+    dyn FnMut(&str, &str) -> Result<String, Report<TrustedServerError>> + 'a;
+
+fn visit_secret_references<C: AppConfigMeta>(
+    data: &mut Value,
+    resolve: &mut ResolveReference<'_>,
+) -> Result<(), Report<TrustedServerError>> {
     for field in C::secret_fields() {
         if matches!(field.kind, SecretKind::StoreRef) {
             continue;
         }
-        resolve_field(
-            &mut resolved_data,
-            &field,
-            &field.path,
-            "",
-            secret_store,
-            default_store_name,
-        )?;
+        resolve_field(data, &field, &field.path, "", resolve)?;
     }
-    *data = resolved_data;
     Ok(())
 }
 
@@ -49,30 +88,17 @@ fn resolve_field(
     field: &SecretField,
     remaining: &[SecretPathSegment],
     rendered_path: &str,
-    secret_store: &dyn PlatformSecretStore,
-    default_store_name: &StoreName,
+    resolve: &mut ResolveReference<'_>,
 ) -> Result<(), Report<TrustedServerError>> {
     match remaining.split_first() {
-        Some((SecretPathSegment::Field(name), [])) => resolve_leaf(
-            node,
-            field,
-            name.as_ref(),
-            rendered_path,
-            secret_store,
-            default_store_name,
-        ),
+        Some((SecretPathSegment::Field(name), [])) => {
+            resolve_leaf(node, field, name.as_ref(), rendered_path, resolve)
+        }
         Some((SecretPathSegment::OptionalField(name), [])) => {
             if matches!(node.get(name.as_ref()), None | Some(Value::Null)) {
                 return Ok(());
             }
-            resolve_leaf(
-                node,
-                field,
-                name.as_ref(),
-                rendered_path,
-                secret_store,
-                default_store_name,
-            )
+            resolve_leaf(node, field, name.as_ref(), rendered_path, resolve)
         }
         Some((SecretPathSegment::Field(name), rest)) => {
             let next_path = join_field(rendered_path, name.as_ref());
@@ -83,14 +109,7 @@ fn resolve_field(
             if child.is_null() {
                 return Err(missing_path(&next_path));
             }
-            resolve_field(
-                child,
-                field,
-                rest,
-                &next_path,
-                secret_store,
-                default_store_name,
-            )
+            resolve_field(child, field, rest, &next_path, resolve)
         }
         Some((SecretPathSegment::OptionalField(name), rest)) => {
             let next_path = join_field(rendered_path, name.as_ref());
@@ -103,14 +122,7 @@ fn resolve_field(
             if child.is_null() {
                 return Ok(());
             }
-            resolve_field(
-                child,
-                field,
-                rest,
-                &next_path,
-                secret_store,
-                default_store_name,
-            )
+            resolve_field(child, field, rest, &next_path, resolve)
         }
         Some((SecretPathSegment::ArrayEach, rest)) => {
             let items = node.as_array_mut().ok_or_else(|| {
@@ -118,14 +130,7 @@ fn resolve_field(
             })?;
             for (index, item) in items.iter_mut().enumerate() {
                 let indexed_path = format!("{rendered_path}[{index}]");
-                resolve_field(
-                    item,
-                    field,
-                    rest,
-                    &indexed_path,
-                    secret_store,
-                    default_store_name,
-                )?;
+                resolve_field(item, field, rest, &indexed_path, resolve)?;
             }
             Ok(())
         }
@@ -142,8 +147,7 @@ fn resolve_leaf(
     field: &SecretField,
     key: &str,
     rendered_parent: &str,
-    secret_store: &dyn PlatformSecretStore,
-    default_store_name: &StoreName,
+    resolve: &mut ResolveReference<'_>,
 ) -> Result<(), Report<TrustedServerError>> {
     let leaf_path = join_field(rendered_parent, key);
     let object = parent.as_object_mut().ok_or_else(|| {
@@ -166,20 +170,7 @@ fn resolve_leaf(
         }
     };
 
-    let resolved = secret_store
-        .get_string(default_store_name, &key_name)
-        .map_err(|_| {
-            configuration_error(format!(
-                "failed to resolve secret reference at `{leaf_path}` from secret store \
-                 `{default_store_name}`"
-            ))
-        })?;
-    if resolved.is_empty() {
-        return Err(configuration_error(format!(
-            "resolved secret at `{leaf_path}` must not be empty"
-        )));
-    }
-
+    let resolved = resolve(&key_name, &leaf_path)?;
     object.insert(key.to_owned(), Value::String(resolved));
     Ok(())
 }
@@ -279,6 +270,30 @@ mod tests {
                 ("feature-key".to_owned(), b"resolved-feature".to_vec()),
             ]),
         }
+    }
+
+    #[test]
+    fn collects_deduplicated_keys_without_mutating_data() {
+        let data = serde_json::json!({
+            "outer": [{"token": "token-a"}, {"token": "token-a", "optional": "token-b"}]
+        });
+        let original = data.clone();
+        let keys =
+            secret_reference_keys::<Fixture>(&data).expect("should collect finite references");
+        assert_eq!(
+            keys,
+            BTreeSet::from(["token-a".to_owned(), "token-b".to_owned()])
+        );
+        assert_eq!(
+            data, original,
+            "should not mutate references during collection"
+        );
+    }
+
+    #[test]
+    fn collection_rejects_malformed_required_paths() {
+        let data = serde_json::json!({"outer": [{"token": false}]});
+        assert!(secret_reference_keys::<Fixture>(&data).is_err());
     }
 
     #[test]

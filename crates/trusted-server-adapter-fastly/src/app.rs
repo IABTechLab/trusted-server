@@ -185,6 +185,7 @@ impl RuntimeStoreConfig {
 /// shared services live here; request-specific state must remain request-local.
 pub(crate) struct AppState {
     pub(crate) settings: Arc<Settings>,
+    pub(crate) delivery_observation: crate::DeliveryObservation,
     pub(crate) orchestrator: Arc<AuctionOrchestrator>,
     pub(crate) registry: Arc<IntegrationRegistry>,
     pub(crate) default_kv_store: Arc<dyn PlatformKvStore>,
@@ -229,6 +230,7 @@ pub(crate) fn build_state_from_settings(
     let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
 
     Ok(Arc::new(AppState {
+        delivery_observation: crate::DeliveryObservation::default(),
         settings: Arc::new(settings),
         orchestrator: Arc::new(orchestrator),
         registry: Arc::new(registry),
@@ -262,12 +264,14 @@ fn warn_if_certificate_check_disabled(settings: &Settings) {
 /// `edgezero_main` after sanitization.
 fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
     let client_info = ctx
-        .request()
         .extensions()
         .get::<ClientInfo>()
         .cloned()
         .unwrap_or_else(|| ClientInfo {
-            client_ip: FastlyRequestContext::get(ctx.request()).and_then(|c| c.client_ip),
+            client_ip: ctx
+                .extensions()
+                .get::<FastlyRequestContext>()
+                .and_then(|c| c.client_ip),
             ..ClientInfo::default()
         });
 
@@ -545,7 +549,36 @@ async fn execute_named(
     handler: NamedRouteHandler,
 ) -> Result<Response, EdgeError> {
     let services = build_per_request_services(&state, &ctx);
-    let mut req = ctx.into_request();
+    if ctx.parts().method == Method::POST {
+        let limit = match handler {
+            NamedRouteHandler::VerifySignature => {
+                Some(trusted_server_core::request_signing::endpoints::VERIFY_MAX_BODY_BYTES)
+            }
+            NamedRouteHandler::RotateKey | NamedRouteHandler::DeactivateKey => {
+                Some(trusted_server_core::request_signing::endpoints::ADMIN_MAX_BODY_BYTES)
+            }
+            NamedRouteHandler::Auction => {
+                Some(trusted_server_core::auction::endpoints::MAX_AUCTION_BODY_SIZE)
+            }
+            NamedRouteHandler::FirstPartySign => {
+                Some(trusted_server_core::proxy::SIGN_MAX_BODY_BYTES)
+            }
+            NamedRouteHandler::FirstPartyProxyRebuild => {
+                Some(trusted_server_core::proxy::REBUILD_MAX_BODY_BYTES)
+            }
+            NamedRouteHandler::AdminCachePurge => {
+                Some(trusted_server_core::cache_purge::PURGE_MAX_BODY_BYTES)
+            }
+            NamedRouteHandler::BatchSync => {
+                Some(trusted_server_core::ec::batch_sync::MAX_BODY_SIZE)
+            }
+            _ => None,
+        };
+        if let Some(limit) = limit {
+            ctx.body_bytes(limit).await?;
+        }
+    }
+    let mut req = ctx.into_request()?;
 
     // S2S batch sync uses Bearer auth (not EC cookies), so it skips EC
     // context creation entirely — mirroring the dedicated early arm in the
@@ -765,7 +798,7 @@ async fn execute_fallback(
     ctx: RequestContext,
 ) -> Result<Response, EdgeError> {
     let services = build_per_request_services(&state, &ctx);
-    let req = ctx.into_request();
+    let req = ctx.into_request()?;
     Ok(dispatch_fallback(&state, &services, req).await)
 }
 
@@ -1274,11 +1307,23 @@ pub struct TrustedServerApp;
 impl TrustedServerApp {
     pub(crate) fn build_app_with_state(
         stores: &RuntimeStoreConfig,
-    ) -> (App, Option<Arc<AppState>>) {
+    ) -> Result<(App, Option<Arc<AppState>>), EdgeError> {
         let (router, state) = Self::router_with_state(stores);
-        let mut app = App::with_name(router, Self::name());
-        Self::configure(&mut app);
-        (app, state)
+        let mut app = App::with_name_and_platform(
+            router,
+            Self::name(),
+            edgezero_adapter_fastly::FASTLY_PLATFORM,
+        );
+        Self::configure(&mut app)?;
+        if app.platform() != edgezero_adapter_fastly::FASTLY_PLATFORM {
+            return Err(EdgeError::internal(fastly::Error::msg(
+                "configure replaced Fastly platform metadata",
+            )));
+        }
+        if let Some(state) = state.as_ref() {
+            app.set_response_egress_observer(state.delivery_observation.clone());
+        }
+        Ok((app, state))
     }
 
     fn router_with_state(stores: &RuntimeStoreConfig) -> (RouterService, Option<Arc<AppState>>) {
@@ -1577,6 +1622,7 @@ mod tests {
         let default_kv_store =
             Arc::new(crate::platform::UnavailableKvStore) as Arc<dyn super::PlatformKvStore>;
         let state = Arc::new(super::AppState {
+            delivery_observation: crate::DeliveryObservation::default(),
             auction_telemetry_sink: Arc::new(
                 trusted_server_core::auction::NoopAuctionTelemetrySink,
             ),
@@ -2997,7 +3043,7 @@ mod tests {
                 let registry = Arc::clone(&registry);
                 let orchestrator = Arc::clone(&orchestrator);
                 Box::pin(async move {
-                    let request = ctx.into_request();
+                    let request = ctx.into_request()?;
                     let method = request.method().clone();
                     let mut ec_context =
                         match EcContext::read_from_request(&settings, &request, &services) {

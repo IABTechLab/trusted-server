@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use edgezero_core::body::Body as EdgeBody;
+use edgezero_core::body::{Body as EdgeBody, BodyContent};
 use error_stack::{Report, ResultExt};
 use futures::StreamExt as _;
 use url::Url;
@@ -184,8 +184,8 @@ pub(crate) async fn collect_body_bounded(
     max_bytes: usize,
     integration: &'static str,
 ) -> Result<Vec<u8>, Report<TrustedServerError>> {
-    match body {
-        EdgeBody::Once(bytes) => {
+    match body.into_content() {
+        BodyContent::Once(bytes) => {
             if bytes.len() > max_bytes {
                 return Err(Report::new(TrustedServerError::RequestTooLarge {
                     message: format!(
@@ -196,7 +196,7 @@ pub(crate) async fn collect_body_bounded(
             }
             Ok(bytes.to_vec())
         }
-        EdgeBody::Stream(mut stream) => {
+        BodyContent::Stream(mut stream) => {
             let mut body_bytes = Vec::new();
             while let Some(chunk_result) = stream.next().await {
                 let chunk = chunk_result.map_err(|error| {
@@ -244,8 +244,8 @@ pub(crate) async fn collect_response_bounded(
     max_bytes: usize,
     integration: &'static str,
 ) -> Result<Vec<u8>, Report<TrustedServerError>> {
-    match body {
-        EdgeBody::Once(bytes) => {
+    match body.into_content() {
+        BodyContent::Once(bytes) => {
             if bytes.len() > max_bytes {
                 return Err(Report::new(TrustedServerError::Integration {
                     integration: integration.to_string(),
@@ -257,7 +257,7 @@ pub(crate) async fn collect_response_bounded(
             }
             Ok(bytes.to_vec())
         }
-        EdgeBody::Stream(mut stream) => {
+        BodyContent::Stream(mut stream) => {
             let mut body_bytes = Vec::new();
             while let Some(chunk_result) = stream.next().await {
                 let chunk = chunk_result.map_err(|error| {
@@ -346,4 +346,102 @@ pub(crate) fn builders() -> &'static [IntegrationBuilder] {
 #[cfg(test)]
 pub(crate) fn registered_builder_ids() -> impl Iterator<Item = &'static str> {
     builders().iter().map(|builder| builder.id)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroUsize;
+
+    use bytes::Bytes;
+
+    use super::*;
+
+    fn managed_body(streaming: bool) -> EdgeBody {
+        let body = if streaming {
+            EdgeBody::stream(futures::stream::iter([
+                Bytes::from_static(b"ab"),
+                Bytes::from_static(b"cd"),
+            ]))
+        } else {
+            EdgeBody::from("abcd")
+        };
+        body.with_buffered_json_policy(NonZeroUsize::new(1).expect("should be positive"), true)
+    }
+
+    #[test]
+    fn managed_collectors_use_explicit_limits_and_preserve_error_contexts() {
+        futures::executor::block_on(async {
+            for streaming in [false, true] {
+                assert_eq!(
+                    collect_body_bounded(managed_body(streaming), 4, "test")
+                        .await
+                        .expect("should collect request at limit"),
+                    b"abcd",
+                    "should collect managed request content with the caller's limit"
+                );
+                assert_eq!(
+                    collect_response_bounded(managed_body(streaming), 4, "test")
+                        .await
+                        .expect("should collect response at limit"),
+                    b"abcd",
+                    "should collect managed response content with the caller's limit"
+                );
+                let request_error = collect_body_bounded(managed_body(streaming), 3, "test")
+                    .await
+                    .expect_err("should reject oversized request");
+                assert!(
+                    matches!(
+                        request_error.current_context(),
+                        TrustedServerError::RequestTooLarge { .. }
+                    ),
+                    "should retain request-too-large classification"
+                );
+                let response_error = collect_response_bounded(managed_body(streaming), 3, "test")
+                    .await
+                    .expect_err("should reject oversized response");
+                assert!(
+                    matches!(
+                        response_error.current_context(),
+                        TrustedServerError::Integration { .. }
+                    ),
+                    "should retain upstream integration error classification"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn managed_collectors_report_external_stream_errors() {
+        futures::executor::block_on(async {
+            for response in [false, true] {
+                let body = EdgeBody::from_external_stream(futures::stream::iter([
+                    Ok(Bytes::from_static(b"ab")),
+                    Err(std::io::Error::other("fixture stream failure")),
+                ]))
+                .with_buffered_json_policy(NonZeroUsize::new(1).expect("should be positive"), true);
+                let result = if response {
+                    collect_response_bounded(body, 4, "test").await
+                } else {
+                    collect_body_bounded(body, 4, "test").await
+                };
+                let error = result.expect_err("should report external stream error");
+                assert!(
+                    matches!(
+                        error.current_context(),
+                        TrustedServerError::Integration { .. }
+                    ),
+                    "should retain integration error classification"
+                );
+                let expected = if response {
+                    "Failed to read response body"
+                } else {
+                    "Failed to read request body"
+                };
+                assert!(
+                    format!("{error:?}").contains(expected),
+                    "should retain request or response read context"
+                );
+            }
+        });
+    }
 }
