@@ -47,6 +47,7 @@ mod completed;
 mod execute;
 mod final_paths;
 mod fresh;
+pub(crate) mod gnu;
 mod identity;
 mod native;
 mod paths;
@@ -396,12 +397,13 @@ fn child_request(request: &RecipeRequest) -> ChildRequest {
 }
 
 /// JS handoff digests an attestation binds.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct JsFacts {
     inventory_sha256: String,
     settings_sha256: String,
     tools_sha256: String,
     modules: Vec<RetainedJsModule>,
+    contributions: Option<crate::javascript::contributions::RetainedContributions>,
 }
 
 /// Source authority of one recipe; bypass exists only in explicit test fixtures.
@@ -542,6 +544,11 @@ impl PreparedRecipe {
         check_recipe_owned_parent(&request, &tools)?;
         let tools_digest = tools.digest()?;
         let retained_digest = retained_tree_digest(&retained_root)?;
+        let contributions = match &workspace {
+            WorkspaceSelection::Approved(_) => Some(completed.retained_contributions()?),
+            #[cfg(test)]
+            WorkspaceSelection::Fixture => None,
+        };
         create_private_roots(&request)?;
         Ok(Self {
             js: JsFacts {
@@ -549,6 +556,7 @@ impl PreparedRecipe {
                 settings_sha256: completed.settings_sha256().to_owned(),
                 tools_sha256: completed.tools_sha256().to_owned(),
                 modules: completed.retained_modules()?,
+                contributions,
             },
             request,
             tools,

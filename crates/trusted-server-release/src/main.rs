@@ -76,6 +76,9 @@ enum Command {
     },
     /// Diagnostic report of pending inputs; constructs no authorization.
     AuditInputs,
+    /// Private fixed in-image GNU tool measurement; supplies no authority.
+    #[command(hide = true)]
+    GnuImageMeasurement,
     /// Network-denial socket probe used by the boundary controls.
     BoundaryProbe {
         #[command(subcommand)]
@@ -132,6 +135,14 @@ fn run(
             Ok(ExitCode::SUCCESS)
         }
         Command::AuditInputs => audit_inputs(),
+        Command::GnuImageMeasurement => {
+            let bytes = recipe::gnu::helper_measurement()?;
+            std::io::stdout().write_all(&bytes).map_err(|error| {
+                Report::new(ReleaseError::Recipe)
+                    .attach(format!("cannot write GNU measurement: {error}"))
+            })?;
+            Ok(ExitCode::SUCCESS)
+        }
         Command::BoundaryProbe {
             probe: ProbeCommand::Connect { address },
         } => boundary_probe(&address),

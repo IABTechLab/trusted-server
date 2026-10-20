@@ -1,7 +1,7 @@
 //! Flat diagnostic exports from owning build results, without release authority.
 //!
 //! This candidate format deliberately differs from the strict collector's build
-//! record. Runtime acceptance, pair claims, original JS inventory transfer and
+//! record. Runtime acceptance, pair claims and
 //! qualified workflow identity have not yet been joined to these owners.
 
 use std::collections::BTreeMap;
@@ -21,6 +21,7 @@ use crate::recipe::{RecipeCompleted, copy_artifact};
 const RECORD: &str = "candidate-build-record.json";
 const COMPOSITION: &str = "composition.json";
 const ARTIFACT: &str = "artifact";
+const INVENTORY: &str = "tsjs-inventory.json";
 const DOCUMENT_LIMIT: u64 = 16 * 1024 * 1024;
 
 /// Owned flat candidate files, with no signing or trusted dependency authority.
@@ -55,6 +56,7 @@ impl CandidateBuildExport {
         let definition = completed.recipe_definition()?;
         let denial = completed.denial_receipt()?;
         let composition = completed.composition_export()?;
+        let javascript = completed.javascript_contributions()?;
         let artifact = completed.artifact();
         let observed = completed.ambient().observed();
         let [inventory, settings, js_tools] = completed.js_digests();
@@ -69,6 +71,8 @@ impl CandidateBuildExport {
             "invocation_sha256": completed.plan_digest(),
             "artifact": {"member": ARTIFACT, "sha256": artifact.sha256(), "size": artifact.size()},
             "composition": {"member": COMPOSITION, "sha256": composition.sha256(), "summary": composition.summary()},
+            "javascript_inventory": {"member": INVENTORY, "sha256": javascript.inventory_sha256(),
+                "size": javascript.raw_inventory().len()},
             "inputs": {"cargo_lock": completed.cargo_lock_sha256(),
                 "materials": completed.materials_digest(), "rust_tools": completed.rust_tools_digest(),
                 "js_inventory": inventory, "js_settings": settings, "js_tools": js_tools},
@@ -82,7 +86,7 @@ impl CandidateBuildExport {
             },
             "elapsed_seconds": completed.elapsed().as_secs(),
             "gaps": ["runtime-acceptance-not-exported", "ambient-pair-claims-not-exported",
-                "original-js-inventory-not-exported", "composition-coverage-incomplete",
+                "composition-coverage-incomplete",
                 "bootstrap-not-authenticated", "workflow-producer-authority-not-established"],
         }))
         .map_err(collection_error)?;
@@ -110,6 +114,7 @@ impl CandidateBuildExport {
         )]);
         for (name, bytes) in [
             (COMPOSITION, composition.bytes()),
+            (INVENTORY, javascript.raw_inventory()),
             (RECORD, record.as_slice()),
         ] {
             write_new(&root.join(name), bytes)?;
@@ -198,6 +203,7 @@ mod tests {
         for (name, bytes) in [
             (ARTIFACT, b"fictional executable".as_slice()),
             (COMPOSITION, b"fictional composition".as_slice()),
+            (INVENTORY, b"fictional original inventory".as_slice()),
             (RECORD, b"fictional record".as_slice()),
         ] {
             write_new(&root.join(name), bytes).expect("should retain diagnostic member");
@@ -224,14 +230,18 @@ mod tests {
             .expect("should verify retained diagnostic files");
         assert_eq!(
             fs::read_dir(root).expect("should list export").count(),
-            3,
-            "should retain precisely the three declared flat files"
+            4,
+            "should retain artifact, original inventory, composition and diagnostic record"
+        );
+        assert!(
+            root.join("tsjs-inventory.json").is_file(),
+            "should retain original JS inventory"
         );
     }
 
     #[test]
     fn each_changed_export_member_blocks_handoff() {
-        for name in [ARTIFACT, COMPOSITION, RECORD] {
+        for name in [ARTIFACT, COMPOSITION, INVENTORY, RECORD] {
             let export = diagnostic_files();
             fs::write(export.root.join(name), b"changed").expect("should change one member");
             assert!(

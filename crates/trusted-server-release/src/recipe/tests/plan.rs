@@ -33,6 +33,44 @@ fn expected_replacement() -> Vec<String> {
 const FIXTURE_CLANG: &str = "/boundary/system/0/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang";
 
 #[test]
+fn gnu_plan_pins_native_tools_and_rejects_backend_fallback() {
+    let fixture = Fixture::new(COMMIT);
+    let prepared = fixture
+        .bind("ts-x86_64-unknown-linux-gnu", Role::Canonical)
+        .expect("should bind GNU recipe");
+    let plan = prepared
+        .plan(&fixture.paths(Role::Canonical))
+        .expect("should derive GNU plan");
+    for (name, expected) in [
+        ("CC_x86_64_unknown_linux_gnu", "/usr/bin/gcc"),
+        ("AR_x86_64_unknown_linux_gnu", "/usr/bin/ar"),
+        ("HOST_CC", "/usr/bin/gcc"),
+        ("HOST_AR", "/usr/bin/ar"),
+        ("AWS_LC_SYS_CMAKE_BUILDER", "0"),
+        ("AWS_LC_SYS_CMAKE_BUILDER_x86_64_unknown_linux_gnu", "0"),
+    ] {
+        assert_eq!(
+            plan.environment.get(name).map(String::as_str),
+            Some(expected),
+            "should enforce {name}"
+        );
+    }
+    assert!(
+        plan.arguments
+            .iter()
+            .any(|argument| argument
+                == "target.\"x86_64-unknown-linux-gnu\".linker=\"/usr/bin/gcc\""),
+        "should select the reviewed linker driver"
+    );
+    plan.confined_command(crate::process::ProcessLimits {
+        wall: std::time::Duration::from_secs(1),
+        stdout_max: 1024,
+        stderr_max: 1024,
+    })
+    .expect("should accept reviewed backend controls");
+}
+
+#[test]
 fn pure_completion_fixture_cannot_export_a_source_owned_recipe_definition() {
     let bytes = wasm_with(&[(".debug_info", b"i"), (".debug_line", b"l")]);
     let mut build = built("trusted-server-fastly.wasm", Role::Canonical, &bytes);
@@ -153,6 +191,12 @@ fn expected_remap(target: ReleaseTarget) -> Vec<String> {
     if target.is_darwin() {
         arguments.push("--config".to_owned());
         arguments.push(format!("target.\"{triple}\".linker=\"{FIXTURE_CLANG}\""));
+    }
+    if target == ReleaseTarget::X86_64UnknownLinuxGnu {
+        arguments.extend([
+            "--config".to_owned(),
+            "target.\"x86_64-unknown-linux-gnu\".linker=\"/usr/bin/gcc\"".to_owned(),
+        ]);
     }
     arguments
 }
@@ -279,6 +323,18 @@ fn assert_environment(actual: &BTreeMap<String, String>, fixture: &Fixture, targ
         "0".to_owned(),
     );
     let underscored = target.triple().replace('-', "_");
+    if target == ReleaseTarget::X86_64UnknownLinuxGnu {
+        for (name, value) in [
+            ("CC_x86_64_unknown_linux_gnu", "/usr/bin/gcc"),
+            ("AR_x86_64_unknown_linux_gnu", "/usr/bin/ar"),
+            ("HOST_CC", "/usr/bin/gcc"),
+            ("HOST_AR", "/usr/bin/ar"),
+            ("AWS_LC_SYS_CMAKE_BUILDER", "0"),
+            ("AWS_LC_SYS_CMAKE_BUILDER_x86_64_unknown_linux_gnu", "0"),
+        ] {
+            expected.insert(name.to_owned(), value.to_owned());
+        }
+    }
     if target.is_darwin() {
         let bin = "/boundary/system/0/Toolchains/XcodeDefault.xctoolchain/usr/bin";
         for (name, value) in [
@@ -475,15 +531,15 @@ fn cargo_plan_rejects_inherited_rustflags_and_selectors() {
         .collect();
     assert_eq!(
         configs.len(),
-        expected_replacement().len() / 2 + 1,
-        "should carry only the exact source-replacement configs and the path remap"
+        expected_replacement().len() / 2 + 2,
+        "should carry the exact source replacements, path remap and reviewed GNU linker"
     );
     assert_eq!(
         configs.last().map(|config| config.as_str()),
         expected_remap(ReleaseTarget::X86_64UnknownLinuxGnu)
             .last()
             .map(String::as_str),
-        "should remap paths only through target rustflags of the asset triple"
+        "should select the reviewed GNU linker after target path remapping"
     );
     for argument in &plan.arguments {
         assert!(

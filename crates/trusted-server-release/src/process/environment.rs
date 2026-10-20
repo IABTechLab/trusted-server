@@ -125,6 +125,8 @@ pub(super) fn is_credential(name: &OsStr) -> bool {
             });
     registry_token
         || (!build_switch
+            && upper != "AWS_LC_SYS_CMAKE_BUILDER"
+            && upper != "AWS_LC_SYS_CMAKE_BUILDER_X86_64_UNKNOWN_LINUX_GNU"
             && CREDENTIAL_PREFIXES
                 .iter()
                 .any(|prefix| upper.starts_with(prefix)))
@@ -195,6 +197,15 @@ impl BoundedCommand {
             return Err(invalid(format!(
                 "environment variable {name:?} injects code or configuration"
             )));
+        }
+        if matches!(
+            upper_name(name).as_str(),
+            "AWS_LC_SYS_CMAKE_BUILDER" | "AWS_LC_SYS_CMAKE_BUILDER_X86_64_UNKNOWN_LINUX_GNU"
+        ) && value != OsStr::new("0")
+        {
+            return Err(invalid(
+                "only the reviewed AWS-LC cc backend switch is permitted",
+            ));
         }
         if self.environment.contains_key(name) {
             return Err(invalid(format!(

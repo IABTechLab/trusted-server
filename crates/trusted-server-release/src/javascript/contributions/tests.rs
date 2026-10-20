@@ -3,7 +3,7 @@ use sha2::{Digest as _, Sha256};
 
 use super::super::JsBuildCompleted;
 
-fn fixture() -> JsBuildCompleted {
+pub(super) fn fixture() -> JsBuildCompleted {
     let mut completed = JsBuildCompleted::fixture_for_tests(&"a".repeat(40));
     let module = &completed.modules["core"];
     let inventory = json!({
@@ -81,7 +81,7 @@ fn checked_export_rejects_unknown_origin_source_mismatch_and_path_aliases() {
     }
 }
 
-fn rich_inventory(completed: &JsBuildCompleted) -> Value {
+pub(super) fn rich_inventory(completed: &JsBuildCompleted) -> Value {
     let bytes = std::fs::read(completed.directory.path().join("tsjs-inventory.json"))
         .expect("should read fixture");
     let mut inventory: Value = serde_json::from_slice(&bytes).expect("should parse fixture");
@@ -183,4 +183,19 @@ fn duplicate_contribution_and_material_ownership_fail_closed() {
             "should reject duplicate ownership"
         );
     }
+}
+
+#[test]
+fn checked_export_retains_exact_original_raw_bytes() {
+    let completed = fixture();
+    let expected = std::fs::read(completed.directory.path().join("tsjs-inventory.json"))
+        .expect("should read original bytes");
+    let exported = completed
+        .retained_contributions()
+        .expect("should export originals");
+    assert_eq!(
+        exported.raw_inventory(),
+        expected,
+        "should preserve exact raw bytes"
+    );
 }

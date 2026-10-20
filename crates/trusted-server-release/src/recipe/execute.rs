@@ -49,6 +49,7 @@ fn build_limits() -> ProcessLimits {
 
 /// What a successful confined run produced, as the run path reports it.
 pub(super) struct RunOutput {
+    pub(super) gnu: Option<super::gnu::GnuEvidence>,
     pub(super) stdout: Vec<u8>,
     pub(super) stderr_sha256: String,
     pub(super) started_at_seconds: u64,
@@ -230,6 +231,16 @@ impl PreparedRecipe {
         }
         self.check_inputs()?;
         self.check_no_fetched_sources()?;
+        let gnu = if self.request.asset.artifact().target == ReleaseTarget::X86_64UnknownLinuxGnu {
+            Some(super::gnu::GnuEvidence::measure(
+                &self.tools,
+                &self.plan(boundary)?,
+                boundary,
+                proof,
+            )?)
+        } else {
+            None
+        };
         let denial = proof.receipt_for(&boundary.execution_fingerprint())?;
         let run: Result<_, Report<ReleaseError>> = (|| {
             let query = |kind| {
@@ -261,7 +272,19 @@ impl PreparedRecipe {
         })();
         let after = self
             .check_inputs()
-            .and_then(|()| self.check_no_fetched_sources());
+            .and_then(|()| self.check_no_fetched_sources())
+            .and_then(|()| {
+                if let Some(before) = &gnu {
+                    let after = super::gnu::GnuEvidence::measure(
+                        &self.tools,
+                        &self.plan(boundary)?,
+                        boundary,
+                        proof,
+                    )?;
+                    before.verify_after(&after)?;
+                }
+                Ok(())
+            });
         let (queries, result, started_at_seconds) = match (run, after) {
             (Ok(result), Ok(())) => result,
             (Ok(_), Err(changed)) => return Err(changed),
@@ -278,6 +301,7 @@ impl PreparedRecipe {
                 .attach("confined Cargo build did not succeed")
         })?;
         let output = RunOutput {
+            gnu,
             stdout,
             stderr_sha256,
             started_at_seconds,
@@ -378,67 +402,77 @@ impl PreparedRecipe {
         let requirements = inspect_copied(artifact.target, &raw.bytes, self.tools.apple())?;
         self.check_final_paths(&raw.bytes, paths)?;
 
-        let cargo_observations =
-            if let Some((captured, selected_package_id)) = cargo_observations.take() {
-                Some(match &self.workspace {
-                    WorkspaceSelection::Approved(workspace) => {
-                        let origins = join_origins(
-                            captured.observations(),
-                            &workspace.origins,
-                            &self.materials,
-                            paths,
-                        )?;
-                        let plan = self.plan(paths)?;
-                        let native = native::collect(
-                            captured.observations(),
-                            &NativeInputs {
-                                origins: origins.native_sources(),
-                                execution_output_root: &paths
-                                    .execution_path(&self.request.target_dir)?,
-                                host_output_root: &self.request.target_dir,
-                                target: artifact.target,
-                                environment: &plan.environment,
-                                check: &|| Ok(()),
+        let cargo_observations = if let Some((captured, selected_package_id)) =
+            cargo_observations.take()
+        {
+            Some(match &self.workspace {
+                WorkspaceSelection::Approved(workspace) => {
+                    let origins = join_origins(
+                        captured.observations(),
+                        &workspace.origins,
+                        &self.materials,
+                        paths,
+                    )?;
+                    let plan = self.plan(paths)?;
+                    let native = native::collect(
+                        captured.observations(),
+                        &NativeInputs {
+                            origins: origins.native_sources(),
+                            execution_output_root: &paths
+                                .execution_path(&self.request.target_dir)?,
+                            host_output_root: &self.request.target_dir,
+                            target: artifact.target,
+                            environment: &plan.environment,
+                            check: &|| Ok(()),
+                        },
+                    )?;
+                    let javascript = collect_js(
+                        &raw.bytes,
+                        copied.sha256(),
+                        &JsInputs {
+                            retained_root: &self.retained_root,
+                            modules: &self.js.modules,
+                            inventory_sha256: &self.js.inventory_sha256,
+                            policy: if artifact.target == ReleaseTarget::Wasm32Wasip1 {
+                                JsRetentionPolicy::FastlyAll
+                            } else {
+                                JsRetentionPolicy::ObserveCli
                             },
-                        )?;
-                        let javascript = collect_js(
-                            &raw.bytes,
-                            copied.sha256(),
-                            &JsInputs {
-                                retained_root: &self.retained_root,
-                                modules: &self.js.modules,
-                                inventory_sha256: &self.js.inventory_sha256,
-                                policy: if artifact.target == ReleaseTarget::Wasm32Wasip1 {
-                                    JsRetentionPolicy::FastlyAll
-                                } else {
-                                    JsRetentionPolicy::ObserveCli
-                                },
-                            },
-                        )?;
-                        self.check_source()?;
-                        let platform = PlatformEvidence::collect(
-                            &self.tools,
-                            &self.tools_digest,
-                            requirements,
-                            artifact.target,
-                            copied.sha256(),
-                        )?;
-                        let captured = captured.with_evidence(
-                            &selected_package_id,
-                            origins,
-                            native,
-                            javascript,
-                            platform,
-                        )?;
-                        self.check_source()?;
-                        captured
-                    }
-                    #[cfg(test)]
-                    WorkspaceSelection::Fixture => captured,
-                })
-            } else {
-                None
-            };
+                        },
+                    )?;
+                    self.check_source()?;
+                    let platform = PlatformEvidence::collect(
+                        &self.tools,
+                        &self.tools_digest,
+                        requirements,
+                        artifact.target,
+                        copied.sha256(),
+                    )?;
+                    let platform = if artifact.target == ReleaseTarget::X86_64UnknownLinuxGnu {
+                        let gnu = run.gnu.ok_or_else(|| {
+                            recipe_error("GNU completion lacks enforced in-image tool measurements")
+                        })?;
+                        gnu.verify_binding(&boundary_fingerprint, plan_digest.sha256())?;
+                        platform.with_gnu(gnu)?
+                    } else {
+                        platform
+                    };
+                    let captured = captured.with_evidence(
+                        &selected_package_id,
+                        origins,
+                        native,
+                        javascript,
+                        platform,
+                    )?;
+                    self.check_source()?;
+                    captured
+                }
+                #[cfg(test)]
+                WorkspaceSelection::Fixture => captured,
+            })
+        } else {
+            None
+        };
 
         if self.tools.authority() == Authority::Qualified
             && !self.materials.derived_manifest_digests().is_empty()
@@ -460,6 +494,7 @@ impl PreparedRecipe {
             js_inventory_sha256: self.js.inventory_sha256.clone(),
             js_settings_sha256: self.js.settings_sha256.clone(),
             js_tools_sha256: self.js.tools_sha256.clone(),
+            js_contributions: self.js.contributions,
             rust_tools_digest: self.tools_digest.clone(),
             boundary_fingerprint,
             denial_receipt,

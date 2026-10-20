@@ -579,3 +579,22 @@ fn verified_cargo_originals_render_without_inventing_download_locations() {
         "should preserve original Git facts"
     );
 }
+
+#[test]
+fn javascript_preminification_contributors_do_not_claim_complete_module_retention() {
+    let mut inputs = fixture();
+    inputs.components[0].roles = vec![ComponentRole::ConservativeJavascript];
+    let output = render(&inputs).expect("should render conservative input");
+    let value: Value = serde_json::from_slice(output.bytes()).expect("should parse SPDX");
+    assert!(
+        value["relationships"]
+            .as_array()
+            .expect("should contain relationships")
+            .iter()
+            .any(|edge| edge["relationshipType"] == "GENERATED_FROM"
+                && edge["comment"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("minification"))),
+        "should preserve pre-minification limitation"
+    );
+}

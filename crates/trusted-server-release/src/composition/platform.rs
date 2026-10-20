@@ -25,11 +25,36 @@ pub(crate) struct PlatformEvidence {
 #[derive(Debug, Serialize)]
 #[serde(tag = "scope", rename_all = "snake_case")]
 enum NativeToolCoverage {
-    HostPathUnresolved { roles: [&'static str; 5] },
-    ExplicitAppleFiles { full_closure_measured: bool },
+    HostPathUnresolved {
+        roles: [&'static str; 5],
+    },
+    ExplicitAppleFiles {
+        full_closure_measured: bool,
+    },
+    ExplicitGnuImage {
+        evidence: crate::recipe::gnu::GnuEvidence,
+    },
 }
 
 impl PlatformEvidence {
+    /// Attaches the owning GNU execution's measured installed-image evidence.
+    ///
+    /// # Errors
+    ///
+    /// Rejects attachment to another target; measurement constructors remain
+    /// private to the actual denied recipe execution.
+    pub(crate) fn with_gnu(
+        mut self,
+        evidence: crate::recipe::gnu::GnuEvidence,
+    ) -> Result<Self, Report<ReleaseError>> {
+        if self.target != ReleaseTarget::X86_64UnknownLinuxGnu.triple() {
+            return Err(composition_error(
+                "GNU image evidence belongs to another target",
+            ));
+        }
+        self.native_tools = NativeToolCoverage::ExplicitGnuImage { evidence };
+        Ok(self)
+    }
     /// Binds measured selected tools to requirements from the accepted artifact.
     ///
     /// # Errors

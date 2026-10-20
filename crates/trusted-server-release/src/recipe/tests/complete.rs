@@ -64,9 +64,109 @@ fn pure_completion_fixtures_cannot_export_candidate_transfers() {
         "should refuse a typed owner view without actual retained composition receipts"
     );
     assert!(
+        completed.javascript_contributions().is_err(),
+        "should refuse original JS evidence absent from the owning completion"
+    );
+    assert!(
         crate::collection::producer::CandidateBuildExport::from_completed(&completed).is_err(),
         "should not manufacture a measured candidate transfer from a pure fixture"
     );
+}
+
+// Inject only a checked JS snapshot into an explicitly unmeasured completion
+// fixture. This cannot create composition, socket or workflow authority.
+fn completed_with_js_snapshot() -> (Built, RecipeCompleted, Vec<u8>) {
+    let javascript = JsBuildCompleted::fixture_for_projection(COMMIT);
+    let snapshot = javascript
+        .retained_contributions()
+        .expect("should validate original JS inventory before retaining it");
+    let raw = snapshot.raw_inventory().to_vec();
+    let bytes = wasm_with(&[(".debug_info", b"i"), (".debug_line", b"l")]);
+    let mut build = built("trusted-server-fastly.wasm", Role::Canonical, &bytes);
+    let prepared = build
+        .prepared
+        .as_mut()
+        .expect("should hold prepared fixture");
+    prepared.js.inventory_sha256 = snapshot.inventory_sha256().to_owned();
+    prepared.js.contributions = Some(snapshot);
+    drop(javascript);
+    let stdout = build.stdout(|_| {});
+    let completed = build
+        .finish(stdout)
+        .expect("should retain checked JS snapshot");
+    (build, completed, raw)
+}
+
+#[test]
+fn completion_retains_exact_js_inventory_after_original_owner_disappears() {
+    let (_build, completed, raw) = completed_with_js_snapshot();
+    let snapshot = completed
+        .javascript_contributions()
+        .expect("should retain checked evidence without its preparation owner or lease");
+    assert_eq!(
+        snapshot.raw_inventory(),
+        raw,
+        "should retain original bytes"
+    );
+    assert_eq!(
+        fs::read(completed.retained_inventory_path()).expect("should retain original file"),
+        raw,
+        "should copy original inventory rather than serialize normalized facts"
+    );
+    assert!(
+        completed.denial_receipt().is_err(),
+        "should grant no measured socket authority to a checked JS snapshot"
+    );
+}
+
+#[test]
+fn completion_rejects_changed_retained_js_inventory() {
+    let (_build, completed, _) = completed_with_js_snapshot();
+    fs::write(completed.retained_inventory_path(), b"changed original")
+        .expect("should change retained bytes");
+    assert!(
+        completed.javascript_contributions().is_err(),
+        "should reject a changed original even with unchanged normalized facts"
+    );
+}
+
+#[test]
+fn completion_rejects_aliases_of_unchanged_retained_js_inventory() {
+    for hard_link in [false, true] {
+        let (_build, completed, raw) = completed_with_js_snapshot();
+        let outside = tempfile::tempdir().expect("should create separate inventory storage");
+        let replacement = outside.path().join("inventory.json");
+        fs::write(&replacement, raw).expect("should copy identical original inventory");
+        let retained = completed.retained_inventory_path();
+        fs::remove_file(&retained).expect("should replace retained inventory");
+        if hard_link {
+            fs::hard_link(&replacement, &retained).expect("should install matching hardlink");
+        } else {
+            symlink(&replacement, &retained).expect("should install matching alias");
+        }
+        assert!(
+            completed.javascript_contributions().is_err(),
+            "should reject aliases even when original JS inventory bytes match"
+        );
+    }
+}
+
+#[test]
+fn completion_rejects_another_js_snapshot_source_or_digest() {
+    for change in [
+        (|facts: &mut super::super::completed::SuccessFacts| {
+            facts.commit = crate::source::CommitId::parse(&"b".repeat(40))
+                .expect("should parse fictional commit")
+        }) as fn(&mut super::super::completed::SuccessFacts),
+        |facts| facts.js_inventory_sha256 = "c".repeat(64),
+    ] {
+        let (_build, mut completed, _) = completed_with_js_snapshot();
+        change(completed.facts_mut_for_tests());
+        assert!(
+            completed.javascript_contributions().is_err(),
+            "should reject snapshot binding to another completed build"
+        );
+    }
 }
 
 pub(super) fn wasm_with(customs: &[(&str, &[u8])]) -> Vec<u8> {
@@ -207,6 +307,7 @@ impl Built {
 
     fn run(&self, stdout: Vec<u8>) -> RunOutput {
         RunOutput {
+            gnu: None,
             stdout,
             stderr_sha256: hex::encode(Sha256::digest(b"fictional diagnostics")),
             started_at_seconds: 1_700_000_000,

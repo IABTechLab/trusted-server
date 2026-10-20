@@ -19,6 +19,7 @@ use crate::policy::ReleaseTarget;
 use crate::recipe::RecipeCompleted;
 
 pub(crate) mod cargo;
+pub(crate) mod javascript;
 
 /// Validated bounded SPDX bytes, without a release-authorization capability.
 #[derive(Debug)]
@@ -90,6 +91,7 @@ struct Component {
 enum ComponentRole {
     ObservedRust,
     RetainedJavascript,
+    ConservativeJavascript,
     ObservedNative,
     BuildMaterial,
     BuildTool,
@@ -97,6 +99,11 @@ enum ComponentRole {
 }
 
 enum Origin {
+    JavascriptVerified {
+        source_commit: String,
+        original: javascript::JavascriptOriginal,
+        producer: Option<String>,
+    },
     CargoMaterial {
         source: String,
         original: CargoOrigin,
@@ -231,10 +238,12 @@ fn license(declaration: Option<&str>) -> Result<(&'static str, String), Report<R
     ))
 }
 
+type OriginFields = (String, String, Option<(&'static str, String)>);
+
 fn origin_fields(
     component: &Component,
     inputs: &SpdxInputs<'_>,
-) -> Result<(String, String, Option<String>), Report<ReleaseError>> {
+) -> Result<OriginFields, Report<ReleaseError>> {
     let origin = component
         .origin
         .as_ref()
@@ -249,6 +258,17 @@ fn origin_fields(
     }
     let unknown_location = "NOASSERTION".to_owned();
     match origin {
+        Origin::JavascriptVerified {
+            source_commit,
+            original,
+            producer,
+        } => javascript::origin_fields(
+            component,
+            inputs,
+            source_commit,
+            original,
+            producer.as_deref(),
+        ),
         Origin::CargoMaterial {
             source,
             original,
@@ -261,7 +281,9 @@ fn origin_fields(
             let facts = serde_json::to_string(&json!({"locked_source":source,"original":original,"prepared_manifest_sha256":prepared_manifest_sha256})).map_err(spdx_error)?;
             plain(&facts)?;
             let checksum = match original {
-                CargoOrigin::Registry { archive_sha256 } => Some(archive_sha256.clone()),
+                CargoOrigin::Registry { archive_sha256 } => {
+                    Some(("SHA256", archive_sha256.clone()))
+                }
                 CargoOrigin::Git { .. } => None,
             };
             let source_info = format!(
@@ -291,7 +313,7 @@ fn origin_fields(
                     "distribution has no bounded origin and raw archive digest",
                 ));
             }
-            Ok((location.clone(),"Checksum identifies the original distribution archive, not the final executable or individual surviving functions.".to_owned(),Some(sha256.clone())))
+            Ok((location.clone(),"Checksum identifies the original distribution archive, not the final executable or individual surviving functions.".to_owned(),Some(("SHA256", sha256.clone()))))
         }
         Origin::StructuredTree { sha256 } => {
             if !lower_hex(sha256, 64)
@@ -331,7 +353,7 @@ fn origin_fields(
                 format!(
                     "Observed generated module bytes before later transformations; producer identity {producer}."
                 ),
-                Some(sha256.clone()),
+                Some(("SHA256", sha256.clone())),
             ))
         }
         Origin::RuntimeObservation { artifact_sha256 } => {
@@ -357,8 +379,8 @@ fn component_package(
         plain(version)?;
         value["versionInfo"] = json!(version);
     }
-    if let Some(sha256) = checksum {
-        value["checksums"] = json!([{"algorithm":"SHA256","checksumValue":sha256}]);
+    if let Some((algorithm, digest)) = checksum {
+        value["checksums"] = json!([{"algorithm":algorithm,"checksumValue":digest}]);
     }
     Ok(value)
 }
@@ -425,6 +447,12 @@ fn render(inputs: &SpdxInputs<'_>) -> Result<GeneratedSpdx, Report<ReleaseError>
                     id.clone(),
                     "Complete module bytes observed in final executable; function reachability is not asserted.",
                 ),
+                ComponentRole::ConservativeJavascript => (
+                    ROOT_ID.to_owned(),
+                    "GENERATED_FROM",
+                    id.clone(),
+                    "Conservative post-Rollup rendered input before esbuild minification; final function reachability is not asserted.",
+                ),
                 ComponentRole::BuildMaterial => (
                     id.clone(),
                     "BUILD_DEPENDENCY_OF",
@@ -446,7 +474,14 @@ fn render(inputs: &SpdxInputs<'_>) -> Result<GeneratedSpdx, Report<ReleaseError>
             };
             relationships.insert((from, kind, to, comment));
         }
-        if let Some(Origin::Generated { producer, .. }) = &component.origin {
+        if let Some(
+            Origin::Generated { producer, .. }
+            | Origin::JavascriptVerified {
+                producer: Some(producer),
+                ..
+            },
+        ) = &component.origin
+        {
             relationships.insert((
                 component_id(producer),
                 "GENERATES",

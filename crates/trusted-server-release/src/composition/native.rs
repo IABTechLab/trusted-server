@@ -214,6 +214,13 @@ fn check_environment(name: &str, inputs: &NativeInputs<'_>) -> Result<(), Report
         if inputs.environment.iter().any(|(key, value)| {
             key.starts_with("AWS_LC_SYS_")
                 && !(key.starts_with("AWS_LC_SYS_USE_SYSTEM") && value == "0")
+                && !(inputs.target == ReleaseTarget::X86_64UnknownLinuxGnu
+                    && matches!(
+                        key.as_str(),
+                        "AWS_LC_SYS_CMAKE_BUILDER"
+                            | "AWS_LC_SYS_CMAKE_BUILDER_x86_64_unknown_linux_gnu"
+                    )
+                    && value == "0")
         }) {
             return Err(composition_error(
                 "AWS-LC has an unreviewed environment selection",

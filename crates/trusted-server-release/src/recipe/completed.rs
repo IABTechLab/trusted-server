@@ -23,10 +23,13 @@ use crate::boundary::{DenialReceipt, DescendantCleanup};
 use crate::composition::{CargoCapture, CompositionView, RetainedCompositionExport};
 use crate::documents::hash_bounded_with_check;
 use crate::error::ReleaseError;
+use crate::javascript::contributions::RetainedContributions;
 use crate::source::CommitId;
 
 /// File name of the retained Cargo message stream.
 const STDOUT_FILE: &str = "cargo-stdout.jsonl";
+/// Original JS observer bytes, retained independently of the preparation lease.
+const JS_INVENTORY_FILE: &str = "tsjs-inventory.json";
 
 /// Facts about one successful run, supplied by the recipe's run path.
 pub(super) struct SuccessFacts {
@@ -38,6 +41,7 @@ pub(super) struct SuccessFacts {
     pub(super) js_inventory_sha256: String,
     pub(super) js_settings_sha256: String,
     pub(super) js_tools_sha256: String,
+    pub(super) js_contributions: Option<RetainedContributions>,
     pub(super) rust_tools_digest: String,
     pub(super) boundary_fingerprint: [u8; 32],
     pub(super) denial_receipt: Option<DenialReceipt>,
@@ -136,6 +140,20 @@ impl RecipeCompleted {
         if let Some(captured) = &facts.cargo_observations {
             captured.retain(retained.path())?;
             captured.rehash(retained.path())?;
+        }
+        if let Some(javascript) = &facts.js_contributions {
+            check_javascript_binding(&facts, javascript)?;
+            let mut inventory = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(retained.path().join(JS_INVENTORY_FILE))
+                .map_err(|error| recipe_error(format!("cannot retain JS inventory: {error}")))?;
+            inventory
+                .write_all(javascript.raw_inventory())
+                .and_then(|()| inventory.sync_all())
+                .map_err(|error| recipe_error(format!("cannot retain JS inventory: {error}")))?;
         }
         Ok(Self {
             facts,
@@ -283,6 +301,24 @@ impl RecipeCompleted {
             .view(self.retained.path())
     }
 
+    /// Borrows checked original JS evidence retained when the recipe was bound.
+    ///
+    /// This snapshot survives cleanup and expiry of its original preparation
+    /// attempt. It grants no new execution or composition-coverage authority.
+    ///
+    /// # Errors
+    ///
+    /// Rejects missing evidence, changed retained bytes or another source/digest.
+    pub(crate) fn javascript_contributions(
+        &self,
+    ) -> Result<&RetainedContributions, Report<ReleaseError>> {
+        self.rehash_for_handoff()?;
+        self.facts
+            .js_contributions
+            .as_ref()
+            .ok_or_else(|| recipe_error("completed build has no retained original JS inventory"))
+    }
+
     /// The copied artifact.
     pub(crate) fn artifact(&self) -> &CopiedArtifact {
         &self.facts.artifact
@@ -330,12 +366,46 @@ impl RecipeCompleted {
         if let Some(captured) = &self.facts.cargo_observations {
             captured.rehash(self.retained.path())?;
         }
+        if let Some(javascript) = &self.facts.js_contributions {
+            check_javascript_binding(&self.facts, javascript)?;
+            let measured = hash_bounded_with_check(
+                &self.retained.path().join(JS_INVENTORY_FILE),
+                javascript.raw_inventory().len() as u64,
+                &|| Ok(()),
+            )
+            .map_err(|error| error.change_context(ReleaseError::Recipe))?;
+            if measured.size != javascript.raw_inventory().len() as u64
+                || measured.sha256 != javascript.inventory_sha256()
+            {
+                return Err(recipe_error("retained original JS inventory changed"));
+            }
+        }
         Ok(&self.facts.output_dir)
     }
 }
 
+fn check_javascript_binding(
+    facts: &SuccessFacts,
+    javascript: &RetainedContributions,
+) -> Result<(), Report<ReleaseError>> {
+    if javascript.source_commit() != facts.commit.as_str()
+        || javascript.inventory_sha256() != facts.js_inventory_sha256
+        || hex::encode(Sha256::digest(javascript.raw_inventory())) != facts.js_inventory_sha256
+    {
+        return Err(recipe_error(
+            "retained JS inventory source or digest differs",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 impl RecipeCompleted {
+    /// Path of original retained JS observer bytes, for tamper tests.
+    pub(crate) fn retained_inventory_path(&self) -> PathBuf {
+        self.retained.path().join(JS_INVENTORY_FILE)
+    }
+
     /// Path of the retained Cargo message stream, for tamper tests.
     pub(crate) fn retained_stdout_path(&self) -> PathBuf {
         self.retained.path().join(STDOUT_FILE)

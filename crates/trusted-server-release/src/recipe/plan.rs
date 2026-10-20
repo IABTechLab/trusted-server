@@ -295,6 +295,9 @@ pub(super) fn plan_for(inputs: &PlanInputs<'_>) -> Result<CargoPlan, Report<Rele
         .as_ref()
         .map_or(&[][..], |darwin| darwin.rustflags.as_slice());
     configs.extend(remap_arguments_with(target.triple(), &sources, link_flags)?);
+    if target == crate::policy::ReleaseTarget::X86_64UnknownLinuxGnu {
+        configs.extend(super::gnu::linker_arguments());
+    }
     let developer = darwin.as_ref().map(|darwin| darwin.developer.as_str());
     let c_prefix_map = c_prefix_map_environment_with(target, &sources, developer)?;
     if let Some((name, mut value)) = c_prefix_map {
@@ -320,6 +323,9 @@ pub(super) fn plan_for(inputs: &PlanInputs<'_>) -> Result<CargoPlan, Report<Rele
             value.push_str(&format!(" -isysroot {sdk} -ffile-prefix-map={sdk}={REMAPPED_SDK} -fdebug-prefix-map={sdk}={REMAPPED_SDK}"));
         }
         environment.insert(name, value);
+    }
+    if target == crate::policy::ReleaseTarget::X86_64UnknownLinuxGnu {
+        environment.extend(super::gnu::environment());
     }
     let apple_identity_sha256 = match darwin {
         Some(darwin) => {

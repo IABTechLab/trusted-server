@@ -82,6 +82,17 @@ pub(super) fn check_export_after_cleanup<T>(build: T, completed: fn(&T) -> &Reci
         view.observations().units().len(),
         "should retain the original per-unit feature and context evidence"
     );
+    let javascript = completed
+        .javascript_contributions()
+        .expect("should retain checked original JS evidence without its preparation lease");
+    let inventory = javascript.raw_inventory().to_vec();
+    let javascript_projection =
+        crate::spdx::javascript::JavascriptProjection::from_completed(completed)
+            .expect("should project original JS evidence joined to final-byte membership");
+    assert!(
+        javascript_projection.component_count() > 0,
+        "should project actual checked JS material even when CLI discards complete bundles"
+    );
     let export = crate::collection::producer::CandidateBuildExport::from_completed(completed)
         .expect("should export actual candidate receipts before closing their owners");
     drop(build);
@@ -89,9 +100,15 @@ pub(super) fn check_export_after_cleanup<T>(build: T, completed: fn(&T) -> &Reci
         !artifact.exists(),
         "should remove the original artifact with its owning build storage"
     );
-    export
+    let root = export
         .rehash_for_handoff()
         .expect("should retain exact exported bytes after all original build storage is removed");
+    assert_eq!(
+        std::fs::read(root.join("tsjs-inventory.json"))
+            .expect("should retain original JS inventory"),
+        inventory,
+        "should preserve original observer bytes after source, target and JS owners disappear"
+    );
 }
 
 /// Every field `fixture.json` must hold, and nothing else.

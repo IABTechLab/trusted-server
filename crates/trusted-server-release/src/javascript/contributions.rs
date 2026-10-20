@@ -4,6 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use error_stack::Report;
 use serde_json::Value;
+#[cfg(test)]
+use sha2::Digest as _;
 
 use super::{JsBuildCompleted, inventory_modules};
 use crate::documents::{Role, parse_json, read_bounded_with_check};
@@ -17,6 +19,8 @@ type Result<T> = core::result::Result<T, Report<ReleaseError>>;
 /// These observations grant no execution, qualification or complete-coverage authority.
 #[derive(Debug, serde::Serialize)]
 pub(crate) struct RetainedContributions {
+    #[serde(skip)]
+    raw_inventory: Vec<u8>,
     inventory_sha256: String,
     inventory: Inventory,
 }
@@ -50,7 +54,7 @@ pub(crate) struct Contribution {
 }
 
 /// Checked original-source identity or a reviewed generated producer observation.
-#[derive(Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub(crate) enum Origin {
     Source {
@@ -78,7 +82,7 @@ pub(crate) enum Origin {
 }
 
 /// Retained material observations, with structured trees distinct from raw files.
-#[derive(Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub(crate) enum Material {
     Source {
@@ -127,6 +131,14 @@ pub(crate) struct Tool {
 }
 
 impl RetainedContributions {
+    /// Returns the exact original collector inventory bytes.
+    pub(crate) fn raw_inventory(&self) -> &[u8] {
+        &self.raw_inventory
+    }
+    /// Returns the approved collector source identity.
+    pub(crate) fn source_commit(&self) -> &str {
+        &self.inventory.source_commit
+    }
     /// Returns the raw original inventory digest, not a reserialization digest.
     pub(crate) fn inventory_sha256(&self) -> &str {
         &self.inventory_sha256
@@ -146,6 +158,14 @@ impl RetainedContributions {
 }
 
 impl ModuleContributions {
+    /// Returns the checked complete bundle filename.
+    pub(crate) fn filename(&self) -> &str {
+        &self.filename
+    }
+    /// Returns complete final bundle length.
+    pub(crate) fn size(&self) -> u64 {
+        self.size
+    }
     /// Returns the discovered module identity.
     pub(crate) fn id(&self) -> &str {
         &self.id
@@ -161,6 +181,10 @@ impl ModuleContributions {
 }
 
 impl Contribution {
+    /// Returns the observed contribution stage before later minification.
+    pub(crate) fn stage(&self) -> &str {
+        &self.stage
+    }
     /// Returns checked ownership without implying final-function reachability.
     pub(crate) fn origin(&self) -> &Origin {
         &self.origin
@@ -312,6 +336,7 @@ pub(super) fn export(completed: &JsBuildCompleted) -> Result<RetainedContributio
     }
     completed.rehash_for_handoff()?;
     Ok(RetainedContributions {
+        raw_inventory: raw.bytes,
         inventory_sha256: raw.sha256,
         inventory: Inventory {
             schema_version: 1,
@@ -724,3 +749,22 @@ fn array(value: &Value) -> Result<&Vec<Value>> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+impl JsBuildCompleted {
+    /// Creates a rehashed fictional owner with checked collector variants.
+    pub(crate) fn fixture_for_projection(commit: &str) -> Self {
+        let mut completed = tests::fixture();
+        completed.source_commit = commit.to_owned();
+        let mut inventory = tests::rich_inventory(&completed);
+        inventory["source_commit"] = serde_json::json!(commit);
+        let bytes = serde_json::to_vec(&inventory).expect("should encode fictional inventory");
+        std::fs::write(
+            completed.directory.path().join("tsjs-inventory.json"),
+            &bytes,
+        )
+        .expect("should write fictional original inventory");
+        completed.inventory_sha256 = hex::encode(sha2::Sha256::digest(&bytes));
+        completed
+    }
+}

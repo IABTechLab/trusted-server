@@ -150,3 +150,20 @@ pub(crate) fn collect_js(
 
 #[cfg(test)]
 mod tests;
+
+impl JsMembership {
+    /// Returns the exact inspected executable identity.
+    pub(crate) fn artifact_sha256(&self) -> &str {
+        &self.artifact_sha256
+    }
+    /// Returns the checked original collector inventory identity.
+    pub(crate) fn inventory_sha256(&self) -> &str {
+        &self.inventory_sha256
+    }
+    /// Returns every prepared module with final artifact classification.
+    pub(crate) fn modules(&self) -> impl Iterator<Item = (&RetainedJsModule, &str)> {
+        self.modules
+            .iter()
+            .map(|entry| (&entry.module, entry.classification))
+    }
+}

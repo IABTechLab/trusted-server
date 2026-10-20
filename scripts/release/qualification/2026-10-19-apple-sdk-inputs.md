@@ -73,5 +73,26 @@ hardlinks in the destination, exhausted bounds, cancellation, stable
 path-independent identities, final-byte path leaks and cleanup of restrictive
 directory modes on error and final-clone drop. A review finding caught the
 read-only-directory cleanup leak before the full smoke; its regression was
-observed failing before the cleanup guard was added. Native compilation with
-the detached SDK remains a separate hosted ARM/Intel validation requirement.
+observed failing before the cleanup guard was added.
+
+## Hosted native recipe follow-up — 2026-10-20
+
+[Run 39290139247](https://github.com/IABTechLab/trusted-server/actions/runs/39290139247)
+finalized success for head `df4a6e5c30fe8c93df68748ead77a3bc559d16b2`.
+Its actual merge source was `506d8ead69757556e1bd8ed29b578d0257d05169`.
+Both Apple candidate recipes compiled, inspected and started their canonical
+CLI artifacts using detached `/apple-sdk`, Xcode 16.4 and SDK 15.5.0.
+Both emitted the same installed SDK tree identity:
+`1482e88484d3ab4b430306607ed07113068eadd7581b232dedb20ea80842bce0`,
+46,233 entries and 656,877,420 regular-file bytes. Their SDK-settings file
+SHA-256 was `58a133735f0a55a624a1703067059f6e78925e51725ec6e1f966072e142c9c42`.
+This hosted tree digest differs from the local smoke's installed tree;
+neither is an authenticated distribution identity or production pin.
+
+ARM's second build was byte-identical. Intel's canonical artifact and
+retained receipt exports passed; its optional second build failed on its
+time bound. No Intel reproducibility result is inferred from the green job.
+The successful fixtures additionally joined verified Rust packages through
+the typed SPDX projection and checked retained export integrity after
+dropping the original build storage. Complete native/tool coverage and
+release qualification remain false.
