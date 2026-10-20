@@ -284,19 +284,22 @@ a legitimate documentation source we link to repeatedly?"
 Integration proxies and loopback. Subdomains are **not** allowed
 (e.g., `anything.api.privacy-center.org` is disallowed).
 
-| Category                                             | Hosts                                                                          |
-| ---------------------------------------------------- | ------------------------------------------------------------------------------ |
-| Loopback                                             | `127.0.0.1`, `::1`, `localhost`                                                |
-| Integration proxies (didomi)                         | `api.privacy-center.org`, `sdk.privacy-center.org`                             |
-| Integration proxies (sourcepoint)                    | `cdn.privacy-mgmt.com`                                                         |
-| Integration proxies (lockr)                          | `aim.loc.kr`, `identity.loc.kr`                                                |
-| Integration proxies (datadome)                       | `js.datadome.co`, `api-js.datadome.co`                                         |
-| Integration proxies (aps / Amazon)                   | `aax.amazon-adsystem.com`, `aax-events.amazon-adsystem.com`                    |
-| Integration proxies (permutive)                      | `api.permutive.com`, `secure-signals.permutive.app`, `cdn.permutive.com`       |
-| Integration proxies (Google Tag Manager / Analytics) | `www.googletagmanager.com`, `www.google-analytics.com`, `analytics.google.com` |
-| Integration proxies (adserver mock)                  | `securepubads.g.doubleclick.net`, `origin-mocktioneer.cdintel.com`             |
-| Integration proxies (Prebid CDN)                     | `cdn.prebid.org`                                                               |
-| Integration proxies (Fastly platform)                | `api.fastly.com`                                                               |
+| Category                                             | Hosts                                                                                                                            |
+| ---------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| Loopback                                             | `127.0.0.1`, `::1`, `localhost`                                                                                                  |
+| Integration proxies (didomi)                         | `api.privacy-center.org`, `sdk.privacy-center.org`                                                                               |
+| Integration proxies (sourcepoint)                    | `cdn.privacy-mgmt.com`, `cdn-eu.privacy-mgmt.com`                                                                                |
+| Integration proxies (lockr)                          | `aim.loc.kr`, `identity.loc.kr`                                                                                                  |
+| Integration proxies (datadome)                       | `js.datadome.co`, `api-js.datadome.co`, `api-fastly.datadome.co`                                                                 |
+| Integration proxies (aps / Amazon)                   | `aax.amazon-adsystem.com`, `aax-events.amazon-adsystem.com`, `client.aps.amazon-adsystem.com`, `web.ads.aps.amazon-adsystem.com` |
+| Integration proxies (permutive)                      | `api.permutive.com`, `secure-signals.permutive.app`, `cdn.permutive.com`, `events.permutive.app`, `sync.permutive.com`           |
+| Integration proxies (Google Tag Manager / Analytics) | `www.googletagmanager.com`, `www.google-analytics.com`, `analytics.google.com`                                                   |
+| Integration proxies (adserver mock)                  | `securepubads.g.doubleclick.net`, `origin-mocktioneer.cdintel.com`                                                               |
+| Integration proxies (Prebid CDN)                     | `cdn.prebid.org`                                                                                                                 |
+| Integration proxies (Fastly platform)                | `api.fastly.com`                                                                                                                 |
+| Integration proxies (inmobi)                         | `cmp.inmobi.com`, `cdn.inmobi.com`                                                                                               |
+| Integration proxies (Google ad tag)                  | `pagead2.googlesyndication.com`                                                                                                  |
+| Integration proxies (Model Terms signal)             | `m4ow.uk`                                                                                                                        |
 
 ### Subdomain-permitting hosts (`SUBDOMAIN_HOSTS`)
 
@@ -335,9 +338,10 @@ suppress per-line.
 | IAB Tech Lab            | `iab.com`, `iabtechlab.com`, `iabtechlab.github.io`, `iabeurope.github.io`                      |
 | Specs (supply chain)    | `in-toto.io`, `rslstandard.org`                                                                 |
 | Specs (other)           | `webassembly.org`                                                                               |
+| IETF RFCs               | `www.rfc-editor.org`                                                                            |
 | Fastly docs             | `www.fastly.com`, `developer.fastly.com`, `manage.fastly.com`                                   |
 | Cloudflare docs         | `developers.cloudflare.com`                                                                     |
-| Vendor docs             | `docs.datadome.co`, `docs.prebid.org`                                                           |
+| Vendor docs             | `docs.datadome.co`, `docs.prebid.org`, `support.google.com`, `developers.google.com`            |
 | Tooling docs            | `vitepress.dev`, `playwright.dev`, `testcontainers.com`, `grafana.com`, `docsearch.algolia.com` |
 
 One-off references not on this list (e.g., a single arxiv.org link in
@@ -561,6 +565,15 @@ fenced code blocks.
   hidden the integration-test app source under
   `crates/integration-tests/fixtures/frameworks/nextjs/app/*.tsx`,
   which we deliberately scan).
+
+- **A module crate's own fixtures**, `crates/<type>/<vendor>/src/fixtures/**`.
+  A module in a crate of its own under `crates/<type>/<vendor>/` (the layout
+  the seam design gives) keeps the page its middleware is tested on, and the
+  page it records, under `src/fixtures/`. Those pages carry the vendor's own
+  script hosts and other vendors' tags the test proves untouched, as the
+  publisher captures above do. The rule is the two-level crate layout
+  exactly, so `crates/<crate>/src/fixtures/` and
+  `crates/integration-tests/fixtures/...` stay scanned.
 
 **Source files under `crates/integration-tests/fixtures/frameworks/*` —
 including `.tsx`, `.ts`, `.json`, `next.config.mjs`, `Dockerfile` —
