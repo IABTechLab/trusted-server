@@ -6,6 +6,9 @@ deployment. It starts from Trusted Server main
 `61bfe3b931fd97f5300287e4a91e33f32aa0fbee`. PRs #1410, #1411 and #1412,
 including their #777 module/configuration/permission stack, are excluded.
 
+The [validation record](./native-rc-validation.md) lists executed checks,
+resolved failures and remaining limits.
+
 The native entry point is `trusted-server-axum` in package
 `trusted-server-adapter-axum`. It runs the RC production initializer and listener,
 not the former environment-backed development router. Required configuration and

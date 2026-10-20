@@ -196,3 +196,6 @@ jobs:
 
       - name: Test proposal scripts
         run: scripts/docs-proposal/test.sh
+
+      - name: Test native and local smoke helpers
+        run: node --test scripts/tests/*.test.mjs
