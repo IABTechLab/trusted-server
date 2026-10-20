@@ -97,7 +97,10 @@ pub struct AuctionConfig {
     pub timeout_ms: u32,
 
     /// KV store name for creative storage (deprecated: creatives are now delivered inline)
-    #[serde(default = "default_creative_store")]
+    #[serde(
+        default = "default_creative_store",
+        serialize_with = "crate::redacted::sensitive"
+    )]
     pub creative_store: String,
 
     /// Keys allowed in the auction request context map.
