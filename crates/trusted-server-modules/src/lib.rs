@@ -219,17 +219,34 @@ mod tests {
                 .map(|integration| integration.id)
                 .collect();
 
+            // A middleware that runs in several phases is listed in the one a
+            // tool writes it in, so what is listed for a phase is registered
+            // for it, and everything registered is listed somewhere.
+            let listed_anywhere: Vec<&str> = listed
+                .iter()
+                .filter(|row| running.contains(&row.integration))
+                .map(|row| row.name)
+                .collect();
             for phase in MiddlewarePhase::ALL {
-                let expected: Vec<&str> = listed
+                let registered = registry.middleware_in(phase);
+                for row in listed
                     .iter()
                     .filter(|row| row.phase == phase && running.contains(&row.integration))
-                    .map(|row| row.name)
-                    .collect();
-                assert_eq!(
-                    registry.middleware_in(phase),
-                    expected,
-                    "should list for {phase} what the modules {running:?} register for it"
-                );
+                {
+                    assert!(
+                        registered.contains(&row.name),
+                        "{} is listed for {phase} and the modules {running:?} do not register it \
+                         for that phase: {registered:?}",
+                        row.name
+                    );
+                }
+                for name in &registered {
+                    assert!(
+                        listed_anywhere.contains(name),
+                        "{name} is registered for {phase} by the modules {running:?} and listed \
+                         in no phase"
+                    );
+                }
             }
             checked.extend(running);
         }

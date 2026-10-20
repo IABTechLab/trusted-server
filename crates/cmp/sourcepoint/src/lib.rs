@@ -1091,8 +1091,8 @@ impl IntegrationProxy for SourcepointIntegration {
     }
 }
 
-/// Sourcepoint's change to a page, on the pages a `[[fetch]]` entry names
-/// [`MODULE`] for. It writes the browser module's settings into the head and,
+/// Sourcepoint's change to a page, on the pages a `[[fetch]]` or `[[serve]]`
+/// entry names [`MODULE`] for, in the phase the publisher chooses. It writes the browser module's settings into the head and,
 /// when `rewrite_sdk` is set, the trap on `window._sp_`, and points the
 /// CDN's addresses at the first-party path.
 struct PageChange {
@@ -1117,7 +1117,7 @@ impl Middleware for PageChange {
     }
 
     fn phases(&self) -> &[MiddlewarePhase] {
-        &[MiddlewarePhase::Fetch]
+        &MiddlewarePhase::ALL
     }
 
     fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
@@ -2383,6 +2383,16 @@ mod tests {
     }
 
     #[test]
+    fn the_page_change_may_run_in_either_phase() {
+        let integration = SourcepointIntegration::new(Arc::new(config()));
+        assert_eq!(
+            PageChange::new(integration).phases(),
+            MiddlewarePhase::ALL,
+            "the publisher chooses the phase by the entry"
+        );
+    }
+
+    #[test]
     fn head_markup_emits_config_script_plus_trap_when_enabled() {
         let integration = SourcepointIntegration::new(Arc::new(config()));
 
@@ -3157,6 +3167,35 @@ mod tests {
                 env!("CARGO_MANIFEST_DIR"),
                 "/src/fixtures/page-change.recorded.html"
             ),
+        );
+    }
+
+    /// Named in `[[serve]]` in place of `[[fetch]]`, the page change passes
+    /// the registry's check and gives a reader the recorded page, because a
+    /// page with no other middleware gets it in the same place from either
+    /// phase.
+    #[test]
+    fn placed_in_serve_the_page_change_gives_a_reader_the_recorded_page() {
+        use trusted_server_core::html_processor::test_support::{
+            page_settings, place_on_every_page, processed_page,
+        };
+        let mut settings = page_settings(include_str!("fixtures/page-change.settings.toml"));
+        settings.fetch = trusted_server_core::middleware::PhaseEntries::default();
+        place_on_every_page(&mut settings, MiddlewarePhase::Serve, &[MODULE]);
+        let registry = IntegrationRegistry::with_registrations(&settings, &[super::builder()])
+            .expect("the registry should accept the page change in a serve entry");
+
+        let page = processed_page(
+            &settings,
+            &registry,
+            include_str!("fixtures/page-change.input.html"),
+            8192,
+        );
+
+        assert_eq!(
+            page,
+            include_str!("fixtures/page-change.recorded.html"),
+            "a serve entry should give the reader the page a fetch entry does"
         );
     }
 }
