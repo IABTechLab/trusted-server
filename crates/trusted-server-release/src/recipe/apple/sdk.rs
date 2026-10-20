@@ -34,6 +34,13 @@ pub(super) struct SdkReceipt {
     entries: usize,
 }
 
+impl SdkReceipt {
+    /// Returns the detached SDK's measured structured-tree identity.
+    pub(super) fn tree_sha256(&self) -> &str {
+        &self.tree_sha256
+    }
+}
+
 /// Private SDK copy whose lifetime is retained by every tool selection clone.
 #[derive(Debug)]
 pub(super) struct OwnedSdk {

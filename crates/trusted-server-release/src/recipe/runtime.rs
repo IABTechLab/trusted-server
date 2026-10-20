@@ -21,6 +21,7 @@
 
 mod config;
 mod exchange;
+mod export;
 mod logs;
 mod viceroy;
 
@@ -35,8 +36,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use error_stack::Report;
 use sha2::{Digest as _, Sha256};
 
-use super::RecipeCompleted;
 use super::compare::{FastlyEqualityChecked, read_artifact};
+use super::{RecipeCompleted, Role};
 use crate::error::ReleaseError;
 use crate::inspect::inspect_wasm;
 use crate::process::{BoundedCommand, Cancellation, ProcessLimits, ProcessOutcome};
@@ -145,6 +146,7 @@ pub(super) enum OriginPresence {
 #[derive(Debug)]
 pub(crate) struct FastlyRuntimeAccepted {
     source_commit: CommitId,
+    role: Role,
     observed: GateObservation,
 }
 
@@ -288,6 +290,7 @@ pub(crate) fn accept_fastly_runtime(
     })?;
     Ok(FastlyRuntimeAccepted {
         source_commit: completed.commit().clone(),
+        role: completed.role(),
         observed,
     })
 }

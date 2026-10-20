@@ -141,6 +141,27 @@ struct AppleFileEvidence {
     sha256: String,
 }
 
+impl AppleToolEvidence {
+    /// Borrows measured tool roles and raw-file digests, excluding private paths.
+    pub(crate) fn tool_files(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.tools
+            .iter()
+            .map(|file| (file.role, file.sha256.as_str()))
+    }
+    /// Returns the SDK settings raw-file digest.
+    pub(crate) fn sdk_settings_sha256(&self) -> &str {
+        &self.sdk_settings.sha256
+    }
+    /// Returns the detached SDK's structured-tree digest, when measured.
+    pub(crate) fn sdk_tree_sha256(&self) -> Option<&str> {
+        self.sdk_tree.as_ref().map(SdkReceipt::tree_sha256)
+    }
+    /// Returns the SDK version used to check the accepted executable.
+    pub(crate) fn sdk_version(&self) -> &str {
+        &self.sdk_version
+    }
+}
+
 fn lower_hex_digest(text: &str) -> bool {
     text.len() == 64
         && text

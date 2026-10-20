@@ -255,12 +255,43 @@ pub(crate) fn helper_measurement() -> Result<Vec<u8>, Report<ReleaseError>> {
 }
 
 impl GnuEvidence {
+    /// Supplies fictional typed observations for projection tests only.
+    #[cfg(test)]
+    pub(crate) fn projection_fixture() -> Self {
+        tests::projection_fixture()
+    }
+    /// Supplies an unreviewed fictional file role for fail-closed adapter tests.
+    #[cfg(test)]
+    pub(crate) fn projection_fixture_with_unknown_file_role() -> Self {
+        let mut fixture = Self::projection_fixture();
+        let file = fixture
+            .measurement
+            .selected_files
+            .remove("compiler_runtime")
+            .expect("should have fictional runtime archive");
+        fixture
+            .measurement
+            .selected_files
+            .insert("unreviewed_compiler_resource".to_owned(), file);
+        fixture
+    }
+    /// Returns the conservative installed-image tree identity.
+    pub(crate) fn installed_files_sha256(&self) -> &str {
+        &self.measurement.installed_files_sha256
+    }
+    /// Borrows selected/configured raw-file identities without private paths.
+    pub(crate) fn measured_files(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.measurement
+            .selected_files
+            .iter()
+            .map(|(role, file)| (role.as_str(), file.sha256.as_str()))
+    }
     /// Requires this receipt's boundary and exact plan at completion sealing.
     ///
     /// # Errors
     ///
     /// Rejects another boundary, invocation or source-owned GNU profile.
-    pub(super) fn verify_binding(
+    pub(crate) fn verify_binding(
         &self,
         boundary: &[u8; 32],
         plan: &str,

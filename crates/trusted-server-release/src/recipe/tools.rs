@@ -104,6 +104,10 @@ pub(crate) struct RustToolEvidence {
 }
 
 impl RustToolEvidence {
+    /// Returns the selected standard-library target.
+    pub(crate) fn target(&self) -> &str {
+        self.target
+    }
     /// Returns the measured installed-tree digest retained in this receipt.
     pub(crate) fn tree_sha256(&self) -> &str {
         &self.tree_sha256

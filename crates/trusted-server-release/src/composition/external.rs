@@ -16,7 +16,7 @@ pub(crate) struct ExternalRequirements {
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "format", rename_all = "snake_case")]
-enum Runtime {
+pub(crate) enum Runtime {
     Elf {
         interpreter: String,
         needed: Vec<String>,
@@ -43,6 +43,10 @@ fn serialize_target<S: Serializer>(
 }
 
 impl ExternalRequirements {
+    /// Borrows exact logical requirements without installed-runtime identity.
+    pub(crate) fn runtime(&self) -> &Runtime {
+        &self.runtime
+    }
     /// Returns the SDK recorded in a Mach-O executable, when present.
     pub(crate) fn macho_sdk(&self) -> Option<&str> {
         match &self.runtime {

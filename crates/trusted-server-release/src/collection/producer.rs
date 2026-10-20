@@ -1,8 +1,8 @@
 //! Flat diagnostic exports from owning build results, without release authority.
 //!
 //! This candidate format deliberately differs from the strict collector's build
-//! record. Runtime acceptance, pair claims and
-//! qualified workflow identity have not yet been joined to these owners.
+//! record. Pair claims, native startup acceptance and qualified workflow
+//! identity have not yet been joined to these owners.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -16,7 +16,7 @@ use serde_json::json;
 use super::{collection_error, digest};
 use crate::documents::hash_bounded_with_check;
 use crate::error::ReleaseError;
-use crate::recipe::{RecipeCompleted, copy_artifact};
+use crate::recipe::{FastlyRuntimeAccepted, RecipeCompleted, copy_artifact};
 
 const RECORD: &str = "candidate-build-record.json";
 const COMPOSITION: &str = "composition.json";
@@ -53,12 +53,45 @@ impl CandidateBuildExport {
     pub(crate) fn from_completed(
         completed: &RecipeCompleted,
     ) -> Result<Self, Report<ReleaseError>> {
+        Self::from_owned(completed, None)
+    }
+
+    /// Copies a candidate with its actual role-bound final-byte Fastly acceptance.
+    ///
+    /// # Errors
+    ///
+    /// Rejects another source, role or artifact, missing required build evidence,
+    /// changed owned files or an oversized diagnostic record.
+    pub(crate) fn with_fastly_runtime(
+        completed: &RecipeCompleted,
+        accepted: &FastlyRuntimeAccepted,
+    ) -> Result<Self, Report<ReleaseError>> {
+        Self::from_owned(completed, Some(accepted))
+    }
+
+    fn from_owned(
+        completed: &RecipeCompleted,
+        accepted: Option<&FastlyRuntimeAccepted>,
+    ) -> Result<Self, Report<ReleaseError>> {
         let definition = completed.recipe_definition()?;
         let denial = completed.denial_receipt()?;
         let composition = completed.composition_export()?;
         let javascript = completed.javascript_contributions()?;
         let artifact = completed.artifact();
         let observed = completed.ambient().observed();
+        let runtime = accepted
+            .map(|accepted| accepted.diagnostic_for(completed))
+            .transpose()?;
+        let gaps = [
+            "runtime-acceptance-not-exported",
+            "ambient-pair-claims-not-exported",
+            "composition-coverage-incomplete",
+            "bootstrap-not-authenticated",
+            "workflow-producer-authority-not-established",
+        ]
+        .into_iter()
+        .filter(|gap| *gap != "runtime-acceptance-not-exported" || runtime.is_none())
+        .collect::<Vec<_>>();
         let [inventory, settings, js_tools] = completed.js_digests();
         let record = serde_json::to_vec(&json!({
             "domain": "trusted-server.release.candidate-build-diagnostic",
@@ -77,6 +110,7 @@ impl CandidateBuildExport {
                 "materials": completed.materials_digest(), "rust_tools": completed.rust_tools_digest(),
                 "js_inventory": inventory, "js_settings": settings, "js_tools": js_tools},
             "socket_observations": denial,
+            "runtime_acceptance": runtime,
             "ambient_observation": {
                 "umask": observed.umask, "jobs": observed.jobs,
                 "host_locale": observed.host_locale, "host_timezone": observed.host_timezone,
@@ -85,9 +119,7 @@ impl CandidateBuildExport {
                 "started_at_seconds": observed.started_at_seconds,
             },
             "elapsed_seconds": completed.elapsed().as_secs(),
-            "gaps": ["runtime-acceptance-not-exported", "ambient-pair-claims-not-exported",
-                "composition-coverage-incomplete",
-                "bootstrap-not-authenticated", "workflow-producer-authority-not-established"],
+            "gaps": gaps,
         }))
         .map_err(collection_error)?;
         if record.len() as u64 > DOCUMENT_LIMIT {

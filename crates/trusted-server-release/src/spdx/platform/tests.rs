@@ -1,0 +1,314 @@
+use super::*;
+use crate::composition::platform::tests::projection_fixture;
+
+impl Owner {
+    fn fixture(platform: &crate::composition::platform::PlatformEvidence) -> Self {
+        Self {
+            target: platform.external_requirements().target(),
+            artifact: platform.artifact_sha256().to_owned(),
+            rust_tree: platform.rust().tree_sha256().to_owned(),
+            source: "a".repeat(40),
+            receipt_source: "a".repeat(40),
+            boundary: [1; 32],
+            plan: "b".repeat(64),
+        }
+    }
+}
+
+#[test]
+fn projects_measured_trees_without_raw_checksums_and_runtime_without_byte_claims() {
+    let platform = projection_fixture(crate::policy::ReleaseTarget::Wasm32Wasip1);
+    let owner = Owner::fixture(&platform);
+    let components = project(&platform, &owner).expect("should project measured platform facts");
+    let rust = components
+        .iter()
+        .find(|component| component.name == "Measured Rust tool tree")
+        .expect("should project Rust tool tree");
+    assert!(
+        rust.roles.contains(&ComponentRole::BuildTool)
+            && rust.roles.contains(&ComponentRole::BuildMaterial),
+        "should preserve both installed Rust roles"
+    );
+    assert!(
+        matches!(&rust.origin, Some(Origin::StructuredTree { .. })),
+        "should not treat a structured tree digest as file bytes"
+    );
+    assert!(
+        components
+            .iter()
+            .any(|component| component.roles == [ComponentRole::ExternalRuntime]),
+        "should project actual Wasm logical imports"
+    );
+    for component in &components {
+        assert!(
+            !component.identity.contains("/boundary/")
+                && !component.identity.contains("/private/")
+                && !component.identity.contains("/var/"),
+            "should use stable identities independent of temporary roots"
+        );
+        assert!(
+            component.declared_license.is_none(),
+            "should not invent licenses"
+        );
+    }
+}
+
+#[test]
+fn rejects_another_artifact_target_rust_tree_or_source_owner() {
+    let platform = projection_fixture(crate::policy::ReleaseTarget::Wasm32Wasip1);
+    for field in ["artifact", "target", "rust", "source"] {
+        let mut owner = Owner::fixture(&platform);
+        match field {
+            "artifact" => owner.artifact = "b".repeat(64),
+            "target" => owner.target = crate::policy::ReleaseTarget::X86_64UnknownLinuxGnu,
+            "rust" => owner.rust_tree = "c".repeat(64),
+            "source" => owner.receipt_source = "d".repeat(40),
+            _ => unreachable!("should select a fixture field"),
+        }
+        assert!(
+            project(&platform, &owner).is_err(),
+            "should reject mismatched {field} owner"
+        );
+    }
+}
+
+#[test]
+fn gnu_projection_requires_the_owning_boundary_and_plan_and_calls_candidates_honestly() {
+    let platform = projection_fixture(crate::policy::ReleaseTarget::X86_64UnknownLinuxGnu)
+        .with_gnu(crate::recipe::gnu::GnuEvidence::projection_fixture())
+        .expect("should attach fictional typed GNU observations");
+    let mut owner = Owner::fixture(&platform);
+    let components = project(&platform, &owner).expect("should join GNU boundary and plan");
+    assert!(
+        components
+            .iter()
+            .any(|component| component.name.contains("gcc_linker_candidate")
+                && component.roles == [ComponentRole::BuildTool]),
+        "should retain configured candidate meaning without claiming execution"
+    );
+    owner.boundary = [2; 32];
+    assert!(
+        project(&platform, &owner).is_err(),
+        "should reject another GNU boundary"
+    );
+    owner.boundary = [1; 32];
+    owner.plan = "f".repeat(64);
+    assert!(
+        project(&platform, &owner).is_err(),
+        "should reject another GNU invocation"
+    );
+}
+
+#[test]
+fn apple_projection_preserves_raw_file_identity_and_logical_runtime_without_private_paths() {
+    let platform = projection_fixture(crate::policy::ReleaseTarget::Aarch64AppleDarwin);
+    let owner = Owner::fixture(&platform);
+    let components = project(&platform, &owner).expect("should project Apple platform");
+    assert_eq!(
+        components
+            .iter()
+            .filter(|component| matches!(
+                &component.origin,
+                Some(Origin::PlatformMeasuredFile { .. })
+            ))
+            .count(),
+        4,
+        "should project three tools and SDK settings as raw files"
+    );
+    assert!(
+        components.iter().any(|component| component.name
+            == format!(
+                "Logical Mach-O SDK: {}",
+                platform
+                    .external_requirements()
+                    .macho_sdk()
+                    .expect("should preserve accepted SDK")
+            )),
+        "should preserve accepted SDK requirement"
+    );
+    for component in &components {
+        assert!(
+            !component.identity.contains("MacOSX.platform")
+                && !component.identity.contains("/private/"),
+            "should exclude private SDK and tool paths from identity"
+        );
+    }
+}
+
+#[test]
+fn measured_file_renderer_asserts_only_bytes_and_rejects_runtime_roles() {
+    let mut component = measured_file(
+        crate::policy::ReleaseTarget::Wasm32Wasip1,
+        "fictional-tool",
+        &"a".repeat(64),
+        ComponentRole::BuildTool,
+    )
+    .expect("should describe installed file");
+    let (location, information, checksum) =
+        file_origin_fields(&component, "fictional-tool", &"a".repeat(64))
+            .expect("should render measured bytes");
+    assert_eq!(
+        location, "NOASSERTION",
+        "should not invent original acquisition location"
+    );
+    assert_eq!(
+        checksum,
+        Some(("SHA256", "a".repeat(64))),
+        "should checksum measured raw bytes"
+    );
+    assert!(
+        information.contains("no original acquisition") && information.contains("executed helper"),
+        "should preserve limits of measured facts"
+    );
+    component.roles = vec![ComponentRole::ExternalRuntime];
+    assert!(
+        file_origin_fields(&component, "fictional-tool", &"a".repeat(64)).is_err(),
+        "should never assign installed bytes to logical runtime requirements"
+    );
+}
+
+#[test]
+fn detached_sdk_is_structured_material_without_raw_file_checksum() {
+    let platform = crate::composition::platform::tests::projection_detached_sdk_fixture();
+    let owner = Owner::fixture(&platform);
+    let components = project(&platform, &owner).expect("should project detached SDK");
+    let sdk = components
+        .iter()
+        .find(|component| component.name == "Measured detached Apple SDK tree")
+        .expect("should retain SDK tree");
+    assert!(
+        sdk.roles == [ComponentRole::BuildMaterial]
+            && matches!(&sdk.origin, Some(Origin::StructuredTree { .. })),
+        "should preserve SDK tree evidence as structured material"
+    );
+    assert!(
+        platform
+            .apple()
+            .expect("should retain Apple receipt")
+            .sdk_tree_sha256()
+            .is_some(),
+        "should borrow original SDK tree receipt"
+    );
+}
+
+#[test]
+fn rendered_projection_preserves_runtime_constraints_without_runtime_byte_checksums() {
+    let platform = projection_fixture(crate::policy::ReleaseTarget::Wasm32Wasip1);
+    let owner = Owner::fixture(&platform);
+    let executable =
+        crate::inspect::tests::builders::wasm_module(&[("fastly_http_req", "downstream_get")]);
+    let components = project(&platform, &owner).expect("should project platform");
+    let inputs = super::super::SpdxInputs {
+        executable: &executable,
+        expected_artifact_sha256: owner.artifact,
+        name: "fictional-artifact".to_owned(),
+        version: "1.0.0".to_owned(),
+        source_commit: owner.source,
+        target: owner.target,
+        created: "2026-01-01T00:00:00Z".to_owned(),
+        components,
+        dependencies: vec![],
+    };
+    let rendered =
+        super::super::render(&inputs).expect("should render schema-valid fictional projection");
+    let json: serde_json::Value =
+        serde_json::from_slice(rendered.bytes()).expect("should inspect rendered document");
+    let runtime = json["packages"]
+        .as_array()
+        .expect("should retain packages")
+        .iter()
+        .find(|package| package["name"] == "Logical Wasm host import: fastly_http_req")
+        .expect("should retain exact runtime requirement");
+    assert!(
+        runtime.get("checksums").is_none(),
+        "should never checksum logical runtime bytes"
+    );
+    assert_eq!(
+        runtime["downloadLocation"], "NOASSERTION",
+        "should not invent runtime acquisition"
+    );
+}
+
+#[test]
+fn compiler_runtime_archive_is_a_build_dependency_with_no_tool_or_retention_claim() {
+    let platform = projection_fixture(crate::policy::ReleaseTarget::X86_64UnknownLinuxGnu)
+        .with_gnu(crate::recipe::gnu::GnuEvidence::projection_fixture())
+        .expect("should attach fictional GNU receipt");
+    let owner = Owner::fixture(&platform);
+    let components = project(&platform, &owner).expect("should project installed GNU facts");
+    let runtime = components
+        .iter()
+        .find(|component| component.name.contains("compiler_runtime"))
+        .expect("should project measured compiler runtime archive");
+    assert!(
+        runtime.roles == [ComponentRole::BuildMaterial],
+        "should classify libgcc.a as build material rather than an executed tool"
+    );
+    let id = super::super::component_id(&runtime.identity);
+    let executable = crate::inspect::tests::builders::elf(
+        &crate::inspect::tests::builders::ElfSpec::conforming(),
+    );
+    let inputs = super::super::SpdxInputs {
+        executable: &executable,
+        expected_artifact_sha256: owner.artifact,
+        name: "fictional-artifact".to_owned(),
+        version: "1.0.0".to_owned(),
+        source_commit: owner.source,
+        target: owner.target,
+        created: "2026-01-01T00:00:00Z".to_owned(),
+        components,
+        dependencies: vec![],
+    };
+    let rendered = super::super::render(&inputs).expect("should render measured GNU projection");
+    let json: serde_json::Value =
+        serde_json::from_slice(rendered.bytes()).expect("should inspect rendered relationships");
+    let relationships = json["relationships"]
+        .as_array()
+        .expect("should retain relationships");
+    assert!(
+        relationships
+            .iter()
+            .any(|relation| relation["spdxElementId"] == id
+                && relation["relationshipType"] == "BUILD_DEPENDENCY_OF"
+                && relation["comment"]
+                    .as_str()
+                    .is_some_and(|comment| comment.contains("retention is not asserted"))),
+        "should preserve archive as a measured build dependency without retention inference"
+    );
+    assert!(
+        !relationships
+            .iter()
+            .any(|relation| relation["spdxElementId"] == id
+                && matches!(
+                    relation["relationshipType"].as_str(),
+                    Some("BUILD_TOOL_OF" | "RUNTIME_DEPENDENCY_OF" | "CONTAINS")
+                )),
+        "should not classify compiler runtime archive as tool, logical runtime, or retained bytes"
+    );
+    let package = json["packages"]
+        .as_array()
+        .expect("should retain packages")
+        .iter()
+        .find(|package| package["SPDXID"] == id)
+        .expect("should retain measured archive package");
+    assert_eq!(
+        package["checksums"][0]["checksumValue"],
+        "c".repeat(64),
+        "should retain measured archive raw-byte identity"
+    );
+    assert_eq!(
+        package["downloadLocation"], "NOASSERTION",
+        "should not invent original archive acquisition"
+    );
+}
+
+#[test]
+fn new_gnu_file_roles_require_review_before_projection() {
+    let platform = projection_fixture(crate::policy::ReleaseTarget::X86_64UnknownLinuxGnu)
+        .with_gnu(crate::recipe::gnu::GnuEvidence::projection_fixture_with_unknown_file_role())
+        .expect("should attach fictional unknown resource");
+    assert!(
+        project(&platform, &Owner::fixture(&platform)).is_err(),
+        "should reject new resources until their component role is reviewed"
+    );
+}

@@ -53,7 +53,8 @@ pub(crate) struct NativeInventory {
 }
 
 #[derive(Debug, Serialize)]
-struct NativeContributor {
+#[cfg_attr(test, derive(Clone))]
+pub(crate) struct NativeContributor {
     package_id: String,
     name: String,
     version: String,
@@ -71,13 +72,15 @@ struct NativeContributor {
 }
 
 #[derive(Debug, Serialize)]
-struct SourceSubtree {
+#[cfg_attr(test, derive(Clone))]
+pub(crate) struct SourceSubtree {
     path: &'static str,
     sha256: String,
 }
 
 #[derive(Debug, Serialize)]
-struct NativeArchive {
+#[cfg_attr(test, derive(Clone))]
+pub(crate) struct NativeArchive {
     path: PathBuf,
     size: u64,
     sha256: String,
@@ -529,3 +532,100 @@ impl NativeInventory {
 
 #[cfg(test)]
 mod tests;
+
+impl NativeInventory {
+    /// Returns measured native inputs without granting coverage completeness.
+    pub(crate) fn contributors(&self) -> &[NativeContributor] {
+        &self.contributors
+    }
+}
+
+impl NativeContributor {
+    /// Returns the exact observed Cargo package ID for joining only.
+    pub(crate) fn package_id(&self) -> &str {
+        &self.package_id
+    }
+    /// Returns the observed Cargo wrapper package name.
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+    /// Returns the observed Cargo wrapper package version.
+    pub(crate) fn version(&self) -> &str {
+        &self.version
+    }
+    /// Returns its observed consuming compiler context.
+    pub(crate) fn context(&self) -> UnitContext {
+        self.context
+    }
+    /// Returns effective consuming-unit features.
+    pub(crate) fn features(&self) -> &[String] {
+        &self.features
+    }
+    /// Returns its conservative collector classification.
+    pub(crate) fn classification(&self) -> &str {
+        self.classification
+    }
+    /// Returns the verified original registry archive digest.
+    pub(crate) fn original_sha256(&self) -> &str {
+        &self.original_sha256
+    }
+    /// Returns structured prepared-source tree evidence, not a raw-file checksum.
+    pub(crate) fn source_tree_sha256(&self) -> &str {
+        &self.source_tree_sha256
+    }
+    /// Returns reviewed structured native source subtree observations.
+    pub(crate) fn source_subtrees(&self) -> &[SourceSubtree] {
+        &self.source_subtrees
+    }
+    /// Returns observed reviewed static-link library directives.
+    pub(crate) fn linked_libs(&self) -> &[String] {
+        &self.linked_libs
+    }
+    /// Returns measured static output archives with private paths inaccessible.
+    pub(crate) fn archives(&self) -> &[NativeArchive] {
+        &self.archives
+    }
+    /// Returns whether this wrapper name and version have reviewed native rules.
+    pub(crate) fn reviewed_wrapper(&self) -> bool {
+        reviewed(&self.name).is_some_and(|rule| rule.version == self.version)
+    }
+}
+
+impl SourceSubtree {
+    /// Returns the reviewed source-relative subtree path.
+    pub(crate) fn path(&self) -> &str {
+        self.path
+    }
+    /// Returns structured subtree evidence, not a raw-file checksum.
+    pub(crate) fn sha256(&self) -> &str {
+        &self.sha256
+    }
+}
+
+impl NativeArchive {
+    /// Returns the logical archive filename without exposing output roots.
+    pub(crate) fn filename(&self) -> Option<&str> {
+        self.path.file_name().and_then(|name| name.to_str())
+    }
+    /// Returns measured static archive length.
+    pub(crate) fn size(&self) -> u64 {
+        self.size
+    }
+    /// Returns the raw static-output archive digest, distinct from its source.
+    pub(crate) fn sha256(&self) -> &str {
+        &self.sha256
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_for_projection(
+    name: &str,
+    context: UnitContext,
+) -> (NativeInventory, CargoObservations) {
+    tests::fixture_for_projection(name, context)
+}
+
+/// Returns the reviewed Cargo wrapper version for a native implementation.
+pub(crate) fn reviewed_wrapper_version(name: &str) -> Option<&'static str> {
+    reviewed(name).map(|rule| rule.version)
+}

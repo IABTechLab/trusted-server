@@ -72,6 +72,7 @@ pub(crate) use completed::RecipeCompleted;
 pub(crate) use identity::{ExactInvocationDigest, RecipeDefinitionIdentity};
 pub(crate) use paths::ExecutionPaths;
 pub(crate) use plan::CargoPlan;
+pub(crate) use runtime::FastlyRuntimeAccepted;
 #[allow(
     unused_imports,
     reason = "the qualified selection has no production caller yet"

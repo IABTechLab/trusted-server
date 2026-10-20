@@ -3,6 +3,49 @@ use std::os::unix::fs::symlink;
 
 use super::*;
 
+pub(super) fn projection_fixture() -> GnuEvidence {
+    GnuEvidence {
+        measurement: Measurement {
+            profile: PROFILE.to_owned(),
+            installed_files_sha256: "a".repeat(64),
+            roots: image::ROOTS.iter().map(|root| (*root).to_owned()).collect(),
+            selected_files: [
+                ("compiler", "/usr/bin/gcc"),
+                ("archiver", "/usr/bin/ar"),
+                ("gcc_linker_candidate", "/usr/bin/ld"),
+                ("gcc_assembler_candidate", "/usr/bin/as"),
+                ("configured_cc1", "/usr/libexec/gcc/example/cc1"),
+                ("configured_collect2", "/usr/libexec/gcc/example/collect2"),
+                ("configured_as", "/usr/bin/as"),
+                ("configured_ld", "/usr/bin/ld"),
+                ("compiler_runtime", "/usr/lib/gcc/example/libgcc.a"),
+            ]
+            .into_iter()
+            .map(|(role, path)| {
+                (
+                    role.to_owned(),
+                    SelectedFile {
+                        selected: path.into(),
+                        resolved: path.into(),
+                        sha256: "c".repeat(64),
+                        size: 128,
+                    },
+                )
+            })
+            .collect(),
+            compiler_queries: BTreeMap::new(),
+            sysroot: "/".to_owned(),
+        },
+        profile_sha256: profile_digest(),
+        helper_sha256: "d".repeat(64),
+        boundary_fingerprint: hex::encode([1; 32]),
+        plan_sha256: "b".repeat(64),
+        identity_scope: "fictional_projection_fixture",
+        acquisition: "unqualified_candidate_measurement",
+        full_closure_measured: false,
+    }
+}
+
 #[test]
 fn installed_image_identity_covers_helpers_headers_modes_and_aliases() {
     let temporary = tempfile::tempdir().expect("should create image fixture");

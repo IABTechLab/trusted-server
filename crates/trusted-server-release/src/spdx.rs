@@ -20,6 +20,8 @@ use crate::recipe::RecipeCompleted;
 
 pub(crate) mod cargo;
 pub(crate) mod javascript;
+pub(crate) mod native;
+pub(crate) mod platform;
 
 /// Validated bounded SPDX bytes, without a release-authorization capability.
 #[derive(Debug)]
@@ -99,6 +101,13 @@ enum ComponentRole {
 }
 
 enum Origin {
+    NativeVerified {
+        original: native::NativeOriginal,
+    },
+    PlatformMeasuredFile {
+        role: String,
+        sha256: String,
+    },
     JavascriptVerified {
         source_commit: String,
         original: javascript::JavascriptOriginal,
@@ -258,6 +267,10 @@ fn origin_fields(
     }
     let unknown_location = "NOASSERTION".to_owned();
     match origin {
+        Origin::NativeVerified { original } => native::origin_fields(component, original),
+        Origin::PlatformMeasuredFile { role, sha256 } => {
+            platform::file_origin_fields(component, role, sha256)
+        }
         Origin::JavascriptVerified {
             source_commit,
             original,

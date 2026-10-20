@@ -37,6 +37,33 @@ enum NativeToolCoverage {
 }
 
 impl PlatformEvidence {
+    /// Returns the selected target triple.
+    pub(crate) fn target(&self) -> &str {
+        self.target
+    }
+    /// Returns the accepted executable's raw-byte digest.
+    pub(crate) fn artifact_sha256(&self) -> &str {
+        &self.artifact_sha256
+    }
+    /// Borrows the measured installed Rust identity.
+    pub(crate) fn rust(&self) -> &RustToolEvidence {
+        &self.rust
+    }
+    /// Borrows exact Apple observations, including their exclusions.
+    pub(crate) fn apple(&self) -> Option<&AppleToolEvidence> {
+        self.apple.as_ref()
+    }
+    /// Borrows the owning GNU measurement, when actually captured.
+    pub(crate) fn gnu(&self) -> Option<&crate::recipe::gnu::GnuEvidence> {
+        match &self.native_tools {
+            NativeToolCoverage::ExplicitGnuImage { evidence } => Some(evidence),
+            _ => None,
+        }
+    }
+    /// Borrows the accepted executable's logical runtime requirements.
+    pub(crate) fn external_requirements(&self) -> &ExternalRequirements {
+        &self.external_requirements
+    }
     /// Attaches the owning GNU execution's measured installed-image evidence.
     ///
     /// # Errors
@@ -124,4 +151,4 @@ impl PlatformEvidence {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

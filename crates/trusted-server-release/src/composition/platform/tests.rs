@@ -47,6 +47,10 @@ impl Fixture {
     }
 
     fn apple(&self) -> AppleDeveloperTools {
+        self.apple_with_detached(false)
+    }
+
+    fn apple_with_detached(&self, detached: bool) -> AppleDeveloperTools {
         let developer_dir = self.root.join("developer");
         let bin = developer_dir.join("Toolchains/XcodeDefault.xctoolchain/usr/bin");
         let sdk_root =
@@ -62,7 +66,7 @@ impl Fixture {
             fs::write(path, b"fictional measured Apple input").expect("should write Apple fixture");
         }
         let digest = hex::encode(Sha256::digest(b"fictional measured Apple input"));
-        AppleDeveloperTools::from_facts_for_tests(AppleToolFacts {
+        let facts = AppleToolFacts {
             developer_dir,
             sdk_root,
             clang: bin.join("clang"),
@@ -74,8 +78,18 @@ impl Fixture {
             ar_sha256: digest.clone(),
             ld_sha256: digest.clone(),
             sdk_settings_sha256: digest,
-        })
-        .expect("should select measured Apple candidate")
+        };
+        if detached {
+            AppleDeveloperTools::with_detached_sdk_for_tests(
+                facts,
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+                &crate::process::Cancellation::default(),
+            )
+            .expect("should stage fictional detached SDK")
+        } else {
+            AppleDeveloperTools::from_facts_for_tests(facts)
+                .expect("should select measured Apple candidate")
+        }
     }
 }
 
@@ -115,6 +129,26 @@ fn collect(
     let external = requirements(fixture.target);
     let artifact = external.artifact_sha256().to_owned();
     PlatformEvidence::collect(tools, &tools.digest()?, external, fixture.target, &artifact)
+}
+
+/// Constructs typed platform fixtures only by measuring fictional tool files.
+pub(crate) fn projection_fixture(target: ReleaseTarget) -> PlatformEvidence {
+    let fixture = Fixture::new(target);
+    let tools = if target.is_darwin() {
+        fixture.tools().with_apple_developer_tools(fixture.apple())
+    } else {
+        fixture.tools()
+    };
+    collect(&fixture, &tools).expect("should collect measured platform fixture")
+}
+
+/// Measures an actual detached fictional SDK for the platform adapter tests.
+pub(crate) fn projection_detached_sdk_fixture() -> PlatformEvidence {
+    let fixture = Fixture::new(ReleaseTarget::Aarch64AppleDarwin);
+    let tools = fixture
+        .tools()
+        .with_apple_developer_tools(fixture.apple_with_detached(true));
+    collect(&fixture, &tools).expect("should collect detached SDK fixture")
 }
 
 #[test]

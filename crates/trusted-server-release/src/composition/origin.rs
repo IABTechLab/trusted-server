@@ -366,3 +366,38 @@ fn require_identity(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+impl VerifiedPackageOrigins {
+    /// Provides fictional registry joins for owner-checked native test fixtures.
+    pub(crate) fn fixture_native_registry(observed: &CargoObservations) -> Self {
+        Self {
+            source_commit: "a".repeat(40),
+            materials_sha256: "b".repeat(64),
+            packages: observed
+                .packages()
+                .iter()
+                .map(|package| {
+                    (
+                        package.id().to_owned(),
+                        PackageOrigin {
+                            name: package.name().to_owned(),
+                            version: package.version().to_owned(),
+                            manifest_path: Path::new("native")
+                                .join(package.name())
+                                .join("Cargo.toml"),
+                            prepared_manifest_sha256: "b".repeat(64),
+                            origin: Original::Material {
+                                source: "registry+https://example.com/index".to_owned(),
+                                original: crate::materials::CargoOrigin::Registry {
+                                    archive_sha256: "a".repeat(64),
+                                },
+                            },
+                        },
+                    )
+                })
+                .collect(),
+            native_sources: BTreeMap::new(),
+        }
+    }
+}

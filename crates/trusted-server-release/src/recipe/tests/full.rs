@@ -438,15 +438,35 @@ fn fastly_canonical_and_reproduction_builds_are_byte_identical() {
         text,
     )
     .expect("should retain the canonical/reproduction equality measurement");
-    run_runtime_gate(&RuntimeGateInputs {
+    let [canonical_runtime, reproduction_runtime] = run_runtime_gate(&RuntimeGateInputs {
         fixture: &fixture,
         source: &js.source,
         canonical: &canonical,
         reproduction: &reproduction,
         checked: &checked,
     });
-    super::candidate::check_export_after_cleanup(canonical, |build| &build.completed);
-    super::candidate::check_export_after_cleanup(reproduction, |build| &build.completed);
+    assert!(
+        canonical_runtime
+            .diagnostic_for(&reproduction.completed)
+            .is_err(),
+        "should reject attaching canonical acceptance to the equal-byte reproduction role"
+    );
+    assert!(
+        reproduction_runtime
+            .diagnostic_for(&canonical.completed)
+            .is_err(),
+        "should reject attaching reproduction acceptance to the equal-byte canonical role"
+    );
+    super::candidate::check_fastly_export_after_cleanup(
+        canonical,
+        |build| &build.completed,
+        &canonical_runtime,
+    );
+    super::candidate::check_fastly_export_after_cleanup(
+        reproduction,
+        |build| &build.completed,
+        &reproduction_runtime,
+    );
 }
 
 /// Everything the chained runtime gate needs from the equality run.
@@ -500,7 +520,7 @@ fn accepted_measurement(accepted: &FastlyRuntimeAccepted) -> serde_json::Value {
 
 /// Runs the final-byte runtime gate on both equal outputs, then proves that
 /// a run with a closed origin is rejected although its health check passes.
-fn run_runtime_gate(inputs: &RuntimeGateInputs<'_>) {
+fn run_runtime_gate(inputs: &RuntimeGateInputs<'_>) -> [FastlyRuntimeAccepted; 2] {
     let RuntimeGateInputs {
         fixture,
         source,
@@ -510,6 +530,7 @@ fn run_runtime_gate(inputs: &RuntimeGateInputs<'_>) {
     } = *inputs;
     let viceroy = pinned_viceroy();
     let mut builds = serde_json::Map::new();
+    let mut accepted_runs = Vec::new();
     for (role, build) in [("canonical", canonical), ("reproduction", reproduction)] {
         let accepted = accept_fastly_runtime(source, &build.completed, checked, &viceroy)
             .unwrap_or_else(|error| {
@@ -521,6 +542,7 @@ fn run_runtime_gate(inputs: &RuntimeGateInputs<'_>) {
             "should execute the exact accepted {role} bytes"
         );
         builds.insert(role.to_owned(), accepted_measurement(&accepted));
+        accepted_runs.push(accepted);
     }
     let bytes = read_artifact(&canonical.completed).expect("should reread the canonical bytes");
     let rejected = run_gate(&bytes, &viceroy, OriginPresence::Closed)
@@ -554,4 +576,7 @@ fn run_runtime_gate(inputs: &RuntimeGateInputs<'_>) {
         text,
     )
     .expect("should retain the runtime gate measurement");
+    accepted_runs
+        .try_into()
+        .expect("should retain exactly the canonical and reproduction runtime owners")
 }

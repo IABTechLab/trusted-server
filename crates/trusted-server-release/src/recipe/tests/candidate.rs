@@ -37,6 +37,23 @@ const ACQUISITION: &str = "unauthenticated-ordinary-ci";
 
 /// Checks that a real candidate export outlives all owned build storage.
 pub(super) fn check_export_after_cleanup<T>(build: T, completed: fn(&T) -> &RecipeCompleted) {
+    check_owned_export_after_cleanup(build, completed, None);
+}
+
+/// Checks an export carrying the actual final-byte Fastly runtime acceptance.
+pub(super) fn check_fastly_export_after_cleanup<T>(
+    build: T,
+    completed: fn(&T) -> &RecipeCompleted,
+    accepted: &super::super::runtime::FastlyRuntimeAccepted,
+) {
+    check_owned_export_after_cleanup(build, completed, Some(accepted));
+}
+
+fn check_owned_export_after_cleanup<T>(
+    build: T,
+    completed: fn(&T) -> &RecipeCompleted,
+    accepted: Option<&super::super::runtime::FastlyRuntimeAccepted>,
+) {
     let completed = completed(&build);
     let artifact = completed.artifact().path().to_owned();
     let view = completed
@@ -93,8 +110,32 @@ pub(super) fn check_export_after_cleanup<T>(build: T, completed: fn(&T) -> &Reci
         javascript_projection.component_count() > 0,
         "should project actual checked JS material even when CLI discards complete bundles"
     );
-    let export = crate::collection::producer::CandidateBuildExport::from_completed(completed)
-        .expect("should export actual candidate receipts before closing their owners");
+    let native = crate::spdx::native::NativeProjection::from_completed(completed).expect(
+        "should project exact observed native contexts through verified original materials",
+    );
+    assert_eq!(
+        native.component_count(),
+        view.native().contributors().len(),
+        "should preserve measured native membership rather than every prepared dependency"
+    );
+    let platform = crate::spdx::platform::PlatformProjection::from_completed(completed)
+        .expect("should project artifact-bound installed tools and logical runtime requirements");
+    assert!(
+        platform.component_count() > 0,
+        "should retain measured platform facts"
+    );
+    assert_eq!(
+        platform.receipt_sha256(),
+        view.receipt_sha256(),
+        "should project the exact retained composition receipt"
+    );
+    let export = match accepted {
+        Some(runtime) => crate::collection::producer::CandidateBuildExport::with_fastly_runtime(
+            completed, runtime,
+        ),
+        None => crate::collection::producer::CandidateBuildExport::from_completed(completed),
+    }
+    .expect("should export actual candidate receipts before closing their owners");
     drop(build);
     assert!(
         !artifact.exists(),
@@ -109,6 +150,40 @@ pub(super) fn check_export_after_cleanup<T>(build: T, completed: fn(&T) -> &Reci
         inventory,
         "should preserve original observer bytes after source, target and JS owners disappear"
     );
+    let record: Value = serde_json::from_slice(
+        &std::fs::read(root.join("candidate-build-record.json"))
+            .expect("should retain build record"),
+    )
+    .expect("should parse exported diagnostic record");
+    let gaps = record["gaps"]
+        .as_array()
+        .expect("should list remaining gaps");
+    match accepted {
+        Some(runtime) => {
+            assert_eq!(
+                record["runtime_acceptance"]["artifact"]["sha256"],
+                runtime.observed().artifact_sha256(),
+                "should retain final-byte runtime evidence after working-root cleanup"
+            );
+            assert!(
+                !gaps
+                    .iter()
+                    .any(|gap| gap == "runtime-acceptance-not-exported"),
+                "should remove only a gap satisfied by actual owning acceptance"
+            );
+        }
+        None => {
+            assert!(
+                record["runtime_acceptance"].is_null(),
+                "should not invent unobserved runtime acceptance"
+            );
+            assert!(
+                gaps.iter()
+                    .any(|gap| gap == "runtime-acceptance-not-exported"),
+                "should preserve the missing runtime gap"
+            );
+        }
+    }
 }
 
 /// Every field `fixture.json` must hold, and nothing else.
