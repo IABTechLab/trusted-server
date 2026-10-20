@@ -3181,6 +3181,7 @@ assume_single_jurisdiction = true
             user_agent: Some("test-agent".to_string()),
             ip: Some("203.0.113.42".to_string()),
             geo: None,
+            attributes: None,
         });
         let settings = make_settings();
         let request = build_test_request();
@@ -3361,6 +3362,7 @@ assume_single_jurisdiction = true
                 region: None,
                 asn: None,
             }),
+            attributes: None,
         });
 
         let settings = make_settings();
@@ -3455,6 +3457,7 @@ assume_single_jurisdiction = true
                 region: Some("NY".to_string()),
                 asn: None,
             }),
+            attributes: None,
         });
 
         let settings = make_settings();
@@ -3494,6 +3497,7 @@ assume_single_jurisdiction = true
                 region: Some("NY".to_string()),
                 asn: None,
             }),
+            attributes: None,
         });
 
         let settings = make_settings();
@@ -3791,6 +3795,7 @@ assume_single_jurisdiction = true
             user_agent: Some("TestAgent".to_string()),
             ip: None,
             geo: None,
+            attributes: None,
         });
 
         let settings = make_settings();
@@ -3819,6 +3824,7 @@ assume_single_jurisdiction = true
             user_agent: Some("TestAgent".to_string()),
             ip: None,
             geo: None,
+            attributes: None,
         });
 
         let settings = make_settings();
@@ -3852,6 +3858,7 @@ assume_single_jurisdiction = true
             user_agent: Some("TestAgent".to_string()),
             ip: None,
             geo: None,
+            attributes: None,
         });
 
         let settings = make_settings();
@@ -3928,6 +3935,7 @@ assume_single_jurisdiction = true
                 region: Some("NY".to_string()),
                 asn: None,
             }),
+            attributes: None,
         });
 
         let settings = make_settings();
@@ -4712,6 +4720,7 @@ assume_single_jurisdiction = true
                 user_agent: Some("test-agent".to_string()),
                 ip: None,
                 geo: None,
+                attributes: None,
             }),
             site: None,
             context: HashMap::new(),

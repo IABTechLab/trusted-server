@@ -6004,6 +6004,9 @@ mod tests {
                 h2_fp_hash: None,
                 known_browser: None,
                 looks_like_browser: false,
+                // Nothing here establishes whether a person is there, and
+                // `Unknown` is the value that says so rather than `Low`.
+                human_confidence: crate::ec::device::HumanConfidence::Unknown,
             }
         }
 
@@ -6513,6 +6516,7 @@ mod tests {
                 h2_fp_hash: None,
                 known_browser: None,
                 looks_like_browser: true,
+                human_confidence: crate::ec::device::HumanConfidence::Unknown,
             }
         }
     }

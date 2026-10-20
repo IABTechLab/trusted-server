@@ -26,7 +26,7 @@ use crate::settings::Settings;
 
 use super::AuctionOrchestrator;
 use super::formats::{
-    convert_to_openrtb_response, convert_to_openrtb_response_with_report,
+    attach_device_attributes, convert_to_openrtb_response, convert_to_openrtb_response_with_report,
     convert_tsjs_to_auction_request,
 };
 use super::telemetry::{
@@ -354,6 +354,18 @@ pub async fn handle_auction(
         geo,
     )?;
 
+    // Ask the selected device module what the bidder should be told about
+    // the device.
+    attach_device_attributes(
+        &mut auction_request,
+        &http_req,
+        ec_context.permissions(),
+        settings,
+        services,
+        settings.auction.timeout_ms,
+    )
+    .await;
+
     // Merge current-request client EIDs with KV-resolved EIDs, then apply
     // consent gating before attaching them to the auction request.
     let merged_eids = merge_auction_eids(client_eids, eids);
@@ -647,20 +659,26 @@ mod tests {
     use crate::auction::types::{AuctionRequest, AuctionResponse};
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::ConsentContext;
+    use crate::ec::device::{DeviceAttributes, DeviceModule};
     use crate::ec::tests::{CANONICAL_COOKIE_VALUE, CANONICAL_KV_KEY, CanonicalizingModule};
     use crate::error::IntoHttpResponse as _;
     use crate::openrtb::Uid;
     use crate::permissions::{Permission, PermissionSet, PermissionState};
     use crate::platform::test_support::{
-        NoopBackend, NoopConfigStore, NoopGeo, NoopHttpClient, NoopSecretStore, StubHttpClient,
-        noop_services,
+        DetectionServiceDevice, NamingBackend, NoopBackend, NoopConfigStore, NoopGeo,
+        NoopHttpClient, NoopSecretStore, StubHttpClient,
+        build_services_with_backend_and_http_client, noop_services,
     };
-    use crate::platform::{ClientInfo, PlatformHttpClient, PlatformHttpRequest, PlatformResponse};
+    use crate::platform::{
+        BackendNamingPolicy, ClientInfo, PlatformBackend, PlatformHttpClient, PlatformHttpRequest,
+        PlatformResponse,
+    };
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     #[derive(Default)]
     struct RecordingTelemetrySink {
@@ -2029,5 +2047,263 @@ mod tests {
                 "streaming request body should fail as bad request"
             );
         });
+    }
+
+    /// Records the [`AuctionRequest`] the orchestrator dispatched, then fails
+    /// its launch so no transport is needed.
+    struct RequestCapturingProvider {
+        captured: Arc<Mutex<Option<AuctionRequest>>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl AuctionProvider for RequestCapturingProvider {
+        fn provider_name(&self) -> &str {
+            "request_capturing_provider"
+        }
+
+        async fn request_bids(
+            &self,
+            request: &AuctionRequest,
+            _context: &AuctionContext<'_>,
+        ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
+            *self.captured.lock().expect("should lock captured request") = Some(request.clone());
+            Err(Report::new(TrustedServerError::Auction {
+                message: "capture only".to_string(),
+            }))
+        }
+
+        async fn parse_response(
+            &self,
+            _response: PlatformResponse,
+            _response_time_ms: u64,
+        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            panic!("parse_response must not run when the launch fails");
+        }
+
+        fn timeout_ms(&self) -> u32 {
+            100
+        }
+
+        fn backend_name(&self, _services: &RuntimeServices, _timeout_ms: u32) -> Option<String> {
+            Some("capture-backend".to_string())
+        }
+    }
+
+    fn orchestrator_capturing(
+        captured: &Arc<Mutex<Option<AuctionRequest>>>,
+    ) -> AuctionOrchestrator {
+        let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
+            enabled: true,
+            provider_names: vec!["request_capturing_provider".to_string()],
+            timeout_ms: 2000,
+            adserver_name: None,
+            ..Default::default()
+        });
+        orchestrator.register_provider(Arc::new(RequestCapturingProvider {
+            captured: Arc::clone(captured),
+        }));
+        orchestrator
+    }
+
+    fn one_slot_auction_request() -> Request<EdgeBody> {
+        Request::builder()
+            .method("POST")
+            .uri("https://test-publisher.com/auction")
+            .body(EdgeBody::from(
+                serde_json::to_vec(&json!({
+                    "adUnits": [
+                        {
+                            "code": "div-gpt-ad-1",
+                            "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+                        }
+                    ]
+                }))
+                .expect("should serialize body"),
+            ))
+            .expect("should build auction request")
+    }
+
+    fn tablet() -> DeviceAttributes {
+        DeviceAttributes {
+            device_type: Some(5),
+            make: Some("ExampleCorp".to_owned()),
+            ..DeviceAttributes::default()
+        }
+    }
+
+    fn selecting_basic_ads() -> PermissionSet {
+        PermissionSet::none().with(Permission::SelectBasicAds)
+    }
+
+    fn captured_attributes(
+        captured: &Arc<Mutex<Option<AuctionRequest>>>,
+    ) -> Option<DeviceAttributes> {
+        captured
+            .lock()
+            .expect("should lock captured request")
+            .as_ref()
+            .expect("should dispatch an auction request")
+            .device
+            .as_ref()
+            .and_then(|device| device.attributes.clone())
+    }
+
+    /// Runs `/auction` for `ec_context` with `module` selected, and returns
+    /// what reached the provider, if anything did.
+    async fn auction_with_device_module(
+        mut ec_context: EcContext,
+        module: &Arc<DetectionServiceDevice>,
+        services: RuntimeServices,
+    ) -> Arc<Mutex<Option<AuctionRequest>>> {
+        let settings = create_test_settings();
+        let captured = Arc::new(Mutex::new(None));
+        let orchestrator = orchestrator_capturing(&captured);
+        let services = services.with_device_module(Arc::clone(module) as Arc<dyn DeviceModule>);
+
+        // The capturing provider fails its launch, so the auction errors. The
+        // assertions are on what reached the provider and the module.
+        let _ = handle_auction(
+            &settings,
+            &orchestrator,
+            None,
+            None,
+            &mut ec_context,
+            &services,
+            one_slot_auction_request(),
+        )
+        .await;
+        captured
+    }
+
+    #[tokio::test]
+    async fn auction_asks_the_device_module_with_the_readers_permissions() {
+        let module = Arc::new(DetectionServiceDevice::new(
+            selecting_basic_ads(),
+            Some(tablet()),
+        ));
+        let ec_context = make_non_regulated_ec_context(None)
+            .with_permissions_for_test(PermissionState::new(selecting_basic_ads()));
+
+        let captured = auction_with_device_module(ec_context, &module, noop_services()).await;
+
+        assert_eq!(
+            module.asked(),
+            1,
+            "the auction should ask the device module"
+        );
+        assert_eq!(
+            captured_attributes(&captured),
+            Some(tablet()),
+            "a module whose permission the reader gave should describe the device to the bidder"
+        );
+    }
+
+    #[tokio::test]
+    async fn auction_sends_no_attributes_a_reader_has_not_agreed_to() {
+        let module = Arc::new(DetectionServiceDevice::new(
+            selecting_basic_ads(),
+            Some(tablet()),
+        ));
+        let ec_context = make_non_regulated_ec_context(None);
+
+        let captured = auction_with_device_module(ec_context, &module, noop_services()).await;
+
+        assert_eq!(
+            module.asked(),
+            1,
+            "the auction should ask the device module"
+        );
+        assert_eq!(
+            captured_attributes(&captured),
+            None,
+            "a reader who did not give the module's permission should have no device described"
+        );
+    }
+
+    #[tokio::test]
+    async fn auction_does_not_ask_the_device_module_when_consent_denies_the_auction() {
+        let module = Arc::new(DetectionServiceDevice::new(
+            selecting_basic_ads(),
+            Some(tablet()),
+        ));
+        // An unknown jurisdiction with no TCF signal fails the auction gate.
+        let ec_context = EcContext::new_for_test(None, ConsentContext::default())
+            .with_permissions_for_test(PermissionState::new(selecting_basic_ads()));
+
+        let captured = auction_with_device_module(ec_context, &module, noop_services()).await;
+
+        assert!(
+            captured
+                .lock()
+                .expect("should lock captured request")
+                .is_none(),
+            "a denied auction should dispatch nothing"
+        );
+        assert_eq!(
+            module.asked(),
+            0,
+            "a request on the consent-denied path should not reach the device module"
+        );
+    }
+
+    #[tokio::test]
+    async fn auction_caps_the_transport_timers_of_the_device_modules_backend() {
+        let backend = Arc::new(NamingBackend::new(BackendNamingPolicy::Axum));
+        let services = build_services_with_backend_and_http_client(
+            Arc::clone(&backend) as Arc<dyn PlatformBackend>,
+            Arc::new(NoopHttpClient),
+        );
+        let module = Arc::new(DetectionServiceDevice::new(PermissionSet::none(), None));
+
+        let _ = auction_with_device_module(make_non_regulated_ec_context(None), &module, services)
+            .await;
+
+        let limit = Duration::from_millis(u64::from(create_test_settings().auction.timeout_ms));
+        let specs = backend
+            .specs
+            .lock()
+            .expect("should lock registered backends");
+        let spec = specs
+            .iter()
+            .find(|spec| spec.host == "detect.example")
+            .expect("the device module should register its service's backend");
+        assert_eq!(
+            (spec.first_byte_timeout, spec.between_bytes_timeout),
+            (limit, limit),
+            "the module's service should hold the auction no longer than the auction's own timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn auction_drops_device_values_a_bidder_cannot_read() {
+        let module = Arc::new(DetectionServiceDevice::new(
+            PermissionSet::none(),
+            Some(DeviceAttributes {
+                device_type: Some(99),
+                make: Some(String::new()),
+                model: Some("   ".to_owned()),
+                os: Some("Android".to_owned()),
+                os_version: None,
+                screen_width: Some(0),
+                screen_height: Some(-1),
+            }),
+        ));
+
+        let captured = auction_with_device_module(
+            make_non_regulated_ec_context(None),
+            &module,
+            noop_services(),
+        )
+        .await;
+
+        assert_eq!(
+            captured_attributes(&captured),
+            Some(DeviceAttributes {
+                os: Some("Android".to_owned()),
+                ..DeviceAttributes::default()
+            }),
+            "a device type outside the list, a size that is not positive and a blank string \
+             should not reach the bidder"
+        );
     }
 }
