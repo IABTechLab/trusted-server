@@ -915,6 +915,68 @@ fn build(
     Ok(Some(GoogleTagManagerIntegration::new(config)))
 }
 
+/// Whether `value` has the shape of a tag id Google serves from `gtag/js`.
+#[must_use]
+pub fn tag_id_is_well_formed(value: &str) -> bool {
+    GTM_TAG_ID_PATTERN.is_match(value)
+}
+
+/// Whether `value` has the shape of a container id.
+#[must_use]
+pub fn container_id_is_well_formed(value: &str) -> bool {
+    GTM_CONTAINER_ID_PATTERN.is_match(value)
+}
+
+/// The first-party path this module serves `gtag/js` from for `tag_id`, or
+/// `None` when it would not serve that tag, either because the module is not
+/// selected or because `tag_id` is neither its container nor on its
+/// `allowed_tag_ids` list, where a request for the tag is redirected upstream
+/// rather than proxied, so naming the first-party path would only add a
+/// redirect to the page's first script.
+///
+/// # Errors
+///
+/// When the module's settings cannot be read or fail their validation.
+pub fn first_party_gtag_js_path(
+    settings: &Settings,
+    tag_id: &str,
+) -> Result<Option<String>, Report<TrustedServerError>> {
+    let Some(config) = settings.module_config::<GoogleTagManagerConfig>(MODULE)? else {
+        return Ok(None);
+    };
+    let serves_tag = config.container_id == tag_id
+        || config
+            .allowed_tag_ids
+            .iter()
+            .any(|allowed| allowed == tag_id);
+    if !serves_tag {
+        return Ok(None);
+    }
+    Ok(Some(format!("/integrations/{GTM_INTEGRATION_ID}/gtag/js")))
+}
+
+/// The first-party path this module serves `gtm.js` from for `container_id`,
+/// or `None` when it would not serve that container. The endpoint always
+/// answers with the container this module is configured for and never with
+/// the one the request names, so a first-party path is only right when the
+/// two are the same container.
+///
+/// # Errors
+///
+/// When the module's settings cannot be read or fail their validation.
+pub fn first_party_gtm_js_path(
+    settings: &Settings,
+    container_id: &str,
+) -> Result<Option<String>, Report<TrustedServerError>> {
+    let Some(config) = settings.module_config::<GoogleTagManagerConfig>(MODULE)? else {
+        return Ok(None);
+    };
+    if config.container_id != container_id {
+        return Ok(None);
+    }
+    Ok(Some(format!("/integrations/{GTM_INTEGRATION_ID}/gtm.js")))
+}
+
 /// Validates the Google Tag Manager configuration for deployment and reports whether
 /// a section selects the integration's module.
 ///
