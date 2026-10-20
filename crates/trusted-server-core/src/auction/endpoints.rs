@@ -10,7 +10,7 @@ use serde_json::Value as JsonValue;
 use crate::auction::formats::AdRequest;
 use crate::auction::orchestrator::OrchestrationResult;
 use crate::consent::{consent_allows_server_side_auction, gate_eids_by_permissions};
-use crate::constants::COOKIE_TS_EIDS;
+use crate::constants::COOKIE_EIDS;
 use crate::cookies::extract_cookie_value;
 use crate::ec::EcContext;
 use crate::ec::EcKvSnapshot;
@@ -295,7 +295,11 @@ pub async fn handle_auction(
     let client_eids = if ec_id.is_some() {
         resolve_client_auction_eids(
             body.eids.as_ref(),
-            extract_cookie_value(&http_req, COOKIE_TS_EIDS).as_deref(),
+            extract_cookie_value(
+                &http_req,
+                &services.public_prefix().cookie_name(COOKIE_EIDS),
+            )
+            .as_deref(),
         )
     } else {
         None
@@ -1538,7 +1542,7 @@ mod tests {
         let req = Request::builder()
             .method("POST")
             .uri("https://test-publisher.com/auction")
-            .header("cookie", format!("{COOKIE_TS_EIDS}={encoded_cookie}"))
+            .header("cookie", format!("ts-{COOKIE_EIDS}={encoded_cookie}"))
             .body(EdgeBody::from(
                 serde_json::to_vec(&body).expect("should serialize body"),
             ))

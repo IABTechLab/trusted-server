@@ -23,6 +23,7 @@ import {
   resolveFirstImpressionElement,
 } from '../../core/first_impression';
 import { log } from '../../core/log';
+import { cookieName } from '../../shared/public_prefix';
 import { buildAdRequest, parseAuctionResponse } from '../../core/auction';
 import { registerApsPrebidRenderer, validateApsRenderer } from '../aps/render';
 import type { AuctionBid, AuctionEid } from '../../core/auction';
@@ -2359,8 +2360,9 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       const requestScopedBidRequests = [...validBidRequests];
       const hasUserIdApi = typeof pbjs.getUserIdsAsEids === 'function';
       const auctionEids = collectAuctionEids();
-      if (hasUserIdApi && !auctionEids) {
-        clearPrebidEidsCookie();
+      const eidsCookie = cookieName(EID_COOKIE);
+      if (hasUserIdApi && !auctionEids && eidsCookie) {
+        clearPrebidEidsCookie(eidsCookie);
       }
       const payload = buildAdRequest(validBidRequests, { eids: auctionEids });
       return {
@@ -2904,15 +2906,16 @@ export function installUserIdModules(): void {
 /** Maximum cookie payload size in bytes (leave room for other cookies). */
 const MAX_EID_COOKIE_BYTES = 3072;
 
-/** Cookie name for persisted Prebid EIDs. */
-const EID_COOKIE_NAME = 'ts-eids';
+/** The cookie persisted Prebid EIDs are written in, named after the page's
+ * public prefix, such as `ts-eids`. */
+const EID_COOKIE = 'eids';
 
 /** Cookie max-age in seconds (1 day). */
 const EID_COOKIE_MAX_AGE = 86400;
 
-/** Clears any previously persisted Prebid EIDs cookie. */
-function clearPrebidEidsCookie(): void {
-  document.cookie = `${EID_COOKIE_NAME}=; Path=/; Secure; SameSite=Lax; Max-Age=0`;
+/** Clears any previously persisted Prebid EIDs cookie, named `name`. */
+function clearPrebidEidsCookie(name: string): void {
+  document.cookie = `${name}=; Path=/; Secure; SameSite=Lax; Max-Age=0`;
 }
 
 /**
@@ -2976,31 +2979,37 @@ function logTrimmedEidSources(droppedSources: Set<string>, trimmedSources: Set<s
 
 /**
  * Collects EIDs from Prebid's User ID Module and writes them as a
- * base64-encoded OpenRTB-style JSON cookie (`ts-eids`) for backend ingestion
- * and auction fallback on later requests.
+ * base64-encoded OpenRTB-style JSON cookie (`<prefix>-eids`, such as
+ * `ts-eids`) for backend ingestion and auction fallback on later requests. A
+ * page naming no public prefix writes no cookie.
  */
 function syncPrebidEidsCookie(): void {
+  const name = cookieName(EID_COOKIE);
+  if (!name) {
+    log.debug('the page names no public prefix, so the EIDs cookie is not written');
+    return;
+  }
   try {
     if (typeof pbjs.getUserIdsAsEids !== 'function') {
       // Without Prebid EIDs to forward, stale auction fallback IDs must not persist.
-      clearPrebidEidsCookie();
+      clearPrebidEidsCookie(name);
       return;
     }
 
     const eids = collectAuctionEids();
     if (!eids) {
-      clearPrebidEidsCookie();
+      clearPrebidEidsCookie(name);
       return;
     }
 
     const payload = fitAuctionEidsToCookie(eids);
     if (!payload) {
-      clearPrebidEidsCookie();
+      clearPrebidEidsCookie(name);
       return;
     }
 
     const encoded = btoa(JSON.stringify(payload));
-    document.cookie = `${EID_COOKIE_NAME}=${encoded}; Path=/; Secure; SameSite=Lax; Max-Age=${EID_COOKIE_MAX_AGE}`;
+    document.cookie = `${name}=${encoded}; Path=/; Secure; SameSite=Lax; Max-Age=${EID_COOKIE_MAX_AGE}`;
 
     log.debug(`[tsjs-prebid] synced ${payload.length} EID sources to cookie`);
   } catch (err) {

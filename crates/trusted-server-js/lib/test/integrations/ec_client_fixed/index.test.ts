@@ -8,7 +8,19 @@ async function importModule() {
 }
 
 function clearResolvedMarker() {
-  document.cookie = 'ts-ecr=; expires=Thu, 01 Jan 1970 00:00:00 GMT';
+  for (const name of ['ts-ecr', '_ex-ecr']) {
+    document.cookie = `${name}=; expires=Thu, 01 Jan 1970 00:00:00 GMT`;
+  }
+}
+
+// The bundle tag the server writes, carrying the public prefix the page's
+// names start with.
+function serveWithPrefix(prefix: string | null): void {
+  document.getElementById('trustedserver-js')?.remove();
+  const tag = document.createElement('script');
+  tag.id = 'trustedserver-js';
+  if (prefix !== null) tag.setAttribute('data-ts-public-prefix', prefix);
+  document.head.appendChild(tag);
 }
 
 describe('ec_client_fixed', () => {
@@ -26,6 +38,7 @@ describe('ec_client_fixed', () => {
 
   beforeEach(() => {
     clearResolvedMarker();
+    serveWithPrefix('ts');
     setPageState(['necessary.operations.storage']);
     global.fetch = vi.fn().mockResolvedValue({ ok: true });
   });
@@ -33,6 +46,7 @@ describe('ec_client_fixed', () => {
   afterEach(() => {
     global.fetch = ORIGINAL_FETCH;
     clearResolvedMarker();
+    document.getElementById('trustedserver-js')?.remove();
     delete window.tsjs;
     vi.resetModules();
   });
@@ -83,12 +97,12 @@ describe('ec_client_fixed', () => {
 
   it('detects the resolved-marker cookie presence', async () => {
     const { hasResolvedMarker } = await importModule();
-    expect(hasResolvedMarker('a=1; ts-ecr=1; b=2')).toBe(true);
-    expect(hasResolvedMarker('first-party=1; b=2')).toBe(false);
+    expect(hasResolvedMarker('a=1; ts-ecr=1; b=2', 'ts-ecr')).toBe(true);
+    expect(hasResolvedMarker('first-party=1; b=2', 'ts-ecr')).toBe(false);
     // The Edge Cookie itself is HttpOnly and never visible here, so its name
     // must not satisfy the marker check.
-    expect(hasResolvedMarker('ts-ec=abc')).toBe(false);
-    expect(hasResolvedMarker('')).toBe(false);
+    expect(hasResolvedMarker('ts-ec=abc', 'ts-ecr')).toBe(false);
+    expect(hasResolvedMarker('', 'ts-ecr')).toBe(false);
   });
 
   it('posts the fixed known word to the resolve endpoint when no marker is present', async () => {
@@ -118,6 +132,34 @@ describe('ec_client_fixed', () => {
     const value = await resolveEdgeCookie();
 
     expect(value).toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('reads the marker named after the public prefix of the page', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true });
+    global.fetch = fetchMock as unknown as typeof fetch;
+    serveWithPrefix('_ex');
+    document.cookie = 'ts-ecr=1';
+    const { resolveEdgeCookie } = await importModule();
+    fetchMock.mockClear();
+
+    await expect(resolveEdgeCookie()).resolves.toBe('an-ec');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    document.cookie = '_ex-ecr=1';
+    fetchMock.mockClear();
+    await expect(resolveEdgeCookie()).resolves.toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('does not post on a page naming no public prefix', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true });
+    global.fetch = fetchMock as unknown as typeof fetch;
+    serveWithPrefix(null);
+    const { resolveEdgeCookie } = await importModule();
+    fetchMock.mockClear();
+
+    await expect(resolveEdgeCookie()).resolves.toBeNull();
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });

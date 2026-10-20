@@ -37,7 +37,7 @@ use super::{EcKvSnapshot, EidSyncSource, current_timestamp, log_id};
 /// leaves an already-issued cookie intact. There is no separate consent KV
 /// store to clean up.
 ///
-/// `eids_cookie` should be the raw value of the `ts-eids` cookie extracted
+/// `eids_cookie` should be the raw value of the EIDs cookie extracted
 /// from the request *before* routing consumes it.
 ///
 /// `services` are the request's runtime services, handed to the selected Edge
@@ -61,7 +61,7 @@ pub async fn ec_finalize_response(
     // unless a module produced headers, so it is safe on every path. Each
     // one was checked against core's reserved response surface at capture
     // time in `EcContext::candidate_id`, so nothing here can set a
-    // managed `ts-` cookie, an `x-ts-` header, or a framing or hop-by-hop
+    // cookie under the public prefix, an `x-ts-` header, or a framing or hop-by-hop
     // header. They accumulate with whatever the origin returned rather than
     // replacing it, for the reasons on
     // `module::apply_module_response_headers`.
@@ -80,7 +80,8 @@ pub async fn ec_finalize_response(
         // Expire the request-local marker independently of the EC cookie: a
         // withdrawal must stop any pending pull-sync disclosure window.
         if storage_withdrawn && ec_context.pull_sync_marker().was_present() {
-            expire_marker(ec_context.pull_sync_marker_mut(), response);
+            let public = ec_context.public_prefix().clone();
+            expire_marker(&public, ec_context.pull_sync_marker_mut(), response);
         }
 
         finalize_unusable_consent(
@@ -94,7 +95,7 @@ pub async fn ec_finalize_response(
         return;
     }
 
-    // The request carried a `ts-ec` the selected module does not own, which
+    // The request carried an Edge Cookie the selected module does not own, which
     // is what a switch between client-cycle modules looks like on the first
     // request after the switch. The resolved marker is not namespaced by the
     // module code, so it would otherwise survive and tell the new module's
@@ -104,7 +105,7 @@ pub async fn ec_finalize_response(
     // already ignored for read-back and a returning visitor may still be
     // carrying an identifier another selected module would own.
     if ec_context.cookie_was_present() && !ec_context.ec_was_present() {
-        expire_ec_resolved_marker(settings, response);
+        expire_ec_resolved_marker(settings, ec_context.public_prefix(), response);
     }
 
     // Returning user: EC is permitted and came from the request.
@@ -272,8 +273,10 @@ fn reconcile_pull_sync_marker(
 ) {
     let ec_id = ec_context.ec_value().map(str::to_owned);
     let snapshot = ec_context.kv_snapshot().clone();
+    let public = ec_context.public_prefix().clone();
     reconcile_marker(
         settings,
+        &public,
         registry,
         ec_id.as_deref(),
         &snapshot,
@@ -472,7 +475,7 @@ pub fn set_ec_cookie_on_response(
     response: &mut Response<EdgeBody>,
 ) {
     if let Some(ec_id) = ec_context.ec_value() {
-        set_ec_cookie(settings, response, ec_id);
+        set_ec_cookie(settings, ec_context.public_prefix(), response, ec_id);
     }
 }
 
@@ -505,8 +508,12 @@ fn partner_response_header(source_domain: &str) -> String {
 /// Clears EC cookie and removes EC-specific response headers.
 ///
 /// Used when the request carries an explicit withdrawal signal.
-pub fn clear_ec_on_response(settings: &Settings, response: &mut Response<EdgeBody>) {
-    expire_ec_cookie(settings, response);
+pub fn clear_ec_on_response(
+    settings: &Settings,
+    public: &crate::prefix::PublicPrefix,
+    response: &mut Response<EdgeBody>,
+) {
+    expire_ec_cookie(settings, public, response);
     clear_ec_headers_on_response(response, None);
 }
 
@@ -531,7 +538,7 @@ fn finalize_unusable_consent(
         return;
     }
 
-    expire_ec_cookie(settings, response);
+    expire_ec_cookie(settings, ec_context.public_prefix(), response);
 
     // Compute once for the authoritative identity-graph tombstones, keyed by
     // the canonical form each row is stored under.
@@ -811,7 +818,11 @@ mod tests {
         set_header(&mut response, "x-ts-eids", "[]");
         set_header(&mut response, "x-ts-unrelated", "keep-me");
 
-        clear_ec_on_response(&settings, &mut response);
+        clear_ec_on_response(
+            &settings,
+            &crate::prefix::PublicPrefix::default(),
+            &mut response,
+        );
 
         assert!(
             get_header(&response, "x-ts-ec").is_none(),

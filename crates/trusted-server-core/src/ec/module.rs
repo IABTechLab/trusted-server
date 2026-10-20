@@ -36,6 +36,7 @@ use crate::error::TrustedServerError;
 use crate::evidence::{HostSignals, RequestInfo};
 use crate::module_context::ModuleCall;
 use crate::permissions::{Permission, PermissionSet};
+use crate::prefix::PublicPrefix;
 use crate::redacted::Redacted;
 use crate::settings::{Ec, EcModuleBlock};
 
@@ -186,17 +187,6 @@ pub struct GeneratedEdgeCookie {
     pub response_headers: Vec<(http::HeaderName, http::HeaderValue)>,
 }
 
-/// The cookie-name namespace Trusted Server manages.
-///
-/// Every cookie core writes or reads as part of its own behavior is named
-/// `ts-<something>` (`ts-ec` in [`COOKIE_TS_EC`](crate::constants::COOKIE_TS_EC),
-/// `ts-eids` in [`COOKIE_TS_EIDS`](crate::constants::COOKIE_TS_EIDS), and
-/// `ts-tester` in [`COOKIE_TS_TESTER`](crate::constants::COOKIE_TS_TESTER)), so
-/// core defends the whole prefix rather than a list that a new managed cookie
-/// would silently outgrow. `sharedId` is deliberately not reserved: core only
-/// reads it, and it belongs to the page's own identity stack.
-const MANAGED_COOKIE_NAME_PREFIX: &[u8] = b"ts-";
-
 /// The response-header namespace Trusted Server reserves for itself.
 ///
 /// Covers the fixed EC output headers and the per-partner
@@ -230,8 +220,9 @@ const FRAMING_OR_HOP_BY_HOP_HEADERS: &[&str] = &[
 /// Why one module response header falls inside core's reserved surface.
 #[derive(Debug, Copy, Clone, Eq, PartialEq, derive_more::Display)]
 pub enum ReservedResponseEffect {
-    /// A `Set-Cookie` naming a cookie in the `ts-` namespace core manages.
-    #[display("sets a cookie in the `ts-` namespace Trusted Server manages")]
+    /// A `Set-Cookie` naming a cookie in the namespace the deployment's public
+    /// prefix starts, which core manages.
+    #[display("sets a cookie under the public prefix core manages")]
     ManagedCookie,
 
     /// A header in the `x-ts-` namespace core emits and strips.
@@ -271,20 +262,24 @@ fn set_cookie_name(value: &[u8]) -> &[u8] {
 /// publisher proxy and integration proxy log the error and serve the response
 /// without an Edge Cookie, and orphan recovery in EC finalization leaves the
 /// visitor's existing cookie in place. Applying the header instead would let a
-/// module set `ts-ec` directly, bypassing core's identifier validation and
+/// module set the Edge Cookie directly, bypassing core's identifier validation and
 /// its requirement that a created identifier have an identity-graph row.
+///
+/// `public` is the request's public prefix, and every cookie core writes or
+/// reads as part of its own behavior is named `<public prefix>-<something>`,
+/// such as `ts-ec`, so core defends the whole namespace rather than a list
+/// that a new managed cookie would silently outgrow. `sharedId` is deliberately
+/// not reserved, because core only reads it and it belongs to the page's own
+/// identity stack.
 #[must_use]
 pub fn reserved_response_effect(
     name: &http::HeaderName,
     value: &http::HeaderValue,
+    public: &PublicPrefix,
 ) -> Option<ReservedResponseEffect> {
     let lower = name.as_str();
     if lower == http::header::SET_COOKIE.as_str() {
-        let cookie_name = set_cookie_name(value.as_bytes());
-        if cookie_name.len() >= MANAGED_COOKIE_NAME_PREFIX.len()
-            && cookie_name[..MANAGED_COOKIE_NAME_PREFIX.len()]
-                .eq_ignore_ascii_case(MANAGED_COOKIE_NAME_PREFIX)
-        {
+        if public.owns_cookie_name(set_cookie_name(value.as_bytes())) {
             return Some(ReservedResponseEffect::ManagedCookie);
         }
         return None;
@@ -1530,7 +1525,7 @@ mod tests {
         ] {
             let (name, value) = header(name, value);
             assert_eq!(
-                reserved_response_effect(&name, &value),
+                reserved_response_effect(&name, &value, &PublicPrefix::default()),
                 Some(expected),
                 "`{name}` should be reserved"
             );
@@ -1548,7 +1543,7 @@ mod tests {
         ] {
             let (name, value) = header(name, value);
             assert_eq!(
-                reserved_response_effect(&name, &value),
+                reserved_response_effect(&name, &value, &PublicPrefix::default()),
                 None,
                 "`{name}` is the module's own and should be allowed"
             );
@@ -1571,7 +1566,7 @@ mod tests {
             "the test value should not be readable as UTF-8"
         );
         assert_eq!(
-            reserved_response_effect(&name, &value),
+            reserved_response_effect(&name, &value, &PublicPrefix::default()),
             Some(ReservedResponseEffect::ManagedCookie),
             "a non-UTF-8 Set-Cookie should still be matched on its cookie name"
         );
@@ -2272,10 +2267,10 @@ mod tests {
         );
         assert!(
             script.contains(&format!(
-                "const MARKER_COOKIE_NAME = '{}'",
-                crate::constants::COOKIE_TS_EC_RESOLVED
+                "const MARKER_COOKIE = '{}'",
+                crate::constants::COOKIE_EC_RESOLVED
             )),
-            "the page script's marker cookie name should match COOKIE_TS_EC_RESOLVED"
+            "the page script's marker cookie name should match COOKIE_EC_RESOLVED"
         );
         // The page module declares the same permission the server-side
         // module requires, and checks it against the state the page is

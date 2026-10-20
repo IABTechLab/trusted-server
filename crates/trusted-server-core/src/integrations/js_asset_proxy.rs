@@ -677,6 +677,7 @@ mod tests {
         );
         let config = HtmlProcessorConfig {
             csp_nonce_observed: None,
+            public_prefix: None,
             prepared: std::sync::Arc::new(crate::middleware::Prepared::default()),
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
