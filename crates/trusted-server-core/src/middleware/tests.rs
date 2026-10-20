@@ -1874,3 +1874,144 @@ fn deploy_validation_refuses_a_misshapen_entry() {
         "should name the entry: {error}"
     );
 }
+
+#[test]
+fn the_making_entry_is_for_the_request_path_and_names_a_middleware() {
+    let entries = PhaseEntries::new(vec![
+        PhaseEntry {
+            media_type: "text/plain".to_owned(),
+            path: Some("/ads.txt".to_owned()),
+            middleware: Vec::new(),
+        },
+        PhaseEntry {
+            media_type: "text/plain".to_owned(),
+            path: Some("/ads.txt".to_owned()),
+            middleware: vec!["example.sellers".to_owned()],
+        },
+        PhaseEntry {
+            media_type: HTML_MEDIA_TYPE.to_owned(),
+            path: None,
+            middleware: vec!["example.page".to_owned()],
+        },
+    ]);
+
+    assert_eq!(
+        entries
+            .making("/ads.txt")
+            .map(|entry| entry.middleware.as_slice()),
+        Some(&["example.sellers".to_owned()][..]),
+        "should pass the entry naming no middleware and take the first that names one"
+    );
+    assert!(
+        entries.making("/robots.txt").is_none(),
+        "should make nothing where no entry is for the request path, whatever covers every path"
+    );
+}
+
+#[test]
+fn an_html_entry_with_a_path_makes_nothing() {
+    let entries = PhaseEntries::new(vec![PhaseEntry {
+        media_type: HTML_MEDIA_TYPE.to_owned(),
+        path: Some("/news/missing".to_owned()),
+        middleware: vec!["example.page".to_owned()],
+    }]);
+
+    assert!(
+        entries.making("/news/missing").is_none(),
+        "should leave a page the origin does not have as the origin's answer"
+    );
+}
+
+#[test]
+fn a_file_is_made_at_the_entry_path_alone() {
+    let entries = PhaseEntries::new(vec![
+        PhaseEntry {
+            media_type: "text/css".to_owned(),
+            path: Some("/".to_owned()),
+            middleware: vec!["example.styles".to_owned()],
+        },
+        PhaseEntry {
+            media_type: "text/plain".to_owned(),
+            path: Some("/ads.txt".to_owned()),
+            middleware: vec!["example.sellers".to_owned()],
+        },
+        PhaseEntry {
+            media_type: "text/plain".to_owned(),
+            path: Some("/feeds/".to_owned()),
+            middleware: vec!["example.feeds".to_owned()],
+        },
+    ]);
+
+    assert_eq!(
+        entries
+            .making("/ads.txt")
+            .map(|entry| entry.media_type.as_str()),
+        Some("text/plain"),
+        "should make the file from the entry for its own path"
+    );
+    for path in [
+        "/site.css",
+        "/missing-page",
+        "/ads.txt.bak",
+        "/feeds/latest",
+    ] {
+        assert!(
+            entries.making(path).is_none(),
+            "should make nothing at {path}, which an entry's path only begins"
+        );
+    }
+    for folder in ["/", "/feeds/"] {
+        assert!(
+            entries.making(folder).is_none(),
+            "should make nothing for the folder {folder}"
+        );
+    }
+}
+
+#[test]
+fn the_first_entry_written_for_the_path_makes_the_file() {
+    let entries = PhaseEntries::new(vec![
+        PhaseEntry {
+            media_type: "text/css".to_owned(),
+            path: Some("/ads.txt".to_owned()),
+            middleware: vec!["example.styles".to_owned()],
+        },
+        PhaseEntry {
+            media_type: "text/plain".to_owned(),
+            path: Some("/ads.txt".to_owned()),
+            middleware: vec!["example.sellers".to_owned()],
+        },
+    ]);
+
+    assert_eq!(
+        entries
+            .making("/ads.txt")
+            .map(|entry| entry.media_type.as_str()),
+        Some("text/css"),
+        "should take the entry written first among those for the path"
+    );
+}
+
+#[test]
+fn an_html_entry_ahead_does_not_shadow_the_entry_that_makes_the_file() {
+    let entries = PhaseEntries::new(vec![
+        PhaseEntry {
+            media_type: HTML_MEDIA_TYPE.to_owned(),
+            path: Some("/".to_owned()),
+            middleware: vec!["example.page".to_owned()],
+        },
+        PhaseEntry {
+            media_type: "text/plain".to_owned(),
+            path: Some("/ads.txt".to_owned()),
+            middleware: vec!["example.sellers".to_owned()],
+        },
+    ]);
+
+    assert_eq!(
+        entries
+            .making("/ads.txt")
+            .map(|entry| entry.media_type.as_str()),
+        Some("text/plain"),
+        "should make the file from the text/plain entry, not as HTML"
+    );
+}
