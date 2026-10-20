@@ -15,6 +15,7 @@ fn fixture() -> SpdxInputs<'static> {
         source_commit: "a".repeat(40),
         target: ReleaseTarget::Wasm32Wasip1,
         created: "2026-01-01T00:00:00Z".to_owned(),
+        document_comment: None,
         components: vec![
             component(
                 "rust:example",

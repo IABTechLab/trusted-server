@@ -13,7 +13,7 @@ use crate::javascript::contributions::{
 };
 use crate::recipe::RecipeCompleted;
 
-use super::{Component, ComponentRole, Origin, lower_hex, plain, spdx_error};
+use super::{Component, ComponentRole, Dependency, Origin, lower_hex, plain, spdx_error};
 
 /// Checked renderer inputs without complete native/tool coverage authority.
 pub(crate) struct JavascriptProjection<'a> {
@@ -56,6 +56,10 @@ impl<'a> JavascriptProjection<'a> {
     /// Returns final-byte observations borrowed from the sealed owner.
     pub(crate) fn membership(&self) -> &JsMembership {
         self.view.javascript()
+    }
+    /// Releases the renderer components; JavaScript projects no package edges.
+    pub(super) fn into_parts(self) -> (Vec<Component>, Vec<Dependency>) {
+        (self.components, Vec::new())
     }
 }
 

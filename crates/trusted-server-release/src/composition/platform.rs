@@ -64,6 +64,27 @@ impl PlatformEvidence {
     pub(crate) fn external_requirements(&self) -> &ExternalRequirements {
         &self.external_requirements
     }
+    /// Returns native tool roles whose host paths were never resolved or measured.
+    pub(crate) fn unresolved_native_tool_roles(&self) -> &[&'static str] {
+        match &self.native_tools {
+            NativeToolCoverage::HostPathUnresolved { roles } => roles,
+            NativeToolCoverage::ExplicitAppleFiles { .. }
+            | NativeToolCoverage::ExplicitGnuImage { .. } => &[],
+        }
+    }
+    /// Returns whether explicit Apple files lack a measured full tool closure.
+    pub(crate) fn apple_tool_closure_unmeasured(&self) -> bool {
+        matches!(
+            self.native_tools,
+            NativeToolCoverage::ExplicitAppleFiles {
+                full_closure_measured: false
+            }
+        )
+    }
+    /// Returns whether material native coverage is recorded as complete.
+    pub(crate) fn material_native_coverage_complete(&self) -> bool {
+        self.material_native_coverage_complete
+    }
     /// Attaches the owning GNU execution's measured installed-image evidence.
     ///
     /// # Errors

@@ -67,6 +67,11 @@ impl<'a> CargoProjection<'a> {
     pub(crate) fn observations(&self) -> &CargoObservations {
         self.view.observations()
     }
+
+    /// Releases the renderer components and potential package relations.
+    pub(super) fn into_parts(self) -> (Vec<Component>, Vec<Dependency>) {
+        (self.components, self.dependencies)
+    }
 }
 
 fn project(

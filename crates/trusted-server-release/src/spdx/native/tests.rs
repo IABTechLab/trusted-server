@@ -49,6 +49,7 @@ fn native_original_archive_checksum_and_measured_outputs_remain_distinct() {
             source_commit: "a".repeat(40),
             target: crate::policy::ReleaseTarget::Aarch64AppleDarwin,
             created: "2026-01-01T00:00:00Z".to_owned(),
+            document_comment: None,
             components,
             dependencies: Vec::new(),
         })

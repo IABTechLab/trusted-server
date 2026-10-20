@@ -1,9 +1,13 @@
 //! Conservative projection of sealed installed-tool and logical runtime facts.
 
+use std::collections::BTreeSet;
+
 use error_stack::Report;
 use serde_json::json;
 
-use super::{Component, ComponentRole, Origin, OriginFields, lower_hex, plain, spdx_error};
+use super::{
+    Component, ComponentRole, Dependency, Origin, OriginFields, lower_hex, plain, spdx_error,
+};
 use crate::composition::CompositionView;
 use crate::composition::external::Runtime;
 use crate::composition::platform::PlatformEvidence;
@@ -58,6 +62,40 @@ impl<'a> PlatformProjection<'a> {
     pub(crate) fn receipt_sha256(&self) -> &str {
         self.view.receipt_sha256()
     }
+    /// Returns sorted, unique coverage gaps recorded in the sealed measurements.
+    pub(super) fn coverage_gaps(&self) -> Vec<String> {
+        coverage_gaps(self.view.platform())
+    }
+    /// Releases the renderer components; platform facts project no package edges.
+    pub(super) fn into_parts(self) -> (Vec<Component>, Vec<Dependency>) {
+        (self.components, Vec::new())
+    }
+}
+
+/// Names each recorded incompleteness without upgrading any measurement.
+fn coverage_gaps(platform: &PlatformEvidence) -> Vec<String> {
+    let mut gaps = BTreeSet::new();
+    if !platform.material_native_coverage_complete() {
+        gaps.insert("native-material-coverage-incomplete".to_owned());
+    }
+    for role in platform.unresolved_native_tool_roles() {
+        gaps.insert(format!("native-tool-host-path-unresolved:{role}"));
+    }
+    if platform.apple_tool_closure_unmeasured() {
+        gaps.insert("apple-tool-closure-unmeasured".to_owned());
+    }
+    if let Some(apple) = platform.apple() {
+        for exclusion in apple.coverage_exclusions() {
+            gaps.insert(format!("apple-coverage-excluded:{exclusion}"));
+        }
+    }
+    if platform
+        .gnu()
+        .is_some_and(|gnu| !gnu.content_unmeasured_files().is_empty())
+    {
+        gaps.insert("gnu-privileged-helper-content-unmeasured".to_owned());
+    }
+    gaps.into_iter().collect()
 }
 
 struct Owner {

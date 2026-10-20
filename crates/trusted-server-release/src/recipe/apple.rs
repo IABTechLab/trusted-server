@@ -160,6 +160,10 @@ impl AppleToolEvidence {
     pub(crate) fn sdk_version(&self) -> &str {
         &self.sdk_version
     }
+    /// Returns the reviewed input classes this selection does not hash.
+    pub(crate) fn coverage_exclusions(&self) -> &[&'static str] {
+        &self.coverage_exclusions
+    }
 }
 
 fn lower_hex_digest(text: &str) -> bool {

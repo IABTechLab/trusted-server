@@ -206,6 +206,7 @@ fn rendered_projection_preserves_runtime_constraints_without_runtime_byte_checks
         source_commit: owner.source,
         target: owner.target,
         created: "2026-01-01T00:00:00Z".to_owned(),
+        document_comment: None,
         components,
         dependencies: vec![],
     };
@@ -256,6 +257,7 @@ fn compiler_runtime_archive_is_a_build_dependency_with_no_tool_or_retention_clai
         source_commit: owner.source,
         target: owner.target,
         created: "2026-01-01T00:00:00Z".to_owned(),
+        document_comment: None,
         components,
         dependencies: vec![],
     };
@@ -310,5 +312,59 @@ fn new_gnu_file_roles_require_review_before_projection() {
     assert!(
         project(&platform, &Owner::fixture(&platform)).is_err(),
         "should reject new resources until their component role is reviewed"
+    );
+}
+
+#[test]
+fn coverage_gaps_name_unresolved_fastly_tools_and_incomplete_native_materials() {
+    let platform = projection_fixture(crate::policy::ReleaseTarget::Wasm32Wasip1);
+    let gaps = coverage_gaps(&platform);
+    for expected in [
+        "native-material-coverage-incomplete",
+        "native-tool-host-path-unresolved:compiler",
+        "native-tool-host-path-unresolved:linker",
+        "native-tool-host-path-unresolved:build_tools",
+    ] {
+        assert!(
+            gaps.iter().any(|gap| gap == expected),
+            "should state gap {expected}"
+        );
+    }
+    assert!(
+        gaps.windows(2).all(|pair| pair[0] < pair[1]),
+        "should list gaps sorted and unique"
+    );
+    assert!(
+        !gaps.iter().any(|gap| gap.starts_with("apple-")),
+        "should not invent Apple gaps for a Wasm target"
+    );
+}
+
+#[test]
+fn coverage_gaps_retain_apple_exclusions_and_unmeasured_tool_closure() {
+    let platform = projection_fixture(crate::policy::ReleaseTarget::Aarch64AppleDarwin);
+    let gaps = coverage_gaps(&platform);
+    assert!(
+        gaps.iter()
+            .any(|gap| gap == "apple-tool-closure-unmeasured"),
+        "should state the unmeasured Apple tool closure"
+    );
+    let apple = platform.apple().expect("should hold Apple evidence");
+    assert!(
+        !apple.coverage_exclusions().is_empty(),
+        "should record fixture exclusions"
+    );
+    for exclusion in apple.coverage_exclusions() {
+        let expected = format!("apple-coverage-excluded:{exclusion}");
+        assert!(
+            gaps.contains(&expected),
+            "should state Apple exclusion {exclusion}"
+        );
+    }
+    assert!(
+        !gaps
+            .iter()
+            .any(|gap| gap.starts_with("native-tool-host-path-unresolved:")),
+        "should not report unresolved host paths for explicit Apple files"
     );
 }

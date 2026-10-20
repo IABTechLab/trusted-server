@@ -62,6 +62,7 @@ fn retained_and_absent_modules_have_different_contributor_roles() {
                 source_commit: "a".repeat(40),
                 target: crate::policy::ReleaseTarget::X86_64UnknownLinuxGnu,
                 created: "2026-01-01T00:00:00Z".to_owned(),
+                document_comment: None,
                 components,
                 dependencies: Vec::new(),
             })
@@ -120,6 +121,7 @@ fn checked_originals_render_distinct_archive_tree_and_generated_evidence() {
         source_commit: "a".repeat(40),
         target: crate::policy::ReleaseTarget::Wasm32Wasip1,
         created: "2026-01-01T00:00:00Z".to_owned(),
+        document_comment: None,
         components,
         dependencies: Vec::new(),
     };

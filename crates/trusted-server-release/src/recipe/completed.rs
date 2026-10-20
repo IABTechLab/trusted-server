@@ -324,6 +324,16 @@ impl RecipeCompleted {
         &self.facts.artifact
     }
 
+    /// Reads the retained final bytes after rechecking their size and digest.
+    ///
+    /// # Errors
+    ///
+    /// Rejects changed owned outputs, an oversized artifact or bytes whose size
+    /// or SHA-256 differ from the recorded artifact.
+    pub(crate) fn read_final_bytes(&self) -> Result<Vec<u8>, Report<ReleaseError>> {
+        super::compare::read_artifact(self)
+    }
+
     /// Re-measures the output directory and retained stream before handoff.
     ///
     /// # Errors

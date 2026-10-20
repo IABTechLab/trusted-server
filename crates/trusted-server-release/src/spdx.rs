@@ -18,6 +18,7 @@ use crate::materials::CargoOrigin;
 use crate::policy::ReleaseTarget;
 use crate::recipe::RecipeCompleted;
 
+pub(crate) mod candidate;
 pub(crate) mod cargo;
 pub(crate) mod javascript;
 pub(crate) mod native;
@@ -73,6 +74,8 @@ struct SpdxInputs<'a> {
     source_commit: String,
     target: ReleaseTarget,
     created: String,
+    // Rendered as `creationInfo.comment`; candidate documents state their gaps here.
+    document_comment: Option<String>,
     components: Vec<Component>,
     dependencies: Vec<Dependency>,
 }
@@ -536,6 +539,10 @@ fn render(inputs: &SpdxInputs<'_>) -> Result<GeneratedSpdx, Report<ReleaseError>
     }
     let relationships:Vec<_> = relationships.into_iter().map(|(from,kind,to,comment)| json!({"spdxElementId":from,"relationshipType":kind,"relatedSpdxElement":to,"comment":comment})).collect();
     let mut document = json!({"SPDXID":DOCUMENT_ID,"spdxVersion":"SPDX-2.3","dataLicense":"CC0-1.0","name":format!("{} {} composition",inputs.name,inputs.version),"creationInfo":{"created":inputs.created,"creators":[format!("Tool: trusted-server-release-{}",env!("CARGO_PKG_VERSION"))]},"documentDescribes":[ROOT_ID],"packages":packages,"relationships":relationships});
+    if let Some(comment) = &inputs.document_comment {
+        plain(comment)?;
+        document["creationInfo"]["comment"] = json!(comment);
+    }
     let semantic_bytes = canonical_json(&document, Role::Spdx)
         .map_err(|error| error.change_context(ReleaseError::Spdx))?;
     document["documentNamespace"] = json!(format!(

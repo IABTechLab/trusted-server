@@ -14,8 +14,8 @@ use crate::materials::CargoOrigin;
 use crate::recipe::RecipeCompleted;
 
 use super::{
-    Component, ComponentRole, Origin, OriginFields, cargo, lower_hex, plain, relative_source,
-    spdx_error,
+    Component, ComponentRole, Dependency, Origin, OriginFields, cargo, lower_hex, plain,
+    relative_source, spdx_error,
 };
 
 /// Renderer inputs borrowed from sealed native receipts, without complete coverage.
@@ -57,6 +57,11 @@ impl<'a> NativeProjection<'a> {
     /// Returns the borrowed measured receipts with their existing coverage gaps.
     pub(crate) fn inventory(&self) -> &NativeInventory {
         self.view.native()
+    }
+
+    /// Releases the renderer components; native contexts project no package edges.
+    pub(super) fn into_parts(self) -> (Vec<Component>, Vec<Dependency>) {
+        (self.components, Vec::new())
     }
 }
 
