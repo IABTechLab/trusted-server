@@ -359,6 +359,13 @@ pub fn validate_settings_for_deploy_with(
     let mut structural_settings = settings.clone();
     structural_settings.prepare_runtime()?;
 
+    // A `[cache.<name>]` module no linked crate offers a cache from is refused
+    // here as making the caches refuses it, so a misspelt module fails
+    // `ts config validate` rather than the service.
+    let builders: Vec<IntegrationBuilder> =
+        crate::integrations::all_builders(extra_integrations).collect();
+    crate::integrations::check_loading_cache_modules(settings, &builders)?;
+
     // The plan is compiled with the builders the blocks are validated
     // against, so a `[demand]` or `[ad-server]` name one of them supplies
     // compiles here.
@@ -1491,6 +1498,40 @@ passphrase = "production-secret-key-32-bytes-min"
 
         validate_settings_for_runtime_with(&settings, &external_adserver_builders())
             .expect("the external builder's ad server should pass runtime validation");
+    }
+
+    fn example_loading_cache() -> std::sync::Arc<dyn crate::platform::PlatformLoadingCache> {
+        std::sync::Arc::new(crate::platform::NoLoadingCache)
+    }
+
+    /// A `[cache.<name>]` module no linked crate offers a cache from is
+    /// refused by deploy validation, as it is when the caches are made, so a
+    /// misspelt module fails `ts config validate` rather than the service.
+    /// Both halves are asserted, so the test fails if the check stops
+    /// refusing the misspelling or starts refusing the module offered.
+    #[test]
+    fn deploy_validation_refuses_a_loading_cache_module_nothing_offers() {
+        let builders =
+            [
+                IntegrationBuilder::implementations("loading-cache.example", "example-crate")
+                    .with_loading_cache(example_loading_cache),
+            ];
+        let mut settings = valid_settings();
+
+        settings.cache.robots_txt.module = Some("example".to_owned());
+        validate_settings_for_deploy_with(&settings, &builders)
+            .expect("a module that offers a cache should pass deploy validation");
+
+        settings.cache.robots_txt.module = Some("exmaple".to_owned());
+        let error = validate_settings_for_deploy_with(&settings, &builders)
+            .expect_err("a module nothing offers should be refused");
+        assert!(
+            format!("{error:?}").contains(
+                "[cache.robots-txt] module names `exmaple`, which no linked crate offers a \
+                 loading cache from. The loading cache modules this build has are: example"
+            ),
+            "should name the table and the modules offered: {error:?}"
+        );
     }
 
     /// Every builder handed to deploy validation has its `validate` run, and

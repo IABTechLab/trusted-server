@@ -3,7 +3,7 @@ use core::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use edgezero_core::app::Hooks;
+use edgezero_core::app::{Hooks, StoreMetadata, StoresMetadata};
 use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderValue, Method, Request, Response, header};
@@ -104,6 +104,10 @@ pub struct AppState {
     /// Services a caller supplied for every request, rather than services built
     /// from the request context. `None` in a deployment.
     services: Option<RuntimeServices>,
+    /// The loading caches the `[cache.<name>]` tables select from the linked
+    /// builders, taken when this state is built and handed to every request's
+    /// services.
+    loading_caches: Arc<trusted_server_core::platform::LoadingCaches>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -311,6 +315,8 @@ fn build_state_with_registrations_and_services(
             &settings,
             &shipped_signal_modules(),
         )?;
+    let loading_caches =
+        trusted_server_core::integrations::loading_caches_from(&settings, integrations)?;
     // This adapter builds no telemetry sink, so a module `[analytics]` selects
     // sends nothing unless the caller's services carry a sink.
     warn_once_when_analytics_is_unsent(
@@ -327,6 +333,7 @@ fn build_state_with_registrations_and_services(
         ec_module,
         permission_signal_modules,
         services,
+        loading_caches,
     }))
 }
 
@@ -376,6 +383,7 @@ impl AppState {
             .clone()
             .unwrap_or_else(|| {
                 build_runtime_services(ctx, &self.settings, &self.permission_signal_modules)
+                    .with_loading_caches(Arc::clone(&self.loading_caches))
             })
             .with_resolved_ec_module(self.ec_module.clone());
         if let Some(module) = self.registry.geo_module() {
@@ -579,6 +587,15 @@ fn startup_error_router(e: &Report<TrustedServerError>) -> RouterService {
 /// `EdgeZero` [`Hooks`] implementation for the Trusted Server application.
 pub struct TrustedServerApp;
 
+/// The key-value store this adapter declares, which is also the Workers KV
+/// binding `run_app` opens for it on every request, because `EdgeZero` binds
+/// a store by its id unless `EDGEZERO__STORES__KV__TRUSTED_SERVER_KV__NAME`
+/// names another binding.
+///
+/// `EdgeZero` treats a declared store as required, so a Worker deployed
+/// without the binding fails every request before any route runs.
+const KV_STORE_ID: &str = "TRUSTED_SERVER_KV";
+
 impl Hooks for TrustedServerApp {
     fn name() -> &'static str {
         "TrustedServer"
@@ -594,6 +611,22 @@ impl Hooks for TrustedServerApp {
         };
 
         build_router(&state)
+    }
+
+    /// Declares the key-value store alone, so `run_app` opens it for every
+    /// request and the request's services keep copies in Workers KV between
+    /// requests. The settings come from the `TRUSTED_SERVER_CONFIG` variable
+    /// at startup and secrets from the Worker environment, so no config or
+    /// secret store is declared.
+    fn stores() -> StoresMetadata {
+        StoresMetadata {
+            config: None,
+            kv: Some(StoreMetadata {
+                default: KV_STORE_ID,
+                ids: &[KV_STORE_ID],
+            }),
+            secrets: None,
+        }
     }
 }
 

@@ -8,8 +8,9 @@ The crate translates Worker requests and responses, registers the shared
 router, and implements Cloudflare-specific HTTP and secret access. The current
 runtime does not open the KV config value written by `ts config push`; startup
 instead consumes the nested `TRUSTED_SERVER_CONFIG` variable bridge. It also
-has no `/health` route or request-time KV registry and permits one enabled
-auction provider.
+has no `/health` route and permits one enabled auction provider. It declares
+the `TRUSTED_SERVER_KV` namespace as its key-value store, which every request
+is given, so a Worker without the binding fails every request.
 
 Build and test from the repository root:
 
