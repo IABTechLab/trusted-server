@@ -102,11 +102,11 @@ fn build_state_with_services(
     // whose application state is built once at start-up while theirs is rebuilt
     // for every request. With no services supplied it threads no module, so
     // `EcContext` resolves the selection itself on every request, building a
-    // fresh built-in module that reads no request data; this dev server
-    // accepts that per-request construction rather than caching a resolved
-    // module.
+    // fresh built-in module that reads no request data. It supplies no host
+    // signals either, so the `host_signals` argument is `None`.
     ensure_module_available(
         &settings.ec,
+        None,
         services
             .as_ref()
             .and_then(RuntimeServices::resolved_ec_module),
@@ -128,7 +128,7 @@ impl AppState {
     fn services_for_request(&self, ctx: &RequestContext) -> RuntimeServices {
         self.services
             .clone()
-            .unwrap_or_else(|| build_runtime_services(ctx))
+            .unwrap_or_else(|| build_runtime_services(ctx, &self.settings))
     }
 }
 
@@ -812,7 +812,7 @@ mod tests {
             .body(edgezero_core::body::Body::empty())
             .expect("should build test request");
         let ctx = RequestContext::new(req, PathParams::default());
-        let services = build_runtime_services(&ctx);
+        let services = build_runtime_services(&ctx, &state.settings);
         let req = ctx.into_request();
 
         let error = build_ec_context(&state, &services, &req)
