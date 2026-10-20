@@ -15,6 +15,7 @@
     )
 )]
 
+use std::rc::Rc;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -28,10 +29,13 @@ use validator::Validate;
 use trusted_server_core::constants::INTERNAL_HEADERS;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::integrations::{
-    AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
-    IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationProxy, IntegrationRegistration,
-    UPSTREAM_SDK_MAX_RESPONSE_BYTES, collect_body_bounded, collect_response_bounded,
-    ensure_integration_backend,
+    AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationEndpoint, IntegrationProxy,
+    IntegrationRegistration, UPSTREAM_SDK_MAX_RESPONSE_BYTES, collect_body_bounded,
+    collect_response_bounded, ensure_integration_backend,
+};
+use trusted_server_core::middleware::{
+    AttributeRewrite, AttributeRewriteFn, Middleware, MiddlewareAction, MiddlewareContext,
+    MiddlewarePhase,
 };
 use trusted_server_core::platform::{PlatformHttpRequest, RuntimeServices};
 use trusted_server_core::settings::{IntegrationConfig, Settings};
@@ -352,7 +356,7 @@ pub fn register(
     Ok(Some(
         IntegrationRegistration::builder(PERMUTIVE_INTEGRATION_ID)
             .with_proxy(integration.clone())
-            .with_attribute_rewriter(integration)
+            .with_middleware(Arc::new(SdkAddress(integration)))
             .build(),
     ))
 }
@@ -458,26 +462,11 @@ impl IntegrationProxy for PermutiveIntegration {
     }
 }
 
-impl IntegrationAttributeRewriter for PermutiveIntegration {
-    fn integration_id(&self) -> &'static str {
-        PERMUTIVE_INTEGRATION_ID
-    }
-
-    fn handles_attribute(&self, attribute: &str) -> bool {
-        self.config.rewrite_sdk && matches!(attribute, "src" | "href")
-    }
-
-    fn rewrite(
-        &self,
-        _attr_name: &str,
-        attr_value: &str,
-        _ctx: &IntegrationAttributeContext<'_>,
-    ) -> AttributeRewriteAction {
-        if !self.config.rewrite_sdk {
-            return AttributeRewriteAction::keep();
-        }
-
-        if self.is_permutive_sdk_url(attr_value) {
+impl PermutiveIntegration {
+    /// What becomes of a `src` or an `href`, which is pointed at the
+    /// first-party endpoint when it is the SDK's address.
+    fn rewrite_sdk_address(&self, value: &str) -> AttributeRewriteAction {
+        if self.is_permutive_sdk_url(value) {
             // Rewrite to first-party SDK endpoint.
             // Root-relative so the browser resolves it against the page host.
             // Note: a page-level `<base href>` participates in this resolution,
@@ -487,6 +476,33 @@ impl IntegrationAttributeRewriter for PermutiveIntegration {
             AttributeRewriteAction::replace("/integrations/permutive/sdk".to_string())
         } else {
             AttributeRewriteAction::keep()
+        }
+    }
+}
+
+/// Loads the SDK from the first-party endpoint, on the pages a `[[fetch]]`
+/// entry names [`MODULE`] for. It does nothing unless `rewrite_sdk` is set.
+struct SdkAddress(Arc<PermutiveIntegration>);
+
+impl Middleware for SdkAddress {
+    fn middleware_id(&self) -> &'static str {
+        MODULE
+    }
+
+    fn phases(&self) -> &[MiddlewarePhase] {
+        &[MiddlewarePhase::Fetch]
+    }
+
+    fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+        if !self.0.config.rewrite_sdk {
+            return MiddlewareAction::pass();
+        }
+        let integration = Arc::clone(&self.0);
+        let decide: Rc<AttributeRewriteFn> =
+            Rc::new(move |matched| integration.rewrite_sdk_address(matched.value));
+        MiddlewareAction {
+            element_handlers: AttributeRewrite::each(&["src", "href"], &decide),
+            ..MiddlewareAction::pass()
         }
     }
 }
@@ -565,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn test_attribute_rewriter_rewrites_sdk_urls() {
+    fn test_element_handler_rewrites_sdk_urls() {
         let config = PermutiveConfig {
             organization_id: "myorg".to_string(),
             workspace_id: "workspace-123".to_string(),
@@ -577,19 +593,8 @@ mod tests {
         };
         let integration = PermutiveIntegration::new(config);
 
-        let ctx = IntegrationAttributeContext {
-            attribute_name: "src",
-            element_name: "script",
-            request_host: "edge.example.com",
-            request_scheme: "https",
-            origin_host: "origin.example.com",
-        };
-
-        let rewritten = integration.rewrite(
-            "src",
-            "https://myorg.edge.permutive.app/workspace-123-web.js",
-            &ctx,
-        );
+        let rewritten = integration
+            .rewrite_sdk_address("https://myorg.edge.permutive.app/workspace-123-web.js");
 
         assert!(matches!(rewritten, AttributeRewriteAction::Replace(_)));
         if let AttributeRewriteAction::Replace(url) = rewritten {
@@ -598,7 +603,7 @@ mod tests {
     }
 
     #[test]
-    fn test_attribute_rewriter_noop_when_disabled() {
+    fn test_element_handler_noop_when_disabled() {
         let config = PermutiveConfig {
             organization_id: "myorg".to_string(),
             workspace_id: "workspace-123".to_string(),
@@ -609,22 +614,16 @@ mod tests {
             rewrite_sdk: false, // Disabled
         };
         let integration = PermutiveIntegration::new(config);
-
-        let ctx = IntegrationAttributeContext {
-            attribute_name: "src",
-            element_name: "script",
-            request_host: "edge.example.com",
-            request_scheme: "https",
-            origin_host: "origin.example.com",
-        };
-
-        let rewritten = integration.rewrite(
-            "src",
-            "https://myorg.edge.permutive.app/workspace-123-web.js",
-            &ctx,
+        let document_state = trusted_server_core::integrations::IntegrationDocumentState::default();
+        let context = trusted_server_core::middleware::test_support::context(
+            MiddlewarePhase::Fetch,
+            &document_state,
         );
 
-        assert!(matches!(rewritten, AttributeRewriteAction::Keep));
+        assert!(
+            SdkAddress(integration).create(&context).is_pass(),
+            "should leave every page alone when SDK rewriting is off"
+        );
     }
 
     #[test]
@@ -759,6 +758,23 @@ mod tests {
             super::MODULE,
             trusted_server_core::module_name!(),
             "should be named by the folder this crate lives in"
+        );
+    }
+
+    /// The page a reader receives with this module running, kept as a file
+    /// so that changing how the page change is made can be shown to leave
+    /// the page as it was.
+    #[test]
+    fn the_page_a_reader_receives_is_the_recorded_one() {
+        trusted_server_core::html_processor::test_support::assert_page_is_recorded(
+            include_str!("fixtures/page-change.settings.toml"),
+            &[super::builder()],
+            include_str!("fixtures/page-change.input.html"),
+            include_str!("fixtures/page-change.recorded.html"),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/fixtures/page-change.recorded.html"
+            ),
         );
     }
 

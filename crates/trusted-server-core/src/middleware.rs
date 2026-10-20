@@ -1,0 +1,645 @@
+//! Page changes, which a module makes to a document on its way to a reader.
+//!
+//! A module changes a page through a middleware and in no other way. It
+//! registers the ones it supplies, and one runs only where an entry in the
+//! settings names it. Each phase has its own ordered list of entries. An
+//! entry covers one media type, optionally only the requests under a path
+//! prefix, and names the middleware to run in order. A response takes the
+//! first entry that covers it, and each middleware is handed the document as
+//! the ones before it left it.
+//!
+//! ```toml
+//! [[fetch]]
+//! media_type = "text/html"
+//! path = "/news/"
+//! middleware = ["example.strip", "example.tag"]
+//!
+//! [[fetch]]
+//! media_type = "text/html"
+//! middleware = ["example.strip"]
+//!
+//! [[serve]]
+//! media_type = "text/html"
+//! middleware = ["example.reader"]
+//! ```
+//!
+//! An entry carries no settings and switches nothing on. Whether a module
+//! runs is decided by the section that selects it, and an entry places and
+//! orders the page changes of the modules that run. A middleware reads its
+//! settings from its module's own table.
+//!
+//! [`MiddlewarePhase`] says when each phase runs.
+
+use std::fmt;
+use std::rc::Rc;
+use std::sync::Arc;
+
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
+
+use crate::integrations::{AttributeRewriteAction, IntegrationDocumentState, ScriptRewriteAction};
+use crate::streaming_processor::StreamProcessor;
+
+/// The media type a document is matched as, and the only one a middleware
+/// runs on.
+pub const HTML_MEDIA_TYPE: &str = "text/html";
+
+/// When a middleware runs, relative to the store of shared templates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MiddlewarePhase {
+    /// On the document as the origin sent it. What is left is what a shared
+    /// template stores, so a fetch middleware is handed nothing a request
+    /// left.
+    Fetch,
+    /// On one reader's copy, on its way out, whether it came from the store
+    /// or from the origin. A serve middleware is handed what the modules'
+    /// request preparers left for this reader's request, and nothing written
+    /// here is stored.
+    Serve,
+}
+
+impl MiddlewarePhase {
+    /// Both phases, in the order they happen.
+    pub const ALL: [Self; 2] = [Self::Fetch, Self::Serve];
+
+    /// The name the phase's entries are written under in the settings.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fetch => "fetch",
+            Self::Serve => "serve",
+        }
+    }
+}
+
+impl fmt::Display for MiddlewarePhase {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// What a middleware is told about the document it is asked to change.
+#[derive(Debug, Clone, Copy)]
+pub struct MiddlewareContext<'a> {
+    /// Which phase is running.
+    pub phase: MiddlewarePhase,
+    /// Publisher-facing host the reader asked for.
+    pub request_host: &'a str,
+    /// Publisher-facing scheme the reader asked for.
+    pub request_scheme: &'a str,
+    /// Host the document was fetched from, the same for a page served from
+    /// the store as for one fetched for this request.
+    pub origin_host: &'a str,
+    /// State shared by the middleware working on this document in this
+    /// phase.
+    pub document_state: &'a IntegrationDocumentState,
+    /// The most a middleware may hold of one script while it decides.
+    pub max_buffered_script_bytes: usize,
+}
+
+/// One attribute of one matched element, as a handler is asked about it.
+#[derive(Debug, Clone, Copy)]
+pub struct MatchedAttribute<'a> {
+    /// The element's tag name, in lower case.
+    pub element_name: &'a str,
+    /// The attribute the handler judges.
+    pub attribute_name: &'a str,
+    /// The attribute's value, as the handlers before this one left it. Core
+    /// has already moved the origin's address in it to the reader's host, in
+    /// either phase.
+    pub value: &'a str,
+}
+
+/// A middleware's decision about one attribute of the elements a selector
+/// matches, being to keep the element, replace the attribute's value or
+/// remove the element.
+pub trait ElementHandler {
+    /// The CSS selector of the elements this handler is asked about.
+    fn selector(&self) -> &str;
+
+    /// The attribute whose value the handler judges. An element the selector
+    /// matches that carries no such attribute is left as it is.
+    fn attribute(&self) -> &str;
+
+    /// Decides what happens to one matched element.
+    fn decide(&mut self, matched: &MatchedAttribute<'_>) -> AttributeRewriteAction;
+}
+
+/// The question an [`AttributeRewrite`] asks about each value.
+pub type AttributeRewriteFn = dyn Fn(&MatchedAttribute<'_>) -> AttributeRewriteAction;
+
+/// An [`ElementHandler`] made from a function, such as one that points a
+/// vendor's script at a first-party path.
+pub struct AttributeRewrite {
+    selector: String,
+    attribute: &'static str,
+    decide: Rc<AttributeRewriteFn>,
+}
+
+impl AttributeRewrite {
+    /// Asks `decide` about `attribute` on every element that carries it.
+    #[must_use]
+    pub fn new(attribute: &'static str, decide: Rc<AttributeRewriteFn>) -> Self {
+        Self::matching(&format!("[{attribute}]"), attribute, decide)
+    }
+
+    /// Asks `decide` about `attribute` on the elements `selector` matches.
+    #[must_use]
+    pub fn matching(
+        selector: &str,
+        attribute: &'static str,
+        decide: Rc<AttributeRewriteFn>,
+    ) -> Self {
+        Self {
+            selector: selector.to_owned(),
+            attribute,
+            decide,
+        }
+    }
+
+    /// One handler for each of `attributes`, each asking `decide` about every
+    /// element that carries it, for a decision that is the same wherever an
+    /// address is written.
+    #[must_use]
+    pub fn each(
+        attributes: &[&'static str],
+        decide: &Rc<AttributeRewriteFn>,
+    ) -> Vec<Box<dyn ElementHandler>> {
+        attributes
+            .iter()
+            .map(|attribute| {
+                Box::new(Self::new(attribute, Rc::clone(decide))) as Box<dyn ElementHandler>
+            })
+            .collect()
+    }
+}
+
+impl ElementHandler for AttributeRewrite {
+    fn selector(&self) -> &str {
+        &self.selector
+    }
+
+    fn attribute(&self) -> &str {
+        self.attribute
+    }
+
+    fn decide(&mut self, matched: &MatchedAttribute<'_>) -> AttributeRewriteAction {
+        (self.decide)(matched)
+    }
+}
+
+/// A middleware's decision about the text inside the elements a selector
+/// matches, being to keep it, replace it or remove it.
+///
+/// Text arrives in chunks. A handler that judges a whole script removes each
+/// chunk as it arrives while keeping a copy, and writes back what it kept, as
+/// it wants it, with the last chunk.
+pub trait TextHandler {
+    /// The CSS selector of the elements whose text this handler is asked
+    /// about.
+    fn selector(&self) -> &str;
+
+    /// Decides what happens to one chunk of text. `text` is the chunk as the
+    /// handlers before this one left it, and `is_last` says whether it is the
+    /// last chunk of its text node.
+    fn decide(&mut self, text: &str, is_last: bool) -> ScriptRewriteAction;
+}
+
+/// What a middleware does to one document. A middleware may do several of
+/// these at once, and an action with nothing set leaves the document as it
+/// arrived.
+#[derive(Default)]
+pub struct MiddlewareAction {
+    /// Markup to write in `<head>` ahead of the script bundle, in the order
+    /// given. A document with no `<head>` gets none.
+    pub head_inserts: Vec<String>,
+    /// Markup to write straight after the main script bundle and before any
+    /// deferred one, for a script that needs the bundle to have run and has
+    /// to run before the page's own scripts.
+    pub after_bundle_inserts: Vec<String>,
+    /// Decisions about elements.
+    pub element_handlers: Vec<Box<dyn ElementHandler>>,
+    /// Decisions about the text inside elements.
+    pub text_handlers: Vec<Box<dyn TextHandler>>,
+    /// A processor over the document the handlers left.
+    pub stream: Option<Box<dyn StreamProcessor>>,
+}
+
+impl MiddlewareAction {
+    /// Nothing to do for this document.
+    #[must_use]
+    pub fn pass() -> Self {
+        Self::default()
+    }
+
+    /// Whether the action leaves the document as it arrived.
+    #[must_use]
+    pub fn is_pass(&self) -> bool {
+        self.head_inserts.is_empty()
+            && self.after_bundle_inserts.is_empty()
+            && self.element_handlers.is_empty()
+            && self.text_handlers.is_empty()
+            && self.stream.is_none()
+    }
+
+    /// Checks every handler's selector parses, before a handler is built
+    /// from it.
+    fn validate_selectors(&self) -> Result<(), String> {
+        let check = |selector: &str| {
+            selector
+                .parse::<lol_html::Selector>()
+                .map(|_| ())
+                .map_err(|error| format!("`{selector}` is not a usable selector: {error}"))
+        };
+        for handler in &self.element_handlers {
+            check(handler.selector())?;
+        }
+        for handler in &self.text_handlers {
+            check(handler.selector())?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for MiddlewareAction {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MiddlewareAction")
+            .field("head_inserts", &self.head_inserts)
+            .field("after_bundle_inserts", &self.after_bundle_inserts)
+            .field(
+                "element_handlers",
+                &selectors_of_elements(&self.element_handlers),
+            )
+            .field("text_handlers", &selectors_of_text(&self.text_handlers))
+            .field("stream", &self.stream.is_some())
+            .finish()
+    }
+}
+
+fn selectors_of_elements(handlers: &[Box<dyn ElementHandler>]) -> Vec<String> {
+    handlers
+        .iter()
+        .map(|handler| format!("{}@{}", handler.selector(), handler.attribute()))
+        .collect()
+}
+
+fn selectors_of_text(handlers: &[Box<dyn TextHandler>]) -> Vec<String> {
+    handlers
+        .iter()
+        .map(|handler| handler.selector().to_owned())
+        .collect()
+}
+
+/// A page change a module supplies.
+///
+/// A registered middleware holds no request state. For each document it is
+/// asked once what it will do, and what it answers is used for that document
+/// alone.
+pub trait Middleware: Send + Sync {
+    /// The name an entry selects this middleware by. A module names its
+    /// middleware by its own name, as [`crate::module_name!`] gives it, with a
+    /// part of its own after it when the module supplies several, and core
+    /// names its own by a bare word.
+    fn middleware_id(&self) -> &'static str;
+
+    /// The phases an entry may name this middleware in.
+    fn phases(&self) -> &[MiddlewarePhase];
+
+    /// Decides what to do with one document.
+    fn create(&self, context: &MiddlewareContext<'_>) -> MiddlewareAction;
+}
+
+/// One entry of `[[fetch]]` or `[[serve]]`, being which responses it covers
+/// and the middleware run on them, in the order written.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PhaseEntry {
+    /// The media type the entry covers, written as a bare `type/subtype`.
+    pub media_type: String,
+    /// A prefix of the request path the entry covers, compared as written,
+    /// or every path when absent. A folder is written with its closing
+    /// slash, because `/news` also begins `/newsletter`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// The middleware run on a response the entry covers, in the order
+    /// written.
+    pub middleware: Vec<String>,
+}
+
+impl PhaseEntry {
+    /// Whether the entry covers a response of `media_type` to a request for
+    /// `path`.
+    #[must_use]
+    pub fn covers(&self, media_type: &str, path: &str) -> bool {
+        self.media_type == media_type
+            && self
+                .path
+                .as_deref()
+                .is_none_or(|prefix| path.starts_with(prefix))
+    }
+
+    /// The prefix the paths the entry covers begin with. The path of a
+    /// request for a page begins with `/`, so `/` covers the same pages as
+    /// no path at all.
+    fn prefix(&self) -> &str {
+        self.path.as_deref().unwrap_or("/")
+    }
+}
+
+/// One phase's entries, in the order written.
+///
+/// A response takes the first entry that covers it and runs that entry's
+/// middleware alone, so an entry with a path goes before the entry covering
+/// every path.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PhaseEntries(Vec<PhaseEntry>);
+
+impl PhaseEntries {
+    /// Entries, in the order they are matched.
+    #[must_use]
+    pub fn new(entries: Vec<PhaseEntry>) -> Self {
+        Self(entries)
+    }
+
+    /// The entries, in the order they are matched.
+    #[must_use]
+    pub fn entries(&self) -> &[PhaseEntry] {
+        &self.0
+    }
+
+    /// Whether the phase has no entries.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The names the first entry covering a response selects, in the order
+    /// they run, or none when no entry covers it.
+    #[must_use]
+    pub fn for_response(&self, media_type: &str, path: &str) -> &[String] {
+        self.0
+            .iter()
+            .find(|entry| entry.covers(media_type, path))
+            .map_or(&[][..], |entry| entry.middleware.as_slice())
+    }
+
+    /// Every name the entries select, each once, in the order first written.
+    #[must_use]
+    pub fn names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = Vec::new();
+        for entry in &self.0 {
+            for name in &entry.middleware {
+                if !names.contains(&name.as_str()) {
+                    names.push(name);
+                }
+            }
+        }
+        names
+    }
+
+    /// Checks each entry's media type, path and names, and that no entry is
+    /// hidden behind an earlier one, or covers the same pages as one.
+    ///
+    /// # Errors
+    ///
+    /// A message naming the entry by its position, and what is wrong with it.
+    pub fn validate(&self, phase: MiddlewarePhase) -> Result<(), String> {
+        for (index, entry) in self.0.iter().enumerate() {
+            let at = format!("[[{phase}]] entry {}", index + 1);
+            if entry.media_type != HTML_MEDIA_TYPE {
+                return Err(format!(
+                    "{at} covers `{}`, and a middleware runs on `{HTML_MEDIA_TYPE}` alone. Write \
+                     media_type = \"{HTML_MEDIA_TYPE}\", in lower case with no parameters",
+                    entry.media_type
+                ));
+            }
+            if let Some(path) = &entry.path {
+                if !path.starts_with('/') {
+                    return Err(format!(
+                        "{at}: path `{path}` must start with `/`, being a prefix of the request \
+                         path"
+                    ));
+                }
+                if path.contains(['*', '?', '#']) {
+                    return Err(format!(
+                        "{at}: path `{path}` is a prefix of the request path, compared as \
+                         written, so it holds no pattern, query or fragment. Write `/news/` to \
+                         cover everything under that folder"
+                    ));
+                }
+            }
+            if entry.middleware.is_empty() {
+                return Err(format!(
+                    "{at} names no middleware. Remove the entry rather than leaving an empty list"
+                ));
+            }
+            for (position, name) in entry.middleware.iter().enumerate() {
+                if !crate::module_name::is_valid(name) {
+                    return Err(format!(
+                        "{at} names `{name}`, which is not a middleware name. A name is parts \
+                         joined by `.`, each in lower case letters, digits, `_` or `-`, such as \
+                         `cmp.example`"
+                    ));
+                }
+                if entry.middleware[..position].contains(name) {
+                    return Err(format!("{at} names `{name}` more than once"));
+                }
+            }
+            if let Some(earlier) = self.0[..index].iter().position(|earlier| {
+                earlier.media_type == entry.media_type
+                    && entry.prefix().starts_with(earlier.prefix())
+            }) {
+                return Err(if self.0[earlier].prefix() == entry.prefix() {
+                    format!(
+                        "{at} covers the same pages as [[{phase}]] entry {}, and a response \
+                         takes the first entry that covers it, so this one is never reached. \
+                         Name every middleware for those pages in one entry's list",
+                        earlier + 1
+                    )
+                } else {
+                    format!(
+                        "{at} is never reached, because [[{phase}]] entry {} covers every \
+                         response it covers and a response takes the first entry that covers \
+                         it. Put the entry with the longer path first",
+                        earlier + 1
+                    )
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for PhaseEntries {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let entries = Vec::<PhaseEntry>::deserialize(deserializer).map_err(|error| {
+            de::Error::custom(format!(
+                "{error}. A phase is a list of entries, each written as [[fetch]] or [[serve]] \
+                 with media_type and middleware, and path where it covers part of the site"
+            ))
+        })?;
+        Ok(Self(entries))
+    }
+}
+
+impl Serialize for PhaseEntries {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+/// The middleware one entry selects, in the order they run.
+#[derive(Clone)]
+pub struct MiddlewareChain {
+    phase: MiddlewarePhase,
+    middleware: Vec<Arc<dyn Middleware>>,
+}
+
+impl fmt::Debug for MiddlewareChain {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MiddlewareChain")
+            .field("phase", &self.phase)
+            .field("middleware", &self.ids())
+            .finish()
+    }
+}
+
+impl MiddlewareChain {
+    /// A chain of middleware already in the order they run.
+    #[must_use]
+    pub fn new(phase: MiddlewarePhase, middleware: Vec<Arc<dyn Middleware>>) -> Self {
+        Self { phase, middleware }
+    }
+
+    /// The phase this chain runs in.
+    #[must_use]
+    pub fn phase(&self) -> MiddlewarePhase {
+        self.phase
+    }
+
+    /// The middleware names, in the order they run.
+    #[must_use]
+    pub fn ids(&self) -> Vec<&'static str> {
+        self.middleware
+            .iter()
+            .map(|middleware| middleware.middleware_id())
+            .collect()
+    }
+
+    /// Whether the chain would do nothing at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.middleware.is_empty()
+    }
+
+    /// Asks every middleware in turn what it will do with one document.
+    ///
+    /// Checks each handler's selector, refusing the document when one does
+    /// not parse.
+    ///
+    /// # Errors
+    ///
+    /// A message naming the middleware and the selector that does not parse.
+    pub fn plan(&self, context: &MiddlewareContext<'_>) -> Result<MiddlewarePlan, String> {
+        let mut plan = MiddlewarePlan::default();
+        for middleware in &self.middleware {
+            let action = middleware.create(context);
+            action.validate_selectors().map_err(|problem| {
+                format!(
+                    "the {} middleware `{}` cannot run, because {problem}",
+                    self.phase,
+                    middleware.middleware_id()
+                )
+            })?;
+            plan.head_inserts.extend(action.head_inserts);
+            plan.after_bundle_inserts
+                .extend(action.after_bundle_inserts);
+            plan.element_handlers.extend(action.element_handlers);
+            plan.text_handlers.extend(action.text_handlers);
+            plan.processors.extend(action.stream);
+        }
+        Ok(plan)
+    }
+}
+
+/// What one document's chain will do, in the order it happens.
+#[derive(Default)]
+pub struct MiddlewarePlan {
+    /// Markup for `<head>`, ahead of the script bundle, in the order it is
+    /// written.
+    pub head_inserts: Vec<String>,
+    /// Markup for straight after the main script bundle, in the order it is
+    /// written.
+    pub after_bundle_inserts: Vec<String>,
+    /// Element handlers, in the order the middleware were named. Two that
+    /// match one element are both asked, in this order.
+    pub element_handlers: Vec<Box<dyn ElementHandler>>,
+    /// Text handlers, in the order the middleware were named.
+    pub text_handlers: Vec<Box<dyn TextHandler>>,
+    /// Stream processors, each handed what the one before it produced.
+    pub processors: Vec<Box<dyn StreamProcessor>>,
+}
+
+impl MiddlewarePlan {
+    /// Whether the chain decided to do nothing to this document.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.head_inserts.is_empty()
+            && self.after_bundle_inserts.is_empty()
+            && self.element_handlers.is_empty()
+            && self.text_handlers.is_empty()
+            && self.processors.is_empty()
+    }
+}
+
+impl fmt::Debug for MiddlewarePlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MiddlewarePlan")
+            .field("head_inserts", &self.head_inserts)
+            .field("after_bundle_inserts", &self.after_bundle_inserts)
+            .field(
+                "element_handlers",
+                &selectors_of_elements(&self.element_handlers),
+            )
+            .field("text_handlers", &selectors_of_text(&self.text_handlers))
+            .field("processors", &self.processors.len())
+            .finish()
+    }
+}
+
+/// What a module's own tests hand a middleware they call directly.
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_support {
+    use super::{MiddlewareContext, MiddlewarePhase};
+    use crate::html_processor::test_support::{ORIGIN_HOST, REQUEST_HOST};
+    use crate::integrations::IntegrationDocumentState;
+
+    /// What a middleware is told in `phase` about a test page, fetched from
+    /// [`ORIGIN_HOST`] for a reader of [`REQUEST_HOST`] over HTTPS, with
+    /// `document_state` as the document's.
+    #[must_use]
+    pub fn context(
+        phase: MiddlewarePhase,
+        document_state: &IntegrationDocumentState,
+    ) -> MiddlewareContext<'_> {
+        MiddlewareContext {
+            phase,
+            request_host: REQUEST_HOST,
+            request_scheme: "https",
+            origin_host: ORIGIN_HOST,
+            document_state,
+            max_buffered_script_bytes: 16 * 1024 * 1024,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

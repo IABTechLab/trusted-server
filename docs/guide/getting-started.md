@@ -175,6 +175,7 @@ only the asset proxy entries you want to serve or block. Then validate it.
 Edit `trusted-server.toml` to configure:
 
 - the page modules that run, each selected in the section of its type (`[cmp]`, `[tag]`, `[ad-tag]`, `[bot-protection]`, `[identity]`, `[audience]`, `[framework]`, and `[auction]` for Prebid), with their settings under `[<section>.<name>]`
+- the `[[fetch]]` and `[[serve]]` entries that say which pages each selected module's page changes run on, which the audit's draft writes for the modules it selects
 - the demand sources, in `[demand] modules`, each with its settings under `[demand.<name>]`
 - the ad server, if one runs, in `[ad-server] module`, with its settings under `[ad-server.<name>]`
 - server bidder routes under `[auction.bidders.<code>]`

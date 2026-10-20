@@ -1,0 +1,15 @@
+[proxy]
+allowed_domains = ["assets.example"]
+
+[auction]
+modules = ["prebid"]
+
+[auction.prebid]
+external_bundle_url = "https://assets.example/prebid/trusted-prebid.js"
+timeout_ms = 1000
+script_patterns = ["/prebid.js", "/prebid.min.js"]
+debug = false
+
+[[fetch]]
+media_type = "text/html"
+middleware = ["auction.prebid"]

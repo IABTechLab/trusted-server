@@ -44,9 +44,9 @@ impl DataDomeIntegration {
         let test_bypass_matched = self.take_protection_test_bypass_header(input.request);
         if test_bypass_matched {
             // Both markers travel together. The first is DataDome's own
-            // tag-suppression signal, left for its head injector. The second tells
-            // core the response is personalized to this request and cannot be
-            // shared through a cache or a template.
+            // tag-suppression signal, left for its serve middleware. The second
+            // tells core the response is personalized to this request and cannot
+            // be shared through a cache or a template.
             super::suppress_client_tag(input.request);
             input
                 .request
@@ -165,9 +165,9 @@ impl DataDomeIntegration {
             } => {
                 if suppress_client_tag {
                     // Both markers travel together. The first is DataDome's own
-                    // tag-suppression signal, left for its head injector. The second
-                    // tells core the response is personalized to this request and
-                    // cannot be shared through a cache or a template.
+                    // tag-suppression signal, left for its serve middleware. The
+                    // second tells core the response is personalized to this request
+                    // and cannot be shared through a cache or a template.
                     super::suppress_client_tag(input.request);
                     input
                         .request

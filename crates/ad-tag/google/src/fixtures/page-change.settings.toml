@@ -1,0 +1,13 @@
+[ad-tag]
+modules = ["google", "google.diagnostics"]
+
+[ad-tag.google]
+gam_attribution_enabled = false
+
+[[fetch]]
+media_type = "text/html"
+middleware = ["ad-tag.google"]
+
+[[serve]]
+media_type = "text/html"
+middleware = ["ad-tag.google.diagnostics"]

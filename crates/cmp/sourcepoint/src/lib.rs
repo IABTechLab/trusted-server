@@ -7,10 +7,10 @@
 //!
 //! | Layer | Mechanism | What it catches |
 //! |-------|-----------|-----------------|
-//! | HTML attributes | `IntegrationAttributeRewriter` | Static `<script src>` / `<link href>` tags |
+//! | HTML attributes | The module's middleware, with an element handler | Static `<script src>` / `<link href>` tags |
 //! | JS response bodies | `rewrite_script_content` | Webpack chunk paths + hardcoded CDN URLs |
 //! | HTML response bodies | `rewrite_html_content` | Root-absolute `src`/`href` in proxied iframe documents |
-//! | Runtime config | `IntegrationHeadInjector` | `window._sp_` assignments from Next.js chunks |
+//! | Runtime config | The module's middleware, with head markup | `window._sp_` assignments from Next.js chunks |
 //! | Dynamic DOM | TS script guard (`script_guard.ts`) | Script/link elements inserted after page load |
 //!
 //! ## Endpoints
@@ -32,6 +32,7 @@
 )]
 
 use std::net::IpAddr;
+use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
 
 use async_trait::async_trait;
@@ -46,10 +47,13 @@ use validator::{Validate, ValidationError};
 
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::integrations::{
-    AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationAttributeContext,
-    IntegrationAttributeRewriter, IntegrationEndpoint, IntegrationHeadInjector,
-    IntegrationHtmlContext, IntegrationProxy, IntegrationRegistration, collect_body_bounded,
-    collect_response_bounded, ensure_integration_backend,
+    AttributeRewriteAction, INTEGRATION_MAX_BODY_BYTES, IntegrationEndpoint, IntegrationProxy,
+    IntegrationRegistration, collect_body_bounded, collect_response_bounded,
+    ensure_integration_backend,
+};
+use trusted_server_core::middleware::{
+    AttributeRewrite, AttributeRewriteFn, Middleware, MiddlewareAction, MiddlewareContext,
+    MiddlewarePhase,
 };
 use trusted_server_core::platform::{PlatformHttpRequest, RuntimeServices};
 use trusted_server_core::settings::{IntegrationConfig, Settings};
@@ -821,8 +825,7 @@ pub fn register(
     Ok(Some(
         IntegrationRegistration::builder(SOURCEPOINT_INTEGRATION_ID)
             .with_proxy(integration.clone())
-            .with_attribute_rewriter(integration.clone())
-            .with_head_injector(integration)
+            .with_middleware(Arc::new(PageChange(integration)))
             .build(),
     ))
 }
@@ -1088,37 +1091,50 @@ impl IntegrationProxy for SourcepointIntegration {
     }
 }
 
-impl IntegrationAttributeRewriter for SourcepointIntegration {
-    fn integration_id(&self) -> &'static str {
-        SOURCEPOINT_INTEGRATION_ID
+/// Sourcepoint's change to a page, on the pages a `[[fetch]]` entry names
+/// [`MODULE`] for. It writes the browser module's settings into the head and,
+/// when `rewrite_sdk` is set, the trap on `window._sp_`, and points the
+/// CDN's addresses at the first-party path.
+struct PageChange(Arc<SourcepointIntegration>);
+
+impl Middleware for PageChange {
+    fn middleware_id(&self) -> &'static str {
+        MODULE
     }
 
-    fn handles_attribute(&self, attribute: &str) -> bool {
-        self.config.rewrite_sdk && matches!(attribute, "src" | "href")
+    fn phases(&self) -> &[MiddlewarePhase] {
+        &[MiddlewarePhase::Fetch]
     }
 
-    fn rewrite(
-        &self,
-        _attr_name: &str,
-        attr_value: &str,
-        _ctx: &IntegrationAttributeContext<'_>,
-    ) -> AttributeRewriteAction {
-        // `handles_attribute()` already gates on `rewrite_sdk`, so this
-        // method is only called when rewriting is enabled.
-        if let Some(rewritten) = self.build_first_party_url(attr_value) {
+    fn create(&self, _context: &MiddlewareContext<'_>) -> MiddlewareAction {
+        let mut action = MiddlewareAction {
+            head_inserts: self.0.head_markup(),
+            ..MiddlewareAction::pass()
+        };
+        if self.0.config.rewrite_sdk {
+            let integration = Arc::clone(&self.0);
+            let decide: Rc<AttributeRewriteFn> =
+                Rc::new(move |matched| integration.rewrite_sdk_address(matched.value));
+            action.element_handlers = AttributeRewrite::each(&["src", "href"], &decide);
+        }
+        action
+    }
+}
+
+impl SourcepointIntegration {
+    /// What becomes of a `src` or an `href`, which is pointed at the
+    /// first-party path when it is an address on Sourcepoint's CDN.
+    fn rewrite_sdk_address(&self, value: &str) -> AttributeRewriteAction {
+        if let Some(rewritten) = self.build_first_party_url(value) {
             return AttributeRewriteAction::replace(rewritten);
         }
 
         AttributeRewriteAction::keep()
     }
-}
 
-impl IntegrationHeadInjector for SourcepointIntegration {
-    fn integration_id(&self) -> &'static str {
-        SOURCEPOINT_INTEGRATION_ID
-    }
-
-    fn head_inserts(&self, _ctx: &IntegrationHtmlContext<'_>) -> Vec<String> {
+    /// The scripts written into the head, being the browser module's
+    /// settings and, when `rewrite_sdk` is set, the trap on `window._sp_`.
+    fn head_markup(&self) -> Vec<String> {
         let mut inserts = vec![format!(
             "<script>window.__tsjs_sourcepoint={{\"rewriteSdk\":{}}};</script>",
             self.config.rewrite_sdk
@@ -1187,7 +1203,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use trusted_server_core::error::IntoHttpResponse as _;
-    use trusted_server_core::integrations::{IntegrationDocumentState, IntegrationRegistry};
+    use trusted_server_core::integrations::IntegrationRegistry;
     use trusted_server_core::platform::test_support::{
         StubHttpClient, build_services_with_http_client,
     };
@@ -2014,18 +2030,8 @@ mod tests {
     #[test]
     fn rewrites_cdn_urls_to_first_party_paths() {
         let integration = SourcepointIntegration::new(Arc::new(config()));
-        let ctx = IntegrationAttributeContext {
-            attribute_name: "src",
-            element_name: "script",
-            request_host: "edge.example.com",
-            request_scheme: "https",
-            origin_host: "origin.example.com",
-        };
-
-        let rewritten = integration.rewrite(
-            "src",
+        let rewritten = integration.rewrite_sdk_address(
             "https://cdn.privacy-mgmt.com/mms/v2/get_site_data?account_id=821",
-            &ctx,
         );
 
         assert_eq!(
@@ -2039,16 +2045,9 @@ mod tests {
     #[test]
     fn leaves_non_sourcepoint_urls_unchanged() {
         let integration = SourcepointIntegration::new(Arc::new(config()));
-        let ctx = IntegrationAttributeContext {
-            attribute_name: "src",
-            element_name: "script",
-            request_host: "edge.example.com",
-            request_scheme: "https",
-            origin_host: "origin.example.com",
-        };
 
         assert_eq!(
-            integration.rewrite("src", "https://example.com/script.js", &ctx),
+            integration.rewrite_sdk_address("https://example.com/script.js"),
             AttributeRewriteAction::keep()
         );
     }
@@ -2314,18 +2313,26 @@ mod tests {
     }
 
     #[test]
-    fn attribute_rewriter_skips_when_rewrite_disabled() {
+    fn element_handler_skips_when_rewrite_disabled() {
         let mut cfg = config();
         cfg.rewrite_sdk = false;
         let integration = SourcepointIntegration::new(Arc::new(cfg));
+        let document_state = trusted_server_core::integrations::IntegrationDocumentState::default();
+        let context = trusted_server_core::middleware::test_support::context(
+            MiddlewarePhase::Fetch,
+            &document_state,
+        );
+
+        let action = PageChange(integration).create(&context);
 
         assert!(
-            !integration.handles_attribute("src"),
-            "should not handle src when rewrite_sdk is false"
+            action.element_handlers.is_empty(),
+            "should judge no address when rewrite_sdk is false"
         );
-        assert!(
-            !integration.handles_attribute("href"),
-            "should not handle href when rewrite_sdk is false"
+        assert_eq!(
+            action.head_inserts.len(),
+            1,
+            "should still write the browser module's settings"
         );
     }
 
@@ -2355,17 +2362,10 @@ mod tests {
     }
 
     #[test]
-    fn head_injector_emits_config_script_plus_trap_when_enabled() {
+    fn head_markup_emits_config_script_plus_trap_when_enabled() {
         let integration = SourcepointIntegration::new(Arc::new(config()));
-        let document_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "ts.example.com",
-            request_scheme: "https",
-            origin_host: "origin.example.com",
-            document_state: &document_state,
-        };
 
-        let inserts = integration.head_inserts(&ctx);
+        let inserts = integration.head_markup();
         assert_eq!(
             inserts.len(),
             2,
@@ -2416,19 +2416,12 @@ mod tests {
     }
 
     #[test]
-    fn head_injector_returns_config_when_rewrite_disabled() {
+    fn head_markup_returns_config_when_rewrite_disabled() {
         let mut cfg = config();
         cfg.rewrite_sdk = false;
         let integration = SourcepointIntegration::new(Arc::new(cfg));
-        let document_state = IntegrationDocumentState::default();
-        let ctx = IntegrationHtmlContext {
-            request_host: "ts.prospecta.com",
-            request_scheme: "https",
-            origin_host: "origin.prospecta.com",
-            document_state: &document_state,
-        };
 
-        let inserts = integration.head_inserts(&ctx);
+        let inserts = integration.head_markup();
         assert_eq!(
             inserts.len(),
             1,
@@ -3082,6 +3075,23 @@ mod tests {
             super::MODULE,
             trusted_server_core::module_name!(),
             "should be named by the folder this crate lives in"
+        );
+    }
+
+    /// The page a reader receives with this module running, kept as a file
+    /// so that changing how the page change is made can be shown to leave
+    /// the page as it was.
+    #[test]
+    fn the_page_a_reader_receives_is_the_recorded_one() {
+        trusted_server_core::html_processor::test_support::assert_page_is_recorded(
+            include_str!("fixtures/page-change.settings.toml"),
+            &[super::builder()],
+            include_str!("fixtures/page-change.input.html"),
+            include_str!("fixtures/page-change.recorded.html"),
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/src/fixtures/page-change.recorded.html"
+            ),
         );
     }
 }

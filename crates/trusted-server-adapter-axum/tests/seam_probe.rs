@@ -378,6 +378,112 @@ fn geo_selector_naming_a_module_without_a_geo_module_fails_at_startup() {
     );
 }
 
+/// A `[[fetch]]` entry naming the probe's middleware starts the adapter, and
+/// the registry runs that middleware on the paths the entry covers.
+#[test]
+fn fetch_entry_naming_a_modules_middleware_starts_the_adapter() {
+    use trusted_server_core::middleware::{HTML_MEDIA_TYPE, MiddlewarePhase};
+
+    let settings = || {
+        settings_with(&format!(
+            r#"
+            {PROBE_BLOCK}
+
+            [[fetch]]
+            media_type = "text/html"
+            path = "/news/"
+            middleware = ["testing.seam-probe"]
+            "#
+        ))
+    };
+
+    let registry = registry_with_probe(&settings());
+    let chain_for = |path: &str| {
+        registry
+            .middleware_chain(
+                &settings().fetch,
+                MiddlewarePhase::Fetch,
+                HTML_MEDIA_TYPE,
+                path,
+            )
+            .ids()
+    };
+    assert_eq!(
+        chain_for("/news/today"),
+        [seam_probe::module_name()],
+        "should run the module's middleware under the entry's path"
+    );
+    assert!(
+        chain_for("/sport/today").is_empty(),
+        "should run nothing on a path no entry covers"
+    );
+
+    TrustedServerApp::routes_with_registrations(settings(), &[seam_probe::builder()])
+        .expect("should start with an entry naming a middleware the module supplies");
+}
+
+/// A `[[serve]]` entry starts the adapter when it names a middleware that
+/// runs in that phase, and is a startup error when it names one that does
+/// not.
+#[test]
+fn serve_entry_starts_the_adapter_only_with_a_middleware_of_that_phase() {
+    let settings = |name: &str| {
+        settings_with(&format!(
+            r#"
+            {PROBE_BLOCK}
+
+            [[serve]]
+            media_type = "text/html"
+            middleware = ["{name}"]
+            "#
+        ))
+    };
+
+    TrustedServerApp::routes_with_registrations(
+        settings(seam_probe::reader_middleware_name()),
+        &[seam_probe::builder()],
+    )
+    .expect("should start with a serve entry naming the module's serve middleware");
+
+    let error = TrustedServerApp::routes_with_registrations(
+        settings(seam_probe::module_name()),
+        &[seam_probe::builder()],
+    )
+    .err()
+    .expect("should refuse to start when a serve entry names a fetch middleware");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("[[serve]] entry 1 names `testing.seam-probe`")
+            && message.contains("does not run in that phase. It runs in [[fetch]]"),
+        "should say which phase the middleware runs in: {message}"
+    );
+}
+
+/// A `[[fetch]]` entry naming the middleware of a module no section selects
+/// is a startup error, raised where the adapter builds its routes.
+#[test]
+fn fetch_entry_naming_the_middleware_of_an_unselected_module_fails_at_startup() {
+    let settings = settings_with(
+        r#"
+            [[fetch]]
+            media_type = "text/html"
+            middleware = ["testing.seam-probe"]
+        "#,
+    );
+
+    let error = TrustedServerApp::routes_with_registrations(settings, &[seam_probe::builder()])
+        .err()
+        .expect("should refuse to start when an entry names a middleware that does not run");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("[[fetch]] entry 1 names `testing.seam-probe`")
+            && message.contains("`testing.seam-probe` is a module no section selects"),
+        "should name the entry and say why the middleware is not running: {message}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 5. Two builders claiming one id are rejected, naming both sources
 // ---------------------------------------------------------------------------
