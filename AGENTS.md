@@ -27,7 +27,7 @@ crates/
   auction/                              # auction module crates (aps, prebid, prebid-server)
   audience/                             # audience module crates (permutive)
   bot-protection/                       # bot protection module crates (datadome)
-  cmp/                                  # consent tool module crates (didomi, osano, sourcepoint)
+  cmp/                                  # consent tool module crates (didomi, inmobi, osano, sourcepoint)
   framework/                            # framework module crates (nextjs)
   identity/                             # identity module crates (lockr)
   tag/                                  # tag manager module crates (google-tag-manager)
