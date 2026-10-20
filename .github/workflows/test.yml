@@ -8,12 +8,13 @@ on:
     branches: [main]
   pull_request:
 
-# Each author runs one pull request at a time per workflow, so one person
-# pushing many PRs cannot fill the runner queue ahead of everyone else. Their
-# other runs wait in order instead of being cancelled. Other events get their
-# own group from the run ID and are never held back.
+# Each pull request author runs one PR at a time per workflow, so one person
+# opening many PRs cannot fill the runner queue ahead of everyone else. Their
+# other runs wait in order instead of being cancelled, and every job has a
+# timeout so a hung run cannot hold that queue for hours. Bot-authored PRs and
+# other events get their own group from the run ID and are never held back.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.actor || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.user.type != 'Bot' && github.event.pull_request.user.login || github.run_id }}
   cancel-in-progress: false
   queue: max
 
@@ -77,6 +78,7 @@ jobs:
   test-axum:
     name: cargo test (axum native)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -125,6 +127,7 @@ jobs:
   test-cloudflare:
     name: cargo check (cloudflare native + wasm32-unknown-unknown)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -146,6 +149,7 @@ jobs:
   test-spin:
     name: cargo check/build/test (spin native + wasm32-wasip1)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -179,6 +183,7 @@ jobs:
   test-parity:
     name: cargo test (cross-adapter parity)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -204,6 +209,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -268,6 +274,7 @@ jobs:
   test-typescript:
     name: vitest
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: crates/trusted-server-js/lib
