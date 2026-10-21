@@ -394,6 +394,67 @@ fn coverage_gaps_name_unresolved_fastly_tools_and_incomplete_native_materials() 
 }
 
 #[test]
+fn coverage_gaps_retain_gnu_tool_closure_without_unreadable_helpers() {
+    let platform = projection_fixture(crate::policy::ReleaseTarget::X86_64UnknownLinuxGnu)
+        .with_gnu(crate::recipe::gnu::GnuEvidence::projection_fixture())
+        .expect("should attach fictional GNU measurements");
+    assert!(
+        platform
+            .gnu()
+            .expect("should hold GNU evidence")
+            .content_unmeasured_files()
+            .is_empty(),
+        "should exercise fully readable installed files"
+    );
+    let gaps = coverage_gaps(&platform);
+    assert!(
+        gaps.iter().any(|gap| gap == "gnu-tool-closure-unmeasured"),
+        "should retain the unmeasured GNU tool closure"
+    );
+    assert!(
+        gaps.windows(2).all(|pair| pair[0] < pair[1]),
+        "should list gaps sorted and unique"
+    );
+}
+
+#[test]
+fn coverage_gaps_retain_gnu_unverified_acquisition_without_unreadable_helpers() {
+    let platform = projection_fixture(crate::policy::ReleaseTarget::X86_64UnknownLinuxGnu)
+        .with_gnu(crate::recipe::gnu::GnuEvidence::projection_fixture())
+        .expect("should attach fictional GNU measurements");
+    let gaps = coverage_gaps(&platform);
+    assert!(
+        gaps.iter()
+            .any(|gap| gap == "gnu-original-acquisition-unverified"),
+        "should retain unverified GNU original acquisition"
+    );
+    assert!(
+        !gaps
+            .iter()
+            .any(|gap| gap == "gnu-privileged-helper-content-unmeasured"),
+        "should not invent unreadable helper content"
+    );
+}
+
+#[test]
+fn coverage_gaps_do_not_invent_gnu_measurements_for_other_platforms() {
+    for target in [
+        crate::policy::ReleaseTarget::Wasm32Wasip1,
+        crate::policy::ReleaseTarget::Aarch64AppleDarwin,
+        crate::policy::ReleaseTarget::X86_64AppleDarwin,
+    ] {
+        let platform = projection_fixture(target);
+        assert!(
+            !coverage_gaps(&platform)
+                .iter()
+                .any(|gap| gap.starts_with("gnu-")),
+            "should not invent GNU gaps for {}",
+            target.triple()
+        );
+    }
+}
+
+#[test]
 fn coverage_gaps_retain_apple_exclusions_and_unmeasured_tool_closure() {
     let platform = projection_fixture(crate::policy::ReleaseTarget::Aarch64AppleDarwin);
     let gaps = coverage_gaps(&platform);

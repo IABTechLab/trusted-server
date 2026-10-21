@@ -56,6 +56,11 @@ qualification. There are **8 complete tasks and 14 open tasks**. One open task
 has its implementation finished; nine tasks therefore have completed code.
 Task counts do not measure remaining effort.
 
+Task 10 remains partial after the 2026-10-21 native archive identity hardening
+and GNU gap reporting increment. Existing source/archive/unit/JS collectors are
+implemented, but full native/tool closure and authenticated acquisition are not
+established. The task counts below do not change for this increment.
+
 | Status                                         | Count | Tasks                     | Remaining exit work                                                                                                                                                                       |
 | ---------------------------------------------- | ----- | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Complete                                       | 8     | 2, 4, 5, 6, 7, 17, 18, 20 | Implementation, local verification, real pinned-verifier public-fixture validation where required, and independent review completed                                                       |
@@ -342,11 +347,48 @@ Progress (2026-10-16, no Task 9 exit yet): the closed recipe, checked A/B ambien
 
 **Create:** release tool `src/composition.rs`, private `composition::tests`, `crates/trusted-server-release/tests/fixtures/composition/`.
 
-- [ ] Add fixtures for host/target dual-role packages with different unit features, ambiguous source IDs, dev-only graph entries, unknown native origin, system substitution and prepared-but-discarded CLI JS.
-- [ ] Run `cargo test -p trusted-server-release --target "$HOST_TARGET" composition::tests` with the nonzero-selection guard; expect absent Rust collector.
-- [ ] Join explicit-target compiler/build-script messages with metadata/tree and selected material identities; preserve each observed unit's features/context. Package union features cannot stand in for effective per-unit features. Retain raw observations for audit; do not claim an exact compiler dependency DAG.
+- [x] Add fixtures for host/target dual-role packages with different unit features, ambiguous source IDs, dev-only graph entries, unknown native origin, system substitution and prepared-but-discarded CLI JS.
+- [x] Run `cargo test -p trusted-server-release --target "$HOST_TARGET" --bin trusted-server-release composition::` with the nonzero-selection guard; the scoped 2026-10-21 run selected and passed 63 pure tests.
+- [x] Join explicit-target compiler/build-script messages with metadata/tree and selected material identities; preserve each observed unit's features/context. Package union features cannot stand in for effective per-unit features. Retain raw observations for audit; do not claim an exact compiler dependency DAG.
 - [ ] Capture AWS-LC/ring/SQLite native source and output archive hashes/link directives, Rust sysroot and external platform libraries. Validate generic/target-specific selection against the recipe. Distinguish embedded components, external requirements and build tools.
-- [ ] Inspect final files conservatively for complete JS module strings. Record absence explicitly; Fastly and CLI do not need the same retained set. Do not force unused JS into CLI. Commit `Collect artifact-specific build composition` after negatives pass.
+- [x] Inspect final files conservatively for complete JS module strings. Record absence explicitly; Fastly and CLI do not need the same retained set. Do not force unused JS into CLI.
+
+Scoped audit and hardening (2026-10-21): the checked items above describe existing
+implemented collectors, not newly established full coverage. Named fixtures in
+`composition/tests.rs`, `graph/tests.rs`, `native/tests.rs` and
+`javascript/tests.rs` already exercise the listed cases. The dual-role feature
+cases are synthetic; retained real cross-build fixtures establish host-only
+membership, not a captured dual-role build or exact compiler dependency DAG.
+AWS-LC/ring/SQLite observations already bind verified original distributions,
+prepared source/subtrees, consuming contexts/features, static output archives
+and link directives. Rust installed-tree measurements and logical external
+runtime requirements remain distinct from original acquisition and complete
+native/tool coverage; that capture exit stays unchecked.
+
+A new negative fixture replaces a native archive between checking its magic and
+hashing its path. The previous implementation accepted a valid header from one
+inode and a digest from a different non-archive file. The collector now hashes
+the checked header and remaining bytes through the same held descriptor, with
+bounded reads, owning-attempt checks and matching final descriptor/path metadata.
+No reported path or digest becomes trusted without local measurement.
+
+GNU receipts already record incomplete closure and unqualified acquisition.
+Candidate SPDX now names both limitations as `gnu-tool-closure-unmeasured` and
+`gnu-original-acquisition-unverified`, independently of the existing
+`gnu-privileged-helper-content-unmeasured` gap. These names are absent for
+non-GNU receipts and remain sorted/unique. No serialized receipt fields, schemas,
+workflow assertions, completeness flags or production constructors changed.
+Hosted Fastly/Linux/Apple candidate validation of this increment and inspection
+of their emitted gaps remain pending. Complete coverage and qualification stay
+false; this does not complete Task 10 or touch the parallel Task 12 adapter.
+
+Local verification for this increment passed 63 composition tests with the
+nonzero-selection guard and 62 SPDX tests, strict native all-target/all-feature
+Clippy, documentation generation and formatting. The inode-swap regression and
+each new GNU gap assertion failed before its corresponding fix and passed after.
+Independent spec and quality review approved the scoped changes; plan wording
+was corrected to distinguish the implemented collector from the historical
+missing-collector test step. No child-process or ignored tests were run locally.
 
 Progress (2026-10-19, partial Task 10 only): candidate recipes retain an unfiltered Cargo metadata identity catalog and run an explicit-target tree query under the same denied boundary and selected tool/environment/source replacements as the build. Completion joins actual compiler messages to exact metadata package/target identities, preserves observed host/target unit features and build-script outputs, and requires the selected final executable to appear exactly once. Raw metadata/tree and normalized observations, including query plan digests, are retained privately and rehashed at handoff; candidate measurements keep `material_native_coverage_complete: false`. Ordinary CI at `456d15005` passed Fastly A/B equality and final-byte Viceroy acceptance with 255 observed packages, 377 units and 39 build-script executions per side, and Linux CLI capture/startup with 486 packages, 649 units and 62 build-script executions. Those runs precede the new component receipts below; they do not validate their full-product integration (later runs 39273777887, 39290139247 and 39417433680 do, as an ordinary-CI candidate). Apple full-product acceptance has since passed in ordinary CI (runs 39273777887 and 39290139247, recorded under Task 9 and below).
 

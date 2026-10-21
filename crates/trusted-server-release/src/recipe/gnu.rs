@@ -335,6 +335,14 @@ fn check_image_sysroot(value: &str) -> Result<(), Report<ReleaseError>> {
 }
 
 impl GnuEvidence {
+    /// Returns whether installed-file measurements lack a complete tool closure.
+    pub(crate) fn tool_closure_unmeasured(&self) -> bool {
+        !self.full_closure_measured
+    }
+    /// Returns whether acquisition is recorded as an unqualified candidate measurement.
+    pub(crate) fn original_acquisition_unverified(&self) -> bool {
+        self.acquisition == "unqualified_candidate_measurement"
+    }
     /// Supplies fictional typed observations for projection tests only.
     #[cfg(test)]
     pub(crate) fn projection_fixture() -> Self {

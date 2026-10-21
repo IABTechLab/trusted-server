@@ -1,19 +1,20 @@
 //! Candidate native source and archive observations, without release authority.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, Metadata, OpenOptions};
 use std::io::Read as _;
-use std::os::unix::fs::OpenOptionsExt as _;
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 
 use error_stack::Report;
 use serde::Serialize;
+use sha2::{Digest as _, Sha256};
 
 use super::{
     BuildScriptObservation, CargoObservations, RustPackage, UnitContext, composition_error,
     normal_path,
 };
-use crate::documents::{hash_bounded_with_check, lower_hex};
+use crate::documents::lower_hex;
 use crate::error::ReleaseError;
 use crate::policy::ReleaseTarget;
 use crate::tool_tree::tool_tree_digest;
@@ -168,6 +169,19 @@ fn archive_parent(root: &Path, file: &Path) -> Result<(), Report<ReleaseError>> 
     Ok(())
 }
 
+fn same_archive(before: &Metadata, after: &Metadata) -> bool {
+    after.is_file()
+        && before.dev() == after.dev()
+        && before.ino() == after.ino()
+        && before.nlink() == after.nlink()
+        && before.len() == after.len()
+        && before.mode() == after.mode()
+        && before.mtime() == after.mtime()
+        && before.mtime_nsec() == after.mtime_nsec()
+        && before.ctime() == after.ctime()
+        && before.ctime_nsec() == after.ctime_nsec()
+}
+
 fn archive_digest(
     root: &Path,
     path: &Path,
@@ -179,15 +193,52 @@ fn archive_digest(
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)
         .map_err(composition_error)?;
+    let before = file.metadata().map_err(composition_error)?;
+    if !before.is_file() || before.nlink() != 1 || before.len() > ARCHIVE_LIMIT {
+        return Err(composition_error(
+            "native archive is not a bounded regular single-link file",
+        ));
+    }
     let mut magic = [0; 8];
     file.read_exact(&mut magic).map_err(composition_error)?;
     if &magic != b"!<arch>\n" {
         return Err(composition_error("native output is not a regular archive"));
     }
-    let identity = hash_bounded_with_check(path, ARCHIVE_LIMIT, check)
-        .map_err(|error| error.change_context(ReleaseError::Composition))?;
+    // Format and content identity must describe the same held descriptor.
+    let mut hash = Sha256::new();
+    hash.update(magic);
+    let mut size = magic.len() as u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        check()?;
+        let count = file.read(&mut buffer).map_err(composition_error)?;
+        if count == 0 {
+            break;
+        }
+        size += count as u64;
+        if size > before.len() || size > ARCHIVE_LIMIT {
+            return Err(composition_error("native archive grows while hashing"));
+        }
+        hash.update(&buffer[..count]);
+    }
+    check()?;
+    if size != before.len()
+        || !same_archive(&before, &file.metadata().map_err(composition_error)?)
+        || !same_archive(
+            &before,
+            &fs::symlink_metadata(path).map_err(composition_error)?,
+        )
+    {
+        return Err(composition_error(
+            "native archive content, metadata or path changes while hashing",
+        ));
+    }
     archive_parent(root, path)?;
-    Ok(identity)
+    Ok(crate::documents::FileDigest {
+        sha256: hex::encode(hash.finalize()),
+        size,
+        mode: before.mode(),
+    })
 }
 
 fn source_digest(

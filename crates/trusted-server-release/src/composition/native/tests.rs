@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::symlink;
@@ -215,6 +216,29 @@ fn native_feature_errors_identify_package_context_and_bounded_observed_features(
         error.len() < 4096,
         "should bound native feature diagnostics"
     );
+}
+
+#[test]
+fn archive_format_and_digest_cannot_come_from_different_inodes() {
+    let temporary = tempfile::tempdir().expect("should create native archive fixture");
+    let root = fs::canonicalize(temporary.path()).expect("should resolve fixture root");
+    let path = root.join("libexample.a");
+    fs::write(&path, b"!<arch>\nfictional archive").expect("should write valid archive header");
+    let replaced = Cell::new(false);
+    let check = || {
+        if !replaced.replace(true) {
+            let replacement = root.join("replacement");
+            fs::write(&replacement, b"fictional non-archive replacement")
+                .expect("should write replacement bytes");
+            fs::rename(replacement, &path).expect("should replace archive after its format check");
+        }
+        Ok(())
+    };
+    assert!(
+        archive_digest(&root, &path, &check).is_err(),
+        "should reject format and digest observations from different files"
+    );
+    assert!(replaced.get(), "should exercise the replacement window");
 }
 
 #[test]

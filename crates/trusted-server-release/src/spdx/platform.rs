@@ -89,11 +89,16 @@ fn coverage_gaps(platform: &PlatformEvidence) -> Vec<String> {
             gaps.insert(format!("apple-coverage-excluded:{exclusion}"));
         }
     }
-    if platform
-        .gnu()
-        .is_some_and(|gnu| !gnu.content_unmeasured_files().is_empty())
-    {
-        gaps.insert("gnu-privileged-helper-content-unmeasured".to_owned());
+    if let Some(gnu) = platform.gnu() {
+        if gnu.tool_closure_unmeasured() {
+            gaps.insert("gnu-tool-closure-unmeasured".to_owned());
+        }
+        if gnu.original_acquisition_unverified() {
+            gaps.insert("gnu-original-acquisition-unverified".to_owned());
+        }
+        if !gnu.content_unmeasured_files().is_empty() {
+            gaps.insert("gnu-privileged-helper-content-unmeasured".to_owned());
+        }
     }
     gaps.into_iter().collect()
 }
