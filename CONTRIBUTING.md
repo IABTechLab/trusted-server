@@ -178,9 +178,17 @@ To scan on demand, `ts dev lint domains` audits the whole working tree and
 `--changed-vs <ref>` limits it to lines added against a ref. The full audit
 reports pre-existing violations, so a non-zero exit is expected today.
 
+CI runs the same check on every pull request: the `lint-domains` job scans the
+lines the PR adds against its base branch, so `--no-verify` or a missing hook
+does not let a host through. Editing or moving a line that already contains a
+non-allowlisted host counts as adding it. Reproduce the job locally with
+`ts dev lint domains --changed-vs origin/main`, using the PR's base branch in
+place of `main` when it targets another branch.
+
 To allow a new host, add it to the allowlist constants in
 `crates/trusted-server-cli/src/commands/dev/lint/domains.rs`. To suppress a
-single line, append `// allow-domain: <host>` in a comment.
+single line, append `// allow-domain: <host>` in a comment
+(`<!-- allow-domain: <host> -->` in Markdown).
 
 ## Commits
 

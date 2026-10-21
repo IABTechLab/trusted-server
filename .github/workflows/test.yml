@@ -320,24 +320,20 @@ jobs:
           cache-key: cargo-cli
           save-cache: "false"
 
-      - name: Read pinned Node.js version
-        id: node-version
-        shell: bash
-        run: echo "version=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
-
-      # trusted-server-core's dependency on trusted-server-js runs the TSJS
-      # build with the `npm` on PATH, so pin Node before any cargo step.
+      # Building `ts` compiles trusted-server-core, whose trusted-server-js
+      # build script runs the TSJS build with the `npm` on PATH, so pin Node
+      # first (see #1204).
       - name: Use Node.js for the TSJS build
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ steps.node-version.outputs.version }}
+          node-version-file: .tool-versions
 
       # The `ts` CLI is host-target only; the workspace default is wasm32-wasip1.
       - name: Lint URL hosts on lines added by this PR
         run: |
           cargo run --manifest-path crates/trusted-server-cli/Cargo.toml \
             --target "$(rustc -vV | sed -n 's/host: //p')" --bin ts -- \
-            dev lint domains --changed-vs HEAD^1
+            dev lint domains --changed-vs HEAD^1 --verbose
 
   test-typescript:
     name: vitest
