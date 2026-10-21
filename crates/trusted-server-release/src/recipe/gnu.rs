@@ -50,6 +50,33 @@ pub(super) fn linker_arguments() -> Vec<String> {
 const PROFILE: &str = "gnu-cc-installed-image-v1";
 const HELPER_ARGUMENT: &str = "gnu-image-measurement";
 const MEASUREMENT_LIMIT: u64 = 64 * 1024;
+const FIXED_SELECTED_FILES: [(&str, &str); 4] = [
+    ("compiler", "/usr/bin/gcc"),
+    ("archiver", "/usr/bin/ar"),
+    ("gcc_linker_candidate", "/usr/bin/ld"),
+    ("gcc_assembler_candidate", "/usr/bin/as"),
+];
+const SELECTED_ROLES: [&str; 9] = [
+    "compiler",
+    "archiver",
+    "gcc_linker_candidate",
+    "gcc_assembler_candidate",
+    "configured_cc1",
+    "configured_collect2",
+    "configured_as",
+    "configured_ld",
+    "compiler_runtime",
+];
+const COMPILER_QUERIES: [&str; 8] = [
+    "-print-prog-name=cc1",
+    "-print-prog-name=collect2",
+    "-print-prog-name=as",
+    "-print-prog-name=ld",
+    "-print-libgcc-file-name",
+    "-print-file-name=include",
+    "-print-sysroot",
+    "-print-search-dirs",
+];
 
 /// Selected/configured installed-file facts, never a claim of executed helpers.
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -246,12 +273,7 @@ pub(crate) fn helper_measurement() -> Result<Vec<u8>, Report<ReleaseError>> {
         ));
     }
     let mut selected_files = BTreeMap::new();
-    for (role, path) in [
-        ("compiler", "/usr/bin/gcc"),
-        ("archiver", "/usr/bin/ar"),
-        ("gcc_linker_candidate", "/usr/bin/ld"),
-        ("gcc_assembler_candidate", "/usr/bin/as"),
-    ] {
+    for (role, path) in FIXED_SELECTED_FILES {
         selected_files.insert(role.to_owned(), file_identity(Path::new(path))?);
     }
     let mut compiler_queries = BTreeMap::new();
@@ -330,6 +352,80 @@ fn check_image_sysroot(value: &str) -> Result<(), Report<ReleaseError>> {
         return Err(recipe_error(format!(
             "GNU profile requires the image-root sysroot; compiler reported {observed:?}"
         )));
+    }
+    Ok(())
+}
+
+fn validate_measurement(measurement: &Measurement) -> Result<(), Report<ReleaseError>> {
+    if measurement.profile != PROFILE
+        || !lower_hex(&measurement.installed_files_sha256, 64)
+        || !valid_content_unmeasured(&measurement.content_unmeasured_files)
+        || measurement.roots != image::ROOTS
+        || measurement.sysroot != "/"
+        || measurement.selected_files.len() != SELECTED_ROLES.len()
+        || SELECTED_ROLES
+            .iter()
+            .any(|role| !measurement.selected_files.contains_key(*role))
+        || measurement.compiler_queries.len() != COMPILER_QUERIES.len()
+        || COMPILER_QUERIES
+            .iter()
+            .any(|query| !measurement.compiler_queries.contains_key(*query))
+    {
+        return Err(recipe_error(
+            "GNU helper returned an unsupported measurement",
+        ));
+    }
+    for file in measurement.selected_files.values() {
+        if !file.selected.is_absolute() {
+            return Err(recipe_error("GNU query returned a relative file path"));
+        }
+        image_path(&file.resolved)?;
+        if !lower_hex(&file.sha256, 64) {
+            return Err(recipe_error("invalid GNU file identity"));
+        }
+    }
+    check_image_sysroot(&measurement.compiler_queries["-print-sysroot"])?;
+    for (role, path) in FIXED_SELECTED_FILES {
+        if measurement.selected_files[role].selected != Path::new(path) {
+            return Err(recipe_error(
+                "GNU selected driver differs from the fixed profile",
+            ));
+        }
+    }
+    for (role, query, bare_name) in [
+        ("configured_cc1", "-print-prog-name=cc1", None),
+        ("configured_collect2", "-print-prog-name=collect2", None),
+        ("configured_as", "-print-prog-name=as", Some("as")),
+        ("configured_ld", "-print-prog-name=ld", Some("ld")),
+        ("compiler_runtime", "-print-libgcc-file-name", None),
+    ] {
+        let output = measurement.compiler_queries[query]
+            .strip_suffix('\n')
+            .filter(|value| !value.is_empty() && !value.chars().any(char::is_control))
+            .ok_or_else(|| recipe_error("GNU path query lacks one bounded result line"))?;
+        let file = &measurement.selected_files[role];
+        let selected = &file.selected;
+        let matches = if let Some(name) = bare_name.filter(|name| *name == output) {
+            let candidate = &measurement.selected_files[if name == "as" {
+                "gcc_assembler_candidate"
+            } else {
+                "gcc_linker_candidate"
+            }];
+            // The fixed image candidate precedes /bin in the selected PATH.
+            // An alternate spelling must identify the same measured image file.
+            (selected == Path::new(&format!("/usr/bin/{name}"))
+                || selected == Path::new(&format!("/bin/{name}")))
+                && file.resolved == candidate.resolved
+                && file.sha256 == candidate.sha256
+                && file.size == candidate.size
+        } else {
+            Path::new(output).is_absolute() && selected == Path::new(output)
+        };
+        if !matches {
+            return Err(recipe_error(
+                "GNU selected file differs from its compiler query",
+            ));
+        }
     }
     Ok(())
 }
@@ -475,27 +571,7 @@ impl GnuEvidence {
             .map_err(|error| error.change_context(ReleaseError::Recipe))?;
         let measurement: Measurement = serde_json::from_value(value)
             .map_err(|error| recipe_error(format!("invalid GNU measurement: {error}")))?;
-        if measurement.profile != PROFILE
-            || !lower_hex(&measurement.installed_files_sha256, 64)
-            || !valid_content_unmeasured(&measurement.content_unmeasured_files)
-            || measurement.roots != image::ROOTS
-            || measurement.sysroot != "/"
-            || measurement.selected_files.len() != 9
-            || measurement.compiler_queries.len() != 8
-        {
-            return Err(recipe_error(
-                "GNU helper returned an unsupported measurement",
-            ));
-        }
-        for file in measurement.selected_files.values() {
-            if !file.selected.is_absolute() {
-                return Err(recipe_error("GNU query returned a relative file path"));
-            }
-            image_path(&file.resolved)?;
-            if !lower_hex(&file.sha256, 64) {
-                return Err(recipe_error("invalid GNU file identity"));
-            }
-        }
+        validate_measurement(&measurement)?;
         Ok(Self {
             measurement,
             profile_sha256: profile_digest(),

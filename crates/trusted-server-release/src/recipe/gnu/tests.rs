@@ -211,6 +211,164 @@ pub(super) fn projection_fixture() -> GnuEvidence {
     }
 }
 
+fn measurement_fixture() -> Measurement {
+    let mut measurement = projection_fixture().measurement;
+    measurement.compiler_queries = [
+        ("-print-prog-name=cc1", "/usr/libexec/gcc/example/cc1\n"),
+        ("-print-prog-name=collect2", "/usr/libexec/gcc/example/collect2\n"),
+        ("-print-prog-name=as", "as\n"),
+        ("-print-prog-name=ld", "ld\n"),
+        ("-print-libgcc-file-name", "/usr/lib/gcc/example/libgcc.a\n"),
+        ("-print-file-name=include", "/usr/lib/gcc/example/include\n"),
+        ("-print-sysroot", ""),
+        ("-print-search-dirs", "install: /usr/lib/gcc/example/\nprograms: =/usr/libexec/gcc/example/\nlibraries: =/usr/lib/gcc/example/\n"),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_owned(), value.to_owned()))
+    .collect();
+    measurement
+}
+
+#[test]
+fn measurement_requires_exact_selected_roles_and_query_keys() {
+    for selected in [true, false] {
+        let mut measurement = measurement_fixture();
+        if selected {
+            let value = measurement
+                .selected_files
+                .remove("compiler")
+                .expect("should have compiler");
+            measurement
+                .selected_files
+                .insert("example_replacement".to_owned(), value);
+        } else {
+            let value = measurement
+                .compiler_queries
+                .remove("-print-sysroot")
+                .expect("should have sysroot query");
+            measurement
+                .compiler_queries
+                .insert("example_replacement".to_owned(), value);
+        }
+        assert!(
+            validate_measurement(&measurement).is_err(),
+            "should reject a missing required identity even when counts match"
+        );
+    }
+}
+
+#[test]
+fn measurement_binds_selected_drivers_and_configured_query_paths() {
+    for role in [
+        "compiler",
+        "archiver",
+        "gcc_linker_candidate",
+        "gcc_assembler_candidate",
+        "configured_cc1",
+        "configured_collect2",
+        "configured_as",
+        "configured_ld",
+        "compiler_runtime",
+    ] {
+        let mut measurement = measurement_fixture();
+        measurement
+            .selected_files
+            .get_mut(role)
+            .expect("should have selected role")
+            .selected = PathBuf::from("/usr/bin/example-replacement");
+        assert!(
+            validate_measurement(&measurement).is_err(),
+            "should join selected {role} to its fixed driver or compiler query"
+        );
+    }
+}
+
+#[test]
+fn measurement_rechecks_the_compiler_sysroot_observation() {
+    let mut measurement = measurement_fixture();
+    measurement.compiler_queries.insert(
+        "-print-sysroot".to_owned(),
+        "/example-other-root\n".to_owned(),
+    );
+    assert!(
+        validate_measurement(&measurement).is_err(),
+        "should reject a query contradicting the recorded image-root sysroot"
+    );
+}
+
+#[test]
+fn measurement_preserves_reviewed_bare_names_and_resolved_aliases() {
+    for sysroot in ["", "\n", "/\n"] {
+        for explicit_paths in [false, true] {
+            let mut measurement = measurement_fixture();
+            measurement
+                .compiler_queries
+                .insert("-print-sysroot".to_owned(), sysroot.to_owned());
+            for name in ["as", "ld"] {
+                let role = format!("configured_{name}");
+                let selected = &mut measurement
+                    .selected_files
+                    .get_mut(&role)
+                    .expect("should have configured helper")
+                    .selected;
+                *selected = PathBuf::from(format!("/bin/{name}"));
+                if explicit_paths {
+                    measurement
+                        .compiler_queries
+                        .insert(format!("-print-prog-name={name}"), format!("/bin/{name}\n"));
+                }
+            }
+            measurement
+                .selected_files
+                .get_mut("compiler")
+                .expect("should have compiler")
+                .resolved = PathBuf::from("/usr/bin/example-gcc");
+            validate_measurement(&measurement)
+                .expect("should accept measured aliases and supported GCC query spellings");
+        }
+    }
+}
+
+#[test]
+fn measurement_rejects_bare_helpers_with_conflicting_image_identities() {
+    for role in ["configured_as", "configured_ld"] {
+        for changed in ["resolved", "sha256", "size"] {
+            let mut measurement = measurement_fixture();
+            let file = measurement
+                .selected_files
+                .get_mut(role)
+                .expect("should have configured helper");
+            match changed {
+                "resolved" => file.resolved = PathBuf::from("/usr/libexec/example-other-tool"),
+                "sha256" => file.sha256 = "d".repeat(64),
+                _ => file.size += 1,
+            }
+            assert!(
+                validate_measurement(&measurement).is_err(),
+                "should join bare {role} to the fixed image tool {changed}"
+            );
+        }
+    }
+}
+
+#[test]
+fn measurement_accepts_an_explicit_alternate_image_helper() {
+    let mut measurement = measurement_fixture();
+    let file = measurement
+        .selected_files
+        .get_mut("configured_as")
+        .expect("should have assembler");
+    file.selected = PathBuf::from("/usr/libexec/example-as");
+    file.resolved = file.selected.clone();
+    file.sha256 = "d".repeat(64);
+    measurement.compiler_queries.insert(
+        "-print-prog-name=as".to_owned(),
+        "/usr/libexec/example-as\n".to_owned(),
+    );
+    validate_measurement(&measurement)
+        .expect("should preserve an explicit measured compiler-selected helper");
+}
+
 #[test]
 fn installed_image_identity_covers_helpers_headers_modes_and_aliases() {
     let temporary = tempfile::tempdir().expect("should create image fixture");

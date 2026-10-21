@@ -5,6 +5,36 @@ use crate::composition::origin::VerifiedPackageOrigins;
 use sha2::Digest as _;
 
 #[test]
+fn native_license_declarations_require_native_license_evidence() {
+    for name in ["aws-lc-sys", "ring", "libsqlite3-sys"] {
+        for context in [UnitContext::Target, UnitContext::Host] {
+            let (inventory, observed) = fixture_for_projection(name, context);
+            let origins = VerifiedPackageOrigins::fixture_native_registry(&observed);
+            let mut components = project(&inventory, &observed, &origins)
+                .expect("should project measured native inputs");
+            components[0].declared_license = Some("MIT".to_owned());
+            let executable = b"fictional native executable";
+            let result = super::super::render(&super::super::SpdxInputs {
+                executable,
+                expected_artifact_sha256: hex::encode(sha2::Sha256::digest(executable)),
+                name: "example-cli".to_owned(),
+                version: "1.0.0".to_owned(),
+                source_commit: "a".repeat(40),
+                target: crate::policy::ReleaseTarget::Aarch64AppleDarwin,
+                created: "2026-01-01T00:00:00Z".to_owned(),
+                document_comment: None,
+                components,
+                dependencies: Vec::new(),
+            });
+            assert!(
+                result.is_err(),
+                "should reject an unsupported native license declaration for {name} in {context:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn target_and_host_native_inputs_keep_distinct_roles_and_unknown_implementation_versions() {
     for context in [UnitContext::Target, UnitContext::Host] {
         let (inventory, observed) = fixture_for_projection("ring", context);

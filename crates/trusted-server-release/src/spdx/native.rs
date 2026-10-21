@@ -319,9 +319,12 @@ pub(super) fn origin_fields(
     } else {
         ComponentRole::BuildMaterial
     };
-    if component.roles != [expected] || component.version.is_some() {
+    if component.roles != [expected]
+        || component.version.is_some()
+        || component.declared_license.is_some()
+    {
         return Err(spdx_error(
-            "native roles or implementation version exceed measured facts",
+            "native roles, implementation version or declared license exceed measured facts",
         ));
     }
     cargo::validate_material(

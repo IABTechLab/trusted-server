@@ -458,6 +458,36 @@ Cargo wall through `ToolSelection::build_wall` (`b4c8e0c0f`), rather than the fi
 The running speedup CI is not yet a completed acceptance result; neither deferral
 nor the changed budget establishes repeatability, complete coverage or qualification.
 
+GNU receipt follow-up (2026-10-21): capture now validates the exact nine selected
+file roles and eight compiler-query identities, not only their counts. Selected
+drivers match the fixed profile; configured cc1, collect2, assembler, linker and
+compiler-runtime files join their recorded query paths. The raw sysroot response
+is rechecked against the supported image-root forms. Bare assembler/linker names
+must match the fixed image candidate's resolved path, digest and size; `/bin`
+aliases of the same file and explicit alternative image-helper paths remain
+supported. These are installed/configured observations, not execution tracing or
+general PATH-resolution proof; tools-root helpers remain outside this profile.
+
+The audit found existing AWS-LC/ring/SQLite collection already retains original
+registry archive identities, prepared source/subtree hashes, static-link
+directives and rehashed output archives. Rust tool trees, measured Apple tools/
+SDK inputs and GNU installed/configured files already project into SPDX. No new
+native source fact, external-library identity or authenticated acquisition is
+invented by strengthening the receipt checks. Native material coverage stays
+incomplete. The existing Fastly unresolved-host-tool, GNU closure/acquisition/
+privileged-helper-content and Apple closure/toolchain-library gaps remain open;
+complete sysroot/tool execution closure and external platform inputs still need
+additional owner measurements and qualification. Real GNU acceptance of this
+guard awaits hosted CI; none of these changes completes Task 10.
+
+Scoped verification: nonzero guards selected 18 pure GNU tests, 67 pure SPDX
+tests and two unchanged producer golden checks; all passed. Strict host clippy,
+documentation and owned-file formatting pass. Independent spec and quality
+reviews approve this increment without blockers, including preservation of
+explicit GCC paths and same-identity aliases. No child-process or ignored tests
+were executed locally. All four candidate gap lists still require inspection
+after the code push; the earlier Task 14 run is not evidence for this new guard.
+
 ### Task 11: Generate complete artifact-specific SPDX
 
 **Create:** release tool `src/spdx.rs`, private `spdx::tests`, `crates/trusted-server-release/tests/fixtures/spdx/`.
@@ -509,8 +539,22 @@ The local suite passes 66 pure SPDX tests plus the two pure golden checks.
 Real-artifact acceptance of the strengthened guard awaits hosted CI. Complete
 native/tool coverage, complete qualified per-artifact SBOMs and the remaining
 Task 11 exits stay unchecked. Parallel Task 12 code and its fixtures are untouched.
-Remaining Task 11 completeness work is deferred behind Task 14; this ordering
-does not waive its coverage or qualified-generation requirements.
+Task 11 resumes after recording Task 14's hosted preservation result and open
+maintainer decision below. Task 14 remains open; this ordering does not waive
+either task's coverage, authority or qualified-generation requirements.
+
+Native license boundary follow-up (2026-10-21): the renderer rejects a native
+implementation license declaration when the measured native original has no
+such license fact. The owning adapter already supplies no declaration; this
+closes an invalid-input path rather than correcting a demonstrated real-build
+misclassification. The integrated regression covers all three reviewed wrappers
+in host and target contexts. Native license declarations and conclusions remain
+`NOASSERTION`; wrapper declarations cannot substitute for native license evidence.
+No license catalog is expanded and no existing measured package or relationship
+was found missing from its projection. Complete artifact-specific generation
+still requires the unmeasured closure/input facts and qualified owning adapters.
+Valid rendering, companion formats and candidate golden fixtures are unchanged;
+hosted acceptance of this strengthened guard remains pending.
 
 ### Task 12: Bind transfers and enforce selected comparisons
 
@@ -686,6 +730,60 @@ official REST-host suppression also received explicit review. Review fixes cover
 Node extraction quoting, least-privilege permissions, documented REST attempt
 responses, tag bounds, per-request remaining budgets and composed source-API
 coverage. Task 14 is not marked complete by those approvals.
+
+Hosted preservation follow-up (2026-10-21): successful [Run Tests 39596973649](https://github.com/IABTechLab/trusted-server/actions/runs/39596973649)
+has head `ac07047ed2b4f1bbe0e1f2e4aac9f845e70b7c7c`, including `2b642b509`.
+All 20 expanded test jobs succeeded, including Fastly candidate
+[119211581826](https://github.com/IABTechLab/trusted-server/actions/runs/39596973649/job/119211581826),
+Linux CLI [119211581675](https://github.com/IABTechLab/trusted-server/actions/runs/39596973649/job/119211581675),
+Apple ARM [119219615235](https://github.com/IABTechLab/trusted-server/actions/runs/39596973649/job/119219615235),
+Apple Intel [119219615180](https://github.com/IABTechLab/trusted-server/actions/runs/39596973649/job/119219615180),
+the index collector [119250788447](https://github.com/IABTechLab/trusted-server/actions/runs/39596973649/job/119250788447)
+and helper contracts [119211581539](https://github.com/IABTechLab/trusted-server/actions/runs/39596973649/job/119211581539).
+The collector's built source is PR merge `1c78dd4556b03ddaa369680f2248edac1761bcd8`,
+distinct from the run head. Matching [Run Format 39596973672](https://github.com/IABTechLab/trusted-server/actions/runs/39596973672)
+passed all five jobs. Comparison with `d774ee47c` confirms the same 16 original
+test and five format definitions, names, conditions, dependencies and matrices;
+only the helper job was appended. Matrix expansion accounts for 19 original test
+instances plus the helper. This establishes ordinary-CI preservation, not a live
+release-validation invocation or governance/source authority.
+
+**Unresolved maintainer decision before Task 14 can advance:**
+
+1. Select an independently governed approval record and its approving maintainers.
+   Approve exact repository/organization ruleset identities, active enforcement,
+   ref inclusions/exclusions and restrictions covering `refs/tags/v*`, `main`
+   and every future exact reviewed RC branch. Specify release-tag creation
+   authority and effective update/deletion restrictions. Eligible branches remain
+   exactly `["main"]`; a candidate entry or name pattern cannot approve an RC.
+2. Approve exact branch-required check identities, their expected reporting
+   applications and branch update policy. Separately approve the release
+   invocation's mandatory same-commit gates: admission, Fastly, native/parity,
+   Cloudflare/Spin, both host release-tool jobs, JavaScript, docs and terminal
+   eligibility. Record actual caller-qualified names when Tasks 15/16 define the
+   caller. Another source/run/attempt or reporting application cannot satisfy
+   these gates by reusing a successful check name.
+3. Approve an empty bypass list or exact actor IDs, actor types, modes and scope
+   of every exception, including inherited organization rules and tag creation
+   authority. Record who reviews changes and approves exceptions. Administrator
+   status, visible settings and candidate assertions do not establish approval.
+4. Approve the independent trust root and read-back evidence. Validation must
+   obtain bounded official API observations of repository identity, applicable
+   repository/inherited ruleset details, active enforcement and ref scope,
+   effective required-check/application bindings and exact bypass actors/modes.
+   Compare with the independently approved record, binding its reviewed revision
+   and approvers. Retain the unpeeled remote tag, actual approved branch tip and
+   ancestry, and this source/workflow/run/attempt's complete terminal gate results.
+   Missing, unreadable, truncated, ambiguous or changed approval/settings
+   evidence must deny eligibility; settings cannot approve themselves.
+
+These are decisions to obtain, not an implemented approval profile or settings
+mutation. No ruleset ID, check configuration, bypass actor or approver is selected
+here. GitHub describes rule applicability and application-bound checks in
+[available rules](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets).
+The terminal job continues refusing eligibility. Stop governance work here until
+maintainers approve the record and Tasks 15/16 supply the reviewed caller and an
+authorized live invocation; bounded Tasks 11/10 resume meanwhile.
 
 ### Task 15: Orchestrate independent builds and isolated signing
 
