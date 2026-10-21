@@ -15,6 +15,14 @@ observed job state: never started, skipped or cancelled before starting is
 `unavailable`; started without an upload, or a failed or timed-out conclusion,
 is `failed`.
 
+The record's boundary block keeps two identities apart. `fingerprint` and
+`execution_fingerprint` name the boundary instance; they must be equal (the
+socket denial receipt belongs to the instance that ran the build) and differ
+between A and B. Because each instance fingerprint includes a fresh nonce, that
+difference only proves separate instances. `invocation_digest` is the exact
+build invocation digest (program, arguments including jobs, environment,
+checkout-root working directory and umask); A and B must also differ there.
+
 The dependency capability has no production constructor: the qualified adapter
 is an uninhabited type. An imported record never constructs local recipe,
 network-denial, composition, or runtime proof types. In particular, the imported

@@ -121,8 +121,14 @@ struct Claim {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Boundary {
+    /// Boundary instance the measured socket denial receipt names.
     fingerprint: String,
-    invocation_fingerprint: String,
+    /// Boundary instance that executed the build; instance identity only,
+    /// including a fresh per-instance nonce, not the invocation content.
+    execution_fingerprint: String,
+    /// SHA-256 of the exact build invocation: program, arguments including
+    /// jobs, environment, working directory (the checkout root) and umask.
+    invocation_digest: String,
     confined: bool,
     control_exit: i32,
     control_accepts: u32,
@@ -302,7 +308,8 @@ fn check_record(transfer: &Transfer, all: &ValidatedTransfers) -> Result<BuildRe
     let boundary = &record.boundary;
     require(
         lower_hex(&boundary.fingerprint, 64)
-            && boundary.fingerprint == boundary.invocation_fingerprint
+            && boundary.fingerprint == boundary.execution_fingerprint
+            && lower_hex(&boundary.invocation_digest, 64)
             && boundary.confined
             && boundary.control_exit == 0
             && boundary.control_accepts == 1
@@ -363,8 +370,15 @@ fn compare_pair(a: &BuildRecord, b: &BuildRecord) -> Result<()> {
     // The exact invocation digest covers role-specific paths, jobs, environment
     // and umask, so a reproduction reusing the canonical one did not vary them.
     require(
-        a.boundary.invocation_fingerprint != b.boundary.invocation_fingerprint,
+        a.boundary.invocation_digest != b.boundary.invocation_digest,
         "A/B share one exact invocation",
+    )?;
+    // Each build runs in its own fresh boundary instance. Instance fingerprints
+    // carry a per-instance nonce, so this proves separate instances, not
+    // varied invocation content.
+    require(
+        a.boundary.execution_fingerprint != b.boundary.execution_fingerprint,
+        "A/B share one boundary instance",
     )?;
     let a = &a.ambient;
     let b = &b.ambient;

@@ -3,6 +3,8 @@
 //! This candidate format deliberately differs from the strict collector's build
 //! record. Runtime acceptance is retained only from its actual owning run;
 //! pair claims and qualified workflow identity remain unavailable.
+//! [`strict_record`] separately renders the collector's record shape from the
+//! same owners; it is not yet an export member.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -23,6 +25,8 @@ const COMPOSITION: &str = "composition.json";
 const ARTIFACT: &str = "artifact";
 const INVENTORY: &str = "tsjs-inventory.json";
 const DOCUMENT_LIMIT: u64 = 16 * 1024 * 1024;
+
+pub(crate) mod strict_record;
 
 /// Owned flat candidate files, with no signing or trusted dependency authority.
 #[derive(Debug)]

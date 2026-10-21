@@ -58,7 +58,9 @@ mod sources;
 mod startup;
 mod tools;
 
-pub(crate) use ambient::{AmbientProfile, CheckedAmbient};
+pub(crate) use ambient::{
+    AmbientClaim, AmbientProfile, CheckedAmbient, Dimension, ObservedAmbient,
+};
 #[allow(
     unused_imports,
     reason = "the qualified Apple selection has no production caller yet"

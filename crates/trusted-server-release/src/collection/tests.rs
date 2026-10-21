@@ -283,7 +283,7 @@ fn wasm() -> Vec<u8> {
     bytes
 }
 
-fn cohort_fixture() -> ValidatedTransfers {
+pub(super) fn cohort_fixture() -> ValidatedTransfers {
     let inventory = b"{\"schema_version\":1}".to_vec();
     let mut invocation = transfer_fixture().0.invocation;
     invocation.inventory_sha256 = digest(&inventory);
@@ -313,7 +313,8 @@ fn cohort_fixture() -> ValidatedTransfers {
             record["composition_sha256"] = json!(digest(&composition));
             if role == "B" {
                 record["boundary"]["fingerprint"] = json!("4".repeat(64));
-                record["boundary"]["invocation_fingerprint"] = json!("4".repeat(64));
+                record["boundary"]["execution_fingerprint"] = json!("4".repeat(64));
+                record["boundary"]["invocation_digest"] = json!("6".repeat(64));
                 record["ambient"]["umask"] = json!(23);
                 record["ambient"]["jobs"] = json!(2);
                 record["ambient"]["checkout_root"] = json!("/external-release-B");
@@ -436,7 +437,9 @@ fn collection_rejects_missing_a_and_every_mandatory_gate_even_with_optional_b_ab
         ("/boundary/control_accepts", json!(0)),
         ("/boundary/probe_exit", json!(0)),
         ("/boundary/probe_accepts", json!(1)),
-        ("/boundary/invocation_fingerprint", json!("9".repeat(64))),
+        ("/boundary/execution_fingerprint", json!("9".repeat(64))),
+        ("/boundary/invocation_digest", json!("5".repeat(63))),
+        ("/boundary/invocation_digest", json!("A".repeat(64))),
         ("/runtime", Value::Null),
         ("/runtime/final_wasm_sha256", json!("9".repeat(64))),
         ("/runtime/publisher_status", json!(500)),
@@ -977,15 +980,33 @@ fn reproduction_selected_without_a_supported_variation_is_rejected_by_the_pair_c
 
 #[test]
 fn reproduction_reusing_the_canonical_exact_invocation_is_rejected() {
+    // Distinct boundary instances do not make one exact invocation two.
     let mut fixture = cohort_fixture();
-    for pointer in ["/boundary/fingerprint", "/boundary/invocation_fingerprint"] {
-        mutate_record(&mut fixture, 1, pointer, json!("3".repeat(64)));
-    }
+    mutate_record(
+        &mut fixture,
+        1,
+        "/boundary/invocation_digest",
+        json!("5".repeat(64)),
+    );
     let error = diagnose_collection(&fixture)
         .expect_err("should reject identical role-specific invocation digests");
     assert!(
-        format!("{error:?}").contains("exact invocation"),
+        format!("{error:?}").contains("A/B share one exact invocation"),
         "should reject a reproduction claiming the canonical invocation: {error:?}"
+    );
+}
+
+#[test]
+fn reproduction_reusing_the_canonical_boundary_instance_is_rejected() {
+    let mut fixture = cohort_fixture();
+    for pointer in ["/boundary/fingerprint", "/boundary/execution_fingerprint"] {
+        mutate_record(&mut fixture, 1, pointer, json!("3".repeat(64)));
+    }
+    let error = diagnose_collection(&fixture)
+        .expect_err("should reject one boundary instance serving both builds");
+    assert!(
+        format!("{error:?}").contains("A/B share one boundary instance"),
+        "should reject a reproduction run in the canonical boundary: {error:?}"
     );
 }
 
@@ -1020,7 +1041,8 @@ fn with_uploaded_native_b(same: bool) -> ValidatedTransfers {
         ("/role", json!("B")),
         ("/job", json!("native-b")),
         ("/boundary/fingerprint", json!("4".repeat(64))),
-        ("/boundary/invocation_fingerprint", json!("4".repeat(64))),
+        ("/boundary/execution_fingerprint", json!("4".repeat(64))),
+        ("/boundary/invocation_digest", json!("6".repeat(64))),
         ("/ambient/umask", json!(23)),
         ("/ambient/jobs", json!(2)),
         ("/ambient/checkout_root", json!("/external-release-B")),
@@ -1089,7 +1111,8 @@ fn no_optional_reproduction_state_hides_a_mandatory_canonical_failure() {
         ("/boundary/probe_errno", json!(111)),
         ("/boundary/probe_errno", json!(0)),
         ("/boundary/probe_accepts", json!(1)),
-        ("/boundary/invocation_fingerprint", json!("9".repeat(64))),
+        ("/boundary/execution_fingerprint", json!("9".repeat(64))),
+        ("/boundary/invocation_digest", json!("5".repeat(63))),
         ("/inventory_sha256", json!("9".repeat(64))),
         ("/composition_sha256", json!("9".repeat(64))),
         ("/recipe_sha256", json!("9".repeat(64))),

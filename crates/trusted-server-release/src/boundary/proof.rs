@@ -64,6 +64,26 @@ impl DenialReceipt {
     pub(crate) fn matches_fingerprint(&self, expected: &[u8; 32]) -> bool {
         self.fingerprint == hex::encode(expected)
     }
+
+    /// Lowercase hex fingerprint of the measured boundary instance.
+    pub(crate) fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    /// Real errno the confined probe reported.
+    pub(crate) fn denied_errno(&self) -> i32 {
+        self.denied_errno
+    }
+
+    /// Exit status and listener accepts of the unconfined control run.
+    pub(crate) fn control(&self) -> (i32, usize) {
+        self.control.measured()
+    }
+
+    /// Exit status and listener accepts of the confined probe run.
+    pub(crate) fn probe(&self) -> (i32, usize) {
+        self.probe.measured()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -87,6 +107,11 @@ enum ReportReceipt {
 }
 
 impl ProbeReceipt {
+    fn measured(&self) -> (i32, usize) {
+        let ExitReceipt::Exited { status } = self.outcome;
+        (status, self.accepted_connections)
+    }
+
     fn from_observation(observed: Observation) -> Result<Self, Report<ReleaseError>> {
         let ProcessOutcome::Exited { code } = observed.outcome else {
             return Err(proof_error(
