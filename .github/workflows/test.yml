@@ -789,10 +789,12 @@ jobs:
       matrix:
         os: [macos-15, macos-15-intel]
     runs-on: ${{ matrix.os }}
-    # Fixture preparation (~5 min), four denial builds (~5 min), then the
-    # canonical and the measured reproduction confined CLI builds (~10-20 min
-    # each; the Intel runners are the slower) and one native startup.
-    timeout-minutes: 90
+    # Setup, fixtures and the producer build (~16 min), four denial builds
+    # (~10 min), then the canonical and the measured reproduction confined CLI
+    # builds and one native startup. On macos-15-intel the canonical build
+    # alone measured 24 min and the two-job reproduction is slower, so a
+    # 90-minute limit cancelled run 39529002302 mid-reproduction.
+    timeout-minutes: 150
     env:
       # Optimize repeated whole-input hashes with test safety checks retained.
       CARGO_PROFILE_TEST_OPT_LEVEL: '2'

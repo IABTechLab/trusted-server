@@ -273,7 +273,11 @@ fn macos_cli_candidate_builds_inspects_and_starts_cleanly() {
     let (js, js_handoff) =
         JsBuildCompleted::adopt_ordinary_ci_handoff_for_tests(&source, &handoff, &js_measurement)
             .expect("should adopt the Linux job's handoff for this source");
-    let deadline = Instant::now() + Duration::from_secs(60 * 60);
+    // One attempt covers the canonical build, the measured reproduction and
+    // the later Apple re-verification, SPDX and index-entry checks. On
+    // macos-15-intel the canonical build alone measured 24 minutes and the
+    // two-job reproduction is slower, so 60 minutes left no margin.
+    let deadline = Instant::now() + Duration::from_secs(120 * 60);
     let cancellation = Cancellation::default();
     let apple = AppleDeveloperTools::for_ordinary_ci(deadline, &cancellation)
         .expect("should measure the selected Xcode");
