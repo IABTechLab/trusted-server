@@ -41,8 +41,9 @@ pub struct AuctionConfig {
     /// endpoints, applied after sanitization when
     /// [`Self::sanitize_creatives`] is enabled.
     ///
-    /// Bidder `<base>` removal and creative TSJS injection run whenever this
-    /// or click rewriting ([`Self::rewrites_auction_clicks`]) is on.
+    /// Bidder `<base>` `href` removal (a `target` is kept) and, on
+    /// `POST /auction`, creative TSJS injection run whenever this or click
+    /// rewriting ([`Self::rewrites_auction_clicks`]) is on.
     ///
     /// The default stays omitted from serialized config blobs to avoid adding
     /// this field when it has no effect. Any rollback across schema versions

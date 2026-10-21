@@ -292,8 +292,9 @@ proxy = "enabled"
 enabled = false
 # Rewrite winning-bid creative asset URLs (images, scripts, styles, media,
 # iframes, CSS url()) to first-party /first-party/proxy endpoints (default
-# true). Set false to leave asset URLs direct. Bidder <base> removal and
-# creative TSJS injection run when this or rewrite_clicks is on. Sanitization
+# true). Set false to leave asset URLs direct. When this or rewrite_clicks is
+# on, a bidder <base> loses its href (a target is kept), and POST /auction
+# creatives get the TSJS runtime. Sanitization
 # is controlled separately by `sanitize_creatives` below. Restore true before
 # rolling back to an older binary that rejects unknown fields.
 rewrite_creatives = true
@@ -309,8 +310,8 @@ rewrite_creatives = true
 # removing those elements together with their inner content. Defaults to false
 # (executable markup preserved). Note that with `rewrite_creatives` or
 # `rewrite_clicks` on, the adm is still not untouched: eligible asset URLs
-# and/or links are rewritten, bidder `<base>` elements are removed, and the
-# creative TSJS runtime is injected. Enable it whenever creatives can render
+# and/or links are rewritten, a bidder `<base>` loses its href, and
+# POST /auction creatives get the TSJS runtime. Enable it whenever creatives can render
 # in a context that shares the publisher origin (its primary defence there);
 # leave it off when creatives render in a
 # foreign-origin frame (e.g. the Prebid Universal Creative inside the ad

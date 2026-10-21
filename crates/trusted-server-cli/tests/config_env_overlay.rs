@@ -193,41 +193,11 @@ fn config_validate_explains_legacy_provider_list_migration() {
 #[test]
 fn map_config_applies_rewrite_creatives_environment_override() {
     let project = migrated_project();
-    let output = Command::new(env!("CARGO_BIN_EXE_ts"))
-        .args(["config", "push", "--adapter", "axum", "--manifest"])
-        .arg(&project.manifest_path)
-        .arg("--app-config")
-        .arg(&project.config_path)
-        .args(["--yes", "--no-diff"])
-        .current_dir(project.directory.path())
-        .env(REWRITE_ENV, "false")
-        .output()
-        .expect("should run ts config push");
 
-    assert!(
-        output.status.success(),
-        "valid boolean overlay should push successfully: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let local_store_path = project
-        .directory
-        .path()
-        .join(".edgezero/local-config-trusted_server_config.json");
-    let local_store: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(local_store_path).expect("should read pushed local config"),
-    )
-    .expect("should parse local config store");
-    let envelope_json = local_store
-        .as_object()
-        .and_then(|entries| entries.values().next())
-        .and_then(serde_json::Value::as_str)
-        .expect("should contain a blob envelope");
-    let envelope: serde_json::Value =
-        serde_json::from_str(envelope_json).expect("should parse blob envelope");
+    let auction = pushed_auction_with_env(&project, REWRITE_ENV, "false");
 
     assert_eq!(
-        envelope["data"]["auction"]["rewrite_creatives"],
+        auction["rewrite_creatives"],
         serde_json::Value::Bool(false),
         "pushed config should contain the environment override"
     );
@@ -285,41 +255,11 @@ fn migrated_config_applies_boolean_environment_overrides() {
 #[test]
 fn migrated_config_applies_sanitize_creatives_environment_override() {
     let project = migrated_project();
-    let output = Command::new(env!("CARGO_BIN_EXE_ts"))
-        .args(["config", "push", "--adapter", "axum", "--manifest"])
-        .arg(&project.manifest_path)
-        .arg("--app-config")
-        .arg(&project.config_path)
-        .args(["--yes", "--no-diff"])
-        .current_dir(project.directory.path())
-        .env(SANITIZE_ENV, "true")
-        .output()
-        .expect("should run ts config push");
 
-    assert!(
-        output.status.success(),
-        "valid boolean overlay should push successfully: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let local_store_path = project
-        .directory
-        .path()
-        .join(".edgezero/local-config-trusted_server_config.json");
-    let local_store: serde_json::Value = serde_json::from_str(
-        &fs::read_to_string(local_store_path).expect("should read pushed local config"),
-    )
-    .expect("should parse local config store");
-    let envelope_json = local_store
-        .as_object()
-        .and_then(|entries| entries.values().next())
-        .and_then(serde_json::Value::as_str)
-        .expect("should contain a blob envelope");
-    let envelope: serde_json::Value =
-        serde_json::from_str(envelope_json).expect("should parse blob envelope");
+    let auction = pushed_auction_with_env(&project, SANITIZE_ENV, "true");
 
     assert_eq!(
-        envelope["data"]["auction"]["sanitize_creatives"],
+        auction["sanitize_creatives"],
         serde_json::Value::Bool(true),
         "pushed config should contain the sanitize environment override"
     );

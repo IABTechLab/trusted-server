@@ -112,13 +112,25 @@ rewrite_creatives = true
 | `false`                      | `false` or unset          | direct               | direct                                | kept           | not injected            |
 
 SSAT/page-bids follows the same table with absolute URLs and never injects TSJS.
+The `<base>` column assumes `sanitize_creatives = false`; the sanitizer removes
+`<base>` entirely before the rewrite pass.
 `exclude_domains` applies to both assets and links.
 
 The client-side `tsCreativeConfig.clickGuard` flag is separate. `rewrite_clicks`
 decides whether the server emits signed click URLs; `clickGuard` decides whether
 the creative runtime re-signs them after creative script changes their query
-parameters. With `rewrite_clicks` off the guard still installs its listeners but never
-acts, because no link carries `data-tsclick`.
+parameters. With `rewrite_clicks` off and `rewrite_creatives` on, the injected
+guard installs its listeners but never acts, because no link carries
+`data-tsclick`.
+
+Both switches also decide where the visitor's EC ID goes. `/first-party/click`
+appends the request's `ts-ec` value to the landing URL and logs the click with
+it, and `/first-party/proxy` appends it to proxied asset requests. With
+`rewrite_clicks = false`, creative links stop forwarding it on every path; with
+`rewrite_clicks = true` and `rewrite_creatives = false`, landing pages receive
+it while assets load direct. Neither switch is a consent control: EC issuance
+is consent-gated, and both endpoints forward whatever EC ID the request
+carries.
 
 With `rewrite_creatives = false` and `rewrite_clicks = true`, `POST /auction`
 still injects TSJS, but this does not reopen asset proxying in practice:
@@ -130,6 +142,13 @@ Whenever either switch is on, a bidder `<base>` loses its `href` and keeps
 `target`; a `<base>` without `target` is removed. With `rewrite_creatives =
 false` and `rewrite_clicks = true`, relative asset URLs therefore no longer
 resolve against the bidder base, so bidders should use absolute asset URLs.
+With `sanitize_creatives = true` the sanitizer removes `<base>` entirely first.
+
+On `POST /auction` and in HTML fetched through `/first-party/proxy`, the
+injected click guard navigates a `data-tsclick` link
+using only the link's own `target`, not a kept `<base target>`. A creative that
+relies on `<base target="_blank">` can therefore open wrapped links in the frame
+and unwrapped links in a new tab; give links an explicit `target` to avoid this.
 
 ::: info Runtime protections inside the sandboxed creative iframe
 Creatives rendered by Trusted Server's own path run in a sandboxed iframe
@@ -171,9 +190,10 @@ ships without them, so a processed or refused creative can never be re-fetched
 raw.
 :::
 
-Neither setting affects HTML/CSS response rewriting under
-`/first-party/proxy`. The publisher SSAT/page-bids path is a production creative
-path and follows both settings. `[debug].inject_adm_for_testing` controls only the
+`rewrite_creatives` and `sanitize_creatives` do not affect HTML/CSS rewriting
+under `/first-party/proxy`; an explicit `rewrite_clicks` does apply to links
+there. The publisher SSAT/page-bids path is a production creative path and
+follows all three settings. `[debug].inject_adm_for_testing` controls only the
 additional `debug_bid` diagnostic blob and testing-only direct GAM replacement;
 it does not control whether the processed `adm` is present.
 
@@ -348,7 +368,7 @@ If the iframe content itself contains HTML, it will be processed recursively. Ea
 
 **Rewrite Mode**: Uses `/first-party/click` for direct redirects
 
-**Controlled by**: `[auction].rewrite_clicks` (follows `rewrite_creatives` when unset)
+**Controlled by**: `[auction].rewrite_clicks` (follows `rewrite_creatives` when unset; HTML fetched through `/first-party/proxy` keeps wrapping links when unset)
 
 **Example**:
 
@@ -704,9 +724,11 @@ Pattern: *.cdn.example.com
 Matches:
   ✅ assets.cdn.example.com
   ✅ images.cdn.example.com
-  ✅ cdn.example.com (base domain)
+  ✅ cdn.example.com (apex also matches)
   ❌ cdn.example.com.evil.com (different domain)
 ```
+
+Matching is case-insensitive.
 
 **Exact Patterns**: No `*` requires exact host match
 
@@ -1003,8 +1025,8 @@ fn test_image_src_rewrite() {
 
 **Relative URLs Not Working**:
 
-- Ensure origin response includes proper `<base>` tag
-- Or convert to absolute URLs before rewriting
+- The rewriter drops a `<base>` `href`, so relative URLs do not resolve against it
+- Convert relative URLs to absolute URLs before rewriting
 
 **Data URIs Being Rewritten**:
 
