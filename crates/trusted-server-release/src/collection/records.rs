@@ -51,6 +51,17 @@ impl RoleProfile {
             },
         ]
     }
+
+    /// Selects an arbitrary fictional profile so pair checks can be isolated.
+    #[cfg(test)]
+    pub(super) fn for_tests(umask: u32, jobs: u32, host_locale: &str, host_timezone: &str) -> Self {
+        Self {
+            umask,
+            jobs,
+            host_locale: host_locale.to_owned(),
+            host_timezone: host_timezone.to_owned(),
+        }
+    }
 }
 
 /// Candidate data only; no field authorizes signing or deployment.
@@ -338,10 +349,25 @@ fn compare_pair(a: &BuildRecord, b: &BuildRecord) -> Result<()> {
         a.inputs == b.inputs && a.recipe_sha256 == b.recipe_sha256,
         "A/B build inputs or recipe differ",
     )?;
+    // The exact invocation digest covers role-specific paths, jobs, environment
+    // and umask, so a reproduction reusing the canonical one did not vary them.
+    require(
+        a.boundary.invocation_fingerprint != b.boundary.invocation_fingerprint,
+        "A/B share one exact invocation",
+    )?;
     let a = &a.ambient;
     let b = &b.ambient;
+    // Normalized dimensions still vary on the host; only the compiler child
+    // observes the fixed normalized values. The spec requires B to differ in
+    // TZ and locale, so a qualified reproduction profile must select values
+    // distinct from canonical; the claim shape cannot express `not-varied`
+    // for them, and such a profile fails here by design.
     require(
-        a.umask != b.umask && a.jobs != b.jobs && a.started_at_seconds != b.started_at_seconds,
+        a.umask != b.umask
+            && a.jobs != b.jobs
+            && a.started_at_seconds != b.started_at_seconds
+            && a.host_locale != b.host_locale
+            && a.host_timezone != b.host_timezone,
         "supported A/B variation is missing",
     )?;
     let a_root = Path::new(&a.checkout_root);

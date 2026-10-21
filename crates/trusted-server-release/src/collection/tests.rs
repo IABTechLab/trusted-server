@@ -312,6 +312,8 @@ fn cohort_fixture() -> ValidatedTransfers {
             record["inventory_sha256"] = json!(digest(&inventory));
             record["composition_sha256"] = json!(digest(&composition));
             if role == "B" {
+                record["boundary"]["fingerprint"] = json!("4".repeat(64));
+                record["boundary"]["invocation_fingerprint"] = json!("4".repeat(64));
                 record["ambient"]["umask"] = json!(23);
                 record["ambient"]["jobs"] = json!(2);
                 record["ambient"]["checkout_root"] = json!("/external-release-B");
@@ -548,46 +550,7 @@ fn zip_deflate_preserves_full_bytes_and_rejects_extra_compressed_data() {
 #[test]
 fn native_b_records_match_mismatch_failed_and_unavailable_without_masking_a() {
     for same in [true, false] {
-        let mut fixture = cohort_fixture();
-        let mut b = Transfer {
-            upload: fixture.transfers[2].upload.clone(),
-            members: fixture.transfers[2].members.clone(),
-        };
-        b.upload.role = "B".to_owned();
-        b.upload.job = "native-b".to_owned();
-        b.upload.artifact_id = 99;
-        fixture.transfers.push(b);
-        let index = fixture.transfers.len() - 1;
-        for (pointer, value) in [
-            ("/role", json!("B")),
-            ("/job", json!("native-b")),
-            ("/ambient/umask", json!(23)),
-            ("/ambient/jobs", json!(2)),
-            ("/ambient/checkout_root", json!("/external-release-B")),
-            ("/ambient/started_at_seconds", json!(101)),
-            ("/ambient/host_locale", json!("en_US.UTF-8")),
-            ("/ambient/host_timezone", json!("Pacific/Auckland")),
-        ] {
-            mutate_record(&mut fixture, index, pointer, value);
-        }
-        if !same {
-            fixture.transfers[index]
-                .members
-                .get_mut("artifact")
-                .expect("should find native B")
-                .push(1);
-            let artifact = fixture.transfers[index].members["artifact"].clone();
-            let hash = digest(&artifact);
-            mutate_record(&mut fixture, index, "/artifact_sha256", json!(hash));
-            mutate_record(&mut fixture, index, "/artifact_size", json!(artifact.len()));
-            let composition=serde_json::to_vec(&json!({"artifact_sha256":hash,"source_commit":fixture.invocation.source_commit,"inventory_sha256":fixture.invocation.inventory_sha256,"contributing_sources":["d".repeat(64)],"compiled_units":1})).expect("should bind native B bytes");
-            let hash = digest(&composition);
-            fixture.transfers[index]
-                .members
-                .insert("composition.json".to_owned(), composition);
-            mutate_record(&mut fixture, index, "/composition_sha256", json!(hash));
-        }
-        fixture.absent.remove(0);
+        let fixture = with_uploaded_native_b(same);
         let diagnostic = diagnose_collection(&fixture)
             .expect("should measure native B without requiring equality");
         assert_eq!(
@@ -936,5 +899,281 @@ fn zip_requires_deflate_stream_end_even_when_crc_size_and_consumption_match() {
                 "should retain exact terminated stream output"
             );
         }
+    }
+}
+
+/// Selects one reproduction profile and makes Fastly B observe it exactly, so
+/// only the A/B pair comparison can reject the record.
+fn fixture_with_selected_reproduction(
+    profile: records::RoleProfile,
+    ambient: &Value,
+) -> ValidatedTransfers {
+    let mut fixture = cohort_fixture();
+    fixture.invocation.profiles[1] = profile;
+    for (field, value) in ambient.as_object().expect("should hold ambient fields") {
+        mutate_record(&mut fixture, 1, &format!("/ambient/{field}"), value.clone());
+    }
+    fixture
+}
+
+#[test]
+fn reproduction_selected_without_a_supported_variation_is_rejected_by_the_pair_check() {
+    for (dimension, profile, ambient) in [
+        (
+            "umask",
+            records::RoleProfile::for_tests(18, 2, "en_US.UTF-8", "Pacific/Auckland"),
+            json!({"umask": 18}),
+        ),
+        (
+            "jobs",
+            records::RoleProfile::for_tests(23, 4, "en_US.UTF-8", "Pacific/Auckland"),
+            json!({"jobs": 4}),
+        ),
+        (
+            "host locale",
+            records::RoleProfile::for_tests(23, 2, "C", "Pacific/Auckland"),
+            json!({"host_locale": "C"}),
+        ),
+        (
+            "host timezone",
+            records::RoleProfile::for_tests(23, 2, "en_US.UTF-8", "UTC"),
+            json!({"host_timezone": "UTC"}),
+        ),
+        (
+            "start time",
+            records::RoleProfile::for_tests(23, 2, "en_US.UTF-8", "Pacific/Auckland"),
+            json!({"started_at_seconds": 100}),
+        ),
+    ] {
+        let fixture = fixture_with_selected_reproduction(profile, &ambient);
+        let error = diagnose_collection(&fixture)
+            .expect_err("should reject a reproduction that omits a supported variation");
+        assert!(
+            format!("{error:?}").contains("A/B variation is missing"),
+            "should reach the pair check for unvaried {dimension}: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn reproduction_reusing_the_canonical_exact_invocation_is_rejected() {
+    let mut fixture = cohort_fixture();
+    for pointer in ["/boundary/fingerprint", "/boundary/invocation_fingerprint"] {
+        mutate_record(&mut fixture, 1, pointer, json!("3".repeat(64)));
+    }
+    let error = diagnose_collection(&fixture)
+        .expect_err("should reject identical role-specific invocation digests");
+    assert!(
+        format!("{error:?}").contains("exact invocation"),
+        "should reject a reproduction claiming the canonical invocation: {error:?}"
+    );
+}
+
+/// Rebinds a changed imported composition summary so only its content is wrong.
+fn rebind_composition(fixture: &mut ValidatedTransfers, index: usize, pointer: &str, value: Value) {
+    let members = &mut fixture.transfers[index].members;
+    let mut composition: Value = serde_json::from_slice(&members["composition.json"])
+        .expect("should parse fictional composition");
+    *composition
+        .pointer_mut(pointer)
+        .expect("should find composition field") = value;
+    let bytes = serde_json::to_vec(&composition).expect("should serialize changed composition");
+    let hash = digest(&bytes);
+    members.insert("composition.json".to_owned(), bytes);
+    mutate_record(fixture, index, "/composition_sha256", json!(hash));
+}
+
+/// Adds an uploaded first-native reproduction with matched or mismatched bytes.
+fn with_uploaded_native_b(same: bool) -> ValidatedTransfers {
+    let mut fixture = cohort_fixture();
+    let mut reproduction = Transfer {
+        upload: fixture.transfers[2].upload.clone(),
+        members: fixture.transfers[2].members.clone(),
+    };
+    reproduction.upload.role = "B".to_owned();
+    reproduction.upload.job = "native-b".to_owned();
+    reproduction.upload.artifact_id = 99;
+    fixture.transfers.push(reproduction);
+    fixture.absent.remove(0);
+    let index = fixture.transfers.len() - 1;
+    for (pointer, value) in [
+        ("/role", json!("B")),
+        ("/job", json!("native-b")),
+        ("/boundary/fingerprint", json!("4".repeat(64))),
+        ("/boundary/invocation_fingerprint", json!("4".repeat(64))),
+        ("/ambient/umask", json!(23)),
+        ("/ambient/jobs", json!(2)),
+        ("/ambient/checkout_root", json!("/external-release-B")),
+        ("/ambient/started_at_seconds", json!(101)),
+        ("/ambient/host_locale", json!("en_US.UTF-8")),
+        ("/ambient/host_timezone", json!("Pacific/Auckland")),
+    ] {
+        mutate_record(&mut fixture, index, pointer, value);
+    }
+    if !same {
+        let artifact = fixture.transfers[index]
+            .members
+            .get_mut("artifact")
+            .expect("should find native B");
+        artifact.push(1);
+        let (hash, size) = (digest(artifact), artifact.len());
+        mutate_record(&mut fixture, index, "/artifact_sha256", json!(hash));
+        mutate_record(&mut fixture, index, "/artifact_size", json!(size));
+        rebind_composition(&mut fixture, index, "/artifact_sha256", json!(hash));
+    }
+    fixture
+}
+
+/// Every optional reproduction state: never started, failed, matched, mismatched.
+fn every_optional_reproduction_state() -> Vec<(&'static str, ValidatedTransfers)> {
+    let mut failed = cohort_fixture();
+    for absent in &mut failed.absent {
+        if let OptionalBuild::NotUploaded { outcome, .. } = absent {
+            *outcome = records::Outcome::Failed;
+        }
+    }
+    vec![
+        ("unavailable", cohort_fixture()),
+        ("failed", failed),
+        ("matched", with_uploaded_native_b(true)),
+        ("mismatched", with_uploaded_native_b(false)),
+    ]
+}
+
+#[test]
+fn every_optional_reproduction_state_is_accepted_with_honest_outcomes() {
+    for (state, fixture) in every_optional_reproduction_state() {
+        let diagnostic = diagnose_collection(&fixture)
+            .unwrap_or_else(|error| panic!("should accept optional B state {state}: {error:?}"));
+        assert_eq!(
+            serde_json::to_value(diagnostic.native[crate::policy::FIXED_ARTIFACTS[1].name])
+                .expect("should serialize outcome"),
+            json!(state),
+            "should record exactly the {state} outcome"
+        );
+        assert_eq!(
+            diagnostic.canonical.len(),
+            4,
+            "should preserve all canonical artifacts once mandatory gates pass"
+        );
+    }
+}
+
+#[test]
+fn no_optional_reproduction_state_hides_a_mandatory_canonical_failure() {
+    let record_gates = [
+        ("/boundary/confined", json!(false)),
+        ("/boundary/control_exit", json!(1)),
+        ("/boundary/control_accepts", json!(0)),
+        ("/boundary/control_accepts", json!(2)),
+        ("/boundary/probe_exit", json!(0)),
+        ("/boundary/probe_errno", json!(111)),
+        ("/boundary/probe_errno", json!(0)),
+        ("/boundary/probe_accepts", json!(1)),
+        ("/boundary/invocation_fingerprint", json!("9".repeat(64))),
+        ("/inventory_sha256", json!("9".repeat(64))),
+        ("/composition_sha256", json!("9".repeat(64))),
+        ("/recipe_sha256", json!("9".repeat(64))),
+        ("/artifact_size", json!(1)),
+        ("/ambient/child_locale", json!("en_US.UTF-8")),
+        ("/claim/varied", json!(["umask", "jobs", "checkout_root"])),
+    ];
+    let composition_gates = [
+        ("/artifact_sha256", json!("9".repeat(64))),
+        ("/source_commit", json!("9".repeat(40))),
+        ("/inventory_sha256", json!("9".repeat(64))),
+        ("/compiled_units", json!(0)),
+        ("/contributing_sources", json!([])),
+        (
+            "/contributing_sources",
+            json!(["d".repeat(64), "d".repeat(64)]),
+        ),
+        ("/contributing_sources", json!(["not-a-digest"])),
+    ];
+    for canonical in [0, 2, 3, 4] {
+        for (state, fixture) in every_optional_reproduction_state() {
+            for (pointer, value) in &record_gates {
+                let mut changed = fixture_clone(&fixture);
+                mutate_record(&mut changed, canonical, pointer, value.clone());
+                assert!(
+                    diagnose_collection(&changed).is_err(),
+                    "should block canonical {canonical} {pointer} with optional B {state}"
+                );
+            }
+            for (pointer, value) in &composition_gates {
+                let mut changed = fixture_clone(&fixture);
+                rebind_composition(&mut changed, canonical, pointer, value.clone());
+                assert!(
+                    diagnose_collection(&changed).is_err(),
+                    "should block canonical {canonical} composition {pointer} with optional B {state}"
+                );
+            }
+            let mut changed = fixture_clone(&fixture);
+            changed.transfers[canonical]
+                .members
+                .insert("tsjs-inventory.json".to_owned(), b"{}".to_vec());
+            assert!(
+                diagnose_collection(&changed).is_err(),
+                "should block changed JS inventory bytes in canonical {canonical} with optional B {state}"
+            );
+            let mut changed = fixture_clone(&fixture);
+            changed.transfers[canonical]
+                .members
+                .get_mut("artifact")
+                .expect("should find canonical artifact")
+                .push(0);
+            assert!(
+                diagnose_collection(&changed).is_err(),
+                "should block changed final bytes in canonical {canonical} with optional B {state}"
+            );
+        }
+    }
+}
+
+#[test]
+fn fastly_runtime_proof_is_required_for_both_roles_and_absent_from_native() {
+    for index in [0, 1] {
+        for (pointer, value) in [
+            ("/runtime", Value::Null),
+            ("/runtime/source_commit", json!("9".repeat(40))),
+            ("/runtime/final_wasm_size", json!(1)),
+            ("/runtime/viceroy_version", json!("0.0.0")),
+        ] {
+            let mut fixture = cohort_fixture();
+            mutate_record(&mut fixture, index, pointer, value);
+            assert!(
+                diagnose_collection(&fixture).is_err(),
+                "should reject Fastly role {index} without bound final-byte runtime {pointer}"
+            );
+        }
+    }
+    let runtime = serde_json::from_slice::<Value>(
+        &cohort_fixture().transfers[0].members["build-record.json"],
+    )
+    .expect("should parse Fastly record")["runtime"]
+        .clone();
+    for index in [2, 3, 4] {
+        let mut fixture = cohort_fixture();
+        mutate_record(&mut fixture, index, "/runtime", runtime.clone());
+        assert!(
+            diagnose_collection(&fixture).is_err(),
+            "should reject a native record carrying a Fastly runtime diagnostic"
+        );
+    }
+}
+
+/// Copies one fixture so each mandatory gate mutates an independent cohort.
+fn fixture_clone(fixture: &ValidatedTransfers) -> ValidatedTransfers {
+    ValidatedTransfers {
+        invocation: fixture.invocation.clone(),
+        transfers: fixture
+            .transfers
+            .iter()
+            .map(|transfer| Transfer {
+                upload: transfer.upload.clone(),
+                members: transfer.members.clone(),
+            })
+            .collect(),
+        absent: fixture.absent.clone(),
     }
 }
