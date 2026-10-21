@@ -99,7 +99,7 @@ fn projected_component_count(completed: &RecipeCompleted) -> usize {
 }
 
 /// Requires the target family's platform gaps and no Apple gap elsewhere.
-fn check_platform_gaps(completed: &RecipeCompleted, gaps: &[String]) {
+pub(super) fn check_platform_gaps(completed: &RecipeCompleted, gaps: &[String]) {
     let view = completed
         .composition_view()
         .expect("should expose the sealed composition view");

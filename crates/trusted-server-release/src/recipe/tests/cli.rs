@@ -19,6 +19,7 @@ use super::super::native::{check_operator_values_absent, measure_native_repeatab
 use super::super::remap::scan_remapped_bytes;
 use super::super::startup::{LINUX_CLI_ASSET, NativeStartupAccepted, StartupCopy};
 use super::candidate::{CargoFixture, cargo_docker_settings};
+use super::candidate_entry::{check_real_entry, js_inventory_sha256};
 use super::cli_candidate::{
     CliCandidateFacts, CliFixture, OPERATOR_SENTINELS, ReproductionOutcome, check_build_budget,
     cli_candidate_measurement, finish_cleanup, new_startup_client, reproduction_result,
@@ -31,6 +32,7 @@ use super::real_fixture::{
 use super::spdx_candidate::{candidate_spdx_measurement, check_real_candidate};
 use super::*;
 use crate::boundary::{Boundary, BoundaryRoots, ConfinedCommand, ImageSelection, ProbeProgram};
+use crate::distribution::CandidateAcceptance;
 use crate::documents::{parse_json, read_bounded};
 use crate::inspect::{ElfPolicy, inspect_elf};
 use crate::preflight::AuditedEnvironment;
@@ -273,7 +275,7 @@ fn linux_cli_candidate_builds_inspects_and_starts_cleanly() {
     check_operator_values_absent(&bytes, &planted)
         .expect("should embed none of the planted operator values");
     let startup = start_everywhere(&canonical.completed, &cli);
-    let canonical_measurement = cli_candidate_measurement(&CliCandidateFacts {
+    let mut canonical_measurement = cli_candidate_measurement(&CliCandidateFacts {
         canonical: &canonical.completed,
         builder: &cli,
         elf: &elf,
@@ -284,6 +286,8 @@ fn linux_cli_candidate_builds_inspects_and_starts_cleanly() {
             .expect("should retain actual Linux startup runs"),
         reproduction: ReproductionOutcome::NotAttempted,
     });
+    let inventory_sha256 = js_inventory_sha256(&canonical.completed);
+    canonical_measurement["js_inventory_sha256"] = serde_json::json!(inventory_sha256);
     fs::write(
         cli_root.join("linux-cli-candidate-measurement.json"),
         serde_json::to_vec_pretty(&canonical_measurement)
@@ -321,12 +325,17 @@ fn linux_cli_candidate_builds_inspects_and_starts_cleanly() {
     });
     measurement["candidate_spdx"] =
         candidate_spdx_measurement(&canonical_candidate, reproduction_candidate.as_ref());
-    let text = serde_json::to_string_pretty(&measurement).expect("should encode the measurement");
-    fs::write(cli_root.join("linux-cli-candidate-measurement.json"), text)
-        .expect("should retain the Linux CLI candidate measurement");
+    measurement["js_inventory_sha256"] = serde_json::json!(inventory_sha256);
+    retain_cli_measurement(&cli_root, &measurement);
     if let Some(error) = invariant {
         panic!("should pair builds over identical inputs: {error:?}");
     }
+    measurement["candidate_entry"] = check_real_entry(
+        &canonical.completed,
+        &js.source,
+        &CandidateAcceptance::Native(&startup),
+    );
+    retain_cli_measurement(&cli_root, &measurement);
     super::candidate::check_native_export_after_cleanup(
         canonical,
         |build| &build.completed,
@@ -335,6 +344,13 @@ fn linux_cli_candidate_builds_inspects_and_starts_cleanly() {
     if let Ok(reproduction) = reproduction_build {
         super::candidate::check_export_after_cleanup(reproduction, |build| &build.completed);
     }
+}
+
+/// Retains `measurement` as the Linux CLI candidate measurement.
+fn retain_cli_measurement(cli_root: &Path, measurement: &serde_json::Value) {
+    let text = serde_json::to_string_pretty(measurement).expect("should encode the measurement");
+    fs::write(cli_root.join("linux-cli-candidate-measurement.json"), text)
+        .expect("should retain the Linux CLI candidate measurement");
 }
 
 /// Loads the staged probe and copied Rust tools on the builder's ABI before JS work.

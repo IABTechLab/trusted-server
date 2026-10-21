@@ -20,6 +20,7 @@ use super::candidate::{
     CargoFixture, SCHEMA_VERSION, cargo_docker_settings, cargo_measurement, denial_measurement,
     equality_measurement, reported_errno,
 };
+use super::candidate_entry::{check_real_entry, js_inventory_sha256};
 use super::real_fixture::{
     ATTEMPTS, DenialCase, DenialSelection, bind_denial_case, cargo_fixture, ordinary_ci_ambient,
     path_text, try_prepare_vendor,
@@ -27,6 +28,7 @@ use super::real_fixture::{
 use super::spdx_candidate::{candidate_spdx_measurement, check_real_candidate};
 use super::*;
 use crate::boundary::{Boundary, DenialProof, ImageSelection, ProbeProgram};
+use crate::distribution::CandidateAcceptance;
 use crate::materials::{LockedMaterials, resolution_differences};
 use crate::preparation::tests::full::{JsFixtureRun, run_two_fresh_js_builds};
 use crate::process::{Cancellation, ProcessLimits};
@@ -434,15 +436,9 @@ fn fastly_canonical_and_reproduction_builds_are_byte_identical() {
     let reproduction_candidate = check_real_candidate(&reproduction.completed, &js.source);
     measurement["candidate_spdx"] =
         candidate_spdx_measurement(&canonical_candidate, Some(&reproduction_candidate));
-    let text = serde_json::to_string_pretty(&measurement).expect("should encode the measurement");
-    println!("{text}");
-    fs::write(
-        fixture
-            .root
-            .join("cargo-canonical-reproduction-equality-measurement.json"),
-        text,
-    )
-    .expect("should retain the canonical/reproduction equality measurement");
+    measurement["js_inventory_sha256"] =
+        serde_json::json!(js_inventory_sha256(&canonical.completed));
+    retain_equality_measurement(&fixture, &measurement);
     let [canonical_runtime, reproduction_runtime] = run_runtime_gate(&RuntimeGateInputs {
         fixture: &fixture,
         source: &js.source,
@@ -462,6 +458,15 @@ fn fastly_canonical_and_reproduction_builds_are_byte_identical() {
             .is_err(),
         "should reject attaching reproduction acceptance to the equal-byte canonical role"
     );
+    measurement["candidate_entry"] = check_real_entry(
+        &canonical.completed,
+        &js.source,
+        &CandidateAcceptance::Fastly {
+            runtime: &canonical_runtime,
+            equality: &checked,
+        },
+    );
+    retain_equality_measurement(&fixture, &measurement);
     super::candidate::check_fastly_export_after_cleanup(
         canonical,
         |build| &build.completed,
@@ -472,6 +477,20 @@ fn fastly_canonical_and_reproduction_builds_are_byte_identical() {
         |build| &build.completed,
         &reproduction_runtime,
     );
+}
+
+/// Prints and retains `measurement` as the canonical/reproduction equality
+/// measurement.
+fn retain_equality_measurement(fixture: &CargoFixture, measurement: &serde_json::Value) {
+    let text = serde_json::to_string_pretty(measurement).expect("should encode the measurement");
+    println!("{text}");
+    fs::write(
+        fixture
+            .root
+            .join("cargo-canonical-reproduction-equality-measurement.json"),
+        text,
+    )
+    .expect("should retain the canonical/reproduction equality measurement");
 }
 
 /// Everything the chained runtime gate needs from the equality run.

@@ -19,6 +19,7 @@ use super::super::remap::scan_remapped_bytes;
 use super::super::startup::native::{NativeStartupLayout, measure_host_identity};
 use super::super::startup::{NativeStartupAccepted, StartupCopy};
 use super::candidate::CargoFixture;
+use super::candidate_entry::{check_real_entry, js_inventory_sha256};
 use super::cli_candidate::{
     OPERATOR_SENTINELS, ReproductionOutcome, check_build_budget, finish_cleanup,
     reproduction_result,
@@ -36,6 +37,7 @@ use super::real_fixture::{
 use super::spdx_candidate::{candidate_spdx_measurement, check_real_candidate};
 use super::*;
 use crate::boundary::DescendantCleanup;
+use crate::distribution::CandidateAcceptance;
 use crate::inspect::{MachoCpu, MachoPolicy, inspect_macho};
 use crate::materials::LockedMaterials;
 use crate::preflight::AuditedEnvironment;
@@ -226,14 +228,22 @@ fn start_natively(build: &MacosBuild) -> NativeStartupAccepted {
 
 /// Encodes, prints and retains the measurement beside the Cargo fixture.
 /// Writes and prints the measurement; `candidate_spdx` is null until rendered.
+/// Returns the retained measurement so a later check can extend it.
 fn retain_measurement(
     fixture: &CargoFixture,
     facts: &MacosCliCandidateFacts<'_>,
     candidate_spdx: serde_json::Value,
-) {
+) -> serde_json::Value {
     let mut measurement = macos_cli_candidate_measurement(facts);
     measurement["candidate_spdx"] = candidate_spdx;
-    let text = serde_json::to_string_pretty(&measurement).expect("should encode the measurement");
+    measurement["js_inventory_sha256"] = serde_json::json!(js_inventory_sha256(facts.canonical));
+    write_measurement(fixture, &measurement);
+    measurement
+}
+
+/// Prints and retains `measurement` as the macOS CLI candidate measurement.
+fn write_measurement(fixture: &CargoFixture, measurement: &serde_json::Value) {
+    let text = serde_json::to_string_pretty(measurement).expect("should encode the measurement");
     println!("{text}");
     fs::write(fixture.root.join(MEASUREMENT_FILE), text)
         .expect("should retain the macOS CLI candidate measurement");
@@ -344,7 +354,7 @@ fn macos_cli_candidate_builds_inspects_and_starts_cleanly() {
         Err(error) if invariant.is_some() => ReproductionOutcome::InvariantFailed(error.clone()),
         Err(error) => ReproductionOutcome::BuildFailed(error.clone()),
     };
-    retain_measurement(
+    let mut measurement = retain_measurement(
         &fixture,
         &facts(reproduction),
         candidate_spdx_measurement(&canonical_candidate, reproduction_candidate.as_ref()),
@@ -352,6 +362,12 @@ fn macos_cli_candidate_builds_inspects_and_starts_cleanly() {
     if let Some(error) = invariant {
         panic!("should pair builds over identical inputs: {error:?}");
     }
+    measurement["candidate_entry"] = check_real_entry(
+        &canonical.completed,
+        &source,
+        &CandidateAcceptance::Native(&startup),
+    );
+    write_measurement(&fixture, &measurement);
     super::candidate::check_native_export_after_cleanup(
         canonical,
         |build| &build.completed,

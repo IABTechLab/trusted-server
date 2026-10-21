@@ -17,6 +17,7 @@ use crate::documents::{validate_release_index_artifact, validate_spdx};
 use crate::policy::{CLI_POLICY_VERSION, FixedArtifact};
 
 mod golden;
+mod summary;
 
 /// Fictional approved source commit of every entry.
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";

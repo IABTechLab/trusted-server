@@ -32,6 +32,8 @@ use crate::recipe::AssetId;
 
 mod entry;
 mod joins;
+#[cfg(test)]
+mod summary;
 
 #[cfg(test)]
 mod tests;
