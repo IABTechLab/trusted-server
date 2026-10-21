@@ -43,7 +43,7 @@ pub fn copy_custom_headers(from: &Request<EdgeBody>, to: &mut Request<EdgeBody>)
 /// Fastly adapter may first consume an authenticated `fastly-client-ip`, but
 /// removes it before routing along with every other listed header. Stripping
 /// them forces [`RequestInfo::from_request`] to fall back to the trustworthy
-/// `Host` header and [`ClientInfo`] TLS detection.
+/// `Host` header or URI authority and [`ClientInfo`] TLS detection.
 pub const SPOOFABLE_FORWARDED_HEADERS: &[&str] = &[
     "forwarded",
     "x-forwarded-host",
@@ -151,9 +151,9 @@ impl RuntimeRequestOrigin {
 /// Effective public request information for URL rewriting.
 ///
 /// Authenticated forwarding takes precedence over transport origin. Without
-/// authenticated metadata, immutable ingress, adapter runtime origin, Host and
-/// platform TLS facts remain the sources; raw forwarding headers never grant
-/// origin trust.
+/// authenticated metadata, immutable ingress, adapter runtime origin, Host,
+/// URI authority and platform TLS facts remain the sources; raw forwarding
+/// headers never grant origin trust.
 #[derive(Debug, Clone)]
 pub struct RequestInfo {
     /// The effective public authority, including a non-default port.
@@ -167,7 +167,9 @@ impl RequestInfo {
     ///
     /// The selected host must be an ASCII hostname (including underscores for
     /// local service names), IPv4 address, or bracketed IPv6 address, optionally
-    /// followed by a numeric port. Requests without any host retain an empty host.
+    /// followed by a numeric port. URI authority supplies the host when no
+    /// higher-priority source is present, including HTTP/2 requests without a
+    /// `Host` header. Requests without any host retain an empty host.
     ///
     /// # Examples
     ///
@@ -214,7 +216,8 @@ impl RequestInfo {
                 .headers()
                 .get(header::HOST)
                 .map(|value| value.to_str().map_err(|_| invalid_host()))
-                .transpose()?,
+                .transpose()?
+                .or_else(|| req.uri().authority().map(http::uri::Authority::as_str)),
         };
         if host.is_some_and(|host| !is_valid_request_host(host)) {
             return Err(invalid_host());
@@ -571,6 +574,115 @@ mod tests {
     }
 
     // RequestInfo tests
+
+    #[test]
+    fn request_info_uses_uri_authority_without_host_headers() {
+        for (uri, expected_host) in [
+            (
+                "https://publisher.example.com/page",
+                "publisher.example.com",
+            ),
+            (
+                "https://publisher.example.com:8443/page",
+                "publisher.example.com:8443",
+            ),
+            ("https://[2001:db8::1]:8443/page", "[2001:db8::1]:8443"),
+        ] {
+            let req = Request::builder()
+                .version(http::Version::HTTP_2)
+                .uri(uri)
+                .body(EdgeBody::empty())
+                .expect("should build authority-only HTTP/2 request");
+            assert!(req.headers().is_empty(), "should have no host headers");
+
+            let info = RequestInfo::from_request(&req, &default_client_info())
+                .expect("should extract request info");
+
+            assert_eq!(
+                info.host, expected_host,
+                "should preserve URI authority including ports and IPv6 brackets"
+            );
+        }
+    }
+
+    #[test]
+    fn request_info_preserves_host_header_precedence_over_uri_authority() {
+        for (headers, expected_host) in [
+            (vec![("host", "header.example.com")], "header.example.com"),
+            (
+                vec![
+                    ("host", "header.example.com"),
+                    ("x-forwarded-host", "proxy.example.com"),
+                ],
+                "header.example.com",
+            ),
+            (
+                vec![
+                    ("host", "header.example.com"),
+                    ("x-forwarded-host", "proxy.example.com"),
+                    ("forwarded", "host=public.example.com"),
+                ],
+                "header.example.com",
+            ),
+        ] {
+            let mut req = build_request(Method::GET, "https://authority.example.com/page");
+            for (name, value) in headers {
+                set_header(&mut req, name, value);
+            }
+
+            let info = RequestInfo::from_request(&req, &default_client_info())
+                .expect("should extract request info");
+
+            assert_eq!(
+                info.host, expected_host,
+                "should preserve explicit host precedence over URI authority"
+            );
+        }
+    }
+
+    #[test]
+    fn request_info_keeps_empty_host_without_headers_or_uri_authority() {
+        let req = build_request(Method::GET, "/page");
+
+        let info = RequestInfo::from_request(&req, &default_client_info())
+            .expect("should extract request info");
+
+        assert!(
+            info.host.is_empty(),
+            "should keep the host empty when no host source is available"
+        );
+    }
+
+    #[test]
+    fn request_info_uses_uri_authority_despite_unauthenticated_forwarding_headers() {
+        let mut request = build_request(Method::GET, "https://publisher.example.com:8443/page");
+        set_header(&mut request, "forwarded", "host=other.example.com");
+        set_header(&mut request, "x-forwarded-host", "other.example.com");
+
+        let info = RequestInfo::from_request(&request, &default_client_info())
+            .expect("should extract request info from URI authority");
+
+        assert_eq!(
+            info.host, "publisher.example.com:8443",
+            "should ignore unauthenticated forwarding hints when falling back to URI authority"
+        );
+    }
+
+    #[test]
+    fn request_info_rejects_malformed_uri_authority() {
+        let request = build_request(Method::GET, "https://bad,host.example.com/page");
+
+        let error = RequestInfo::from_request(&request, &default_client_info())
+            .expect_err("should validate URI authority before using it as the request host");
+
+        assert!(
+            matches!(
+                error.current_context(),
+                TrustedServerError::BadRequest { .. }
+            ),
+            "should reject a malformed URI authority with a bad-request error"
+        );
+    }
 
     #[test]
     fn request_info_prioritizes_forwarder_then_ingress_then_runtime_origin() {
