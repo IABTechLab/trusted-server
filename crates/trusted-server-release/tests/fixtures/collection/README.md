@@ -2,8 +2,18 @@
 
 `build-record.json` is fictional imported diagnostic data. The tests fill its
 artifact, inventory, composition, and runtime digests from local fixture bytes.
-A missing optional native reproduction has a separate bounded result with no
-upload ID, transfer digest, or invented environment observations.
+A Fastly runtime diagnostic names the build role (`A` or `B`) whose own run
+accepted the final bytes and must match its record's role. That role is
+asserted by the producer inside its own record, so it catches mix-ups and reuse
+in an honest pipeline but not a malicious producer copying the other role's
+runtime object over equal bytes. Binding strength comes from the trusted upload
+role and job isolation; a per-run Viceroy identity remains a named gap. A
+missing optional
+native reproduction has a separate bounded result with no upload ID, transfer
+digest, or invented environment observations. Its outcome derives from the
+observed job state: never started, skipped or cancelled before starting is
+`unavailable`; started without an upload, or a failed or timed-out conclusion,
+is `failed`.
 
 The dependency capability has no production constructor: the qualified adapter
 is an uninhabited type. An imported record never constructs local recipe,

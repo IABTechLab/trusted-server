@@ -8,7 +8,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::{OptionalBuild, Transfer, ValidatedTransfers, collection_error, digest};
+use super::{Transfer, ValidatedTransfers, collection_error, digest};
 use crate::documents::{Role, lower_hex, parse_json};
 use crate::error::ReleaseError;
 use crate::inspect::inspect_wasm;
@@ -134,6 +134,9 @@ struct Boundary {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Runtime {
+    /// The build role the producer claims for the Viceroy run that accepted
+    /// these final bytes; self-asserted, not an independent run identity.
+    role: String,
     source_commit: String,
     final_wasm_sha256: String,
     final_wasm_size: u64,
@@ -325,8 +328,16 @@ fn check_record(transfer: &Transfer, all: &ValidatedTransfers) -> Result<BuildRe
             .runtime
             .as_ref()
             .ok_or_else(|| collection_error("missing final-byte runtime proof diagnostic"))?;
+        // A and B final bytes must be equal, so without the role one build's
+        // runtime run could stand in for the other's. The role is asserted by
+        // the producer inside its own record: it catches mix-ups and reuse in
+        // an honest pipeline, not a malicious producer copying A's runtime
+        // object and changing its role. Binding strength comes from the trusted
+        // upload role and job isolation; a per-run Viceroy identity remains a
+        // named gap.
         require(
-            runtime.source_commit == record.source_commit
+            runtime.role == record.role
+                && runtime.source_commit == record.source_commit
                 && runtime.final_wasm_sha256 == record.artifact_sha256
                 && runtime.final_wasm_size == record.artifact_size
                 && runtime.publisher_status == 200
@@ -404,28 +415,20 @@ pub(super) fn diagnose(all: &ValidatedTransfers) -> Result<CollectionDiagnostic>
     }
     let mut native = BTreeMap::new();
     for absent in &all.absent {
-        let OptionalBuild::NotUploaded {
-            asset,
-            outcome,
-            elapsed_seconds,
-            deadline_seconds,
-        } = absent
-        else {
-            return Err(collection_error(
-                "absent result has invented upload identity",
-            ));
-        };
+        let outcome = absent
+            .outcome()
+            .filter(|_| {
+                FIXED_ARTIFACTS
+                    .iter()
+                    .skip(1)
+                    .any(|fixed| fixed.name == absent.asset)
+                    && !builds.contains_key(&(absent.asset.clone(), "B".to_owned()))
+            })
+            .ok_or_else(|| {
+                collection_error("optional B absence is not a bounded distinct native result")
+            })?;
         require(
-            FIXED_ARTIFACTS
-                .iter()
-                .skip(1)
-                .any(|fixed| fixed.name == asset)
-                && matches!(outcome, Outcome::Failed | Outcome::Unavailable)
-                && *deadline_seconds > 0
-                && *deadline_seconds <= 5400
-                && elapsed_seconds <= deadline_seconds
-                && !builds.contains_key(&(asset.clone(), "B".to_owned()))
-                && native.insert(asset.clone(), *outcome).is_none(),
+            native.insert(absent.asset.clone(), outcome).is_none(),
             "optional B absence is not a bounded distinct native result",
         )?;
     }
@@ -485,21 +488,19 @@ pub(super) fn diagnose(all: &ValidatedTransfers) -> Result<CollectionDiagnostic>
             } else {
                 all.absent
                     .iter()
-                    .find_map(|absent| match absent {
-                        OptionalBuild::NotUploaded {
-                            asset: absent_asset,
-                            outcome,
-                            elapsed_seconds,
-                            deadline_seconds,
-                        } if absent_asset == asset.name => Some((
-                            *outcome,
-                            json!({
-                                "outcome": outcome,
-                                "elapsed_seconds": elapsed_seconds,
-                                "deadline_seconds": deadline_seconds,
-                            }),
-                        )),
-                        _ => None,
+                    .filter(|absent| absent.asset == asset.name)
+                    .find_map(|absent| {
+                        absent.outcome().map(|outcome| {
+                            (
+                                outcome,
+                                json!({
+                                    "outcome": outcome,
+                                    "job_state": absent.job,
+                                    "elapsed_seconds": absent.elapsed_seconds,
+                                    "deadline_seconds": absent.deadline_seconds,
+                                }),
+                            )
+                        })
                     })
                     .ok_or_else(|| collection_error("bounded native absence disappeared"))?
             };

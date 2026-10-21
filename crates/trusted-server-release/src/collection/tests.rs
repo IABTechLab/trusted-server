@@ -322,7 +322,7 @@ fn cohort_fixture() -> ValidatedTransfers {
                 record["ambient"]["host_timezone"] = json!("Pacific/Auckland");
             }
             if index == 0 {
-                record["runtime"] = json!({"source_commit":invocation.source_commit,"final_wasm_sha256":digest(&artifact),"final_wasm_size":artifact.len(),"publisher_status":200,"injected_scripts":1,"origin_marker_matched":true,"viceroy_version":"0.17.0"});
+                record["runtime"] = json!({"role":role,"source_commit":invocation.source_commit,"final_wasm_sha256":digest(&artifact),"final_wasm_size":artifact.len(),"publisher_status":200,"injected_scripts":1,"origin_marker_matched":true,"viceroy_version":"0.17.0"});
             }
             let upload = Upload {
                 asset: asset.name.to_owned(),
@@ -354,17 +354,34 @@ fn cohort_fixture() -> ValidatedTransfers {
     let absent = crate::policy::FIXED_ARTIFACTS
         .iter()
         .skip(1)
-        .map(|asset| OptionalBuild::NotUploaded {
-            asset: asset.name.to_owned(),
-            outcome: records::Outcome::Unavailable,
-            elapsed_seconds: 0,
-            deadline_seconds: 1800,
-        })
+        .map(|asset| no_upload(asset.name, QUEUED, 1800))
         .collect();
     ValidatedTransfers {
         invocation,
         transfers,
         absent,
+    }
+}
+
+/// Still queued, with no runner and no conclusion, when the collector deadline expired.
+const QUEUED: ObservedJob = ObservedJob {
+    started: false,
+    conclusion: None,
+};
+
+/// A started job ended by its own failure before the upload step.
+const FAILED_BEFORE_UPLOAD: ObservedJob = ObservedJob {
+    started: true,
+    conclusion: Some(JobConclusion::Failure),
+};
+
+/// A no-upload optional reproduction observed within a fictional 1800 s deadline.
+fn no_upload(asset: &str, job: ObservedJob, elapsed_seconds: u64) -> NoUpload {
+    NoUpload {
+        asset: asset.to_owned(),
+        job,
+        elapsed_seconds,
+        deadline_seconds: 1800,
     }
 }
 
@@ -563,14 +580,12 @@ fn native_b_records_match_mismatch_failed_and_unavailable_without_masking_a() {
             "should report actual complete-byte native result"
         );
     }
-    for outcome in [records::Outcome::Failed, records::Outcome::Unavailable] {
+    for (job, elapsed, outcome) in [
+        (FAILED_BEFORE_UPLOAD, 7, records::Outcome::Failed),
+        (QUEUED, 1800, records::Outcome::Unavailable),
+    ] {
         let mut fixture = cohort_fixture();
-        fixture.absent[0] = OptionalBuild::NotUploaded {
-            asset: crate::policy::FIXED_ARTIFACTS[1].name.to_owned(),
-            outcome,
-            elapsed_seconds: 7,
-            deadline_seconds: 1800,
-        };
+        fixture.absent[0] = no_upload(crate::policy::FIXED_ARTIFACTS[1].name, job, elapsed);
         assert_eq!(
             diagnose_collection(&fixture)
                 .expect("should retain bounded native B failure")
@@ -578,12 +593,7 @@ fn native_b_records_match_mismatch_failed_and_unavailable_without_masking_a() {
             outcome,
             "should report honest bounded outcome"
         );
-        if let OptionalBuild::NotUploaded {
-            elapsed_seconds, ..
-        } = &mut fixture.absent[0]
-        {
-            *elapsed_seconds = 1801;
-        }
+        fixture.absent[0].elapsed_seconds = 1801;
         assert!(
             diagnose_collection(&fixture).is_err(),
             "should reject unbounded optional B outcome"
@@ -732,11 +742,17 @@ fn candidate_rebuild_details_preserve_observations_and_absence_without_authority
         .expect("should retain honest bounded absence");
     assert_eq!(
         b.len(),
-        3,
-        "should emit only outcome, elapsed and deadline without invented identity or observations"
+        4,
+        "should emit only outcome, observed job state, elapsed and deadline without invented identity or observations"
+    );
+    assert_eq!(
+        b["job_state"],
+        json!({"started": false, "conclusion": null}),
+        "should retain the observed never-started job state honestly"
     );
     for field in [
         "artifact_id",
+        "artifact_name",
         "job",
         "attempt",
         "archive_sha256",
@@ -769,7 +785,11 @@ fn exact_current_run_archives_feed_the_complete_candidate_comparison() {
     let mut dependencies = TrustedDependencies {
         invocation: fixture.invocation,
         required: Vec::new(),
-        optional: fixture.absent,
+        optional: fixture
+            .absent
+            .into_iter()
+            .map(OptionalBuild::NotUploaded)
+            .collect(),
     };
     let mut source = FakeRun(BTreeMap::new());
     for transfer in fixture.transfers {
@@ -1028,9 +1048,8 @@ fn with_uploaded_native_b(same: bool) -> ValidatedTransfers {
 fn every_optional_reproduction_state() -> Vec<(&'static str, ValidatedTransfers)> {
     let mut failed = cohort_fixture();
     for absent in &mut failed.absent {
-        if let OptionalBuild::NotUploaded { outcome, .. } = absent {
-            *outcome = records::Outcome::Failed;
-        }
+        absent.job = FAILED_BEFORE_UPLOAD;
+        absent.elapsed_seconds = 7;
     }
     vec![
         ("unavailable", cohort_fixture()),
@@ -1159,6 +1178,343 @@ fn fastly_runtime_proof_is_required_for_both_roles_and_absent_from_native() {
             diagnose_collection(&fixture).is_err(),
             "should reject a native record carrying a Fastly runtime diagnostic"
         );
+    }
+}
+
+#[test]
+fn fastly_runtime_proof_must_belong_to_its_own_build_role() {
+    let runtime_of = |fixture: &ValidatedTransfers, index: usize| {
+        serde_json::from_slice::<Value>(&fixture.transfers[index].members["build-record.json"])
+            .expect("should parse Fastly record")["runtime"]
+            .clone()
+    };
+    let fixture = cohort_fixture();
+    assert_eq!(
+        runtime_of(&fixture, 0)["role"],
+        "A",
+        "should bind the canonical runtime proof to Role::Canonical"
+    );
+    assert_eq!(
+        runtime_of(&fixture, 1)["role"],
+        "B",
+        "should bind the reproduction runtime proof to Role::Reproduction"
+    );
+    // Equal final bytes make the proofs otherwise interchangeable, so each
+    // case swaps in the other role's run or an unbound role.
+    for (index, other) in [(0, 1), (1, 0)] {
+        let mut fixture = cohort_fixture();
+        let reused = runtime_of(&fixture, other);
+        mutate_record(&mut fixture, index, "/runtime", reused);
+        let error = diagnose_collection(&fixture)
+            .expect_err("should reject one role's runtime run reused for the other");
+        assert!(
+            format!("{error:?}").contains("runtime diagnostic"),
+            "should reject reused runtime proof at the runtime gate: {error:?}"
+        );
+        for role in [json!("C"), json!(""), Value::Null] {
+            let mut fixture = cohort_fixture();
+            mutate_record(&mut fixture, index, "/runtime/role", role.clone());
+            assert!(
+                diagnose_collection(&fixture).is_err(),
+                "should reject Fastly record {index} with runtime role {role}"
+            );
+        }
+        let mut fixture = cohort_fixture();
+        let mut unbound = runtime_of(&fixture, index);
+        unbound
+            .as_object_mut()
+            .expect("should hold runtime fields")
+            .remove("role");
+        mutate_record(&mut fixture, index, "/runtime", unbound);
+        assert!(
+            diagnose_collection(&fixture).is_err(),
+            "should reject Fastly record {index} whose runtime proof carries no role"
+        );
+    }
+}
+
+/// Optional reproduction jobs that never uploaded, with their spec outcomes.
+///
+/// `unavailable` means no reproduction ran: still queued at the deadline, or
+/// skipped/cancelled by the scheduler before any step started. `failed` means
+/// the job started, or its observed conclusion itself states failure.
+fn no_upload_job_states() -> Vec<(&'static str, ObservedJob, u64, records::Outcome)> {
+    let started = |conclusion| ObservedJob {
+        started: true,
+        conclusion,
+    };
+    let not_started = |conclusion| ObservedJob {
+        started: false,
+        conclusion,
+    };
+    vec![
+        (
+            "queued at deadline",
+            QUEUED,
+            1800,
+            records::Outcome::Unavailable,
+        ),
+        (
+            "scheduler skipped",
+            not_started(Some(JobConclusion::Skipped)),
+            3,
+            records::Outcome::Unavailable,
+        ),
+        (
+            "scheduler cancelled before start",
+            not_started(Some(JobConclusion::Cancelled)),
+            3,
+            records::Outcome::Unavailable,
+        ),
+        (
+            "failed before any step",
+            not_started(Some(JobConclusion::Failure)),
+            3,
+            records::Outcome::Failed,
+        ),
+        (
+            "timed out before any step",
+            not_started(Some(JobConclusion::TimedOut)),
+            1800,
+            records::Outcome::Failed,
+        ),
+        (
+            "failed before upload",
+            FAILED_BEFORE_UPLOAD,
+            7,
+            records::Outcome::Failed,
+        ),
+        (
+            "cancelled after start",
+            started(Some(JobConclusion::Cancelled)),
+            7,
+            records::Outcome::Failed,
+        ),
+        (
+            "timed out after start",
+            started(Some(JobConclusion::TimedOut)),
+            1800,
+            records::Outcome::Failed,
+        ),
+        (
+            "succeeded without upload output",
+            started(Some(JobConclusion::Success)),
+            7,
+            records::Outcome::Failed,
+        ),
+        (
+            "still running at deadline",
+            started(None),
+            1800,
+            records::Outcome::Failed,
+        ),
+    ]
+}
+
+#[test]
+fn optional_reproduction_job_states_map_to_bounded_honest_outcomes() {
+    for (state, job, elapsed, expected) in no_upload_job_states() {
+        let mut fixture = cohort_fixture();
+        fixture.absent[0] = no_upload(crate::policy::FIXED_ARTIFACTS[1].name, job, elapsed);
+        let diagnostic = diagnose_collection(&fixture)
+            .unwrap_or_else(|error| panic!("should accept optional B {state}: {error:?}"));
+        assert_eq!(
+            diagnostic.native[crate::policy::FIXED_ARTIFACTS[1].name],
+            expected,
+            "should map optional B {state} to its spec outcome"
+        );
+        assert_eq!(
+            diagnostic.canonical.len(),
+            4,
+            "should keep every canonical artifact with optional B {state}"
+        );
+        let reproduction =
+            &diagnostic.rebuild[crate::policy::FIXED_ARTIFACTS[1].name]["reproduction"];
+        assert_eq!(
+            reproduction["outcome"],
+            serde_json::to_value(expected).expect("should serialize outcome"),
+            "should record the derived outcome for {state}"
+        );
+        assert_eq!(
+            reproduction["job_state"]["started"], job.started,
+            "should record whether {state} started"
+        );
+        for field in ["artifact_id", "artifact_name", "archive_sha256", "ambient"] {
+            assert!(
+                reproduction.get(field).is_none(),
+                "should not synthesize {field} for optional B {state}"
+            );
+        }
+    }
+}
+
+#[test]
+fn contradictory_premature_or_unbounded_optional_job_states_are_rejected() {
+    let cases = [
+        (
+            "success without starting",
+            ObservedJob {
+                started: false,
+                conclusion: Some(JobConclusion::Success),
+            },
+            7,
+            1800,
+        ),
+        (
+            "skipped after starting",
+            ObservedJob {
+                started: true,
+                conclusion: Some(JobConclusion::Skipped),
+            },
+            7,
+            1800,
+        ),
+        ("queued before the deadline", QUEUED, 1799, 1800),
+        (
+            "running before the deadline",
+            ObservedJob {
+                started: true,
+                conclusion: None,
+            },
+            1799,
+            1800,
+        ),
+        ("waited past the deadline", QUEUED, 1801, 1800),
+        ("missing deadline", FAILED_BEFORE_UPLOAD, 0, 0),
+        ("deadline beyond the cohort cap", QUEUED, 5401, 5401),
+    ];
+    for (state, job, elapsed, deadline) in cases {
+        let absent = NoUpload {
+            asset: crate::policy::FIXED_ARTIFACTS[1].name.to_owned(),
+            job,
+            elapsed_seconds: elapsed,
+            deadline_seconds: deadline,
+        };
+        let mut fixture = cohort_fixture();
+        fixture.absent[0] = absent.clone();
+        assert!(
+            diagnose_collection(&fixture).is_err(),
+            "should reject optional B {state} in the measurement"
+        );
+        let (mut dependencies, mut source) = transfer_fixture();
+        dependencies.optional = vec![OptionalBuild::NotUploaded(absent)];
+        assert!(
+            validate_transfers(&dependencies, &mut source).is_err(),
+            "should reject optional B {state} before any transfer"
+        );
+        assert!(
+            source.requested.is_empty(),
+            "should reject optional B {state} before fetching any artifact"
+        );
+    }
+}
+
+#[test]
+fn optional_upload_identity_requires_a_started_successful_job() {
+    let uploaded_as_optional = |job| {
+        let (mut dependencies, source) = transfer_fixture();
+        let mut upload = dependencies.required.remove(0);
+        upload.role = "B".to_owned();
+        upload.asset = crate::policy::FIXED_ARTIFACTS[1].name.to_owned();
+        dependencies.optional = vec![OptionalBuild::Uploaded { upload, job }];
+        (dependencies, source)
+    };
+    let (dependencies, mut source) = uploaded_as_optional(ObservedJob {
+        started: true,
+        conclusion: Some(JobConclusion::Success),
+    });
+    validate_transfers(&dependencies, &mut source)
+        .expect("should accept an upload from a started successful optional job");
+    for (state, job, _, _) in no_upload_job_states()
+        .into_iter()
+        .filter(|(state, ..)| *state != "succeeded without upload output")
+    {
+        let (dependencies, mut source) = uploaded_as_optional(job);
+        assert!(
+            validate_transfers(&dependencies, &mut source).is_err(),
+            "should reject an upload identity claimed by optional B {state}"
+        );
+        assert!(
+            source.requested.is_empty(),
+            "should reject the claimed upload for {state} before fetching it"
+        );
+    }
+}
+
+#[test]
+fn dependency_channels_only_accept_their_own_build_roles() {
+    let succeeded = ObservedJob {
+        started: true,
+        conclusion: Some(JobConclusion::Success),
+    };
+    let native = crate::policy::FIXED_ARTIFACTS[1].name;
+    let fastly = crate::policy::FIXED_ARTIFACTS[0].name;
+    // The optional channel carries only native reproductions.
+    for (asset, role) in [(native, "A"), (fastly, "B"), (fastly, "A")] {
+        let (mut dependencies, mut source) = transfer_fixture();
+        let mut upload = dependencies.required.remove(0);
+        upload.asset = asset.to_owned();
+        upload.role = role.to_owned();
+        dependencies.optional = vec![OptionalBuild::Uploaded {
+            upload,
+            job: succeeded,
+        }];
+        assert!(
+            validate_transfers(&dependencies, &mut source).is_err(),
+            "should reject {asset} role {role} supplied through the optional channel"
+        );
+        assert!(
+            source.requested.is_empty(),
+            "should reject optional {asset} role {role} before any fetch"
+        );
+    }
+    // The mandatory channel carries every A and only the Fastly reproduction.
+    let (dependencies, mut source) = transfer_fixture();
+    validate_transfers(&dependencies, &mut source).expect("should accept a mandatory Fastly A");
+    for (asset, role, accepted) in [(fastly, "B", true), (native, "B", false)] {
+        let (mut dependencies, mut source) = transfer_fixture();
+        dependencies.required[0].asset = asset.to_owned();
+        dependencies.required[0].role = role.to_owned();
+        let result = validate_transfers(&dependencies, &mut source);
+        assert_eq!(
+            result.is_ok(),
+            accepted,
+            "should only accept mandatory B for the Fastly asset ({asset})"
+        );
+        if !accepted {
+            assert!(
+                source.requested.is_empty(),
+                "should reject mandatory native B before any fetch"
+            );
+        }
+    }
+}
+
+#[test]
+fn missing_mandatory_canonical_rejects_under_every_optional_reproduction_state() {
+    let mut states = every_optional_reproduction_state();
+    for (state, job, elapsed, _) in no_upload_job_states() {
+        let mut fixture = cohort_fixture();
+        for absent in &mut fixture.absent {
+            absent.job = job;
+            absent.elapsed_seconds = elapsed;
+        }
+        states.push((state, fixture));
+    }
+    for (state, fixture) in &states {
+        for asset in crate::policy::FIXED_ARTIFACTS {
+            let mut changed = fixture_clone(fixture);
+            changed.transfers.retain(|transfer| {
+                transfer.upload.asset != asset.name || transfer.upload.role != "A"
+            });
+            let error = diagnose_collection(&changed)
+                .expect_err("should reject a missing, failed or cancelled mandatory A");
+            assert!(
+                format!("{error:?}").contains("missing mandatory A"),
+                "should block missing A {} with optional B {state}: {error:?}",
+                asset.name
+            );
+        }
     }
 }
 

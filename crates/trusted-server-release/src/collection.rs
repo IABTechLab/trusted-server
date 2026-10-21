@@ -12,6 +12,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::documents::{Role, lower_hex, parse_json};
 use crate::error::ReleaseError;
+use crate::policy::FIXED_ARTIFACTS;
 
 const ARCHIVE_LIMIT: usize = 768 * 1024 * 1024;
 
@@ -54,16 +55,89 @@ struct Upload {
     members: BTreeMap<String, u64>,
 }
 
+/// A terminal job conclusion as the trusted dependency adapter observed it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum JobConclusion {
+    Success,
+    Failure,
+    Cancelled,
+    Skipped,
+    TimedOut,
+}
+
+/// What the trusted adapter observed for one optional reproduction job.
+///
+/// `conclusion` is `None` when the job had no terminal conclusion when the
+/// collector's bounded wait reached its deadline. The trusted adapter MUST
+/// wait for a terminal conclusion or for the full deadline before it
+/// constructs a conclusion-less observation; stopping early is not a legal
+/// input, and [`NoUpload::outcome`] rejects one whose elapsed wait is short of
+/// the deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+struct ObservedJob {
+    /// At least one job step executed.
+    ///
+    /// This is not GitHub's job `started_at`, which a job skipped or cancelled
+    /// before any step may still carry; the adapter derives it from executed
+    /// steps.
+    started: bool,
+    conclusion: Option<JobConclusion>,
+}
+
+/// An optional reproduction job that produced no upload.
+///
+/// It has no field for an upload ID, name or digest, so none can be supplied
+/// or synthesized for it.
+#[derive(Clone, Debug)]
+struct NoUpload {
+    asset: String,
+    job: ObservedJob,
+    elapsed_seconds: u64,
+    deadline_seconds: u64,
+}
+
+impl NoUpload {
+    /// Derives the spec outcome, or `None` for contradictory or unbounded input.
+    ///
+    /// `unavailable` means no reproduction ran: the job was still queued at the
+    /// deadline, or the scheduler skipped or cancelled it before any step
+    /// started. `failed` means it started and produced no upload, or its own
+    /// conclusion states failure or timeout. The latter stays `failed` even
+    /// without a started step, so a stated failure is never relabeled as an
+    /// absent measurement. A job without a conclusion is accepted only once the
+    /// wait reached the deadline, so the collector cannot cut a reproduction
+    /// short; deadlines are capped, so it cannot wait indefinitely either.
+    fn outcome(&self) -> Option<records::Outcome> {
+        if !bounded(self.elapsed_seconds, self.deadline_seconds) {
+            return None;
+        }
+        let at_deadline = self.elapsed_seconds == self.deadline_seconds;
+        match (self.job.started, self.job.conclusion) {
+            (false, None) if at_deadline => Some(records::Outcome::Unavailable),
+            (true, None) if at_deadline => Some(records::Outcome::Failed),
+            (_, None) => None,
+            (false, Some(JobConclusion::Skipped | JobConclusion::Cancelled)) => {
+                Some(records::Outcome::Unavailable)
+            }
+            (true, Some(JobConclusion::Skipped)) | (false, Some(JobConclusion::Success)) => None,
+            (_, Some(JobConclusion::Failure | JobConclusion::TimedOut))
+            | (true, Some(JobConclusion::Cancelled | JobConclusion::Success)) => {
+                Some(records::Outcome::Failed)
+            }
+        }
+    }
+}
+
 /// A bounded optional job result with no invented artifact identity.
 #[derive(Clone, Debug)]
 enum OptionalBuild {
-    Uploaded(Upload),
-    NotUploaded {
-        asset: String,
-        outcome: records::Outcome,
-        elapsed_seconds: u64,
-        deadline_seconds: u64,
+    /// An upload, valid only from a started job that concluded successfully.
+    Uploaded {
+        upload: Upload,
+        job: ObservedJob,
     },
+    NotUploaded(NoUpload),
 }
 
 /// Authenticated dependency outputs; no JSON or caller-field constructor exists.
@@ -114,7 +188,7 @@ struct Transfer {
 pub(crate) struct ValidatedTransfers {
     invocation: Invocation,
     transfers: Vec<Transfer>,
-    absent: Vec<OptionalBuild>,
+    absent: Vec<NoUpload>,
 }
 
 /// Validates current-run metadata and the complete bounded ZIP before use.
@@ -145,29 +219,46 @@ pub(crate) fn validate_transfers(
     let mut roles = BTreeSet::new();
     let mut transfers = Vec::new();
     let mut absent = Vec::new();
+    // The mandatory channel carries every canonical build and only the Fastly
+    // reproduction; native reproductions are optional.
+    if dependencies.required.iter().any(|upload| {
+        upload.role != "A" && (upload.role != "B" || upload.asset != FIXED_ARTIFACTS[0].name)
+    }) {
+        return Err(collection_error(
+            "mandatory upload is neither canonical nor the Fastly reproduction",
+        ));
+    }
     let mut uploads = dependencies.required.iter().collect::<Vec<_>>();
     for optional in &dependencies.optional {
         match optional {
-            OptionalBuild::Uploaded(upload) => uploads.push(upload),
-            OptionalBuild::NotUploaded {
-                asset,
-                outcome,
-                elapsed_seconds,
-                deadline_seconds,
-            } => {
-                if !matches!(
-                    outcome,
-                    records::Outcome::Failed | records::Outcome::Unavailable
-                ) || *deadline_seconds == 0
-                    || *deadline_seconds > 5400
-                    || elapsed_seconds > deadline_seconds
-                    || !roles.insert((asset.clone(), "B".to_owned()))
+            OptionalBuild::Uploaded { upload, job } => {
+                if *job
+                    != (ObservedJob {
+                        started: true,
+                        conclusion: Some(JobConclusion::Success),
+                    })
+                {
+                    return Err(collection_error(
+                        "optional B claims an upload identity without a successful job",
+                    ));
+                }
+                // The optional channel carries only native reproductions.
+                if upload.role != "B" || upload.asset == FIXED_ARTIFACTS[0].name {
+                    return Err(collection_error(
+                        "optional upload is not a native reproduction",
+                    ));
+                }
+                uploads.push(upload);
+            }
+            OptionalBuild::NotUploaded(no_upload) => {
+                if no_upload.outcome().is_none()
+                    || !roles.insert((no_upload.asset.clone(), "B".to_owned()))
                 {
                     return Err(collection_error(
                         "optional B result is not bounded failed/unavailable",
                     ));
                 }
-                absent.push(optional.clone());
+                absent.push(no_upload.clone());
             }
         }
     }
@@ -252,9 +343,12 @@ fn collection_error(detail: impl std::fmt::Display) -> Report<ReleaseError> {
 }
 
 fn bounded_upload(upload: &Upload) -> bool {
-    upload.deadline_seconds > 0
-        && upload.deadline_seconds <= 5400
-        && upload.elapsed_seconds <= upload.deadline_seconds
+    bounded(upload.elapsed_seconds, upload.deadline_seconds)
+}
+
+/// Requires a nonzero capped deadline that the observed wait did not exceed.
+fn bounded(elapsed_seconds: u64, deadline_seconds: u64) -> bool {
+    deadline_seconds > 0 && deadline_seconds <= 5400 && elapsed_seconds <= deadline_seconds
 }
 
 fn safe_repository(repository: &str) -> bool {

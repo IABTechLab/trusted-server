@@ -200,8 +200,8 @@ impl Selection {
                     .optional
                     .iter()
                     .filter_map(|optional| match optional {
-                        OptionalBuild::Uploaded(upload) => Some(upload),
-                        OptionalBuild::NotUploaded { .. } => None,
+                        OptionalBuild::Uploaded { upload, .. } => Some(upload),
+                        OptionalBuild::NotUploaded(_) => None,
                     }),
             )
         {
