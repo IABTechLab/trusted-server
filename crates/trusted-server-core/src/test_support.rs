@@ -1,3 +1,52 @@
+/// Shares the process logger among independent test log captures.
+#[cfg(test)]
+pub(crate) mod logging {
+    use std::sync::{Mutex, Once};
+
+    struct TestLogger(Mutex<Vec<&'static dyn log::Log>>);
+
+    impl log::Log for TestLogger {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.level() <= log::Level::Debug
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            for logger in self
+                .0
+                .lock()
+                .expect("should lock test log subscribers")
+                .iter()
+            {
+                if logger.enabled(record.metadata()) {
+                    logger.log(record);
+                }
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    static LOGGER: TestLogger = TestLogger(Mutex::new(Vec::new()));
+    static INITIALIZE: Once = Once::new();
+
+    /// Registers a test capture without replacing the process-global logger.
+    ///
+    /// # Panics
+    ///
+    /// Panics if another logger is already installed or the subscriber lock is poisoned.
+    pub(crate) fn register(logger: &'static dyn log::Log) {
+        INITIALIZE.call_once(|| {
+            log::set_logger(&LOGGER).expect("should install the shared test logger");
+            log::set_max_level(log::LevelFilter::Debug);
+        });
+        LOGGER
+            .0
+            .lock()
+            .expect("should register the test log subscriber")
+            .push(logger);
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
     use crate::consent::jurisdiction::Jurisdiction;

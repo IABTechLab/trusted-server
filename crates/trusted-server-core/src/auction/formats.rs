@@ -9,6 +9,7 @@ use error_stack::{Report, ResultExt, ensure};
 use http::{HeaderValue, Request, Response, StatusCode, header};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
+use serde_json::value::RawValue;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use url::Url;
 use uuid::Uuid;
@@ -45,7 +46,7 @@ use super::types::{
 pub struct AdRequest {
     pub ad_units: Vec<AdUnit>,
     pub config: Option<JsonValue>,
-    pub eids: Option<JsonValue>,
+    pub eids: Option<Box<RawValue>>,
 }
 
 /// A single ad placement in an [`AdRequest`].
@@ -600,6 +601,7 @@ mod tests {
     use crate::openrtb::{Eid, Uid};
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::create_test_settings;
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     use http::Method;
     use serde_json::json;
     use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -853,6 +855,7 @@ mod tests {
             inserter: None,
             matcher: None,
             mm: None,
+            ext: None,
             source: "ssp.com".to_owned(),
             uids: vec![Uid {
                 id: "uid-1".to_owned(),
@@ -2196,6 +2199,32 @@ mod tests {
                 "should allocate no public trace member when the base gate is absent"
             );
         }
+    }
+    #[test]
+    fn eid_header_carries_provenance_fields_and_repeated_sources() {
+        let mut request = make_auction_request();
+        request.user.eids = Some(crate::auction::test_support::repeated_source_provenance_eids());
+
+        let response =
+            convert_to_openrtb_response(&make_empty_result(), &make_settings(), &request, true)
+                .expect("should build response");
+
+        let header = response
+            .headers()
+            .get(&HEADER_X_TS_EIDS)
+            .and_then(|value| value.to_str().ok())
+            .expect("should include x-ts-eids");
+        let decoded: serde_json::Value = serde_json::from_slice(
+            &BASE64
+                .decode(header)
+                .expect("should decode x-ts-eids base64"),
+        )
+        .expect("should parse x-ts-eids JSON");
+        assert_eq!(
+            decoded,
+            crate::auction::test_support::repeated_source_provenance_eids_json(),
+            "x-ts-eids should show both entries with their own EID-level fields"
+        );
     }
 }
 

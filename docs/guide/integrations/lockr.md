@@ -112,7 +112,25 @@ User data is stored securely in Lockr's privacy vault:
 
 A later server-side auction can include a usable registered ID5 record as an `id5-sync.com` EID with the registry's `atype=1`. When the persisted record's writer is `lockr`, Trusted Server reconstructs `inserter: "Lockr-For-Publishers"`, `matcher: ""` and `mm: 2`. These fixed values require no extra KV fields and remain available if new capture is disabled. Source or configured ownership alone does not establish Lockr origin; browser, legacy and unknown-writer records are not labeled as Lockr.
 
-Explicit browser-supplied provenance retains current-request precedence. If the browser adds a different UID for the same source, the merged EID omits reconstructed provenance to avoid attributing every UID to Lockr. Trusted Server does not store arbitrary provenance, provider `ext` or extra UIDs in KV. Other provider token mappings are not enabled by the ID5 parser.
+Browser entries take precedence for their entire source and retain their own UIDs and provenance. Trusted Server never adds KV-derived provenance to a browser entry. Reconstructed Lockr provenance is used only when the browser sends no entry for that source. Trusted Server does not store arbitrary provenance, provider `ext` or extra UIDs in KV. Other provider token mappings are not enabled by the ID5 parser.
+
+The SDK writes the EID after its own network call, so the first auction on a
+page may run before it is available. Later auctions include it, and requests
+without an EID body get it from the `ts-eids` cookie and KV.
+
+To store the ID in the EC identity graph, register the source:
+
+```toml
+[[ec.partners]]
+name = "ID5 via Lockr"
+source_domain = "id5-sync.com"
+bidstream_enabled = true
+```
+
+Where GDPR applies and Prebid's TCF enforcement is active, Prebid sends the
+`trustedServer` adapter no EIDs unless the publisher grants the exception
+described in
+[TCF and the `trustedServer` adapter](./prebid.md#tcf-and-the-trustedserver-adapter).
 
 ## Use Cases
 

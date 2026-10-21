@@ -405,7 +405,7 @@ mod tests {
 
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use http::{HeaderValue, header};
-    use log::{LevelFilter, Log, Metadata, Record};
+    use log::{Log, Metadata, Record};
     use serde_json::json;
 
     use crate::auth::EdgeTerminatedAuthorization;
@@ -797,8 +797,7 @@ mod tests {
     #[test]
     fn trace_auth_failure_logs_a_fixed_category_without_the_path() {
         LOG_INIT.call_once(|| {
-            log::set_logger(&LOGS).expect("should install the test logger");
-            log::set_max_level(LevelFilter::Warn);
+            crate::test_support::logging::register(&LOGS);
         });
         let mut request = request(Method::GET, "/_ts/trace/fictional-secret-sentinel", false);
         request.headers_mut().insert(

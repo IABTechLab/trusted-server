@@ -6854,6 +6854,7 @@ external_bundle_sri = "sha384-AAAA"
                 inserter: None,
                 matcher: None,
                 mm: None,
+                ext: None,
                 source: "liveramp.com".to_owned(),
                 uids: vec![crate::openrtb::Uid {
                     id: "LR_xyz".to_owned(),
@@ -6865,6 +6866,7 @@ external_bundle_sri = "sha384-AAAA"
                 inserter: None,
                 matcher: None,
                 mm: None,
+                ext: None,
                 source: "id5-sync.com".to_owned(),
                 uids: vec![crate::openrtb::Uid {
                     id: "ID5_abc".to_owned(),
@@ -6876,6 +6878,7 @@ external_bundle_sri = "sha384-AAAA"
                 inserter: None,
                 matcher: None,
                 mm: None,
+                ext: None,
                 source: "google.com".to_owned(),
                 uids: vec![crate::openrtb::Uid {
                     id: "pair-id".to_owned(),
@@ -10090,6 +10093,30 @@ set = { networkId = 42 }
             enabled,
             r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"ConsentedProvidersSettings":{"consented_providers":"fictional-ac"},"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"kid":"fictional-kid","request_host":"publisher.example","request_scheme":"https","signature":"LU_JUIA1BT80ShZNjSa4PIF5T-uMjEeodwKrV_6bXgh0hi1SYVtCKn9g_DTW62krmjCOFgoFYPHsu6L0nAcuDg","ts":1706900000,"version":"1.1"}}}"#,
             "should preserve the complete enabled PBS wire shape"
+        );
+    }
+    #[test]
+    fn to_openrtb_forwards_eid_provenance_fields_and_repeated_sources() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let mut auction_request = create_test_auction_request();
+        auction_request.user.eids =
+            Some(crate::auction::test_support::repeated_source_provenance_eids());
+        let settings = make_settings();
+        let request = build_test_request();
+        let context = create_test_auction_context(&settings, &request);
+
+        let openrtb = provider.to_openrtb(
+            &auction_request,
+            &context,
+            None,
+            make_request_info(&context),
+        );
+
+        let serialized = serde_json::to_value(&openrtb).expect("should serialize OpenRTB request");
+        assert_eq!(
+            serialized["user"]["ext"]["eids"],
+            crate::auction::test_support::repeated_source_provenance_eids_json(),
+            "Prebid Server should receive both entries with their own EID-level fields"
         );
     }
 }

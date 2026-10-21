@@ -838,9 +838,7 @@ mod tests {
 
         #[test]
         fn document_fallback_warns_once_without_publisher_source() {
-            log::set_logger(&LOGGER).expect("should install the fallback test logger");
-            let previous_level = log::max_level();
-            log::set_max_level(log::LevelFilter::Warn);
+            crate::test_support::logging::register(&LOGGER);
             MESSAGES.with(|messages| *messages.borrow_mut() = Some(Vec::new()));
             let document = IntegrationDocumentState::default();
             let rewriter = NextJsRscPlaceholderRewriter::new(test_config());
@@ -858,7 +856,6 @@ mod tests {
             let messages = MESSAGES
                 .with(|messages| messages.borrow_mut().take())
                 .expect("should capture this thread's fallback warning");
-            log::set_max_level(previous_level);
             assert_eq!(
                 messages,
                 ["Next.js RSC fallback: uncaptured data head; remaining Flight payloads stay raw"],

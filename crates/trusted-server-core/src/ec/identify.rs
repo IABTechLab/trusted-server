@@ -128,6 +128,7 @@ pub fn handle_identify(
         inserter: None,
         matcher: None,
         mm: None,
+        ext: None,
         source: partner.source_domain.clone(),
         uids: vec![Uid {
             id: u.clone(),

@@ -2683,6 +2683,37 @@ mod tests {
     }
 
     #[test]
+    fn auction_route_retains_redacted_identity_finalization_context() {
+        let router = test_router();
+        let eids_cookie = base64::engine::general_purpose::STANDARD.encode(
+            serde_json::json!([{ "source": "ids.example.com", "uids": [{ "id": "example-uid" }] }])
+                .to_string(),
+        );
+        let mut request = browser_request(Method::POST, "/auction", "empty");
+        request.headers_mut().insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("ts-eids={eids_cookie}"))
+                .expect("should build cookie header"),
+        );
+
+        let response = route(&router, request);
+
+        let state = response
+            .extensions()
+            .get::<super::EcFinalizeState>()
+            .expect("auction responses should carry EC finalization state");
+        assert!(
+            !format!("{:?}", state.ec_context).contains(&eids_cookie),
+            "should keep the captured browser EID cookie out of debug output"
+        );
+        assert_eq!(
+            state.ec_context.eid_sync_source(),
+            Some(EidSyncSource::Auction),
+            "finalization should know this was an /auction request"
+        );
+    }
+
+    #[test]
     fn dispatch_limits_returning_user_eid_sync_to_eligible_routes() {
         let router = test_router();
 

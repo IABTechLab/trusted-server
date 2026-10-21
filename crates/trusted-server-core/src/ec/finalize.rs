@@ -87,7 +87,7 @@ pub fn ec_finalize_response(
                 .map(|_| {
                     collect_browser_eid_updates(
                         body_updates.clone(),
-                        ec_context.prebid_eids_cookie(),
+                        browser_eids_cookie(ec_context),
                         sharedid_cookie,
                         registry,
                     )
@@ -147,7 +147,7 @@ pub fn ec_finalize_response(
         let updates = gate_eid_updates_by_consent(
             collect_browser_eid_updates(
                 body_updates,
-                ec_context.prebid_eids_cookie(),
+                browser_eids_cookie(ec_context),
                 sharedid_cookie,
                 registry,
             ),
@@ -163,6 +163,14 @@ pub fn ec_finalize_response(
 
     reconcile_pull_sync_marker(settings, registry, ec_context, response);
     super::identity_handoff::finalize_response(settings, registry, ec_context, response);
+}
+
+/// Selects cookie input without re-ingesting a stale cookie beside auction-scoped EIDs.
+fn browser_eids_cookie(context: &EcContext) -> Option<&str> {
+    match context.eid_sync_source() {
+        Some(EidSyncSource::Auction) => None,
+        _ => context.prebid_eids_cookie(),
+    }
 }
 
 fn protect_pending_capture_updates(
@@ -1443,10 +1451,17 @@ mod tests {
                 stored.ids["id5-sync.com"].uid, "body-id5",
                 "body must override browser cookie"
             );
-            assert_eq!(
-                stored.ids["ids.example.com"].uid, "cookie-only",
-                "cookie-only source must still persist"
-            );
+            if source == EidSyncSource::Auction {
+                assert!(
+                    !stored.ids.contains_key("ids.example.com"),
+                    "should not ingest a cookie-only source beside auction-scoped input"
+                );
+            } else {
+                assert_eq!(
+                    stored.ids["ids.example.com"].uid, "cookie-only",
+                    "cookie-only routes should still persist registered sources"
+                );
+            }
             assert_eq!(
                 stored.ids["sharedid.org"].uid, "direct-shared",
                 "direct sharedId must retain final precedence"
