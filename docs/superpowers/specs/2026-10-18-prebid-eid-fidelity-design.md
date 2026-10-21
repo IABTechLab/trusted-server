@@ -772,7 +772,7 @@ Why:
   repeated sources (3.5). Current Prebid Server does not require unique
   sources: `validateEIDs` only removes entries with an empty source and UIDs
   with an empty id
-  ([source](https://raw.githubusercontent.com/prebid/prebid-server/master/endpoints/openrtb2/auction.go)).
+  ([source](https://github.com/prebid/prebid-server/blob/master/endpoints/openrtb2/auction.go)).
 - KV is the staler copy for a source the browser sends (D9). Keeping the two
   kinds of data in separate entries means fields are never mixed.
 - Section 8.3 adds a staging check that each deployed provider accepts

@@ -586,7 +586,7 @@ mod tests {
                 "https://publisher.example.com:8443/page",
                 "publisher.example.com:8443",
             ),
-            ("https://[2001:db8::1]:8443/page", "[2001:db8::1]:8443"),
+            ("https://[2001:db8::1]:8443/page", "[2001:db8::1]:8443"), // allow-domain: 2001:db8::1
         ] {
             let req = Request::builder()
                 .version(http::Version::HTTP_2)

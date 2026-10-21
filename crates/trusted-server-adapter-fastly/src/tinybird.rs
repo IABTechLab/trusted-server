@@ -879,7 +879,9 @@ mod tests {
         // load a real token through Viceroy without a secret-store test
         // double — the same fixture backs the auction-token secret used
         // above.
-        let target = TinybirdEventsTarget::from_access_config(enabled_config());
+        let mut config = enabled_config();
+        config.api_host = "api.tinybird.example".to_owned();
+        let target = TinybirdEventsTarget::from_access_config(config);
         let http_client = RecordingHttpClient::respond_with(202);
         let row = r#"{"status":200}"#.to_owned();
 
@@ -893,7 +895,7 @@ mod tests {
         assert_eq!(requests.len(), 1, "should send exactly one request");
         assert_eq!(
             requests[0].uri,
-            "https://api.us-east.aws.tinybird.co/v0/events?name=access_logs_raw"
+            "https://api.tinybird.example/v0/events?name=access_logs_raw"
         );
         assert_eq!(requests[0].method, Method::POST.to_string());
         assert_eq!(

@@ -1350,7 +1350,7 @@ In the `tests` module of `src/auction/endpoints.rs`, add next to `EidCapturingPr
         let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
         let mut builder = Request::builder()
             .method("POST")
-            .uri("https://test-publisher.com/auction");
+            .uri(format!("https://{}/auction", settings.publisher.domain));
         if let Some(cookie) = ts_eids_cookie {
             builder = builder.header(header::COOKIE, format!("{COOKIE_TS_EIDS}={cookie}"));
         }
@@ -2243,7 +2243,7 @@ In `src/auction/endpoints.rs` tests, next to `auction_body_eids_reach_kv_even_wh
         let cookie = cookie_only_ts_eids();
         let req = Request::builder()
             .method("POST")
-            .uri("https://test-publisher.com/auction")
+            .uri(format!("https://{}/auction", settings.publisher.domain))
             .header(header::COOKIE, format!("{COOKIE_TS_EIDS}={cookie}"))
             .body(EdgeBody::from(
                 serde_json::to_vec(&json!({
@@ -2297,7 +2297,7 @@ In `src/auction/endpoints.rs` tests, next to `auction_body_eids_reach_kv_even_wh
         let cookie = cookie_only_ts_eids();
         let req = Request::builder()
             .method("POST")
-            .uri("https://test-publisher.com/auction")
+            .uri(format!("https://{}/auction", settings.publisher.domain))
             .header(header::COOKIE, format!("{COOKIE_TS_EIDS}={cookie}"))
             .body(EdgeBody::from(ad_units_only_body()))
             .expect("should build auction request");

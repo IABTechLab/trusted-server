@@ -3254,7 +3254,7 @@ mod tests {
             [publisher]
             domain = "test-publisher.com"
             cookie_domain = ".test-publisher.com"
-            origin_url = "https://origin.test-publisher.com"
+            origin_url = "https://origin.example.com"
             proxy_secret = "unit-test-proxy-secret"
 
             [ec]
@@ -4008,7 +4008,7 @@ mod tests {
             [publisher]
             domain = "test-publisher.com"
             cookie_domain = ".test-publisher.com"
-            origin_url = "https://origin.test-publisher.com"
+            origin_url = "https://origin.example.com"
             proxy_secret = "unit-test-proxy-secret"
 
             [ec]

@@ -1166,7 +1166,7 @@ mod tests {
         );
         let req = Request::builder()
             .method("POST")
-            .uri("https://test-publisher.com/auction")
+            .uri(format!("https://{}/auction", settings.publisher.domain))
             .header(header::COOKIE, format!("{COOKIE_TS_EIDS}={cookie}"))
             .body(EdgeBody::from(ad_units_only_body()))
             .expect("should build auction request");
@@ -1263,7 +1263,7 @@ mod tests {
         ec_context.set_eid_sync_source(crate::ec::EidSyncSource::Auction);
         let req = Request::builder()
             .method("POST")
-            .uri("https://test-publisher.com/auction")
+            .uri(format!("https://{}/auction", settings.publisher.domain))
             .body(EdgeBody::from(
                 serde_json::to_vec(&json!({
                     "adUnits": [
@@ -2117,7 +2117,7 @@ mod tests {
         let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
         let mut builder = Request::builder()
             .method("POST")
-            .uri("https://test-publisher.com/auction");
+            .uri(format!("https://{}/auction", settings.publisher.domain));
         if let Some(cookie) = ts_eids_cookie {
             builder = builder.header(header::COOKIE, format!("{COOKIE_TS_EIDS}={cookie}"));
         }

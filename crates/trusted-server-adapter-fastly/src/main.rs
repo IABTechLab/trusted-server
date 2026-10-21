@@ -2182,7 +2182,7 @@ mod tests {
             [publisher]
             domain = "test-publisher.com"
             cookie_domain = ".test-publisher.com"
-            origin_url = "https://origin.test-publisher.com"
+            origin_url = "https://origin.example.com"
             proxy_secret = "unit-test-proxy-secret"
 
             [ec]
@@ -2234,7 +2234,7 @@ mod tests {
         let ec_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.test01";
         let request = edgezero_core::http::request_builder()
             .method(fastly::http::Method::GET)
-            .uri("https://test-publisher.com/article")
+            .uri(format!("https://{}/article", settings.publisher.domain))
             .header("cookie", format!("ts-ec={ec_id}"))
             .body(EdgeBody::empty())
             .expect("should build EC finalize test request");
