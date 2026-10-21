@@ -66,13 +66,9 @@ impl RuntimeEnvironment for CloudflareWorkers {
     }
 
     fn spawn(&self, _wasm_path: &Path) -> TestResult<RuntimeProcess> {
-        let wrangler_dir = self.wrangler_dir();
-        let config = if std::env::var("CI").is_ok() {
-            write_generated_ci_config(&wrangler_dir, &cloudflare_config_json(origin_port())?)?
-        } else {
-            "wrangler.toml".to_string()
-        };
-        self.spawn_wrangler(&wrangler_dir, &config)
+        self.spawn_with_readiness(|base_url| {
+            super::wait_for_ready(base_url, self.health_check_path(), true)
+        })
     }
 
     fn health_check_path(&self) -> &str {
@@ -81,6 +77,26 @@ impl RuntimeEnvironment for CloudflareWorkers {
 }
 
 impl CloudflareWorkers {
+    /// Start an isolated fixture with an explicit authenticated readiness probe.
+    ///
+    /// The standard [`RuntimeEnvironment::spawn`] retains its original readiness check.
+    ///
+    /// # Errors
+    ///
+    /// Returns the existing spawn failure or the supplied readiness-probe error.
+    pub(crate) fn spawn_with_readiness(
+        &self,
+        ready: impl FnOnce(&str) -> TestResult<()>,
+    ) -> TestResult<RuntimeProcess> {
+        let wrangler_dir = self.wrangler_dir();
+        let config = if std::env::var("CI").is_ok() {
+            write_generated_ci_config(&wrangler_dir, &cloudflare_config_json(origin_port())?)?
+        } else {
+            "wrangler.toml".to_string()
+        };
+        self.spawn_wrangler(&wrangler_dir, &config, ready)
+    }
+
     /// Start `wrangler dev` with a test-specific `TRUSTED_SERVER_CONFIG` binding.
     ///
     /// Unlike [`RuntimeEnvironment::spawn`], this always renders the CI
@@ -95,10 +111,17 @@ impl CloudflareWorkers {
     pub fn spawn_with_config_json(&self, config_json: &str) -> TestResult<RuntimeProcess> {
         let wrangler_dir = self.wrangler_dir();
         let config = write_generated_ci_config(&wrangler_dir, config_json)?;
-        self.spawn_wrangler(&wrangler_dir, &config)
+        self.spawn_wrangler(&wrangler_dir, &config, |base_url| {
+            super::wait_for_ready(base_url, self.health_check_path(), true)
+        })
     }
 
-    fn spawn_wrangler(&self, wrangler_dir: &Path, config: &str) -> TestResult<RuntimeProcess> {
+    fn spawn_wrangler(
+        &self,
+        wrangler_dir: &Path,
+        config: &str,
+        ready: impl FnOnce(&str) -> TestResult<()>,
+    ) -> TestResult<RuntimeProcess> {
         let port = super::find_available_port().unwrap_or(CLOUDFLARE_DEFAULT_PORT);
 
         #[cfg(unix)]
@@ -166,7 +189,7 @@ impl CloudflareWorkers {
         let handle = CloudflareHandle { child };
         let base_url = format!("http://127.0.0.1:{port}");
 
-        super::wait_for_ready(&base_url, self.health_check_path(), true)?;
+        ready(&base_url)?;
 
         Ok(RuntimeProcess {
             inner: Box::new(handle),

@@ -187,7 +187,6 @@ fn dispatch(args: Args) -> Result<RunOutcome, String> {
 mod tests {
     use std::path::PathBuf;
 
-    use clap::Parser as _;
     use edgezero_cli::args::{AuthSub, ConfigDiffArgs, ConfigPushArgs, ConfigValidateArgs};
 
     use super::*;
@@ -984,6 +983,48 @@ mod tests {
         assert_eq!(generate.browser.settle_quiet_ms, 750);
         assert_eq!(generate.browser.settle_max_ms, 12_000);
         assert!(!generate.scroll, "generation should not scroll by default");
+        assert!(
+            !generate.yes,
+            "generation should ask before writing unless --yes is passed"
+        );
+    }
+
+    #[test]
+    fn audit_ad_templates_generate_parses_yes() {
+        let args = parse(&[
+            "ts",
+            "audit",
+            "ad-templates",
+            "generate",
+            "https://www.example.com/",
+            "--yes",
+        ]);
+        let Command::Audit(audit) = args.command else {
+            panic!("expected audit command");
+        };
+        let Some(crate::commands::audit::AuditSubcommand::AdTemplates(
+            crate::commands::audit::AuditAdTemplatesCommand::Generate(generate),
+        )) = audit.command
+        else {
+            panic!("expected audit ad-templates generate command");
+        };
+
+        assert!(generate.yes, "--yes should pre-approve the config write");
+        assert!(!generate.dry_run, "--yes should not imply --dry-run");
+    }
+
+    #[test]
+    fn audit_ad_templates_generate_rejects_dry_run_with_yes() {
+        Args::try_parse_from([
+            "ts",
+            "audit",
+            "ad-templates",
+            "generate",
+            "https://www.example.com/",
+            "--dry-run",
+            "--yes",
+        ])
+        .expect_err("should reject conflicting --dry-run and --yes");
     }
 
     #[test]

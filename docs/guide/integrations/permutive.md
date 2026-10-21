@@ -35,6 +35,18 @@ rewrite_sdk = true
 - `GET/POST /integrations/permutive/sync/*` - ID synchronization
 - `GET /integrations/permutive/cdn/*` - CDN proxy
 
+## SDK URL rewriting
+
+Server-side attribute rewriting and the browser script guard recognize URLs on
+`cdn.permutive.com` or a subdomain of `edge.permutive.app` whose pathname ends in
+`-web.js`, case-insensitively. Absolute HTTP(S) and protocol-relative URLs are
+supported. The bare `edge.permutive.app` host, unrelated scripts, lookalike hosts,
+and vendor names embedded in another URL's path or query are not claimed.
+
+Query strings and fragments do not prevent SDK recognition. Matching URLs use
+`/integrations/permutive/sdk`, which serves the SDK selected by `organization_id`
+and `workspace_id`; the original query and fragment are not forwarded to upstream.
+
 ## Features
 
 - **Real-time segmentation**: Build audience cohorts in real-time

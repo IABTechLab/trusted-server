@@ -1,3 +1,7 @@
+import type { TraceCollector } from '../trace/collector';
+import type { TraceGptIdentity } from '../trace/types';
+import type { TraceGptBridge } from '../trace/gpt';
+
 // Shared TypeScript types for the tsjs core API and extensions.
 export type Size = readonly [number, number];
 
@@ -27,6 +31,10 @@ export interface AuctionSlot {
   div_id: string;
   formats: Array<[number, number]>;
   targeting?: Record<string, string>;
+  ext?: {
+    trusted_server?: { trace_slot_ref?: unknown; [key: string]: unknown };
+    [key: string]: unknown;
+  };
 }
 
 /** Debug-only copy of server-side bid fields exposed for pipeline inspection. */
@@ -87,10 +95,6 @@ export interface AuctionBidData {
   hb_cache_path?: string;
   /** Opaque server-auction correlation ID used only by GPT diagnostics. */
   hb_auction_id?: string;
-  /** Winning creative width; the bridge sizes the inline render from this. */
-  w?: number;
-  /** Winning creative height; the bridge sizes the inline render from this. */
-  h?: number;
   nurl?: string;
   burl?: string;
   /** Typed winning-bid renderer capability. */
@@ -106,6 +110,43 @@ export interface AuctionBidData {
   adm?: string;
   /** Debug-only bid field mirror. Only present when `[debug] inject_adm_for_testing = true`. */
   debug_bid?: AuctionDebugBidData;
+}
+
+/** Server-measured auction timings relative to their documented server-side origin. */
+export interface AuctionDiagnosticsData {
+  auctionDispatchedMs?: number;
+  auctionResolvedMs?: number;
+  auctionCommittedMs?: number;
+  auctionWaitMs?: number;
+  auctionWaitPlacement?: 'pre_header' | 'in_stream';
+}
+
+/** Auction path presented by GPT diagnostics. */
+export type GptDiagnosticsAuctionType = 'ssat' | 'trusted_server' | 'client_side' | 'competing';
+
+/** Clock origin for server auction timings, independent of aggregate auction classification. */
+export type GptDiagnosticsServerAuctionTimingOrigin = 'navigation' | 'spa_auction';
+
+/** Sanitized bid facts already exposed as bucketed ad-server targeting. */
+export interface GptDiagnosticsAuctionWinner {
+  bidder: string;
+  priceBucket: string;
+  /** ISO currency supplied by the evidence source; absent means not supplied. */
+  currency?: string;
+}
+
+/** A completed, exactly correlated client-side Prebid auction. */
+export interface GptDiagnosticsPrebidAuctionEvidence {
+  auctionId: string;
+  targetingCandidate?: GptDiagnosticsAuctionWinner;
+  win?: GptDiagnosticsAuctionWinner;
+}
+
+/** Internal Trusted Server auction evidence attached to the next GPT request. */
+export interface GptDiagnosticsAuctionFacts {
+  auctionType?: Extract<GptDiagnosticsAuctionType, 'ssat' | 'trusted_server'>;
+  winner?: GptDiagnosticsAuctionWinner;
+  serverTimings?: AuctionDiagnosticsData;
 }
 
 export type GptDiagnosticsCallbackKind =
@@ -181,12 +222,42 @@ export type GptDiagnosticsTrustedServerOpportunity =
   | 'unrenderable_candidate'
   | 'no_candidate';
 
+/**
+ * Every safe failure category observed while obtaining or posting creative markup.
+ *
+ * This array is the single source of truth: `GptDiagnosticsCreativeFailure` is
+ * derived from it, and the diagnostics store validates against it at runtime.
+ * Adding a member here is sufficient for the store to accept it; a
+ * compile-time union and a hand-written runtime allowlist would otherwise
+ * drift, and a dropped reason is silent. An `aps_` member also needs a wire
+ * name in the render path's reason map to be reachable, and every member needs
+ * a case in the overlay's exhaustive switch, which is a compile error by design.
+ *
+ * The `aps_` members cover the APS render path, where a blank slot is otherwise
+ * indistinguishable from a filled one: Ad Manager reports a non-empty 1x1
+ * render whether or not the creative ever drew.
+ */
+export const GPT_DIAGNOSTICS_CREATIVE_FAILURES = [
+  'missing_render_source',
+  'cache_fetch_failed',
+  'invalid_cache_payload',
+  'response_post_failed',
+  // Reported by the sandboxed renderer document and relayed by the creative.
+  'aps_bad_hash',
+  'aps_nonce_mismatch',
+  'aps_descriptor_keys',
+  'aps_descriptor_fields',
+  'aps_descriptor_envelope',
+  'aps_runner_script_error',
+  // Observed by the Universal Creative source around its renderer frame.
+  'aps_frame_timeout',
+  'aps_frame_load_error',
+  'aps_frame_reported_failure',
+  'aps_unknown',
+] as const;
+
 /** A safe failure category observed while obtaining or posting creative markup. */
-export type GptDiagnosticsCreativeFailure =
-  | 'missing_render_source'
-  | 'cache_fetch_failed'
-  | 'invalid_cache_payload'
-  | 'response_post_failed';
+export type GptDiagnosticsCreativeFailure = (typeof GPT_DIAGNOSTICS_CREATIVE_FAILURES)[number];
 
 /** Delivery evidence derived for a GPT request cycle. */
 export type GptDiagnosticsDelivery =
@@ -224,6 +295,14 @@ export interface GptDiagnosticsRequestCycle {
   requestPath?: GptDiagnosticsRequestPath;
   requestIntentId?: number;
   trustedServerAuctionId?: string;
+  auctionType?: GptDiagnosticsAuctionType;
+  /** Compatibility field: winner of the observed server auction, not necessarily the served creative. */
+  auctionWinner?: GptDiagnosticsAuctionWinner;
+  /** Completed Prebid facts, correlated to this exact slot, request, and auction attempt. */
+  prebidAuction?: GptDiagnosticsPrebidAuctionEvidence;
+  serverAuctionTimings?: AuctionDiagnosticsData;
+  /** Retained separately because `auctionType` can become `competing`. */
+  serverAuctionTimingOrigin?: GptDiagnosticsServerAuctionTimingOrigin;
   opportunityToRequestMs?: number;
   replacedRequestNumber?: number;
   previousRenderToRequestMs?: number;
@@ -332,10 +411,24 @@ export interface GptDiagnosticsRecorder {
     auctionSlotId: string,
     opportunity: GptDiagnosticsTrustedServerOpportunity,
     trustedServerAuctionId?: string,
-    requestedSlotSizes?: ReadonlyArray<Size>
+    requestedSlotSizes?: ReadonlyArray<Size>,
+    auctionFacts?: GptDiagnosticsAuctionFacts,
+    traceIdentity?: TraceGptIdentity
   ): void;
   /** Mark slots whose next observed GPT request follows the Prebid refresh path. */
   recordPrebidRefresh(slots: GptDiagnosticsSlotHandle[]): void;
+  /** Record a completed Prebid attempt at its targeting boundary for one exact GPT slot. */
+  recordPrebidAuction(
+    slot: GptDiagnosticsSlotHandle,
+    auctionId: string,
+    targetingCandidate?: GptDiagnosticsAuctionWinner
+  ): void;
+  /** Record Prebid's documented `bidWon` observation for that exact attempt. */
+  recordPrebidWin(
+    slot: GptDiagnosticsSlotHandle,
+    auctionId: string,
+    winner: GptDiagnosticsAuctionWinner
+  ): void;
   /** Record a creative markup request and return its opaque attempt ID. */
   recordTrustedServerCreativeRequest(auctionSlotId: string): number | undefined;
   /** Record that a creative attempt successfully posted markup. */
@@ -404,6 +497,10 @@ export interface FirstImpressionState {
 }
 
 export interface TsjsApi {
+  /** Internal trace observations, installed only for a literal activated document. */
+  traceEvidence?: TraceCollector;
+  /** Internal active-only bridge shared with the early GPT bootstrap. */
+  traceGpt?: TraceGptBridge;
   version: string;
   que: Array<() => void>;
   addAdUnits(units: AdUnit | AdUnit[]): void;
@@ -430,6 +527,8 @@ export interface TsjsApi {
   adSlots?: AuctionSlot[];
   /** Winning bid targeting data injected before </body>. */
   bids?: Record<string, AuctionBidData>;
+  /** Server-measured timing evidence for the auction that populated `bids`. */
+  auctionDiagnostics?: AuctionDiagnosticsData;
   /**
    * Bounded client-side Prebid APS renderer capabilities keyed by Prebid's generated
    * `hb_adid`. The Universal Creative bridge consumes each entry at most once.
@@ -515,7 +614,9 @@ export interface TsjsApi {
    */
   scheduleInitialAdInit?: (
     initialBids?: Record<string, AuctionBidData>,
-    initialSlots?: AuctionSlot[]
+    initialSlots?: AuctionSlot[],
+    initialAuctionDiagnostics?: AuctionDiagnosticsData,
+    traceAuctionTransport?: unknown
   ) => void;
   /** Read-only GPT lifecycle diagnostics API, present only in an activated tab. */
   gptDiagnostics?: GptDiagnosticsApi;

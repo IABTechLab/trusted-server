@@ -8,6 +8,16 @@ on:
     branches: [main]
   pull_request:
 
+# Each pull request author runs one PR at a time per workflow, so one person
+# opening many PRs cannot fill the runner queue ahead of everyone else. Their
+# other runs wait in order instead of being cancelled, and every job has a
+# timeout so a hung run cannot hold that queue for hours. Bot-authored PRs and
+# other events get their own group from the run ID and are never held back.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.event.pull_request.user.type != 'Bot' && github.event.pull_request.user.login || github.run_id }}
+  cancel-in-progress: false
+  queue: max
+
 jobs:
   test-rust:
     name: cargo test
@@ -45,13 +55,20 @@ jobs:
         if: steps.cache-viceroy.outputs.cache-hit != 'true'
         run: cargo install viceroy --version "${{ steps.viceroy-version.outputs.viceroy-version }}" --locked --force
 
-      - name: Use Node.js for the served-seam contract
+      # trusted-server-core's dependency on trusted-server-js runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build and the served-seam contract
         uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
 
       - name: Run tests
         run: cargo test-fastly
+
+      - name: Run trace emitted-script regressions
+        run: |
+          cargo test -p trusted-server-core --target x86_64-unknown-linux-gnu --lib trace_document_skipped_emitted_script_leaves_ad_state_untouched -- --ignored
+          cargo test -p trusted-server-core --target x86_64-unknown-linux-gnu --lib trace_document_emitted_script_deep_freezes_owned_context_in_node -- --ignored
 
       - name: Run tests (reusable-sandbox feature)
         run: cargo test-fastly-reuse
@@ -68,6 +85,7 @@ jobs:
   test-axum:
     name: cargo test (axum native)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -79,12 +97,15 @@ jobs:
           target: wasm32-wasip1
           cache-key: cargo-axum
 
-      - name: Read pinned Node.js version for CLI fixtures
+      - name: Read pinned Node.js version
         id: node-version
         shell: bash
         run: echo "version=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/setup-node@v4
+      # trusted-server-core's dependency on trusted-server-js runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build and the CLI fixtures
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.node-version.outputs.version }}
 
@@ -116,6 +137,7 @@ jobs:
   test-cloudflare:
     name: cargo check (cloudflare native + wasm32-unknown-unknown)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -124,6 +146,15 @@ jobs:
         with:
           target: wasm32-unknown-unknown
           cache-key: cargo-cloudflare
+
+      # trusted-server-core's dependency on trusted-server-js runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .tool-versions
+          cache: npm
+          cache-dependency-path: crates/trusted-server-js/lib/package-lock.json
 
       - name: Check Cloudflare adapter (native host)
         run: cargo check -p trusted-server-adapter-cloudflare
@@ -137,6 +168,7 @@ jobs:
   test-spin:
     name: cargo check/build/test (spin native + wasm32-wasip1)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -145,6 +177,15 @@ jobs:
         with:
           target: wasm32-wasip1
           cache-key: cargo-spin
+
+      # trusted-server-core's dependency on trusted-server-js runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .tool-versions
+          cache: npm
+          cache-dependency-path: crates/trusted-server-js/lib/package-lock.json
 
       - name: Check Spin adapter (native host)
         run: cargo check -p trusted-server-adapter-spin
@@ -170,6 +211,7 @@ jobs:
   test-parity:
     name: cargo test (cross-adapter parity)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -178,6 +220,15 @@ jobs:
         with:
           components: clippy, rustfmt
           cache-key: cargo-parity
+
+      # trusted-server-core's dependency on trusted-server-js runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .tool-versions
+          cache: npm
+          cache-dependency-path: crates/trusted-server-js/lib/package-lock.json
 
       - name: Format check (parity test crate)
         run: cargo fmt --manifest-path crates/trusted-server-integration-tests/Cargo.toml -- --check
@@ -195,6 +246,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -204,12 +256,15 @@ jobs:
           components: "clippy, rustfmt"
           cache-key: cargo-cli
 
-      - name: Read pinned Node.js version for CLI fixtures
+      - name: Read pinned Node.js version
         id: node-version
         shell: bash
         run: echo "version=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/setup-node@v4
+      # trusted-server-core's dependency on trusted-server-js runs the TSJS
+      # build with the `npm` on PATH, so pin Node before any cargo step.
+      - name: Use Node.js for the TSJS build and the CLI fixtures
+        uses: actions/setup-node@v4
         with:
           node-version: ${{ steps.node-version.outputs.version }}
 
@@ -256,9 +311,49 @@ jobs:
           cargo test --manifest-path crates/trusted-server-cli/Cargo.toml --target "$TARGET" \
             --test proxy_trust_linux -- --ignored
 
+  lint-domains:
+    # Server-side counterpart to the `ts dev install-hooks` pre-commit hook,
+    # which `--no-verify` skips and fresh clones never install: fail the PR
+    # when an added line introduces a non-allowlisted URL host. PR-only, so
+    # direct pushes to main are not linted.
+    name: ts dev lint domains (changed lines)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      # A PR checkout is GitHub's merge commit; depth 2 also fetches its
+      # parents, so `HEAD^1` is the exact base commit the PR merges into.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Set up Rust toolchain
+        uses: ./.github/actions/setup-rust
+        with:
+          # Restore `test-cli`'s cache read-only. This job never runs on main,
+          # so a key of its own is only ever saved in PR scope, where no other
+          # PR can restore it.
+          cache-key: cargo-cli
+          save-cache: "false"
+
+      # Building `ts` compiles trusted-server-core, whose trusted-server-js
+      # build script runs the TSJS build with the `npm` on PATH, so pin Node
+      # first (see #1204).
+      - name: Use Node.js for the TSJS build
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .tool-versions
+
+      # The `ts` CLI is host-target only; the workspace default is wasm32-wasip1.
+      - name: Lint URL hosts on lines added by this PR
+        run: |
+          cargo run --manifest-path crates/trusted-server-cli/Cargo.toml \
+            --target "$(rustc -vV | sed -n 's/host: //p')" --bin ts -- \
+            dev lint domains --changed-vs HEAD^1 --verbose
+
   test-typescript:
     name: vitest
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: crates/trusted-server-js/lib

@@ -8,6 +8,7 @@
 
 use std::borrow::Cow;
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use edgezero_core::app_config::{SecretField, SecretKind, SecretPathSegment};
 use error_stack::Report;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -22,7 +23,7 @@ use crate::integrations::{
     didomi::DidomiIntegrationConfig,
     google_tag_manager::GoogleTagManagerConfig,
     gpt::GptConfig,
-    gpt_diagnostics::GptDiagnosticsConfig,
+    gpt_diagnostics::{GPT_DIAGNOSTICS_INTEGRATION_ID, GptDiagnosticsConfig},
     js_asset_proxy::{JS_ASSET_PROXY_INTEGRATION_ID, JsAssetProxyConfig},
     lockr::LockrConfig,
     nextjs::NextJsIntegrationConfig,
@@ -150,6 +151,16 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
             field(
                 vec![
                     object("ec"),
+                    optional_object("identity_handoff"),
+                    optional_object("keys"),
+                    SecretPathSegment::ArrayEach,
+                    object("secret"),
+                ],
+                false,
+            ),
+            field(
+                vec![
+                    object("ec"),
                     optional_object("partners"),
                     SecretPathSegment::ArrayEach,
                     object("api_token"),
@@ -181,7 +192,18 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
                 false,
             ),
             field(
+                vec![
+                    optional_object("trusted_forwarder"),
+                    object("shared_secret"),
+                ],
+                false,
+            ),
+            field(
                 vec![optional_object("tinybird"), object("auction_token_secret")],
+                true,
+            ),
+            field(
+                vec![optional_object("tinybird"), object("access_token_secret")],
                 true,
             ),
             field(
@@ -247,9 +269,12 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
 /// Returns [`TrustedServerError`] when non-secret configuration or a secret key
 /// reference is invalid.
 pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
+    validate_identity_handoff_structure(settings)?;
     validate_secret_key_references(settings)?;
+    validate_identity_handoff_uses_dedicated_keys(settings)?;
     validate_non_secret_deploy_placeholders(settings)?;
     validate_js_asset_proxy_config(settings)?;
+    validate_gpt_diagnostics_config(settings)?;
 
     let mut structural_settings = settings.clone();
     structural_settings.prepare_runtime()?;
@@ -258,6 +283,7 @@ pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<Tr
     let plan = crate::auction::compile_auction_plan(settings)?;
     validate_enabled_integrations(settings, &plan, false)?;
     PartnerRegistry::validate_config_for_deploy(&settings.ec.partners)?;
+    crate::integrations::IntegrationRegistry::validate_identity_owners(settings)?;
     Ok(())
 }
 
@@ -270,13 +296,40 @@ pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<Tr
 pub fn validate_settings_for_runtime(
     settings: &Settings,
 ) -> Result<(), Report<TrustedServerError>> {
+    validate_identity_handoff_structure(settings)?;
+    validate_identity_handoff_runtime_keys(settings)?;
+    validate_identity_handoff_uses_dedicated_keys(settings)?;
     settings.reject_placeholder_secrets()?;
     validate_js_asset_proxy_config(settings)?;
+    validate_gpt_diagnostics_config(settings)?;
     settings.validate_admin_handler_passwords()?;
     let plan = crate::auction::compile_auction_plan(settings)?;
     validate_enabled_integrations(settings, &plan, true)?;
     PartnerRegistry::from_config(&settings.ec.partners).map(|_| ())?;
+    crate::integrations::IntegrationRegistry::validate_identity_owners(settings)?;
     Ok(())
+}
+
+fn validate_gpt_diagnostics_config(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
+    let Some(raw_config) = settings.integrations.get(GPT_DIAGNOSTICS_INTEGRATION_ID) else {
+        return Ok(());
+    };
+    // Validate this dependency even when the normal integration lookup skips
+    // disabled integrations, including the default when enabled is omitted.
+    let config: GptDiagnosticsConfig = serde_json::from_value(raw_config.clone()).map_err(|error| {
+        Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "integration startup failed for `{GPT_DIAGNOSTICS_INTEGRATION_ID}`: configuration could not be parsed: {error}"
+            ),
+        })
+    })?;
+    config.validate().map_err(|error| {
+        Report::new(TrustedServerError::Configuration {
+            message: format!(
+                "integration startup failed for `{GPT_DIAGNOSTICS_INTEGRATION_ID}`: {error}"
+            ),
+        })
+    })
 }
 
 fn validate_js_asset_proxy_config(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
@@ -387,12 +440,93 @@ fn validate_non_secret_deploy_placeholders(
     }))
 }
 
+fn validate_identity_handoff_structure(
+    settings: &Settings,
+) -> Result<(), Report<TrustedServerError>> {
+    settings.ec.identity_handoff.validate().map_err(|error| {
+        Report::new(TrustedServerError::Configuration {
+            message: format!("ec.identity_handoff configuration is invalid: {error}"),
+        })
+    })
+}
+
+fn validate_identity_handoff_runtime_keys(
+    settings: &Settings,
+) -> Result<(), Report<TrustedServerError>> {
+    for (index, key) in settings.ec.identity_handoff.keys.iter().enumerate() {
+        let decoded = URL_SAFE_NO_PAD.decode(key.secret.expose()).map_err(|_| {
+            invalid_identity_handoff_secret(index, &key.id, "must use URL_SAFE_NO_PAD base64")
+        })?;
+        if decoded.len() != 32 {
+            return Err(invalid_identity_handoff_secret(
+                index,
+                &key.id,
+                "must decode to exactly 32 bytes",
+            ));
+        }
+        if decoded.as_slice() == settings.ec.passphrase.expose().as_bytes() {
+            return Err(invalid_identity_handoff_secret(
+                index,
+                &key.id,
+                "must not reuse ec.passphrase key material",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_identity_handoff_uses_dedicated_keys(
+    settings: &Settings,
+) -> Result<(), Report<TrustedServerError>> {
+    if let Some((index, key)) = settings
+        .ec
+        .identity_handoff
+        .keys
+        .iter()
+        .enumerate()
+        .find(|(_, key)| key.secret.expose() == settings.ec.passphrase.expose())
+    {
+        return Err(invalid_identity_handoff_secret(
+            index,
+            &key.id,
+            "must not reuse ec.passphrase",
+        ));
+    }
+    Ok(())
+}
+
+fn invalid_identity_handoff_secret(
+    index: usize,
+    key_id: &str,
+    requirement: &str,
+) -> Report<TrustedServerError> {
+    Report::new(TrustedServerError::Configuration {
+        message: format!(
+            "secret at `ec.identity_handoff.keys[{index}].secret` for key `{key_id}` {requirement}"
+        ),
+    })
+}
+
 fn validate_secret_key_references(settings: &Settings) -> Result<(), Report<TrustedServerError>> {
     validate_secret_key_reference(
         "publisher.proxy_secret",
         settings.publisher.proxy_secret.expose(),
     )?;
     validate_secret_key_reference("ec.passphrase", settings.ec.passphrase.expose())?;
+
+    for (index, key) in settings.ec.identity_handoff.keys.iter().enumerate() {
+        validate_secret_key_reference(
+            &format!("ec.identity_handoff.keys[{index}].secret"),
+            key.secret.expose(),
+        )?;
+        if key.secret.expose().trim() != key.secret.expose() {
+            return Err(invalid_identity_handoff_secret(
+                index,
+                &key.id,
+                "reference must not contain surrounding whitespace",
+            ));
+        }
+    }
 
     for (index, partner) in settings.ec.partners.iter().enumerate() {
         if let Some(token) = &partner.api_token {
@@ -423,13 +557,28 @@ fn validate_secret_key_references(settings: &Settings) -> Result<(), Report<Trus
         )?;
     }
 
-    if settings.tinybird.enabled {
+    if let Some(trusted_forwarder) = &settings.trusted_forwarder {
+        validate_secret_key_reference(
+            "trusted_forwarder.shared_secret",
+            trusted_forwarder.shared_secret.expose(),
+        )?;
+    }
+
+    if settings.tinybird.enabled && settings.tinybird.auction_enabled {
         let token = settings
             .tinybird
             .auction_token_secret
             .as_ref()
             .ok_or_else(|| missing_secret_key_reference("tinybird.auction_token_secret"))?;
         validate_secret_key_reference("tinybird.auction_token_secret", token.expose())?;
+    }
+    if settings.tinybird.enabled && settings.tinybird.access_enabled {
+        let token = settings
+            .tinybird
+            .access_token_secret
+            .as_ref()
+            .ok_or_else(|| missing_secret_key_reference("tinybird.access_token_secret"))?;
+        validate_secret_key_reference("tinybird.access_token_secret", token.expose())?;
     }
 
     if let Some(datadome) = settings.integration_config::<DataDomeConfig>("datadome")? {
@@ -514,12 +663,16 @@ fn report_to_validation_error(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     use super::*;
     use crate::auction_config_types::{NotificationConfig, ProviderConfig, RoutingMode};
+    use crate::platform::{StoreName, test_support::HashMapSecretStore};
     use crate::redacted::Redacted;
-    use crate::settings::{ProxyAssetRoute, S3SigV4AuthConfig, TrustedClientIpConfig};
+    use crate::settings::{
+        IdentityHandoffConfig, IdentityHandoffKey, ProxyAssetRoute, S3SigV4AuthConfig,
+        TrustedClientIpConfig,
+    };
     use crate::test_support::tests::crate_test_settings_str;
     use edgezero_core::app_config::AppConfigMeta;
     use edgezero_core::blob_envelope::BlobEnvelope;
@@ -577,6 +730,13 @@ formats = [{ width = 300, height = 250 }]
             Settings::from_toml(&crate_test_settings_str()).expect("should parse test settings");
         settings.proxy.allowed_domains = vec!["*.example".to_string(), "*.example.com".to_string()];
         settings
+    }
+
+    fn handoff_key(id: &str, secret: &str) -> IdentityHandoffKey {
+        IdentityHandoffKey {
+            id: id.to_owned(),
+            secret: Redacted::new(secret.to_owned()),
+        }
     }
 
     #[test]
@@ -900,11 +1060,14 @@ formats = [{ width = 300, height = 250 }]
             vec![
                 ("publisher.proxy_secret".to_owned(), false),
                 ("ec.passphrase".to_owned(), false),
+                ("ec.identity_handoff.keys[*].secret".to_owned(), false,),
                 ("ec.partners[*].api_token".to_owned(), true),
                 ("ec.partners[*].ts_pull_token".to_owned(), true),
                 ("handlers[*].password".to_owned(), false),
                 ("trusted_client_ip.shared_secret".to_owned(), false),
+                ("trusted_forwarder.shared_secret".to_owned(), false),
                 ("tinybird.auction_token_secret".to_owned(), true),
+                ("tinybird.access_token_secret".to_owned(), true),
                 (
                     "integrations.datadome.server_side_key_secret_name".to_owned(),
                     true,
@@ -933,7 +1096,7 @@ formats = [{ width = 300, height = 250 }]
     }
 
     #[test]
-    fn partner_secret_metadata_makes_the_defaulted_array_optional() {
+    fn defaulted_array_secret_metadata_uses_optional_container_segments() {
         let fields = TrustedServerAppConfig::secret_fields();
 
         for field in fields.iter().filter(|field| {
@@ -947,6 +1110,19 @@ formats = [{ width = 300, height = 250 }]
                 SecretPathSegment::OptionalField(name) if name == "partners"
             ));
         }
+
+        let handoff = fields
+            .iter()
+            .find(|field| field.dotted_path() == "ec.identity_handoff.keys[*].secret")
+            .expect("should expose identity handoff key secret metadata");
+        assert!(matches!(
+            &handoff.path[1],
+            SecretPathSegment::OptionalField(name) if name == "identity_handoff"
+        ));
+        assert!(matches!(
+            &handoff.path[2],
+            SecretPathSegment::OptionalField(name) if name == "keys"
+        ));
     }
 
     #[test]
@@ -1131,6 +1307,67 @@ gam_network_id = "99999"
     }
 
     #[test]
+    fn trusted_forwarder_deploy_accepts_short_secret_key_reference() {
+        let mut value =
+            serde_json::to_value(valid_settings()).expect("should serialize test settings");
+        value["trusted_forwarder"] = serde_json::json!({"auth_header": "x-ts-forwarder-auth", "shared_secret": "forwarder_key"});
+        let settings =
+            serde_json::from_value(value).expect("should deserialize secret key references");
+        TrustedServerAppConfig::new(settings)
+            .expect("should validate the key name rather than a resolved value");
+    }
+
+    #[test]
+    fn trusted_forwarder_deploy_rejects_reserved_auth_header_with_short_secret_reference() {
+        for auth_header in ["X-Forwarded-Host", "X-TS-DataDome-Bypass"] {
+            let mut value =
+                serde_json::to_value(valid_settings()).expect("should serialize test settings");
+            value["trusted_forwarder"] =
+                serde_json::json!({"auth_header": auth_header, "shared_secret": "forwarder_key"});
+            let settings =
+                serde_json::from_value(value).expect("should deserialize secret key references");
+            let error = TrustedServerAppConfig::new(settings)
+                .expect_err("should validate headers even with unresolved short secret references");
+            assert!(
+                format!("{error:?}").contains("reserved_trusted_forwarder_auth_header"),
+                "should reject the reserved authentication header"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_forwarder_deploy_rejects_client_ip_collision_with_short_secret_references() {
+        let mut value =
+            serde_json::to_value(valid_settings()).expect("should serialize test settings");
+        value["trusted_forwarder"] = serde_json::json!({"auth_header": "X-TS-Client-IP-Auth", "shared_secret": "forwarder_key"});
+        value["trusted_client_ip"] = serde_json::json!({"ip_header": "x-ts-client-ip", "auth_header": "x-ts-client-ip-auth", "shared_secret": "client_ip_key"});
+        let settings =
+            serde_json::from_value(value).expect("should deserialize secret key references");
+        let error = TrustedServerAppConfig::new(settings)
+            .expect_err("should validate collisions even with unresolved short secret references");
+        assert!(
+            format!("{error:?}").contains("colliding_trusted_forwarder_client_ip_header"),
+            "should reject colliding authentication headers"
+        );
+    }
+
+    #[test]
+    fn trusted_forwarder_deploy_rejects_empty_secret_key_reference() {
+        let mut value =
+            serde_json::to_value(valid_settings()).expect("should serialize test settings");
+        value["trusted_forwarder"] =
+            serde_json::json!({"auth_header": "x-ts-forwarder-auth", "shared_secret": " "});
+        let settings =
+            serde_json::from_value(value).expect("should deserialize secret key references");
+        let error = TrustedServerAppConfig::new(settings)
+            .expect_err("should reject an empty forwarder key reference");
+        assert!(
+            format!("{error:?}").contains("trusted_forwarder.shared_secret"),
+            "should name the invalid key reference field"
+        );
+    }
+
+    #[test]
     fn app_config_new_accepts_trusted_client_ip_secret_key_reference() {
         let mut settings = valid_settings();
         settings.trusted_client_ip = Some(TrustedClientIpConfig {
@@ -1158,6 +1395,140 @@ gam_network_id = "99999"
     }
 
     #[test]
+    fn identity_handoff_disabled_empty_config_validates_at_deploy_and_runtime() {
+        let settings = valid_settings();
+
+        validate_settings_for_deploy(&settings)
+            .expect("disabled empty handoff should pass deploy validation");
+        validate_settings_for_runtime(&settings)
+            .expect("disabled empty handoff should pass runtime validation");
+    }
+
+    #[test]
+    fn identity_handoff_deploy_validation_accepts_unresolved_rotation_key_references() {
+        let mut settings = valid_settings();
+        settings.ec.identity_handoff = IdentityHandoffConfig {
+            enabled: true,
+            active_key_id: "current".to_owned(),
+            keys: vec![
+                handoff_key("previous", "identity_handoff_previous"),
+                handoff_key("current", "identity_handoff_current"),
+            ],
+        };
+
+        validate_settings_for_deploy(&settings)
+            .expect("deploy validation should treat handoff secrets as key references");
+    }
+
+    #[test]
+    fn identity_handoff_deploy_validation_rejects_invalid_or_reused_key_references() {
+        for secret in ["   ", " padded_reference ", "same_key_as_ec_passphrase"] {
+            let mut settings = valid_settings();
+            if secret == "same_key_as_ec_passphrase" {
+                settings.ec.passphrase = Redacted::new(secret.to_owned());
+            }
+            settings.ec.identity_handoff.keys = vec![handoff_key("key-1", secret)];
+
+            let error = validate_settings_for_deploy(&settings)
+                .expect_err("deploy validation should reject an unusable handoff key reference");
+            assert!(
+                error
+                    .to_string()
+                    .contains("ec.identity_handoff.keys[0].secret"),
+                "error should name the handoff secret path without its value: {error:?}"
+            );
+            if !secret.trim().is_empty() {
+                assert!(
+                    !error.to_string().contains(secret.trim()),
+                    "error should not expose the handoff secret or reference: {error:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn identity_handoff_structure_fails_the_same_deploy_and_runtime_boundaries() {
+        let mut settings = valid_settings();
+        settings.ec.identity_handoff = IdentityHandoffConfig {
+            enabled: true,
+            active_key_id: "not-configured".to_owned(),
+            keys: vec![handoff_key("configured", "identity_handoff_key")],
+        };
+
+        for error in [
+            validate_settings_for_deploy(&settings)
+                .expect_err("deploy should reject a missing active key"),
+            validate_settings_for_runtime(&settings)
+                .expect_err("runtime should reject a missing active key"),
+        ] {
+            assert!(
+                error.to_string().contains("active_key_id"),
+                "both boundaries should report the active key invariant: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_handoff_runtime_validation_requires_canonical_32_byte_keys() {
+        let valid = URL_SAFE_NO_PAD.encode([7_u8; 32]);
+        let invalid_cases = [
+            ("not-base64url".to_owned(), "URL_SAFE_NO_PAD"),
+            (URL_SAFE_NO_PAD.encode([7_u8; 31]), "exactly 32 bytes"),
+            (format!("{valid}="), "URL_SAFE_NO_PAD"),
+        ];
+
+        for (secret, expected) in invalid_cases {
+            let mut settings = valid_settings();
+            settings.ec.identity_handoff.keys = vec![handoff_key("key-1", &secret)];
+
+            let error = validate_settings_for_runtime(&settings)
+                .expect_err("runtime should reject invalid handoff key material");
+            let message = error.to_string();
+            assert!(
+                message.contains(expected),
+                "runtime error should explain the key shape: {error:?}"
+            );
+            assert!(
+                !message.contains(&secret),
+                "runtime error should not expose handoff key material: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_handoff_runtime_rejects_encoded_ec_passphrase_key_material() {
+        let mut settings = valid_settings();
+        let ec_key = "synthetic-ec-key-with-32-bytes!!";
+        assert_eq!(ec_key.len(), 32);
+        settings.ec.passphrase = Redacted::new(ec_key.to_owned());
+        settings.ec.identity_handoff.keys =
+            vec![handoff_key("dedicated", &URL_SAFE_NO_PAD.encode(ec_key))];
+        let error = validate_settings_for_runtime(&settings)
+            .expect_err("should reject reused decoded EC key material");
+        assert!(error.to_string().contains("must not reuse ec.passphrase"));
+        assert!(!error.to_string().contains(ec_key));
+    }
+
+    #[test]
+    fn identity_handoff_runtime_validation_accepts_rotation_and_active_key_changes() {
+        let mut settings = valid_settings();
+        settings.ec.identity_handoff = IdentityHandoffConfig {
+            enabled: true,
+            active_key_id: "current".to_owned(),
+            keys: vec![
+                handoff_key("previous", &URL_SAFE_NO_PAD.encode([3_u8; 32])),
+                handoff_key("current", &URL_SAFE_NO_PAD.encode([7_u8; 32])),
+            ],
+        };
+
+        validate_settings_for_runtime(&settings)
+            .expect("runtime should accept current and previous rotation keys");
+        settings.ec.identity_handoff.active_key_id = "previous".to_owned();
+        validate_settings_for_runtime(&settings)
+            .expect("runtime should accept switching issuance to a retained key");
+    }
+
+    #[test]
     fn app_config_new_rejects_invalid_non_secret_settings() {
         let mut settings = valid_settings();
         settings.publisher.domain = "invalid/domain".to_owned();
@@ -1169,6 +1540,80 @@ gam_network_id = "99999"
             err.to_string().contains("invalid_publisher_domain"),
             "error should identify the structural validation failure: {err:?}"
         );
+    }
+
+    #[test]
+    fn trace_config_requires_enabled_on_both_validation_paths() {
+        for raw in [
+            serde_json::json!({"enabled": false, "trace_page_enabled": true}),
+            serde_json::json!({"trace_page_enabled": true}),
+        ] {
+            let mut settings = valid_settings();
+            settings
+                .integrations
+                .insert_config("gpt_diagnostics", &raw)
+                .expect("should insert trace configuration");
+
+            for validation in [validate_settings_for_deploy, validate_settings_for_runtime] {
+                let error = validation(&settings)
+                    .expect_err("should reject trace without enabled diagnostics");
+                assert!(
+                    format!("{error:?}").contains("trace_page_enabled requires enabled = true"),
+                    "should identify the trace configuration dependency: {error:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn trace_config_accepts_valid_flags_and_rejects_disabled_unknown_fields() {
+        for raw in [
+            serde_json::json!({}),
+            serde_json::json!({"enabled": true, "trace_page_enabled": true}),
+            serde_json::json!({"enabled": true, "trace_page_enabled": false}),
+            serde_json::json!({"enabled": false, "trace_page_enabled": false}),
+            serde_json::json!({"trace_page_enabled": false}),
+            serde_json::json!({"enabled": true}),
+        ] {
+            let mut settings = valid_settings();
+            settings
+                .integrations
+                .insert_config("gpt_diagnostics", &raw)
+                .expect("should insert valid trace configuration");
+            validate_settings_for_deploy(&settings)
+                .expect("should accept valid trace configuration at deployment");
+            validate_settings_for_runtime(&settings)
+                .expect("should accept valid trace configuration at runtime");
+        }
+
+        for (raw, expected) in [
+            (
+                serde_json::json!({"enabled": false, "trace_page_enabeld": false}),
+                "unknown field",
+            ),
+            (
+                serde_json::json!({"trace_page_enabeld": false}),
+                "unknown field",
+            ),
+            (
+                serde_json::json!({"enabled": false, "trace_page_enabled": "false"}),
+                "boolean",
+            ),
+        ] {
+            let mut settings = valid_settings();
+            settings
+                .integrations
+                .insert_config("gpt_diagnostics", &raw)
+                .expect("should insert invalid trace configuration");
+            for validation in [validate_settings_for_deploy, validate_settings_for_runtime] {
+                let error = validation(&settings)
+                    .expect_err("should reject invalid disabled trace configuration");
+                assert!(
+                    format!("{error:?}").contains(expected),
+                    "should identify the configuration schema error"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1614,6 +2059,301 @@ password = "production-admin-password-32-bytes"
         assert!(
             err.to_string().contains("missing-provider"),
             "validation error should mention invalid provider"
+        );
+    }
+
+    fn lockr_identity_owner_settings() -> (Settings, String) {
+        let mut settings = valid_settings();
+        settings
+            .integrations
+            .insert_config(
+                "lockr",
+                &serde_json::json!({
+                    "enabled": true,
+                    "capture_identity": false,
+                    "app_id": "synthetic-lockr-app",
+                }),
+            )
+            .expect("should insert disabled-capture Lockr config");
+        let registration = crate::integrations::lockr::register(&settings)
+            .expect("should build Lockr registration")
+            .expect("Lockr config should register");
+        let capture = registration
+            .identity_capture
+            .expect("Lockr registration should retain its capture descriptor");
+        assert!(
+            !capture.enabled(),
+            "fixture should exercise the capture kill switch"
+        );
+        let source = capture
+            .sources()
+            .first()
+            .expect("Lockr should declare at least one source")
+            .to_string();
+
+        settings.ec.partners.push(crate::settings::EcPartner {
+            name: "Owned identity source".to_owned(),
+            source_domain: source.clone(),
+            openrtb_atype: crate::settings::EcPartner::default_openrtb_atype(),
+            bidstream_enabled: true,
+            api_token: Some(Redacted::new(
+                "owned-api-token-key-reference-32-bytes".to_owned(),
+            )),
+            batch_rate_limit: crate::settings::EcPartner::default_batch_rate_limit(),
+            pull_sync_enabled: false,
+            pull_sync_url: None,
+            pull_sync_allowed_domains: vec![],
+            pull_sync_ttl_sec: crate::settings::EcPartner::default_pull_sync_ttl_sec(),
+            pull_sync_rate_limit: crate::settings::EcPartner::default_pull_sync_rate_limit(),
+            identity_owner: Some("lockr".to_owned()),
+            ts_pull_token: None,
+        });
+        (settings, source)
+    }
+
+    #[test]
+    fn owner_validation_accepts_disabled_capture_and_unresolved_deploy_secret_refs() {
+        let (settings, source) = lockr_identity_owner_settings();
+
+        validate_settings_for_deploy(&settings)
+            .expect("deploy validation should accept a disabled capture descriptor");
+        let partner = settings
+            .ec
+            .partners
+            .last()
+            .expect("should retain the configured owner partner");
+        assert_eq!(partner.source_domain, source);
+        assert_eq!(
+            partner
+                .api_token
+                .as_ref()
+                .expect("should retain the API token reference")
+                .expose(),
+            "owned-api-token-key-reference-32-bytes",
+            "deploy validation should keep the unresolved secret reference"
+        );
+    }
+
+    #[test]
+    fn owner_validation_rejects_unknown_and_nonclaiming_owners_in_deploy_and_runtime() {
+        for (owner, source_override) in [
+            ("missing_identity_module", None),
+            ("lockr", Some("unclaimed.identity.test")),
+        ] {
+            let (mut settings, _) = lockr_identity_owner_settings();
+            {
+                let partner = settings
+                    .ec
+                    .partners
+                    .last_mut()
+                    .expect("should retain the configured owner partner");
+                partner.identity_owner = Some(owner.to_owned());
+                if let Some(source) = source_override {
+                    partner.source_domain = source.to_owned();
+                }
+            }
+            let deploy_error = validate_settings_for_deploy(&settings)
+                .expect_err("deploy validation should reject an invalid owner claim");
+            assert!(
+                deploy_error.to_string().contains("identity owner"),
+                "deploy error should identify the owner claim: {deploy_error:?}"
+            );
+            let runtime_error = validate_settings_for_runtime(&settings)
+                .expect_err("runtime validation should reject an invalid owner claim");
+            assert!(
+                runtime_error.to_string().contains("identity owner"),
+                "runtime error should identify the owner claim: {runtime_error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn owner_validation_rejects_enabled_legacy_pull_in_deploy_and_runtime() {
+        let (mut settings, _) = lockr_identity_owner_settings();
+        let partner = settings
+            .ec
+            .partners
+            .last_mut()
+            .expect("should retain the configured owner partner");
+        partner.pull_sync_enabled = true;
+        partner.pull_sync_url = Some("https://pull.identity.test/v1".to_owned());
+        partner.pull_sync_allowed_domains = vec!["pull.identity.test".to_owned()];
+        partner.ts_pull_token = Some(Redacted::new(
+            "owned-pull-token-key-reference-32-bytes".to_owned(),
+        ));
+
+        let deploy_error = validate_settings_for_deploy(&settings)
+            .expect_err("deploy validation should reject legacy pull on an owned source");
+        assert!(
+            deploy_error.to_string().contains("legacy pull disabled"),
+            "deploy error should identify the owned-source pull conflict: {deploy_error:?}"
+        );
+        let runtime_error = validate_settings_for_runtime(&settings)
+            .expect_err("runtime validation should reject legacy pull on an owned source");
+        assert!(
+            runtime_error.to_string().contains("legacy pull disabled"),
+            "runtime error should identify the owned-source pull conflict: {runtime_error:?}"
+        );
+    }
+
+    #[test]
+    fn startup_blob_resolves_provided_disabled_identity_handoff_keys() {
+        let mut settings = valid_settings();
+        settings.publisher.proxy_secret = Redacted::new("handoff-proxy-secret".to_owned());
+        settings.ec.passphrase = Redacted::new("handoff-ec-passphrase".to_owned());
+        for (index, handler) in settings.handlers.iter_mut().enumerate() {
+            handler.password = Redacted::new(format!("handoff-handler-password-{index}"));
+        }
+        settings.ec.identity_handoff = IdentityHandoffConfig {
+            enabled: false,
+            active_key_id: "next".to_owned(),
+            keys: vec![handoff_key("next", "identity-handoff-next")],
+        };
+
+        validate_settings_for_deploy(&settings)
+            .expect("deploy should accept a disabled provisioned key reference");
+
+        let resolved_key = URL_SAFE_NO_PAD.encode([11_u8; 32]);
+        let secret_store = |handoff_secret: &str| {
+            let mut secrets = HashMap::new();
+            for (key, value) in [
+                (
+                    "handoff-proxy-secret".to_owned(),
+                    "resolved-proxy-secret-not-placeholder".to_owned(),
+                ),
+                (
+                    "handoff-ec-passphrase".to_owned(),
+                    "resolved-ec-passphrase-32-bytes-valid".to_owned(),
+                ),
+                (
+                    "identity-handoff-next".to_owned(),
+                    handoff_secret.to_owned(),
+                ),
+            ] {
+                secrets.insert(key, value.into_bytes());
+            }
+            for index in 0..settings.handlers.len() {
+                secrets.insert(
+                    format!("handoff-handler-password-{index}"),
+                    format!("resolved-handler-password-{index}-32-bytes").into_bytes(),
+                );
+            }
+            HashMapSecretStore::new(secrets)
+        };
+        let envelope = BlobEnvelope::new(
+            serde_json::to_value(&settings).expect("should serialize settings"),
+            "2026-10-10T00:00:00Z".to_owned(),
+        );
+        let envelope_json = serde_json::to_string(&envelope).expect("should serialize envelope");
+
+        let started = crate::config_payload::settings_from_config_blob(
+            &envelope_json,
+            &secret_store(&resolved_key),
+            &StoreName::from("identity-handoff-test-secrets"),
+        )
+        .expect("startup should resolve and validate the disabled provisioned key");
+
+        assert!(!started.ec.identity_handoff.enabled);
+        assert_eq!(started.ec.identity_handoff.active_key_id, "next");
+        assert_eq!(
+            started.ec.identity_handoff.keys[0].secret.expose(),
+            &resolved_key,
+            "startup should replace the key reference with resolved key material"
+        );
+
+        let malformed = "not-valid-key-material";
+        let error = crate::config_payload::settings_from_config_blob(
+            &envelope_json,
+            &secret_store(malformed),
+            &StoreName::from("identity-handoff-test-secrets"),
+        )
+        .expect_err("startup should reject malformed resolved handoff key material");
+        assert!(error.to_string().contains("URL_SAFE_NO_PAD"));
+        assert!(
+            !error.to_string().contains(malformed),
+            "startup error should not expose resolved handoff key material: {error:?}"
+        );
+    }
+
+    #[test]
+    fn startup_blob_validation_keeps_disabled_owner_descriptor_and_resolves_partner_token() {
+        let (mut settings, source) = lockr_identity_owner_settings();
+        settings.publisher.proxy_secret = Redacted::new("owner-proxy-secret".to_owned());
+        settings.ec.passphrase = Redacted::new("owner-ec-passphrase".to_owned());
+        for (index, handler) in settings.handlers.iter_mut().enumerate() {
+            handler.password = Redacted::new(format!("owner-handler-password-{index}"));
+        }
+        settings
+            .ec
+            .partners
+            .last_mut()
+            .expect("should retain the configured owner partner")
+            .api_token = Some(Redacted::new("owner-partner-api-token".to_owned()));
+
+        validate_settings_for_deploy(&settings)
+            .expect("deploy should accept unresolved references before startup resolves them");
+
+        let mut secrets = HashMap::new();
+        for (key, value) in [
+            (
+                "owner-proxy-secret",
+                "resolved-proxy-secret-not-placeholder",
+            ),
+            (
+                "owner-ec-passphrase",
+                "resolved-ec-passphrase-32-bytes-valid",
+            ),
+            (
+                "owner-handler-password-0",
+                "resolved-handler-password-0-32-bytes",
+            ),
+            (
+                "owner-handler-password-1",
+                "resolved-handler-password-1-32-bytes",
+            ),
+            (
+                "owner-partner-api-token",
+                "resolved-owned-api-token-32-bytes-minimum",
+            ),
+        ] {
+            secrets.insert(key.to_owned(), value.as_bytes().to_vec());
+        }
+        let store = HashMapSecretStore::new(secrets);
+        let envelope = BlobEnvelope::new(
+            serde_json::to_value(&settings).expect("should serialize settings"),
+            "2026-10-09T00:00:00Z".to_owned(),
+        );
+        let envelope_json = serde_json::to_string(&envelope).expect("should serialize envelope");
+
+        let started = crate::config_payload::settings_from_config_blob(
+            &envelope_json,
+            &store,
+            &StoreName::from("identity-owner-test-secrets"),
+        )
+        .expect("startup should resolve secrets and validate the disabled owner descriptor");
+
+        let started_partner = started
+            .ec
+            .partners
+            .last()
+            .expect("startup should retain the configured owner partner");
+        assert_eq!(started_partner.identity_owner.as_deref(), Some("lockr"));
+        assert_eq!(started_partner.source_domain, source);
+        assert_eq!(
+            started_partner
+                .api_token
+                .as_ref()
+                .expect("startup should retain the identify token")
+                .expose(),
+            "resolved-owned-api-token-32-bytes-minimum",
+            "startup should resolve the identify token for the owned source"
+        );
+        let registration = crate::integrations::lockr::register(&started)
+            .expect("should build Lockr registration after startup")
+            .expect("Lockr should remain registered while capture is disabled");
+        assert!(
+            registration.identity_capture.is_some(),
+            "the disabled capture descriptor should remain discoverable"
         );
     }
 }

@@ -33,6 +33,7 @@ mod auth;
 
 pub mod admin;
 pub mod batch_sync;
+pub(crate) mod client_eids;
 pub mod consent;
 pub mod cookies;
 pub mod device;
@@ -40,6 +41,9 @@ pub mod eids;
 pub mod finalize;
 pub mod generation;
 pub mod identify;
+pub mod identity;
+pub(crate) mod identity_handoff;
+pub(crate) mod identity_handoff_codec;
 pub mod kv;
 pub mod kv_backend;
 pub mod kv_types;
@@ -73,13 +77,15 @@ use error_stack::Report;
 use http::Request;
 
 use crate::consent::{self as consent_mod, ConsentContext, ConsentPipelineInput};
-use crate::constants::{COOKIE_TS_EC, COOKIE_TS_EC_PULL_COMPLETE};
+use crate::constants::{
+    COOKIE_TS_EC, COOKIE_TS_EC_PULL_COMPLETE, COOKIE_TS_EIDS, COOKIE_TS_EIDS_SERVER,
+};
 use crate::cookies::handle_request_cookies;
 use crate::ec::cookies::ec_id_has_only_allowed_chars;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
-use crate::openrtb::Eid;
 use crate::platform::RuntimeServices;
+use crate::redacted::Redacted;
 use crate::settings::Settings;
 use device::DeviceSignals;
 
@@ -87,7 +93,7 @@ use self::kv::{CreateIfAbsentOutcome, KvIdentityGraph};
 use self::kv_types::KvEntry;
 use self::pull_sync_marker::{PullSyncMarkerState, validate_marker_state};
 
-/// Bounded request classifications that may persist browser EID cookies.
+/// Bounded request classifications that may persist browser EIDs.
 ///
 /// Adapters classify publisher navigations and `POST /auction` only after
 /// pre-route filters allow dispatch. The shared page-bids handler classifies an
@@ -272,16 +278,16 @@ pub struct EcContext {
     kv_snapshot: EcKvSnapshot,
     /// Whether this request may rotate an orphaned EC identity.
     recovery_eligible: bool,
-    /// EIDs the route resolved from the current request: the `/auction` JSON
-    /// body, or the `ts-eids` cookie when the body carried none. Carried to
-    /// response finalization so KV ingestion can use the full set the client
-    /// sent instead of being limited to whatever fits in the size-capped
-    /// `ts-eids` cookie.
-    client_eids: Option<Vec<Eid>>,
     /// Browser-carried proof of recent pull-partner completeness.
     pull_sync_marker: PullSyncMarkerState,
     /// Allowed returning-user EID persistence source, assigned only after request filters pass.
     eid_sync_source: Option<EidSyncSource>,
+    /// Browser-written EID cookie retained for response-time ingestion, never logging.
+    prebid_eids_cookie: Option<Redacted<String>>,
+    /// Normalized browser body updates retained even when auction dispatch fails.
+    browser_eid_updates: Vec<kv::PartnerIdUpdate>,
+    /// Authenticated capture observations, bound to the incoming full EC ID.
+    pub(crate) identity_handoff: identity_handoff::HandoffState,
 }
 
 impl EcContext {
@@ -350,7 +356,23 @@ impl EcContext {
             consent.jurisdiction,
         );
 
+        let prebid_eids_cookie = parsed
+            .jar
+            .as_ref()
+            .and_then(|jar| jar.get(COOKIE_TS_EIDS))
+            .map(|cookie| Redacted::new(cookie.value().to_owned()));
+        let identity_handoff = identity_handoff::HandoffState::from_cookie(
+            settings,
+            ec_value.as_deref(),
+            parsed
+                .jar
+                .as_ref()
+                .and_then(|jar| jar.get(COOKIE_TS_EIDS_SERVER))
+                .map(cookie::Cookie::value),
+        );
         Ok(Self {
+            identity_handoff,
+            prebid_eids_cookie,
             ec_value,
             cookie_ec_value: parsed.cookie_ec,
             ec_was_present,
@@ -361,9 +383,9 @@ impl EcContext {
             device_signals: None,
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
-            client_eids: None,
             pull_sync_marker: PullSyncMarkerState::from_cookie(parsed.pull_sync_marker),
             eid_sync_source: None,
+            browser_eid_updates: Vec::new(),
         })
     }
 
@@ -531,6 +553,13 @@ impl EcContext {
         self.geo_info.as_ref()
     }
 
+    /// Allows authenticated handoff work on an adapter with supported KV/post-send execution.
+    ///
+    /// Adapters must leave this disabled for bot-gated or unsupported requests.
+    pub fn set_identity_handoff_supported(&mut self, supported: bool) {
+        self.identity_handoff.supported = supported;
+    }
+
     /// Returns the request-scoped identity-graph snapshot.
     #[must_use]
     pub fn kv_snapshot(&self) -> &EcKvSnapshot {
@@ -547,9 +576,26 @@ impl EcContext {
         self.recovery_eligible = eligible;
     }
 
-    /// Allows returning-user EID cookie persistence for this request source.
+    /// Allows returning-user browser EID persistence for this request source.
     pub fn set_eid_sync_source(&mut self, source: EidSyncSource) {
         self.eid_sync_source = Some(source);
+    }
+
+    /// Returns the browser-written cookie for decoding and consent-gated use.
+    pub(crate) fn prebid_eids_cookie(&self) -> Option<&str> {
+        self.prebid_eids_cookie
+            .as_ref()
+            .map(|cookie| cookie.expose().as_str())
+    }
+
+    /// Stages registered browser body updates before dispatch. No root is created.
+    pub(crate) fn stage_browser_eid_updates(&mut self, updates: Vec<kv::PartnerIdUpdate>) {
+        self.browser_eid_updates = updates;
+    }
+
+    /// Takes the request's browser updates for one finalization attempt.
+    pub(crate) fn take_browser_eid_updates(&mut self) -> Vec<kv::PartnerIdUpdate> {
+        std::mem::take(&mut self.browser_eid_updates)
     }
 
     /// Returns the allowed returning-user EID persistence source.
@@ -562,18 +608,6 @@ impl EcContext {
     #[must_use]
     pub fn recovery_eligible(&self) -> bool {
         self.recovery_eligible
-    }
-
-    /// Records the current request's own EIDs (e.g. an `/auction` body) for
-    /// use by response finalization's KV ingestion.
-    pub(crate) fn set_client_eids(&mut self, eids: Vec<Eid>) {
-        self.client_eids = Some(eids);
-    }
-
-    /// Returns the current request's own EIDs, if the route captured any.
-    #[must_use]
-    pub(crate) fn client_eids(&self) -> Option<&[Eid]> {
-        self.client_eids.as_deref()
     }
 
     /// Validates a browser completeness marker against the active EC and partner set.
@@ -652,6 +686,9 @@ impl EcContext {
     #[must_use]
     pub fn new_for_test(ec_value: Option<String>, consent: ConsentContext) -> Self {
         Self {
+            prebid_eids_cookie: None,
+            identity_handoff: identity_handoff::HandoffState::default(),
+            browser_eid_updates: Vec::new(),
             ec_was_present: ec_value.is_some(),
             cookie_ec_value: ec_value.clone(),
             ec_value,
@@ -662,7 +699,6 @@ impl EcContext {
             device_signals: None,
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
-            client_eids: None,
             pull_sync_marker: PullSyncMarkerState::Absent,
             eid_sync_source: None,
         }
@@ -677,6 +713,9 @@ impl EcContext {
         client_ip: Option<String>,
     ) -> Self {
         Self {
+            prebid_eids_cookie: None,
+            identity_handoff: identity_handoff::HandoffState::default(),
+            browser_eid_updates: Vec::new(),
             ec_was_present: ec_value.is_some(),
             cookie_ec_value: ec_value.clone(),
             ec_value,
@@ -687,7 +726,6 @@ impl EcContext {
             device_signals: None,
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
-            client_eids: None,
             pull_sync_marker: PullSyncMarkerState::Absent,
             eid_sync_source: None,
         }
@@ -705,6 +743,9 @@ impl EcContext {
         consent: ConsentContext,
     ) -> Self {
         Self {
+            prebid_eids_cookie: None,
+            identity_handoff: identity_handoff::HandoffState::default(),
+            browser_eid_updates: Vec::new(),
             ec_value,
             cookie_ec_value,
             ec_was_present,
@@ -715,7 +756,6 @@ impl EcContext {
             device_signals: None,
             kv_snapshot: EcKvSnapshot::NotRead,
             recovery_eligible: false,
-            client_eids: None,
             pull_sync_marker: PullSyncMarkerState::Absent,
             eid_sync_source: None,
         }
@@ -985,6 +1025,26 @@ mod tests {
         assert!(!ec.ec_was_present(), "should not detect EC from header");
         assert!(!ec.cookie_was_present(), "should not detect cookie");
         assert!(!ec.ec_generated(), "should not mark as generated");
+    }
+
+    #[test]
+    fn read_from_request_retains_browser_eid_cookie_without_debug_disclosure() {
+        let settings = create_test_settings();
+        let ec_id = valid_ec_id("a", "Eids01");
+        let value = "synthetic-encoded-cookie-content";
+        let cookies = format!("ts-ec={ec_id}; ts-eids={value}");
+        let req = create_test_request(&[("cookie", &cookies)]);
+        let context = EcContext::read_from_request(&settings, &req, &noop_services())
+            .expect("should read browser cookie");
+        assert_eq!(
+            context.prebid_eids_cookie(),
+            Some(value),
+            "should retain request-local cookie for ingestion"
+        );
+        assert!(
+            !format!("{context:?}").contains(value),
+            "should redact browser EID cookie from debug output"
+        );
     }
 
     #[test]

@@ -339,8 +339,8 @@ A settled result that denies consent still seeds the managed entry; `tcfControl`
 then blocks the vendor call and the storage write, which is the enforcement path
 this integration relies on. A CMP that recovers later — the user completes its
 UI, or a delayed first response arrives — activates the managed entries at that
-point, with `userSync.autoRefresh` briefly enabled so Prebid initializes modules
-added after its first pass.
+point, with `userSync.autoRefresh` enabled so Prebid initializes modules
+added after its first pass. Because Prebid accumulates `userSync` settings, `autoRefresh` then stays enabled for the rest of the page.
 
 This scope is deliberately narrow. It applies only to the automatic TCF
 collector that Trusted Server configures for its own managed modules. A
@@ -659,9 +659,26 @@ paths.
 
 ## User ID Modules
 
-Prebid.js can expose publisher-configured User ID Module output via
-`pbjs.getUserIdsAsEids()`. The TSJS Prebid shim reads those current-request
-EIDs after auctions and forwards them to Trusted Server when they are available.
+Prebid.js places the EIDs each bidder may receive in that bidder's
+`bidderRequest.ortb2`: User ID module output, `setConfig({ortb2})` and
+`setBidderConfig` data, and RTD output, with IDs restricted to other bidders
+left out and Prebid's activity controls applied. The `trustedServer` adapter
+forwards exactly the `user.ext.eids` and `user.eids` entries in its own bidder
+request, with their `inserter`, `matcher`, `mm` and `ext`. It never reads
+`pbjs.getUserIdsAsEids()`, which also returns IDs restricted to other bidders.
+
+### Timing and `userSync`
+
+Trusted Server writes no Prebid `userSync` settings other than the managed
+`userIds` entries below (and `autoRefresh` when a late CMP answer seeds them).
+The publisher's `auctionDelay`, `syncDelay`, `syncsPerBidder` and
+`filterSettings`, or Prebid's defaults, apply from the first auction. Prebid's
+default `auctionDelay` is 500 ms: an auction waits up to that long while User
+ID modules are still resolving, and not at all once they have settled. Set
+`auctionDelay` and `filterSettings` in your own Prebid configuration if the
+defaults do not suit you. Prebid's default allows image user syncs only.
+Vendors that write `ortb2` after their own network call, such as the Lockr
+SDK, are not awaited; their IDs reach later requests.
 
 User ID submodule inclusion comes from `bundle.modules.user_id`. The available
 modules and default preset are checked in at
@@ -845,16 +862,16 @@ IdentityLink resolves asynchronously. A new browser's first auction can run
 before RampID is available; later auctions can include it without blocking the
 page or auction. When available, the opaque value follows the standard path:
 
-1. `pbjs.getUserIdsAsEids()` exposes an entry whose source is `liveramp.com`.
-2. The current `/auction` request includes that entry.
-3. Trusted Server merges and consent-gates it, then forwards it to Prebid
-   Server as `user.ext.eids`.
-4. After the response, the same `/auction` request ingests the body entry into
-   an EC/KV partner configured with `source_domain = "liveramp.com"`, when that
-   partner UID is not already stored.
-5. The browser also persists the opaque value in the bounded `ts-eids` cookie,
-   which lets requests without an EID body, such as `GET /_ts/page-bids` and
-   page navigations, ingest it.
+1. Prebid includes a `liveramp.com` entry in the `trustedServer` bidder request
+   when the module resolves it and bidder restrictions permit forwarding.
+2. The adapter copies the bidder-local EIDs into the bounded `ts-eids` cookie
+   before sending them in the `/auction` body.
+3. Trusted Server validates and consent-gates the browser entries, adds KV-only
+   sources, and forwards the result to Prebid Server as `user.ext.eids`.
+4. Response finalization conservatively stores the selected client UID on an
+   existing, consenting EC row for a partner configured with
+   `source_domain = "liveramp.com"`. A usable body takes precedence over the cookie.
+5. Later auctions use browser entries first, with KV fallback for absent sources.
 
 Trusted Server treats the RampID envelope as an opaque string. Do not log,
 decode, publish, or dimension metrics by the value. Source names, counts,
@@ -922,8 +939,8 @@ domain, booleans, source names, counts, and status codes:
    recording its value.
 5. Confirm a controlled Prebid Server request contains that source in
    `user.ext.eids`.
-6. Confirm a later request ingests the source into the configured
-   `liveramp.com` EC partner.
+6. Confirm the body submission persists the source into the existing
+   `liveramp.com` EC partner, then confirm a later auction resolves it from KV.
 7. Repeat with denied consent and confirm the envelope endpoint is not called,
    `idl_env` is not written, and no LiveRamp EID is forwarded.
 8. Repeat on an unapproved origin and confirm identity resolution degrades
@@ -936,17 +953,28 @@ not passed by this implementation.
 
 ## Identity Forwarding
 
-Trusted Server uses a **hybrid EID forwarding model** for Prebid-routed auctions:
+Trusted Server combines browser EIDs with the EC/KV identity graph:
 
-1. **Current-request EIDs from Prebid.js** are read from `pbjs.getUserIdsAsEids()` in the browser and sent in the `/auction` request body.
-2. **Server-side EIDs from the EC/KV identity graph** are resolved on the edge from the current EC ID.
-3. Trusted Server **merges and deduplicates** both sets before calling Prebid Server.
-4. The merged result is forwarded downstream as `user.ext.eids` in the OpenRTB request.
-5. After the response, Trusted Server adds matched partner UIDs that are missing from the EC identity graph, reading the `ts-eids` cookie, then the `/auction` request-body EIDs, then the `sharedId` cookie. Because the body carries the untrimmed EID set, `/auction` ingestion is not limited by the size-capped `ts-eids` cookie.
+1. **Browser EIDs** are the entries Prebid placed in the `trustedServer`
+   bidder request. The adapter sends them in the `/auction` body as plain data
+   and copies them, without EID-level `ext`, into the `ts-eids` cookie before
+   the request is sent.
+2. **Server-side EIDs** are resolved from the EC/KV identity graph for
+   partners with `bidstream_enabled = true`.
+3. Browser entries are forwarded first, exactly as sent. KV adds entries only
+   for registered sources the browser did not send.
+4. Consent gating applies to the merged set, which goes out as `user.ext.eids`
+   and is echoed in the `x-ts-eids` response header.
+5. During response finalization, `/auction` adds matched partner UIDs that KV
+   does not yet hold from its selected client set (the usable body, or the cookie
+   when the body has none), then from the `sharedId` cookie. Other routes read
+   the `ts-eids` cookie instead. Disabled auctions do not ingest browser EIDs.
 
-The `ts-eids` cookie still matters for requests without an EID body, such as `GET /_ts/page-bids` and page navigations, where it is the source for both EID fallback and identity-graph ingestion. Identity-graph EID writes follow the same consent rule as bidstream forwarding: under GDPR, TCF Purpose 1 and Purpose 4 must both be consented.
-
-This means Prebid auctions get same-request transparency for browser-resolved IDs without giving up the durability of the server-managed EC identity graph.
+The server validates every browser entry on its own, whether it came in the
+body or the cookie. A malformed entry or field is dropped and the rest of the
+request proceeds. Identity-graph writes follow the same consent rule as
+bidstream forwarding: under GDPR, TCF Purpose 1 and Purpose 4 must both be
+consented.
 
 ### Identity flow
 
@@ -957,38 +985,124 @@ sequenceDiagram
     participant K as EC + KV identity graph
     participant P as Prebid Server
 
-    B->>B: User ID modules resolve EIDs
-    B->>T: POST /auction\n(adUnits + current-request eids)
+    B->>B: Prebid builds the trustedServer bidder request (ortb2 EIDs)
+    B->>B: Copy its EIDs into ts-eids (no EID-level ext)
+    B->>T: POST /auction\n(adUnits + the bidder request's eids)
+    T->>T: Validate each entry
     T->>K: Resolve EC-backed source-domain IDs
     K-->>T: KV-derived EIDs
-    T->>T: Merge + dedupe client + KV EIDs
+    T->>T: Browser entries as sent, then KV-only sources
     T->>T: Apply consent gating
     T->>P: OpenRTB request\nuser.ext.eids = merged set
     P-->>T: OpenRTB bid response
-    T-->>B: Auction response
-    T->>K: Ingest body eids + ts-eids/sharedId cookies\n(TCF Purpose 1 + 4 under GDPR)
+    T->>K: Finalize selected client EIDs + sharedId cookie\n(TCF Purpose 1 + 4 under GDPR)
+    T-->>B: Auction response + x-ts-eids
 ```
 
-### Merge and deduplication rules
+### Merge rules
 
-- Client-request EIDs and KV-resolved EIDs are merged by `source`
-- UIDs are deduplicated by `source + id`
-- If the same UID appears in both places, it is sent only once downstream
-- Distinct UIDs under the same source are preserved
-- Consent gating is applied to the **merged** set before forwarding
+- Browser entries are forwarded in the order Prebid sent them and are never
+  altered or combined. A source can appear in more than one entry, for example
+  `adserver.org` from two modules with different `matcher` values.
+- KV adds one entry for each registered source no browser entry carries.
+  Sources are compared case-insensitively, ignoring a trailing dot.
+- For a source the browser sends, KV's stored UID and its configured
+  `openrtb_atype` are not used.
+- Known-expired KV IDs are omitted, including an identical body or cookie UID
+  for the same source. A different fresh browser UID remains request-local.
+- Consent gating is applied to the merged set before forwarding.
+
+### Persistence and lifecycle safeguards
+
+Registered client sources are staged before provider dispatch. No-bid and handled
+provider-error responses still finalize them against the auction's KV snapshot.
+Browser input fills absent sources only. It cannot replace stored IDs, forge
+writer, revision or lifecycle metadata, create a root, recover a missing root, or
+revive a withdrawal tombstone. Unknown sources remain current-request-only.
+
+This persistence requires EC KV support. Fastly supports it; adapters without an
+EC identity graph can forward permitted body EIDs but do not persist them.
+Publisher and SPA page-bid auctions read permitted cookie EIDs through the same
+expiry-aware merge. There is no page-exit beacon.
+
+### Browser cookie and diagnostics
+
+Before dispatch, the adapter writes a one-day, host-only `ts-eids` cookie with
+`Path=/; Secure; SameSite=Lax`. Its base64 payload is capped at 3,072 bytes,
+trimming UIDs and then sources from the tail deterministically. The auction body
+remains untrimmed. Empty or unavailable IDs clear stale cookie state. This
+unsigned cookie is browser input, not authenticated capture authority, and cannot
+strip stored or pending capture lifecycle metadata.
+
+Auction responses emit base64 `x-ts-eids` diagnostics capped at 4,096 bytes;
+`x-ts-eids-truncated: true` appears only when tail sources were removed. Both
+names remain stripped from inbound requests. `/_ts/admin/eids` remains an
+authenticated local cookie diagnostic with `Cache-Control: no-store` and
+`X-Content-Type-Options: nosniff`, never publisher fallback. Use `/_ts/admin/ec`
+to inspect persisted lifecycle state on adapters with EC KV support. EC and
+consent headers remain independent. Cookie and diagnostic retirement is deferred
+to a separate PR.
+
+Deploy metadata-preserving readers and writers everywhere and drain old invocations
+before activating body writer/revision metadata. Old binaries can erase metadata
+or ignore expiry; rolling back to them after activation is unsafe. A passing test
+on a new binary is not deployment-drain evidence.
 
 ### What reaches Prebid Server
 
 The downstream Prebid Server request includes:
 
 - `user.id` when EC forwarding is allowed
-- `user.ext.eids` containing the merged, deduplicated EID set
+- `user.ext.eids` with the browser entries and their `inserter`, `matcher`,
+  `mm` and `ext`, followed by KV-only sources
 - forwarded browser cookies (subject to consent-forwarding mode)
 
-In practice, this gives operators both:
+Before rolling this out, send one request with a repeated source and all four
+EID-level fields to each configured provider in staging and confirm it is
+accepted.
 
-- **same-request identity transparency** for Prebid User ID Module output, and
-- **future-request continuity** through cookie ingestion and KV-backed partner resolution.
+### TCF and the `trustedServer` adapter
+
+The `trustedServer` adapter has no GVL ID. Where GDPR applies and Prebid's TCF
+enforcement is active (the publisher configures `consentManagement.gdpr`, or
+Trusted Server enables it for managed User IDs), Prebid's default rules remove
+`trustedServer` from the auction and withhold its EIDs. Trusted Server then
+receives no browser EIDs from the adapter, and the adapter clears `ts-eids`
+when Prebid reports the block.
+
+Granting `trustedServer` an exception is the publisher's decision. Use only
+the full rule:
+
+```js
+pbjs.setConfig({
+  consentManagement: {
+    gdpr: {
+      // ...the publisher's existing CMP settings...
+      rules: [
+        {
+          purpose: 'basicAds',
+          enforcePurpose: true,
+          enforceVendor: true,
+          softVendorExceptions: ['trustedServer'],
+        },
+      ],
+    },
+  },
+})
+```
+
+::: warning
+A publisher rule replaces Prebid's default rule for that purpose. A rule
+written as `{ purpose: 'basicAds', softVendorExceptions: ['trustedServer'] }`,
+without `enforcePurpose: true` and `enforceVendor: true`, switches off both
+checks for **every** bidder. Do not use `vendorExceptions`, which also skips
+the purpose check.
+:::
+
+With the full rule, `trustedServer` still needs Purpose 2 consent and skips
+only the vendor check. A publisher that sets `eidsRequireP4Consent` must also
+add the same full rule for `personalizedAds`; without it `trustedServer` gets
+bid requests with no EIDs and `ts-eids` is cleared after every auction.
 
 ## Endpoints
 
@@ -1053,7 +1167,7 @@ The shared OpenRTB driver builds Prebid Server requests:
 - Sets `tagid` from the slot ID
 - Adds site metadata with publisher domain, a validated publisher-owned page URL with query and fragment removed, `site.publisher` from the domain, and the browser `Referer` as `site.ref`. Removing query and fragment data from `site.page` can reduce contextual targeting or per-page reporting for sites whose page identity depends on query parameters
 - Injects EC ID in the user object
-- Merges current-request browser EIDs with KV-resolved EIDs and forwards the deduplicated result as `user.ext.eids`
+- Forwards the browser EIDs as sent, followed by KV-resolved EIDs for registered sources the browser did not send, as `user.ext.eids`
 - Forwards user consent string and sets the GDPR flag based on geo and consent presence
 - Translates the `Sec-GPC` header to a US Privacy string (`us_privacy`)
 - Extracts `DNT` and `Accept-Language` headers into device fields

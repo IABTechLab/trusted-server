@@ -1,0 +1,61 @@
+[[handlers]]
+path = "^/_ts/admin"
+username = "admin"
+password = "integration_admin_password"
+
+[publisher]
+domain = "localhost"
+cookie_domain = "localhost"
+origin_url = "http://127.0.0.1:8888"
+proxy_secret = "integration_proxy_secret"
+
+[ec]
+passphrase = "integration_ec_passphrase"
+ec_store = "ec_identity_store"
+
+[[ec.partners]]
+name = "Example partner"
+source_domain = "partner.example.com"
+bidstream_enabled = true
+api_token = "integration_partner_token_alpha"
+
+[request_signing]
+enabled = false
+config_store_id = "app_config"
+secret_store_id = "secrets"
+
+[integrations.gpt_diagnostics]
+enabled = true
+trace_page_enabled = true
+
+[integrations.gpt]
+enabled = true
+gam_attribution_enabled = false
+script_url = "https://ads.example.com/gpt.js"
+rewrite_script = false
+
+[proxy]
+certificate_check = false
+
+[auction]
+enabled = true
+timeout_ms = 1000
+rewrite_creatives = false
+
+[auction.providers.example]
+protocol = "openrtb-2.6"
+profile = "standard"
+endpoint = "https://bidder.example.com/api/trace-bidder"
+routing = "all_eligible"
+
+[creative_opportunities]
+enabled = true
+gam_network_id = "123456789"
+auction_timeout_ms = 1000
+
+[[creative_opportunities.slot]]
+id = "example-primary"
+div_id = "gpt-diagnostics-slot-primary"
+gam_unit_path = "/123456789/example-primary"
+page_patterns = ["/gpt-diagnostics"]
+formats = [{ width = 300, height = 250 }]

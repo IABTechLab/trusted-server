@@ -1,4 +1,5 @@
 import { createScriptGuard } from '../../shared/script_guard';
+import { parseSdkNetworkUrl } from '../../shared/sdk_url';
 
 /**
  * Lockr SDK Script Interception Guard
@@ -17,28 +18,18 @@ import { createScriptGuard } from '../../shared/script_guard';
 
 /**
  * Check if a URL is a Lockr SDK URL.
- * Matches the logic from lockr.rs:79-86
+ * Browser/Rust ownership cases live in test/fixtures/sdk-url-ownership.json.
  */
 function isLockrSdkUrl(url: string): boolean {
-  if (!url) return false;
+  const parsed = parseSdkNetworkUrl(url);
+  if (!parsed) return false;
 
-  const lower = url.toLowerCase();
-
-  // Check for aim.loc.kr domain
-  if (lower.includes('aim.loc.kr')) {
-    return true;
-  }
-
-  // Check for identity.loc.kr with identity-lockr and .js extension
-  if (
-    lower.includes('identity.loc.kr') &&
-    lower.includes('identity-lockr') &&
-    lower.endsWith('.js')
-  ) {
-    return true;
-  }
-
-  return false;
+  const path = parsed.pathname.toLowerCase();
+  return (
+    (parsed.hostname === 'aim.loc.kr' || parsed.hostname === 'identity.loc.kr') &&
+    path.includes('identity-lockr') &&
+    path.endsWith('.js')
+  );
 }
 
 const guard = createScriptGuard({

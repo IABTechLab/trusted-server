@@ -1,13 +1,17 @@
 import type {
   GptDiagnosticsApi,
+  GptDiagnosticsAuctionFacts,
+  GptDiagnosticsAuctionWinner,
   GptDiagnosticsCreativeFailure,
   GptDiagnosticsExportV1,
   GptDiagnosticsRecorder,
   GptDiagnosticsSlotHandle,
   GptDiagnosticsTrustedServerOpportunity,
 } from '../../core/types';
+import type { TraceGptIdentity } from '../../trace/types';
 
 import type { GptDiagnosticsBindingManager } from './binding';
+import { clonePrebidAuctionEvidence } from './evidence';
 import type { GptDiagnosticsStoreSnapshot } from './store';
 
 interface ApiStore {
@@ -18,9 +22,21 @@ interface ApiStore {
     auctionSlotId: string,
     opportunity: GptDiagnosticsTrustedServerOpportunity,
     trustedServerAuctionId?: string,
-    requestedSlotSizes?: ReadonlyArray<readonly [number, number]>
+    requestedSlotSizes?: ReadonlyArray<readonly [number, number]>,
+    auctionFacts?: GptDiagnosticsAuctionFacts,
+    traceIdentity?: TraceGptIdentity
   ): void;
   recordPrebidRefresh(slots: GptDiagnosticsSlotHandle[]): void;
+  recordPrebidAuction(
+    slot: GptDiagnosticsSlotHandle,
+    auctionId: string,
+    targetingCandidate?: GptDiagnosticsAuctionWinner
+  ): void;
+  recordPrebidWin(
+    slot: GptDiagnosticsSlotHandle,
+    auctionId: string,
+    winner: GptDiagnosticsAuctionWinner
+  ): void;
   recordTrustedServerCreativeRequest(auctionSlotId: string): number | undefined;
   recordTrustedServerCreativeResponse(attemptId: number): void;
   recordTrustedServerCreativeFailure(
@@ -67,6 +83,13 @@ function cloneExportSnapshot(snapshot: GptDiagnosticsExportV1): GptDiagnosticsEx
         requestedSlotSizes: cycle.requestedSlotSizes?.map((size) => [...size]),
         size: cycle.size ? [...cycle.size] : undefined,
         observedSlotSize: cycle.observedSlotSize ? [...cycle.observedSlotSize] : undefined,
+        ...(cycle.auctionWinner ? { auctionWinner: { ...cycle.auctionWinner } } : {}),
+        ...(cycle.prebidAuction
+          ? { prebidAuction: clonePrebidAuctionEvidence(cycle.prebidAuction) }
+          : {}),
+        ...(cycle.serverAuctionTimings
+          ? { serverAuctionTimings: { ...cycle.serverAuctionTimings } }
+          : {}),
         adManager: cycle.adManager
           ? {
               ...cycle.adManager,
@@ -157,7 +180,9 @@ export class GptDiagnosticsApiController {
         auctionSlotId,
         opportunity,
         trustedServerAuctionId,
-        requestedSlotSizes
+        requestedSlotSizes,
+        auctionFacts,
+        traceIdentity
       ) =>
         safelyRecord(() => {
           this.store.recordTrustedServerOpportunity(
@@ -165,10 +190,16 @@ export class GptDiagnosticsApiController {
             auctionSlotId,
             opportunity,
             trustedServerAuctionId,
-            requestedSlotSizes
+            requestedSlotSizes,
+            auctionFacts,
+            ...(traceIdentity ? ([traceIdentity] as const) : [])
           );
         }),
       recordPrebidRefresh: (slots) => safelyRecord(() => this.store.recordPrebidRefresh(slots)),
+      recordPrebidAuction: (slot, auctionId, targetingCandidate) =>
+        safelyRecord(() => this.store.recordPrebidAuction(slot, auctionId, targetingCandidate)),
+      recordPrebidWin: (slot, auctionId, winner) =>
+        safelyRecord(() => this.store.recordPrebidWin(slot, auctionId, winner)),
       recordTrustedServerCreativeRequest: (auctionSlotId) =>
         safelyCreateAttempt(() => this.store.recordTrustedServerCreativeRequest(auctionSlotId)),
       recordTrustedServerCreativeResponse: (attemptId) =>
@@ -200,6 +231,13 @@ export class GptDiagnosticsApiController {
           requestedSlotSizes: cycle.requestedSlotSizes?.map((size) => [...size]),
           size: cycle.size ? [...cycle.size] : undefined,
           observedSlotSize: cycle.observedSlotSize ? [...cycle.observedSlotSize] : undefined,
+          ...(cycle.auctionWinner ? { auctionWinner: { ...cycle.auctionWinner } } : {}),
+          ...(cycle.prebidAuction
+            ? { prebidAuction: clonePrebidAuctionEvidence(cycle.prebidAuction) }
+            : {}),
+          ...(cycle.serverAuctionTimings
+            ? { serverAuctionTimings: { ...cycle.serverAuctionTimings } }
+            : {}),
           adManager: cycle.adManager
             ? {
                 ...cycle.adManager,

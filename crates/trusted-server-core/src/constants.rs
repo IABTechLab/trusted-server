@@ -1,18 +1,21 @@
 use http::header::HeaderName;
 
 pub const COOKIE_TS_EC: &str = "ts-ec";
+/// Authenticated, short-lived handoff for server-captured identity observations.
+pub const COOKIE_TS_EIDS_SERVER: &str = "ts-eids-s";
 /// Short-lived signed proof that the current EC row has every pull-partner UID.
 pub const COOKIE_TS_EC_PULL_COMPLETE: &str = "ts-ec-pull-complete";
-/// Cookie written by the Trusted Server JS SDK containing a standard-base64-encoded
-/// JSON array of Extended User IDs (`[{ source, uids }]`) from identity providers.
+/// Browser-written EID cookie used for auction fallback and EC ingestion.
 pub const COOKIE_TS_EIDS: &str = "ts-eids";
 pub const COOKIE_TS_TESTER: &str = "ts-tester";
 pub const COOKIE_SHAREDID: &str = "sharedId";
 
 pub const HEADER_X_PUB_USER_ID: HeaderName = HeaderName::from_static("x-pub-user-id");
 pub const HEADER_X_TS_EC: HeaderName = HeaderName::from_static("x-ts-ec");
+/// Diagnostic header carrying consent-gated EIDs; keep inbound stripping and withdrawal clearing.
 pub const HEADER_X_TS_EIDS: HeaderName = HeaderName::from_static("x-ts-eids");
 pub const HEADER_X_TS_EC_CONSENT: HeaderName = HeaderName::from_static("x-ts-ec-consent");
+/// Diagnostic header indicating that `x-ts-eids` was truncated.
 pub const HEADER_X_TS_EIDS_TRUNCATED: HeaderName = HeaderName::from_static("x-ts-eids-truncated");
 pub const HEADER_X_TS_ERROR: HeaderName = HeaderName::from_static("x-ts-error");
 pub const HEADER_X_TS_JS_ASSET_PROXY: HeaderName = HeaderName::from_static("x-ts-js-asset-proxy");
@@ -48,6 +51,8 @@ pub const TS_GIT_VERSION: Option<&str> = match option_env!("TRUSTED_SERVER__GIT_
 // Fastly environment variables
 pub const ENV_FASTLY_SERVICE_VERSION: &str = "FASTLY_SERVICE_VERSION";
 pub const ENV_FASTLY_IS_STAGING: &str = "FASTLY_IS_STAGING";
+pub const ENV_FASTLY_SERVICE_ID: &str = "FASTLY_SERVICE_ID";
+pub const ENV_FASTLY_POP: &str = "FASTLY_POP";
 
 // Common standard header names used across modules
 pub const HEADER_USER_AGENT: HeaderName = HeaderName::from_static("user-agent");

@@ -1,11 +1,11 @@
 //! HTTP endpoint handlers for auction requests.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt};
 use http::{Request, Response, StatusCode, header};
-use serde_json::Value as JsonValue;
+use serde_json::value::RawValue;
 
 use crate::auction::formats::AdRequest;
 use crate::auction::orchestrator::OrchestrationResult;
@@ -14,30 +14,29 @@ use crate::constants::COOKIE_TS_EIDS;
 use crate::cookies::extract_cookie_value;
 use crate::ec::EcContext;
 use crate::ec::EcKvSnapshot;
+use crate::ec::client_eids::parse_client_eids;
 use crate::ec::eids::{resolve_partner_ids, to_eids};
 use crate::ec::kv::KvIdentityGraph;
-use crate::ec::kv_types::MAX_UID_LENGTH;
-use crate::ec::prebid_eids::parse_prebid_eids_cookie;
+use crate::ec::partner::normalize_partner_source_domain;
+use crate::ec::prebid_eids::{collect_prebid_eid_updates_from_eids, parse_prebid_eids_cookie};
 use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
-use crate::openrtb::{Eid, Uid};
+use crate::openrtb::Eid;
 use crate::platform::RuntimeServices;
+use crate::request_timing::RequestTimings;
 use crate::settings::Settings;
+use crate::trace::{
+    TraceAuctionCarry, TraceAuctionSource, TraceAuctionTerminalReason, TraceAuctionTerminalStatus,
+    TraceCaptureGate, TraceClientSlotRefs,
+};
 
 use super::AuctionOrchestrator;
-use super::formats::{
-    convert_to_openrtb_response, convert_to_openrtb_response_with_report,
-    convert_tsjs_to_auction_request,
-};
+use super::formats::{convert_to_openrtb_response_with_trace, convert_tsjs_to_auction_request};
 use super::telemetry::{
     AuctionObservationContext, AuctionSource, AuctionTerminalOutcome, build_auction_events,
     emit_auction_events_best_effort_lazy,
 };
-use super::types::AuctionContext;
-
-const MAX_CLIENT_EID_SOURCES: usize = 64;
-const MAX_CLIENT_UIDS_PER_SOURCE: usize = 32;
-const MAX_CLIENT_EID_SOURCE_BYTES: usize = 255;
+use super::types::{AuctionContext, AuctionRequest};
 
 /// Maximum accepted JSON body size for `/auction`. Picked to comfortably fit
 /// the largest realistic Prebid-derived auction request (hundreds of ad units
@@ -84,10 +83,14 @@ const MAX_AUCTION_BODY_SIZE: usize = 256 * 1024;
 /// ## Response
 ///
 /// Returns an `OpenRTB 2.x` response. Creative HTML is inlined in each bid's
-/// `adm` field after mandatory server-side sanitization. First-party resource
-/// and click URL rewriting plus creative TSJS injection are enabled by default;
-/// setting [`auction.rewrite_creatives`][`crate::auction_config_types::AuctionConfig::rewrite_creatives`]
-/// to `false` skips only that rewrite pass.
+/// `adm` field after optional sanitization
+/// ([`auction.sanitize_creatives`][`crate::auction_config_types::AuctionConfig::sanitize_creatives`]).
+/// First-party asset rewriting
+/// ([`auction.rewrite_creatives`][`crate::auction_config_types::AuctionConfig::rewrite_creatives`])
+/// and click wrapping
+/// ([`auction.rewrite_clicks`][`crate::auction_config_types::AuctionConfig::rewrite_clicks`])
+/// are enabled by default. When either is on, a bidder `<base>` loses its
+/// `href` (a `target` is kept) and creative TSJS is injected.
 ///
 /// ## Scroll, refresh, and SPA navigation
 ///
@@ -145,6 +148,16 @@ pub async fn handle_auction(
     }
 
     let (parts, body) = req.into_parts();
+    // T0-anchored timeline (spec section 18). This route is the auction, so
+    // dispatch and resolve bracket `run_auction` rather than the origin
+    // fetch, and the commit mark lands once the OpenRTB response carrying the
+    // targeting has been built. A defaulted handle records into nothing that
+    // is ever read, so direct-handler tests are unaffected.
+    let timings = parts
+        .extensions
+        .get::<RequestTimings>()
+        .cloned()
+        .unwrap_or_default();
     let body_bytes = body.into_bytes().unwrap_or_default();
     if body_bytes.len() > MAX_AUCTION_BODY_SIZE {
         return Response::builder()
@@ -167,7 +180,16 @@ pub async fn handle_auction(
         body.ad_units.len()
     );
 
-    let http_req = Request::from_parts(parts, EdgeBody::empty());
+    let mut http_req = Request::from_parts(parts, EdgeBody::empty());
+    if http_req
+        .extensions()
+        .get::<TraceCaptureGate>()
+        .is_some_and(TraceCaptureGate::base_active)
+    {
+        http_req
+            .extensions_mut()
+            .insert(TraceClientSlotRefs::from_raw(&body_bytes));
+    }
 
     // Story 5 middleware contract: auction is a read-only EC route.
     // It must not generate EC IDs; it only consumes pre-routed context.
@@ -192,6 +214,13 @@ pub async fn handle_auction(
             ec_id.as_deref(),
             None,
         )?;
+        let trace = capture_api_trace(&mut http_req, &auction_request);
+        if let Some(trace) = &trace {
+            trace.finish(
+                TraceAuctionTerminalStatus::Skipped,
+                Some(TraceAuctionTerminalReason::PolicySkipped),
+            );
+        }
         let observation = AuctionObservationContext::from_auction_request(
             AuctionSource::AuctionApi,
             &auction_request,
@@ -216,12 +245,14 @@ pub async fn handle_auction(
             total_time_ms: 0,
             metadata: HashMap::new(),
         };
-        return convert_to_openrtb_response(
+        return convert_to_openrtb_response_with_trace(
             &empty_result,
             settings,
             &auction_request,
             ec_context.ec_allowed(),
-        );
+            trace.as_ref(),
+        )
+        .map(|conversion| retain_private_trace(conversion.response, trace));
     }
 
     // Server-side auction consent gate. The publisher-navigation and
@@ -246,6 +277,13 @@ pub async fn handle_auction(
             ec_id.as_deref(),
             None,
         )?;
+        let trace = capture_api_trace(&mut http_req, &auction_request);
+        if let Some(trace) = &trace {
+            trace.finish(
+                TraceAuctionTerminalStatus::Skipped,
+                Some(TraceAuctionTerminalReason::PolicySkipped),
+            );
+        }
         let observation = AuctionObservationContext::from_auction_request(
             AuctionSource::AuctionApi,
             &auction_request,
@@ -269,40 +307,31 @@ pub async fn handle_auction(
             total_time_ms: 0,
             metadata: HashMap::new(),
         };
-        return convert_to_openrtb_response(
+        return convert_to_openrtb_response_with_trace(
             &empty_result,
             settings,
             &auction_request,
             ec_context.ec_allowed(),
-        );
+            trace.as_ref(),
+        )
+        .map(|conversion| retain_private_trace(conversion.response, trace));
     }
 
-    // Parse client-provided EIDs from the current request body. When the
-    // current request does not include them, fall back to the persisted
-    // `ts-eids` cookie so later requests can still forward the browser's
-    // full OpenRTB-style EID structure.
-    //
-    // Gate this on the same identity-consent condition as the EC ID
-    // (`ec_id.is_some()`, which is already filtered by `ec_context.ec_allowed()`).
-    // Otherwise a US/GPC or US-Privacy opt-out context — where EC identity use is
-    // denied but a non-personalized auction may still run — could forward
-    // persistent client EIDs from the body/cookie, since `gate_eids_by_consent`
-    // only strips on TCF/GDPR signals. This matches the publisher and
-    // `/_ts/page-bids` paths, which also resolve client EIDs only when
-    // `ec_id.is_some()`.
+    // Keep normalized body updates on the adapter-owned context, not the
+    // response, so handled provider errors cannot lose persistence work.
     let client_eids = if ec_id.is_some() {
         resolve_client_auction_eids(
-            body.eids.as_ref(),
+            body.eids.as_deref(),
             extract_cookie_value(&http_req, COOKIE_TS_EIDS).as_deref(),
         )
     } else {
         None
     };
-    // Carry the full request-local EID set to response finalization so KV
-    // ingestion uses what this request actually sent, not just whatever fits
-    // in the size-capped `ts-eids` cookie (see `ec::finalize::ec_finalize_response`).
-    if let Some(eids) = &client_eids {
-        ec_context.set_client_eids(eids.clone());
+    if let Some(registry) = registry
+        && let Some(eids) = &client_eids
+    {
+        ec_context.stage_browser_eid_updates(collect_prebid_eid_updates_from_eids(eids, registry));
+        ec_context.set_eid_sync_source(crate::ec::EidSyncSource::Auction);
     }
 
     // Resolve partner EIDs from the KV identity graph when the user has a valid
@@ -315,12 +344,11 @@ pub async fn handle_auction(
     };
     // Hand the loaded row to the request context so response finalization —
     // which runs on an EC context the adapter owns, after this handler returns
-    // — ingests `ts-eids`/`sharedId` updates from this read instead of paying
+    // — ingests cookie/body/sharedId updates from this read instead of paying
     // for a second lookup.
     if !matches!(auction_kv_snapshot, EcKvSnapshot::NotRead) {
         ec_context.set_kv_snapshot(auction_kv_snapshot.clone());
     }
-    let eids = resolve_auction_eids(&auction_kv_snapshot, registry, ec_context);
 
     // Look up geo for device info.
     let geo = services
@@ -344,13 +372,17 @@ pub async fn handle_auction(
 
     // Merge current-request client EIDs with KV-resolved EIDs, then apply
     // consent gating before attaching them to the auction request.
-    let merged_eids = merge_auction_eids(client_eids, eids);
+    let merged_eids =
+        resolve_and_merge_auction_eids(client_eids, &auction_kv_snapshot, registry, ec_context);
     let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
     auction_request.user.eids =
         gate_eids_by_consent(merged_eids, auction_request.user.consent.as_ref());
     if had_eids && auction_request.user.eids.is_none() {
         log::warn!("Auction EIDs stripped by TCF consent gating");
     }
+
+    let trace = capture_api_trace(&mut http_req, &auction_request);
+    let _trace_cancellation = trace.as_ref().map(TraceAuctionCarry::cancellation_guard);
 
     // Create auction context
     let context = AuctionContext {
@@ -368,10 +400,17 @@ pub async fn handle_auction(
         ec_context,
     );
 
+    timings.set_auction_id(observation.auction_id);
+
     // Run the auction
+    timings.mark_auction_dispatched();
     let result = match orchestrator.run_auction(&auction_request, &context).await {
-        Ok(result) => result,
+        Ok(result) => {
+            timings.mark_auction_resolved();
+            result
+        }
         Err(err) => {
+            timings.mark_auction_resolved();
             let elapsed_ms = observation.elapsed_ms();
             emit_auction_events_best_effort_lazy(services, || {
                 build_auction_events(
@@ -391,11 +430,12 @@ pub async fn handle_auction(
         }
     };
 
-    let conversion = match convert_to_openrtb_response_with_report(
+    let conversion = match convert_to_openrtb_response_with_trace(
         &result,
         settings,
         &auction_request,
         ec_context.ec_allowed(),
+        trace.as_ref(),
     ) {
         Ok(conversion) => conversion,
         Err(error) => {
@@ -415,6 +455,10 @@ pub async fn handle_auction(
             return Err(error);
         }
     };
+
+    // Targeting is available to the caller: for this route the response body
+    // is the commit, since there is no page state to write into.
+    timings.mark_auction_committed();
 
     emit_auction_events_best_effort_lazy(services, || {
         build_auction_events(
@@ -436,7 +480,41 @@ pub async fn handle_auction(
         result.total_time_ms
     );
 
-    Ok(conversion.response)
+    Ok(retain_private_trace(conversion.response, trace))
+}
+
+fn capture_api_trace(
+    request: &mut Request<EdgeBody>,
+    auction: &AuctionRequest,
+) -> Option<TraceAuctionCarry> {
+    let active = request
+        .extensions()
+        .get::<TraceCaptureGate>()
+        .is_some_and(TraceCaptureGate::base_active);
+    let carry = TraceAuctionCarry::capture_if_enabled(
+        active,
+        TraceAuctionSource::AuctionApi,
+        &auction.slots,
+    )?;
+    if let Some(refs) = request
+        .extensions()
+        .get::<TraceClientSlotRefs>()
+        .and_then(TraceClientSlotRefs::accepted_refs)
+    {
+        carry.bind_client_refs(&refs);
+    }
+    request.extensions_mut().insert(carry.clone());
+    Some(carry)
+}
+
+fn retain_private_trace(
+    mut response: Response<EdgeBody>,
+    trace: Option<TraceAuctionCarry>,
+) -> Response<EdgeBody> {
+    if let Some(trace) = trace {
+        response.extensions_mut().insert(trace);
+    }
+    response
 }
 
 /// Resolves partner EIDs from the KV identity graph for bidstream decoration.
@@ -448,6 +526,7 @@ pub(crate) fn resolve_auction_eids(
     snapshot: &EcKvSnapshot,
     registry: Option<&PartnerRegistry>,
     ec_context: &EcContext,
+    now: Option<u64>,
 ) -> Option<Vec<Eid>> {
     let registry = registry?;
 
@@ -465,15 +544,52 @@ pub(crate) fn resolve_auction_eids(
         return Some(Vec::new());
     }
 
-    let resolved = resolve_partner_ids(registry, entry);
-    Some(to_eids(&resolved))
+    let resolved = resolve_partner_ids(registry, entry, now);
+    let mut eids = to_eids(&resolved);
+    eids.extend(crate::ec::identity_handoff::resolve_eids(
+        ec_context, snapshot, registry, now,
+    ));
+    Some(eids)
 }
 
+/// Merges browser and KV EIDs without letting browser input revive an unusable UID.
+///
+/// Uses one checked time for both filters and only the active full EC ID's row.
+/// A different browser UID remains usable for this request, not a KV replacement.
+pub(crate) fn resolve_and_merge_auction_eids(
+    mut client_eids: Option<Vec<Eid>>,
+    snapshot: &EcKvSnapshot,
+    registry: Option<&PartnerRegistry>,
+    ec_context: &EcContext,
+) -> Option<Vec<Eid>> {
+    if !ec_context.ec_allowed() {
+        return None;
+    }
+    let ec_id = ec_context.ec_value()?;
+    let now = crate::ec::checked_current_timestamp();
+    if let (Some(eids), Some(entry)) = (&mut client_eids, snapshot.entry_for(ec_id)) {
+        for eid in eids.iter_mut() {
+            if let Ok(source) = normalize_partner_source_domain(eid.source.trim())
+                && let Some(record) = entry.ids.get(&source)
+                && !record.is_usable(now)
+            {
+                eid.uids.retain(|uid| uid.id != record.uid);
+            }
+        }
+        eids.retain(|eid| !eid.uids.is_empty());
+    }
+    let resolved = resolve_auction_eids(snapshot, registry, ec_context, now);
+    merge_auction_eids(client_eids, resolved)
+}
+
+/// Prefers the current body EID set, falling back to the browser-written cookie.
 pub(crate) fn resolve_client_auction_eids(
-    raw: Option<&JsonValue>,
+    raw: Option<&RawValue>,
     cookie_value: Option<&str>,
 ) -> Option<Vec<Eid>> {
-    parse_client_auction_eids(raw).or_else(|| parse_cookie_auction_eids(cookie_value))
+    raw.map(parse_client_eids)
+        .filter(|eids| !eids.is_empty())
+        .or_else(|| parse_cookie_auction_eids(cookie_value))
 }
 
 fn parse_cookie_auction_eids(cookie_value: Option<&str>) -> Option<Vec<Eid>> {
@@ -488,131 +604,40 @@ fn parse_cookie_auction_eids(cookie_value: Option<&str>) -> Option<Vec<Eid>> {
     }
 }
 
-fn parse_client_auction_eids(raw: Option<&JsonValue>) -> Option<Vec<Eid>> {
-    let Some(JsonValue::Array(entries)) = raw else {
-        return None;
-    };
-
-    let mut eids = Vec::new();
-
-    for entry in entries {
-        if eids.len() >= MAX_CLIENT_EID_SOURCES {
-            log::debug!(
-                "Auction EIDs: reached max client EID source count ({MAX_CLIENT_EID_SOURCES})"
-            );
-            break;
-        }
-        let JsonValue::Object(entry) = entry else {
-            log::debug!("Auction EIDs: dropping malformed client EID entry");
-            continue;
-        };
-
-        let Some(source) = entry
-            .get("source")
-            .and_then(JsonValue::as_str)
-            .filter(|source| !source.trim().is_empty())
-            .filter(|source| source.len() <= MAX_CLIENT_EID_SOURCE_BYTES)
-            .map(str::to_owned)
-        else {
-            continue;
-        };
-
-        let Some(JsonValue::Array(raw_uids)) = entry.get("uids") else {
-            continue;
-        };
-
-        let uids: Vec<_> = raw_uids
-            .iter()
-            .filter_map(parse_client_auction_uid)
-            .take(MAX_CLIENT_UIDS_PER_SOURCE)
-            .collect();
-        if uids.is_empty() {
-            continue;
-        }
-
-        eids.push(Eid { source, uids });
-    }
-
-    if eids.is_empty() { None } else { Some(eids) }
-}
-
-fn parse_client_auction_uid(raw: &JsonValue) -> Option<Uid> {
-    let JsonValue::Object(uid) = raw else {
-        return None;
-    };
-
-    let id = uid
-        .get("id")
-        .and_then(JsonValue::as_str)
-        .filter(|id| !id.trim().is_empty())
-        .filter(|id| id.len() <= MAX_UID_LENGTH)?
-        .to_owned();
-
-    let atype = uid
-        .get("atype")
-        .and_then(JsonValue::as_u64)
-        .and_then(|atype| i32::try_from(atype).ok());
-
-    let ext = match uid.get("ext") {
-        Some(JsonValue::Object(_)) => uid.get("ext").cloned(),
-        _ => None,
-    };
-
-    Some(Uid { id, atype, ext })
-}
-
+/// Merges the request's browser EIDs with KV-resolved partner EIDs.
+///
+/// Browser entries are forwarded as parsed, in wire order, never altered or
+/// combined: they are what Prebid sent the `trustedServer` adapter, and a
+/// source may repeat with different EID-level fields. KV entries are appended
+/// after them, only for registered sources no browser entry carries. Sources
+/// are compared as the partner registry normalizes them (lowercase, trailing
+/// dot removed). For a source the browser sends, KV's UIDs, `atype` and `ext`
+/// are not used: KV keeps the first value it stored, so it is the staler copy.
+/// Entries without UIDs are dropped.
 pub(crate) fn merge_auction_eids(
     client_eids: Option<Vec<Eid>>,
     resolved_eids: Option<Vec<Eid>>,
 ) -> Option<Vec<Eid>> {
-    let mut merged = Vec::new();
-
-    for eid in resolved_eids
+    let mut merged: Vec<Eid> = client_eids
         .into_iter()
         .flatten()
-        .chain(client_eids.into_iter().flatten())
-    {
-        if eid.source.is_empty() {
+        .filter(|eid| !eid.uids.is_empty())
+        .collect();
+    let browser_sources: HashSet<String> = merged
+        .iter()
+        .filter_map(|eid| normalize_partner_source_domain(&eid.source).ok())
+        .collect();
+
+    for eid in resolved_eids.into_iter().flatten() {
+        if eid.uids.is_empty() {
             continue;
         }
-
-        let source_index = match merged
-            .iter()
-            .position(|existing: &Eid| existing.source == eid.source)
-        {
-            Some(index) => index,
-            None => {
-                merged.push(Eid {
-                    source: eid.source.clone(),
-                    uids: Vec::new(),
-                });
-                merged.len() - 1
-            }
-        };
-
-        for uid in eid.uids {
-            if uid.id.trim().is_empty() || uid.id.len() > MAX_UID_LENGTH {
-                continue;
-            }
-
-            if let Some(existing_uid) = merged[source_index]
-                .uids
-                .iter_mut()
-                .find(|existing| existing.id == uid.id)
-            {
-                if existing_uid.atype.is_none() {
-                    existing_uid.atype = uid.atype;
-                }
-                if existing_uid.ext.is_none() {
-                    existing_uid.ext = uid.ext;
-                }
-            } else {
-                merged[source_index].uids.push(uid);
-            }
+        let carried_by_browser = normalize_partner_source_domain(&eid.source)
+            .is_ok_and(|source| browser_sources.contains(&source));
+        if !carried_by_browser {
+            merged.push(eid);
         }
     }
-
-    merged.retain(|eid| !eid.uids.is_empty());
 
     if merged.is_empty() {
         None
@@ -630,17 +655,24 @@ mod tests {
     use crate::auction::types::{AuctionRequest, AuctionResponse};
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::ConsentContext;
+    use crate::ec::kv_backend::test_support::InMemoryEcKv;
+    use crate::ec::kv_backend::{
+        EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome,
+    };
     use crate::error::IntoHttpResponse as _;
+    use crate::integrations::adserver_mock::{AdServerMockConfig, AdServerMockProvider};
     use crate::openrtb::Uid;
     use crate::platform::test_support::{
-        NoopBackend, NoopConfigStore, NoopGeo, NoopHttpClient, NoopSecretStore, StubHttpClient,
-        noop_services,
+        NoopBackend, NoopConfigStore, NoopGeo, NoopHttpClient, NoopSecretStore, StubBackend,
+        StubHttpClient, noop_services,
     };
     use crate::platform::{ClientInfo, PlatformHttpClient, PlatformHttpRequest, PlatformResponse};
     use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
+    use crate::trace::TracePreDispatchHook;
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64;
-    use serde_json::json;
+    use edgezero_core::router::PreDispatchHook as _;
+    use serde_json::{Value as JsonValue, json};
     use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
@@ -661,6 +693,12 @@ mod tests {
                 .push(batch);
             Ok(())
         }
+    }
+
+    fn parse_client_auction_eids(raw: Option<&JsonValue>) -> Option<Vec<Eid>> {
+        let raw = RawValue::from_string(raw?.to_string()).expect("should encode EID fixture");
+        let eids = parse_client_eids(&raw);
+        (!eids.is_empty()).then_some(eids)
     }
 
     fn services_with_telemetry(sink: Arc<RecordingTelemetrySink>) -> RuntimeServices {
@@ -689,6 +727,7 @@ mod tests {
 
     fn counting_test_partner(source_domain: &str) -> crate::settings::EcPartner {
         crate::settings::EcPartner {
+            identity_owner: None,
             name: format!("Partner {source_domain}"),
             source_domain: source_domain.to_owned(),
             openrtb_atype: crate::settings::EcPartner::default_openrtb_atype(),
@@ -706,13 +745,51 @@ mod tests {
         }
     }
 
+    struct BrowserRecordingKv {
+        inner: InMemoryEcKv,
+        lookups: Arc<std::sync::atomic::AtomicUsize>,
+        writes: Arc<Mutex<Vec<EcKvWriteMode>>>,
+    }
+
+    impl EcKvStore for BrowserRecordingKv {
+        fn store_name(&self) -> &str {
+            self.inner.store_name()
+        }
+        fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+            self.lookups
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.lookup(key)
+        }
+        fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+            self.inner.key_exists(key)
+        }
+        fn insert(
+            &self,
+            key: &str,
+            write: EcKvWrite<'_>,
+        ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
+            self.writes
+                .lock()
+                .expect("should lock write modes")
+                .push(write.mode);
+            self.inner.insert(key, write)
+        }
+        fn list_keys_with_prefix(
+            &self,
+            prefix: &str,
+            limit: u32,
+        ) -> Result<Vec<String>, Report<TrustedServerError>> {
+            self.inner.list_keys_with_prefix(prefix, limit)
+        }
+        fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+            self.inner.delete(key)
+        }
+    }
+
     #[tokio::test]
     async fn auction_endpoint_snapshot_is_reused_by_response_finalization() {
-        // `/auction` loads the identity-graph row to resolve server-side EIDs.
-        // Finalization runs afterwards on the same EC context and ingests
-        // `ts-eids`/`sharedId` updates. Both must be served by a single billable
-        // read: before the snapshot was shared, finalization saw `NotRead` and
-        // paid for a second lookup.
+        // Body updates survive the provider error on the adapter-owned context.
+        // Finalization combines sharedId and reuses the one auction lookup.
         let settings = create_test_settings();
         let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
             enabled: true,
@@ -722,18 +799,27 @@ mod tests {
             ..Default::default()
         });
         orchestrator.register_provider(Arc::new(EidCapturingProvider {
-            had_eids: Arc::new(std::sync::Mutex::new(None)),
+            requests: Arc::new(Mutex::new(Vec::new())),
         }));
-        let registry = PartnerRegistry::from_config(&[counting_test_partner("sharedid.org")])
-            .expect("should build partner registry");
+        let registry = PartnerRegistry::from_config(&[
+            counting_test_partner("sharedid.org"),
+            counting_test_partner("id5-sync.com"),
+        ])
+        .expect("should build partner registry");
 
         let lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let graph = KvIdentityGraph::counting("counting-store", Arc::clone(&lookups));
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let graph = KvIdentityGraph::new(BrowserRecordingKv {
+            inner: InMemoryEcKv::new("counting-store"),
+            lookups: Arc::clone(&lookups),
+            writes: Arc::clone(&writes),
+        });
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let mut live = crate::ec::kv_types::KvEntry::tombstone(1000);
         live.consent.ok = true;
         graph.create(&ec_id, &live).expect("should seed live row");
         lookups.store(0, std::sync::atomic::Ordering::Relaxed);
+        writes.lock().expect("should lock write modes").clear();
 
         let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
         let req = Request::builder()
@@ -746,6 +832,11 @@ mod tests {
                             "code": "div-gpt-ad-1",
                             "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
                         }
+                    ],
+                    "eids": [
+                        {"source":"id5-sync.com", "inserter":"forged", "matcher":"", "mm":0,
+                         "uids":[{"id":"body-id5", "ext":{"writer":"forged"}}]},
+                        {"source":"unknown.example", "uids":[{"id":"body-only"}]}
                     ]
                 }))
                 .expect("should serialize body"),
@@ -754,7 +845,7 @@ mod tests {
 
         // The capturing provider deliberately fails its launch; identity
         // resolution — the subject of this test — completes before dispatch.
-        let _ = handle_auction(
+        let result = handle_auction(
             &settings,
             &orchestrator,
             Some(&graph),
@@ -764,6 +855,10 @@ mod tests {
             req,
         )
         .await;
+        assert!(
+            result.is_err(),
+            "provider launch failure should return a handled error"
+        );
 
         assert_eq!(
             lookups.load(std::sync::atomic::Ordering::Relaxed),
@@ -775,14 +870,12 @@ mod tests {
             "the endpoint must hand its snapshot to the request context"
         );
 
-        ec_context.set_eid_sync_source(crate::ec::EidSyncSource::Auction);
         let mut response = http::Response::new(EdgeBody::empty());
         crate::ec::finalize::ec_finalize_response(
             &settings,
             &mut ec_context,
             Some(&graph),
             &registry,
-            None,
             Some("shared-cookie-id"),
             &mut response,
         );
@@ -792,6 +885,14 @@ mod tests {
             1,
             "finalization must reuse the endpoint snapshot instead of reading again"
         );
+        let recorded = writes.lock().expect("should lock write modes");
+        assert_eq!(
+            recorded.len(),
+            1,
+            "body and sharedId must make only one write"
+        );
+        assert!(matches!(recorded[0], EcKvWriteMode::IfGenerationMatch(_)));
+        drop(recorded);
         let (stored, _) = graph
             .get(&ec_id)
             .expect("should read store")
@@ -800,6 +901,333 @@ mod tests {
             stored.ids.get("sharedid.org").map(|id| id.uid.as_str()),
             Some("shared-cookie-id"),
             "the sharedId update must still be ingested from the shared snapshot"
+        );
+        assert_eq!(
+            stored.ids.get("id5-sync.com").map(|id| id.uid.as_str()),
+            Some("body-id5")
+        );
+        assert!(!stored.ids.contains_key("unknown.example"));
+        let serialized = serde_json::to_value(&stored).expect("should serialize persisted row");
+        assert!(serialized["ids"]["id5-sync.com"].get("inserter").is_none());
+        assert!(!serialized.to_string().contains("forged"));
+    }
+
+    #[tokio::test]
+    async fn disabled_auction_never_enriches_or_recovers_a_root() {
+        for case in [
+            "live",
+            "no-token",
+            "denied",
+            "missing",
+            "failed",
+            "tombstone",
+            "cookie-only",
+        ] {
+            let settings = create_test_settings();
+            let orchestrator = AuctionOrchestrator::new(AuctionConfig {
+                enabled: false,
+                ..Default::default()
+            });
+            let registry = PartnerRegistry::from_config(&[counting_test_partner("id5-sync.com")])
+                .expect("should build registry");
+            let ec_id = format!("{}.ABC123", "a".repeat(64));
+            let lookups = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let writes = Arc::new(Mutex::new(Vec::new()));
+            let graph = KvIdentityGraph::new(BrowserRecordingKv {
+                inner: InMemoryEcKv::new("browser-test"),
+                lookups: Arc::clone(&lookups),
+                writes: Arc::clone(&writes),
+            });
+            if !matches!(case, "missing" | "failed") {
+                let mut entry = crate::ec::kv_types::KvEntry::tombstone(1_000);
+                entry.consent.ok = case != "tombstone";
+                graph.create(&ec_id, &entry).expect("should seed row");
+            }
+            let mut context = make_ec_context(
+                Jurisdiction::NonRegulated,
+                (case != "no-token").then_some(ec_id.as_str()),
+            );
+            if case == "denied" {
+                context.consent_mut().jurisdiction = Jurisdiction::Unknown;
+            }
+            if case == "failed" {
+                context.set_kv_snapshot(EcKvSnapshot::Failed {
+                    ec_id: ec_id.clone(),
+                });
+            } else {
+                context.set_kv_snapshot(graph.load_snapshot(&ec_id));
+            }
+            lookups.store(0, std::sync::atomic::Ordering::Relaxed);
+            writes.lock().expect("should lock writes").clear();
+            let payload = json!({"adUnits":[{"code":"slot", "mediaTypes":{"banner":{"sizes":[[300,250]]}}}],
+            "eids": if case == "cookie-only" { JsonValue::Null } else {
+                json!([{"source":"id5-sync.com", "uids":[{"id":"body-id"}]}])
+            }});
+            let cookie = BASE64.encode(
+                serde_json::to_vec(&json!([
+                    {"source":"id5-sync.com", "uids":[{"id":"cookie-id"}]}
+                ]))
+                .expect("should encode legacy cookie"),
+            );
+            let request = Request::builder()
+                .method("POST")
+                .uri("https://publisher.example/auction")
+                .header("cookie", format!("ts-eids={cookie}"))
+                .body(EdgeBody::from(
+                    serde_json::to_vec(&payload).expect("should serialize body"),
+                ))
+                .expect("should build request");
+            let mut response = handle_auction(
+                &settings,
+                &orchestrator,
+                Some(&graph),
+                Some(&registry),
+                &mut context,
+                &noop_services(),
+                request,
+            )
+            .await
+            .expect("should return no bid");
+            crate::ec::finalize::ec_finalize_response(
+                &settings,
+                &mut context,
+                Some(&graph),
+                &registry,
+                None,
+                &mut response,
+            );
+            assert_eq!(
+                writes.lock().expect("should lock writes").len(),
+                0,
+                "{case}"
+            );
+            assert_eq!(
+                lookups.load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "{case}: a disabled auction must not read identity storage"
+            );
+            assert!(
+                !context.ec_generated(),
+                "{case}: auction must not create or recover roots"
+            );
+            let stored = graph.get(&ec_id).expect("should inspect row");
+            if let Some((entry, _)) = stored {
+                assert!(entry.ids.is_empty(), "{case}: no browser enrichment");
+            } else {
+                assert!(matches!(case, "missing" | "failed"));
+            }
+            assert!(response.headers().get("x-ts-eids").is_none());
+            assert!(response.headers().get("x-ts-eids-truncated").is_none());
+        }
+    }
+
+    const COOKIE_ONLY_SOURCE: &str = "cookie-only.example.com";
+
+    fn ingestion_registry(extra_source: &str) -> PartnerRegistry {
+        PartnerRegistry::from_config(&[
+            counting_test_partner(COOKIE_ONLY_SOURCE),
+            counting_test_partner(extra_source),
+        ])
+        .expect("should build partner registry")
+    }
+
+    fn context_with_browser_cookie(
+        settings: &Settings,
+        ec_id: &str,
+        cookie: &str,
+        source: crate::ec::EidSyncSource,
+    ) -> EcContext {
+        let request = Request::builder()
+            .uri("https://publisher.example.com/page")
+            .header(
+                header::COOKIE,
+                format!("ts-ec={ec_id}; {COOKIE_TS_EIDS}={cookie}"),
+            )
+            .body(EdgeBody::empty())
+            .expect("should build browser cookie fixture");
+        let mut context = EcContext::read_from_request(settings, &request, &noop_services())
+            .expect("should capture browser cookies");
+        *context.consent_mut() = ConsentContext {
+            jurisdiction: Jurisdiction::NonRegulated,
+            ..ConsentContext::default()
+        };
+        context.set_eid_sync_source(source);
+        context
+    }
+
+    fn cookie_only_ts_eids() -> String {
+        BASE64.encode(
+            serde_json::to_vec(&json!([
+                { "source": COOKIE_ONLY_SOURCE, "uids": [{ "id": "cookie-uid" }] }
+            ]))
+            .expect("should serialize cookie"),
+        )
+    }
+
+    fn seeded_graph(ec_id: &str) -> KvIdentityGraph {
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let mut live = crate::ec::kv_types::KvEntry::tombstone(1000);
+        live.consent.ok = true;
+        graph.create(ec_id, &live).expect("should seed live row");
+        graph
+    }
+
+    fn stored_ids(graph: &KvIdentityGraph, ec_id: &str) -> Vec<(String, String)> {
+        let (stored, _) = graph
+            .get(ec_id)
+            .expect("should read store")
+            .expect("row should exist");
+        stored
+            .ids
+            .iter()
+            .map(|(source, id)| (source.clone(), id.uid.clone()))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn auction_ingests_its_body_eids_and_not_a_cookie_only_source() {
+        let settings = create_test_settings();
+        let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
+            enabled: true,
+            providers: AuctionConfig::legacy_provider_map(&["eid_capturing_provider"]),
+            timeout_ms: 2000,
+            mediator: None,
+            ..Default::default()
+        });
+        orchestrator.register_provider(Arc::new(EidCapturingProvider {
+            requests: Arc::new(Mutex::new(Vec::new())),
+        }));
+        let registry = ingestion_registry("body.example.com");
+        let ec_id = format!("{}.ingbdy", "a".repeat(64));
+        let graph = seeded_graph(&ec_id);
+        let cookie = cookie_only_ts_eids();
+        let mut ec_context = context_with_browser_cookie(
+            &settings,
+            &ec_id,
+            &cookie,
+            crate::ec::EidSyncSource::Auction,
+        );
+        let req = Request::builder()
+            .method("POST")
+            .uri("https://test-publisher.com/auction")
+            .header(header::COOKIE, format!("{COOKIE_TS_EIDS}={cookie}"))
+            .body(EdgeBody::from(
+                serde_json::to_vec(&json!({
+                    "adUnits": [{ "code": "div-gpt-ad-1", "mediaTypes": { "banner": { "sizes": [[300, 250]] } } }],
+                    "eids": [{ "source": "body.example.com", "uids": [{ "id": "body-uid" }] }]
+                }))
+                .expect("should serialize body"),
+            ))
+            .expect("should build auction request");
+
+        let _ = handle_auction(
+            &settings,
+            &orchestrator,
+            Some(&graph),
+            Some(&registry),
+            &mut ec_context,
+            &noop_services(),
+            req,
+        )
+        .await;
+        let mut response = http::Response::new(EdgeBody::empty());
+        crate::ec::finalize::ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry,
+            None,
+            &mut response,
+        );
+
+        assert_eq!(
+            stored_ids(&graph, &ec_id),
+            vec![("body.example.com".to_owned(), "body-uid".to_owned())],
+            "KV should learn the body's source and not the cookie-only source"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_auction_ingests_nothing_from_the_cookie_but_keeps_shared_id() {
+        let settings = create_test_settings();
+        let orchestrator = AuctionOrchestrator::new(AuctionConfig {
+            enabled: false,
+            ..Default::default()
+        });
+        let registry = ingestion_registry("sharedid.org");
+        let ec_id = format!("{}.ingdis", "a".repeat(64));
+        let graph = seeded_graph(&ec_id);
+        let cookie = cookie_only_ts_eids();
+        let mut ec_context = context_with_browser_cookie(
+            &settings,
+            &ec_id,
+            &cookie,
+            crate::ec::EidSyncSource::Auction,
+        );
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("https://{}/auction", settings.publisher.domain))
+            .header(header::COOKIE, format!("{COOKIE_TS_EIDS}={cookie}"))
+            .body(EdgeBody::from(ad_units_only_body()))
+            .expect("should build auction request");
+
+        let _ = handle_auction(
+            &settings,
+            &orchestrator,
+            Some(&graph),
+            Some(&registry),
+            &mut ec_context,
+            &noop_services(),
+            req,
+        )
+        .await;
+        let mut response = http::Response::new(EdgeBody::empty());
+        crate::ec::finalize::ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry,
+            Some("shared-cookie-id"),
+            &mut response,
+        );
+
+        assert_eq!(
+            stored_ids(&graph, &ec_id),
+            vec![("sharedid.org".to_owned(), "shared-cookie-id".to_owned())],
+            "an /auction that resolved no client set should ingest only the sharedId cookie"
+        );
+    }
+
+    #[test]
+    fn navigation_ingests_the_cookie_only_source() {
+        // Control for the two tests above: the registry does match the
+        // cookie-only source when the route reads the cookie.
+        let settings = create_test_settings();
+        let registry = ingestion_registry("body.example.com");
+        let ec_id = format!("{}.ingnav", "a".repeat(64));
+        let graph = seeded_graph(&ec_id);
+        let cookie = cookie_only_ts_eids();
+        let mut ec_context = context_with_browser_cookie(
+            &settings,
+            &ec_id,
+            &cookie,
+            crate::ec::EidSyncSource::Navigation,
+        );
+        let mut response = http::Response::new(EdgeBody::empty());
+
+        crate::ec::finalize::ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry,
+            None,
+            &mut response,
+        );
+
+        assert_eq!(
+            stored_ids(&graph, &ec_id),
+            vec![(COOKIE_ONLY_SOURCE.to_owned(), "cookie-uid".to_owned())],
+            "a navigation should ingest the cookie's registered source"
         );
     }
 
@@ -820,7 +1248,7 @@ mod tests {
             ..Default::default()
         });
         orchestrator.register_provider(Arc::new(EidCapturingProvider {
-            had_eids: Arc::new(std::sync::Mutex::new(None)),
+            requests: Arc::new(Mutex::new(Vec::new())),
         }));
         let registry = PartnerRegistry::from_config(&[counting_test_partner("id5-sync.com")])
             .expect("should build partner registry");
@@ -835,7 +1263,7 @@ mod tests {
         ec_context.set_eid_sync_source(crate::ec::EidSyncSource::Auction);
         let req = Request::builder()
             .method("POST")
-            .uri("https://test-publisher.com/auction")
+            .uri(format!("https://{}/auction", settings.publisher.domain))
             .body(EdgeBody::from(
                 serde_json::to_vec(&json!({
                     "adUnits": [
@@ -865,22 +1293,12 @@ mod tests {
         )
         .await;
 
-        assert_eq!(
-            ec_context.client_eids().map(|eids| eids
-                .iter()
-                .map(|eid| eid.source.as_str())
-                .collect::<Vec<_>>()),
-            Some(vec!["id5-sync.com"]),
-            "the endpoint must hand its parsed body EIDs to the request context"
-        );
-
         let mut response = http::Response::new(EdgeBody::empty());
         crate::ec::finalize::ec_finalize_response(
             &settings,
             &mut ec_context,
             Some(&graph),
             &registry,
-            None, // No `ts-eids` cookie on this request at all.
             None,
             &mut response,
         );
@@ -1112,6 +1530,339 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trace_slot_conversion_api_keeps_refs_out_of_actual_bidder_and_mediator_payloads() {
+        const SLOT_REF: &str = "ts-slot-00000000-0000-4000-8000-000000000001";
+        let settings_toml = format!(
+            "{}\n[auction]\nenabled = true\n\n[auction.providers.bidder]\nprotocol = \"openrtb-2.6\"\nprofile = \"standard\"\nendpoint = \"https://bidder.example.com/auction\"\nrouting = \"all_eligible\"\n",
+            crate_test_settings_str()
+        );
+        let mut settings =
+            Settings::from_toml(&settings_toml).expect("should parse live provider settings");
+        settings
+            .integrations
+            .insert_config(
+                "gpt_diagnostics",
+                &json!({"enabled":true,"trace_page_enabled":true}),
+            )
+            .expect("should enable trace");
+        let settings = Arc::new(settings);
+        let plan = Arc::new(
+            crate::auction::compile_auction_plan(&settings)
+                .expect("should compile production provider plan"),
+        );
+        let mediator = AdServerMockProvider::new(AdServerMockConfig {
+            enabled: true,
+            endpoint: "https://mediator.example.com/auction".to_string(),
+            timeout_ms: 500,
+            ..Default::default()
+        });
+        let orchestrator = AuctionOrchestrator::from_plan(plan, Some(Arc::new(mediator)));
+        let http = Arc::new(StubHttpClient::new());
+        http.push_response(204, Vec::new());
+        http.push_response(204, Vec::new());
+        let services = RuntimeServices::builder()
+            .config_store(Arc::new(NoopConfigStore))
+            .secret_store(Arc::new(NoopSecretStore))
+            .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+            .backend(Arc::new(StubBackend))
+            .http_client(Arc::clone(&http) as Arc<_>)
+            .geo(Arc::new(NoopGeo))
+            .client_info(ClientInfo::default())
+            .build();
+        let body = json!({"adUnits":[{"code":"slot","mediaTypes":{"banner":{"sizes":[[300,250]]}},"ext":{"trusted_server":{"trace_slot_ref":SLOT_REF}}}]});
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("https://publisher.example.com/auction")
+            .header(header::COOKIE, "__Host-ts-console=1")
+            .body(EdgeBody::from(
+                serde_json::to_vec(&body).expect("should encode source token"),
+            ))
+            .expect("should build request");
+        TracePreDispatchHook::new(
+            Arc::clone(&settings),
+            Arc::new(|_| panic!("should not load API setup metadata")),
+        )
+        .handle(&mut request)
+        .await
+        .expect("should freeze trace gate");
+        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let response = handle_auction(
+            &settings,
+            &orchestrator,
+            None,
+            None,
+            &mut ec_context,
+            &services,
+            request,
+        )
+        .await
+        .expect("should execute bidder and mediator");
+        let bytes = response
+            .into_body()
+            .into_bytes()
+            .expect("should collect API evidence");
+        let value: JsonValue = serde_json::from_slice(&bytes).expect("should decode response");
+        let evidence = &value["ext"]["trusted_server"]["trace_auction"]["evidence"];
+        let auction_token = evidence["diagnostic_auction_id"]
+            .as_str()
+            .expect("should deliver auction token");
+        assert_eq!(
+            evidence["slots"][0]["slot_ref"], SLOT_REF,
+            "should echo exact accepted ref"
+        );
+        assert_eq!(
+            evidence["terminal_status"], "completed",
+            "should preserve completed zero bids"
+        );
+        assert_eq!(
+            evidence["slots"][0]["candidate"], "no_candidate",
+            "should observe no delivered candidate"
+        );
+        let bodies = http.recorded_request_bodies();
+        assert_eq!(
+            bodies.len(),
+            2,
+            "should actually serialize bidder and mediator requests"
+        );
+        for bytes in bodies {
+            let body = String::from_utf8(bytes).expect("should serialize UTF-8 outbound JSON");
+            for private in [
+                SLOT_REF,
+                auction_token,
+                "trace_slot_ref",
+                "trace_auction",
+                "diagnostic_auction_id",
+            ] {
+                assert!(
+                    !body.contains(private),
+                    "should keep trace association out of outbound JSON: {private}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn trace_slot_conversion_api_echoes_only_unique_accepted_refs_when_frozen_active() {
+        const FIRST: &str = "ts-slot-00000000-0000-4000-8000-000000000001";
+        const SECOND: &str = "ts-slot-00000000-0000-4000-8000-000000000002";
+        for active in [false, true] {
+            let mut settings = create_test_settings();
+            settings
+                .integrations
+                .insert_config(
+                    "gpt_diagnostics",
+                    &json!({"enabled":true,"trace_page_enabled":true}),
+                )
+                .expect("should enable trace feature");
+            let settings = Arc::new(settings);
+            let orchestrator = AuctionOrchestrator::new(AuctionConfig {
+                enabled: false,
+                ..Default::default()
+            });
+            let services = services_with_telemetry(Arc::new(RecordingTelemetrySink::default()));
+            let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+            let body = json!({"adUnits":[
+                {"code":"filtered","mediaTypes":{"video":{}},"ext":{"trusted_server":{"trace_slot_ref":SECOND}}},
+                {"code":"duplicate","mediaTypes":{"banner":{"sizes":[[300,250]]}},"ext":{"trusted_server":{"trace_slot_ref":FIRST}}},
+                {"code":"duplicate","mediaTypes":{"banner":{"sizes":[[300,250]]}},"ext":{"trusted_server":{"trace_slot_ref":FIRST}}},
+                {"code":"unique","mediaTypes":{"banner":{"sizes":[[300,250]]}},"ext":{"trusted_server":{"trace_slot_ref":SECOND}}}
+            ]});
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("https://publisher.example.com/auction")
+                .body(EdgeBody::from(
+                    serde_json::to_vec(&body).expect("should serialize request"),
+                ))
+                .expect("should build request");
+            if active {
+                request.headers_mut().insert(
+                    header::COOKIE,
+                    "__Host-ts-console=1".parse().expect("should build cookie"),
+                );
+            }
+            TracePreDispatchHook::new(
+                Arc::clone(&settings),
+                Arc::new(|_| panic!("should not load API setup metadata")),
+            )
+            .handle(&mut request)
+            .await
+            .expect("should freeze cookie gate");
+            let response = handle_auction(
+                &settings,
+                &orchestrator,
+                None,
+                None,
+                &mut ec_context,
+                &services,
+                request,
+            )
+            .await
+            .expect("should preserve accepted ordinary ads request");
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "should preserve no-bid status"
+            );
+            assert!(
+                !response.headers().contains_key(header::SET_COOKIE),
+                "should not refresh console cookie"
+            );
+            assert_eq!(
+                response
+                    .extensions()
+                    .get::<crate::response_privacy::TerminalPrivateResponse>()
+                    .is_some(),
+                active,
+                "should gate private evidence response"
+            );
+            let bytes = response
+                .into_body()
+                .into_bytes()
+                .expect("should collect response");
+            let value: JsonValue = serde_json::from_slice(&bytes).expect("should decode response");
+            let transport = &value["ext"]["trusted_server"]["trace_auction"];
+            if !active {
+                assert!(transport.is_null(), "should omit inactive transport");
+                continue;
+            }
+            let evidence = &transport["evidence"];
+            assert_eq!(
+                evidence["source"], "auction_api",
+                "should observe API source"
+            );
+            assert_eq!(
+                evidence["terminal_reason"], "policy_skipped",
+                "should retain skipped reason"
+            );
+            let slots = evidence["slots"]
+                .as_array()
+                .expect("should publish accepted slots");
+            assert_eq!(slots.len(), 3, "should exclude filtered occurrence");
+            assert_ne!(
+                slots[0]["slot_ref"], FIRST,
+                "should replace repeated accepted token"
+            );
+            assert_ne!(
+                slots[1]["slot_ref"], FIRST,
+                "should replace every repeated token occurrence"
+            );
+            assert_ne!(
+                slots[0]["slot_ref"], slots[1]["slot_ref"],
+                "should preserve distinct occurrence refs"
+            );
+            assert_eq!(
+                slots[2]["slot_ref"], SECOND,
+                "should ignore filtered token repetition"
+            );
+            for (index, slot) in slots.iter().enumerate() {
+                assert_eq!(
+                    slot["slot_number"],
+                    index + 1,
+                    "should number accepted occurrences"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn trace_auction_api_frozen_disabled_capture_delivers_private_evidence() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "gpt_diagnostics",
+                &json!({"enabled":true,"trace_page_enabled":true}),
+            )
+            .expect("should enable trace capture");
+        let settings = Arc::new(settings);
+
+        let config = AuctionConfig {
+            enabled: false,
+            providers: AuctionConfig::legacy_provider_map(&["panic_provider"]),
+            timeout_ms: 2000,
+            mediator: None,
+            ..Default::default()
+        };
+        let mut orchestrator = AuctionOrchestrator::new(config);
+        orchestrator.register_provider(Arc::new(PanicOnBidProvider));
+        let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
+        let services = services_with_telemetry(Arc::clone(&telemetry_sink));
+        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let body = json!({
+            "adUnits": [{
+                "code": "div-gpt-ad-1",
+                "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+            }]
+        });
+        let mut request = Request::builder()
+            .method("POST")
+            .header("cookie", "__Host-ts-console=1")
+            .uri("https://test-publisher.example/auction")
+            .body(EdgeBody::from(
+                serde_json::to_vec(&body).expect("should serialize disabled-auction body"),
+            ))
+            .expect("should build disabled-auction request");
+
+        let hook = TracePreDispatchHook::new(
+            Arc::clone(&settings),
+            Arc::new(|_| panic!("should not load setup metadata on API capture")),
+        );
+        assert!(
+            hook.handle(&mut request)
+                .await
+                .expect("should freeze API cookies")
+                .is_none(),
+            "should retain ordinary API routing"
+        );
+
+        let response = handle_auction(
+            &settings,
+            &orchestrator,
+            None,
+            None,
+            &mut ec_context,
+            &services,
+            request,
+        )
+        .await
+        .expect("disabled auction should return a no-bid response");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "disabled auction should return a 200 no-bid response"
+        );
+        let carry = response
+            .extensions()
+            .get::<crate::trace::TraceAuctionCarry>()
+            .expect("should retain private API terminal facts");
+        let facts = serde_json::to_value(
+            carry
+                .transport()
+                .expect("should finish the skipped API carry"),
+        )
+        .expect("should serialize public-safe facts");
+        assert_eq!(
+            facts["evidence"]["source"], "auction_api",
+            "should preserve the real API source"
+        );
+        assert_eq!(
+            facts["evidence"]["terminal_reason"], "policy_skipped",
+            "should observe the explicit disabled policy"
+        );
+        let bytes = response
+            .into_body()
+            .into_bytes()
+            .expect("should preserve the ordinary OpenRTB response");
+        let response: JsonValue =
+            serde_json::from_slice(&bytes).expect("should decode response evidence");
+        assert_eq!(
+            response["ext"]["trusted_server"]["trace_auction"], facts,
+            "should deliver the same checked terminal facts"
+        );
+    }
+
+    #[tokio::test]
     async fn all_planned_launch_failures_return_bad_gateway_and_execution_failed_telemetry() {
         let settings_toml = format!(
             "{}\n[auction]\nenabled = true\n\n[auction.providers.launch-fail]\nprotocol = \"openrtb-2.6\"\nprofile = \"standard\"\nendpoint = \"https://bidder.example/auction\"\nrouting = \"all_eligible\"\n",
@@ -1254,10 +2005,9 @@ mod tests {
         );
     }
 
-    /// Provider that records whether the auction request it received carried
-    /// EIDs, then fails its launch so no real transport handle is needed.
+    /// Records bidder-facing requests, then fails without a transport handle.
     struct EidCapturingProvider {
-        had_eids: Arc<std::sync::Mutex<Option<bool>>>,
+        requests: Arc<Mutex<Vec<AuctionRequest>>>,
     }
 
     #[async_trait::async_trait(?Send)]
@@ -1271,8 +2021,10 @@ mod tests {
             request: &AuctionRequest,
             _context: &AuctionContext<'_>,
         ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
-            *self.had_eids.lock().expect("should lock captured eids") =
-                Some(request.user.eids.is_some());
+            self.requests
+                .lock()
+                .expect("should lock captured requests")
+                .push(request.clone());
             Err(Report::new(TrustedServerError::Auction {
                 message: "capture only".to_string(),
             }))
@@ -1295,6 +2047,197 @@ mod tests {
         }
     }
 
+    const AUCTION_BODY_FIXTURE: &str =
+        include_str!("../../../trusted-server-js/lib/test/fixtures/auction-body-eids.txt");
+    const TS_EIDS_COOKIE_FIXTURE: &str =
+        include_str!("../../../trusted-server-js/lib/test/fixtures/ts-eids-cookie.txt");
+
+    /// Provider that records the full EID set its auction request carried,
+    /// then fails its launch so no real transport handle is needed.
+    struct EidRecordingProvider {
+        eids: Arc<Mutex<Option<JsonValue>>>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl AuctionProvider for EidRecordingProvider {
+        fn provider_name(&self) -> &str {
+            "eid_recording_provider"
+        }
+
+        async fn request_bids(
+            &self,
+            request: &AuctionRequest,
+            _context: &AuctionContext<'_>,
+        ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
+            *self.eids.lock().expect("should lock recorded eids") = Some(
+                serde_json::to_value(&request.user.eids).expect("should serialize recorded eids"),
+            );
+            Err(Report::new(TrustedServerError::Auction {
+                message: "record only".to_string(),
+            }))
+        }
+
+        async fn parse_response(
+            &self,
+            _response: PlatformResponse,
+            _response_time_ms: u64,
+        ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+            panic!("parse_response must not run when the launch fails");
+        }
+
+        fn timeout_ms(&self) -> u32 {
+            100
+        }
+
+        fn backend_name(&self, _services: &RuntimeServices, _timeout_ms: u32) -> Option<String> {
+            Some("record-backend".to_string())
+        }
+    }
+
+    /// Runs `/auction` with an allowed EC and returns the EIDs the provider
+    /// received: `None` when no provider was called (the request was
+    /// rejected), `Some(Value::Null)` when it carried no EIDs.
+    async fn recorded_auction_eids(
+        body: Vec<u8>,
+        ts_eids_cookie: Option<&str>,
+    ) -> Option<JsonValue> {
+        let settings = create_test_settings();
+        let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
+            enabled: true,
+            providers: AuctionConfig::legacy_provider_map(&["eid_recording_provider"]),
+            timeout_ms: 2000,
+            mediator: None,
+            ..Default::default()
+        });
+        let recorded = Arc::new(Mutex::new(None));
+        orchestrator.register_provider(Arc::new(EidRecordingProvider {
+            eids: Arc::clone(&recorded),
+        }));
+        let ec_id = format!("{}.fixtur", "a".repeat(64));
+        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(format!("https://{}/auction", settings.publisher.domain));
+        if let Some(cookie) = ts_eids_cookie {
+            builder = builder.header(header::COOKIE, format!("{COOKIE_TS_EIDS}={cookie}"));
+        }
+        let req = builder
+            .body(EdgeBody::from(body))
+            .expect("should build auction request");
+
+        // The recording provider fails its launch; the assertion is on what
+        // it received, not on the auction result.
+        let _ = handle_auction(
+            &settings,
+            &orchestrator,
+            None,
+            None,
+            &mut ec_context,
+            &noop_services(),
+            req,
+        )
+        .await;
+
+        recorded.lock().expect("should lock recorded eids").clone()
+    }
+
+    /// The two parsable entries of the fixture input, as providers receive
+    /// them. The cookie copy has no EID-level `ext` on the last entry.
+    fn fixture_good_entries(with_eid_ext: bool) -> JsonValue {
+        let mut last = json!({
+            "source": "last.example.com",
+            "uids": [{ "id": "last-uid", "atype": 3 }]
+        });
+        if with_eid_ext {
+            last["ext"] = json!({ "segments": ["s1"] });
+        }
+        json!([
+            {
+                "source": "first.example.com",
+                "inserter": "inserter-€.example.com",
+                "matcher": "first.example.com",
+                "mm": 3,
+                "uids": [{ "id": "first-uid", "atype": 1, "ext": { "label": "日本" } }]
+            },
+            last
+        ])
+    }
+
+    #[tokio::test]
+    async fn tsjs_auction_body_fixture_drops_only_the_unparsable_entry() {
+        let recorded =
+            recorded_auction_eids(AUCTION_BODY_FIXTURE.trim_end().as_bytes().to_vec(), None).await;
+
+        assert_eq!(
+            recorded,
+            Some(fixture_good_entries(true)),
+            "the request should be accepted and carry the two good entries unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn tsjs_cookie_fixture_drops_only_the_unparsable_entry() {
+        let recorded = recorded_auction_eids(
+            ad_units_only_body(),
+            Some(TS_EIDS_COOKIE_FIXTURE.trim_end()),
+        )
+        .await;
+
+        assert_eq!(
+            recorded,
+            Some(fixture_good_entries(false)),
+            "the cookie's good entries should reach the provider without the bad one"
+        );
+    }
+
+    #[tokio::test]
+    async fn auction_body_eid_level_fields_reach_the_auction_request() {
+        let eids = json!([{
+            "source": "adserver.org",
+            "inserter": "adserver.org",
+            "matcher": "adserver.org",
+            "mm": 4,
+            "uids": [{ "id": "fictional-tdid", "atype": 1, "ext": { "rtiPartner": "TDID" } }]
+        }]);
+        let body = serde_json::to_vec(&json!({
+            "adUnits": [{ "code": "div-gpt-1", "mediaTypes": { "banner": { "sizes": [[300, 250]] } } }],
+            "eids": eids
+        }))
+        .expect("should serialize body");
+
+        assert_eq!(
+            recorded_auction_eids(body, None).await,
+            Some(eids),
+            "EID-level fields from the body should reach the provider unchanged"
+        );
+    }
+
+    fn ad_units_only_body() -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "adUnits": [{ "code": "div-gpt-1", "mediaTypes": { "banner": { "sizes": [[300, 250]] } } }]
+        }))
+        .expect("should serialize body")
+    }
+
+    #[tokio::test]
+    async fn auction_uses_the_cookie_when_no_body_entry_is_valid() {
+        let cookie_entries =
+            json!([{ "source": "cookie.example.com", "uids": [{ "id": "cookie-uid" }] }]);
+        let cookie =
+            BASE64.encode(serde_json::to_vec(&cookie_entries).expect("should serialize cookie"));
+        let body = serde_json::to_vec(&json!({
+            "adUnits": [{ "code": "div-gpt-1", "mediaTypes": { "banner": { "sizes": [[300, 250]] } } }],
+            "eids": [{ "source": "", "uids": [{ "id": "body-uid" }] }]
+        }))
+        .expect("should serialize body");
+
+        assert_eq!(
+            recorded_auction_eids(body, Some(&cookie)).await,
+            Some(cookie_entries),
+            "a body whose entries are all invalid should count as absent"
+        );
+    }
+
     #[tokio::test]
     async fn auction_strips_client_eids_when_ec_identity_denied() {
         // US-state opt-out via GPC: the server-side auction consent gate still
@@ -1312,9 +2255,9 @@ mod tests {
             ..Default::default()
         };
         let mut orchestrator = AuctionOrchestrator::new(config);
-        let had_eids = Arc::new(std::sync::Mutex::new(None));
+        let requests = Arc::new(Mutex::new(Vec::new()));
         orchestrator.register_provider(Arc::new(EidCapturingProvider {
-            had_eids: Arc::clone(&had_eids),
+            requests: Arc::clone(&requests),
         }));
         let services = noop_services();
 
@@ -1374,10 +2317,193 @@ mod tests {
         )
         .await;
 
+        let captured = requests.lock().expect("should lock captured requests");
+        let request = captured
+            .last()
+            .expect("should capture the bidder-facing request");
+        assert!(
+            request.user.eids.is_none(),
+            "should carry no EIDs when EC identity is denied"
+        );
+    }
+
+    #[tokio::test]
+    async fn auction_body_and_cookie_cannot_resubmit_expired_identity() {
+        for (client_uids, from_cookie, expected_uids) in [
+            (vec!["expired-uid"], false, vec![]),
+            (vec!["expired-uid"], true, vec![]),
+            (vec!["different-uid"], false, vec!["different-uid"]),
+            (vec!["different-uid"], true, vec!["different-uid"]),
+            (
+                vec!["expired-uid", "different-uid"],
+                false,
+                vec!["different-uid"],
+            ),
+        ] {
+            let settings = create_test_settings();
+            let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
+                enabled: true,
+                providers: AuctionConfig::legacy_provider_map(&["eid_capturing_provider"]),
+                ..Default::default()
+            });
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            orchestrator.register_provider(Arc::new(EidCapturingProvider {
+                requests: Arc::clone(&requests),
+            }));
+            let registry =
+                PartnerRegistry::from_config(&[counting_test_partner("ids.example.com")])
+                    .expect("should build registry");
+            let graph = KvIdentityGraph::in_memory("auction-store");
+            let ec_id = format!("{}.ABC123", "a".repeat(64));
+            let mut entry =
+                crate::ec::kv_types::KvEntry::minimal("ids.example.com", "expired-uid", 1_000);
+            entry
+                .ids
+                .get_mut("ids.example.com")
+                .expect("should contain record")
+                .expires_at = Some(1);
+            graph.create(&ec_id, &entry).expect("should seed identity");
+            let (_, generation_before) = graph
+                .get(&ec_id)
+                .expect("should read identity")
+                .expect("should find identity");
+            let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+            let eids = json!([{
+                "source": "IDS.EXAMPLE.COM.",
+                "uids": client_uids.iter().map(|uid| json!({"id": uid})).collect::<Vec<_>>()
+            }]);
+            let mut body = json!({ "adUnits": [{
+                "code": "example-slot",
+                "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
+            }] });
+            let mut builder = Request::builder()
+                .method("POST")
+                .uri("https://publisher.example.com/auction");
+            if from_cookie {
+                let cookie =
+                    BASE64.encode(serde_json::to_vec(&eids).expect("should encode cookie EIDs"));
+                builder = builder.header("cookie", format!("{COOKIE_TS_EIDS}={cookie}"));
+            } else {
+                body["eids"] = eids;
+            }
+            let request = builder
+                .body(EdgeBody::from(
+                    serde_json::to_vec(&body).expect("should serialize body"),
+                ))
+                .expect("should build auction request");
+
+            let _ = handle_auction(
+                &settings,
+                &orchestrator,
+                Some(&graph),
+                Some(&registry),
+                &mut ec_context,
+                &noop_services(),
+                request,
+            )
+            .await;
+
+            let captured = requests.lock().expect("should lock captured requests");
+            let sent = captured
+                .last()
+                .expect("should capture the bidder-facing request");
+            let actual_uids: Vec<&str> = sent
+                .user
+                .eids
+                .iter()
+                .flatten()
+                .flat_map(|eid| &eid.uids)
+                .map(|uid| uid.id.as_str())
+                .collect();
+            assert_eq!(
+                actual_uids, expected_uids,
+                "should remove the matching expired UID but preserve different current-request IDs"
+            );
+            let (retained, generation_after) = graph
+                .get(&ec_id)
+                .expect("should read retained identity")
+                .expect("should retain identity");
+            assert_eq!(
+                retained, entry,
+                "should not replace or delete retained expired records"
+            );
+            assert_eq!(
+                generation_before, generation_after,
+                "should not write on auction resolution"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn auction_delivers_lockr_provenance_from_persisted_writer() {
+        let settings = create_test_settings();
+        let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
+            enabled: true,
+            providers: AuctionConfig::legacy_provider_map(&["eid_capturing_provider"]),
+            ..Default::default()
+        });
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        orchestrator.register_provider(Arc::new(EidCapturingProvider {
+            requests: Arc::clone(&requests),
+        }));
+        let mut partner = counting_test_partner("id5-sync.com");
+        partner.openrtb_atype = 1;
+        let registry =
+            PartnerRegistry::from_config(&[partner]).expect("should build source registry");
+        let graph = KvIdentityGraph::in_memory("lockr-provenance-auction");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let now = crate::ec::current_timestamp();
+        let mut entry = crate::ec::kv_types::KvEntry::minimal("id5-sync.com", "synthetic-uid", now);
+        let record = entry
+            .ids
+            .get_mut("id5-sync.com")
+            .expect("should contain ID5");
+        record.writer = Some("lockr".to_owned());
+        record.expires_at = Some(now + 3_600);
+        record.revision = Some("synthetic-revision".to_owned());
+        graph
+            .create(&ec_id, &entry)
+            .expect("should persist identity");
+        let stored_before = graph.get(&ec_id).expect("should read identity");
+        let mut context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        let request = Request::builder()
+            .method("POST")
+            .uri("https://publisher.example.com/auction")
+            .body(EdgeBody::from(
+                serde_json::to_vec(&json!({"adUnits": [{
+                    "code": "example-slot",
+                    "mediaTypes": {"banner": {"sizes": [[300, 250]]}}
+                }]}))
+                .expect("should serialize auction"),
+            ))
+            .expect("should build auction request");
+        // This provider deliberately fails after recording its bidder-facing request.
+        let _ = handle_auction(
+            &settings,
+            &orchestrator,
+            Some(&graph),
+            Some(&registry),
+            &mut context,
+            &noop_services(),
+            request,
+        )
+        .await;
+        let captured = requests.lock().expect("should lock bidder requests");
+        let sent = captured.last().expect("should dispatch bidder request");
+        let payload = serde_json::to_value(sent.user.eids.as_ref().expect("should deliver ID5"))
+            .expect("should serialize bidder EIDs");
         assert_eq!(
-            *had_eids.lock().expect("should lock captured eids"),
-            Some(false),
-            "outgoing auction request must carry no EIDs when EC identity is denied"
+            payload,
+            json!([{
+                "source": "id5-sync.com", "inserter": "Lockr-For-Publishers",
+                "matcher": "", "mm": 2,
+                "uids": [{"id": "synthetic-uid", "atype": 1}]
+            }])
+        );
+        assert_eq!(
+            graph.get(&ec_id).expect("should read identity"),
+            stored_before,
+            "should reconstruct provenance without changing persisted state"
         );
     }
 
@@ -1387,7 +2513,12 @@ mod tests {
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
 
-        let result = resolve_auction_eids(&EcKvSnapshot::NotRead, Some(&registry), &ec_context);
+        let result = resolve_auction_eids(
+            &EcKvSnapshot::NotRead,
+            Some(&registry),
+            &ec_context,
+            Some(1_000),
+        );
         assert!(
             result.is_some_and(|eids| eids.is_empty()),
             "should degrade to empty EIDs without a snapshot"
@@ -1399,7 +2530,7 @@ mod tests {
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
 
-        let result = resolve_auction_eids(&EcKvSnapshot::NotRead, None, &ec_context);
+        let result = resolve_auction_eids(&EcKvSnapshot::NotRead, None, &ec_context, Some(1_000));
         assert!(
             result.is_none(),
             "should return None when registry is missing"
@@ -1412,7 +2543,12 @@ mod tests {
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let ec_context = make_ec_context(Jurisdiction::Unknown, Some(&ec_id));
 
-        let result = resolve_auction_eids(&EcKvSnapshot::NotRead, Some(&registry), &ec_context);
+        let result = resolve_auction_eids(
+            &EcKvSnapshot::NotRead,
+            Some(&registry),
+            &ec_context,
+            Some(1_000),
+        );
         assert!(
             result.is_none(),
             "should return None when consent is denied"
@@ -1424,7 +2560,12 @@ mod tests {
         let registry = PartnerRegistry::empty();
         let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
 
-        let result = resolve_auction_eids(&EcKvSnapshot::NotRead, Some(&registry), &ec_context);
+        let result = resolve_auction_eids(
+            &EcKvSnapshot::NotRead,
+            Some(&registry),
+            &ec_context,
+            Some(1_000),
+        );
         assert!(
             result.is_none(),
             "should return None when no EC value is present"
@@ -1440,7 +2581,7 @@ mod tests {
         let snapshot = EcKvSnapshot::Failed {
             ec_id: ec_id.clone(),
         };
-        let result = resolve_auction_eids(&snapshot, Some(&registry), &ec_context);
+        let result = resolve_auction_eids(&snapshot, Some(&registry), &ec_context, Some(1_000));
         let eids = result.expect("should return Some on KV error (degraded mode)");
         assert!(
             eids.is_empty(),
@@ -1449,306 +2590,454 @@ mod tests {
     }
 
     #[test]
-    fn resolve_client_auction_eids_falls_back_to_ts_eids_cookie() {
-        let cookie_payload = json!([
-            {
-                "source": "sharedid.org",
-                "uids": [
-                    { "id": "shared_cookie", "atype": 3 },
-                    { "id": "shared_cookie_2", "ext": { "provider": "example" } }
-                ]
-            }
-        ]);
-        let encoded = BASE64
-            .encode(serde_json::to_vec(&cookie_payload).expect("should serialize cookie payload"));
-
-        let resolved = resolve_client_auction_eids(None, Some(&encoded))
-            .expect("should fall back to structured ts-eids cookie");
-
-        assert_eq!(resolved.len(), 1, "should preserve cookie source entry");
-        assert_eq!(resolved[0].source, "sharedid.org");
+    fn expiry_matching_uses_normalized_sources_and_full_ec_identity() {
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let mut entry =
+            crate::ec::kv_types::KvEntry::minimal("ids.example.com", "expired-uid", 1_000);
+        entry
+            .ids
+            .get_mut("ids.example.com")
+            .expect("should contain record")
+            .expires_at = Some(1);
+        let snapshot = EcKvSnapshot::Present {
+            ec_id: ec_id.clone(),
+            entry: Box::new(entry),
+            generation: Some(1),
+        };
+        let context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        for source in ["ids.example.com", "IDS.EXAMPLE.COM.", " ids.example.com "] {
+            let client = parse_client_auction_eids(Some(
+                &json!([{"source": source, "uids": [{"id": "expired-uid"}]}]),
+            ));
+            assert!(
+                resolve_and_merge_auction_eids(client, &snapshot, None, &context).is_none(),
+                "should not bypass expiry with a source alias"
+            );
+        }
+        let other_ec_id = format!("{}.XYZ789", "a".repeat(64));
+        let other_context = make_ec_context(Jurisdiction::NonRegulated, Some(&other_ec_id));
+        let client = parse_client_auction_eids(Some(
+            &json!([{"source": "ids.example.com", "uids": [{"id": "expired-uid"}]}]),
+        ));
+        let resolved = resolve_and_merge_auction_eids(client, &snapshot, None, &other_context)
+            .expect("should preserve unrelated current-request input");
         assert_eq!(
-            resolved[0].uids.len(),
+            resolved[0].uids[0].id, "expired-uid",
+            "should not apply another full EC ID's lifecycle metadata"
+        );
+    }
+
+    #[test]
+    fn lockr_provenance_does_not_label_other_browser_uids() {
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let now = crate::ec::current_timestamp();
+        let mut entry = crate::ec::kv_types::KvEntry::minimal("id5-sync.com", "captured-uid", now);
+        let record = entry
+            .ids
+            .get_mut("id5-sync.com")
+            .expect("should contain ID5");
+        record.writer = Some("lockr".to_owned());
+        record.expires_at = Some(now + 3_600);
+        let snapshot = EcKvSnapshot::Present {
+            ec_id: ec_id.clone(),
+            entry: Box::new(entry),
+            generation: Some(1),
+        };
+        let registry = PartnerRegistry::from_config(&[counting_test_partner("id5-sync.com")])
+            .expect("should build source registry");
+        let context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        for (uids, body_provenance, captured_provenance) in [
+            (vec!["captured-uid"], false, false),
+            (vec!["browser-uid"], false, false),
+            (vec!["captured-uid", "browser-uid"], false, false),
+            (vec!["browser-uid"], true, false),
+        ] {
+            let mut raw = json!([{"source": "id5-sync.com",
+                "uids": uids.iter().map(|id| json!({"id": id})).collect::<Vec<_>>() }]);
+            if body_provenance {
+                raw[0]["inserter"] = json!("Browser-Integration");
+                raw[0]["matcher"] = json!("");
+                raw[0]["mm"] = json!(0);
+            }
+            let client = parse_client_auction_eids(Some(&raw));
+            let merged =
+                resolve_and_merge_auction_eids(client, &snapshot, Some(&registry), &context)
+                    .expect("should merge captured and browser EIDs");
+            let payload = serde_json::to_value(&merged).expect("should serialize EIDs");
+            let eid = &payload[0];
+            if body_provenance {
+                assert_eq!(eid["inserter"], "Browser-Integration");
+                assert!(
+                    eid.get("matcher").is_none(),
+                    "should omit blank browser matcher"
+                );
+                assert_eq!(eid["mm"], 0);
+            } else if captured_provenance {
+                assert_eq!(eid["inserter"], "Lockr-For-Publishers");
+                assert!(
+                    eid.get("matcher").is_none(),
+                    "should omit blank browser matcher"
+                );
+                assert_eq!(eid["mm"], 2);
+            } else {
+                for field in ["inserter", "matcher", "mm"] {
+                    assert!(
+                        eid.get(field).is_none(),
+                        "should not attribute a mixed-origin EID to Lockr"
+                    );
+                }
+            }
+            let expected_uids = uids;
+            assert_eq!(
+                merged[0]
+                    .uids
+                    .iter()
+                    .map(|uid| uid.id.as_str())
+                    .collect::<Vec<_>>(),
+                expected_uids,
+                "should preserve the browser UID set without adding KV UIDs"
+            );
+        }
+    }
+
+    #[test]
+    fn body_provenance_survives_parse_merge_and_serialization() {
+        let raw = json!([{"source":"id5-sync.com", "inserter":"Browser-Integration",
+            "matcher":"", "mm":0, "uids":[{"id":"uid", "ext":{"linkType":1}}]}]);
+        let client = parse_client_auction_eids(Some(&raw));
+        let resolved = Some(vec![Eid {
+            source: "id5-sync.com".to_owned(),
+            inserter: Some("Lockr-For-Publishers".to_owned()),
+            matcher: Some("stored-matcher".to_owned()),
+            mm: Some(2),
+            ext: None,
+            uids: vec![Uid {
+                id: "uid".to_owned(),
+                atype: Some(1),
+                ext: None,
+            }],
+        }]);
+        let merged = merge_auction_eids(client, resolved).expect("should merge body and KV");
+        let output = serde_json::to_value(&merged).expect("should serialize");
+        assert_eq!(output[0]["inserter"], "Browser-Integration");
+        assert!(
+            output[0].get("matcher").is_none(),
+            "should omit blank browser matcher"
+        );
+        assert_eq!(output[0]["mm"], 0);
+        assert!(
+            output[0]["uids"][0].get("atype").is_none(),
+            "should not borrow KV atype for a browser entry"
+        );
+        assert_eq!(output[0]["uids"][0]["ext"]["linkType"], 1);
+        assert!(parse_client_auction_eids(None).is_none());
+    }
+
+    #[test]
+    fn restored_cookie_fallback_keeps_body_first_semantics() {
+        let cookie = BASE64.encode(
+            serde_json::to_vec(&json!([
+                {"source":"ids.example.com", "uids":[{"id":"cookie-id"}]},
+                {"source":"extra.example.com", "uids":[{"id":"cookie-only"}]}
+            ]))
+            .expect("should encode cookie"),
+        );
+        let body = json!([{ "source":"ids.example.com", "uids":[{"id":"body-id"}] }]);
+        let from_body = resolve_client_auction_eids(
+            Some(&RawValue::from_string(body.to_string()).expect("should encode body fixture")),
+            Some(&cookie),
+        )
+        .expect("should prefer body EIDs");
+        assert_eq!(
+            from_body.len(),
+            1,
+            "valid body must not merge missing cookie sources"
+        );
+        assert_eq!(
+            from_body[0].uids[0].id, "body-id",
+            "body must win over cookie"
+        );
+        let fallback =
+            resolve_client_auction_eids(None, Some(&cookie)).expect("should fall back to cookie");
+        assert_eq!(
+            fallback.len(),
             2,
-            "should preserve multiple cookie UIDs"
+            "cookie-only request must retain its full EID set"
         );
-        assert_eq!(resolved[0].uids[0].id, "shared_cookie");
         assert_eq!(
-            resolved[0].uids[1].ext,
-            Some(json!({ "provider": "example" })),
-            "should preserve UID ext from cookie fallback"
-        );
-    }
-
-    #[test]
-    fn resolve_client_auction_eids_prefers_request_body_over_cookie() {
-        let raw = json!([
-            {
-                "source": "id5-sync.com",
-                "uids": [{ "id": "body_uid", "atype": 1 }]
-            }
-        ]);
-        let cookie_payload = json!([
-            {
-                "source": "sharedid.org",
-                "uids": [{ "id": "cookie_uid", "atype": 3 }]
-            }
-        ]);
-        let encoded = BASE64
-            .encode(serde_json::to_vec(&cookie_payload).expect("should serialize cookie payload"));
-
-        let resolved = resolve_client_auction_eids(Some(&raw), Some(&encoded))
-            .expect("should prefer request body EIDs");
-
-        assert_eq!(resolved.len(), 1, "should use request body when present");
-        assert_eq!(resolved[0].source, "id5-sync.com");
-        assert_eq!(resolved[0].uids[0].id, "body_uid");
-    }
-
-    #[test]
-    fn parse_client_auction_eids_ignores_malformed_entries() {
-        let raw = json!([
-            {
-                "source": "id5-sync.com",
-                "uids": [{ "id": "ID5_abc", "atype": 1 }]
-            },
-            {
-                "source": "broken.example",
-                "uids": "not-an-array"
-            },
-            {
-                "source": "sharedid.org",
-                "uids": [{ "id": "shared_123" }, { "id": "" }]
-            }
-        ]);
-
-        let parsed = parse_client_auction_eids(Some(&raw)).expect("should parse valid EIDs");
-
-        assert_eq!(parsed.len(), 2, "should keep only valid EID entries");
-        assert_eq!(parsed[0].source, "id5-sync.com");
-        assert_eq!(parsed[0].uids.len(), 1, "should keep valid UID");
-        assert_eq!(parsed[1].source, "sharedid.org");
-        assert_eq!(parsed[1].uids.len(), 1, "should drop empty UID values");
-    }
-
-    #[test]
-    fn parse_client_auction_eids_caps_sources_and_uids() {
-        let entries: Vec<_> = (0..(MAX_CLIENT_EID_SOURCES + 5))
-            .map(|source_index| {
-                let uids: Vec<_> = (0..(MAX_CLIENT_UIDS_PER_SOURCE + 5))
-                    .map(|uid_index| json!({ "id": format!("uid-{source_index}-{uid_index}") }))
-                    .collect();
-                json!({
-                    "source": format!("source-{source_index}.example.com"),
-                    "uids": uids,
-                })
-            })
-            .collect();
-        let raw = JsonValue::Array(entries);
-
-        let parsed = parse_client_auction_eids(Some(&raw)).expect("should parse capped EIDs");
-
-        assert_eq!(
-            parsed.len(),
-            MAX_CLIENT_EID_SOURCES,
-            "should cap client EID sources"
+            fallback[0].uids[0].id, "cookie-id",
+            "should retain cookie UID"
         );
         assert!(
-            parsed
-                .iter()
-                .all(|eid| eid.uids.len() == MAX_CLIENT_UIDS_PER_SOURCE),
-            "should cap UIDs per source"
+            resolve_client_auction_eids(None, Some("invalid-cookie")).is_none(),
+            "malformed cookie must not become auction input"
+        );
+    }
+
+    const SOURCE_S: &str = "ids.example.com";
+    const SOURCE_T: &str = "other.example.com";
+
+    fn kv_eid(source: &str, id: &str, atype: i32) -> Eid {
+        Eid::new(
+            source.to_owned(),
+            vec![Uid {
+                id: id.to_owned(),
+                atype: Some(atype),
+                ext: None,
+            }],
+        )
+    }
+
+    /// A browser entry, every field spelled out (spec 7.1 rule 9).
+    fn browser_eid(
+        source: &str,
+        id: &str,
+        atype: Option<i32>,
+        inserter: Option<&str>,
+        mm: Option<i32>,
+    ) -> Eid {
+        Eid {
+            source: source.to_owned(),
+            uids: vec![Uid {
+                id: id.to_owned(),
+                atype,
+                ext: None,
+            }],
+            inserter: inserter.map(str::to_owned),
+            matcher: None,
+            mm,
+            ext: None,
+        }
+    }
+
+    fn merged_json(client: Option<Vec<Eid>>, kv: Option<Vec<Eid>>) -> JsonValue {
+        serde_json::to_value(merge_auction_eids(client, kv)).expect("should serialize merged EIDs")
+    }
+
+    #[test]
+    fn merge_case_1_forwards_a_browser_entry_with_its_fields() {
+        let merged = merged_json(
+            Some(vec![browser_eid(
+                SOURCE_S,
+                "u1",
+                None,
+                Some("inserter-1.example.com"),
+                Some(1),
+            )]),
+            None,
+        );
+
+        assert_eq!(
+            merged,
+            json!([{ "source": SOURCE_S, "inserter": "inserter-1.example.com", "mm": 1, "uids": [{ "id": "u1" }] }]),
+            "a browser entry should go out with its EID-level fields"
         );
     }
 
     #[test]
-    fn parse_client_auction_eids_drops_whitespace_and_oversized_uids() {
-        let raw = json!([
-            {
-                "source": "id5-sync.com",
-                "uids": [
-                    { "id": "   " },
-                    { "id": "x".repeat(MAX_UID_LENGTH + 1) },
-                    { "id": "valid" }
-                ]
-            }
-        ]);
-
-        let parsed = parse_client_auction_eids(Some(&raw)).expect("should parse valid UID");
-
-        assert_eq!(parsed.len(), 1, "should retain source with valid UID");
-        assert_eq!(parsed[0].uids.len(), 1, "should drop invalid UIDs");
-        assert_eq!(parsed[0].uids[0].id, "valid", "should keep valid UID");
-    }
-
-    #[test]
-    fn parse_client_auction_eids_preserves_pair_atype() {
-        let raw = json!([
-            {
-                "source": "google.com",
-                "uids": [{ "id": "pair-id", "atype": 571187 }]
-            }
-        ]);
-
-        let parsed = parse_client_auction_eids(Some(&raw)).expect("should parse PAIR EID");
+    fn merge_case_2_keeps_the_browser_atype_for_a_shared_uid() {
+        let merged = merged_json(
+            Some(vec![browser_eid(
+                SOURCE_S,
+                "u1",
+                Some(1),
+                Some("inserter-1.example.com"),
+                Some(1),
+            )]),
+            Some(vec![kv_eid(SOURCE_S, "u1", 3)]),
+        );
 
         assert_eq!(
-            parsed[0].uids[0].atype,
-            Some(571187),
-            "should preserve PAIR's vendor-specific atype"
+            merged,
+            json!([{ "source": SOURCE_S, "inserter": "inserter-1.example.com", "mm": 1, "uids": [{ "id": "u1", "atype": 1 }] }]),
+            "KV's operator-configured atype should not override the browser's"
         );
     }
 
     #[test]
-    fn parse_client_auction_eids_preserves_uid_ext_and_sanitizes_invalid_atype() {
-        let raw = json!([
-            {
-                "source": "adserver.org",
-                "uids": [
-                    {
-                        "id": "uid-with-ext",
-                        "atype": 1,
-                        "ext": { "provider": "liveintent.com", "rtiPartner": "TDID" }
-                    },
-                    {
-                        "id": "uid-bad-atype",
-                        "atype": 2_147_483_648_u64,
-                        "ext": { "keep": true }
-                    },
-                    {
-                        "id": "uid-float-atype",
-                        "atype": 1.5
-                    }
-                ]
-            }
-        ]);
+    fn merge_case_3_drops_the_stale_kv_uid_for_a_browser_source() {
+        let merged = merged_json(
+            Some(vec![browser_eid(
+                SOURCE_S,
+                "u1",
+                None,
+                Some("inserter-1.example.com"),
+                Some(1),
+            )]),
+            Some(vec![kv_eid(SOURCE_S, "u0", 3)]),
+        );
 
-        let parsed = parse_client_auction_eids(Some(&raw)).expect("should parse valid EIDs");
+        assert_eq!(
+            merged,
+            json!([{ "source": SOURCE_S, "inserter": "inserter-1.example.com", "mm": 1, "uids": [{ "id": "u1" }] }]),
+            "KV's value for a source the browser sends should not be forwarded"
+        );
+    }
 
-        assert_eq!(parsed.len(), 1, "should keep valid source");
-        assert_eq!(parsed[0].uids.len(), 3, "should keep valid UIDs");
-        assert_eq!(
-            parsed[0].uids[0].atype,
-            Some(1),
-            "should preserve valid atype"
+    #[test]
+    fn merge_case_4_appends_kv_sources_the_browser_did_not_send() {
+        let merged = merged_json(
+            Some(vec![browser_eid(SOURCE_S, "u1", None, None, None)]),
+            Some(vec![kv_eid(SOURCE_T, "t1", 3)]),
         );
+
         assert_eq!(
-            parsed[0].uids[0].ext,
-            Some(json!({ "provider": "liveintent.com", "rtiPartner": "TDID" })),
-            "should preserve uid ext"
+            merged,
+            json!([
+                { "source": SOURCE_S, "uids": [{ "id": "u1" }] },
+                { "source": SOURCE_T, "uids": [{ "id": "t1", "atype": 3 }] }
+            ]),
+            "browser entries should come first and KV-only sources after"
         );
-        assert_eq!(
-            parsed[0].uids[1].atype, None,
-            "should drop out-of-range atype without dropping uid"
+    }
+
+    #[test]
+    fn merge_case_5_keeps_same_source_entries_with_different_fields_apart() {
+        let merged = merged_json(
+            Some(vec![
+                browser_eid(
+                    SOURCE_S,
+                    "u1",
+                    None,
+                    Some("inserter-1.example.com"),
+                    Some(1),
+                ),
+                browser_eid(
+                    SOURCE_S,
+                    "u1",
+                    None,
+                    Some("inserter-2.example.com"),
+                    Some(2),
+                ),
+            ]),
+            None,
         );
+
         assert_eq!(
-            parsed[0].uids[1].ext,
-            Some(json!({ "keep": true })),
-            "should preserve ext when atype is invalid"
+            merged,
+            json!([
+                { "source": SOURCE_S, "inserter": "inserter-1.example.com", "mm": 1, "uids": [{ "id": "u1" }] },
+                { "source": SOURCE_S, "inserter": "inserter-2.example.com", "mm": 2, "uids": [{ "id": "u1" }] }
+            ]),
+            "two browser entries for one source should stay two entries"
         );
+    }
+
+    #[test]
+    fn merge_case_6_matches_sources_as_the_registry_normalizes_them() {
+        let merged = merged_json(
+            Some(vec![browser_eid(
+                "IDS.Example.com.",
+                "u1",
+                None,
+                None,
+                None,
+            )]),
+            Some(vec![kv_eid(SOURCE_S, "u0", 3)]),
+        );
+
         assert_eq!(
-            parsed[0].uids[2].atype, None,
-            "should drop non-integer atype without dropping uid"
+            merged,
+            json!([{ "source": "IDS.Example.com.", "uids": [{ "id": "u1" }] }]),
+            "a browser source differing only in case or a trailing dot should suppress KV's"
+        );
+    }
+
+    #[test]
+    fn merge_case_7_forwards_kv_entries_when_the_browser_sent_none() {
+        let merged = merged_json(
+            None,
+            Some(vec![kv_eid(SOURCE_S, "u0", 3), kv_eid(SOURCE_T, "t1", 3)]),
+        );
+
+        assert_eq!(
+            merged,
+            json!([
+                { "source": SOURCE_S, "uids": [{ "id": "u0", "atype": 3 }] },
+                { "source": SOURCE_T, "uids": [{ "id": "t1", "atype": 3 }] }
+            ]),
+            "KV entries should be forwarded unchanged without browser EIDs"
+        );
+    }
+
+    #[test]
+    fn merge_drops_entries_without_uids() {
+        let empty_browser = Eid::new(SOURCE_S.to_owned(), Vec::new());
+        let empty_kv = Eid::new(SOURCE_T.to_owned(), Vec::new());
+
+        assert_eq!(
+            merged_json(Some(vec![empty_browser]), Some(vec![empty_kv])),
+            JsonValue::Null,
+            "entries without UIDs should be dropped, leaving no EIDs"
         );
     }
 
     #[test]
     fn merge_auction_eids_deduplicates_client_and_resolved_ids() {
-        let client_eids = Some(vec![Eid {
-            source: "id5-sync.com".to_string(),
-            uids: vec![Uid {
-                id: "ID5_abc".to_string(),
-                atype: Some(1),
-                ext: None,
-            }],
-        }]);
-        let resolved_eids = Some(vec![
-            Eid {
-                source: "id5-sync.com".to_string(),
-                uids: vec![Uid {
-                    id: "ID5_abc".to_string(),
-                    atype: Some(1),
-                    ext: None,
-                }],
-            },
-            Eid {
-                source: "liveramp.com".to_string(),
-                uids: vec![Uid {
-                    id: "LR_xyz".to_string(),
-                    atype: Some(3),
-                    ext: None,
-                }],
-            },
-        ]);
+        let merged = merged_json(
+            Some(vec![kv_eid("id5-sync.com", "ID5_abc", 1)]),
+            Some(vec![
+                kv_eid("id5-sync.com", "ID5_abc", 1),
+                kv_eid("liveramp.com", "LR_xyz", 3),
+            ]),
+        );
 
-        let merged = merge_auction_eids(client_eids, resolved_eids).expect("should merge EIDs");
-
-        assert_eq!(merged.len(), 2, "should retain distinct EID sources");
-        assert_eq!(merged[0].source, "id5-sync.com");
-        assert_eq!(merged[0].uids.len(), 1, "should deduplicate matching UIDs");
-        assert_eq!(merged[1].source, "liveramp.com");
-        assert_eq!(merged[1].uids[0].id, "LR_xyz");
+        assert_eq!(
+            merged,
+            json!([
+                { "source": "id5-sync.com", "uids": [{ "id": "ID5_abc", "atype": 1 }] },
+                { "source": "liveramp.com", "uids": [{ "id": "LR_xyz", "atype": 3 }] }
+            ]),
+            "the browser's id5 entry should go out once, followed by KV's liveramp"
+        );
     }
 
     #[test]
-    fn merge_auction_eids_preserves_multiple_uids_per_source() {
-        let client_eids = Some(vec![Eid {
-            source: "sharedid.org".to_string(),
-            uids: vec![Uid {
-                id: "shared_client".to_string(),
-                atype: None,
-                ext: None,
-            }],
-        }]);
-        let resolved_eids = Some(vec![Eid {
-            source: "sharedid.org".to_string(),
-            uids: vec![Uid {
-                id: "shared_server".to_string(),
-                atype: Some(3),
-                ext: None,
-            }],
-        }]);
+    fn merge_auction_eids_does_not_union_kv_uids_into_a_browser_source() {
+        let merged = merged_json(
+            Some(vec![browser_eid(
+                "sharedid.org",
+                "shared_client",
+                None,
+                None,
+                None,
+            )]),
+            Some(vec![kv_eid("sharedid.org", "shared_server", 3)]),
+        );
 
-        let merged = merge_auction_eids(client_eids, resolved_eids).expect("should merge EIDs");
-
-        assert_eq!(merged.len(), 1, "should merge same-source entries");
-        assert_eq!(merged[0].uids.len(), 2, "should preserve distinct UIDs");
-        assert_eq!(merged[0].uids[0].id, "shared_server");
-        assert_eq!(merged[0].uids[1].id, "shared_client");
+        assert_eq!(
+            merged,
+            json!([{ "source": "sharedid.org", "uids": [{ "id": "shared_client" }] }]),
+            "KV's UID for a source the browser sends should not be added to it"
+        );
     }
 
     #[test]
-    fn merge_auction_eids_prefers_server_resolved_metadata_on_conflict() {
-        let client_eids = Some(vec![Eid {
-            source: "adserver.org".to_string(),
-            uids: vec![Uid {
-                id: "shared_uid".to_string(),
+    fn merge_auction_eids_keeps_browser_metadata_on_conflict() {
+        let client = Eid::new(
+            "adserver.org".to_owned(),
+            vec![Uid {
+                id: "shared_uid".to_owned(),
                 atype: Some(1),
                 ext: Some(json!({ "provider": "client" })),
             }],
-        }]);
-        let resolved_eids = Some(vec![Eid {
-            source: "adserver.org".to_string(),
-            uids: vec![Uid {
-                id: "shared_uid".to_string(),
+        );
+        let resolved = Eid::new(
+            "adserver.org".to_owned(),
+            vec![Uid {
+                id: "shared_uid".to_owned(),
                 atype: Some(3),
                 ext: Some(json!({ "provider": "server" })),
             }],
-        }]);
-
-        let merged = merge_auction_eids(client_eids, resolved_eids).expect("should merge EIDs");
-
-        assert_eq!(merged.len(), 1, "should merge duplicate source");
-        assert_eq!(merged[0].uids.len(), 1, "should deduplicate duplicate uid");
-        assert_eq!(
-            merged[0].uids[0].atype,
-            Some(3),
-            "should prefer resolved atype"
         );
+
         assert_eq!(
-            merged[0].uids[0].ext,
-            Some(json!({ "provider": "server" })),
-            "should prefer resolved ext"
+            merged_json(Some(vec![client]), Some(vec![resolved])),
+            json!([{
+                "source": "adserver.org",
+                "uids": [{ "id": "shared_uid", "atype": 1, "ext": { "provider": "client" } }]
+            }]),
+            "the browser's atype and ext should win over KV's"
         );
     }
 

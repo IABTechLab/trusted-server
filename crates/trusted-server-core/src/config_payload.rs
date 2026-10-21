@@ -72,16 +72,25 @@ pub fn settings_from_config_blob(
 }
 
 fn remove_inactive_secret_references(data: &mut serde_json::Value) {
-    if data
-        .pointer("/tinybird/enabled")
-        .and_then(serde_json::Value::as_bool)
-        != Some(true)
-        && let Some(tinybird) = data
-            .get_mut("tinybird")
-            .and_then(serde_json::Value::as_object_mut)
+    if let Some(tinybird) = data
+        .get_mut("tinybird")
+        .and_then(serde_json::Value::as_object_mut)
     {
-        tinybird.remove("auction_token_secret");
-        tinybird.remove("access_token_secret");
+        let enabled = tinybird.get("enabled").and_then(serde_json::Value::as_bool) == Some(true);
+        let auction_enabled = tinybird
+            .get("auction_enabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true);
+        let access_enabled = tinybird
+            .get("access_enabled")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        if !enabled || !auction_enabled {
+            tinybird.remove("auction_token_secret");
+        }
+        if !enabled || !access_enabled {
+            tinybird.remove("access_token_secret");
+        }
     }
 
     if let Some(partners) = data
@@ -206,6 +215,7 @@ mod tests {
                 "partner-api-token-key" => "resolved-partner-api-token-32-bytes-ok",
                 "partner-pull-token-key" => "resolved-partner-pull-token-32-bytes-ok",
                 "trusted-client-ip-key" => "resolved-trusted-client-ip-secret-32-bytes",
+                "trusted-forwarder-key" => "resolved-trusted-forwarder-secret-32-bytes",
                 _ => key,
             };
             Ok(value.as_bytes().to_vec())
@@ -444,6 +454,51 @@ mod tests {
                 .map(Redacted::expose)
                 .map(String::as_str),
             Some("resolved-partner-pull-token-32-bytes-ok")
+        );
+    }
+
+    #[test]
+    fn trusted_forwarder_resolves_shared_secret_from_default_store() {
+        let mut value =
+            serde_json::to_value(test_settings()).expect("should serialize test settings");
+        value["trusted_forwarder"] = serde_json::json!({"auth_header": "x-ts-forwarder-auth", "shared_secret": "trusted-forwarder-key"});
+        let original =
+            serde_json::from_value(value).expect("should deserialize the secret key reference");
+        let settings = settings_from_config_blob(
+            &envelope_json(&original),
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+        )
+        .expect("should resolve the trusted forwarder shared secret");
+        let value = serde_json::to_value(settings).expect("should serialize resolved settings");
+        assert_eq!(
+            value["trusted_forwarder"]["shared_secret"],
+            "resolved-trusted-forwarder-secret-32-bytes",
+            "should resolve the forwarder secret reference"
+        );
+    }
+
+    #[test]
+    fn trusted_forwarder_missing_shared_secret_fails_resolution_without_leaking_key() {
+        let mut value =
+            serde_json::to_value(test_settings()).expect("should serialize test settings");
+        value["trusted_forwarder"] = serde_json::json!({"auth_header": "x-ts-forwarder-auth", "shared_secret": "unused-trusted-forwarder-key"});
+        let original =
+            serde_json::from_value(value).expect("should deserialize the secret key reference");
+        let error = settings_from_config_blob(
+            &envelope_json(&original),
+            &UnifiedSecretStore,
+            &StoreName::from("ts_secrets"),
+        )
+        .expect_err("should reject a missing forwarder shared secret");
+        let message = format!("{error:?}");
+        assert!(
+            message.contains("trusted_forwarder.shared_secret"),
+            "should name the unresolved secret field: {message}"
+        );
+        assert!(
+            !message.contains("unused-trusted-forwarder-key"),
+            "should not expose the key reference: {message}"
         );
     }
 
@@ -736,6 +791,43 @@ mod tests {
     }
 
     #[test]
+    fn legacy_blob_without_rewrite_include_domains_loads_with_empty_list() {
+        let data =
+            serde_json::to_value(test_settings()).expect("should serialize settings to JSON");
+        let rewrite = data
+            .get("rewrite")
+            .and_then(serde_json::Value::as_object)
+            .expect("should serialize rewrite settings as an object");
+        assert!(
+            !rewrite.contains_key("include_domains"),
+            "should omit the default include list from the payload"
+        );
+
+        let reconstructed = load_settings(&envelope_json(&test_settings()))
+            .expect("should reconstruct settings without include_domains");
+
+        assert!(
+            reconstructed.rewrite.include_domains.is_empty(),
+            "should load an empty include list from a blob without the key"
+        );
+    }
+
+    #[test]
+    fn rewrite_include_domains_survive_blob_round_trip() {
+        let mut original = test_settings();
+        original.rewrite.include_domains = vec!["*.cdn.example.com".to_owned()];
+
+        let reconstructed = load_settings(&envelope_json(&original))
+            .expect("should reconstruct settings with include_domains");
+
+        assert_eq!(
+            reconstructed.rewrite.include_domains,
+            vec!["*.cdn.example.com".to_owned()],
+            "should preserve the configured include list"
+        );
+    }
+
+    #[test]
     fn disabled_rewrite_creatives_survives_blob_round_trip() {
         let mut original = test_settings();
         original.auction.rewrite_creatives = false;
@@ -747,6 +839,50 @@ mod tests {
             !reconstructed.auction.rewrite_creatives,
             "should preserve the explicit rewrite opt-out"
         );
+    }
+
+    #[test]
+    fn legacy_blob_without_rewrite_clicks_follows_rewrite_creatives() {
+        for rewrite_creatives in [true, false] {
+            let mut original = test_settings();
+            original.auction.rewrite_creatives = rewrite_creatives;
+            let data = serde_json::to_value(&original).expect("should serialize settings to JSON");
+            assert!(
+                data["auction"].get("rewrite_clicks").is_none(),
+                "should omit unset rewrite_clicks from the payload"
+            );
+
+            let reconstructed = load_settings(&envelope_json(&original))
+                .expect("should reconstruct settings without rewrite_clicks");
+
+            assert_eq!(
+                reconstructed.auction.rewrite_clicks, None,
+                "should load a blob without rewrite_clicks as unset"
+            );
+            assert_eq!(
+                reconstructed.auction.rewrites_auction_clicks(),
+                rewrite_creatives,
+                "should follow rewrite_creatives = {rewrite_creatives} when unset"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_rewrite_clicks_survives_blob_round_trip() {
+        for (rewrite_creatives, rewrite_clicks) in [(true, false), (false, true)] {
+            let mut original = test_settings();
+            original.auction.rewrite_creatives = rewrite_creatives;
+            original.auction.rewrite_clicks = Some(rewrite_clicks);
+
+            let reconstructed = load_settings(&envelope_json(&original))
+                .expect("should reconstruct explicit rewrite_clicks");
+
+            assert_eq!(
+                reconstructed.auction.rewrite_clicks,
+                Some(rewrite_clicks),
+                "should preserve rewrite_clicks = {rewrite_clicks} with rewrite_creatives = {rewrite_creatives}"
+            );
+        }
     }
 
     #[test]

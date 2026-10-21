@@ -143,6 +143,30 @@ When Trusted Server processes an HTML response, it automatically rewrites GTM sc
 <script src="/integrations/google_tag_manager/gtm.js?id=GTM-XXXXXX"></script>
 ```
 
+#### Next.js App Router Flight data
+
+With both `google_tag_manager` and `nextjs` enabled, Trusted Server also rewrites
+supported GTM/Google Analytics URLs inside captured App Router Flight payloads.
+Next.js origin-host rewrites and GTM rewrites compose before the decoded byte
+length of each `T` record is recomputed. This preserves the payload's record
+boundaries rather than applying ordinary script substitutions to raw Flight.
+Complete serialized channel-2 form state is preserved without disabling later
+Flight rewrites.
+
+Buffering is bounded and per document. Unsafe or unsupported payloads retain their
+original bytes. An uncaptured channel-1 data head or binary channel-3 push disables
+Flight rewriting for the rest of the document, including restoration of queued
+payloads; already-streamed complete groups cannot be restored. The conservative
+raw-head guard also applies to inert `self.__next_f.push([1,` text in strings,
+comments, or JSON-LD, so pages quoting Flight source may lose later origin/GTM
+rewrites. A warning identifies the first placeholder-stage document fallback
+without including the source text.
+
+Flight rewriting operates on supported quoted URL tokens and complete-record
+URLs, including bare origins; it is not limited to script attributes. This can
+also change rendered content and differ from SSR HTML rewriting. Restricting this
+policy and optimizing its inline-script cost are separate follow-ups.
+
 ### 2. Script Proxying
 
 The proxy intercepts requests for the GTM library and modifies it on-the-fly. This is critical for First-Party context.

@@ -13,75 +13,48 @@
   "modules": [
     {
       "moduleName": "connectIdSystem",
-      "configNames": ["connectId"],
-      "eidSources": ["yahoo.com"]
+      "configNames": ["connectId"]
     },
     {
       "moduleName": "criteoIdSystem",
-      "configNames": ["criteo"],
-      "eidSources": ["criteo.com"]
+      "configNames": ["criteo"]
     },
     {
       "moduleName": "id5IdSystem",
-      "configNames": ["id5Id"],
-      "eidSources": ["id5-sync.com"]
+      "configNames": ["id5Id"]
     },
     {
       "moduleName": "identityLinkIdSystem",
-      "configNames": ["identityLink"],
-      "eidSources": ["liveramp.com"]
+      "configNames": ["identityLink"]
     },
     {
       "moduleName": "liveIntentIdSystem",
       "configNames": ["liveIntentId"],
-      "eidSources": [
-        "liveintent.com",
-        "bidswitch.net",
-        "liveintent.triplelift.com",
-        "rubiconproject.com",
-        "liveintent.indexexchange.com",
-        "openx.net",
-        "pubmatic.com",
-        "liveintent.sovrn.com",
-        "liveintent.unrulymedia.com",
-        "media.net",
-        "zeta-ssp.liveintent.com",
-        "fpid.liveintent.com",
-        "sharethrough.com",
-        "liveintent.sonobi.com",
-        "liveintent.vidazoo.com"
-      ],
       "notes": "Imported through a local ESM shim because the public Prebid wrapper contains CommonJS require()."
     },
     {
       "moduleName": "lockrAIMIdSystem",
-      "configNames": ["lockrAIMId"],
-      "eidSources": []
+      "configNames": ["lockrAIMId"]
     },
     {
       "moduleName": "pairIdSystem",
-      "configNames": ["pairId"],
-      "eidSources": ["google.com"]
+      "configNames": ["pairId"]
     },
     {
       "moduleName": "pubProvidedIdSystem",
-      "configNames": ["pubProvidedId"],
-      "eidSources": []
+      "configNames": ["pubProvidedId"]
     },
     {
       "moduleName": "sharedIdSystem",
-      "configNames": ["sharedId", "pubCommonId"],
-      "eidSources": ["pubcid.org"]
+      "configNames": ["sharedId", "pubCommonId"]
     },
     {
       "moduleName": "uid2IdSystem",
-      "configNames": ["uid2"],
-      "eidSources": ["uidapi.com"]
+      "configNames": ["uid2"]
     },
     {
       "moduleName": "unifiedIdSystem",
-      "configNames": ["unifiedId"],
-      "eidSources": ["adserver.org"]
+      "configNames": ["unifiedId"]
     }
   ]
 }

@@ -200,9 +200,9 @@ fn generate_from_fixture(
             "--settle-max-ms",
             "1000",
         ]);
-    if dry_run {
-        command.arg("--dry-run");
-    }
+    // A test run has no terminal to confirm on, so a write must opt in the way
+    // automation does.
+    command.arg(if dry_run { "--dry-run" } else { "--yes" });
     command
         .output()
         .expect("should run generation against local GPT fixture")

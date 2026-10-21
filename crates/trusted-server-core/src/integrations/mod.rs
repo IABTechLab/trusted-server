@@ -18,6 +18,7 @@ pub mod didomi;
 pub mod google_tag_manager;
 pub mod gpt;
 pub mod gpt_diagnostics;
+pub mod identity;
 pub mod js_asset_proxy;
 pub mod lockr;
 pub mod nextjs;
@@ -25,6 +26,9 @@ pub mod osano;
 pub mod permutive;
 pub mod prebid;
 mod registry;
+mod sdk_url;
+#[cfg(test)]
+mod sdk_url_test_support;
 pub mod sourcepoint;
 pub mod testlight;
 
@@ -300,6 +304,8 @@ pub(crate) fn builders() -> &'static [IntegrationBuilder] {
             id: "testlight",
             build: testlight::register,
         },
+        // Next.js must precede GTM: GTM reads the Flight-protection snapshot
+        // that the Next.js script stage records for the same fragment.
         IntegrationBuilder {
             id: "nextjs",
             build: nextjs::register,

@@ -20,7 +20,7 @@ use super::kv::{
     apply_partner_id_updates,
 };
 use super::kv_types::KvEntry;
-use super::prebid_eids::collect_eid_updates;
+use super::prebid_eids::collect_browser_eid_updates;
 use super::pull_sync_marker::{expire_marker, reconcile_marker};
 use super::registry::PartnerRegistry;
 use super::{EcKvSnapshot, EidSyncSource, current_timestamp, log_id};
@@ -42,20 +42,23 @@ const EC_RESPONSE_HEADERS: &[&str] = &[
 /// immediately and the EC identity-graph KV tombstone is the authoritative
 /// revocation marker. There is no separate consent KV store to clean up.
 ///
-/// `eids_cookie` should be the raw value of the `ts-eids` cookie extracted
-/// from the request *before* routing consumes it.
+/// Browser cookie, staged auction body and sharedId updates are combined once.
 pub fn ec_finalize_response(
     settings: &Settings,
     ec_context: &mut EcContext,
     kv: Option<&KvIdentityGraph>,
     registry: &PartnerRegistry,
-    eids_cookie: Option<&str>,
     sharedid_cookie: Option<&str>,
     response: &mut Response<EdgeBody>,
 ) {
     ec_context.validate_pull_sync_marker(settings, registry);
-    let consent_allows_ec = ec_consent_granted(ec_context.consent());
-    let consent_withdrawn = ec_consent_withdrawn(ec_context.consent());
+    let captured_withdrawal = response
+        .extensions()
+        .get::<super::identity::IdentityEffects>()
+        .is_some_and(|effects| effects.withdraws(ec_context));
+    let consent_allows_ec = ec_consent_granted(ec_context.consent()) && !captured_withdrawal;
+    let consent_withdrawn = ec_consent_withdrawn(ec_context.consent()) || captured_withdrawal;
+    let body_updates = ec_context.take_browser_eid_updates();
 
     if !consent_allows_ec {
         // Expire the request-local marker independently of the EC cookie: a
@@ -72,6 +75,7 @@ pub fn ec_finalize_response(
             consent_withdrawn,
             response,
         );
+        super::identity_handoff::finalize_response(settings, registry, ec_context, response);
         return;
     }
 
@@ -79,16 +83,17 @@ pub fn ec_finalize_response(
     if ec_context.ec_was_present() && !ec_context.ec_generated() && consent_allows_ec {
         if let (Some(graph), Some(ec_id)) = (kv, ec_context.ec_value().map(str::to_owned)) {
             let source = ec_context.eid_sync_source();
-            let collected = source
+            let mut collected = source
                 .map(|_| {
-                    collect_eid_updates(
-                        eids_cookie,
+                    collect_browser_eid_updates(
+                        body_updates.clone(),
+                        browser_eids_cookie(ec_context),
                         sharedid_cookie,
-                        ec_context.client_eids(),
                         registry,
                     )
                 })
                 .unwrap_or_default();
+            protect_pending_capture_updates(&mut collected, ec_context, response);
             let had_eid_updates = !collected.is_empty();
             let updates = gate_eid_updates_by_consent(collected, ec_context.consent());
             // `sync_eid_cookie_updates` early-returns without refreshing the
@@ -123,8 +128,9 @@ pub fn ec_finalize_response(
 
         reconcile_pull_sync_marker(settings, registry, ec_context, response);
 
-        // Ordinary returning-user page views no longer refresh the browser
-        // cookie, emit the EC header, or update KV TTL.
+        // Capture handoff reconciliation is separate from browser EID ingestion.
+        super::identity_handoff::finalize_response(settings, registry, ec_context, response);
+        // Ordinary returning-user page views do not refresh the EC cookie.
         return;
     }
 
@@ -139,10 +145,10 @@ pub fn ec_finalize_response(
         };
 
         let updates = gate_eid_updates_by_consent(
-            collect_eid_updates(
-                eids_cookie,
+            collect_browser_eid_updates(
+                body_updates,
+                browser_eids_cookie(ec_context),
                 sharedid_cookie,
-                ec_context.client_eids(),
                 registry,
             ),
             ec_context.consent(),
@@ -156,6 +162,29 @@ pub fn ec_finalize_response(
     }
 
     reconcile_pull_sync_marker(settings, registry, ec_context, response);
+    super::identity_handoff::finalize_response(settings, registry, ec_context, response);
+}
+
+/// Selects cookie input without re-ingesting a stale cookie beside auction-scoped EIDs.
+fn browser_eids_cookie(context: &EcContext) -> Option<&str> {
+    match context.eid_sync_source() {
+        Some(EidSyncSource::Auction) => None,
+        _ => context.prebid_eids_cookie(),
+    }
+}
+
+fn protect_pending_capture_updates(
+    updates: &mut Vec<PartnerIdUpdate>,
+    context: &EcContext,
+    response: &Response<EdgeBody>,
+) {
+    let capture = response
+        .extensions()
+        .get::<super::identity::IdentityEffects>();
+    updates.retain(|update| {
+        !super::identity_handoff::protects_source(context, &update.partner_id)
+            && !capture.is_some_and(|effects| effects.protects_source(&update.partner_id))
+    });
 }
 
 fn sync_eid_cookie_updates(
@@ -526,12 +555,9 @@ where
 mod tests {
     use http::HeaderValue;
 
-    use base64::Engine as _;
-
     use super::*;
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{ConsentContext, ConsentSource};
-    use crate::openrtb::{Eid, Uid};
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
     use crate::test_support::tests::{create_test_settings, purpose_one_only_consent};
@@ -603,6 +629,7 @@ mod tests {
 
     fn make_partner(source_domain: &str) -> EcPartner {
         EcPartner {
+            identity_owner: None,
             name: format!("Partner {source_domain}"),
             source_domain: source_domain.to_owned(),
             openrtb_atype: EcPartner::default_openrtb_atype(),
@@ -618,6 +645,131 @@ mod tests {
             pull_sync_rate_limit: EcPartner::default_pull_sync_rate_limit(),
             ts_pull_token: None,
         }
+    }
+
+    #[test]
+    fn captured_withdrawal_precedes_browser_enrichment_and_is_retained_for_after_send() {
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("captwd");
+        let graph = KvIdentityGraph::in_memory("captured-withdrawal");
+        let mut live = KvEntry::minimal("id5-sync.com", "stored-id", current_timestamp());
+        live.consent.ok = true;
+        graph.create(&ec_id, &live).expect("should seed live row");
+        let registry = PartnerRegistry::from_config(&[
+            make_partner("id5-sync.com"),
+            make_partner("sharedid.org"),
+        ])
+        .expect("should build registry");
+        let mut context = make_context(
+            Some(&ec_id),
+            Some(&ec_id),
+            true,
+            false,
+            Jurisdiction::NonRegulated,
+        );
+        context.set_kv_snapshot(graph.load_snapshot(&ec_id));
+        context.set_eid_sync_source(EidSyncSource::Auction);
+        context.stage_browser_eid_updates(vec![PartnerIdUpdate::new("id5-sync.com", "body-id")]);
+        let effects = super::super::identity::stage_capture(
+            "lockr",
+            &["id5-sync.com"],
+            super::super::identity::IdentityObservation {
+                outcomes: vec![super::super::identity::IdentityOutcome::ConsentWithdrawn],
+                consent: Default::default(),
+            },
+            &context,
+            &registry,
+            &settings,
+        )
+        .expect("should stage approved global withdrawal");
+        let mut response = empty_response();
+        response.extensions_mut().insert(effects.clone());
+        set_header(&mut response, "x-ts-ec", &ec_id);
+        set_header(&mut response, "x-ts-eids", "retired-value");
+        ec_finalize_response(
+            &settings,
+            &mut context,
+            Some(&graph),
+            &registry,
+            Some("shared-id"),
+            &mut response,
+        );
+        assert!(
+            response.headers()[http::header::SET_COOKIE]
+                .to_str()
+                .expect("cookie header")
+                .contains("Max-Age=0")
+        );
+        assert!(response.headers().get("x-ts-ec").is_none());
+        assert!(response.headers().get("x-ts-eids").is_none());
+        let snapshot = context
+            .kv_snapshot()
+            .entry_for(&ec_id)
+            .expect("should retain withdrawn snapshot");
+        assert!(!snapshot.consent.ok);
+        assert!(
+            snapshot.ids.is_empty(),
+            "withdrawal cannot seed body or sharedId"
+        );
+        let (_, generation) = graph
+            .get(&ec_id)
+            .expect("should read tombstone")
+            .expect("tombstone exists");
+        effects.apply(&graph, &registry, &mut context);
+        let (stored, after_generation) = graph
+            .get(&ec_id)
+            .expect("should read tombstone")
+            .expect("tombstone exists");
+        assert_eq!(
+            generation, after_generation,
+            "after-send must not duplicate finalization tombstone"
+        );
+        assert!(stored.ids.is_empty());
+    }
+
+    #[test]
+    fn captured_withdrawal_for_another_full_ec_id_is_ignored() {
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("captwd");
+        let other_id = sample_ec_id("other1");
+        let registry = PartnerRegistry::empty();
+        let old_context = make_context(
+            Some(&ec_id),
+            Some(&ec_id),
+            true,
+            false,
+            Jurisdiction::NonRegulated,
+        );
+        let effects = super::super::identity::stage_capture(
+            "lockr",
+            &[],
+            super::super::identity::IdentityObservation {
+                outcomes: vec![super::super::identity::IdentityOutcome::ConsentWithdrawn],
+                consent: Default::default(),
+            },
+            &old_context,
+            &registry,
+            &settings,
+        )
+        .expect("should stage withdrawal");
+        let mut context = make_context(
+            Some(&other_id),
+            Some(&other_id),
+            true,
+            false,
+            Jurisdiction::NonRegulated,
+        );
+        let mut response = empty_response();
+        response.extensions_mut().insert(effects);
+        ec_finalize_response(
+            &settings,
+            &mut context,
+            None,
+            &registry,
+            None,
+            &mut response,
+        );
+        assert!(response.headers().get(http::header::SET_COOKIE).is_none());
     }
 
     #[test]
@@ -764,7 +916,6 @@ mod tests {
             Some(&kv),
             &registry,
             None,
-            None,
             &mut response,
         );
 
@@ -816,7 +967,6 @@ mod tests {
             Some(&kv),
             &registry,
             None,
-            None,
             &mut response,
         );
 
@@ -867,7 +1017,6 @@ mod tests {
             Some(&kv),
             &registry,
             None,
-            None,
             &mut response,
         );
 
@@ -911,7 +1060,6 @@ mod tests {
             &mut ec_context,
             None,
             &test_registry,
-            None,
             None,
             &mut response,
         );
@@ -964,7 +1112,6 @@ mod tests {
             None,
             &test_registry,
             None,
-            None,
             &mut response,
         );
 
@@ -998,7 +1145,6 @@ mod tests {
             None,
             &test_registry,
             None,
-            None,
             &mut response,
         );
 
@@ -1031,7 +1177,6 @@ mod tests {
             &mut ec_context,
             None,
             &test_registry,
-            None,
             None,
             &mut response,
         );
@@ -1072,7 +1217,6 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
             None,
             &mut response,
         );
@@ -1115,14 +1259,10 @@ mod tests {
         );
         ec_context.set_recovery_eligible(true);
         ec_context.set_eid_sync_source(EidSyncSource::Navigation);
-        ec_context.set_client_eids(vec![Eid {
-            source: "id5-sync.com".to_owned(),
-            uids: vec![Uid {
-                id: "ID5_should_not_persist".to_owned(),
-                atype: Some(1),
-                ext: None,
-            }],
-        }]);
+        ec_context.stage_browser_eid_updates(vec![PartnerIdUpdate::new(
+            "id5-sync.com",
+            "ID5_should_not_persist",
+        )]);
         let partners = vec![make_partner("id5-sync.com")];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let graph = KvIdentityGraph::in_memory("test_store");
@@ -1133,7 +1273,6 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry,
-            None,
             None,
             &mut response,
         );
@@ -1189,7 +1328,6 @@ mod tests {
             Some(&graph),
             &registry,
             None,
-            None,
             &mut response,
         );
 
@@ -1232,7 +1370,6 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry,
-            None,
             Some("shared-cookie-id"),
             &mut response,
         );
@@ -1245,6 +1382,158 @@ mod tests {
             !stored.ids.contains_key("sharedid.org"),
             "a subresource response must not persist request EID cookies"
         );
+    }
+
+    #[test]
+    fn finalize_restored_cookie_combines_with_body_and_sharedid_once() {
+        for source in [
+            EidSyncSource::Navigation,
+            EidSyncSource::PageBids,
+            EidSyncSource::Auction,
+        ] {
+            let settings = create_test_settings();
+            let ec_id = sample_ec_id("cook01");
+            let graph = KvIdentityGraph::in_memory("restored-cookie");
+            let root = KvEntry::new(
+                &granting_consent(),
+                None,
+                current_timestamp(),
+                &settings.publisher.domain,
+            );
+            graph.create(&ec_id, &root).expect("should seed live root");
+            let value = base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                serde_json::to_vec(&serde_json::json!([
+                    {"source":"id5-sync.com", "uids":[{"id":"cookie-id5"}]},
+                    {"source":"ids.example.com", "uids":[{"id":"cookie-only"}]},
+                    {"source":"sharedid.org", "uids":[{"id":"cookie-shared"}]}
+                ]))
+                .expect("should encode browser cookie"),
+            );
+            let request = http::Request::builder()
+                .header("cookie", format!("ts-ec={ec_id}; ts-eids={value}"))
+                .body(EdgeBody::empty())
+                .expect("should build request");
+            let mut context = EcContext::read_from_request(
+                &settings,
+                &request,
+                &crate::platform::test_support::noop_services(),
+            )
+            .expect("should read browser cookie");
+            *context.consent_mut() = granting_consent();
+            context.set_kv_snapshot(graph.load_snapshot(&ec_id));
+            context.set_eid_sync_source(source);
+            context.stage_browser_eid_updates(vec![
+                PartnerIdUpdate::new("id5-sync.com", "body-id5"),
+                PartnerIdUpdate::new("sharedid.org", "body-shared"),
+            ]);
+            let registry = PartnerRegistry::from_config(&[
+                make_partner("id5-sync.com"),
+                make_partner("ids.example.com"),
+                make_partner("sharedid.org"),
+            ])
+            .expect("should build registry");
+            let mut response = empty_response();
+            ec_finalize_response(
+                &settings,
+                &mut context,
+                Some(&graph),
+                &registry,
+                Some("direct-shared"),
+                &mut response,
+            );
+            let stored = graph
+                .get(&ec_id)
+                .expect("should read combined write")
+                .expect("should retain root")
+                .0;
+            assert_eq!(
+                stored.ids["id5-sync.com"].uid, "body-id5",
+                "body must override browser cookie"
+            );
+            if source == EidSyncSource::Auction {
+                assert!(
+                    !stored.ids.contains_key("ids.example.com"),
+                    "should not ingest a cookie-only source beside auction-scoped input"
+                );
+            } else {
+                assert_eq!(
+                    stored.ids["ids.example.com"].uid, "cookie-only",
+                    "cookie-only routes should still persist registered sources"
+                );
+            }
+            assert_eq!(
+                stored.ids["sharedid.org"].uid, "direct-shared",
+                "direct sharedId must retain final precedence"
+            );
+        }
+    }
+
+    #[test]
+    fn restored_cookie_cannot_replace_managed_or_expired_metadata() {
+        for cookie_uid in ["stored-id", "different-browser-id"] {
+            let settings = create_test_settings();
+            let ec_id = sample_ec_id("cook02");
+            let graph = KvIdentityGraph::in_memory("cookie-metadata");
+            let mut root = KvEntry::minimal("ids.example.com", "stored-id", current_timestamp());
+            root.consent.ok = true;
+            let record = root
+                .ids
+                .get_mut("ids.example.com")
+                .expect("should get managed record");
+            record.expires_at = Some(1);
+            record.writer = Some("lockr".to_owned());
+            record.revision = Some("stored-revision".to_owned());
+            let original_record = record.clone();
+            graph
+                .create(&ec_id, &root)
+                .expect("should seed managed record");
+            let value = base64::Engine::encode(&base64::engine::general_purpose::STANDARD,
+                serde_json::to_vec(&serde_json::json!([
+                    {"source":"ids.example.com", "uids":[{"id":cookie_uid}], "writer":"forged", "expires_at":9999999999_u64},
+                    {"source":"browser.example.com", "uids":[{"id":"new-browser-id"}]}
+                ])).expect("should encode browser cookie"));
+            let request = http::Request::builder()
+                .header("cookie", format!("ts-ec={ec_id}; ts-eids={value}"))
+                .body(EdgeBody::empty())
+                .expect("should build request");
+            let mut context = EcContext::read_from_request(
+                &settings,
+                &request,
+                &crate::platform::test_support::noop_services(),
+            )
+            .expect("should read cookie");
+            *context.consent_mut() = granting_consent();
+            context.set_kv_snapshot(graph.load_snapshot(&ec_id));
+            context.set_eid_sync_source(EidSyncSource::Navigation);
+            let registry = PartnerRegistry::from_config(&[
+                make_partner("ids.example.com"),
+                make_partner("browser.example.com"),
+            ])
+            .expect("should build registry");
+            let mut response = empty_response();
+            ec_finalize_response(
+                &settings,
+                &mut context,
+                Some(&graph),
+                &registry,
+                None,
+                &mut response,
+            );
+            let stored = graph
+                .get(&ec_id)
+                .expect("should read store")
+                .expect("should retain root")
+                .0;
+            assert_eq!(
+                stored.ids["ids.example.com"], original_record,
+                "browser cookie must preserve managed lifecycle metadata"
+            );
+            assert_eq!(
+                stored.ids["browser.example.com"].uid, "new-browser-id",
+                "independent absent source may still fill"
+            );
+        }
     }
 
     #[test]
@@ -1276,7 +1565,6 @@ mod tests {
                 &mut ec_context,
                 Some(&graph),
                 &registry,
-                None,
                 Some(cookie_id),
                 &mut response,
             );
@@ -1319,7 +1607,6 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry,
-            None,
             Some("generated-cookie-id"),
             &mut response,
         );
@@ -1464,7 +1751,6 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry,
-            None,
             Some("shared-cookie-id"),
             &mut response,
         );
@@ -1482,12 +1768,9 @@ mod tests {
     }
 
     #[test]
-    fn finalize_persists_every_configured_partner_from_client_eids_over_a_trimmed_cookie() {
-        // Regression test for #1184: the `ts-eids` cookie only carries what
-        // the browser could fit under its size cap, but `/auction` also
-        // hands finalization the full EID set from the request body via
-        // `EcContext::set_client_eids`. That full set must land in KV even
-        // when the cookie alone would have dropped a configured partner.
+    fn finalize_persists_every_configured_partner_from_staged_body_eids() {
+        // Regression test for #1184: persistence must use the full auction body,
+        // without depending on the size-capped EID cookie.
         let settings = create_test_settings();
         let ec_id = sample_ec_id("cleids1");
         let graph = KvIdentityGraph::in_memory("test_store");
@@ -1508,31 +1791,9 @@ mod tests {
             false,
         );
         ec_context.set_eid_sync_source(EidSyncSource::Auction);
-        // Only `id5-sync.com` "fit" in the (simulated) trimmed cookie;
-        // `liveramp.com` was dropped by the browser's size cap.
-        let eids_cookie = base64::engine::general_purpose::STANDARD.encode(
-            serde_json::to_vec(&serde_json::json!([
-                {"source": "id5-sync.com", "uids": [{"id": "ID5_from_cookie", "atype": 1}]}
-            ]))
-            .expect("should serialize test cookie payload"),
-        );
-        ec_context.set_client_eids(vec![
-            Eid {
-                source: "id5-sync.com".to_owned(),
-                uids: vec![Uid {
-                    id: "ID5_from_body".to_owned(),
-                    atype: Some(1),
-                    ext: None,
-                }],
-            },
-            Eid {
-                source: "liveramp.com".to_owned(),
-                uids: vec![Uid {
-                    id: "LR_from_body".to_owned(),
-                    atype: Some(3),
-                    ext: None,
-                }],
-            },
+        ec_context.stage_browser_eid_updates(vec![
+            PartnerIdUpdate::new("id5-sync.com", "ID5_from_body"),
+            PartnerIdUpdate::new("liveramp.com", "LR_from_body"),
         ]);
         let partners = vec![make_partner("id5-sync.com"), make_partner("liveramp.com")];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
@@ -1543,7 +1804,6 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry,
-            Some(&eids_cookie),
             None,
             &mut response,
         );
@@ -1555,12 +1815,12 @@ mod tests {
         assert_eq!(
             stored.ids.get("id5-sync.com").map(|id| id.uid.as_str()),
             Some("ID5_from_body"),
-            "the request body's EID should win over the cookie's stale value"
+            "the request body's EID should persist without an EID cookie"
         );
         assert_eq!(
             stored.ids.get("liveramp.com").map(|id| id.uid.as_str()),
             Some("LR_from_body"),
-            "a partner the cookie trimmed must still be ingested from the body"
+            "every configured partner must be ingested from the body"
         );
     }
 
@@ -1595,14 +1855,10 @@ mod tests {
             ec_id: ec_id.clone(),
         });
         ec_context.set_eid_sync_source(EidSyncSource::Auction);
-        ec_context.set_client_eids(vec![Eid {
-            source: "id5-sync.com".to_owned(),
-            uids: vec![Uid {
-                id: "ID5_should_not_persist".to_owned(),
-                atype: Some(1),
-                ext: None,
-            }],
-        }]);
+        ec_context.stage_browser_eid_updates(vec![PartnerIdUpdate::new(
+            "id5-sync.com",
+            "ID5_should_not_persist",
+        )]);
         let partners = vec![make_partner("id5-sync.com")];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let mut response = empty_response();
@@ -1612,7 +1868,6 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry,
-            None,
             None,
             &mut response,
         );
@@ -1652,7 +1907,6 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry,
-            None,
             Some("shared-cookie-id"),
             &mut response,
         );
@@ -1696,7 +1950,6 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
             None,
             &mut response,
         );
@@ -1743,7 +1996,6 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
             None,
             &mut response,
         );
@@ -1801,7 +2053,6 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
             &mut response,
         );
 
@@ -1848,7 +2099,6 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
             &mut response,
         );
 
@@ -1878,7 +2128,6 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
             &mut response,
         );
 
@@ -1900,7 +2149,6 @@ mod tests {
             &mut ec_context,
             None,
             &test_registry,
-            None,
             None,
             &mut response,
         );
@@ -1936,7 +2184,6 @@ mod tests {
             &mut ec_context,
             None,
             &test_registry,
-            None,
             None,
             &mut response,
         );
@@ -2009,7 +2256,6 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
             &mut response,
         );
 
@@ -2036,7 +2282,6 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
             &mut response,
         );
 
@@ -2061,7 +2306,6 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
             None,
             &mut response,
         );
@@ -2089,7 +2333,6 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
             None,
             &mut response,
         );
@@ -2128,7 +2371,6 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
             None,
             &mut response,
         );
@@ -2182,7 +2424,6 @@ mod tests {
             Some(&graph),
             &PartnerRegistry::empty(),
             None,
-            None,
             &mut response,
         );
 
@@ -2217,7 +2458,6 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
             None,
             &mut repeated_response,
         );
@@ -2265,7 +2505,6 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &PartnerRegistry::empty(),
-            None,
             None,
             &mut response,
         );
@@ -2317,6 +2556,7 @@ mod tests {
             "ssp.example.com".to_owned(),
             crate::ec::kv_types::KvPartnerId {
                 uid: "partner-uid".to_owned(),
+                ..Default::default()
             },
         );
         ec_context.set_kv_snapshot(EcKvSnapshot::Present {
@@ -2331,7 +2571,6 @@ mod tests {
             &mut ec_context,
             None,
             &registry,
-            None,
             None,
             &mut response,
         );
@@ -2368,7 +2607,6 @@ mod tests {
             None,
             &PartnerRegistry::empty(),
             None,
-            None,
             &mut response,
         );
 
@@ -2398,7 +2636,6 @@ mod tests {
             &mut ec_context,
             None,
             &PartnerRegistry::empty(),
-            None,
             None,
             &mut response,
         );

@@ -7,8 +7,10 @@
 use axum::body::Body as AxumBody;
 use axum::http::Request;
 use edgezero_adapter_axum::service::EdgeZeroAxumService;
+use std::sync::Arc;
 use tower::{Service as _, ServiceExt as _};
 use trusted_server_adapter_axum::app::TrustedServerApp;
+use trusted_server_core::test_support::nextjs_auction;
 
 const LEGACY_ADMIN_DENY_METHODS: &[&str] =
     &["GET", "POST", "HEAD", "OPTIONS", "PUT", "PATCH", "DELETE"];
@@ -412,14 +414,32 @@ async fn admin_ec_route_without_credentials_returns_401() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn authenticated_admin_eids_route_returns_200() {
-    // The EIDs echo is pure request inspection (no KV), so the dev server
-    // serves the real handler.
+async fn admin_eids_route_still_requires_authentication() {
+    let req = Request::builder()
+        .method("GET")
+        .uri("/_ts/admin/eids")
+        .body(AxumBody::empty())
+        .expect("should build request");
+    let resp = make_service()
+        .ready()
+        .await
+        .expect("should be ready")
+        .call(req)
+        .await
+        .expect("should respond");
+    assert_eq!(resp.status().as_u16(), 401);
+    assert!(resp.headers().contains_key("www-authenticate"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn authenticated_admin_eids_route_returns_diagnostic_locally() {
+    // The diagnostic is served locally, never via publisher fallback.
     let mut svc = make_service();
     let req = Request::builder()
         .method("GET")
         .uri("/_ts/admin/eids")
         .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+        .header("cookie", "ts-eids=private-cookie-value")
         .body(AxumBody::empty())
         .expect("should build request");
     let resp = svc
@@ -429,10 +449,37 @@ async fn authenticated_admin_eids_route_returns_200() {
         .call(req)
         .await
         .expect("should respond");
+    assert_eq!(resp.status().as_u16(), 200);
     assert_eq!(
-        resp.status().as_u16(),
-        200,
-        "/_ts/admin/eids should serve the real EIDs echo handler"
+        resp.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.split(';').next().unwrap_or(v)),
+        Some("application/json")
+    );
+    assert_eq!(
+        resp.headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+    assert_eq!(
+        resp.headers()
+            .get("x-content-type-options")
+            .and_then(|v| v.to_str().ok()),
+        Some("nosniff")
+    );
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .expect("should read admin EIDs response body");
+    let body = std::str::from_utf8(&body).expect("should read UTF-8 admin EIDs response");
+    assert!(
+        body.contains("\"cookie_present\":true"),
+        "should inspect the request cookie locally"
+    );
+    assert!(
+        body.contains("ts-eids"),
+        "should include the cookie diagnostic"
     );
 }
 
@@ -878,10 +925,6 @@ async fn first_party_proxy_rebuild_is_routed() {
 /// Fastly adapter alone and not by this test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nextjs_auction_output_holds_until_the_structural_body_close() {
-    use std::sync::Arc;
-
-    use trusted_server_core::test_support::nextjs_auction;
-
     let client = Arc::new(nextjs_auction::NextJsAuctionOrigin::default());
     let router = TrustedServerApp::routes_with_settings_and_services(
         nextjs_auction::settings(),
@@ -969,4 +1012,160 @@ async fn health_reports_git_version() {
         trusted_server_core::constants::TS_GIT_VERSION,
         "should report the compiled-in git version on /health"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nextjs_gtm_rejects_malformed_request_hosts() {
+    for (header, expected_status) in [("host", 400), ("x-forwarded-host", 200), ("forwarded", 200)]
+    {
+        let origin = Arc::new(nextjs_auction::NextJsAuctionOrigin::with_html_response(
+            &nextjs_auction::script_composition_html(),
+            false,
+            true,
+        ));
+        let router = TrustedServerApp::routes_with_settings_and_services(
+            nextjs_auction::script_composition_settings(),
+            nextjs_auction::services(origin),
+        )
+        .expect("should build script composition router");
+        let mut service = EdgeZeroAxumService::new(router);
+        let hostile_host = "example.com</script><script>alert(1)</script>";
+        let value = if header == "forwarded" {
+            format!("host=\"{hostile_host}\"")
+        } else {
+            hostile_host.to_owned()
+        };
+        let mut request = Request::builder()
+            .uri("/script-composition")
+            .header("host", nextjs_auction::PUBLISHER_HOST)
+            .body(AxumBody::empty())
+            .expect("should build hostile host request");
+        request.headers_mut().insert(
+            header,
+            value.parse().expect("should encode hostile host header"),
+        );
+        let response = service
+            .ready()
+            .await
+            .expect("should be ready")
+            .call(request)
+            .await
+            .expect("should respond to hostile host request");
+        assert_eq!(
+            response.status().as_u16(),
+            expected_status,
+            "should reject a malformed Host and ignore unauthenticated {header}"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("should consume host rejection response");
+        assert!(
+            !String::from_utf8_lossy(&body).contains(hostile_host),
+            "should not reflect the rejected host in the response"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nextjs_gtm_accepts_local_request_hosts_and_ports() {
+    for host in [
+        "localhost:3000",
+        "example.com:8443",
+        "[::1]:3000",
+        "my_service:8080",
+        "_service_.example.com:8443",
+    ] {
+        let origin = Arc::new(nextjs_auction::NextJsAuctionOrigin::with_html_response(
+            &nextjs_auction::script_composition_html(),
+            false,
+            true,
+        ));
+        let router = TrustedServerApp::routes_with_settings_and_services(
+            nextjs_auction::script_composition_settings(),
+            nextjs_auction::services(origin),
+        )
+        .expect("should build script composition router");
+        let mut service = EdgeZeroAxumService::new(router);
+        let request = Request::builder()
+            .uri("/script-composition")
+            .header("host", host)
+            .body(AxumBody::empty())
+            .expect("should build local host request");
+        let response = service
+            .ready()
+            .await
+            .expect("should be ready")
+            .call(request)
+            .await
+            .expect("should serve local host request");
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "should accept host: {host}"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("should consume local host response");
+        let html = String::from_utf8(body.to_vec()).expect("should emit UTF-8 HTML");
+        assert!(
+            html.contains(&format!("http://{host}/app")),
+            "should preserve host and port in rewritten Flight URL: {host}"
+        );
+        assert!(
+            !html.contains("__ts_rsc_"),
+            "should resolve every local host payload"
+        );
+        assert!(
+            html.ends_with("</body></html>"),
+            "should complete local response"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nextjs_gtm_html_response_is_complete() {
+    for gzip in [false, true] {
+        let origin = Arc::new(nextjs_auction::NextJsAuctionOrigin::with_html_response(
+            &nextjs_auction::script_composition_html(),
+            gzip,
+            false,
+        ));
+        let router = TrustedServerApp::routes_with_settings_and_services(
+            nextjs_auction::script_composition_settings(),
+            nextjs_auction::services(origin),
+        )
+        .expect("should build mixed integration router");
+        let mut service = EdgeZeroAxumService::new(router);
+        let request = Request::builder()
+            .method("GET")
+            .uri("/article")
+            .header("host", nextjs_auction::PUBLISHER_HOST)
+            .header("accept", "text/html")
+            .body(AxumBody::empty())
+            .expect("should build navigation");
+        let response = service
+            .ready()
+            .await
+            .expect("should be ready")
+            .call(request)
+            .await
+            .expect("should serve HTML");
+        assert_eq!(
+            response.status().as_u16(),
+            200,
+            "should return a successful composed publisher response"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("content-encoding")
+                .map(|value| value.to_str().expect("should have ASCII coding")),
+            gzip.then_some("gzip"),
+            "should retain the requested response compression"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("should consume entire adapter body");
+        nextjs_auction::assert_script_composition_response(&body, gzip);
+    }
 }

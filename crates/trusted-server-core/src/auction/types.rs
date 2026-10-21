@@ -93,7 +93,7 @@ pub struct UserInfo {
     /// cookies/headers, not from stored data.
     #[serde(skip)]
     pub consent: Option<crate::consent::ConsentContext>,
-    /// Extended User IDs parsed from the [`crate::constants::COOKIE_TS_EIDS`] cookie.
+    /// Extended User IDs from the current auction body and usable registered KV records.
     ///
     /// Raw (un-gated) values from the browser; consent gating via
     /// [`crate::consent::gate_eids_by_consent`] is applied centrally in the
