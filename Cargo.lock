@@ -7095,6 +7095,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
  "sha1-checked",
  "sha2 0.10.9",
  "tar",

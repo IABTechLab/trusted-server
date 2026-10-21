@@ -1439,3 +1439,25 @@ jobs:
           set -euo pipefail
           TEST_NAME=collection::transfer::ordinary::real_uploaded_archive
           cargo +"$RUST_VERSION" test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --nocapture
+
+  test-release-workflow-contract:
+    name: Release validation helper contracts (pure)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0 (Node 24)
+        with:
+          persist-credentials: false
+
+      - name: Read pinned Node version
+        id: node
+        shell: bash
+        run: |
+          echo "version=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0 (Node 24)
+        with:
+          node-version: ${{ steps.node.outputs.version }}
+
+      - name: Check invocation and waiter contracts without network or child processes
+        run: node --test .github/workflows/release-validation.test.mjs

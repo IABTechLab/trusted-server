@@ -16,6 +16,112 @@ const TOOLS: &str = "scripts/release/release-tools.json";
 const CLI_POLICY: &str = "crates/trusted-server-cli/release-policy.json";
 const BOOTSTRAP: &str = "scripts/release/bootstrap.sh";
 
+#[test]
+fn workflow_contract_command_checks_reviewed_files_without_release_authority() {
+    let root = tempdir().expect("should create private workflow fixture");
+    for name in ["release-validation.yml", "release-validation.mjs"] {
+        fs::copy(
+            Path::new(REPOSITORY).join(".github/workflows").join(name),
+            root.path().join(name),
+        )
+        .expect("should copy reviewed contract input");
+    }
+    let output = Command::new(RELEASE_BIN)
+        .current_dir(root.path())
+        .env_clear()
+        .args([
+            "check-workflow-contract",
+            "--workflow",
+            "release-validation.yml",
+        ])
+        .output()
+        .expect("should run only the release contract checker");
+    assert!(
+        output.status.success(),
+        "should accept the reviewed workflow: {}",
+        stderr(&output)
+    );
+    let report: Value =
+        serde_json::from_slice(&output.stdout).expect("should parse contract diagnostic");
+    assert_eq!(
+        report["release_qualification"], false,
+        "should grant no release authority"
+    );
+    assert_eq!(
+        report["source_eligibility"], false,
+        "should grant no source eligibility"
+    );
+}
+
+#[test]
+fn workflow_contract_command_requires_an_explicit_readable_workflow() {
+    for arguments in [
+        vec!["check-workflow-contract"],
+        vec![
+            "check-workflow-contract",
+            "--workflow",
+            "missing-example.yml",
+        ],
+    ] {
+        let output = Command::new(RELEASE_BIN)
+            .env_clear()
+            .args(arguments)
+            .output()
+            .expect("should run only the release contract checker");
+        assert!(
+            !output.status.success(),
+            "should reject absent contract input"
+        );
+        assert!(
+            output.stdout.is_empty(),
+            "should emit no acceptance on failure"
+        );
+    }
+}
+
+#[test]
+fn workflow_contract_command_rejects_changed_workflow_or_runtime_helper() {
+    for changed in ["release-validation.yml", "release-validation.mjs"] {
+        let root = tempdir().expect("should create private workflow fixture");
+        for name in ["release-validation.yml", "release-validation.mjs"] {
+            let original = fs::read(Path::new(REPOSITORY).join(".github/workflows").join(name))
+                .expect("should read reviewed contract input");
+            let bytes = if name == changed {
+                if name.ends_with(".yml") {
+                    String::from_utf8(original)
+                        .expect("should decode reviewed YAML")
+                        .replace("cargo test-fastly", "echo example-command")
+                        .into_bytes()
+                } else {
+                    [
+                        original.as_slice(),
+                        b"\n// Example unreviewed helper change.\n",
+                    ]
+                    .concat()
+                }
+            } else {
+                original
+            };
+            fs::write(root.path().join(name), bytes).expect("should write private contract input");
+        }
+        let output = Command::new(RELEASE_BIN)
+            .current_dir(root.path())
+            .env_clear()
+            .args([
+                "check-workflow-contract",
+                "--workflow",
+                "release-validation.yml",
+            ])
+            .output()
+            .expect("should run only the release contract checker");
+        assert!(!output.status.success(), "should reject changed {changed}");
+        assert!(
+            output.stdout.is_empty(),
+            "should emit no acceptance on failure"
+        );
+    }
+}
+
 fn manual_package_fixture(root: &Path) -> (String, String) {
     let manifest = b"manifest_version = 3\nname = \"example-app\"\n";
     let wasm = b"\0asm\x01\0\0\0";

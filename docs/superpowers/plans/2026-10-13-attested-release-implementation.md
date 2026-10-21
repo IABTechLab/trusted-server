@@ -596,11 +596,78 @@ publication and qualification stay open.
 **Modify:** `.github/workflows/test.yml`, `format.yml` only to extract/reuse existing required jobs without losing existing triggers/gates.
 
 - [ ] Add static workflow fixtures for wrong SHA/event/ref, unlisted RC branch, malicious candidate allowlist, forged local remote refs, missing governance/ruleset/bypass approval, skipped/path-filtered gates, arbitrary commands, excessive permissions and any floating external action ref in the complete release/validation invocation.
-- [ ] Run `cargo test -p trusted-server-release --target "$HOST_TARGET" workflow_contract` with the nonzero-selection guard; expect absent callable validation.
+- [x] Run the pure `workflow_contract` suite with the nonzero-selection guard. The scoped 2026-10-21 run selected and passed 19 tests; three release-binary-only command tests and 45 pure Node tests also passed. These checks do not establish hosted release eligibility.
 - [ ] SHA-pin every external action in release.yml, release-build.yml and all called release validation jobs, including checkout/setup/cache/upload/download and attest. Preserve readable version comments, audit dependencies and reject floating @v\*/main refs. Local workflow calls are allowed only at the caller's checked source revision. Existing test/format action refs MUST NOT be inherited unreviewed into this path.
 - [ ] Expose reviewed workflow_call or explicit jobs running every current AGENTS gate at the tag SHA. Maintain PR/main tests; RC is permitted only by exact reviewed cohort branch entries. Validate strict SemVer/lightweight tag independently; annotated tags fail.
 - [ ] Wait up to 90 minutes for this invocation's required terminal validation results; fail cancelled/skipped/timeout results with rerun guidance. Do not trust arbitrary named successful checks or unrelated main commits.
 - [ ] Include JS build/tests/format, all Rust aliases/parity/CLI/build-digest, the explicit host-only release-tool test/clippy gate (or reviewed aliases), docs/Markdown and `scripts/lint-wasm-clock.sh`. Commit `Validate release source at the exact tag commit`.
+
+Progress (2026-10-21, partial Task 14): `release-validation.yml` exposes only
+`workflow_call` with one required source SHA. Its explicit jobs cover the current
+AGENTS gates, host release-tool Linux/macOS tests and clippy, and existing parity,
+codegen, JS prebuilt, documentation and trust-test checks. Every checkout selects
+the supplied SHA with persisted credentials disabled. Both external actions use
+reviewed commit pins and version comments; no composite or local workflow is
+inherited. Shell Rust setup follows the existing native release-tool approach
+without introducing a floating action or shared cache.
+
+The read-only `check-workflow-contract --workflow <path>` command checks exactly
+one reviewed workflow and its fixed sibling helper. It executes nothing, performs
+no network access and reports both source eligibility and release qualification
+as false. Inputs are bounded to 1 MiB before parsing; held regular-file reads use
+no-follow/nonblocking open. Raw workflow, canonical parsed structure and helper
+digests bind commands, permissions, conditions, action pins and each version
+comment. YAML references, merge keys, duplicate/non-string keys, tags and
+unsupported ambiguous spellings fail. The restricted parser conservatively
+rejects reference indicators outside literal run blocks, even in quoted scalars.
+Formatting or helper changes require explicit review and pin updates. Additional
+files and local invocation graphs remain unsupported; Tasks 15–16 must extend
+this closed contract when their actual caller/signing workflows exist. The YAML
+dependency reuses the workspace package; the lockfile adds only its dependency
+edge, with no new package.
+
+The runtime helper requires the same full source/workflow SHA, official repository
+identity, tag-push event, exact caller/ref and strict bounded SemVer. Fixed-origin
+bounded read-only REST requests observe the unpeeled lightweight tag, actual
+remote `main` tip and ancestry; neither local refs nor candidate branch entries
+provide authority. No RC branch is approved. Admission records observations and
+`source_eligibility: false`, allowing quality checks to run without authorizing a
+release. The parallel waiter enumerates this run attempt's required terminal jobs,
+rejects missing/duplicate/wrong-source results and non-success conclusions, and
+uses an original-run, queue-inclusive 90-minute window with monotonic remaining
+budgets for requests and polling. The first bounded REST read obtains the trusted
+run creation time. Rerunning jobs cannot reset that window; diagnostics distinguish
+reruns within it from an expired window requiring a fresh trusted invocation.
+
+Even if every quality gate succeeds, the terminal helper fails because an
+independently approved governance/ruleset/bypass profile is not established.
+No approval schema, ruleset identity or bypass actor is invented. Consequently
+Task 14 remains open for independent governance authority and live callable
+acceptance, and the remaining checklist exits stay unchecked. No tag/release
+trigger, signing, publication, settings change or qualified capability is added.
+
+Preservation check: all 16 pre-existing `test.yml` jobs and five `format.yml` jobs
+retain their exact names, conditions, dependencies and matrices. `test.yml` only
+appends the pure helper-contract job; `format.yml` is byte-identical. Thus existing
+triggers, path classification, caches, native-reproduction selectors, four
+candidate legs and the candidate-index collector remain unchanged. The before/
+after listing was compared against `d774ee47c` before editing.
+
+Local verification passes the 19 pure Rust cases, three checker command cases,
+45 pure Node tests, strict host clippy, documentation, owned-file rustfmt and
+Prettier, and the forbidden-action guard. Modified workflows pass actionlint.
+The all-workflow actionlint run reproduces three existing diagnostics in unchanged
+`deploy-docs.yml`/`docs-proposal.yml` (unquoted output path and locally unsupported
+concurrency/permission keys); the baseline at `d774ee47c` reports the same three.
+The broad `.github` Prettier check also reports ten unchanged baseline files;
+the owned workflow/helper files pass the pinned docs configuration. No unrelated
+workflow or shared-tree formatting is changed. Hosted preservation/contract
+results after this push remain pending; pure fixtures are not a live invocation.
+Independent spec and quality reviews approve this scoped foundation; the narrow
+official REST-host suppression also received explicit review. Review fixes cover
+Node extraction quoting, least-privilege permissions, documented REST attempt
+responses, tag bounds, per-request remaining budgets and composed source-API
+coverage. Task 14 is not marked complete by those approvals.
 
 ### Task 15: Orchestrate independent builds and isolated signing
 

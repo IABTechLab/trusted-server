@@ -42,6 +42,7 @@ mod source;
 )]
 mod spdx;
 mod tool_tree;
+mod workflow_contract;
 
 use std::ffi::OsString;
 use std::io::Write as _;
@@ -82,6 +83,11 @@ enum Command {
     },
     /// Diagnostic report of pending inputs; constructs no authorization.
     AuditInputs,
+    /// Check explicitly supplied validation workflow files without executing them.
+    CheckWorkflowContract {
+        #[arg(long = "workflow", required = true, num_args = 1..)]
+        workflows: Vec<PathBuf>,
+    },
     /// Inspect a retained manual Fastly package against independently approved digests.
     InspectFastlyPackage {
         #[arg(long)]
@@ -152,6 +158,21 @@ fn run(
             Ok(ExitCode::SUCCESS)
         }
         Command::AuditInputs => audit_inputs(),
+        Command::CheckWorkflowContract { workflows } => {
+            workflow_contract::check_files(&workflows)?;
+            let report = serde_json::json!({
+                "report": "workflow-contract-check",
+                "release_qualification": false,
+                "source_eligibility": false,
+            });
+            let bytes = documents::canonical_json(&report, documents::Role::Metadata)?;
+            std::io::stdout().write_all(&bytes).map_err(|error| {
+                Report::new(ReleaseError::Document).attach(format!(
+                    "cannot write workflow contract diagnostic: {error}"
+                ))
+            })?;
+            Ok(ExitCode::SUCCESS)
+        }
         Command::InspectFastlyPackage {
             package_dir,
             manifest,
