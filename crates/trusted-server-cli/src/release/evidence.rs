@@ -45,7 +45,8 @@ use serde_json::{Map, Value, json};
 
 use super::artifact::AssetMeasurement;
 use super::documents::{
-    ApprovedRelease, FileRecord, IndexArtifact, ReleaseIndex, lower_hex, parse_release_index,
+    ApprovedRelease, FileRecord, IndexArtifact, ReleaseIndex, Role, lower_hex, parse_json,
+    parse_release_index,
 };
 use super::error::{ReleaseError, report};
 use super::gh::{PredicateKind, VerificationMode, VerifiedAttestation};
@@ -65,6 +66,11 @@ const VERIFICATION_MEDIA_TYPE: &str =
 const STATEMENT_TYPE: &str = "https://in-toto.io/Statement/v1";
 /// Fixed name of the signed release index.
 pub(crate) const INDEX_NAME: &str = "release-index.json";
+/// Fixed sentinel tag of every unqualified candidate index the release tool
+/// assembles; it never names an official release.
+const CANDIDATE_TAG: &str = "v0.0.0-unqualified-candidate";
+/// Companion field a candidate producer sets to `false`.
+const RELEASE_QUALIFICATION: &str = "release_qualification";
 /// Caller workflow path inside the official repository.
 const CALLER_PATH: &str = ".github/workflows/release.yml";
 const CERTIFICATE: [&str; 3] = ["verificationResult", "signature", "certificate"];
@@ -443,6 +449,7 @@ pub(crate) fn verify_index(
     proof: &VerifiedAttestation,
     bundle: &AssetMeasurement,
 ) -> Result<ReleaseIndex, Report<ReleaseError>> {
+    check_not_candidate_tag(release)?;
     let measurement = AssetMeasurement::of_bytes(bytes);
     let subjects = BTreeMap::from([(INDEX_NAME, measurement.sha256())]);
     let claims = proof.for_inputs(release, PredicateKind::Provenance, &measurement, bundle)?;
@@ -467,6 +474,7 @@ pub(crate) fn verify_index(
 pub(crate) fn verify_build_evidence(
     inputs: &EvidenceInputs<'_>,
 ) -> Result<BuildEvidenceVerified, Report<ReleaseError>> {
+    check_not_candidate_tag(inputs.release)?;
     check_consumed_names(inputs.artifacts)?;
     let mode = inputs.index_proof.mode();
     if inputs.artifacts.iter().any(|artifact| {
@@ -562,6 +570,7 @@ impl ArtifactContext<'_> {
             })?;
         check_bundle_records(entry)?;
         check_companion_bytes(entry, consumed)?;
+        check_release_qualification(entry, consumed)?;
         joins::parse_informational(consumed.build_recipe)?;
         let provenance_subjects = provenance_subjects(entry);
         let proof = consumed.provenance_proof.for_inputs(
@@ -625,6 +634,73 @@ fn check_bundle_records(entry: &IndexArtifact) -> Result<(), Report<ReleaseError
                 "signature bundle `{}` is empty; an unsigned candidate index cannot be verified",
                 record.name
             )));
+        }
+    }
+    Ok(())
+}
+
+/// Rejects the candidate sentinel tag before any proof or index field is used.
+///
+/// Full verification requires an index tag equal to the approved tag, so
+/// checking the approved release rejects every candidate index. The match is
+/// exact: the release-index v1 schema reserves no `v0.0.0-` prefix, and
+/// other `v0.0.0` pre-release tags remain valid semantic-version tags.
+///
+/// # Errors
+///
+/// Returns [`ReleaseError::Policy`] when the approved tag is the sentinel.
+fn check_not_candidate_tag(release: &ApprovedRelease) -> Result<(), Report<ReleaseError>> {
+    if release.tag().as_str() == CANDIDATE_TAG {
+        return Err(report(
+            ReleaseError::Policy,
+            format!(
+                "`{CANDIDATE_TAG}` is the unqualified candidate sentinel tag, not an official release"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Rejects consumed companions that declare themselves unqualified.
+///
+/// Build evidence, build recipe and rebuild check of a candidate carry
+/// `"release_qualification": false`. The R-INDEX field contracts do not
+/// define the field and no closed companion schema is retained, so an absent
+/// field is accepted and `true` is accepted; `false` and any non-boolean
+/// value fail closed. Runs after [`check_companion_bytes`] so only the
+/// index-authenticated bytes are read, and independently of
+/// [`check_bundle_records`].
+///
+/// # Errors
+///
+/// Returns [`ReleaseError::Document`] for malformed JSON and
+/// [`ReleaseError::Evidence`] for a `false` or non-boolean declaration.
+fn check_release_qualification(
+    entry: &IndexArtifact,
+    consumed: &ConsumedArtifact<'_>,
+) -> Result<(), Report<ReleaseError>> {
+    let companions = &entry.companions;
+    let documents = [
+        (&companions.build_evidence, consumed.build_evidence),
+        (&companions.build_recipe, consumed.build_recipe),
+        (&companions.rebuild_check, consumed.rebuild_check),
+    ];
+    for (record, bytes) in documents {
+        let document = parse_json(bytes, Role::Companion)?;
+        match document.get(RELEASE_QUALIFICATION) {
+            None | Some(Value::Bool(true)) => {}
+            Some(Value::Bool(false)) => {
+                return Err(evidence_error(format!(
+                    "`{}` declares `{RELEASE_QUALIFICATION}: false`; an unqualified candidate cannot be verified",
+                    record.name
+                )));
+            }
+            Some(_) => {
+                return Err(evidence_error(format!(
+                    "`{}` field `{RELEASE_QUALIFICATION}` must be a boolean",
+                    record.name
+                )));
+            }
         }
     }
     Ok(())

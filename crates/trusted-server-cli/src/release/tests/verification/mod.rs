@@ -122,6 +122,86 @@ fn rejects_empty_signature_bundle_records() {
     }
 }
 
+/// Name suffix and graph accessor of one companion document.
+type CompanionDocument = (&'static str, fn(&mut Graph) -> &mut Value);
+
+/// The three consumed companion kinds that may carry `release_qualification`.
+const QUALIFIED_COMPANIONS: [CompanionDocument; 3] = [
+    ("build-evidence", |graph| &mut graph.build_evidence),
+    ("build-recipe", |graph| &mut graph.build_recipe),
+    ("rebuild-check", |graph| &mut graph.rebuild_check),
+];
+
+fn graph_with_qualification(document: fn(&mut Graph) -> &mut Value, value: Value) -> Graph {
+    let mut graph = Graph::new();
+    document(&mut graph)["release_qualification"] = value;
+    graph
+}
+
+#[test]
+fn rejects_each_companion_declaring_release_qualification_false() {
+    for (companion, document) in QUALIFIED_COMPANIONS {
+        let signed = graph_with_qualification(document, json!(false))
+            .build()
+            .sign();
+
+        let error = signed
+            .verify()
+            .expect_err("should reject an unqualified companion with signed, non-empty bundles");
+
+        assert_eq!(
+            *error.current_context(),
+            ReleaseError::Evidence,
+            "should fail closed for an unqualified {companion}"
+        );
+        assert!(
+            format!("{error:?}").contains(&format!(
+                "{ASSET}.{companion}.json` declares `release_qualification: false`"
+            )),
+            "should name the unqualified {companion}: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn rejects_each_companion_with_non_boolean_release_qualification() {
+    for (companion, document) in QUALIFIED_COMPANIONS {
+        for value in [json!(null), json!("false"), json!(0)] {
+            let signed = graph_with_qualification(document, value.clone())
+                .build()
+                .sign();
+
+            let error = signed
+                .verify()
+                .expect_err("should reject a non-boolean qualification declaration");
+
+            assert_eq!(
+                *error.current_context(),
+                ReleaseError::Evidence,
+                "should fail closed for {companion} release_qualification {value}"
+            );
+            assert!(
+                format!("{error:?}").contains("must be a boolean"),
+                "should name the malformed declaration: {error:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn accepts_companions_declaring_release_qualification_true() {
+    let mut graph = Graph::new();
+    for (_, document) in QUALIFIED_COMPANIONS {
+        document(&mut graph)["release_qualification"] = json!(true);
+    }
+
+    graph
+        .build()
+        .sign()
+        .verify()
+        .expect("should verify companions declaring qualification");
+}
+
 #[test]
 fn rejects_empty_bundle_records_of_an_unconsumed_index_artifact() {
     let mut built = Graph::new().build();

@@ -5,6 +5,8 @@
 //! test-only; neither crate depends on the other. Every document join the
 //! consumer runs without signatures must accept them, while the size-0
 //! awaiting-signature bundle records must keep the candidate unverifiable.
+//! Full verification independently rejects the sentinel tag and each
+//! `"release_qualification": false` companion, even with non-empty bundles.
 //!
 //! The ignored ordinary-CI test runs the same checks over the index the
 //! release tool's collector assembled from four real candidate jobs.
@@ -13,15 +15,21 @@ use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::path::Path;
 
-use serde_json::Value;
+use error_stack::Report;
+use serde_json::{Value, json};
 
-use super::{check_bundle_records, joins};
+use super::{
+    BuildEvidenceVerified, ConsumedArtifact, EvidenceInputs, check_bundle_records,
+    check_release_qualification, joins, verify_build_evidence, verify_index,
+};
+use crate::release::artifact::AssetMeasurement;
 use crate::release::documents::{
     ApprovedCommit, ApprovedRelease, FileRecord, ReleaseTag, Role, parse_json, parse_release_index,
     sha256_hex,
 };
 use crate::release::error::ReleaseError;
 use crate::release::evidence::ComparisonOutcome;
+use crate::release::gh::{PredicateKind, VerifiedAttestation};
 use crate::release::policy::{
     AcceptanceRules, AcceptedProducerPolicy, EMBEDDED_POLICY, accept_producer_policy,
     embedded_policy,
@@ -261,6 +269,174 @@ fn check_empty_bundle_sentinels(candidate: &CandidateFiles) {
         assert!(
             format!("{error:?}").contains("is empty"),
             "should name the empty bundle: {error:?}"
+        );
+    }
+}
+
+/// A placeholder proof bound to `release`; the sentinel-tag rule must reject
+/// before any proof field is read.
+fn placeholder_proof(
+    release: &ApprovedRelease,
+    predicate: PredicateKind,
+    subject: &AssetMeasurement,
+) -> VerifiedAttestation {
+    VerifiedAttestation::synthetic_for_tests(
+        json!({}),
+        release.clone(),
+        predicate,
+        subject.clone(),
+        AssetMeasurement::of_bytes(b"fictional placeholder bundle"),
+    )
+}
+
+/// Rewrites every bundle record of `index_bytes` as a non-empty record, so
+/// the empty-bundle rule alone can no longer reject the index.
+fn with_non_empty_bundle_records(index_bytes: &[u8]) -> Vec<u8> {
+    let mut index: Value =
+        serde_json::from_slice(index_bytes).expect("should parse the candidate index");
+    let bundle = b"fictional non-empty signature bundle";
+    for artifact in index["artifacts"]
+        .as_array_mut()
+        .expect("should hold candidate artifacts")
+    {
+        for slot in ["provenance", "sbom_attestation"] {
+            let record = &mut artifact["companions"][slot];
+            record["size"] = json!(bundle.len());
+            record["sha256"] = json!(sha256_hex(bundle));
+        }
+    }
+    serde_json::to_vec(&index).expect("should serialize the altered index")
+}
+
+/// Runs full build-evidence verification over `index_bytes` and the golden
+/// Fastly companions, under the sentinel tag.
+fn verify_candidate(
+    candidate: &CandidateFiles,
+    index_bytes: &[u8],
+) -> Result<BuildEvidenceVerified, Report<ReleaseError>> {
+    let release = candidate.approved();
+    let policy = embedded_policy().expect("should accept the embedded consumer policy");
+    let source =
+        ApprovedSourcePolicy::for_tests(candidate.approved_commit(), EMBEDDED_POLICY.to_vec());
+    let asset = "trusted-server-fastly.wasm";
+    let executable = AssetMeasurement::of_bytes(b"fictional candidate executable");
+    let bundle = AssetMeasurement::of_bytes(b"fictional placeholder bundle");
+    let index_measurement = AssetMeasurement::of_bytes(index_bytes);
+    let index_proof = placeholder_proof(&release, PredicateKind::Provenance, &index_measurement);
+    let provenance_proof = placeholder_proof(&release, PredicateKind::Provenance, &executable);
+    let spdx_proof = placeholder_proof(&release, PredicateKind::Spdx, &executable);
+    let artifacts = [ConsumedArtifact {
+        name: asset,
+        executable: &executable,
+        spdx: candidate.bytes(&format!("{asset}.spdx.json")),
+        build_evidence: candidate.bytes(&format!("{asset}.build-evidence.json")),
+        build_recipe: candidate.bytes(&format!("{asset}.build-recipe.json")),
+        rebuild_check: candidate.bytes(&format!("{asset}.rebuild-check.json")),
+        provenance_bundle: &bundle,
+        sbom_bundle: &bundle,
+        provenance_proof: &provenance_proof,
+        spdx_proof: &spdx_proof,
+    }];
+    verify_build_evidence(&EvidenceInputs {
+        release: &release,
+        consumer_policy: &policy,
+        source_policy: &source,
+        index_bytes,
+        index_proof: &index_proof,
+        index_bundle: &bundle,
+        inventory_bytes: candidate.bytes(INVENTORY_NAME),
+        artifacts: &artifacts,
+    })
+}
+
+/// Requires `result` to fail as the sentinel-tag policy rejection.
+fn assert_sentinel_rejection<T: core::fmt::Debug>(result: Result<T, Report<ReleaseError>>) {
+    let error = result.expect_err("should reject the candidate sentinel tag");
+    assert_eq!(
+        *error.current_context(),
+        ReleaseError::Policy,
+        "should fail closed as a policy rejection"
+    );
+    assert!(
+        format!("{error:?}").contains("unqualified candidate sentinel tag"),
+        "should name the sentinel tag: {error:?}"
+    );
+}
+
+#[test]
+fn full_verification_rejects_the_golden_candidate_for_its_sentinel_tag() {
+    let candidate = CandidateFiles::committed();
+
+    assert_sentinel_rejection(verify_candidate(
+        &candidate,
+        candidate.bytes(CANDIDATE_INDEX_NAME),
+    ));
+}
+
+#[test]
+fn full_verification_rejects_the_sentinel_tag_even_with_non_empty_bundle_records() {
+    let candidate = CandidateFiles::committed();
+    let index_bytes = with_non_empty_bundle_records(candidate.bytes(CANDIDATE_INDEX_NAME));
+    let policy = embedded_policy().expect("should accept the embedded consumer policy");
+    let index = parse_release_index(&index_bytes, &policy, &candidate.approved())
+        .expect("should parse the altered candidate index");
+    index
+        .artifacts
+        .iter()
+        .try_for_each(check_bundle_records)
+        .expect("should pass the empty-bundle rule once bundles are non-empty");
+
+    assert_sentinel_rejection(verify_candidate(&candidate, &index_bytes));
+    let release = candidate.approved();
+    let index_measurement = AssetMeasurement::of_bytes(&index_bytes);
+    assert_sentinel_rejection(verify_index(
+        &release,
+        &policy,
+        &ApprovedSourcePolicy::for_tests(candidate.approved_commit(), EMBEDDED_POLICY.to_vec()),
+        &index_bytes,
+        &placeholder_proof(&release, PredicateKind::Provenance, &index_measurement),
+        &AssetMeasurement::of_bytes(b"fictional placeholder bundle"),
+    ));
+}
+
+#[test]
+fn golden_candidate_companions_fail_the_release_qualification_rule() {
+    let candidate = CandidateFiles::committed();
+    let index_bytes = with_non_empty_bundle_records(candidate.bytes(CANDIDATE_INDEX_NAME));
+    let policy = embedded_policy().expect("should accept the embedded consumer policy");
+    let release = candidate.approved();
+    let index = parse_release_index(&index_bytes, &policy, &release)
+        .expect("should parse the altered candidate index");
+    let executable = AssetMeasurement::of_bytes(b"fictional candidate executable");
+    let bundle = AssetMeasurement::of_bytes(b"fictional placeholder bundle");
+    let proof = placeholder_proof(&release, PredicateKind::Provenance, &executable);
+    for entry in &index.artifacts {
+        let companions = &entry.companions;
+        let consumed = ConsumedArtifact {
+            name: &entry.name,
+            executable: &executable,
+            spdx: candidate.present_bytes(&companions.sbom),
+            build_evidence: candidate.present_bytes(&companions.build_evidence),
+            build_recipe: candidate.present_bytes(&companions.build_recipe),
+            rebuild_check: candidate.present_bytes(&companions.rebuild_check),
+            provenance_bundle: &bundle,
+            sbom_bundle: &bundle,
+            provenance_proof: &proof,
+            spdx_proof: &proof,
+        };
+
+        let error = check_release_qualification(entry, &consumed)
+            .expect_err("should reject the unqualified candidate companions");
+
+        assert_eq!(
+            *error.current_context(),
+            ReleaseError::Evidence,
+            "should fail closed as an evidence error for {}",
+            entry.name
+        );
+        assert!(
+            format!("{error:?}").contains("declares `release_qualification: false`"),
+            "should name the unqualified declaration: {error:?}"
         );
     }
 }
