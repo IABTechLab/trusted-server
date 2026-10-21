@@ -128,6 +128,17 @@ The `ubuntu:22.04` image ID differs from the 2026-10-16 report
 39417433680 recorded the same three IDs. The real startup timeout regression
 (`startup_timeout_removes_only_its_owned_container`) also passed in run 39417433680.
 
+## Subsequent reproduction scheduling
+
+The equality observations above remain tied to their original runs. Since
+`3e3e30996`, ordinary push/PR runs defer the optional native reproduction;
+scheduled/dispatched or appropriately labelled PR runs measure it. Linux
+canonical build, inspection and all three startup checks remain mandatory.
+See the [dated schedule report](2026-10-21-native-reproduction-schedule.md)
+for the selector, exact baseline jobs and the subsequent 45-minute ordinary-CI
+per-build wall. Later equality claims need a measured run/job and built source,
+not a successful deferred job. GNU helper coverage and qualification gaps remain.
+
 ## Limits
 
 The GNU installed-file snapshot and the sibling measurement record which files

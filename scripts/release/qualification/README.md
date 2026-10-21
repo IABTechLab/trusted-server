@@ -47,6 +47,17 @@ selected runtimes and complete Fastly A/B acceptance remain mandatory. Independe
 reviewed all-cohort remote evidence is distinct from current installed-tool rehash
 and SDK/environment checks; neither is a substitute for the other.
 
+Native reproduction scheduling changed in `3e3e30996`: ordinary push/PR runs
+defer the optional CLI reproduction, while scheduled/dispatched runs and PRs
+labelled before a triggering event measure it. Fastly equality and native
+canonical acceptance remain mandatory. `b4c8e0c0f` increases the ordinary-CI
+per-build wall to 45 minutes after Intel's optional reproduction again exhausted
+25 minutes in run 39540057202. The [schedule/cache report](2026-10-21-native-reproduction-schedule.md)
+records baseline timings and pending validation; no Intel equality under the new
+wall is established. The [candidate index report](2026-10-21-candidate-release-index.md)
+records four successful per-asset entry checks, not a real cross-job assembly
+or completion of Task 13. None of these changes qualifies a production selection.
+
 ## Local Rust checks
 
 Current registered utility checks use the source-built developer target. The

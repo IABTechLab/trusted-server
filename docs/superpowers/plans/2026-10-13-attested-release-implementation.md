@@ -75,6 +75,15 @@ startup with byte-identical canonical/reproduction output. Intel canonical
 runtime validation also passed; its optional reproduction failed on time bounds in runs 39273777887 and 39290139247 and was identical in later runs 39417433680 and 39420011152 (a measurement with a thin timing margin, not a gate). Authenticated selections remain open. Ordinary CI passes do not change the pending
 qualification pins or authorize release publication.
 
+Follow-up (2026-10-21): run 39540057202 passed all four canonical candidates,
+but Intel's optional reproduction again exhausted the 25-minute confined-build
+wall. `3e3e30996` defers native reproduction on ordinary push/PR runs and measures
+it on scheduled/dispatched or appropriately labelled PR runs; Fastly equality
+remains mandatory. `b4c8e0c0f` raises only the ordinary-CI per-build wall to
+45 minutes. The [schedule/cache report](../../../scripts/release/qualification/2026-10-21-native-reproduction-schedule.md)
+records exact jobs, source, trigger availability and pending validation. Earlier
+Intel equality observations do not establish equality under this new selection.
+
 ## Work breakdown and ownership
 
 Use successive focused commit/review groups within PR #1262: (1) input/fact/JS guards, (2) qualified recipes and composition, (3) collection/signing/publication, (4) verifier/manual route/docs. Each depends on its predecessor; tag enablement waits for all four. No new Trusted Server implementation PR is created. Build scripts can be proved locally before production YAML exists. No intermediate PR may enable an incomplete release trigger.
@@ -367,6 +376,21 @@ GNU measurement in a sibling sandbox (2026-10-20, `bfab8ef20`): the next hosted 
 
 Apple toolchain identity (2026-10-21, uncommitted, Tasks 9/10 candidate only): the ordinary-CI Apple selection now also measures, in place below the selected `clang`'s toolchain `usr` directory, a structured-tree digest of the helper directory beside `clang` (files, modes and relative alias targets), the single versioned clang resource directory (`lib/clang/<version>`; any second real version directory, foreign alias or other entry fails closed) and the SHA-256 of `lib/libLTO.dylib` (missing, aliased or non-regular fails closed). The trees are bounded by entry, file and total byte limits and reject special files and absolute, dangling or escaping aliases. Vendor hard links are accepted because the tree is not owned; every file is rehashed instead. Nothing is copied, executed or resolved through `xcrun`. The receipt is part of the Apple identity record and therefore the plan digest, and it is rechecked at every Apple verification point and at evidence sealing. Candidate exports drop the `tool_helpers`, `liblto` and `clang_resource_directory` exclusions only when the receipt is present, and add a `toolchain_libraries` exclusion for other toolchain libraries such as `libtapi`. The `apple-tool-closure-unmeasured` gap stays: which helpers clang actually ran is unmeasured, and the developer directory remains a broad read/execute system root. The platform SPDX projection adds `libLTO` and the two trees as components. Pure fictional fixtures cover this locally; the real Xcode layout is exercised only by the ordinary-CI macOS jobs, which have not yet run it. It grants no qualification.
 
+Apple measurement follow-up (2026-10-21): the earlier uncommitted/unexecuted
+status above is superseded by committed `7d045ac83` and the successful ARM/Intel
+candidate jobs in run 39540057202. Their candidate entries retain
+`apple-coverage-excluded:toolchain_libraries` and `apple-tool-closure-unmeasured`;
+passing the measurement path does not establish complete closure or acquisition
+authenticity. See the [candidate index report](../../../scripts/release/qualification/2026-10-21-candidate-release-index.md).
+
+Timing follow-up (2026-10-21): the Intel optional reproduction timeout recorded
+in run 39273777887 recurred in run 39540057202, after historical successful
+Intel comparisons. The ordinary-CI selection now supplies a 45-minute confined
+Cargo wall through `ToolSelection::build_wall` (`b4c8e0c0f`), rather than the fixed
+25 minutes. See the [schedule/cache report](../../../scripts/release/qualification/2026-10-21-native-reproduction-schedule.md).
+The running speedup CI is not yet a completed acceptance result; neither deferral
+nor the changed budget establishes repeatability, complete coverage or qualification.
+
 ### Task 11: Generate complete artifact-specific SPDX
 
 **Create:** release tool `src/spdx.rs`, private `spdx::tests`, `crates/trusted-server-release/tests/fixtures/spdx/`.
@@ -430,6 +454,19 @@ Local verification of this batch passed 853 native unit tests (seven ignored ext
 - [ ] Cross-check schema and semantic joins on all real artifacts before signing/rehearsal. Commit `Assemble the authenticated release distribution`.
 
 Progress (2026-10-20, partial candidate index): a private `distribution` module assembles an unqualified candidate release index. `candidate_entry_from_completed` accepts only a canonical completed build at its approved source with the matching actual acceptance (Fastly runtime plus canonical/reproduction equality, or native startup), renders the candidate SPDX itself and renders build-evidence, build-recipe and rebuild-check companions. Each companion carries `"release_qualification": false`, sorted non-empty gaps and `null` workflow run and transfer IDs. Fastly records `matched` only from the checked equality; native assets record `unavailable`. `assemble_candidate_index` requires each fixed asset exactly once with one source commit, producer policy identity and inventory, emits artifacts sorted by name with no timestamps, and rechecks the rendered bytes against the retained v1 schema plus mirrored consumer semantics. Fixed per-asset identity comes from a compiled accessor equal to the schema row, so `fastly-staging` cannot appear. The tag is the sentinel `v0.0.0-unqualified-candidate`, the bytes are named only `candidate-release-index.json`, and both signature bundle slots are `AwaitingSignature`: they render the true empty-file record and their `Signed` variant is uninhabited. There is no command, writer or signer. Golden fixtures under `crates/trusted-server-release/tests/fixtures/index/candidate/` are byte-compared by the producer and run through the CLI's unsigned consumer joins. Each entry derives `policy_version` and `policy_sha256` from the same approved policy bytes, as the consumer does, and rejects a version other than the compiled one. The CLI verifier now rejects size-0 provenance and SBOM bundle records for every indexed artifact immediately after parsing the index, and again for each consumed artifact, so the candidate cannot pass full verification. Follow-up (see Task 15): once real signing exists, the consumer must also reject the sentinel tag and `"release_qualification": false` documents. Pure fixtures cannot exercise a successful completed-build entry, because they have no composition receipts or actual acceptances. Only owner wiring rejections are covered locally, and real four-asset assembly is deferred to Tasks 12 and 15. Signing, SHA256SUMS, provenance subject checks and qualification remain open.
+
+Hosted candidate-entry follow-up (2026-10-21): `4483e8256` wires independent
+real canonical-entry checks into the candidate jobs. Run 39529922087 completed
+Fastly, Linux CLI and Apple ARM jobs, but Intel and the overall run were cancelled.
+Run 39540057202 subsequently passed all four per-asset entry checks for source
+`d0cd53343fcbe1fb6f06eafc009e306e24b1245d`, with the same JS inventory digest
+in all four jobs. The [candidate index report](../../../scripts/release/qualification/2026-10-21-candidate-release-index.md)
+retains exact job/entry identities and distinguishes native measurement results
+from the entries' deliberately `unavailable` rebuild outcome. This establishes
+per-asset integration, not real cross-job four-entry assembly. Task 12's trusted
+transfer adapter is the next join prerequisite; complete native/tool coverage,
+authenticated acquisition, signing, publication and qualification remain separate
+unfinished exits. Task 13 remains partial.
 
 ### Task 14: Expose trusted same-commit validation
 

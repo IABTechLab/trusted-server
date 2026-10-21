@@ -7,6 +7,16 @@ started outside the checkout in all three reviewed Linux images. This is
 candidate evidence with `release_qualification: false`; it does not qualify
 production tools, image pins, acquisition or release enablement.
 
+## Subsequent reproduction scheduling
+
+This report retains its original equality observation. `3e3e30996` later
+defers optional native reproduction on ordinary push/PR runs, measuring it on
+scheduled/dispatched or appropriately labelled PR runs instead. Canonical
+build/inspection/startup remain required. The [dated schedule report](2026-10-21-native-reproduction-schedule.md)
+records the triggers, cache limits and subsequent 45-minute ordinary-CI per-build
+wall. Future equality results must cite the measured run/job and built source;
+a deferred run does not repeat this report's equality proof.
+
 ## Run and artifact
 
 - [Successful candidate job](https://github.com/IABTechLab/trusted-server/actions/runs/38921701566/job/117042987142).

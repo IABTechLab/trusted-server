@@ -134,6 +134,18 @@ where it was exceeded. No code change was made to widen that margin, so this
 is a timing observation: it does not establish that Intel reproduction is now
 reliable. Intel remains a bounded optional measurement.
 
+## Subsequent reproduction scheduling
+
+`3e3e30996` defers optional native reproduction on ordinary push/PR runs;
+scheduled/dispatched runs and PRs carrying the reproduction label before a
+triggering event measure it. Canonical Apple build/inspection/startup remain
+mandatory. Run 39540057202 subsequently passed both canonical candidates, with
+ARM reproduction identical and Intel reproduction failing at its 25-minute
+confined-build wall. `b4c8e0c0f` raises that ordinary-CI wall to 45 minutes;
+it does not establish Intel equality. See the [dated schedule report](2026-10-21-native-reproduction-schedule.md)
+for exact jobs, built source and trigger limitations. Future equality statements
+must cite the measured run/job and built source; a deferred pass supplies none.
+
 ## Limits
 
 This evidence does not establish authenticated acquisition of Xcode, the SDK
