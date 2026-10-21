@@ -279,6 +279,23 @@ pub(super) fn origin_fields(
     if commit != inputs.source_commit || !lower_hex(commit, 40) {
         return Err(spdx_error("JavaScript source differs from selected source"));
     }
+    if !matches!(
+        (original, component.roles.as_slice()),
+        (
+            JavascriptOriginal::Bundle { .. },
+            [ComponentRole::RetainedJavascript | ComponentRole::BuildMaterial]
+        ) | (
+            JavascriptOriginal::Contribution(_),
+            [ComponentRole::ConservativeJavascript | ComponentRole::BuildMaterial]
+        ) | (
+            JavascriptOriginal::Material(_),
+            [ComponentRole::BuildTool | ComponentRole::BuildMaterial]
+        )
+    ) {
+        return Err(spdx_error(
+            "JavaScript origin and component roles are incompatible",
+        ));
+    }
     let generated = matches!(
         original,
         JavascriptOriginal::Contribution(JsOrigin::Generated { .. })

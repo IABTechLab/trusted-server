@@ -379,6 +379,61 @@ fn rejects_root_digest_changes_duplicate_identities_missing_origins_and_dangling
 }
 
 #[test]
+fn declared_license_facts_remain_exact_without_becoming_license_conclusions() {
+    for declaration in [
+        "MIT",
+        "Apache-2.0",
+        "MIT OR Apache-2.0",
+        "Apache-2.0 OR MIT",
+    ] {
+        let mut inputs = fixture();
+        inputs.components[0].declared_license = Some(declaration.to_owned());
+        let doc = document(&inputs);
+        let observed = package(&doc, "rust:example");
+        assert_eq!(
+            observed["licenseDeclared"], declaration,
+            "should retain the exact reviewed observed declaration"
+        );
+        assert_eq!(
+            observed["licenseConcluded"], "NOASSERTION",
+            "should not turn a declaration into license analysis"
+        );
+        assert_eq!(
+            observed["filesAnalyzed"], false,
+            "should not imply license-file inspection"
+        );
+    }
+    for declaration in [
+        None,
+        Some("Example unreviewed license"),
+        Some("MIT AND LicenseRef-Example-Unreviewed"),
+        Some("NONE"),
+    ] {
+        let mut inputs = fixture();
+        inputs.components[0].declared_license = declaration.map(str::to_owned);
+        let doc = document(&inputs);
+        let observed = package(&doc, "rust:example");
+        assert_eq!(
+            observed["licenseDeclared"], "NOASSERTION",
+            "should not infer a declaration from missing or unreviewed facts"
+        );
+        assert_eq!(
+            observed["licenseConcluded"], "NOASSERTION",
+            "should not infer a legal conclusion or license absence"
+        );
+        if let Some(declaration) = declaration {
+            assert!(
+                observed["licenseComments"]
+                    .as_str()
+                    .expect("should retain bounded declaration context")
+                    .contains(declaration),
+                "should preserve an unreviewed declaration without reinterpreting it"
+            );
+        }
+    }
+}
+
+#[test]
 fn unknown_licenses_use_noassertion_and_never_become_unsupported_expressions() {
     let mut inputs = fixture();
     inputs.components[0].declared_license = Some("Example unknown license".to_owned());

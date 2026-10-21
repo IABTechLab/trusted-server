@@ -3,6 +3,120 @@ use crate::composition::javascript::{JsInputs, JsRetentionPolicy, collect_js};
 use crate::javascript::JsBuildCompleted;
 use sha2::{Digest as _, Sha256};
 
+fn role_originals() -> [JavascriptOriginal; 3] {
+    [
+        JavascriptOriginal::Bundle {
+            id: "example".to_owned(),
+            filename: "tsjs-example.js".to_owned(),
+            size: 16,
+            sha256: "b".repeat(64),
+        },
+        JavascriptOriginal::Contribution(JsOrigin::Source {
+            path: "src/example.ts".to_owned(),
+            transform: "source".to_owned(),
+            sha256: "c".repeat(64),
+        }),
+        JavascriptOriginal::Material(Material::Source {
+            id: "source:example".to_owned(),
+            path: "src/example.ts".to_owned(),
+            sha256: "d".repeat(64),
+        }),
+    ]
+}
+
+fn role_inputs(
+    original: JavascriptOriginal,
+    role: ComponentRole,
+) -> super::super::SpdxInputs<'static> {
+    let bytes = b"fictional executable";
+    super::super::SpdxInputs {
+        executable: bytes,
+        expected_artifact_sha256: hex::encode(Sha256::digest(bytes)),
+        name: "example-artifact".to_owned(),
+        version: "1.0.0".to_owned(),
+        source_commit: "a".repeat(40),
+        target: crate::policy::ReleaseTarget::Wasm32Wasip1,
+        created: "2026-01-01T00:00:00Z".to_owned(),
+        document_comment: None,
+        components: vec![component(
+            "javascript:example".to_owned(),
+            "example".to_owned(),
+            None,
+            role,
+            &"a".repeat(40),
+            original,
+            None,
+        )],
+        dependencies: Vec::new(),
+    }
+}
+
+#[test]
+fn materials_cannot_render_complete_module_containment() {
+    let original = role_originals()[2].clone();
+    let inputs = role_inputs(original, ComponentRole::RetainedJavascript);
+    let error = super::super::render(&inputs)
+        .expect_err("should reject material evidence claiming complete module containment");
+    assert!(
+        format!("{error:?}").contains("JavaScript origin and component roles are incompatible"),
+        "should reject the unsupported containment claim at the JavaScript origin boundary"
+    );
+}
+
+#[test]
+fn javascript_originals_accept_only_their_single_supported_roles() {
+    let roles = [
+        ComponentRole::ObservedRust,
+        ComponentRole::RetainedJavascript,
+        ComponentRole::ConservativeJavascript,
+        ComponentRole::ObservedNative,
+        ComponentRole::BuildMaterial,
+        ComponentRole::BuildTool,
+        ComponentRole::ExternalRuntime,
+    ];
+    for (original, allowed) in role_originals().into_iter().zip([
+        [
+            ComponentRole::RetainedJavascript,
+            ComponentRole::BuildMaterial,
+        ],
+        [
+            ComponentRole::ConservativeJavascript,
+            ComponentRole::BuildMaterial,
+        ],
+        [ComponentRole::BuildTool, ComponentRole::BuildMaterial],
+    ]) {
+        for role in roles {
+            let inputs = role_inputs(original.clone(), role);
+            assert_eq!(
+                super::super::render(&inputs).is_ok(),
+                allowed.contains(&role),
+                "should accept exactly the supported original and role pairs"
+            );
+        }
+        for invalid in [vec![], vec![allowed[0], allowed[0]], allowed.to_vec()] {
+            let mut inputs = role_inputs(original.clone(), allowed[0]);
+            inputs.components[0].roles = invalid;
+            assert!(
+                super::super::render(&inputs).is_err(),
+                "should reject empty, duplicate or mixed JavaScript roles"
+            );
+        }
+    }
+}
+
+#[test]
+fn valid_javascript_role_document_bytes_remain_unchanged() {
+    let original = role_originals()[0].clone();
+    let inputs = role_inputs(original, ComponentRole::RetainedJavascript);
+    let generated = super::super::render(&inputs).expect("should render valid module evidence");
+    // Captured before JavaScript origin/role validation was introduced.
+    assert_eq!(
+        generated.sha256(),
+        "2a79890ec323d58b8c6b8f304b06977c8355c8a5c341301b9782a82ddc489ee8",
+        "should preserve valid rendered bytes"
+    );
+}
+
 #[test]
 fn retained_and_absent_modules_have_different_contributor_roles() {
     let completed = JsBuildCompleted::fixture_for_projection(&"a".repeat(40));

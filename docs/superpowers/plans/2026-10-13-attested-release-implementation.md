@@ -390,6 +390,20 @@ Independent spec and quality review approved the scoped changes; plan wording
 was corrected to distinguish the implemented collector from the historical
 missing-collector test step. No child-process or ignored tests were run locally.
 
+Hosted gap follow-up (2026-10-21): [run 39565110219](https://github.com/IABTechLab/trusted-server/actions/runs/39565110219)
+has head `7ab7f96e71c896b214e6d09e760b7da7ea22d1b4`. Completed candidate logs
+for Fastly [119105403584](https://github.com/IABTechLab/trusted-server/actions/runs/39565110219/job/119105403584),
+Linux CLI [119105404005](https://github.com/IABTechLab/trusted-server/actions/runs/39565110219/job/119105404005)
+and Apple ARM [119111703005](https://github.com/IABTechLab/trusted-server/actions/runs/39565110219/job/119111703005)
+record built PR merge source `f5bac2786585169cf597139069d05dd47513d9f1` and
+`material_native_coverage_complete: false`. Linux alone reports both
+`gnu-tool-closure-unmeasured` and `gnu-original-acquisition-unverified`, alongside
+its existing privileged-helper and incomplete-native-material gaps. Fastly and
+ARM report neither new GNU gap; their existing host-tool/Apple exclusions remain.
+At this evidence check Intel [119111702865](https://github.com/IABTechLab/trusted-server/actions/runs/39565110219/job/119111702865)
+was still running its denial fixture. Its final candidate gap list and the overall
+run result remain pending; no all-four confirmation is inferred.
+
 Progress (2026-10-19, partial Task 10 only): candidate recipes retain an unfiltered Cargo metadata identity catalog and run an explicit-target tree query under the same denied boundary and selected tool/environment/source replacements as the build. Completion joins actual compiler messages to exact metadata package/target identities, preserves observed host/target unit features and build-script outputs, and requires the selected final executable to appear exactly once. Raw metadata/tree and normalized observations, including query plan digests, are retained privately and rehashed at handoff; candidate measurements keep `material_native_coverage_complete: false`. Ordinary CI at `456d15005` passed Fastly A/B equality and final-byte Viceroy acceptance with 255 observed packages, 377 units and 39 build-script executions per side, and Linux CLI capture/startup with 486 packages, 649 units and 62 build-script executions. Those runs precede the new component receipts below; they do not validate their full-product integration (later runs 39273777887, 39290139247 and 39417433680 do, as an ordinary-CI candidate). Apple full-product acceptance has since passed in ordinary CI (runs 39273777887 and 39290139247, recorded under Task 9 and below).
 
 The candidate completion path now also reconciles normal/build metadata and tree edges against observed compiler membership, rejects ambiguous source joins and dev-only paths, and keeps potential graph membership separate from actual compiled units. It does not claim an exact compiler unit dependency DAG. Verified package origins join opaque compiled IDs to approved workspace manifests or original registry/Git materials. Reviewed AWS-LC, ring and bundled SQLite collectors bind original source, prepared source trees, static output archives, observed features and link directives; unknown native contributors and system substitutions fail. Final-byte JS checks classify complete retained modules conservatively: Fastly requires every prepared module, while CLI absence remains build-material evidence. Bound source checks cover every tracked input before/after execution and immediately before sealing. Native working inputs are rehashed at sealing; retained immutable receipt bytes are verified before cleanup and at subsequent handoffs. No retained-input archive is implied. Tool/sysroot/SDK/external-requirement coverage, all-cohort real component validation and qualification remain open, so these components do not complete Task 10.
@@ -438,7 +452,7 @@ nor the changed budget establishes repeatability, complete coverage or qualifica
 **Create:** release tool `src/spdx.rs`, private `spdx::tests`, `crates/trusted-server-release/tests/fixtures/spdx/`.
 
 - [ ] Write cases for incorrect root digest, missing native coverage, ambiguous package identity, unknown license, duplicate SPDX IDs, dangling relationships, uncompiled dev dependencies, type-only/virtual JS and oversize predicates.
-- [ ] Run `cargo test -p trusted-server-release --target "$HOST_TARGET" spdx::tests` with the nonzero-selection guard; expect missing Rust generator.
+- [x] Run the pure `spdx::` suite with the nonzero-selection guard. The scoped 2026-10-21 run selected and passed 66 tests; this validates renderer/candidate behavior, not the closed qualified generator.
 - [ ] Emit SPDX 2.3 JSON from Task 10 normalized evidence. Root checksum is final executable SHA-256; contributors/materials/tools/external requirements have distinct relationships. Unknown licenses use NOASSERTION; missing contributing origin/coverage fails. Validator uses a pinned authoritative SPDX schema.
 - [ ] Generate full real Fastly and all three CLI SBOMs; schema-valid toy fixtures are not sufficient. Validate size <=16 MiB and document equality semantics: reject duplicate keys, ignore object order, preserve array order.
 - [ ] Re-run fixtures plus actual coverage inspection. Commit `Generate validated per-artifact SPDX evidence`.
@@ -454,6 +468,36 @@ The next JS adapter joins that sealed final-byte membership to checked original 
 Native and platform adapters now also borrow the sealed completed owner. Native projection requires exact observed wrapper/context/features and verified original-source joins, rejects missing contexts and duplicate aliases of the same original, and keeps original registry archive checksums separate from structured source trees and measured static output archives. Wrapper versions do not assert native implementation versions. Platform projection preserves measured Rust trees, Apple tool files/SDK materials and GNU installed/configured identities with their acquisition and coverage limitations. Logical runtime requirements retain accepted artifact/target/format facts without invented installed-runtime checksums. Source, artifact, target, tool-tree, GNU boundary/plan/profile and Apple SDK joins are checked. Private working paths and opaque Cargo IDs stay out of projected identities. The shared real-candidate helper exercises both adapters, with hosted validation of these assertions in ordinary-CI run 39417433680 (all candidate jobs succeeded; verified from job conclusions, not per-assertion output). Complete generation remains closed until full owning composition coverage and whole-document integration are available.
 
 Candidate whole-document SPDX (2026-10-20, `1719cf15f` and `073704cc7`): a private `candidate_from_completed` joins the Cargo, JS, native and platform projections of one completed recipe into a single validated SPDX 2.3 document, returned as a separate `CandidateSpdx` with no conversion into the closed `GeneratedSpdx` and no generation command. The source commit must match the build, the platform receipt must equal the composition view's, and the root package must be the policy asset's verified workspace package at the same commit and version. Parts merge only with unique identities and edges inside their own part. The creation comment marks the document as an unqualified candidate and lists the platform coverage gaps, which must not be empty. The root checksum equals the rehashed artifact, the creation time derives from the source epoch and documents stay within the SPDX size bound. `073704cc7` runs it on every real completed artifact in the Fastly, Linux CLI and Apple candidate tests, checks the gaps each platform must report (unresolved Fastly host tools, the reviewed GNU privileged helpers, the Apple exclusions and unmeasured tool closure) and retains document digests and sizes as measurements; Fastly canonical-versus-reproduction document identity is a measurement only. Hosted status: ordinary-CI run 39420011152 passed for `1719cf15f`, which contains the assembly but not the real-build checks. The run for `073704cc7` (Run Tests 39452090186) was still in progress when this note was written, so no hosted result exists for the real-artifact SPDX checks yet. Task 11 remains open: complete native/tool coverage, qualified generation, the producer/consumer contract and full real SBOMs for all four assets are still required.
+
+Renderer validation follow-up (2026-10-21): JavaScript originals now require
+exactly one compatible role before rendering relationships. A complete bundle
+may be retained or build material; a rendered contribution may be conservative
+input or build material; preparation/tool material may be a build tool or build
+material. Crossed, empty, duplicate and mixed roles fail. This prevents a material
+record or pre-minification contribution from manufacturing `CONTAINS` evidence.
+The normal completed-owner projection already selects these roles correctly;
+this is validation hardening, not evidence of a real recipe misclassification.
+
+An integrated negative fixture rendered unsupported containment before the guard
+and rejects it afterward. All six accepted pairs are covered. A fixed valid
+document retains its pre-change SHA-256
+`2a79890ec323d58b8c6b8f304b06977c8355c8a5c341301b9782a82ddc489ee8`.
+Both pure producer golden checks pass against the unchanged candidate index and
+companions; no golden, schema or companion format was rewritten.
+
+License regression tests confirm the existing conservative behavior: the four
+explicitly reviewed exact declarations retain their original spelling/order;
+missing or unreviewed declarations, unsupported expressions and an observed
+`NONE` use `NOASSERTION`, preserving bounded observed text in license comments.
+No license conclusion, file-license analysis, wrapper-to-native license inference
+or complete SPDX license-catalog support is asserted. This change does not add
+license facts or infer missing origins. Existing named native/tool/acquisition
+gaps remain present, and complete qualified generation remains closed.
+
+The local suite passes 66 pure SPDX tests plus the two pure golden checks.
+Real-artifact acceptance of the strengthened guard awaits hosted CI. Complete
+native/tool coverage, complete qualified per-artifact SBOMs and the remaining
+Task 11 exits stay unchecked. Parallel Task 12 code and its fixtures are untouched.
 
 ### Task 12: Bind transfers and enforce selected comparisons
 
