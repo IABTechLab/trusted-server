@@ -16,11 +16,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Retrieve Rust version
-        id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
-        shell: bash
-
       - name: Retrieve Viceroy version
         id: viceroy-version
         # `.tool-versions` is the single source of truth so this workflow and
@@ -34,11 +29,10 @@ jobs:
         shell: bash
 
       - name: Set up Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: ${{ steps.rust-version.outputs.rust-version }}
           target: wasm32-wasip1
-          cache-shared-key: cargo-${{ runner.os }}
+          cache-key: cargo-fastly
 
       - name: Cache Viceroy binary
         id: cache-viceroy
@@ -77,19 +71,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Retrieve Rust version
-        id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
-        shell: bash
-
       - name: Set up Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: ${{ steps.rust-version.outputs.rust-version }}
           # wasm32-wasip1 is required by the "Verify Fastly WASM release
           # build" step below; the axum build and tests are native.
           target: wasm32-wasip1
-          cache-shared-key: cargo-${{ runner.os }}
+          cache-key: cargo-axum
 
       - name: Read pinned Node.js version for CLI fixtures
         id: node-version
@@ -131,17 +119,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Retrieve Rust version
-        id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
-        shell: bash
-
       - name: Set up Rust toolchain (native + wasm32-unknown-unknown)
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: ${{ steps.rust-version.outputs.rust-version }}
           target: wasm32-unknown-unknown
-          cache-shared-key: cargo-${{ runner.os }}
+          cache-key: cargo-cloudflare
 
       - name: Check Cloudflare adapter (native host)
         run: cargo check -p trusted-server-adapter-cloudflare
@@ -158,17 +140,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Retrieve Rust version
-        id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
-        shell: bash
-
       - name: Set up Rust toolchain (native + wasm32-wasip1)
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: ${{ steps.rust-version.outputs.rust-version }}
           target: wasm32-wasip1
-          cache-shared-key: cargo-${{ runner.os }}
+          cache-key: cargo-spin
 
       - name: Check Spin adapter (native host)
         run: cargo check -p trusted-server-adapter-spin
@@ -197,17 +173,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Retrieve Rust version
-        id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
-        shell: bash
-
       - name: Set up Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: ${{ steps.rust-version.outputs.rust-version }}
           components: clippy, rustfmt
-          cache-shared-key: cargo-${{ runner.os }}
+          cache-key: cargo-parity
 
       - name: Format check (parity test crate)
         run: cargo fmt --manifest-path crates/trusted-server-integration-tests/Cargo.toml -- --check
@@ -228,17 +198,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Retrieve Rust version
-        id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
-        shell: bash
-
       - name: Set up Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: ${{ steps.rust-version.outputs.rust-version }}
           components: "clippy, rustfmt"
-          cache-shared-key: cargo-cli-${{ runner.os }}
+          cache-key: cargo-cli
 
       - name: Read pinned Node.js version for CLI fixtures
         id: node-version
