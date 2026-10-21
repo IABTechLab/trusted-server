@@ -29,12 +29,13 @@ Golden fixtures in `tests/fixtures/index/candidate/` and CLI
 and rejection boundaries. `recipe/tests/candidate_index.rs` covers pure owner
 wiring rejections. `candidate_entry.rs` checks each real canonical entry
 independently, with reporting in `distribution/summary.rs`. Collecting and
-assembling the four real entries across CI jobs is now implemented, pending a
-hosted run. Each candidate job uploads its rechecked entry and final
-executable. The `test-release-candidate-index` job rebuilds the four entries
-from the exact uploads (`distribution::transfer` and `distribution::ordinary`,
-test-only) and assembles them. It then runs the CLI consumer's unsigned joins
-over the result. No hosted all-four assembly has been observed yet.
+assembling the four real entries across CI jobs is now implemented. Each
+candidate job uploads its rechecked entry and final executable. The
+`test-release-candidate-index` job rebuilds the four entries from the exact
+uploads (`distribution::transfer` and `distribution::ordinary`, test-only) and
+assembles them. It then runs the CLI consumer's unsigned joins over the
+result. The first hosted all-four assembly passed in run 39577910126; see the
+[four-asset candidate join report](2026-10-21-four-asset-candidate-join.md).
 
 ## Real canonical-entry observations
 
