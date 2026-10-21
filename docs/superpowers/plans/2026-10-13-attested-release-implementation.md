@@ -404,6 +404,17 @@ At this evidence check Intel [119111702865](https://github.com/IABTechLab/truste
 was still running its denial fixture. Its final candidate gap list and the overall
 run result remain pending; no all-four confirmation is inferred.
 
+Intel follow-up (2026-10-21): successful [run 39577910126](https://github.com/IABTechLab/trusted-server/actions/runs/39577910126),
+head `d774ee47c274257fa0a088280f7df37ed530020c` (including `04be89638`),
+completed Intel candidate [119154065062](https://github.com/IABTechLab/trusted-server/actions/runs/39577910126/job/119154065062).
+Its built PR merge source is `fb42d8268af93c011959d032c81bfa581306c7c2`.
+The final candidate SPDX reports only `apple-coverage-excluded:toolchain_libraries`,
+`apple-tool-closure-unmeasured` and `native-material-coverage-incomplete`;
+neither GNU closure/acquisition gap appears, and
+`material_native_coverage_complete` and `release_qualification` remain false.
+Together with the three completed logs above, this closes the four-platform
+gap-placement follow-up across the recorded runs, not complete native coverage.
+
 Progress (2026-10-19, partial Task 10 only): candidate recipes retain an unfiltered Cargo metadata identity catalog and run an explicit-target tree query under the same denied boundary and selected tool/environment/source replacements as the build. Completion joins actual compiler messages to exact metadata package/target identities, preserves observed host/target unit features and build-script outputs, and requires the selected final executable to appear exactly once. Raw metadata/tree and normalized observations, including query plan digests, are retained privately and rehashed at handoff; candidate measurements keep `material_native_coverage_complete: false`. Ordinary CI at `456d15005` passed Fastly A/B equality and final-byte Viceroy acceptance with 255 observed packages, 377 units and 39 build-script executions per side, and Linux CLI capture/startup with 486 packages, 649 units and 62 build-script executions. Those runs precede the new component receipts below; they do not validate their full-product integration (later runs 39273777887, 39290139247 and 39417433680 do, as an ordinary-CI candidate). Apple full-product acceptance has since passed in ordinary CI (runs 39273777887 and 39290139247, recorded under Task 9 and below).
 
 The candidate completion path now also reconciles normal/build metadata and tree edges against observed compiler membership, rejects ambiguous source joins and dev-only paths, and keeps potential graph membership separate from actual compiled units. It does not claim an exact compiler unit dependency DAG. Verified package origins join opaque compiled IDs to approved workspace manifests or original registry/Git materials. Reviewed AWS-LC, ring and bundled SQLite collectors bind original source, prepared source trees, static output archives, observed features and link directives; unknown native contributors and system substitutions fail. Final-byte JS checks classify complete retained modules conservatively: Fastly requires every prepared module, while CLI absence remains build-material evidence. Bound source checks cover every tracked input before/after execution and immediately before sealing. Native working inputs are rehashed at sealing; retained immutable receipt bytes are verified before cleanup and at subsequent handoffs. No retained-input archive is implied. Tool/sysroot/SDK/external-requirement coverage, all-cohort real component validation and qualification remain open, so these components do not complete Task 10.
@@ -498,6 +509,8 @@ The local suite passes 66 pure SPDX tests plus the two pure golden checks.
 Real-artifact acceptance of the strengthened guard awaits hosted CI. Complete
 native/tool coverage, complete qualified per-artifact SBOMs and the remaining
 Task 11 exits stay unchecked. Parallel Task 12 code and its fixtures are untouched.
+Remaining Task 11 completeness work is deferred behind Task 14; this ordering
+does not waive its coverage or qualified-generation requirements.
 
 ### Task 12: Bind transfers and enforce selected comparisons
 
