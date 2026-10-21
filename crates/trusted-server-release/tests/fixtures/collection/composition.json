@@ -1,0 +1,203 @@
+{
+  "metadata_plan_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+  "tree_plan_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
+  "observations": {
+    "packages": [
+      {
+        "id": "path+file:///workspace/crates/example-app#0.1.0",
+        "name": "example-app",
+        "version": "0.1.0",
+        "source": null,
+        "manifest_path": "/workspace/crates/example-app/Cargo.toml",
+        "license": "Apache-2.0"
+      },
+      {
+        "id": "registry+https://registry.example.com/index#example-dep@1.0.0",
+        "name": "example-dep",
+        "version": "1.0.0",
+        "source": "registry+https://registry.example.com/index",
+        "manifest_path": "/workspace/vendor/example-dep-1.0.0/Cargo.toml",
+        "license": null
+      }
+    ],
+    "units": [
+      {
+        "package_id": "registry+https://registry.example.com/index#example-dep@1.0.0",
+        "target_name": "example_dep",
+        "target_kind": ["lib"],
+        "crate_types": ["lib"],
+        "context": "target",
+        "features": ["default"],
+        "profile": {
+          "opt_level": "3",
+          "debuginfo": 2,
+          "debug_assertions": false,
+          "overflow_checks": false,
+          "test": false
+        },
+        "filenames": [
+          "/workspace/target/release/deps/libexample_dep-0000000000000000.rlib"
+        ],
+        "executable": null
+      },
+      {
+        "package_id": "path+file:///workspace/crates/example-app#0.1.0",
+        "target_name": "example-app",
+        "target_kind": ["bin"],
+        "crate_types": ["bin"],
+        "context": "target",
+        "features": [],
+        "profile": {
+          "opt_level": "3",
+          "debuginfo": 2,
+          "debug_assertions": false,
+          "overflow_checks": false,
+          "test": false
+        },
+        "filenames": ["/workspace/target/release/example-app"],
+        "executable": "/workspace/target/release/example-app"
+      }
+    ],
+    "build_scripts": [
+      {
+        "package_id": "registry+https://registry.example.com/index#example-dep@1.0.0",
+        "context": "target",
+        "out_dir": "/workspace/target/release/build/example-dep-0000000000000000/out",
+        "linked_libs": ["static=example"],
+        "linked_paths": [
+          "native=/workspace/target/release/build/example-dep-0000000000000000/out"
+        ],
+        "cfgs": ["example_cfg"],
+        "environment": [["EXAMPLE_ENV", "1"]]
+      }
+    ]
+  },
+  "composition": {
+    "graph": {
+      "selected_package_id": "path+file:///workspace/crates/example-app#0.1.0",
+      "tree_package_ids": [
+        "path+file:///workspace/crates/example-app#0.1.0",
+        "registry+https://registry.example.com/index#example-dep@1.0.0"
+      ],
+      "observed_package_ids": [
+        "path+file:///workspace/crates/example-app#0.1.0",
+        "registry+https://registry.example.com/index#example-dep@1.0.0"
+      ],
+      "edges": [
+        {
+          "parent": "path+file:///workspace/crates/example-app#0.1.0",
+          "dependency": "registry+https://registry.example.com/index#example-dep@1.0.0",
+          "kinds": ["normal"]
+        }
+      ]
+    },
+    "package_origins": {
+      "source_commit": "",
+      "materials_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "packages": {
+        "path+file:///workspace/crates/example-app#0.1.0": {
+          "name": "example-app",
+          "version": "0.1.0",
+          "manifest_path": "crates/example-app/Cargo.toml",
+          "prepared_manifest_sha256": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+          "origin": {
+            "kind": "workspace",
+            "source_commit": "",
+            "path": "crates/example-app/Cargo.toml"
+          }
+        },
+        "registry+https://registry.example.com/index#example-dep@1.0.0": {
+          "name": "example-dep",
+          "version": "1.0.0",
+          "manifest_path": "vendor/example-dep-1.0.0/Cargo.toml",
+          "prepared_manifest_sha256": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+          "origin": {
+            "kind": "material",
+            "source": "registry+https://registry.example.com/index",
+            "original": {
+              "kind": "registry",
+              "archive_sha256": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3"
+            }
+          }
+        }
+      }
+    },
+    "native": {
+      "contributors": [
+        {
+          "package_id": "registry+https://registry.example.com/index#example-dep@1.0.0",
+          "name": "example-dep",
+          "version": "1.0.0",
+          "context": "target",
+          "features": ["default"],
+          "classification": "conservative_embedded_contributor",
+          "original_sha256": "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3",
+          "source_tree_sha256": "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4",
+          "source_subtrees": [
+            {
+              "path": "native",
+              "sha256": "e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5e5"
+            }
+          ],
+          "linked_libs": ["static=example"],
+          "linked_paths": [
+            "native=/workspace/target/release/build/example-dep-0000000000000000/out"
+          ],
+          "archives": [
+            {
+              "path": "/workspace/target/release/build/example-dep-0000000000000000/out/libexample.a",
+              "size": 4096,
+              "sha256": "f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6f6"
+            }
+          ]
+        }
+      ],
+      "build_tool_package_ids": [],
+      "material_native_coverage_complete": false
+    },
+    "javascript": {
+      "artifact_sha256": "",
+      "inventory_sha256": "",
+      "modules": [
+        {
+          "module": {
+            "id": "core",
+            "filename": "tsjs-core.js",
+            "size": 64,
+            "sha256": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+          },
+          "classification": "conservative_embedded_js"
+        }
+      ],
+      "method": "complete-uncompressed-module-substring; no function reachability claim"
+    },
+    "platform": {
+      "target": "",
+      "artifact_sha256": "",
+      "rust": {
+        "tree_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "target": "",
+        "cargo": "cargo 1.95.0",
+        "rustc": "rustc 1.95.0",
+        "target_standard_library": "lib/rustlib/example-target/lib",
+        "identity_scope": "fictional-installed-tree",
+        "origin": "fictional-unauthenticated",
+        "qualification": "unqualified"
+      },
+      "apple": null,
+      "external_requirements": {
+        "target": "",
+        "artifact_sha256": "",
+        "runtime": {
+          "format": "wasm",
+          "import_modules": ["fastly_http_req"]
+        }
+      },
+      "native_tools": {
+        "scope": "host_path_unresolved",
+        "roles": ["compiler", "assembler", "archiver", "linker", "build_tools"]
+      },
+      "material_native_coverage_complete": false
+    }
+  }
+}

@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use serde_json::json;
 
 use super::*;
-use crate::collection::tests::cohort_fixture;
+use crate::collection::tests::{cohort_fixture, composition_receipt};
 use crate::collection::{ValidatedTransfers, diagnose_collection, digest};
 
 // Fictional facts mirroring what a completed build owns. Pure tests cannot
@@ -306,32 +306,169 @@ fn expected_rejection(name: &str) -> &'static str {
     }
 }
 
-#[test]
-fn producer_composition_receipt_is_not_the_collector_composition_summary() {
-    // The producer's `composition.json` is its sealed normalized receipt. The
-    // collector parses a different summary, so the real member cannot pass
-    // until that schema mismatch is resolved.
-    let mut fixture = producer_cohort();
-    let receipt = serde_json::to_vec(&json!({
-        "metadata_plan_sha256": "a".repeat(64),
-        "tree_plan_sha256": "b".repeat(64),
-        "observations": {"packages": [], "units": [], "build_scripts": []},
-    }))
-    .expect("should serialize fictional receipt");
-    let mut record = producer_record(&fixture, 0);
+/// Installs a sealed receipt and the producer record naming its exact digest.
+fn install_receipt(fixture: &mut ValidatedTransfers, index: usize, receipt: Vec<u8>) {
+    let mut record = producer_record(fixture, index);
     record.composition_sha256 = digest(&receipt);
-    fixture.transfers[0]
+    fixture.transfers[index]
         .members
         .insert("composition.json".to_owned(), receipt);
-    install(&mut fixture, 0, &record);
-    let error = format!(
-        "{:?}",
-        diagnose_collection(&fixture).expect_err("should reject the receipt shape")
+    install(fixture, index, &record);
+}
+
+/// The producer's receipt shape for one fixture transfer, with its own bindings.
+fn producer_receipt(fixture: &ValidatedTransfers, index: usize) -> Value {
+    let transfer = &fixture.transfers[index];
+    let target = FIXED_ARTIFACTS
+        .iter()
+        .find(|asset| asset.name == transfer.upload.asset)
+        .expect("should use a fixed fixture asset")
+        .target
+        .triple();
+    serde_json::from_slice(&composition_receipt(
+        target,
+        &digest(&transfer.members["artifact"]),
+        &fixture.invocation.source_commit,
+        &digest(&transfer.members["tsjs-inventory.json"]),
+    ))
+    .expect("should parse producer receipt")
+}
+
+#[test]
+fn producer_composition_receipt_passes_the_strict_collector() {
+    // The producer's `composition.json` is its sealed normalized receipt
+    // (`metadata_plan_sha256`, `tree_plan_sha256`, `observations`,
+    // `composition`). Each record's `composition_sha256` names its exact bytes.
+    let mut fixture = producer_cohort();
+    for index in 0..fixture.transfers.len() {
+        let receipt = serde_json::to_vec(&producer_receipt(&fixture, index))
+            .expect("should serialize producer receipt");
+        install_receipt(&mut fixture, index, receipt);
+    }
+    for transfer in &fixture.transfers {
+        let receipt: Value = serde_json::from_slice(&transfer.members["composition.json"])
+            .expect("should parse installed receipt");
+        let keys = receipt
+            .as_object()
+            .expect("should be an object")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            keys,
+            [
+                "composition",
+                "metadata_plan_sha256",
+                "observations",
+                "tree_plan_sha256"
+            ],
+            "should carry exactly the producer receipt members"
+        );
+    }
+    let diagnostic =
+        diagnose_collection(&fixture).expect("should accept producer records and receipts");
+    assert_eq!(
+        diagnostic.canonical.len(),
+        4,
+        "should retain all four canonical artifacts from producer receipts"
     );
-    assert!(
-        error.contains("unknown field"),
-        "should reject the producer receipt shape as a collector summary: {error}"
-    );
+}
+
+/// Changes one receipt fact, given the dependency and workspace package IDs.
+type ReceiptMutation = fn(&mut Value, &str, &str);
+
+#[test]
+fn each_changed_producer_receipt_fact_is_rejected_by_the_collector() {
+    let dependency = "registry+https://registry.example.com/index#example-dep@1.0.0";
+    let workspace = "path+file:///workspace/crates/example-app#0.1.0";
+    let cases: [(&str, ReceiptMutation, &str); 9] = [
+        (
+            "another artifact",
+            |receipt, _, _| {
+                receipt["composition"]["javascript"]["artifact_sha256"] = json!("9".repeat(64));
+            },
+            "composition receipt is not bound to the final artifact",
+        ),
+        (
+            "another source",
+            |receipt, _, workspace| {
+                receipt["composition"]["package_origins"]["packages"][workspace]["origin"]["source_commit"] =
+                    json!("9".repeat(40));
+            },
+            "composition receipt is not bound to the approved source",
+        ),
+        (
+            "another inventory",
+            |receipt, _, _| {
+                receipt["composition"]["javascript"]["inventory_sha256"] = json!("9".repeat(64));
+            },
+            "composition receipt is not bound to the shared JS inventory",
+        ),
+        (
+            "malformed plan digest",
+            |receipt, _, _| {
+                receipt["metadata_plan_sha256"] = json!("A".repeat(64));
+            },
+            "composition receipt digests are malformed",
+        ),
+        (
+            "malformed origin digest",
+            |receipt, dependency, _| {
+                receipt["composition"]["package_origins"]["packages"][dependency]["prepared_manifest_sha256"] =
+                    json!("b2".repeat(31));
+            },
+            "composition receipt package origins are malformed or ambiguous",
+        ),
+        (
+            "empty observations",
+            |receipt, _, _| {
+                receipt["observations"]["units"] = json!([]);
+            },
+            "composition receipt has no compiled units",
+        ),
+        (
+            "no package origins",
+            |receipt, _, _| {
+                receipt["observations"]["packages"] = json!([]);
+                receipt["composition"]["package_origins"]["packages"] = json!({});
+            },
+            "composition receipt package origins are malformed or ambiguous",
+        ),
+        (
+            "extra field",
+            |receipt, _, _| {
+                receipt["composition"]["coverage_complete"] = json!(true);
+            },
+            "unknown field",
+        ),
+        (
+            "unjoined dependency",
+            |receipt, dependency, _| {
+                receipt["composition"]["package_origins"]["packages"]
+                    .as_object_mut()
+                    .expect("should find package origins")
+                    .remove(dependency);
+            },
+            "composition receipt package origins are malformed or ambiguous",
+        ),
+    ];
+    for (name, mutate, expected) in cases {
+        for index in [0, 2] {
+            let mut fixture = producer_cohort();
+            let mut receipt = producer_receipt(&fixture, index);
+            mutate(&mut receipt, dependency, workspace);
+            let bytes = serde_json::to_vec(&receipt).expect("should serialize changed receipt");
+            install_receipt(&mut fixture, index, bytes);
+            let error = format!(
+                "{:?}",
+                diagnose_collection(&fixture).expect_err("should reject a changed receipt")
+            );
+            assert!(
+                error.contains(expected),
+                "should reject receipt with {name} for transfer {index}: {error}"
+            );
+        }
+    }
 }
 
 #[test]

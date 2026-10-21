@@ -283,6 +283,69 @@ fn wasm() -> Vec<u8> {
     bytes
 }
 
+/// Fills the fictional sealed composition receipt with one build's bindings.
+///
+/// The fixture has the producer's `composition_export()` shape; only the
+/// target, final artifact, approved source and shared inventory vary per build.
+pub(super) fn composition_receipt(
+    target: &str,
+    artifact_sha256: &str,
+    source_commit: &str,
+    inventory_sha256: &str,
+) -> Vec<u8> {
+    let mut receipt: Value = serde_json::from_str(include_str!(
+        "../../tests/fixtures/collection/composition.json"
+    ))
+    .expect("should parse fictional composition receipt");
+    for (pointer, value) in [
+        ("/composition/platform/target", target),
+        ("/composition/platform/rust/target", target),
+        ("/composition/platform/external_requirements/target", target),
+        ("/composition/javascript/artifact_sha256", artifact_sha256),
+        ("/composition/platform/artifact_sha256", artifact_sha256),
+        (
+            "/composition/platform/external_requirements/artifact_sha256",
+            artifact_sha256,
+        ),
+        ("/composition/javascript/inventory_sha256", inventory_sha256),
+        ("/composition/package_origins/source_commit", source_commit),
+    ] {
+        *receipt
+            .pointer_mut(pointer)
+            .expect("should find receipt binding") = json!(value);
+    }
+    let platform = &mut receipt["composition"]["platform"];
+    if target.ends_with("-apple-darwin") {
+        platform["apple"] = json!({"sdk_version": "15.0", "qualification": "unqualified"});
+        platform["external_requirements"]["runtime"] = json!({
+            "format": "macho",
+            "loader": "/usr/lib/dyld",
+            "cpu": "fictional",
+            "dylibs": ["/usr/lib/libSystem.B.dylib"],
+            "minimum_os": "13.0",
+            "sdk": "15.0",
+        });
+    } else if target.ends_with("-linux-gnu") {
+        platform["external_requirements"]["runtime"] = json!({
+            "format": "elf",
+            "interpreter": "/lib64/ld-linux-x86-64.so.2",
+            "needed": ["libc.so.6"],
+            "version_requirements": [],
+            "max_glibc": "2.34",
+        });
+    }
+    let packages = receipt
+        .pointer_mut("/composition/package_origins/packages")
+        .and_then(Value::as_object_mut)
+        .expect("should find package origins");
+    for origin in packages.values_mut().map(|package| &mut package["origin"]) {
+        if origin["kind"] == "workspace" {
+            origin["source_commit"] = json!(source_commit);
+        }
+    }
+    serde_json::to_vec(&receipt).expect("should serialize composition receipt")
+}
+
 pub(super) fn cohort_fixture() -> ValidatedTransfers {
     let inventory = b"{\"schema_version\":1}".to_vec();
     let mut invocation = transfer_fixture().0.invocation;
@@ -299,7 +362,12 @@ pub(super) fn cohort_fixture() -> ValidatedTransfers {
             } else {
                 b"native final bytes".to_vec()
             };
-            let composition=serde_json::to_vec(&json!({"artifact_sha256":digest(&artifact),"source_commit":invocation.source_commit,"inventory_sha256":invocation.inventory_sha256,"contributing_sources":["d".repeat(64)],"compiled_units":1})).expect("should serialize composition");
+            let composition = composition_receipt(
+                asset.target.triple(),
+                &digest(&artifact),
+                &invocation.source_commit,
+                &invocation.inventory_sha256,
+            );
             let mut record: Value = serde_json::from_str(include_str!(
                 "../../tests/fixtures/collection/build-record.json"
             ))
@@ -507,7 +575,12 @@ fn collection_compares_complete_fastly_final_bytes_without_exclusions() {
     mutate_record(&mut fixture, 1, "/artifact_sha256", json!(sha));
     mutate_record(&mut fixture, 1, "/runtime/final_wasm_sha256", json!(sha));
     mutate_record(&mut fixture, 1, "/runtime/final_wasm_size", json!(size));
-    let composition=serde_json::to_vec(&json!({"artifact_sha256":sha,"source_commit":fixture.invocation.source_commit,"inventory_sha256":fixture.invocation.inventory_sha256,"contributing_sources":["d".repeat(64)],"compiled_units":1})).expect("should bind changed composition");
+    let composition = composition_receipt(
+        crate::policy::FIXED_ARTIFACTS[0].target.triple(),
+        &sha,
+        &fixture.invocation.source_commit,
+        &fixture.invocation.inventory_sha256,
+    );
     let composition_sha = digest(&composition);
     fixture.transfers[1]
         .members
@@ -1061,9 +1134,313 @@ fn with_uploaded_native_b(same: bool) -> ValidatedTransfers {
         let (hash, size) = (digest(artifact), artifact.len());
         mutate_record(&mut fixture, index, "/artifact_sha256", json!(hash));
         mutate_record(&mut fixture, index, "/artifact_size", json!(size));
-        rebind_composition(&mut fixture, index, "/artifact_sha256", json!(hash));
+        for pointer in RECEIPT_ARTIFACT_BINDINGS {
+            rebind_composition(&mut fixture, index, pointer, json!(hash));
+        }
     }
     fixture
+}
+
+/// Every receipt field the producer binds to the exact final artifact digest.
+const RECEIPT_ARTIFACT_BINDINGS: [&str; 3] = [
+    "/composition/javascript/artifact_sha256",
+    "/composition/platform/artifact_sha256",
+    "/composition/platform/external_requirements/artifact_sha256",
+];
+
+/// Fixture receipt pointer to the registry dependency's package origin.
+const DEPENDENCY_ORIGIN: &str = "/composition/package_origins/packages/registry+https:~1~1registry.example.com~1index#example-dep@1.0.0";
+/// Fixture receipt pointer to the workspace package's origin.
+const WORKSPACE_ORIGIN: &str =
+    "/composition/package_origins/packages/path+file:~1~1~1workspace~1crates~1example-app#0.1.0";
+
+/// Receipt changes that each break one collector composition check.
+fn composition_gates() -> Vec<(String, Value)> {
+    let mut gates = RECEIPT_ARTIFACT_BINDINGS
+        .iter()
+        .map(|pointer| ((*pointer).to_owned(), json!("9".repeat(64))))
+        .collect::<Vec<_>>();
+    gates.extend([
+        (
+            "/composition/package_origins/source_commit".to_owned(),
+            json!("9".repeat(40)),
+        ),
+        (
+            format!("{WORKSPACE_ORIGIN}/origin/source_commit"),
+            json!("9".repeat(40)),
+        ),
+        (
+            "/composition/javascript/inventory_sha256".to_owned(),
+            json!("9".repeat(64)),
+        ),
+        (
+            "/composition/package_origins/materials_sha256".to_owned(),
+            json!("9".repeat(64)),
+        ),
+        (
+            "/composition/platform/target".to_owned(),
+            json!("example-unknown-none"),
+        ),
+        (
+            "/composition/platform/external_requirements/target".to_owned(),
+            json!("example-unknown-none"),
+        ),
+        (
+            "/composition/native/material_native_coverage_complete".to_owned(),
+            json!(true),
+        ),
+        (
+            "/composition/platform/material_native_coverage_complete".to_owned(),
+            json!(true),
+        ),
+        ("/observations/units".to_owned(), json!([])),
+        (
+            "/composition/package_origins/packages".to_owned(),
+            json!({}),
+        ),
+        (
+            format!("{DEPENDENCY_ORIGIN}/manifest_path"),
+            json!("crates/example-app/Cargo.toml"),
+        ),
+        (
+            format!("{DEPENDENCY_ORIGIN}/prepared_manifest_sha256"),
+            json!("not-a-digest"),
+        ),
+        ("/metadata_plan_sha256".to_owned(), json!("7".repeat(63))),
+        ("/tree_plan_sha256".to_owned(), json!("8".repeat(65))),
+        (
+            "/composition/javascript/modules/0/module/sha256".to_owned(),
+            json!("not-a-digest"),
+        ),
+        ("/composition/javascript/modules".to_owned(), json!([])),
+        (
+            "/composition/graph/selected_package_id".to_owned(),
+            json!("path+file:///workspace/crates/another#0.1.0"),
+        ),
+        (
+            "/observations/units/0/package_id".to_owned(),
+            json!("path+file:///workspace/crates/another#0.1.0"),
+        ),
+        (
+            "/composition/native/contributors/0/original_sha256".to_owned(),
+            json!("c3".repeat(31)),
+        ),
+    ]);
+    gates
+}
+
+#[test]
+fn every_composition_receipt_gate_rejects_its_changed_fact() {
+    for (pointer, value) in composition_gates() {
+        let mut fixture = cohort_fixture();
+        rebind_composition(&mut fixture, 0, &pointer, value);
+        let error = diagnose_collection(&fixture)
+            .expect_err("should reject a changed composition receipt fact");
+        assert!(
+            format!("{error:?}").contains("composition receipt"),
+            "should reject receipt {pointer} at a composition receipt gate: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn composition_receipt_shape_is_strict() {
+    let fixture = cohort_fixture();
+    let receipt: Value = serde_json::from_slice(&fixture.transfers[0].members["composition.json"])
+        .expect("should parse fixture receipt");
+    let summary = json!({
+        "artifact_sha256": digest(&fixture.transfers[0].members["artifact"]),
+        "source_commit": fixture.invocation.source_commit,
+        "inventory_sha256": fixture.invocation.inventory_sha256,
+        "contributing_sources": ["d".repeat(64)],
+        "compiled_units": 1,
+    });
+    let mut extra_top = receipt.clone();
+    extra_top["coverage_complete"] = json!(true);
+    let mut extra_nested = receipt.clone();
+    extra_nested["composition"]["javascript"]["function_reachability"] = json!(true);
+    let mut missing = receipt.clone();
+    missing["composition"]
+        .as_object_mut()
+        .expect("should find composition")
+        .remove("native");
+    let mut extra_origin = receipt.clone();
+    extra_origin
+        .pointer_mut(&format!("{DEPENDENCY_ORIGIN}/origin/original"))
+        .and_then(Value::as_object_mut)
+        .expect("should find the registry original")
+        .insert("verified".to_owned(), json!(true));
+    let mut missing_apple = receipt.clone();
+    missing_apple["composition"]["platform"]
+        .as_object_mut()
+        .expect("should find platform")
+        .remove("apple");
+    let serialized = |value: &Value| serde_json::to_vec(value).expect("should serialize receipt");
+    let text = String::from_utf8(serialized(&receipt)).expect("should be UTF-8");
+    let duplicate = text
+        .replacen(
+            "\"metadata_plan_sha256\"",
+            &format!(
+                "\"metadata_plan_sha256\":\"{}\",\"metadata_plan_sha256\"",
+                "7".repeat(64)
+            ),
+            1,
+        )
+        .into_bytes();
+    for (name, bytes) in [
+        ("collector summary", serialized(&summary)),
+        ("extra top-level field", serialized(&extra_top)),
+        ("extra nested field", serialized(&extra_nested)),
+        ("missing component", serialized(&missing)),
+        ("extra tagged origin field", serialized(&extra_origin)),
+        ("missing opaque platform member", serialized(&missing_apple)),
+        ("duplicate key", duplicate),
+    ] {
+        let mut changed = cohort_fixture();
+        let hash = digest(&bytes);
+        changed.transfers[0]
+            .members
+            .insert("composition.json".to_owned(), bytes);
+        mutate_record(&mut changed, 0, "/composition_sha256", json!(hash));
+        let error = format!(
+            "{:?}",
+            diagnose_collection(&changed).expect_err("should reject a malformed receipt")
+        );
+        assert!(
+            !error.contains("composition receipt") && !error.contains("digest changed"),
+            "should reject a receipt with {name} while parsing it: {error}"
+        );
+    }
+}
+
+#[test]
+fn receipt_coverage_claims_apple_evidence_and_runtime_format_follow_the_target() {
+    // Transfers 0, 2, 3 and 4 are Fastly, both Darwin CLIs and the Linux CLI.
+    let cases = [
+        (
+            0,
+            "/composition/native/material_native_coverage_complete",
+            json!(true),
+            "claims complete material native coverage",
+        ),
+        (
+            4,
+            "/composition/platform/material_native_coverage_complete",
+            json!(true),
+            "claims complete material native coverage",
+        ),
+        (
+            0,
+            "/composition/platform/apple",
+            json!({"sdk_version": "15.0"}),
+            "Apple evidence does not match its target",
+        ),
+        (
+            4,
+            "/composition/platform/apple",
+            json!({"sdk_version": "15.0"}),
+            "Apple evidence does not match its target",
+        ),
+        (
+            2,
+            "/composition/platform/apple",
+            Value::Null,
+            "Apple evidence does not match its target",
+        ),
+        (
+            0,
+            "/composition/platform/external_requirements/runtime/format",
+            json!("elf"),
+            "runtime format does not match its target",
+        ),
+        (
+            3,
+            "/composition/platform/external_requirements/runtime/format",
+            json!("wasm"),
+            "runtime format does not match its target",
+        ),
+        (
+            4,
+            "/composition/platform/external_requirements/runtime/format",
+            json!("macho"),
+            "runtime format does not match its target",
+        ),
+    ];
+    for (index, pointer, value, expected) in cases {
+        let mut fixture = cohort_fixture();
+        rebind_composition(&mut fixture, index, pointer, value);
+        let error = diagnose_collection(&fixture).expect_err("should reject the receipt");
+        assert!(
+            format!("{error:?}").contains(expected),
+            "should reject transfer {index} receipt {pointer} with {expected}: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn receipt_entry_point_binds_producer_facts_for_every_fixed_asset() {
+    let (artifact, source, inventory, materials) = (
+        "a".repeat(64),
+        "b".repeat(40),
+        "c".repeat(64),
+        "e".repeat(64),
+    );
+    let facts = |asset: &'static str| ReceiptFacts {
+        artifact_sha256: &artifact,
+        source_commit: &source,
+        inventory_sha256: &inventory,
+        materials_sha256: &materials,
+        asset,
+    };
+    for fixed in &crate::policy::FIXED_ARTIFACTS {
+        let receipt = composition_receipt(fixed.target.triple(), &artifact, &source, &inventory);
+        check_composition_receipt(&receipt, &facts(fixed.name)).unwrap_or_else(|error| {
+            panic!("should accept the receipt for {}: {error:?}", fixed.name)
+        });
+        let other_materials = "9".repeat(64);
+        let error = check_composition_receipt(
+            &receipt,
+            &ReceiptFacts {
+                materials_sha256: &other_materials,
+                ..facts(fixed.name)
+            },
+        )
+        .expect_err("should reject other build materials");
+        assert!(
+            format!("{error:?}").contains("not bound to the build materials"),
+            "should reject {} receipt for other materials: {error:?}",
+            fixed.name
+        );
+    }
+    let fastly = &crate::policy::FIXED_ARTIFACTS[0];
+    let receipt = composition_receipt(fastly.target.triple(), &artifact, &source, &inventory);
+    let error = check_composition_receipt(&receipt, &facts(crate::policy::FIXED_ARTIFACTS[3].name))
+        .expect_err("should reject a receipt for another asset target");
+    assert!(
+        format!("{error:?}").contains("composition receipt names another target"),
+        "should derive the target from the asset: {error:?}"
+    );
+    let error = check_composition_receipt(&receipt, &facts("unknown-asset"))
+        .expect_err("should reject an unknown asset");
+    assert!(
+        format!("{error:?}").contains("unknown cohort artifact"),
+        "should reject an asset outside the fixed set: {error:?}"
+    );
+}
+
+#[test]
+fn fastly_receipt_must_embed_every_js_module_while_native_may_not() {
+    let pointer = "/composition/javascript/modules/0/classification";
+    let mut fastly = cohort_fixture();
+    rebind_composition(&mut fastly, 0, pointer, json!("js_build_material"));
+    let error = diagnose_collection(&fastly).expect_err("should reject unembedded Fastly JS");
+    assert!(
+        format!("{error:?}").contains("composition receipt omits a complete Fastly JS module"),
+        "should reject a Fastly receipt with an unembedded module: {error:?}"
+    );
+    let mut native = cohort_fixture();
+    rebind_composition(&mut native, 2, pointer, json!("js_build_material"));
+    diagnose_collection(&native).expect("should accept CLI-discarded JS build material");
 }
 
 /// Every optional reproduction state: never started, failed, matched, mismatched.
@@ -1120,18 +1497,7 @@ fn no_optional_reproduction_state_hides_a_mandatory_canonical_failure() {
         ("/ambient/child_locale", json!("en_US.UTF-8")),
         ("/claim/varied", json!(["umask", "jobs", "checkout_root"])),
     ];
-    let composition_gates = [
-        ("/artifact_sha256", json!("9".repeat(64))),
-        ("/source_commit", json!("9".repeat(40))),
-        ("/inventory_sha256", json!("9".repeat(64))),
-        ("/compiled_units", json!(0)),
-        ("/contributing_sources", json!([])),
-        (
-            "/contributing_sources",
-            json!(["d".repeat(64), "d".repeat(64)]),
-        ),
-        ("/contributing_sources", json!(["not-a-digest"])),
-    ];
+    let composition_gates = composition_gates();
     for canonical in [0, 2, 3, 4] {
         for (state, fixture) in every_optional_reproduction_state() {
             for (pointer, value) in &record_gates {

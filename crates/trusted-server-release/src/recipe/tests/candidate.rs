@@ -155,6 +155,22 @@ fn check_owned_export_after_cleanup<T>(
         view.receipt_sha256(),
         "should project the exact retained composition receipt"
     );
+    let composition = completed
+        .composition_export()
+        .expect("should export the sealed composition receipt");
+    crate::collection::check_composition_receipt(
+        composition.bytes(),
+        &crate::collection::ReceiptFacts {
+            artifact_sha256: completed.artifact().sha256(),
+            source_commit: completed.commit().as_str(),
+            inventory_sha256: javascript.inventory_sha256(),
+            materials_sha256: completed.materials_digest(),
+            asset: completed.artifact().name(),
+        },
+    )
+    .unwrap_or_else(|error| {
+        panic!("should accept the real producer composition receipt: {error:?}")
+    });
     let expected_runtime = accepted.map(|accepted| accepted.diagnostic_for(completed));
     let export = match accepted {
         Some(RuntimeAcceptance::Fastly(runtime)) => {

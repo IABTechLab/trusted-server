@@ -2,6 +2,21 @@
 
 `build-record.json` is fictional imported diagnostic data. The tests fill its
 artifact, inventory, composition, and runtime digests from local fixture bytes.
+
+`composition.json` is a fictional sealed composition receipt in the producer's
+exact `composition_export()` shape: Cargo query plan digests, compiler
+observations, and the graph, package origin, native, JavaScript and platform
+receipts. The tests fill its target, final artifact digest (JavaScript,
+platform and external-requirement bindings), approved source commit (package
+origins and workspace origins) and shared inventory digest per build. The
+collector rejects unknown or missing members at every level it checks, binds
+the receipt to the record's artifact, source, inventory, materials digest and
+fixed target, requires compiled units and one well-formed origin per observed
+package, rejects any complete material native coverage claim, and requires a
+Fastly receipt to embed every prepared JS module. The platform's installed-tool
+subtrees stay opaque apart from those bindings, Apple evidence present exactly
+for Darwin targets, and a runtime format (`wasm`, `elf`, `macho`) matching the
+target; the tests add fictional Apple and runtime facts per target.
 A Fastly runtime diagnostic names the build role (`A` or `B`) whose own run
 accepted the final bytes and must match its record's role. That role is
 asserted by the producer inside its own record, so it catches mix-ups and reuse
@@ -26,7 +41,7 @@ checkout-root working directory and umask); A and B must also differ there.
 The dependency capability has no production constructor: the qualified adapter
 is an uninhabited type. An imported record never constructs local recipe,
 network-denial, composition, or runtime proof types. In particular, the imported
-composition summary checks digest and identity consistency; it does not prove
+composition receipt checks digest and identity consistency; it does not prove
 complete source coverage or final executable membership. These diagnostics
 cannot authorize signing, publication, or deployment.
 

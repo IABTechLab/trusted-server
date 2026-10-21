@@ -8,11 +8,14 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use self::receipt::{ReceiptBinding, check_receipt};
 use super::{Transfer, ValidatedTransfers, collection_error, digest};
 use crate::documents::{Role, lower_hex, parse_json};
 use crate::error::ReleaseError;
 use crate::inspect::inspect_wasm;
 use crate::policy::FIXED_ARTIFACTS;
+
+mod receipt;
 
 /// A bounded native reproduction measurement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -152,18 +155,47 @@ struct Runtime {
     viceroy_version: String,
 }
 
-/// A digest-bound imported summary, deliberately not a proof of complete coverage.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CompositionDiagnostic {
-    artifact_sha256: String,
-    source_commit: String,
-    inventory_sha256: String,
-    contributing_sources: Vec<String>,
-    compiled_units: u64,
+type Result<T> = std::result::Result<T, Report<ReleaseError>>;
+
+/// Build record facts a sealed composition receipt must restate.
+pub(crate) struct ReceiptFacts<'a> {
+    /// Exact final artifact digest.
+    pub(crate) artifact_sha256: &'a str,
+    /// Approved source commit.
+    pub(crate) source_commit: &'a str,
+    /// Shared original JS inventory digest.
+    pub(crate) inventory_sha256: &'a str,
+    /// Prepared Cargo materials tree digest (`inputs.materials`).
+    pub(crate) materials_sha256: &'a str,
+    /// Fixed asset name; selects the target and the Fastly JS rule.
+    pub(crate) asset: &'a str,
 }
 
-type Result<T> = std::result::Result<T, Report<ReleaseError>>;
+/// Checks a sealed composition receipt exactly as the strict collector does.
+///
+/// The collector calls this after binding the receipt bytes to the record's
+/// `composition_sha256`; the real candidate tests call it on actual producer
+/// exports so the collector schema cannot drift from the producer's.
+///
+/// # Errors
+///
+/// Rejects an unknown asset and every receipt rejection of the collector.
+pub(crate) fn check_composition_receipt(bytes: &[u8], facts: &ReceiptFacts<'_>) -> Result<()> {
+    let fixed = FIXED_ARTIFACTS
+        .iter()
+        .find(|asset| asset.name == facts.asset)
+        .ok_or_else(|| collection_error("unknown cohort artifact"))?;
+    check_receipt(
+        bytes,
+        &ReceiptBinding {
+            artifact_sha256: facts.artifact_sha256,
+            source_commit: facts.source_commit,
+            inventory_sha256: facts.inventory_sha256,
+            materials_sha256: facts.materials_sha256,
+            target: fixed.target,
+        },
+    )
+}
 
 fn require(condition: bool, detail: &str) -> Result<()> {
     if !condition {
@@ -284,26 +316,19 @@ fn check_record(transfer: &Transfer, all: &ValidatedTransfers) -> Result<BuildRe
         digest(composition) == record.composition_sha256,
         "composition document digest changed",
     )?;
-    let composition: CompositionDiagnostic = parse(composition)?;
-    require(
-        composition.artifact_sha256 == record.artifact_sha256
-            && composition.source_commit == record.source_commit
-            && composition.inventory_sha256 == record.inventory_sha256
-            && composition.compiled_units > 0
-            && composition.compiled_units <= 65_536
-            && !composition.contributing_sources.is_empty()
-            && composition.contributing_sources.len() <= 16_384
-            && composition
-                .contributing_sources
-                .iter()
-                .all(|value| lower_hex(value, 64))
-            && composition
-                .contributing_sources
-                .iter()
-                .collect::<BTreeSet<_>>()
-                .len()
-                == composition.contributing_sources.len(),
-        "imported composition summary is missing or inconsistent",
+    let materials_sha256 = record
+        .inputs
+        .get("materials")
+        .ok_or_else(|| collection_error("missing or invalid build input digests"))?;
+    check_composition_receipt(
+        composition,
+        &ReceiptFacts {
+            artifact_sha256: &record.artifact_sha256,
+            source_commit: &record.source_commit,
+            inventory_sha256: &record.inventory_sha256,
+            materials_sha256,
+            asset: &record.asset,
+        },
     )?;
     let boundary = &record.boundary;
     require(

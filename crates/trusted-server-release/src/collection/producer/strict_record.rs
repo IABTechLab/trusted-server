@@ -5,15 +5,13 @@
 //! the collector's unchanged checks can run on producer output. It grants no
 //! authority: the collector still binds identity fields to trusted upload
 //! outputs, and the record cannot reconstruct any local proof type.
+//! `composition_sha256` names the producer's own sealed composition receipt,
+//! which the collector parses strictly and binds to this record.
 //!
 //! Remaining gaps before a real producer transfer can pass the collector:
 //!
 //! - Job identity: the producing job's workflow job ID and attempt are not
 //!   owned by the completed build, so the caller must supply [`ProducerJob`].
-//! - Composition summary: the collector's `composition.json` summary
-//!   (`contributing_sources`, `compiled_units`) has no producer-owned
-//!   equivalent. `composition_sha256` here names the producer's own sealed
-//!   composition receipt, which that summary parser rejects.
 //! - Native startup: the collector schema allows no runtime block for native
 //!   builds, so native startup acceptance cannot be represented.
 
