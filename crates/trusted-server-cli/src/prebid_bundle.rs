@@ -485,7 +485,7 @@ pub(crate) fn load_bundle_config(config_path: &Path) -> CliResult<PrebidBundleCo
         report_error(format!(
             "invalid TOML in {}{}",
             config_path.display(),
-            toml_error_location(error.span())
+            toml_error_location(&contents, error.span())
         ))
     })?;
 
@@ -758,7 +758,7 @@ fn patch_config_metadata(config_path: &Path, sha256: &str, sri: &str) -> CliResu
         report_error(format!(
             "failed to parse config {}{} for metadata update",
             config_path.display(),
-            toml_error_location(error.span())
+            toml_error_location(&contents, error.span())
         ))
     })?;
 
@@ -1864,23 +1864,32 @@ real_time_data = ["exampleRtdProvider"]
     #[cfg(unix)]
     #[test]
     fn patch_config_metadata_preserves_config_permissions() {
-        let (_temp, path) = write_config(&valid_config());
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-            .expect("should restrict config permissions");
+        // The temp file is created 0600, so 0640 is what proves the target's mode
+        // is copied onto the replacement rather than the temp file's default kept.
+        for mode in [0o600, 0o640] {
+            let (_temp, path) = write_config(&valid_config());
+            fs::set_permissions(&path, fs::Permissions::from_mode(mode))
+                .expect("should set config permissions");
 
-        patch_config_metadata(&path, &"a".repeat(64), "sha384-abc")
-            .expect("should patch config metadata");
+            patch_config_metadata(&path, &"a".repeat(64), "sha384-abc")
+                .expect("should patch config metadata");
 
-        let mode = fs::metadata(&path)
-            .expect("should stat patched config")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(mode, 0o600, "should keep the operator's config permissions");
+            let patched = fs::metadata(&path)
+                .expect("should stat patched config")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                patched, mode,
+                "should keep the operator's config permissions {mode:o}"
+            );
+        }
     }
 
+    // Success path only; the failed-rename cleanup is covered by
+    // `fs_util::tests::write_file_atomically_removes_temp_file_when_rename_fails`.
     #[test]
-    fn patch_config_metadata_leaves_no_temp_files() {
+    fn patch_config_metadata_leaves_only_config_on_success() {
         let (temp, path) = write_config(&valid_config());
 
         patch_config_metadata(&path, &"a".repeat(64), "sha384-abc")
@@ -1910,7 +1919,26 @@ real_time_data = ["exampleRtdProvider"]
             "should not echo config source text: {error}"
         );
         assert!(
-            error.contains("at byte offset"),
+            error.contains("at line "),
+            "should report the error location: {error}"
+        );
+    }
+
+    #[test]
+    fn patch_config_metadata_parse_error_does_not_echo_config_source() {
+        let (_temp, path) = write_config(
+            "[publisher]\norigin_url = \"https://origin-private.example.com/internal\n",
+        );
+
+        let error = patch_config_metadata(&path, &"a".repeat(64), "sha384-abc")
+            .expect_err("should reject invalid TOML");
+
+        assert!(
+            !error.contains("origin-private.example.com"),
+            "should not echo config source text: {error}"
+        );
+        assert!(
+            error.contains("at line "),
             "should report the error location: {error}"
         );
     }

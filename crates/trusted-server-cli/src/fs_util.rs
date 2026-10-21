@@ -13,9 +13,11 @@ use std::path::Path;
 /// within a directory is atomic, so a reader sees either the old file or the
 /// complete new one. If any step fails, the temp file is removed on drop.
 ///
-/// The temp file is created 0600. When the target already exists, its
-/// permissions are carried onto the replacement so the write neither widens
-/// nor narrows access; a new file stays 0600.
+/// The temp file is created 0600. When the target already exists, its mode
+/// bits are carried onto the replacement; a new file stays 0600. Because the
+/// target is replaced by rename, its owner, group, ACLs and hard links are not
+/// preserved, and a symlink at `path` is replaced by a regular file rather than
+/// updating the file it points to.
 ///
 /// # Errors
 ///

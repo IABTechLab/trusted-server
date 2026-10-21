@@ -28,7 +28,7 @@ use crate::commands::audit::generate::slot_toml::{
     render_slots, replace_key_in_section, resolve_network_id, splice_creative_slots, toml_string,
 };
 use crate::commands::config::init::EXAMPLE_CONFIG;
-use crate::error::{CliResult, cli_error, report_error};
+use crate::error::{CliResult, cli_error, report_error, toml_error_location};
 use crate::fs_util::write_file_atomically;
 
 use analyzer::{analyze_collected_page, extract_gtm_container_id};
@@ -1159,7 +1159,10 @@ pub(crate) fn run_update_slots(
 /// unrelated operator configuration from dry-run output.
 fn managed_creative_projection(document: &str) -> CliResult<String> {
     let value = toml::from_str::<toml::Value>(document).map_err(|error| {
-        report_error(format!("failed to parse config for dry-run diff: {error}"))
+        report_error(format!(
+            "failed to parse config for dry-run diff{}",
+            toml_error_location(document, error.span())
+        ))
     })?;
     let creative = value
         .get("creative_opportunities")
@@ -4336,6 +4339,22 @@ mod tests {
             fs::read_to_string(&config_path).expect("should re-read config"),
             replacement,
             "the concurrent edit must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn managed_creative_projection_parse_error_does_not_echo_config_source() {
+        let source = "[publisher]\norigin_url = \"https://origin-private.example.com/internal\n";
+
+        let error = managed_creative_projection(source).expect_err("should reject invalid TOML");
+
+        assert!(
+            !error.contains("origin-private.example.com"),
+            "should not echo config source text: {error}"
+        );
+        assert!(
+            error.contains("at line 2, column "),
+            "should report the error location: {error}"
         );
     }
 }
