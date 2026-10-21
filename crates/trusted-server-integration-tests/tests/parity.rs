@@ -1564,22 +1564,18 @@ mod trace_parity {
                         futures_trace_empty_stream(),
                     ))
                     .expect("should build no-content-type streamed action");
-                request.extensions_mut().insert(
-                    RequestIngress::new(
-                        CapturedTarget::Unavailable(TargetUnavailable::NotExposed),
-                        Some(
-                            InboundOrigin::parse(
-                                "https",
-                                "publisher.example.com",
-                                OriginSource::RuntimeUri,
-                            )
-                            .expect("should freeze trusted origin"),
-                        ),
-                        HeaderFidelity::default(),
-                        Vec::new(),
-                    )
-                    .expect("should create ingress snapshot"),
-                );
+                request.extensions_mut().insert(RequestIngress::new(
+                    CapturedTarget::Unavailable(TargetUnavailable::NotExposed),
+                    Some(
+                        InboundOrigin::parse(
+                            "https",
+                            "publisher.example.com",
+                            OriginSource::RuntimeUri,
+                        )
+                        .expect("should freeze trusted origin"),
+                    ),
+                    HeaderFidelity::default(),
+                ));
                 let response = RouterService::oneshot(&router, request)
                     .await
                     .expect("should request local mutation");
@@ -1679,18 +1675,14 @@ mod trace_parity {
             .header("x-ts-trace-action", "enable")
             .body(edgezero_core::body::Body::empty())
             .expect("should build an authenticated forwarded request");
-        request.extensions_mut().insert(
-            RequestIngress::new(
-                CapturedTarget::Unavailable(TargetUnavailable::NotExposed),
-                Some(
-                    InboundOrigin::parse("http", TRANSPORT_AUTHORITY, OriginSource::RuntimeUri)
-                        .expect("should freeze internal transport origin"),
-                ),
-                HeaderFidelity::default(),
-                Vec::new(),
-            )
-            .expect("should retain transport ingress"),
-        );
+        request.extensions_mut().insert(RequestIngress::new(
+            CapturedTarget::Unavailable(TargetUnavailable::NotExposed),
+            Some(
+                InboundOrigin::parse("http", TRANSPORT_AUTHORITY, OriginSource::RuntimeUri)
+                    .expect("should freeze internal transport origin"),
+            ),
+            HeaderFidelity::default(),
+        ));
         request
     }
 
@@ -1931,27 +1923,19 @@ mod trace_parity {
                     http::HeaderValue::from_str("__Host-ts-console=1; unrelated=\u{fffd}")
                         .expect("should supply runtime-visible cookie marker"),
                 );
-                request.extensions_mut().insert(
-                    RequestIngress::new(
-                        CapturedTarget::Unavailable(TargetUnavailable::NotExposed),
-                        Some(
-                            InboundOrigin::parse(
-                                "http",
-                                TRANSPORT_AUTHORITY,
-                                OriginSource::RuntimeUri,
-                            )
+                request.extensions_mut().insert(RequestIngress::new(
+                    CapturedTarget::Unavailable(TargetUnavailable::NotExposed),
+                    Some(
+                        InboundOrigin::parse("http", TRANSPORT_AUTHORITY, OriginSource::RuntimeUri)
                             .expect("should retain transport origin"),
-                        ),
-                        HeaderFidelity::new(
-                            preservation,
-                            preservation,
-                            Preservation::Unknown,
-                            Preservation::Unavailable,
-                        ),
-                        Vec::new(),
-                    )
-                    .expect("should supply original cookie fidelity"),
-                );
+                    ),
+                    HeaderFidelity::new(
+                        preservation,
+                        preservation,
+                        Preservation::Unknown,
+                        Preservation::Unavailable,
+                    ),
+                ));
                 let response = RouterService::oneshot(&router, request)
                     .await
                     .expect("should observe forwarded cookie state");

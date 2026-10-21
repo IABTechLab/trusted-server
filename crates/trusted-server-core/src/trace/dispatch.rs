@@ -594,7 +594,7 @@ mod tests {
         let metadata = Arc::new(AtomicUsize::new(0));
         let handler_calls = Arc::clone(&ordinary);
         let router = RouterService::builder()
-            .pre_dispatch_hook(Arc::new(hook(true, Arc::clone(&metadata))))
+            .pre_dispatch_hook_arc(Arc::new(hook(true, Arc::clone(&metadata))))
             .middleware(OrdinaryLifecycleCounter(Arc::clone(&ordinary)))
             .route("/{*rest}", Method::GET, move |_context: RequestContext| {
                 let handler_calls = Arc::clone(&handler_calls);

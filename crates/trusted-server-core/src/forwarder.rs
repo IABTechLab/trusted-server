@@ -442,9 +442,7 @@ mod tests {
                         .expect("should construct immutable transport origin"),
                 ),
                 HeaderFidelity::default(),
-                vec![],
-            )
-            .expect("should retain unavailable target and fidelity");
+            );
             let original_fidelity = ingress.header_fidelity(&header::COOKIE);
             request.extensions_mut().insert(ingress);
             request.headers_mut().insert(

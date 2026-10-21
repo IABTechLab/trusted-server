@@ -722,24 +722,20 @@ mod tests {
                 )
                 .expect("should validate runtime origin"),
             ));
-            request.extensions_mut().insert(
-                RequestIngress::new(
-                    edgezero_core::request::CapturedTarget::Unavailable(
-                        edgezero_core::request::TargetUnavailable::NotExposed,
-                    ),
-                    ingress_available.then(|| {
-                        InboundOrigin::parse(
-                            "http",
-                            "internal.example.com:8080",
-                            edgezero_core::request::OriginSource::RuntimeUri,
-                        )
-                        .expect("should validate ingress origin")
-                    }),
-                    edgezero_core::request::HeaderFidelity::default(),
-                    Vec::new(),
-                )
-                .expect("should freeze ingress"),
-            );
+            request.extensions_mut().insert(RequestIngress::new(
+                edgezero_core::request::CapturedTarget::Unavailable(
+                    edgezero_core::request::TargetUnavailable::NotExposed,
+                ),
+                ingress_available.then(|| {
+                    InboundOrigin::parse(
+                        "http",
+                        "internal.example.com:8080",
+                        edgezero_core::request::OriginSource::RuntimeUri,
+                    )
+                    .expect("should validate ingress origin")
+                }),
+                edgezero_core::request::HeaderFidelity::default(),
+            ));
             crate::forwarder::prepare_trusted_forwarder(&mut request, &settings);
 
             let info = RequestInfo::from_request(&request, &default_client_info())

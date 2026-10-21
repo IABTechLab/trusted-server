@@ -224,8 +224,8 @@ mod tests {
             CapturedTarget::Unavailable(TargetUnavailable::NotExposed),
             None,
             common,
-            overrides,
         )
+        .with_header_overrides(overrides)
         .expect("should construct distinct field fidelity overrides")
     }
 

@@ -5192,9 +5192,7 @@ mod tests {
                     .expect("should construct transport origin"),
                 ),
                 edgezero_core::request::HeaderFidelity::default(),
-                vec![],
-            )
-            .expect("should construct ingress");
+            );
             request.extensions_mut().insert(ingress);
             crate::forwarder::prepare_trusted_forwarder(&mut request, &settings);
             let mut snapshot = super::snapshot_context_request(&request);
