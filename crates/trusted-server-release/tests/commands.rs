@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 use tempfile::{TempDir, tempdir};
 
 const RELEASE_BIN: &str = env!("CARGO_BIN_EXE_trusted-server-release");
@@ -14,6 +15,121 @@ const COHORT: &str = "scripts/release/release-cohort.json";
 const TOOLS: &str = "scripts/release/release-tools.json";
 const CLI_POLICY: &str = "crates/trusted-server-cli/release-policy.json";
 const BOOTSTRAP: &str = "scripts/release/bootstrap.sh";
+
+fn manual_package_fixture(root: &Path) -> (String, String) {
+    let manifest = b"manifest_version = 3\nname = \"example-app\"\n";
+    let wasm = b"\0asm\x01\0\0\0";
+    let directory = root.join("pkg");
+    fs::create_dir(&directory).expect("should create package directory");
+    fs::write(root.join("fastly.toml"), manifest).expect("should write reviewed manifest");
+    let encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    let mut archive = tar::Builder::new(encoder);
+    for (path, kind, bytes) in [
+        ("example-app/", tar::EntryType::Directory, &b""[..]),
+        ("example-app/bin/", tar::EntryType::Directory, &b""[..]),
+        (
+            "example-app/bin/main.wasm",
+            tar::EntryType::Regular,
+            &wasm[..],
+        ),
+        (
+            "example-app/fastly.toml",
+            tar::EntryType::Regular,
+            &manifest[..],
+        ),
+    ] {
+        let mut header = tar::Header::new_ustar();
+        header.set_entry_type(kind);
+        header.set_mode(0o755);
+        header.set_size(bytes.len() as u64);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, path, bytes)
+            .expect("should write bounded fictional package member");
+    }
+    let bytes = archive
+        .into_inner()
+        .expect("should finish archive")
+        .finish()
+        .expect("should finish gzip");
+    fs::write(directory.join("example-app.tar.gz"), bytes).expect("should write package");
+    (
+        hex::encode(Sha256::digest(manifest)),
+        hex::encode(Sha256::digest(wasm)),
+    )
+}
+
+fn inspect_manual_package(root: &Path, manifest: &str, wasm: &str) -> Output {
+    Command::new(RELEASE_BIN)
+        .current_dir(root)
+        .env_clear()
+        .args([
+            "inspect-fastly-package",
+            "--package-dir",
+            "pkg",
+            "--manifest",
+            "fastly.toml",
+            "--expected-manifest-sha256",
+            manifest,
+            "--expected-wasm-sha256",
+            wasm,
+        ])
+        .output()
+        .expect("should run only the local release inspector")
+}
+
+#[test]
+fn manual_fastly_package_command_accepts_exact_bytes_without_release_authority() {
+    let root = tempdir().expect("should create private package fixture");
+    let (manifest, wasm) = manual_package_fixture(root.path());
+    let output = inspect_manual_package(root.path(), &manifest, &wasm);
+    assert!(
+        output.status.success(),
+        "should accept exact package: {}",
+        stderr(&output)
+    );
+    let report: Value =
+        serde_json::from_slice(&output.stdout).expect("should parse inspection report");
+    assert_eq!(
+        report["accepted"], true,
+        "should report the bounded byte checks"
+    );
+    assert_eq!(
+        report["module_sha256"], wasm,
+        "should bind the actual module member"
+    );
+    assert_eq!(
+        report["manifest_sha256"], manifest,
+        "should bind reviewed manifest bytes"
+    );
+    assert_eq!(
+        report["limits"]["runtime_validated"], false,
+        "should retain runtime limitation"
+    );
+    assert_eq!(
+        report["limits"]["official_release_verified"], false,
+        "should not mint release trust"
+    );
+    assert_eq!(
+        report["limits"]["deployment_authorized"], false,
+        "should not authorize mutation"
+    );
+}
+
+#[test]
+fn manual_fastly_package_command_rejects_an_unmatched_expected_digest() {
+    let root = tempdir().expect("should create private package fixture");
+    let (manifest, _) = manual_package_fixture(root.path());
+    let output = inspect_manual_package(root.path(), &manifest, &"b".repeat(64));
+    assert!(
+        !output.status.success(),
+        "should reject another expected executable"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "should emit no acceptance on failure"
+    );
+}
 
 /// Preflight rejects any ancestor Cargo configuration layer, so fixtures need a
 /// temporary directory whose ancestry has none; report that host precondition.

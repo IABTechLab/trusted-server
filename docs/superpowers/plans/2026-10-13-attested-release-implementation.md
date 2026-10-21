@@ -49,19 +49,19 @@ The producer helper MUST itself be built and executable inside the selected GNU 
 
 Current implementation includes strict documents/policy, local source/preflight checks, bounded process supervision, owning build facts, checked JS inventory and Node composition. Original archive authentication, bounded private extraction and lifecycle declaration review are implemented. Final-artifact inspection and experimental native boundaries are implemented, with separate consumer evidence verification. The experimental macOS profile now kills and rejects descendants that escape the process group, including with a scrubbed environment, by identifying its sandbox instance after each run; it remains unqualified and does not own descendant cleanup the way a container does. Native boundary controls pass ordinary Ubuntu 24.04 and macOS 15 CI; they do not qualify complete release recipes or authenticated tool selections. Original npm and Cargo Git material verification and two-installation JS orchestration are implemented; the full Linux A/B execution test passed in ordinary PR CI. Candidate recipes for all four assets are implemented and pass ordinary CI (unqualified, `release_qualification: false`). Qualification, the closed `build.sh` interface, the production reproduction profile, authenticated bootstrap/acquisition and hosted qualification remain incomplete. Production wrappers and qualified selection remain closed.
 
-## Current task status — 2026-10-20
+## Current task status — 2026-10-21
 
 Count complete task exits separately from implemented code awaiting external
 qualification. There are **8 complete tasks and 14 open tasks**. One open task
 has its implementation finished; nine tasks therefore have completed code.
 Task counts do not measure remaining effort.
 
-| Status                                         | Count | Tasks                     | Remaining exit work                                                                                                                                                                           |
-| ---------------------------------------------- | ----- | ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Complete                                       | 8     | 2, 4, 5, 6, 7, 17, 18, 20 | Implementation, local verification, real pinned-verifier public-fixture validation where required, and independent review completed                                                           |
-| Implementation complete; qualification pending | 1     | 19                        | Official Trusted Server signed-release first-use verification; upstream provenance/SPDX format compatibility has been measured                                                                |
-| Partial or prerequisite approval pending       | 7     | 1, 3, 8, 9, 10, 11, 12    | Maintainer scope approval; authenticated bootstrap/tool selection; platform qualification; full Rust recipes/runtime acceptance; complete composition/SPDX and qualified transfer integration |
-| Pending implementation                         | 6     | 13–16, 21–22              | Evidence collector, trusted workflows, immutable publication, manual Fastly route and final qualification                                                                                     |
+| Status                                         | Count | Tasks                     | Remaining exit work                                                                                                                                                                       |
+| ---------------------------------------------- | ----- | ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Complete                                       | 8     | 2, 4, 5, 6, 7, 17, 18, 20 | Implementation, local verification, real pinned-verifier public-fixture validation where required, and independent review completed                                                       |
+| Implementation complete; qualification pending | 1     | 19                        | Official Trusted Server signed-release first-use verification; upstream provenance/SPDX format compatibility has been measured                                                            |
+| Partial or prerequisite approval pending       | 9     | 1, 3, 8–13, 21            | Maintainer scope approval; authenticated bootstrap/tool selection; platform qualification; complete composition/SPDX, trusted transfers and real index assembly; live manual Fastly proof |
+| Pending implementation                         | 4     | 14–16, 22                 | Trusted same-commit validation/signing workflows, immutable publication and final qualification                                                                                           |
 
 Task 7's Linux JS exit (M3) passed: an actual ordinary-CI run completed both
 fresh offline installations, lifecycle observations, missing-tool and download
@@ -562,15 +562,51 @@ unfinished exits. Task 13 remains partial.
 **Create:** release tool `src/package.rs`, private `package::tests`, bounded manual Fastly archive fixtures and public command tests.
 **Modify:** `docs/guide/release-verification.md`, `docs/guide/cli.md`, `CHANGELOG.md`; correct obsolete config-embedding comments in source/test/setup files identified below.
 
-- [ ] Test accepted four-member layout, generic manifest-only archive, swept-in files, reserved/empty package name, traversal, links, duplicates, wrong module/manifest, malformed/non-core wasm and max-size bounds.
-- [ ] Run `cargo test -p trusted-server-release --target "$HOST_TARGET" package::tests` with the nonzero-selection guard; expect absent inspector.
+- [x] Test accepted four-member layout, generic manifest-only archive, swept-in files, reserved/empty package name, traversal, links, duplicates, wrong module/manifest, malformed/non-core wasm and max-size bounds.
+- [x] Run `cargo test -p trusted-server-release --target "$HOST_TARGET" package::tests` with the nonzero-selection guard; expect absent inspector.
 - [ ] Use a fresh private directory, independently bootstrapped approved-source `trusted-server-release inspect-fastly-package`, an allowlisted deployment-only manifest and verified wasm. `compute pack --wasm-binary` has two output archives; select named archive only after exact layout/content checks. Pack/validate accepting a file does not prove valid Wasm or application execution. Verify valid core format and positive publisher-request fixture separately.
-- [ ] Inspector takes the approved expected executable digest and manifest identity from the successful verification/context procedure, rehashes both the retained archive and its actual module member immediately before submission, and never trusts a digest supplied by the archive. Document trusted-source acquisition for the helper; it is not a separately authenticated release asset.
-- [ ] Document observed service/base-version bindings and explicit production command with --service-id, --version and --no-default-domain. Explain manifest precedence, automatic clone/activation, possible same-hash skip and inability to supply integrated staging/preactivation guarantees. Serialize manual operator changes. No compute publish/source build is permitted.
+- [x] Inspector takes the approved expected executable digest and manifest identity from the successful verification/context procedure, rehashes both the retained archive and its actual module member immediately before submission, and never trusts a digest supplied by the archive. Document trusted-source acquisition for the helper; it is not a separately authenticated release asset.
+- [x] Document observed service/base-version bindings and explicit production command with --service-id, --version and --no-default-domain. Explain manifest precedence, automatic clone/activation, possible same-hash skip and inability to supply integrated staging/preactivation guarantees. Serialize manual operator changes. No compute publish/source build is permitted.
 - [ ] Run a separately authorized disposable Fastly service submission; compare submitted member and actual returned version, including skip/uncertain cases. Record live proof before declaring AC-9 passed. No customer context or provider credentials enter producer jobs.
-- [ ] Correct false config-embedding text in `.github/actions/setup-integration-test-env/action.yml`, `.github/workflows/test.yml`, integration runtime/framework/parity helpers, browser infra helper and Spin app/middleware/route comments; behavior changes remain separate. Commit `Document and validate verified-byte Fastly deployment`.
 
-- [ ] Update `docs/guide/getting-started.md`, `edgezero.md` and `error-reference.md`: canonical `x-ts-version` is full source identity, external tag belongs to the index, and development retains #1213 display fallback. Annotate the historical #1213 goals. Validate manual retained-byte packaging/submission as AC-9/D6 and operator guidance as AC-9/D8; upstream EdgeZero delay MUST NOT block this manual route. Context/preactivation/staging/recovery remain AC-8.
+  This exit remains unchecked: no live service submission is authorized in the
+  local Task 21 increment. Inspector/command tests and instructions do not supply
+  submitted-member, returned-version or application-runtime observations.
+
+- [x] Correct false config-embedding text in `.github/actions/setup-integration-test-env/action.yml`, `.github/workflows/test.yml`, integration runtime/framework/parity helpers, browser infra helper and Spin app/middleware/route comments; behavior changes remain separate. Commit `Document and validate verified-byte Fastly deployment`.
+
+- [x] Update `docs/guide/getting-started.md`, `edgezero.md` and `error-reference.md`: canonical `x-ts-version` is full source identity, external tag belongs to the index, and development retains #1213 display fallback. Annotate the historical #1213 goals. Validate manual retained-byte packaging/submission as AC-9/D6 and operator guidance as AC-9/D8; upstream EdgeZero delay MUST NOT block this manual route. Context/preactivation/staging/recovery remain AC-8.
+
+Local implementation (2026-10-21): `inspect-fastly-package` selects only the
+named archive derived from a separately approved manifest, checks its four raw
+TAR members without extraction and validates actual module bytes with the pinned
+core-Wasm inspector. The initial manifest profile is deliberately narrow: exactly
+`manifest_version = 3` and a portable nonreserved `name`, in canonical two-line
+form without comments. It accepts no build hooks, setup payloads or local fixtures.
+Held-file/path identity checks and repeated archive/member hashes precede the
+diagnostic report; expected hashes are independent inputs and grant no authority.
+Pure archive fixtures and command tests exercise local inspection only.
+
+The guidance documents trusted helper bootstrap, separate retained verified-byte
+acquisition, service/base-version observations and explicit production limits.
+`ts release verify` still has no public export option. The source-header split
+and historical #1213 development fallback remain documented. The checked guidance
+item above records the text implementation, not completion of its AC-9/D6 live
+validation dependency. An actual pinned Fastly CLI pack/inspect compatibility run,
+positive application-request runtime acceptance in this manual operation, and
+separately authorized disposable-service submission remain unobserved here.
+The pack/private-directory exit and live submission exit stay unchecked; AC-9
+and Task 21 are not complete. No production selector, workflow trigger, transfer
+adapter, signer, deployment code or provider resource was changed.
+
+Local verification passed 17 pure package tests with a nonzero-selection guard,
+both new public-command tests (spawning only the release binary), strict native
+all-target/all-feature Clippy, documentation generation, formatting and workflow
+lint. The acceptance command failed before dispatch existed and passed afterward;
+a non-UTF-8 report-path panic was separately reproduced and corrected. Independent
+spec and quality review found no remaining findings. No sandbox/container tests,
+Fastly CLI process or provider submission were run locally. The complete hosted
+CI matrix and actual pinned-pack compatibility remain separate validation.
 
 ### Task 22: Full validation, qualification evidence and release handoff
 

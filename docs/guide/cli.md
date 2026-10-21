@@ -94,8 +94,12 @@ ts release verify v1.2.0 --asset ts-aarch64-apple-darwin \
 
 Replace this fictional commit with an independently approved full source commit.
 The command is read-only, uses an explicit read-only `GH_TOKEN` (falling back to
-`GITHUB_TOKEN`), and returns a verification report. It has no deployment or public
-offline option.
+`GITHUB_TOKEN`), and returns a verification report. It has no deployment, export or
+public offline option.
+
+For manual production consumption of verified Fastly wasm, follow the
+[private-directory packaging and submission procedure](./release-verification.md#manual-fastly-production-consumption).
+Bootstrap the separate package inspector from independently approved source.
 
 ## Common workflow
 

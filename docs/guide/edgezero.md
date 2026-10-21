@@ -81,3 +81,9 @@ See [Configuration](/guide/configuration) for the field contract, the
 [CLI guide](/guide/cli) for exact command help, and
 [deployment guides](/guide/integrations-overview#adapter-support) for target
 behavior.
+
+Canonical Fastly release consumption has a separate
+[manual verified-byte procedure](/guide/release-verification#manual-fastly-production-consumption).
+Integrated attested deployment with preactivation checks and staging isolation
+remains separate work; the managed source/application-release path is not proof
+those guarantees exist.

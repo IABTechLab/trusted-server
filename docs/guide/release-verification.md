@@ -155,3 +155,139 @@ Offline success establishes approved bytes and build evidence. It cannot
 re-establish official immutable release membership, current release state or
 fresh revocation. GitHub release verification requires online publication checks;
 offline official deployment is unsupported.
+
+## Manual Fastly production consumption
+
+This manual route transports inspected, verified wasm bytes while integrated
+attested deployment is pending. It activates production and does not provide the
+integrated preactivation binding check, staging isolation or durable structured
+recovery contract. Existing EdgeZero application-release deployment is a separate
+path; `ts deploy --release` is not an implemented command here.
+
+### Retain trusted inputs and bootstrap the inspector
+
+Complete online release verification for `trusted-server-fastly.wasm` against the
+independently approved source commit. `ts release verify` reports verification and
+discards its retained files; it has no public export option. Separately retain the
+exact wasm bytes using a trusted acquisition procedure, and compare their SHA-256
+with the successful verification context. Stop if trusted retention of matching
+bytes is unavailable. A neighboring checksum or an archive's own digest does not
+establish this trust.
+
+Build the package inspector from the same independently approved repository
+commit, with its reviewed lockfile and toolchain. Do not execute a newly downloaded
+helper to establish its own trust. For example, in that approved checkout on
+Apple Silicon macOS:
+
+```bash
+cargo build --locked --package trusted-server-release --target aarch64-apple-darwin
+TRUSTED_RELEASE="$PWD/target/aarch64-apple-darwin/debug/trusted-server-release"
+```
+
+Use the corresponding native host target on Linux. The source-built inspector is
+not a separately authenticated release asset and does not verify acquisition,
+attestations, provider bindings or live execution.
+
+### Prepare a private deployment directory
+
+Use a fresh private directory for this operation. Copy the retained verified wasm
+there as `trusted-server-fastly.wasm`. Derive a new deployment-only `fastly.toml`
+from the reviewed publisher-owned manifest; leave the original operator manifest
+unchanged. The inspector accepts this deliberately narrow two-line profile:
+
+```toml
+manifest_version = 3
+name = "example-app"
+```
+
+Use exactly these two root keys in this order, this spacing, and a final newline.
+The name must contain 1–64 lowercase ASCII letters/digits, optionally separated
+by single hyphens, and must not be `package`. No comments, descriptions, language,
+service IDs, tables, `[local_server]`, `[setup]`, scripts, build hooks, inline
+fixtures, active app-config payloads or secrets are accepted. This profile does
+not provision resources; select the existing service explicitly at submission.
+Independently approve the exact deployment manifest bytes and their SHA-256 in
+the deployment context before packing. Keep that approved digest and the verified
+wasm digest outside the archive as trusted inputs.
+
+Review the intended existing service and integer base version. Independently
+inspect that exact version's observed Config, KV and Secret Store links, logical
+IDs, selectors and required secret references/presence. Declarations in an
+operator manifest's `[setup]` do not prove or update existing-service bindings;
+this procedure does not push configuration or secrets. Record shared resources
+and serialize changes to the service and those resources across environments.
+
+### Pack, inspect and submit
+
+Use the pinned Fastly CLI **15.1.0** from an independently trusted installation.
+From the private directory containing only the approved deployment inputs, run:
+
+```bash
+fastly compute pack --wasm-binary ./trusted-server-fastly.wasm
+```
+
+At this pin, packing creates both `pkg/<name>.tar.gz` and an unrelated
+`pkg/package.tar.gz`, and can sweep in pre-existing package contents. Fresh
+private directories are required. The selected named archive must contain exactly
+`<name>/`, `<name>/bin/`, `<name>/bin/main.wasm` and `<name>/fastly.toml`.
+Never submit the generic `package.tar.gz` by guessing its name.
+
+Inspect the output directory using the independently approved expected manifest
+and wasm digests. Replace the placeholders with those trusted SHA-256 values:
+
+```bash
+"$TRUSTED_RELEASE" inspect-fastly-package \
+  --package-dir "$PWD/pkg" \
+  --manifest "$PWD/fastly.toml" \
+  --expected-manifest-sha256 '<approved-manifest-sha256>' \
+  --expected-wasm-sha256 '<verified-wasm-sha256>'
+```
+
+The inspector bounds archive processing and rejects traversal, links, duplicate
+or extra entries, mismatched manifest/wasm bytes and malformed or non-core wasm.
+Its JSON report identifies the selected absolute package path and the archive,
+module and manifest hashes, together with its limits. Record those observations.
+The archive SHA-256 identifies this operation's envelope; nondeterministic tar
+metadata means it is not the canonical release identity.
+
+Packing and `compute validate` can accept non-wasm bytes and do not remove private
+fixtures. Neither command proves valid wasm, usable application configuration or
+application execution. Inspector success also does not replace a positive
+publisher-request runtime check; `/health` alone can bypass application settings.
+
+Immediately before submission, recheck the selected base version's bindings and
+selectors and rerun the inspector against the retained package and trusted
+digests. Keep the reviewed manifest, wasm and package unchanged. Use the exact
+package path reported by the inspector and the inspected service/base version:
+
+```bash
+fastly compute deploy --package './pkg/example-app.tar.gz' \
+  --service-id '99999' --version '7' --no-default-domain
+```
+
+The service ID and version above are fictional; replace them with the inspected
+existing service and integer base version. Replace the example package name
+with the inspector-selected name. The working
+directory's manifest takes precedence over the packaged manifest, so retain only
+the inspected deployment-only manifest there. Explicit `--service-id`, integer
+`--version` and `--no-default-domain` are required: omitted version selection can
+resolve active, or latest when no active version exists, and omitted domain
+suppression can create a random default domain. Do not use `compute publish` or
+build from source for this verified-byte route.
+
+At this pin, `compute deploy` clones an active/locked version and activates
+production internally; it has no staging mode. It can also return success while
+skipping deployment when the selected version already has the same package hash.
+Exit zero therefore does not prove upload, allocation of a new version or
+activation. Record the version actually reported and independently inspect its
+bindings, package observations and a non-health publisher response. Preserve
+uncertain outcomes as uncertain; do not infer ownership from the currently active
+or highest version, blindly retry, or guess a rollback target.
+
+This procedure cannot interpose a binding check between upload and production
+activation. It supplies no staging isolation or durable structured recovery.
+These integrated guarantees remain separate work. No live disposable-service
+submission or AC-9 qualification is established by these instructions or by
+provider-free inspector tests; that proof requires a separately authorized
+production submission with submitted-member and returned-version observations,
+including skipped or uncertain outcomes.

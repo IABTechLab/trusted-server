@@ -3,7 +3,7 @@ description: Prepare toolchains, Viceroy, and Docker images for integration test
 
 inputs:
   origin-port:
-    description: Fixed origin port baked into the WASM binary for integration tests.
+    description: Fixed origin port used by integration runtime configuration and container mappings.
     required: true
   install-viceroy:
     description: Install the Viceroy binary used by integration tests.

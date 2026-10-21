@@ -239,6 +239,10 @@ commit and no Git display fallback. Their `x-ts-version` is that source identity
 the external release tag is recorded separately in the signed release index.
 The header is not a binary checksum or attestation verification.
 
+For canonical Fastly bytes, use the separate
+[manual verified-byte production procedure](/guide/release-verification#manual-fastly-production-consumption).
+The source-build commands above do not establish canonical release provenance.
+
 ## Next Steps
 
 - Learn about [Edge Cookies](/guide/edge-cookies)

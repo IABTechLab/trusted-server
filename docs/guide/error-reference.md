@@ -651,6 +651,11 @@ present release-control values fail without Git fallback. Release Cargo builds
 require absolute `TSJS_PREBUILT_DIR` and
 `TRUSTED_SERVER__TSJS_PREBUILT_INVENTORY` paths and do not run npm.
 
+Canonical `x-ts-version` reports that full source commit, while the external
+release tag belongs to the signed release index. Development builds retain the
+override/tag/branch/short-commit display fallback. The header alone does not
+authenticate executable bytes; use [release verification](/guide/release-verification).
+
 | Error message contains                                                                       | Cause and fix                                                                                                                                                   |
 | -------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `tsjs: release builds require TSJS_PREBUILT_DIR` / `TRUSTED_SERVER__TSJS_PREBUILT_INVENTORY` | Supply both absolute paths from the checked producer output.                                                                                                    |

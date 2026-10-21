@@ -21,6 +21,7 @@ mod inspect;
 mod javascript;
 #[allow(dead_code, reason = "consumed by Task 7 material preparation")]
 mod materials;
+mod package;
 mod policy;
 mod preflight;
 #[allow(dead_code, reason = "production JS tool qualification remains closed")]
@@ -81,6 +82,17 @@ enum Command {
     },
     /// Diagnostic report of pending inputs; constructs no authorization.
     AuditInputs,
+    /// Inspect a retained manual Fastly package against independently approved digests.
+    InspectFastlyPackage {
+        #[arg(long)]
+        package_dir: PathBuf,
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        expected_manifest_sha256: String,
+        #[arg(long)]
+        expected_wasm_sha256: String,
+    },
     /// Private fixed in-image GNU tool measurement; supplies no authority.
     #[command(hide = true)]
     GnuImageMeasurement,
@@ -140,6 +152,25 @@ fn run(
             Ok(ExitCode::SUCCESS)
         }
         Command::AuditInputs => audit_inputs(),
+        Command::InspectFastlyPackage {
+            package_dir,
+            manifest,
+            expected_manifest_sha256,
+            expected_wasm_sha256,
+        } => {
+            let report = package::inspect_package(
+                &package_dir,
+                &manifest,
+                &expected_manifest_sha256,
+                &expected_wasm_sha256,
+            )?;
+            let bytes = documents::canonical_json(&report, documents::Role::Metadata)?;
+            std::io::stdout().write_all(&bytes).map_err(|error| {
+                Report::new(ReleaseError::Inspect)
+                    .attach(format!("cannot write package inspection: {error}"))
+            })?;
+            Ok(ExitCode::SUCCESS)
+        }
         Command::GnuImageMeasurement => {
             let bytes = recipe::gnu::helper_measurement()?;
             std::io::stdout().write_all(&bytes).map_err(|error| {
