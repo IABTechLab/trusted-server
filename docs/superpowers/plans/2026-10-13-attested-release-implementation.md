@@ -541,7 +541,7 @@ An ordinary-CI producer/receiver fixture now uploads four inert fictional flat m
 
 Local verification of this batch passed 853 native unit tests (seven ignored external/helper fixtures), 13 command tests, strict native Clippy, documentation generation, Rust/Markdown/YAML formatting, actionlint and staged domain lint. A full-suite failure exposed inherited nonblocking accepted sockets in the fictional macOS HTTP fixture; fragmented-header red/green and aborted-header regressions now cover the corrected test server. Independent review found no remaining findings. Linux cross-target Clippy on this Mac cannot compile the newly needed TLS C dependencies without a Linux C cross-compiler; hosted Linux validation remains required. No candidate or release qualification is inferred from these local checks.
 
-Cross-job candidate-entry transfer (2026-10-21, implemented; hosted run pending): each real candidate job (Fastly, Linux CLI and both macOS legs) now exports its rechecked entry as six flat files: the final executable `artifact`, `tsjs-inventory.json` and the four unsigned companions. It writes a separate CI-internal transfer file and uploads the files with the pinned upload action under `candidate-entry-<asset>-<run_id>-<run_attempt>` (1-day retention, fork PRs skipped). A describe step merges the exact upload ID, name and archive digest with the producing job's own run attempt into a job-output descriptor; the macOS matrix uses per-leg keys. The new `test-release-candidate-index` job (`contents`/`actions` read only, token only in the download step, restore-only cache) runs the ignored `distribution::ordinary::real_four_job_candidate_index`. It strictly parses the four descriptors, retrieves each exact upload through the unchanged bounded backend and ZIP reader with REST run/head/name/digest corroboration, and rehashes the executable against build-evidence `artifact_sha256`/`artifact_size`. Existing bounds cover the largest measured executable (Linux CLI about 285 MB; 512 MiB member, 768 MiB archive). The descriptor is not a release schema and grants no trusted workflow dependency: companions keep `null` workflow/transfer identities and the `trusted-workflow-transfer-not-bound` gap. Pure tests cover descriptor parsing, export writing and transfer rejections. The trusted dependency adapter, ambient pair claims and qualification remain open, so Task 12 stays open.
+Cross-job candidate-entry transfer (2026-10-21, implemented; first hosted pass in run 39577910126): each real candidate job (Fastly, Linux CLI and both macOS legs) now exports its rechecked entry as six flat files: the final executable `artifact`, `tsjs-inventory.json` and the four unsigned companions. It writes a separate CI-internal transfer file and uploads the files with the pinned upload action under `candidate-entry-<asset>-<run_id>-<run_attempt>` (1-day retention, fork PRs skipped). A describe step merges the exact upload ID, name and archive digest with the producing job's own run attempt into a job-output descriptor; the macOS matrix uses per-leg keys. The new `test-release-candidate-index` job (`contents`/`actions` read only, token only in the download step, restore-only cache) runs the ignored `distribution::ordinary::real_four_job_candidate_index`. It strictly parses the four descriptors, retrieves each exact upload through the unchanged bounded backend and ZIP reader with REST run/head/name/digest corroboration, and rehashes the executable against build-evidence `artifact_sha256`/`artifact_size`. Existing bounds cover the largest measured executable (Linux CLI about 285 MB; 512 MiB member, 768 MiB archive). The descriptor is not a release schema and grants no trusted workflow dependency: companions keep `null` workflow/transfer identities and the `trusted-workflow-transfer-not-bound` gap. Pure tests cover descriptor parsing, export writing and transfer rejections. The trusted dependency adapter, ambient pair claims and qualification remain open, so Task 12 stays open.
 
 ### Task 13: Assemble and validate the exact evidence graph
 
@@ -569,7 +569,7 @@ transfer adapter is the next join prerequisite; complete native/tool coverage,
 authenticated acquisition, signing, publication and qualification remain separate
 unfinished exits. Task 13 remains partial.
 
-Real cross-job assembly (2026-10-21, implemented; hosted run pending): the
+Real cross-job assembly (2026-10-21, implemented; first hosted pass in run 39577910126): the
 collector job rebuilds each transferred entry with the test-only
 `CandidateArtifactEntry::from_ordinary_ci_transfer`, the one documented
 exception to the production-only constructor. Production is unchanged. The
@@ -587,8 +587,26 @@ consumer's unsigned joins and empty-bundle rejection over those files, and the
 directory is uploaded as 7-day unqualified candidate evidence. It runs only when
 all four candidate jobs succeed and is not a required check. A pure round trip
 reproduces the golden index byte for byte, alongside rejection, descriptor and
-writer tests. The first hosted all-four run remains to be recorded. Signing,
-publication and qualification stay open.
+writer tests. The first hosted all-four assembly passed in run 39577910126 at
+merge source `fb42d8268`: index SHA-256
+`4872ef96086e93f720187f363e7262ae2921e663fbc9a531f2a42cc5d803b14d`, accepted by
+the consumer's unsigned joins (see the
+[four-asset candidate join report](../../../scripts/release/qualification/2026-10-21-four-asset-candidate-join.md)).
+The preceding run 39567710071 rejected its first download because the collector
+passed one 20-minute deadline to a transport capped at 15 minutes;
+`d774ee47c` bounds each download separately. Signing, publication and
+qualification stay open.
+
+Pair comparison (2026-10-21, `de52e66fd`): the collector also rejects a
+canonical/reproduction pair sharing one exact invocation fingerprint and treats
+an equal host locale or timezone as a missing supported variation. New pure
+tests isolate the pair check per dimension, record every optional native
+reproduction outcome, show no reproduction state hides a mandatory canonical
+failure, and require Fastly runtime proof for both roles. Still open: native
+canonical input digests are only compared against a reproduction (no trusted
+expected digests without a reproduction), runtime proof carries no role field,
+and an invalid uploaded native reproduction rejects the whole collection rather
+than recording `failed`.
 
 ### Task 14: Expose trusted same-commit validation
 
@@ -676,7 +694,7 @@ coverage. Task 14 is not marked complete by those approvals.
 - [ ] Test never-started/queued or scheduler-cancelled optional native B jobs as well as pre-step failure: the trusted collector MUST emit a bounded failed/unavailable measurement with absent observations represented honestly and no fabricated upload identity. Confirm the workflow cannot wait indefinitely or hide a mandatory A failure.
 - [ ] Test topology: shared JS A/B, separate fresh Fastly A/B, three mandatory native A jobs, bounded optional native B jobs, validated current-run collector and no signing credentials in executable/lifecycle jobs. Require job configurations to apply Task 9 role profiles and publish observed variation/runtime records; tests reject default-only A/B jobs or collectors that bypass these gates.
 - [ ] Run `cargo test -p trusted-server-release --target "$HOST_TARGET" workflow_contract` with the nonzero-selection guard; expect absent graph.
-- [ ] TODO (from Task 13): when real signing exists, the consumer MUST also reject the candidate sentinel tag `v0.0.0-unqualified-candidate` and any companion declaring `"release_qualification": false`. Until then, only the non-empty bundle rule keeps a candidate index from verifying.
+- [x] (from Task 13) The consumer rejects the candidate sentinel tag `v0.0.0-unqualified-candidate` (exact match) as the first check of `verify_index` and `verify_build_evidence`, which every online and offline path reaches. It also rejects any consumed build-evidence, build-recipe or rebuild-check companion declaring `"release_qualification": false` or a non-boolean value, after the companion bytes are authenticated against the signed index; an absent field or `true` is accepted because the R-INDEX contracts do not define the field. Both rules hold independently of the empty-bundle rule: a golden candidate index with non-empty bundle records is still rejected (`ac07047ed`). Making the field normative in the spec's companion contract needs a reviewed amendment.
 - [ ] Call local reusable workflow at source revision. Build jobs are read-only. Collector uses Task 12 outputs; signing grants only contents-read/id-token-write/attestations-write, plus actions-read when needed. No artifact-metadata write for file attestations. Caller grants enough permissions for called signing jobs but its own build jobs explicitly narrow them.
 - [ ] Invoke pinned attest 4.2.2 twice per canonical asset: exact executable/SBOM/evidence/recipe/rebuild provenance subjects, then executable subject + SPDX predicate. Save named bundles, validate all proofs/joins and sign index after collection. Do not construct caller predicates or sign source supplied commands.
 - [ ] Rehearse actual certificates/toolkit fields in a disposable repository with test-only policy fixtures. Verify repository IDs, exact SAN, issuer, build/caller/source/event/run fields for both predicate types. Commit `Sign validated release outputs through the reusable builder`.
