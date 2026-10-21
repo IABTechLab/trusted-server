@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use error_stack::Report;
 use serde::Serialize;
@@ -12,6 +13,15 @@ use super::recipe_error;
 use crate::error::ReleaseError;
 use crate::policy::ReleaseTarget;
 use crate::tool_tree::tool_tree_digest;
+
+/// Wall limit of one confined Cargo build for the ordinary CI selection.
+///
+/// The hosted `macos-15-intel` canonical CLI build took 1,193 s and its
+/// reproduction exceeded the former 25-minute wall while still compiling
+/// (run 39540057202), so the candidate wall allows roughly twice the measured
+/// canonical time. It stays inside the macOS CLI test's 120-minute deadline.
+#[cfg(test)]
+const ORDINARY_CI_BUILD_WALL: Duration = Duration::from_secs(45 * 60);
 
 /// A Rust toolchain that passed Task 8 qualification.
 ///
@@ -75,6 +85,19 @@ impl ToolSelection {
             Self::Qualified(qualification) => match *qualification {},
             #[cfg(test)]
             Self::OrdinaryCi => true,
+        }
+    }
+
+    /// Returns the wall limit of one confined Cargo build.
+    ///
+    /// Only the test-only ordinary CI selection has one, sized from hosted
+    /// runner measurements. A qualified selection must decide its own wall
+    /// explicitly when one exists.
+    pub(crate) fn build_wall(&self) -> Duration {
+        match self {
+            Self::Qualified(qualification) => match *qualification {},
+            #[cfg(test)]
+            Self::OrdinaryCi => ORDINARY_CI_BUILD_WALL,
         }
     }
 }
@@ -231,6 +254,11 @@ impl SelectedRustTools {
     /// Whether this selection accepts post-run-reaped descendant cleanup.
     pub(crate) fn permits_post_run_reaped_cleanup(&self) -> bool {
         self.selection.permits_post_run_reaped_cleanup()
+    }
+
+    /// The wall limit of one confined Cargo build for this selection.
+    pub(crate) fn build_wall(&self) -> Duration {
+        self.selection.build_wall()
     }
 
     /// Host path of the selected Cargo.

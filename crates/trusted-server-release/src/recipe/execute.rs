@@ -18,7 +18,7 @@ use super::gnu::{GnuEvidence, MeasurementSandbox};
 use super::plan::CargoQuery;
 use super::{
     Authority, ExactInvocationDigest, ExecutionPaths, PreparedRecipe, RecipeCompleted,
-    WorkspaceSelection, recipe_error,
+    SelectedRustTools, WorkspaceSelection, recipe_error,
 };
 use crate::boundary::{Boundary, DenialProof, DenialReceipt, DescendantCleanup};
 use crate::composition::external::ExternalRequirements;
@@ -34,15 +34,13 @@ use crate::policy::ReleaseTarget;
 use crate::process::ProcessLimits;
 use crate::tool_tree::tool_tree_digest;
 
-/// Wall limit of one Cargo build.
-const BUILD_WALL: Duration = Duration::from_secs(25 * 60);
 /// Captured output limit of each Cargo stream.
 const BUILD_STREAM_MAX: u64 = 16 * 1024 * 1024;
 
-/// Limits of the confined Cargo process.
-fn build_limits() -> ProcessLimits {
+/// Limits of the confined Cargo process under the selection's build wall.
+fn build_limits(tools: &SelectedRustTools) -> ProcessLimits {
     ProcessLimits {
-        wall: BUILD_WALL,
+        wall: tools.build_wall(),
         stdout_max: BUILD_STREAM_MAX,
         stderr_max: BUILD_STREAM_MAX,
     }
@@ -246,7 +244,9 @@ impl PreparedRecipe {
         proof: &DenialProof,
     ) -> Result<RecipeCompleted, Report<ReleaseError>> {
         let cleanup = self.check_boundary(boundary)?;
-        let command = self.plan(boundary)?.confined_command(build_limits())?;
+        let command = self
+            .plan(boundary)?
+            .confined_command(build_limits(&self.tools))?;
         if !self.tools.permits_candidate_run() {
             return Err(Report::new(ReleaseError::Unqualified)
                 .attach("Cargo execution is closed until Rust tools and boundary are qualified"));
@@ -283,7 +283,7 @@ impl PreparedRecipe {
                 let plan = self.plan(boundary)?.observation_query(kind)?;
                 let limits = ProcessLimits {
                     wall: Duration::from_secs(120),
-                    ..build_limits()
+                    ..build_limits(&self.tools)
                 };
                 let digest = plan.digest()?;
                 let stdout = boundary
