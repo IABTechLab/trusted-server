@@ -300,7 +300,7 @@ fn sign_value(key_id: &str, secret: &[u8; 32], payload: &[u8]) -> Option<String>
 }
 
 fn new_mac(secret: &[u8; 32]) -> Option<HmacSha256> {
-    <HmacSha256 as hmac::Mac>::new_from_slice(secret).ok()
+    <HmacSha256 as hmac::KeyInit>::new_from_slice(secret).ok()
 }
 
 fn update_mac(mac: &mut HmacSha256, version: &str, key_id: &str, payload_b64: &str) {
