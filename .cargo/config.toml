@@ -2,7 +2,7 @@
 #   trusted-server-adapter-fastly    → wasm32-wasip1         (Fastly Compute)
 #   trusted-server-adapter-axum      → native                (dev server)
 #   trusted-server-adapter-cloudflare → wasm32-unknown-unknown (Cloudflare Workers)
-#   trusted-server-adapter-spin      → wasm32-wasip1         (Fermyon Spin)
+#   trusted-server-adapter-spin      → wasm32-wasip2         (Fermyon Spin)
 #   trusted-server-cli               → native                (operator CLI)
 #
 # All adapters are workspace members so `-p` resolves each.
@@ -54,9 +54,9 @@ clippy-cloudflare-wasm = "clippy -p trusted-server-adapter-cloudflare --target w
 test-cloudflare = "test -p trusted-server-adapter-cloudflare"
 
 # --- Spin adapter (native host tests + wasm32-wasip1 target) ---
-check-spin = "check -p trusted-server-adapter-spin --target wasm32-wasip1 --features spin"
+check-spin = "check -p trusted-server-adapter-spin --target wasm32-wasip2 --features spin"
 clippy-spin-native = "clippy -p trusted-server-adapter-spin --all-targets -- -D warnings"
-clippy-spin-wasm = "clippy -p trusted-server-adapter-spin --target wasm32-wasip1 --features spin --lib -- -D warnings"
+clippy-spin-wasm = "clippy -p trusted-server-adapter-spin --target wasm32-wasip2 --features spin --lib -- -D warnings"
 test-spin = "test -p trusted-server-adapter-spin"
 
 # --- ts operator CLI (native host; install uses the current host platform) ---

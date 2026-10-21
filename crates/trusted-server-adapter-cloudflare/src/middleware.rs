@@ -5,9 +5,9 @@ use edgezero_core::context::RequestContext;
 use edgezero_core::error::EdgeError;
 use edgezero_core::http::{HeaderValue, Response};
 use edgezero_core::middleware::{Middleware, Next};
-use trusted_server_core::auth::enforce_basic_auth;
+use trusted_server_core::auth::enforce_basic_auth_parts;
 use trusted_server_core::constants::HEADER_X_GEO_INFO_AVAILABLE;
-use trusted_server_core::http_util::sanitize_trusted_client_ip_headers;
+use trusted_server_core::http_util::sanitize_trusted_client_ip_header_map;
 use trusted_server_core::settings::Settings;
 
 // ---------------------------------------------------------------------------
@@ -38,8 +38,8 @@ impl SanitizeRequestMiddleware {
 #[async_trait(?Send)]
 impl Middleware for SanitizeRequestMiddleware {
     async fn handle(&self, mut ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
-        sanitize_trusted_client_ip_headers(
-            ctx.request_mut(),
+        sanitize_trusted_client_ip_header_map(
+            ctx.headers_mut(),
             self.settings.trusted_client_ip.as_ref(),
         );
         next.run(ctx).await
@@ -75,7 +75,6 @@ impl FinalizeResponseMiddleware {
 impl Middleware for FinalizeResponseMiddleware {
     async fn handle(&self, ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
         let geo_available = ctx
-            .request()
             .headers()
             .get("cf-ipcountry")
             .and_then(|v| v.to_str().ok())
@@ -94,7 +93,7 @@ impl Middleware for FinalizeResponseMiddleware {
 
 /// Inner middleware: enforces basic-auth before the handler runs.
 ///
-/// - `Ok(Some(response))` from [`enforce_basic_auth`] → auth failed; return the
+/// - `Ok(Some(response))` from [`enforce_basic_auth_parts`] → auth failed; return the
 ///   challenge response (bubbles through [`FinalizeResponseMiddleware`] for header injection).
 /// - `Ok(None)` → no auth required or credentials accepted; continue the chain.
 /// - `Err(report)` → internal error; log and convert to a 500 HTTP response.
@@ -113,7 +112,7 @@ impl AuthMiddleware {
 #[async_trait(?Send)]
 impl Middleware for AuthMiddleware {
     async fn handle(&self, mut ctx: RequestContext, next: Next<'_>) -> Result<Response, EdgeError> {
-        match enforce_basic_auth(&self.settings, ctx.request_mut()) {
+        match enforce_basic_auth_parts(&self.settings, ctx.parts_mut()) {
             Ok(Some(response)) => return Ok(response),
             Ok(None) => {}
             Err(report) => {
@@ -306,8 +305,8 @@ mod tests {
             let handler_observed = Arc::clone(&handler_observed);
             async move {
                 *handler_observed.lock().expect("should lock observation") = Some((
-                    ctx.request().headers().contains_key("x-reader-ip"),
-                    ctx.request().headers().contains_key("x-reader-ip-auth"),
+                    ctx.headers().contains_key("x-reader-ip"),
+                    ctx.headers().contains_key("x-reader-ip-auth"),
                 ));
                 Ok::<Response, EdgeError>(empty_response())
             }
@@ -321,6 +320,54 @@ mod tests {
             Some((false, false)),
             "should remove both configured trust headers before the handler"
         );
+    }
+
+    #[test]
+    fn middleware_preserves_cached_managed_body_and_extensions() {
+        let settings = Arc::new(settings_with_response_headers(vec![]));
+        let request = request_builder()
+            .method(Method::POST)
+            .uri("/_ts/admin/keys")
+            .header("authorization", "Basic YWRtaW46YWRtaW4tcGFzcw==")
+            .header("cf-ipcountry", "US")
+            .body(Body::from("null").with_buffered_json_policy(
+                std::num::NonZeroUsize::new(4).expect("should create a positive ceiling"),
+                true,
+            ))
+            .expect("should build a managed request");
+        let mut ctx = RequestContext::new(request, PathParams::default());
+        ctx.extensions_mut().insert(String::from("request marker"));
+        let middlewares: Vec<Arc<dyn Middleware>> = vec![
+            Arc::new(SanitizeRequestMiddleware::new(Arc::clone(&settings))),
+            Arc::new(FinalizeResponseMiddleware::new(Arc::clone(&settings))),
+            Arc::new(AuthMiddleware::new(settings)),
+        ];
+        let handler = Arc::new(|ctx: RequestContext| async move {
+            assert!(
+                matches!(
+                    ctx.body_kind(),
+                    edgezero_core::context::BodyKind::Cached { len: 4 }
+                ),
+                "should preserve cached body provenance across middleware"
+            );
+            assert_eq!(
+                ctx.extensions().get::<String>().map(String::as_str),
+                Some("request marker"),
+                "should retain unrelated request extensions"
+            );
+            assert_eq!(
+                ctx.body_bytes(4).await?.as_ref(),
+                b"null",
+                "should retain the cached managed body"
+            );
+            Ok::<Response, EdgeError>(empty_response())
+        });
+
+        block_on(async {
+            ctx.body_bytes(4).await?;
+            Next::new(&middlewares, &*handler).run(ctx).await
+        })
+        .expect("should authenticate and preserve the managed request");
     }
 
     #[test]

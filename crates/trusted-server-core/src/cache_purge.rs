@@ -27,7 +27,8 @@ use crate::http_util::enforce_max_body_size;
 use crate::platform::{RuntimeServices, reader_url_surrogate_key};
 
 /// Purge bodies name a scope and, for a URL purge, one URL. Nothing here is unbounded.
-const PURGE_MAX_BODY_BYTES: usize = 4096;
+/// Maximum request bytes buffered by adapters for template-cache purge.
+pub const PURGE_MAX_BODY_BYTES: usize = 4096;
 
 /// The request body, before its scope is validated.
 ///

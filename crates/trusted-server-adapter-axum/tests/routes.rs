@@ -1,13 +1,47 @@
 //! Integration tests for the Axum dev server.
 //!
-//! Uses `EdgeZeroAxumService` directly (no live TCP server) so tests remain fast
+//! Uses `RouterHarness` directly (no live TCP server) so tests remain fast
 //! and self-contained. Each test builds the full `TrustedServerApp` router and
 //! drives it through the Tower `Service` interface.
 
 use axum::body::Body as AxumBody;
 use axum::http::Request;
-use edgezero_adapter_axum::service::EdgeZeroAxumService;
-use tower::{Service as _, ServiceExt as _};
+
+// Route/converter harness only. Managed native lifecycle is exercised by the
+// production-binary acceptance tests, not by this in-process route seam.
+struct RouterHarness(edgezero_core::router::RouterService);
+
+impl RouterHarness {
+    fn new(router: edgezero_core::router::RouterService) -> Self {
+        Self(router)
+    }
+
+    async fn ready(&mut self) -> Result<&mut Self, std::convert::Infallible> {
+        Ok(self)
+    }
+
+    async fn call(
+        &mut self,
+        request: axum::http::Request<AxumBody>,
+    ) -> Result<axum::http::Response<AxumBody>, String> {
+        let request = edgezero_adapter_axum::request::into_core_request(request).await?;
+        let response = self
+            .0
+            .oneshot(request)
+            .await
+            .map_err(|error| error.to_string())?;
+        let (parts, body) = response.into_parts();
+        let bytes = body
+            .into_bytes_bounded(16 * 1024 * 1024)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(axum::http::Response::from_parts(
+            parts,
+            AxumBody::from(bytes),
+        ))
+    }
+}
+
 use trusted_server_adapter_axum::app::TrustedServerApp;
 
 const LEGACY_ADMIN_DENY_METHODS: &[&str] =
@@ -44,8 +78,8 @@ fn test_router() -> edgezero_core::router::RouterService {
         .expect("should build router from test settings")
 }
 
-fn make_service() -> EdgeZeroAxumService {
-    EdgeZeroAxumService::new(test_router())
+fn make_service() -> RouterHarness {
+    RouterHarness::new(test_router())
 }
 
 fn registered_routes() -> Vec<(String, String)> {
@@ -83,7 +117,7 @@ async fn aps_profile_serves_renderer_through_adapter_fallback() {
     );
     let router = TrustedServerApp::routes_with_settings(settings)
         .expect("should build router with APS profile");
-    let mut service = EdgeZeroAxumService::new(router);
+    let mut service = RouterHarness::new(router);
     let request = Request::builder()
         .method("GET")
         .uri("/integrations/aps/renderer")

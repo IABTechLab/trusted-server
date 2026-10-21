@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use edgezero_core::config_store::ConfigStoreHandle;
 use edgezero_core::key_value_store::{KvHandle, KvPage, KvStore};
 use error_stack::{Report, ResultExt as _};
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
@@ -60,10 +59,8 @@ impl PlatformConfigStore for NoopConfigStore {
     }
 }
 
-#[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
 struct NoopSecretStore;
 
-#[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
 impl PlatformSecretStore for NoopSecretStore {
     fn get_bytes(&self, _: &StoreName, _: &str) -> Result<Vec<u8>, Report<PlatformError>> {
         Err(Report::new(PlatformError::SecretStore).attach("secret store not available"))
@@ -98,40 +95,8 @@ impl PlatformBackend for NoopBackend {
 }
 
 // ---------------------------------------------------------------------------
-// edgezero handle adapters — injected by edgezero_adapter_spin::run_app
+// Spin secret-variable naming and asynchronous KV handle adapter
 // ---------------------------------------------------------------------------
-
-/// Bridges edgezero's [`ConfigStoreHandle`] to [`PlatformConfigStore`].
-///
-/// Spin config stores are KV-backed, so reads preserve the requested key
-/// verbatim. Writes are unsupported on current Spin runtime config and return
-/// typed errors.
-pub(crate) struct ConfigStoreHandleAdapter(pub(crate) ConfigStoreHandle);
-
-impl PlatformConfigStore for ConfigStoreHandleAdapter {
-    fn get(&self, _store_name: &StoreName, key: &str) -> Result<String, Report<PlatformError>> {
-        futures::executor::block_on(self.0.get(key))
-            .map_err(|error| {
-                Report::new(PlatformError::ConfigStore).attach(format!(
-                    "config store lookup failed for key `{key}`: {error}"
-                ))
-            })?
-            .ok_or_else(|| {
-                Report::new(PlatformError::ConfigStore)
-                    .attach(format!("key `{key}` not found in Spin config store"))
-            })
-    }
-
-    fn put(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::ConfigStore)
-            .attach("config store writes are not supported on Spin"))
-    }
-
-    fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::ConfigStore)
-            .attach("config store writes are not supported on Spin"))
-    }
-}
 
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 fn spin_variable_name(
@@ -181,7 +146,7 @@ fn push_spin_variable_escape(out: &mut String, byte: u8) {
 }
 
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
-fn spin_secret_variable_name(
+pub(crate) fn spin_secret_variable_name(
     store_name: &StoreName,
     key: &str,
 ) -> Result<String, Report<PlatformError>> {
@@ -468,6 +433,7 @@ impl SpinPlatformHttpClient {
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
         reject_unsupported_request_contracts(&request)?;
+        let request = request.buffer_body().await?;
 
         let method = request.request.method().clone();
         let uri = request.request.uri().to_string();
@@ -496,18 +462,14 @@ impl SpinPlatformHttpClient {
         }
 
         let (_, body) = request.request.into_parts();
-        let body_bytes = match body {
-            edgezero_core::body::Body::Once(bytes) => bytes.to_vec(),
-            edgezero_core::body::Body::Stream(_) => {
-                // TODO: streaming request bodies unsupported; large proxy POBs (e.g.
-                // /first-party/proxy-rebuild) will fail until Spin WASI HTTP buffering
-                // is added to this client.
-                return Err(Report::new(PlatformError::HttpClient)
-                    .attach("streaming request bodies are not supported on Spin outbound HTTP"));
-            }
-        };
+        // SDK7 ingress is lazy even for an empty GET body. Buffer uploads at
+        // this owned boundary under the caller's finite cap, rather than reject
+        // ordinary requests merely because their carrier is a managed stream.
+        let body_bytes = body.into_bytes().ok_or_else(|| {
+            Report::new(PlatformError::HttpClient).attach("Spin buffered upload invariant was lost")
+        })?;
         let spin_request = builder
-            .body(spin_sdk::http::FullBody::new(Bytes::from(body_bytes)))
+            .body(spin_sdk::http::FullBody::new(body_bytes))
             .map_err(|error| {
                 Report::new(PlatformError::HttpClient)
                     .attach(format!("failed to build Spin outbound request: {error}"))
@@ -581,9 +543,9 @@ impl PlatformHttpClient for SpinPlatformHttpClient {
             .iter()
             .map(|(n, v)| (n.to_string(), v.as_bytes().to_vec()))
             .collect();
-        let body_bytes = match response.response.into_body() {
-            edgezero_core::body::Body::Once(bytes) => bytes.to_vec(),
-            edgezero_core::body::Body::Stream(_) => {
+        let body_bytes = match response.response.into_body().into_content() {
+            edgezero_core::body::BodyContent::Once(bytes) => bytes.to_vec(),
+            edgezero_core::body::BodyContent::Stream(_) => {
                 return Err(Report::new(PlatformError::HttpClient)
                     .attach("SpinPlatformHttpClient::execute returned a streaming body"));
             }
@@ -648,61 +610,14 @@ fn into_spin_method(method: &edgezero_core::http::Method) -> spin_sdk::http::Met
 }
 
 // ---------------------------------------------------------------------------
-// SpinSecretStoreAdapter — WASM target + spin feature only
-// ---------------------------------------------------------------------------
-
-/// Bridges Spin component variables to [`PlatformSecretStore`].
-///
-/// # Limitations
-///
-/// - **UTF-8 only.** `spin_sdk::variables::get` returns a `String`, so all
-///   secret values must be valid UTF-8. JSON-encoded signing keys work today;
-///   raw binary secrets (e.g. bare Ed25519 bytes) would silently fail at the
-///   Spin runtime layer.
-///
-/// - **Plaintext at rest.** Spin component variables are unencrypted in the
-///   application manifest by default. Production deployments must back variables
-///   with a real secret-provider source (e.g. Vault, Azure Key Vault) to avoid
-///   storing signing keys in plaintext on disk.
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-pub(crate) struct SpinSecretStoreAdapter;
-
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-impl PlatformSecretStore for SpinSecretStoreAdapter {
-    fn get_bytes(
-        &self,
-        store_name: &StoreName,
-        key: &str,
-    ) -> Result<Vec<u8>, Report<PlatformError>> {
-        let variable_name = spin_secret_variable_name(store_name, key)?;
-        match futures::executor::block_on(spin_sdk::variables::get(&variable_name)) {
-            Ok(value) => Ok(value.into_bytes()),
-            Err(error) => Err(Report::new(PlatformError::SecretStore).attach(format!(
-                "secret lookup failed for key `{key}` as Spin variable `{variable_name}`: {error}"
-            ))),
-        }
-    }
-
-    fn create(&self, _: &StoreId, _: &str, _: &str) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::SecretStore)
-            .attach("secret store writes are not supported on Spin"))
-    }
-
-    fn delete(&self, _: &StoreId, _: &str) -> Result<(), Report<PlatformError>> {
-        Err(Report::new(PlatformError::SecretStore)
-            .attach("secret store deletes are not supported on Spin"))
-    }
-}
-
-// ---------------------------------------------------------------------------
 // build_runtime_services
 // ---------------------------------------------------------------------------
 
 /// Construct [`RuntimeServices`] for an incoming Spin request.
 ///
-/// Config and KV are sourced from the `EdgeZero` handles that `run_app` injects
-/// before routing. Secrets are read synchronously from Spin component
-/// variables because Trusted Server's platform secret trait is sync.
+/// Config and secrets come only from the immutable async bootstrap snapshot.
+/// Client metadata is derived after request normalization, never at startup.
+/// KV remains an asynchronous request-local handle when one is injected.
 #[must_use]
 pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> RuntimeServices {
     let client_ip = extract_client_ip(ctx);
@@ -712,9 +627,11 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
     #[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
     let http_client: Arc<dyn PlatformHttpClient> = Arc::new(UnavailableHttpClient);
 
-    let config_store: Arc<dyn PlatformConfigStore> = ctx
-        .config_store_default()
-        .map(|h| Arc::new(ConfigStoreHandleAdapter(h)) as Arc<dyn PlatformConfigStore>)
+    let snapshot = ctx
+        .extensions()
+        .get::<Arc<crate::startup::SpinStoreSnapshot>>();
+    let config_store: Arc<dyn PlatformConfigStore> = snapshot
+        .map(|snapshot| Arc::clone(snapshot) as Arc<dyn PlatformConfigStore>)
         .unwrap_or_else(|| Arc::new(NoopConfigStore));
 
     let kv_store: Arc<dyn PlatformKvStore> = ctx
@@ -722,10 +639,9 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
         .map(|h| Arc::new(KvHandleAdapter(h)) as Arc<dyn PlatformKvStore>)
         .unwrap_or_else(|| Arc::new(UnavailableKvStore));
 
-    #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-    let secret_store: Arc<dyn PlatformSecretStore> = Arc::new(SpinSecretStoreAdapter);
-    #[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
-    let secret_store: Arc<dyn PlatformSecretStore> = Arc::new(NoopSecretStore);
+    let secret_store: Arc<dyn PlatformSecretStore> = snapshot
+        .map(|snapshot| Arc::clone(snapshot) as Arc<dyn PlatformSecretStore>)
+        .unwrap_or_else(|| Arc::new(NoopSecretStore));
 
     RuntimeServices::builder()
         .config_store(config_store)
@@ -774,7 +690,8 @@ impl PlatformGeo for NullGeo {
 /// Cloudflare adapters receive. Deployments fronting Spin with such a hop must
 /// account for this.
 fn extract_client_ip(ctx: &edgezero_core::context::RequestContext) -> Option<IpAddr> {
-    edgezero_adapter_spin::context::SpinRequestContext::get(ctx.request())
+    ctx.extensions()
+        .get::<edgezero_adapter_spin::context::SpinRequestContext>()
         .and_then(|c| c.client_addr)
 }
 
@@ -783,7 +700,10 @@ mod tests {
     use super::*;
 
     use edgezero_core::body::Body;
-    use edgezero_core::config_store::{ConfigStore, ConfigStoreError};
+    use edgezero_core::config_store::{
+        BoundedStoreRead, ConfigStore, ConfigStoreError, ConfigValue, finish_bounded_config_read,
+    };
+    use edgezero_core::time::{Deadline, MonotonicClock};
     use trusted_server_core::platform::AuctionTargetId;
 
     #[test]
@@ -806,9 +726,71 @@ mod tests {
 
     #[async_trait::async_trait(?Send)]
     impl ConfigStore for InMemoryConfigStore {
-        async fn get(&self, key: &str) -> Result<Option<String>, ConfigStoreError> {
-            Ok(self.0.get(key).cloned())
+        async fn get(&self, key: &str) -> Result<Option<ConfigValue>, ConfigStoreError> {
+            Ok(self
+                .0
+                .get(key)
+                .map(|value| ConfigValue::from(value.as_str())))
         }
+
+        async fn get_bounded(
+            &self,
+            key: &str,
+            clock: &MonotonicClock,
+            deadline: Deadline,
+            max_backend_bytes: u64,
+            max_value_bytes: u64,
+        ) -> Result<BoundedStoreRead<ConfigValue>, ConfigStoreError> {
+            if deadline.is_expired_at(clock.now()) {
+                return Err(ConfigStoreError::DeadlineExceeded);
+            }
+            finish_bounded_config_read(
+                Ok(self.0.get(key).map(String::as_str)),
+                clock,
+                deadline,
+                max_backend_bytes,
+                max_value_bytes,
+            )
+        }
+    }
+
+    #[test]
+    fn config_fixture_enforces_both_byte_caps_and_deadline() {
+        let store = InMemoryConfigStore(std::collections::BTreeMap::from([(
+            "config".to_owned(),
+            "value".to_owned(),
+        )]));
+        let clock = MonotonicClock::default();
+        let deadline = Deadline::after(Duration::from_secs(1));
+
+        let read = futures::executor::block_on(store.get_bounded("config", &clock, deadline, 5, 5))
+            .expect("should accept the exact byte caps");
+        assert_eq!(read.backend_bytes, 5, "should account for backend bytes");
+        assert_eq!(
+            read.value.as_deref(),
+            Some("value"),
+            "should read the value"
+        );
+        for (backend_cap, value_cap) in [(4, 5), (5, 4)] {
+            let error = futures::executor::block_on(store.get_bounded(
+                "config",
+                &clock,
+                deadline,
+                backend_cap,
+                value_cap,
+            ))
+            .expect_err("should reject a value exceeding either cap");
+            assert!(matches!(error, ConfigStoreError::ValueTooLarge));
+        }
+        let error = futures::executor::block_on(store.get_bounded(
+            "config",
+            &clock,
+            Deadline::at_instant(clock.now()),
+            0,
+            0,
+        ))
+        .expect_err("should reject an expired read before checking byte caps");
+        assert!(matches!(error, ConfigStoreError::DeadlineExceeded));
     }
 
     fn make_ctx_without_spin_context() -> RequestContext {
@@ -924,29 +906,6 @@ mod tests {
                 .expect("should not fail")
                 .is_none(),
             "should return None for any client IP"
-        );
-    }
-
-    #[test]
-    fn config_store_handle_adapter_reads_verbatim_kv_key() {
-        let handle = ConfigStoreHandle::new(Arc::new(InMemoryConfigStore(
-            std::collections::BTreeMap::from([(
-                "trusted_server_config".to_owned(),
-                "blob-envelope".to_owned(),
-            )]),
-        )));
-        let adapter = ConfigStoreHandleAdapter(handle);
-
-        let value = adapter
-            .get(
-                &StoreName::from("trusted_server_config"),
-                "trusted_server_config",
-            )
-            .expect("should read the verbatim config-store key");
-
-        assert_eq!(
-            value, "blob-envelope",
-            "should not translate a KV-backed config key into a Spin variable name"
         );
     }
 

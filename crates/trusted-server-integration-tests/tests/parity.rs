@@ -12,11 +12,46 @@ use std::sync::Arc;
 
 use axum::body::Body as AxumBody;
 use axum::http::Request as AxumRequest;
-use edgezero_adapter_axum::service::EdgeZeroAxumService;
+
+// Route/converter harness only. Managed native lifecycle is exercised by the
+// production-binary acceptance tests, not by this in-process route seam.
+struct RouterHarness(edgezero_core::router::RouterService);
+
+impl RouterHarness {
+    fn new(router: edgezero_core::router::RouterService) -> Self {
+        Self(router)
+    }
+
+    async fn ready(&mut self) -> Result<&mut Self, std::convert::Infallible> {
+        Ok(self)
+    }
+
+    async fn call(
+        &mut self,
+        request: axum::http::Request<AxumBody>,
+    ) -> Result<axum::http::Response<AxumBody>, String> {
+        let request = edgezero_adapter_axum::request::into_core_request(request).await?;
+        let response = self
+            .0
+            .oneshot(request)
+            .await
+            .map_err(|error| error.to_string())?;
+        let (parts, body) = response.into_parts();
+        let bytes = body
+            .into_bytes_bounded(16 * 1024 * 1024)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(axum::http::Response::from_parts(
+            parts,
+            AxumBody::from(bytes),
+        ))
+    }
+}
+
 use edgezero_core::http::request_builder;
 use edgezero_core::router::RouterService;
 use http::HeaderMap;
-use tower::{Service as _, ServiceExt as _};
+
 use trusted_server_adapter_axum::app::TrustedServerApp as AxumApp;
 use trusted_server_adapter_cloudflare::app::TrustedServerApp as CloudflareApp;
 use trusted_server_adapter_spin::app::TrustedServerApp as SpinApp;
@@ -72,7 +107,7 @@ fn spin_router() -> RouterService {
 
 /// Send a GET request to the Axum adapter and return (status, headers).
 async fn axum_get(uri: &str) -> (u16, HeaderMap) {
-    let mut svc = EdgeZeroAxumService::new(axum_router());
+    let mut svc = RouterHarness::new(axum_router());
     let req = AxumRequest::builder()
         .method("GET")
         .uri(uri)
@@ -91,7 +126,7 @@ async fn axum_get(uri: &str) -> (u16, HeaderMap) {
 /// Send a POST request to the Axum adapter and return (status, headers, body bytes).
 async fn axum_post(uri: &str, body: &str) -> (u16, HeaderMap, bytes::Bytes) {
     use http_body_util::BodyExt as _;
-    let mut svc = EdgeZeroAxumService::new(axum_router());
+    let mut svc = RouterHarness::new(axum_router());
     let req = AxumRequest::builder()
         .method("POST")
         .uri(uri)
@@ -222,7 +257,7 @@ async fn spin_post_with_headers(
 
 /// Send an authorized JSON request to the Axum adapter and return (status, headers).
 async fn axum_authorized_json(method: &str, uri: &str, body: &str) -> (u16, HeaderMap) {
-    let mut svc = EdgeZeroAxumService::new(axum_router());
+    let mut svc = RouterHarness::new(axum_router());
     let req = AxumRequest::builder()
         .method(method)
         .uri(uri)
@@ -270,7 +305,7 @@ async fn spin_authorized_json(method: &str, uri: &str, body: &str) -> (u16, Head
 
 /// Send an OPTIONS request to the Axum adapter and return (status, headers).
 async fn axum_options(uri: &str) -> (u16, HeaderMap) {
-    let mut svc = EdgeZeroAxumService::new(axum_router());
+    let mut svc = RouterHarness::new(axum_router());
     let req = AxumRequest::builder()
         .method("OPTIONS")
         .uri(uri)
@@ -339,7 +374,7 @@ async fn discovery_route_body_is_json_parity() {
     use serde_json::Value;
 
     let (axum_status, axum_body_bytes) = {
-        let mut svc = EdgeZeroAxumService::new(axum_router());
+        let mut svc = RouterHarness::new(axum_router());
         let req = AxumRequest::builder()
             .method("GET")
             .uri("/.well-known/trusted-server.json")

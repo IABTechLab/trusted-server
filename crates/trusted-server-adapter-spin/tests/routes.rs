@@ -14,9 +14,7 @@ use trusted_server_core::settings::Settings;
 
 /// Build the full application router from explicit test settings.
 ///
-/// The settings baked into the binary contain placeholder secrets that
-/// `get_settings()` rejects by design, which would turn every route into a
-/// startup error page (and its route table into the fallback-only set).
+/// Production settings arrive through async invocation-local bootstrap.
 /// The handler regex is the production-shaped `^/_ts/admin`, matching
 /// `Settings::ADMIN_ENDPOINTS` and the default config, so the canonical
 /// `/_ts/admin/keys/*` routes are auth-gated exactly as in production.
@@ -50,8 +48,7 @@ async fn route(router: RouterService, req: Request) -> Response {
 
 #[test]
 fn routes_build_without_panic() {
-    // build_state() may fail (no real settings in CI) — startup_error_router
-    // is the fallback. Either way, routes() must not panic.
+    // Route construction performs no provider reads and does not fabricate readiness.
     let _router = TrustedServerApp::routes();
 }
 
@@ -66,15 +63,9 @@ fn edgezero_manifest_loads_and_resolves_spin_stores() {
         manifest.stores.config.is_some(),
         "Spin EdgeZero manifest must enable config store injection"
     );
-    assert_eq!(
-        manifest
-            .stores
-            .kv
-            .as_ref()
-            .expect("should declare a KV store")
-            .default_id(),
-        "trusted_server_kv",
-        "Spin KV declaration must expose its default logical store id"
+    assert!(
+        manifest.stores.kv.is_none(),
+        "unused generic KV must not become a required provider; Spin config retains its dedicated default-store bootstrap"
     );
     assert!(
         manifest.secret_store_enabled(edgezero_core::app::SPIN_ADAPTER),

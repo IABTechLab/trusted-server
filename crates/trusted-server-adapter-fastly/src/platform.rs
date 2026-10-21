@@ -327,13 +327,13 @@ fn edge_request_to_fastly(
             fastly_req.append_header(name.as_str(), value.as_bytes());
         }
     }
-    match body {
-        edgezero_core::body::Body::Once(bytes) => {
+    match body.into_content() {
+        edgezero_core::body::BodyContent::Once(bytes) => {
             if !bytes.is_empty() {
                 fastly_req.set_body(bytes.to_vec());
             }
         }
-        edgezero_core::body::Body::Stream(_) => {
+        edgezero_core::body::BodyContent::Stream(_) => {
             return Err(Report::new(PlatformError::HttpClient)
                 .attach("streaming request body is not supported by Fastly request conversion"));
         }
@@ -363,7 +363,7 @@ fn fastly_body_to_edge_stream(body: fastly::Body) -> edgezero_core::body::Body {
         }
     });
 
-    edgezero_core::body::Body::from_stream(stream)
+    edgezero_core::body::Body::from_external_stream(stream)
 }
 
 /// Return whether a response is allowed to carry a body.
@@ -508,6 +508,7 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
+        let request = request.buffer_body().await?;
         let backend_name = request.backend_name.clone();
         let image_optimizer = request.image_optimizer;
         let stream_response = request.stream_response;
@@ -533,6 +534,7 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
             return Err(Report::new(PlatformError::HttpClient)
                 .attach("Image Optimizer is not supported with Fastly send_async"));
         }
+        let request = request.buffer_body().await?;
         let stream_response = request.stream_response;
         let request_method = request.request.method().clone();
         let cache_intent = request.cache_intent.clone();
@@ -1441,12 +1443,12 @@ mod tests {
     }
 
     #[test]
-    fn fastly_platform_http_client_send_returns_error_for_streaming_body() {
+    fn fastly_platform_http_client_send_buffers_lazy_upload_before_dispatch() {
         let client = FastlyPlatformHttpClient;
         let request = request_builder()
             .method("POST")
             .uri("https://example.com/")
-            .body(Body::from_stream(futures::stream::empty::<
+            .body(Body::from_external_stream(futures::stream::empty::<
                 Result<_, io::Error>,
             >()))
             .expect("should build streaming test request");
@@ -1454,7 +1456,7 @@ mod tests {
         let err = futures::executor::block_on(
             client.send(PlatformHttpRequest::new(request, "nonexistent-backend")),
         )
-        .expect_err("should reject streaming request bodies before sending");
+        .expect_err("should fail at the missing backend after bounded upload collection");
 
         assert!(
             matches!(err.current_context(), &PlatformError::HttpClient),
@@ -1462,8 +1464,8 @@ mod tests {
             err.current_context()
         );
         assert!(
-            format!("{err:?}").contains("streaming request body"),
-            "should describe the unsupported streaming body: {err:?}"
+            err.contains::<fastly::http::request::SendError>(),
+            "should reach SDK dispatch instead of rejecting the lazy body: {err:?}"
         );
     }
 
@@ -1516,12 +1518,12 @@ mod tests {
     }
 
     #[test]
-    fn fastly_platform_http_client_send_async_returns_error_for_streaming_body() {
+    fn fastly_platform_http_client_send_async_buffers_lazy_upload_before_dispatch() {
         let client = FastlyPlatformHttpClient;
         let request = request_builder()
             .method("POST")
             .uri("https://example.com/")
-            .body(Body::from_stream(futures::stream::empty::<
+            .body(Body::from_external_stream(futures::stream::empty::<
                 Result<_, io::Error>,
             >()))
             .expect("should build streaming test request");
@@ -1529,7 +1531,7 @@ mod tests {
         let err = futures::executor::block_on(
             client.send_async(PlatformHttpRequest::new(request, "nonexistent-backend")),
         )
-        .expect_err("should reject streaming request bodies before launching async send");
+        .expect_err("should fail at the missing backend after bounded upload collection");
 
         assert!(
             matches!(err.current_context(), &PlatformError::HttpClient),
@@ -1537,8 +1539,8 @@ mod tests {
             err.current_context()
         );
         assert!(
-            format!("{err:?}").contains("streaming request body"),
-            "should describe the unsupported streaming body: {err:?}"
+            err.contains::<fastly::http::request::SendError>(),
+            "should reach SDK dispatch instead of rejecting the lazy body: {err:?}"
         );
     }
 

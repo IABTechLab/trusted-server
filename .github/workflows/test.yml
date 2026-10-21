@@ -135,21 +135,21 @@ jobs:
         run: cargo test-cloudflare
 
   test-spin:
-    name: cargo check/build/test (spin native + wasm32-wasip1)
+    name: cargo check/build/test (spin native + wasm32-wasip2)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Rust toolchain (native + wasm32-wasip1)
+      - name: Set up Rust toolchain (native + wasm32-wasip2)
         uses: ./.github/actions/setup-rust
         with:
-          target: wasm32-wasip1
+          target: wasm32-wasip2
           cache-key: cargo-spin
 
       - name: Check Spin adapter (native host)
         run: cargo check -p trusted-server-adapter-spin
 
-      - name: Check Spin adapter (wasm32-wasip1)
+      - name: Check Spin adapter (wasm32-wasip2)
         run: cargo check-spin
 
       - name: Build Spin adapter release WASM
@@ -162,7 +162,7 @@ jobs:
           TRUSTED_SERVER__PUBLISHER__PROXY_SECRET: integration-test-proxy-secret
           TRUSTED_SERVER__EC__PASSPHRASE: integration-test-ec-secret-padded-32
           TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK: "false"
-        run: cargo build --package trusted-server-adapter-spin --target wasm32-wasip1 --features spin --release
+        run: cargo build --package trusted-server-adapter-spin --target wasm32-wasip2 --features spin --release
 
       - name: Run Spin adapter tests (native host)
         run: cargo test-spin

@@ -43,7 +43,8 @@ const MAX_CLIENT_EID_SOURCE_BYTES: usize = 255;
 /// the largest realistic Prebid-derived auction request (hundreds of ad units
 /// with EID arrays) while preventing an authenticated client from consuming
 /// arbitrary WASM linear memory.
-const MAX_AUCTION_BODY_SIZE: usize = 256 * 1024;
+/// Maximum request bytes buffered by adapters for the auction endpoint.
+pub const MAX_AUCTION_BODY_SIZE: usize = 256 * 1024;
 
 /// Handle auction request from `POST /auction`.
 ///
@@ -145,7 +146,12 @@ pub async fn handle_auction(
     }
 
     let (parts, body) = req.into_parts();
-    let body_bytes = body.into_bytes().unwrap_or_default();
+    let body_bytes = body.into_bytes().ok_or_else(|| {
+        Report::new(TrustedServerError::BadRequest {
+            message: "auction request body must be buffered by the adapter under its byte limit"
+                .to_owned(),
+        })
+    })?;
     if body_bytes.len() > MAX_AUCTION_BODY_SIZE {
         return Response::builder()
             .status(StatusCode::PAYLOAD_TOO_LARGE)

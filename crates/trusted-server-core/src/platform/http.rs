@@ -2,7 +2,7 @@ use std::any::Any;
 use std::fmt;
 
 use edgezero_core::http::{Method, Request as EdgeRequest, Response as EdgeResponse};
-use error_stack::Report;
+use error_stack::{Report, ResultExt as _};
 
 use super::PlatformError;
 use super::image_optimizer::PlatformImageOptimizerOptions;
@@ -74,6 +74,14 @@ pub struct PlatformHttpRequest {
     /// Adapters that cannot preserve streaming response bodies should return an
     /// error rather than silently buffering large asset responses.
     pub stream_response: bool,
+    /// Maximum encoded outbound request bytes accepted by managed transports.
+    pub max_request_body_bytes: u64,
+    /// Maximum response bytes accepted by managed transports.
+    pub max_response_body_bytes: u64,
+    /// Absolute deadline on the application's monotonic clock, when supplied.
+    pub deadline: Option<edgezero_core::time::Deadline>,
+    /// Finite total transport budget, independent of first-byte progress.
+    pub timeout: Option<std::time::Duration>,
 }
 
 impl PlatformHttpRequest {
@@ -86,7 +94,59 @@ impl PlatformHttpRequest {
             image_optimizer: None,
             cache_intent: PlatformCacheIntent::Default,
             stream_response: false,
+            max_request_body_bytes: 8 * 1024 * 1024,
+            max_response_body_bytes: 16 * 1024 * 1024,
+            deadline: None,
+            timeout: Some(std::time::Duration::from_secs(30)),
         }
+    }
+
+    /// Buffer an owned upload under its caller-supplied byte ceiling.
+    ///
+    /// SDK adapters with buffered uploads use this at conversion, including for
+    /// lazy empty bodies. Request parts/extensions are unchanged, and source
+    /// failures and inherited managed read deadlines propagate. This does not
+    /// add a runtime timer; native streaming transport retains its own path.
+    ///
+    /// # Errors
+    /// Returns an HTTP-client error for an unrepresentable cap, excess bytes or
+    /// a failed source read.
+    pub async fn buffer_body(mut self) -> Result<Self, Report<PlatformError>> {
+        let maximum = usize::try_from(self.max_request_body_bytes)
+            .change_context(PlatformError::HttpClient)?;
+        let body = std::mem::replace(self.request.body_mut(), edgezero_core::body::Body::empty());
+        let bytes = body
+            .into_bytes_bounded(maximum)
+            .await
+            .change_context(PlatformError::HttpClient)?;
+        *self.request.body_mut() = edgezero_core::body::Body::from(bytes);
+        Ok(self)
+    }
+
+    /// Sets the response byte ceiling without changing streaming selection.
+    #[must_use]
+    pub fn with_response_limit(mut self, max_bytes: u64) -> Self {
+        self.max_response_body_bytes = max_bytes;
+        self
+    }
+
+    /// Sets the total transport budget, including connection and body reads.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Sets an absolute application deadline and a finite transport budget.
+    #[must_use]
+    pub fn with_deadline(
+        mut self,
+        deadline: edgezero_core::time::Deadline,
+        timeout: std::time::Duration,
+    ) -> Self {
+        self.deadline = Some(deadline);
+        self.timeout = Some(timeout);
+        self
     }
 
     /// Attach Image Optimizer metadata to the request.
@@ -438,6 +498,68 @@ mod tests {
     use edgezero_core::http::request_builder;
 
     use super::*;
+
+    #[test]
+    fn buffered_upload_accepts_lazy_empty_and_exact_bodies_but_rejects_excess() {
+        futures::executor::block_on(async {
+            for chunks in [
+                vec![],
+                vec![
+                    bytes::Bytes::from_static(b"a"),
+                    bytes::Bytes::from_static(b"bc"),
+                ],
+            ] {
+                let body = Body::stream(futures::stream::iter(chunks));
+                let mut request = PlatformHttpRequest::new(
+                    request_builder()
+                        .body(body)
+                        .expect("should build lazy request"),
+                    "fixture",
+                );
+                request.max_request_body_bytes = 3;
+                request.request.headers_mut().insert(
+                    "x-fixture",
+                    "retained".parse().expect("should parse header"),
+                );
+                let buffered = request
+                    .buffer_body()
+                    .await
+                    .expect("should buffer bounded lazy upload");
+                assert_eq!(buffered.request.headers()["x-fixture"], "retained");
+                assert!(
+                    buffered.request.body().as_bytes().is_some(),
+                    "should normalize only the owned body"
+                );
+            }
+            let mut oversized = PlatformHttpRequest::new(
+                request_builder()
+                    .body(Body::from("abcd"))
+                    .expect("should build oversized request"),
+                "fixture",
+            );
+            oversized.max_request_body_bytes = 3;
+            assert!(
+                oversized.buffer_body().await.is_err(),
+                "should reject oversized upload"
+            );
+            let source_error =
+                Body::from_external_stream(futures::stream::iter([Err::<bytes::Bytes, _>(
+                    std::io::Error::other("synthetic upload source error"),
+                )]));
+            assert!(
+                PlatformHttpRequest::new(
+                    request_builder()
+                        .body(source_error)
+                        .expect("should build failed source request"),
+                    "fixture"
+                )
+                .buffer_body()
+                .await
+                .is_err(),
+                "should propagate source errors without an empty fallback"
+            );
+        });
+    }
 
     #[test]
     fn platform_http_request_cache_bypass_defaults_to_false() {

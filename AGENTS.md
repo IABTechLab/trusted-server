@@ -31,16 +31,18 @@ Supporting files: `edgezero.toml`, `fastly.toml`,
 
 ## Toolchain
 
-| Tool        | Version / Target                         |
-| ----------- | ---------------------------------------- |
-| Rust        | 1.95.0 (pinned in `rust-toolchain.toml`) |
-| WASM target | `wasm32-wasip1`                          |
-| Node        | 24.12.0 (from `.tool-versions`)          |
-| Fastly CLI  | 15.1.0 (from `.tool-versions`)           |
-| Viceroy     | 0.17.0 (from `.tool-versions`)           |
-| Wasmtime    | 44.0.1 (from `.tool-versions`)           |
-| AWS CLI     | 2.36.45 (from `.tool-versions`)          |
-| Terraform   | 1.16.2 (from `.tool-versions`)           |
+| Tool        | Version / Target                             |
+| ----------- | -------------------------------------------- |
+| Rust        | 1.98.1 (pinned in `rust-toolchain.toml`)     |
+| WASM target | Fastly `wasm32-wasip1`; Spin `wasm32-wasip2` |
+| Node        | 24.12.0 (from `.tool-versions`)              |
+| Fastly CLI  | 16.0.0 (from `.tool-versions`)               |
+| Viceroy     | 0.21.0 (from `.tool-versions`)               |
+| Wasmtime    | 48.0.2 (from `.tool-versions`)               |
+| Spin        | 4.1.0 (from `.tool-versions`)                |
+| Wrangler    | 4.151.3 (from `.tool-versions`)              |
+| AWS CLI     | 2.36.45 (from `.tool-versions`)              |
+| Terraform   | 1.16.2 (from `.tool-versions`)               |
 
 ---
 
@@ -62,7 +64,8 @@ fastly compute serve
 EDGEZERO_MANIFEST="<release-root>/edgezero.toml" \
   ts deploy --adapter fastly --service-id <service-id> --application-release "<release-root>"
 
-# Run Axum dev server (native — no Viceroy)
+# Run native TS with prepared config/secrets, not legacy TRUSTED_SERVER_* inputs.
+# See docs/guide/native-rc-demo.md for local files, secret variables and providers.
 cargo run -p trusted-server-adapter-axum
 
 # Test Axum adapter only
@@ -87,7 +90,7 @@ cargo check-spin
 cargo test-spin
 
 # Production-style Spin WASM artifact used by crates/trusted-server-adapter-spin/spin.toml
-cargo build --package trusted-server-adapter-spin --target wasm32-wasip1 --features spin --release
+cargo build --package trusted-server-adapter-spin --target wasm32-wasip2 --features spin --release
 
 # Optional local Spin runtime smoke, if the Spin CLI is installed
 spin up --from crates/trusted-server-adapter-spin
@@ -158,7 +161,7 @@ cd crates/trusted-server-js/lib && node build-all.mjs
 ### Install prerequisites
 
 ```bash
-cargo install viceroy --version 0.17.0 --locked --force
+cargo install viceroy --version 0.21.0 --locked --force
 ```
 
 ---
@@ -352,7 +355,7 @@ IntegrationRegistration::builder(ID)
 | `fastly.toml`                 | Fastly service configuration and build settings                                                   |
 | `trusted-server.example.toml` | Source-controlled Trusted Server app-config template                                              |
 | `trusted-server.toml`         | Operator-owned app config; gitignored; `ts config push` publishes it as an EdgeZero blob envelope |
-| `rust-toolchain.toml`         | Pins Rust version to 1.95.0                                                                       |
+| `rust-toolchain.toml`         | Pins Rust version to 1.98.1                                                                       |
 | `.env.dev`                    | Local development environment variables                                                           |
 
 ---

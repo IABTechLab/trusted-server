@@ -41,6 +41,7 @@ log = { workspace = true }
 reqwest = { workspace = true, features = ["blocking", "cookies"] }
 scraper = { workspace = true }
 testcontainers = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 tower = { workspace = true, features = ["util"] }
 trusted-server-adapter-axum = { path = "../trusted-server-adapter-axum" }

@@ -1,7 +1,7 @@
 use crate::http_util::{
     RequestInfo, compute_encrypted_sha256_token, ct_str_eq, enforce_max_body_size,
 };
-use edgezero_core::body::Body as EdgeBody;
+use edgezero_core::body::{Body as EdgeBody, BodyContent};
 use edgezero_core::http::{Uri as EdgeUri, request_builder as edge_request_builder};
 use error_stack::{Report, ResultExt};
 use futures::StreamExt as _;
@@ -37,8 +37,10 @@ const STREAMING_CHUNK_SIZE: usize = 8192;
 /// Fallback `Content-Type` for image-like responses missing an origin type.
 const IMAGE_FALLBACK_CONTENT_TYPE: &str = "application/octet-stream";
 
-const SIGN_MAX_BODY_BYTES: usize = 65536;
-const REBUILD_MAX_BODY_BYTES: usize = 65536;
+/// Maximum request bytes buffered by adapters for first-party signing.
+pub const SIGN_MAX_BODY_BYTES: usize = 65536;
+/// Maximum request bytes buffered by adapters for first-party proxy rebuilding.
+pub const REBUILD_MAX_BODY_BYTES: usize = 65536;
 
 fn body_as_reader(body: EdgeBody) -> Cursor<bytes::Bytes> {
     Cursor::new(body.into_bytes().unwrap_or_default())
@@ -249,9 +251,9 @@ pub(crate) fn platform_response_to_fastly(
     platform_resp: PlatformResponse,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let (parts, body) = platform_resp.response.into_parts();
-    let body_bytes = match body {
-        EdgeBody::Once(bytes) => bytes.to_vec(),
-        EdgeBody::Stream(_) => {
+    let body_bytes = match body.into_content() {
+        BodyContent::Once(bytes) => bytes.to_vec(),
+        BodyContent::Stream(_) => {
             return Err(Report::new(TrustedServerError::Proxy {
                 message: "streaming platform response body is not supported by Fastly response conversion"
                     .to_string(),
@@ -264,14 +266,14 @@ pub(crate) fn platform_response_to_fastly(
 fn platform_response_to_fastly_asset(platform_resp: PlatformResponse) -> AssetProxyResponse {
     let (parts, body) = platform_resp.response.into_parts();
 
-    match body {
-        EdgeBody::Once(bytes) => AssetProxyResponse::origin_controlled(Response::from_parts(
+    match body.into_content() {
+        BodyContent::Once(bytes) => AssetProxyResponse::origin_controlled(Response::from_parts(
             parts,
             EdgeBody::from(bytes.to_vec()),
         )),
-        stream_body @ EdgeBody::Stream(_) => {
+        stream_body @ BodyContent::Stream(_) => {
             let resp = Response::from_parts(parts, EdgeBody::empty());
-            AssetProxyResponse::origin_controlled_stream(resp, stream_body)
+            AssetProxyResponse::origin_controlled_stream(resp, EdgeBody::from(stream_body))
         }
     }
 }
@@ -289,15 +291,15 @@ pub async fn stream_asset_body<W: Write>(
     body: EdgeBody,
     output: &mut W,
 ) -> Result<(), Report<TrustedServerError>> {
-    match body {
-        EdgeBody::Once(bytes) => {
+    match body.into_content() {
+        BodyContent::Once(bytes) => {
             output
                 .write_all(bytes.as_ref())
                 .change_context(TrustedServerError::Proxy {
                     message: "failed to write buffered platform response body".to_string(),
                 })?;
         }
-        EdgeBody::Stream(mut stream) => {
+        BodyContent::Stream(mut stream) => {
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|err| {
                     Report::new(TrustedServerError::Proxy {
@@ -5934,9 +5936,67 @@ mod tests {
     }
 
     #[test]
+    fn managed_platform_response_conversion_preserves_asset_body() {
+        futures::executor::block_on(async {
+            for streaming in [false, true] {
+                let make_response = || {
+                    let body = if streaming {
+                        EdgeBody::stream(futures::stream::iter([
+                            Bytes::from_static(b"ab"),
+                            Bytes::from_static(b"cd"),
+                        ]))
+                    } else {
+                        EdgeBody::from("abcd")
+                    }
+                    .with_buffered_json_policy(
+                        std::num::NonZeroUsize::new(1).expect("should be positive"),
+                        false,
+                    );
+                    PlatformResponse {
+                        response: Response::new(body),
+                        backend_name: None,
+                    }
+                };
+                let buffered = super::platform_response_to_fastly(make_response());
+                if streaming {
+                    assert!(
+                        buffered.is_err(),
+                        "should reject managed streams in buffered conversion"
+                    );
+                } else {
+                    assert_eq!(
+                        buffered
+                            .expect("should convert managed buffer")
+                            .body()
+                            .as_bytes(),
+                        Some(&b"abcd"[..]),
+                        "should retain managed buffered response content"
+                    );
+                }
+
+                let asset = super::platform_response_to_fastly_asset(make_response());
+                let (response, stream) = asset.into_response_and_body();
+                assert_eq!(
+                    stream.is_some(),
+                    streaming,
+                    "should preserve logical stream ownership"
+                );
+                let mut output = Vec::new();
+                stream_asset_body(stream.unwrap_or_else(|| response.into_body()), &mut output)
+                    .await
+                    .expect("should write managed asset body");
+                assert_eq!(
+                    output, b"abcd",
+                    "should retain managed asset response content"
+                );
+            }
+        });
+    }
+
+    #[test]
     fn stream_asset_body_reports_mid_stream_origin_errors() {
         futures::executor::block_on(async {
-            let body = EdgeBody::from_stream(futures::stream::iter(vec![
+            let body = EdgeBody::from_external_stream(futures::stream::iter(vec![
                 Ok::<Bytes, io::Error>(Bytes::from_static(b"partial")),
                 Err(io::Error::other("origin stream failed")),
             ]));
@@ -5990,7 +6050,7 @@ mod tests {
         // the client renders nothing behind committed headers.
         let events = Rc::new(RefCell::new(Vec::new()));
         let source_events = Rc::clone(&events);
-        let body = EdgeBody::from_stream(async_stream::stream! {
+        let body = EdgeBody::from_external_stream(async_stream::stream! {
             for (index, segment) in ["<html><head>", "</head><body>"].into_iter().enumerate() {
                 source_events
                     .borrow_mut()

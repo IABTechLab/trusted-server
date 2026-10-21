@@ -1,0 +1,37 @@
+# Allow only build inputs, never the entire operator checkout.
+**
+!Cargo.toml
+!Cargo.lock
+!.tool-versions
+!rust-toolchain.toml
+!edgezero.toml
+!.cargo/
+!.cargo/config.toml
+!crates/
+!crates/**
+# Exclude operator TOMLs even if placed below a crate.
+**/*.toml
+!**/Cargo.toml
+!rust-toolchain.toml
+!edgezero.toml
+!.cargo/config.toml
+!trusted-server.example.toml
+**/.git
+**/target
+**/node_modules
+**/dist
+crates/trusted-server-adapter-cloudflare/build
+crates/trusted-server-adapter-cloudflare/pkg
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+**/*.p12
+**/*.pfx
+**/keys
+**/secrets
+**/.aws
+**/.npmrc
+**/.cargo/credentials*
+**/.ts-tmp
+**/.tsjs-npm-ci.lock

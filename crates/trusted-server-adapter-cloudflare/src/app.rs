@@ -276,7 +276,25 @@ where
         let f = f.clone();
         Box::pin(async move {
             let services = s.services_for_request(&ctx);
-            let mut req = ctx.into_request();
+            if ctx.parts().method == Method::POST {
+                let limit = match ctx.parts().uri.path() {
+                    "/verify-signature" => {
+                        Some(trusted_server_core::request_signing::endpoints::VERIFY_MAX_BODY_BYTES)
+                    }
+                    "/auction" => {
+                        Some(trusted_server_core::auction::endpoints::MAX_AUCTION_BODY_SIZE)
+                    }
+                    "/first-party/sign" => Some(trusted_server_core::proxy::SIGN_MAX_BODY_BYTES),
+                    "/first-party/proxy-rebuild" => {
+                        Some(trusted_server_core::proxy::REBUILD_MAX_BODY_BYTES)
+                    }
+                    _ => None,
+                };
+                if let Some(limit) = limit {
+                    ctx.body_bytes(limit).await?;
+                }
+            }
+            let mut req = ctx.into_request()?;
             if let Err(error) = trusted_server_core::integrations::gpt_diagnostics::prepare_request(
                 &s.settings,
                 &mut req,
@@ -512,7 +530,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             ctx: RequestContext,
         ) -> Result<Response, EdgeError> {
             let services = state.services_for_request(&ctx);
-            let mut req = ctx.into_request();
+            let mut req = ctx.into_request()?;
             if let Some(response) = deny_admin_diagnostic_fallback(&req) {
                 return Ok(response);
             }
