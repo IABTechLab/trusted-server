@@ -28,6 +28,11 @@ mod preflight;
 mod preparation;
 #[allow(
     dead_code,
+    reason = "immutable release publication remains closed: no API adapter, workflow or command"
+)]
+mod publication;
+#[allow(
+    dead_code,
     reason = "Task 9 slice 1 recipe layer has no production caller yet"
 )]
 mod recipe;
