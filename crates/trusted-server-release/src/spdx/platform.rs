@@ -219,6 +219,14 @@ fn project(
                 ComponentRole::BuildTool,
             )?);
         }
+        if let Some(sha256) = apple.libtapi_sha256() {
+            components.push(measured_file(
+                owner.target,
+                "apple-libtapi",
+                sha256,
+                ComponentRole::BuildTool,
+            )?);
+        }
         let toolchain_trees = [
             (
                 "apple-clang-resource-tree",

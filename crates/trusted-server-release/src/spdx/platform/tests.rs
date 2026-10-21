@@ -1,5 +1,66 @@
 use super::*;
 use crate::composition::platform::tests::projection_fixture;
+use sha2::{Digest as _, Sha256};
+
+#[test]
+fn libtapi_projects_only_present_measured_bytes_as_a_build_tool() {
+    for present in [false, true] {
+        let platform =
+            crate::composition::platform::tests::projection_toolchain_with_libtapi_fixture(present);
+        let components = project(&platform, &Owner::fixture(&platform))
+            .expect("should project optional TAPI measurements");
+        let tapi = components.iter().find(|component| {
+            matches!(
+                &component.origin,
+                Some(Origin::PlatformMeasuredFile { role, .. }) if role == "apple-libtapi"
+            )
+        });
+        assert_eq!(
+            tapi.is_some(),
+            present,
+            "should project only present libtapi"
+        );
+        if let Some(component) = tapi {
+            assert!(
+                component.declared_license.is_none(),
+                "should not invent a libtapi license"
+            );
+            let digest = hex::encode(Sha256::digest(b"fictional libtapi"));
+            assert!(
+                component.roles == [ComponentRole::BuildTool],
+                "should assert only a build tool role"
+            );
+            let (location, comment, checksum) =
+                file_origin_fields(component, "apple-libtapi", &digest)
+                    .expect("should render measured libtapi bytes");
+            assert_eq!(location, "NOASSERTION", "should not claim acquisition");
+            assert_eq!(
+                checksum,
+                Some(("SHA256", digest.clone())),
+                "should preserve raw-file checksum"
+            );
+            assert!(
+                comment.contains("no original acquisition")
+                    && comment.contains("executed helper claim"),
+                "should retain conservative measurement scope"
+            );
+            assert!(
+                matches!(&component.origin, Some(Origin::PlatformMeasuredFile { sha256, .. }) if sha256 == &digest),
+                "should bind measured libtapi bytes"
+            );
+        }
+        assert!(
+            coverage_gaps(&platform)
+                .contains(&"apple-coverage-excluded:toolchain_libraries".to_owned()),
+            "should retain unmeasured library coverage"
+        );
+        let receipt = serde_json::to_value(&platform).expect("should serialize platform receipt");
+        assert_eq!(
+            receipt["native_tools"]["full_closure_measured"], false,
+            "should retain incomplete closure"
+        );
+    }
+}
 
 impl Owner {
     fn fixture(platform: &crate::composition::platform::PlatformEvidence) -> Self {

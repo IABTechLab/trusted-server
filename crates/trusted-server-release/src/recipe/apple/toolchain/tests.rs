@@ -85,6 +85,138 @@ fn make_fifo(path: &Path) {
 }
 
 #[test]
+fn libtapi_absence_requires_a_real_unaliased_parent() {
+    let toolchain = Toolchain::new();
+    let missing = toolchain.usr.join("missing");
+    let alias = toolchain.usr.join("aliased-lib");
+    symlink("lib", &alias).expect("should alias library directory");
+    let dangling = toolchain.usr.join("dangling-lib");
+    symlink("missing", &dangling).expect("should create dangling parent alias");
+    for parent in [&missing, &alias, &dangling] {
+        assert!(
+            optional_libtapi_digest(&parent.join("libtapi.dylib"), &|| Ok(())).is_err(),
+            "should not record absence below a missing or aliased parent"
+        );
+    }
+}
+
+#[test]
+fn libtapi_receipt_records_digest_or_explicit_null_and_detects_presence_changes() {
+    let toolchain = Toolchain::new();
+    let library = toolchain.usr.join(LIBTAPI);
+    let absent = toolchain.measure().expect("should measure without libtapi");
+    let serialized = serde_json::to_value(absent.receipt()).expect("should serialize receipt");
+    assert_eq!(
+        serialized.get("libtapi_sha256"),
+        Some(&serde_json::Value::Null),
+        "should explicitly record genuine absence"
+    );
+    assert_eq!(
+        absent.receipt().libtapi_sha256(),
+        None,
+        "should expose absence"
+    );
+    fs::write(&library, b"fictional libtapi").expect("should add libtapi");
+    assert!(absent.verify().is_err(), "should reject added libtapi");
+    let present = toolchain.measure().expect("should measure present libtapi");
+    let digest = hex::encode(Sha256::digest(b"fictional libtapi"));
+    assert_eq!(
+        present.receipt().libtapi_sha256(),
+        Some(digest.as_str()),
+        "should hash exact selected libtapi bytes"
+    );
+    let serialized = serde_json::to_value(present.receipt()).expect("should serialize receipt");
+    assert_eq!(
+        serialized["libtapi_sha256"], digest,
+        "should serialize measured digest"
+    );
+    present.verify().expect("should verify unchanged libtapi");
+    fs::remove_file(&library).expect("should remove libtapi");
+    assert!(present.verify().is_err(), "should reject removed libtapi");
+    assert_eq!(
+        toolchain.receipt(),
+        *absent.receipt(),
+        "should remeasure genuine absence identically"
+    );
+}
+
+#[test]
+fn libtapi_rejects_aliases_directories_special_files_and_oversize_files() {
+    let cases: [(&str, Mutation); 5] = [
+        ("alias", |path| {
+            symlink("libLTO.dylib", path).expect("should alias libtapi");
+        }),
+        ("dangling alias", |path| {
+            symlink("missing.dylib", path).expect("should add dangling alias");
+        }),
+        ("directory", |path| {
+            fs::create_dir(path).expect("should create directory");
+        }),
+        ("special file", make_fifo),
+        ("oversize file", |path| {
+            File::create(path)
+                .expect("should create sparse file")
+                .set_len(128 * 1024 * 1024 + 1)
+                .expect("should exceed fixed TAPI limit");
+        }),
+    ];
+    for (label, mutate) in cases {
+        let toolchain = Toolchain::new();
+        mutate(&toolchain.usr.join(LIBTAPI));
+        assert!(
+            toolchain.measure().is_err(),
+            "should reject libtapi {label}"
+        );
+    }
+}
+
+#[test]
+fn libtapi_rejects_unreadable_files_and_honors_the_attempt_budget() {
+    let toolchain = Toolchain::new();
+    let library = toolchain.usr.join(LIBTAPI);
+    fs::write(&library, b"fictional libtapi").expect("should write libtapi");
+    let measured = toolchain.measure().expect("should measure libtapi");
+    fs::set_permissions(&library, fs::Permissions::from_mode(0o0))
+        .expect("should remove read permissions");
+    assert!(
+        toolchain.measure().is_err(),
+        "should reject unreadable libtapi"
+    );
+    fs::set_permissions(&library, fs::Permissions::from_mode(0o600))
+        .expect("should restore permissions");
+    measured.cancellation.cancel();
+    assert!(
+        measured.verify().is_err(),
+        "should stop cancelled libtapi remeasurement"
+    );
+    for present in [false, true] {
+        if !present {
+            fs::remove_file(&library).expect("should remove libtapi");
+        } else {
+            fs::write(&library, b"fictional libtapi").expect("should restore libtapi");
+        }
+        assert!(
+            optional_libtapi_digest(&library, &|| budget(
+                Instant::now() - Duration::from_secs(1),
+                &Cancellation::default()
+            ))
+            .is_err(),
+            "should reject an expired budget even when presence is {present}"
+        );
+    }
+}
+
+#[test]
+fn libtapi_change_is_detected_during_remeasurement() {
+    let toolchain = Toolchain::new();
+    let library = toolchain.usr.join("lib/libtapi.dylib");
+    fs::write(&library, b"fictional libtapi").expect("should write libtapi");
+    let measured = toolchain.measure().expect("should measure toolchain");
+    fs::write(&library, b"changed libtapi").expect("should change libtapi");
+    assert!(measured.verify().is_err(), "should reject changed libtapi");
+}
+
+#[test]
 fn receipt_records_single_resource_version_aliases_and_three_digests() {
     let toolchain = Toolchain::new();
     let receipt = toolchain.receipt();

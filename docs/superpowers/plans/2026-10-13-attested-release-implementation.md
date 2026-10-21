@@ -536,6 +536,33 @@ documentation and owned-file formatting passed. Independent review found no
 blocker and confirmed the package/context limitation stated above. Real-build
 acceptance of this new graph guard remains pending its own hosted run.
 
+Selected Apple library measurement (2026-10-21): the in-place toolchain receipt
+now records the SHA-256 of the exact `usr/lib/libtapi.dylib` when present,
+alongside the existing `libLTO`, helper and resource measurements. A missing
+leaf is recorded explicitly as `libtapi_sha256: null`; unreadable files, aliases,
+special files and exhausted bounds are errors. Present files use the existing
+no-follow descriptor/stamp checks, a 128 MiB limit and the attempt's cancellation
+and deadline. Remeasurement rejects content changes, appearance and disappearance.
+The new field is inside the collector's opaque `platform.apple.toolchain`
+subtree; all strictly checked receipt fields remain unchanged.
+
+This measures one selected toolchain library, not its execution or loading.
+Other toolchain libraries, runtime inputs, original acquisition and the full
+tool closure remain unresolved. The existing `toolchain_libraries` exclusion,
+`apple-tool-closure-unmeasured` gap and incomplete coverage flags are retained.
+Hosted acceptance of this additional measurement requires its own later run;
+run `39637275502` contains the preceding graph checks only.
+
+Verification of this increment selected and passed 66 composition, 68 SPDX,
+19 Apple toolchain, 18 GNU, 46 collection and two unchanged producer golden
+tests with nonzero guards. The collection transfer module and ignored tests
+were excluded under the local execution restrictions. Strict host clippy,
+documentation and owned-file formatting passed. Independent spec and code
+quality reviews approved the increment. Review also strengthened the absence
+check: a missing or aliased parent cannot be recorded as a missing library.
+The existing vendor-tree intermediate-directory swap limitation still applies;
+no stronger isolation guarantee is claimed.
+
 ### Task 11: Generate complete artifact-specific SPDX
 
 **Create:** release tool `src/spdx.rs`, private `spdx::tests`, `crates/trusted-server-release/tests/fixtures/spdx/`.
@@ -604,6 +631,14 @@ still requires the unmeasured closure/input facts and qualified owning adapters.
 Valid rendering, companion formats and candidate golden fixtures are unchanged;
 all four candidate jobs accepted the strengthened guard in the `e91d75b74`
 run recorded under Task 10. Complete generation remains closed.
+
+Selected Apple library projection (2026-10-21): a present measured `libtapi`
+digest projects as a build tool with a raw-file SHA-256. Recorded absence
+creates no package. The projection asserts no original download, license,
+runtime bytes or execution, and retains `NOASSERTION` through the existing
+renderer. Other package projections, relationship policies and candidate golden
+fixtures are unchanged. This adds measured bytes to candidate SPDX without
+opening complete qualified generation or closing Task 11.
 
 ### Task 12: Bind transfers and enforce selected comparisons
 

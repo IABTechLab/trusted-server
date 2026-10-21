@@ -1,5 +1,5 @@
-//! In-place identity of the selected toolchain's helpers, `libLTO` and clang
-//! resource directory.
+//! In-place identity of the selected toolchain's helpers, `libLTO`, optional
+//! `libtapi` and clang resource directory.
 //!
 //! Everything is read below the selected `clang`'s toolchain `usr` directory,
 //! which stays part of the vendor developer root: nothing is copied, executed
@@ -46,10 +46,14 @@ use crate::process::Cancellation;
 const TOOLCHAIN_LIB: &str = "lib";
 /// The LTO library `ld` loads, relative to the toolchain `usr` directory.
 const LIBLTO: &str = "lib/libLTO.dylib";
+/// Optional TAPI library relative to the selected toolchain `usr` directory.
+const LIBTAPI: &str = "lib/libtapi.dylib";
 /// Parent of clang's versioned resource directory below the toolchain `usr`.
 const CLANG_RESOURCES: &str = "lib/clang";
 /// Largest accepted `libLTO.dylib`.
 const LIBLTO_LIMIT: u64 = 512 * 1024 * 1024;
+/// Largest accepted `libtapi.dylib`.
+const LIBTAPI_LIMIT: u64 = 128 * 1024 * 1024;
 /// Most entries accepted in the clang resource parent directory.
 const RESOURCE_PARENT_ENTRY_LIMIT: usize = 64;
 /// Longest accepted clang resource version or alias name.
@@ -102,6 +106,7 @@ pub(super) struct ToolchainReceipt {
     clang_resource_aliases: Vec<String>,
     clang_resource_tree: VendorTreeReceipt,
     liblto_sha256: String,
+    libtapi_sha256: Option<String>,
     helper_tree: VendorTreeReceipt,
 }
 
@@ -113,6 +118,10 @@ impl ToolchainReceipt {
     /// Returns the raw-file digest of `libLTO.dylib`.
     pub(super) fn liblto_sha256(&self) -> &str {
         &self.liblto_sha256
+    }
+    /// Returns the raw-file digest of `libtapi.dylib`, when present.
+    pub(super) fn libtapi_sha256(&self) -> Option<&str> {
+        self.libtapi_sha256.as_deref()
     }
     /// Returns the helper directory's structured-tree digest.
     pub(super) fn helper_tree_sha256(&self) -> &str {
@@ -243,14 +252,37 @@ fn measure_receipt(
     real_directory("Apple clang resource directory", &resource_dir)?;
     let clang_resource_tree = vendor_tree_digest(&resource_dir, RESOURCE_POLICY, check)?;
     let (liblto_sha256, _) = hash_vendor_file(&usr_dir.join(LIBLTO), LIBLTO_LIMIT, check)?;
+    let libtapi_sha256 = optional_libtapi_digest(&usr_dir.join(LIBTAPI), check)?;
     let helper_tree = vendor_tree_digest(helper_dir, HELPER_POLICY, check)?;
     Ok(ToolchainReceipt {
         clang_resource_version,
         clang_resource_aliases,
         clang_resource_tree,
         liblto_sha256,
+        libtapi_sha256,
         helper_tree,
     })
+}
+
+/// Records absence only when the exact leaf does not exist; aliases and all
+/// other metadata or read failures are rejected rather than treated as absent.
+fn optional_libtapi_digest(
+    path: &Path,
+    check: &dyn Fn() -> Result<(), Report<ReleaseError>>,
+) -> Result<Option<String>, Report<ReleaseError>> {
+    check()?;
+    match fs::symlink_metadata(path) {
+        Ok(_) => hash_vendor_file(path, LIBTAPI_LIMIT, check).map(|(digest, _)| Some(digest)),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            check()?;
+            let parent = path
+                .parent()
+                .ok_or_else(|| recipe_error("Apple libtapi path has no library directory"))?;
+            real_directory("Apple toolchain library directory", parent)?;
+            Ok(None)
+        }
+        Err(error) => Err(measurement_error(error)),
+    }
 }
 
 fn resource_version_name(name: &str) -> bool {

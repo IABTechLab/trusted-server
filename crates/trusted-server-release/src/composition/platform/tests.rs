@@ -153,6 +153,11 @@ pub(crate) fn projection_detached_sdk_fixture() -> PlatformEvidence {
 
 /// Measures a detached SDK and an in-place fictional toolchain.
 pub(crate) fn projection_measured_toolchain_fixture() -> PlatformEvidence {
+    projection_toolchain_with_libtapi_fixture(false)
+}
+
+/// Measures a fictional toolchain with an explicitly selected optional TAPI file.
+pub(crate) fn projection_toolchain_with_libtapi_fixture(libtapi: bool) -> PlatformEvidence {
     let fixture = Fixture::new(ReleaseTarget::Aarch64AppleDarwin);
     let apple = fixture.apple_with_detached(true);
     let usr = fixture
@@ -162,6 +167,10 @@ pub(crate) fn projection_measured_toolchain_fixture() -> PlatformEvidence {
         .expect("should create fictional resource directory");
     fs::write(usr.join("lib/libLTO.dylib"), b"fictional libLTO")
         .expect("should write fictional libLTO");
+    if libtapi {
+        fs::write(usr.join("lib/libtapi.dylib"), b"fictional libtapi")
+            .expect("should write fictional libtapi");
+    }
     fs::write(
         usr.join("lib/clang/17/include/stddef.h"),
         b"fictional header",
