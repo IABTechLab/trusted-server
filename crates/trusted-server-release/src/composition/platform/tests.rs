@@ -151,6 +151,32 @@ pub(crate) fn projection_detached_sdk_fixture() -> PlatformEvidence {
     collect(&fixture, &tools).expect("should collect detached SDK fixture")
 }
 
+/// Measures a detached SDK and an in-place fictional toolchain.
+pub(crate) fn projection_measured_toolchain_fixture() -> PlatformEvidence {
+    let fixture = Fixture::new(ReleaseTarget::Aarch64AppleDarwin);
+    let apple = fixture.apple_with_detached(true);
+    let usr = fixture
+        .root
+        .join("developer/Toolchains/XcodeDefault.xctoolchain/usr");
+    fs::create_dir_all(usr.join("lib/clang/17/include"))
+        .expect("should create fictional resource directory");
+    fs::write(usr.join("lib/libLTO.dylib"), b"fictional libLTO")
+        .expect("should write fictional libLTO");
+    fs::write(
+        usr.join("lib/clang/17/include/stddef.h"),
+        b"fictional header",
+    )
+    .expect("should write fictional resource header");
+    let apple = apple
+        .with_measured_toolchain_for_tests(
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            &crate::process::Cancellation::default(),
+        )
+        .expect("should measure fictional toolchain");
+    let tools = fixture.tools().with_apple_developer_tools(apple);
+    collect(&fixture, &tools).expect("should collect measured toolchain fixture")
+}
+
 #[test]
 fn candidate_platform_receipt_binds_actual_tools_and_external_artifact_without_completing_coverage()
 {
@@ -272,7 +298,8 @@ fn darwin_platform_receipt_requires_apple_files_and_retains_sdk_coverage_exclusi
             "sdk_frameworks",
             "tool_helpers",
             "liblto",
-            "clang_resource_directory"
+            "clang_resource_directory",
+            "toolchain_libraries"
         ]),
         "should never imply complete SDK coverage"
     );

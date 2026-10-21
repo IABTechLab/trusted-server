@@ -15,10 +15,15 @@
 //! frameworks, modes and internal aliases in that selected copy are rehashed
 //! before and after execution and at evidence sealing. Explicit lexical test
 //! fixtures retain only the four-file record and never claim SDK coverage.
-//! Clang's helpers, resource directory, `libLTO`, other toolchain libraries,
-//! host runtime and original acquisition remain unresolved. The developer
-//! directory still permits broad read/execute access; the snapshot does not
-//! prove every compiler input came from the selected SDK.
+//!
+//! Ordinary CI selection also measures, in place below the selected `clang`'s
+//! toolchain, a tree digest of the toolchain helper directory, the single
+//! versioned clang resource directory and the SHA-256 of `libLTO.dylib`, and
+//! rechecks them at every verification point. Which helpers clang actually
+//! ran, other toolchain libraries, host runtime and original acquisition
+//! remain unresolved. The developer directory still permits broad
+//! read/execute access; neither receipt proves every compiler input came from
+//! the measured trees.
 //!
 //! Only the test-only ordinary CI selection constructs a record; the
 //! qualified selection is uninhabited until Task 8 qualifies a toolchain.
@@ -46,8 +51,10 @@ use crate::inspect::MacosVersion;
 #[cfg(test)]
 use crate::process::Cancellation;
 use sdk::{OwnedSdk, SdkReceipt};
+use toolchain::{MeasuredToolchain, ToolchainReceipt};
 
 mod sdk;
+mod toolchain;
 
 /// Fixed prefix the C path remap gives the developer directory.
 pub(crate) const REMAPPED_DEVELOPER: &str = "/apple-developer";
@@ -115,12 +122,14 @@ pub(crate) struct AppleDeveloperTools {
     facts: AppleToolFacts,
     selection: AppleSelection,
     sdk: Option<Arc<OwnedSdk>>,
+    toolchain: Option<MeasuredToolchain>,
 }
 
 /// Candidate identity of the explicitly measured Apple files.
 ///
 /// The exclusions describe inputs this selection does not hash. A detached
-/// SDK receipt is present only for a measured owned snapshot.
+/// SDK receipt is present only for a measured owned snapshot, and a
+/// toolchain receipt only for a measured in-place toolchain.
 #[derive(Debug, Serialize)]
 pub(crate) struct AppleToolEvidence {
     identity_sha256: String,
@@ -129,6 +138,7 @@ pub(crate) struct AppleToolEvidence {
     tools: [AppleFileEvidence; 3],
     sdk_settings: AppleFileEvidence,
     sdk_tree: Option<SdkReceipt>,
+    toolchain: Option<ToolchainReceipt>,
     coverage_exclusions: Vec<&'static str>,
     origin: &'static str,
     qualification: &'static str,
@@ -155,6 +165,22 @@ impl AppleToolEvidence {
     /// Returns the detached SDK's structured-tree digest, when measured.
     pub(crate) fn sdk_tree_sha256(&self) -> Option<&str> {
         self.sdk_tree.as_ref().map(SdkReceipt::tree_sha256)
+    }
+    /// Returns the in-place `libLTO.dylib` raw-file digest, when measured.
+    pub(crate) fn liblto_sha256(&self) -> Option<&str> {
+        self.toolchain.as_ref().map(ToolchainReceipt::liblto_sha256)
+    }
+    /// Returns the clang resource directory's structured-tree digest, when measured.
+    pub(crate) fn clang_resource_tree_sha256(&self) -> Option<&str> {
+        self.toolchain
+            .as_ref()
+            .map(ToolchainReceipt::clang_resource_tree_sha256)
+    }
+    /// Returns the toolchain helper directory's structured-tree digest, when measured.
+    pub(crate) fn helper_tree_sha256(&self) -> Option<&str> {
+        self.toolchain
+            .as_ref()
+            .map(ToolchainReceipt::helper_tree_sha256)
     }
     /// Returns the SDK version used to check the accepted executable.
     pub(crate) fn sdk_version(&self) -> &str {
@@ -332,21 +358,30 @@ impl AppleDeveloperTools {
                 )?
             },
             sdk_tree: self.sdk.as_ref().map(|sdk| sdk.receipt().clone()),
-            coverage_exclusions: if self.sdk.is_some() {
-                vec!["tool_helpers", "liblto", "clang_resource_directory"]
-            } else {
-                vec![
-                    "sdk_headers",
-                    "sdk_stubs",
-                    "sdk_frameworks",
-                    "tool_helpers",
-                    "liblto",
-                    "clang_resource_directory",
-                ]
-            },
+            toolchain: self
+                .toolchain
+                .as_ref()
+                .map(|toolchain| toolchain.receipt().clone()),
+            coverage_exclusions: self.coverage_exclusions(),
             origin: "candidate_measurement",
             qualification: "unqualified",
         })
+    }
+
+    /// Names the reviewed input classes this selection does not hash.
+    ///
+    /// Toolchain libraries other than `libLTO` are never measured, so the
+    /// list is never empty.
+    fn coverage_exclusions(&self) -> Vec<&'static str> {
+        let mut exclusions = Vec::new();
+        if self.sdk.is_none() {
+            exclusions.extend(["sdk_headers", "sdk_stubs", "sdk_frameworks"]);
+        }
+        if self.toolchain.is_none() {
+            exclusions.extend(["tool_helpers", "liblto", "clang_resource_directory"]);
+        }
+        exclusions.push("toolchain_libraries");
+        exclusions
     }
 
     /// Accepts only a qualified selection; production construction stays closed.
@@ -372,7 +407,36 @@ impl AppleDeveloperTools {
             facts,
             selection: AppleSelection::OrdinaryCi,
             sdk: None,
+            toolchain: None,
         })
+    }
+
+    /// Measures the selected toolchain's helpers, `libLTO` and clang resource
+    /// directory in place and binds them into this record.
+    ///
+    /// # Errors
+    ///
+    /// Rejects changed recorded files, or as the toolchain measurement:
+    /// ambiguous resource versions, a missing `libLTO`, unsafe entries,
+    /// exhausted limits, cancellation or expiration.
+    #[cfg(test)]
+    pub(crate) fn with_measured_toolchain_for_tests(
+        mut self,
+        deadline: Instant,
+        cancellation: &Cancellation,
+    ) -> Result<Self, Report<ReleaseError>> {
+        self.toolchain = Some(MeasuredToolchain::measure(
+            &self.facts.clang,
+            &self.facts.developer_dir,
+            deadline,
+            cancellation,
+        )?);
+        // One verification after measuring suffices: it rehashes every
+        // recorded file against the facts (so an earlier change is still
+        // caught) and also remeasures the new toolchain receipt. A second
+        // pass before measuring would only rehash the same files again.
+        self.verify()?;
+        Ok(self)
     }
 
     /// Stages an explicit test selection through the same detached SDK policy.
@@ -455,7 +519,8 @@ impl AppleDeveloperTools {
             xcode_version,
             sdk_version,
         };
-        Self::with_detached_sdk_for_tests(facts, deadline, cancellation)
+        Self::with_detached_sdk_for_tests(facts, deadline, cancellation)?
+            .with_measured_toolchain_for_tests(deadline, cancellation)
     }
 
     /// The authority of this selection.
@@ -499,18 +564,22 @@ impl AppleDeveloperTools {
         self.facts.sdk_version
     }
 
-    /// Rehashes the tools and SDK settings against the record.
+    /// Rehashes the tools, SDK settings, detached SDK and measured toolchain
+    /// against the record.
     ///
     /// # Errors
     ///
     /// Returns [`ReleaseError::Recipe`] when the developer directory or SDK
     /// root is not a real directory, a tool or the settings file is not a
-    /// regular file, or any digest differs.
+    /// regular file, or any digest or toolchain receipt differs.
     pub(crate) fn verify(&self) -> Result<(), Report<ReleaseError>> {
         real_directory("Apple developer directory", &self.facts.developer_dir)?;
         real_directory("Apple SDK root", self.sdk_root())?;
         if let Some(sdk) = &self.sdk {
             sdk.verify()?;
+        }
+        if let Some(toolchain) = &self.toolchain {
+            toolchain.verify()?;
         }
         let settings = self.sdk_root().join(SDK_SETTINGS);
         let expected = [
@@ -565,6 +634,9 @@ impl AppleDeveloperTools {
         });
         if let Some(sdk) = &self.sdk {
             value["sdk_tree"] = json!(sdk.receipt());
+        }
+        if let Some(toolchain) = &self.toolchain {
+            value["toolchain"] = json!(toolchain.receipt());
         }
         value
     }

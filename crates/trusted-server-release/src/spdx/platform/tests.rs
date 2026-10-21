@@ -192,6 +192,59 @@ fn detached_sdk_is_structured_material_without_raw_file_checksum() {
 }
 
 #[test]
+fn measured_toolchain_projects_liblto_resource_and_helper_components_and_drops_their_gaps() {
+    let platform = crate::composition::platform::tests::projection_measured_toolchain_fixture();
+    let owner = Owner::fixture(&platform);
+    let components = project(&platform, &owner).expect("should project measured toolchain");
+    let apple = platform.apple().expect("should retain Apple receipt");
+    for (name, sha256, role) in [
+        (
+            "Measured Apple clang resource directory tree",
+            apple.clang_resource_tree_sha256(),
+            ComponentRole::BuildMaterial,
+        ),
+        (
+            "Measured Apple toolchain helper directory tree",
+            apple.helper_tree_sha256(),
+            ComponentRole::BuildTool,
+        ),
+    ] {
+        let sha256 = sha256.expect("should hold the measured tree digest");
+        let tree = components
+            .iter()
+            .find(|component| component.name == name)
+            .unwrap_or_else(|| panic!("should project {name}"));
+        assert!(
+            tree.roles == [role]
+                && matches!(&tree.origin, Some(Origin::StructuredTree { sha256: digest }) if digest == sha256),
+            "should project {name} as a structured tree"
+        );
+    }
+    assert!(
+        components
+            .iter()
+            .any(|component| component.name == "Measured platform file (apple-liblto)"),
+        "should project libLTO as a measured file"
+    );
+    let gaps = coverage_gaps(&platform);
+    for measured in ["tool_helpers", "liblto", "clang_resource_directory"] {
+        assert!(
+            !gaps.contains(&format!("apple-coverage-excluded:{measured}")),
+            "should not state measured {measured} as excluded"
+        );
+    }
+    for retained in [
+        "apple-coverage-excluded:toolchain_libraries",
+        "apple-tool-closure-unmeasured",
+    ] {
+        assert!(
+            gaps.iter().any(|gap| gap == retained),
+            "should retain {retained}"
+        );
+    }
+}
+
+#[test]
 fn rendered_projection_preserves_runtime_constraints_without_runtime_byte_checksums() {
     let platform = projection_fixture(crate::policy::ReleaseTarget::Wasm32Wasip1);
     let owner = Owner::fixture(&platform);

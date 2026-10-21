@@ -85,7 +85,12 @@ fn owned_sdk_closure_rechecks_headers_stubs_and_frameworks_and_retains_clone_lif
         );
         assert_eq!(
             value["coverage_exclusions"],
-            serde_json::json!(["tool_helpers", "liblto", "clang_resource_directory"]),
+            serde_json::json!([
+                "tool_helpers",
+                "liblto",
+                "clang_resource_directory",
+                "toolchain_libraries"
+            ]),
             "should remove only covered SDK exclusions"
         );
         fs::write(root.join(relative), b"changed SDK input").expect("should mutate owned input");
@@ -218,7 +223,8 @@ fn candidate_apple_evidence_records_only_measured_files_and_explicit_exclusions(
             "sdk_frameworks",
             "tool_helpers",
             "liblto",
-            "clang_resource_directory"
+            "clang_resource_directory",
+            "toolchain_libraries"
         ]),
         "should explicitly retain every unmeasured SDK/tool closure class"
     );

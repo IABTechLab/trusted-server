@@ -206,6 +206,46 @@ fn project(
                 },
             )?);
         }
+        if let Some(sha256) = apple.liblto_sha256() {
+            components.push(measured_file(
+                owner.target,
+                "apple-liblto",
+                sha256,
+                ComponentRole::BuildTool,
+            )?);
+        }
+        let toolchain_trees = [
+            (
+                "apple-clang-resource-tree",
+                apple.clang_resource_tree_sha256(),
+                "Measured Apple clang resource directory tree",
+                ComponentRole::BuildMaterial,
+            ),
+            (
+                "apple-toolchain-helper-tree",
+                apple.helper_tree_sha256(),
+                "Measured Apple toolchain helper directory tree",
+                ComponentRole::BuildTool,
+            ),
+        ];
+        for (role, digest, name, component_role) in toolchain_trees {
+            let Some(sha256) = digest else {
+                continue;
+            };
+            if !lower_hex(sha256, 64) {
+                return Err(spdx_error("invalid Apple toolchain tree identity"));
+            }
+            components.push(component(
+                owner.target,
+                role,
+                sha256,
+                name.to_owned(),
+                vec![component_role],
+                Origin::StructuredTree {
+                    sha256: sha256.to_owned(),
+                },
+            )?);
+        }
     }
     if let Some(gnu) = platform.gnu() {
         if owner.target != ReleaseTarget::X86_64UnknownLinuxGnu {

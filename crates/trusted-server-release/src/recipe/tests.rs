@@ -343,6 +343,7 @@ mod compare;
 mod complete;
 mod complete_darwin;
 mod darwin;
+mod darwin_toolchain;
 mod fixture;
 #[cfg(target_os = "linux")]
 mod full;
