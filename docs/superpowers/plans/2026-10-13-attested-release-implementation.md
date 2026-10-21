@@ -642,15 +642,43 @@ passed one 20-minute deadline to a transport capped at 15 minutes;
 qualification stay open.
 
 Pair comparison (2026-10-21, `de52e66fd`): the collector also rejects a
-canonical/reproduction pair sharing one exact invocation fingerprint and treats
-an equal host locale or timezone as a missing supported variation. New pure
-tests isolate the pair check per dimension, record every optional native
+canonical/reproduction pair sharing one boundary instance and treats an equal
+host locale or timezone as a missing supported variation. New pure tests
+isolate the pair check per dimension, record every optional native
 reproduction outcome, show no reproduction state hides a mandatory canonical
-failure, and require Fastly runtime proof for both roles. Still open: native
-canonical input digests are only compared against a reproduction (no trusted
-expected digests without a reproduction), runtime proof carries no role field,
-and an invalid uploaded native reproduction rejects the whole collection rather
-than recording `failed`.
+failure, and require Fastly runtime proof for both roles.
+
+Collector follow-ups (2026-10-21):
+
+- `f17377a4e`: an optional native reproduction without an upload is an
+  observed job (started flag, terminal conclusion, bounded elapsed/deadline)
+  with no upload identity fields; the collector derives `unavailable` (queued
+  at the deadline, skipped, cancelled before any step) or `failed` (started
+  then cancelled or still running, failure, timed out, success without an
+  upload) and rejects contradictory, premature or unbounded observations. Each
+  dependency channel accepts only its own build roles before any fetch, and the
+  Fastly runtime record must carry its record's role. That role is
+  producer-asserted, so it guards an honest pipeline; a per-run Viceroy
+  identity remains open.
+- `15893ef1e`: the earlier "exact invocation" check compared a fingerprint
+  forced equal to the boundary instance, so it only proved distinct instances.
+  Records now carry `execution_fingerprint` (boundary instance, bound to the
+  denial receipt) and a separate `invocation_digest` from the exact Cargo plan
+  digest (program, arguments including jobs, environment, role checkout root,
+  umask); the pair must differ in both. A test-reachable producer renderer
+  emits this strict record from producer-owned facts.
+- `5a98c18ad`: the collector parses the producer's real sealed composition
+  receipt instead of a fixture-only summary, keeping every earlier check and
+  adding materials, target, package-join, Fastly embedding, coverage-claim and
+  platform-shape bindings. Real candidate tests feed each real receipt through
+  the same check, so producer/collector drift fails ordinary CI.
+
+Still open: the trusted workflow adapter that fills observed job states and
+upload identities; job/attempt identity supplied by the workflow; native
+startup acceptance has no collector slot; native canonical input digests are
+only compared against a reproduction; an invalid uploaded native reproduction
+rejects the whole collection rather than recording `failed`; and the
+`failed`/`unavailable` mapping is not yet normative in the spec.
 
 ### Task 14: Expose trusted same-commit validation
 
@@ -797,15 +825,40 @@ authorized live invocation; bounded Tasks 11/10 resume meanwhile.
 - [ ] Invoke pinned attest 4.2.2 twice per canonical asset: exact executable/SBOM/evidence/recipe/rebuild provenance subjects, then executable subject + SPDX predicate. Save named bundles, validate all proofs/joins and sign index after collection. Do not construct caller predicates or sign source supplied commands.
 - [ ] Rehearse actual certificates/toolkit fields in a disposable repository with test-only policy fixtures. Verify repository IDs, exact SAN, issuer, build/caller/source/event/run fields for both predicate types. Commit `Sign validated release outputs through the reusable builder`.
 
+Progress (2026-10-21, partial, collector logic only): `f17377a4e` implements
+the collector side of the never-started/queued/cancelled and pre-step-failure
+bullet as pure logic (see Task 12 collector follow-ups): no upload identity can
+exist for such a job, outcomes are derived from bounded observed job states,
+and a missing mandatory canonical rejects collection under every optional
+state. The bullet stays open until the trusted workflow adapter supplies real
+job observations and `release-build.yml` bounds the wait; no workflow, signing
+or publication was added.
+
 ### Task 16: Publish through one immutable-release owner
 
 **Create:** `.github/workflows/release.yml`, release tool `src/publication.rs` and private `publication::tests`.
 
-- [ ] Add fake API cases for matching/conflicting draft, missing/altered asset, concurrent rerun, lost response, already published tag, mutable/unknown final state and permission differences on approved RC commits.
+- [x] Add fake API cases for matching/conflicting draft, missing/altered asset, concurrent rerun, lost response, already published tag, mutable/unknown final state and permission differences on approved RC commits.
 - [ ] Run `cargo test -p trusted-server-release --target "$HOST_TARGET" publication::tests` and `workflow_contract` separately with the nonzero-selection guard; expect absent publication owner.
 - [ ] Keep tag-scoped concurrency without cancellation. Draft, upload, re-download and validate the exact asset set before publication. Match source/bytes for draft resume; never overwrite published assets/tags. Publication has contents-write only, no OIDC/provider/settings token.
 - [ ] Require maintainer governance approval and immutable/tag-rule setup before enabling tags; afterward read immutable=true and verify GitHub release statement/membership with the normal token. A confirmed mutable release fails publication, is removed only when the workflow release-write role authorizes that still-mutable cleanup, and produces an incident with the cleanup outcome. Never delete an immutable release. Unknown state produces an incident and read-only reconciliation; it MUST NOT trigger blind deletion. A lost publish response also triggers read-only reconciliation before another mutation.
 - [ ] Exercise all failure paths in an authorized disposable public repository and record measured evidence. Production tag/permissions require separate release authorization. Commit `Publish complete immutable attested releases`.
+
+Progress (2026-10-21, `9bd8be2c2`, closed pure owner): `src/publication/`
+implements the sole-owner state machine against a `ReleaseApi` trait with an
+in-process fake (33 tests). It refuses a tag that has a published release or
+points at another commit, resumes a draft only on matching tag, commit and
+bytes, re-downloads and validates the exact asset set within bounds derived
+from the index asset set and role limits, re-checks the tag and draft before
+publishing, and reconciles lost responses read-only. After publication it
+requires an immutable release whose observed tag, commit and statement
+membership equal the intended release; a confirmed mutable release is removed
+only with cleanup authority after a fresh read, with an incident carrying the
+API failure. Immutable or unknown releases are never deleted. Publication holds
+only a contents-write marker built from the caller-attested job permissions.
+There is no real API adapter, `release.yml`, `workflow_contract` publication
+fixture, command or token handling, so the remaining bullets stay open; partial
+uploads after lost responses need a manual recovery runbook.
 
 ### Task 17: Implement strict consumer documents and embedded policy
 
