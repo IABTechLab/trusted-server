@@ -327,6 +327,8 @@ pub(crate) fn reconcile(
         }
     }
     let mut compiled_ids = BTreeSet::new();
+    let mut custom_build_ids = BTreeSet::new();
+    let mut consumer_contexts = BTreeSet::new();
     let mut binaries = 0;
     for unit in &observed.units {
         let contexts = reachable
@@ -336,6 +338,14 @@ pub(crate) fn reconcile(
             return Err(composition_error("compiler unit has no observed package"));
         }
         let custom_build = unit.target_kind.iter().any(|kind| kind == "custom-build");
+        if custom_build {
+            custom_build_ids.insert(unit.package_id.as_str());
+        } else {
+            consumer_contexts.insert((
+                unit.package_id.as_str(),
+                unit.context == UnitContext::Target,
+            ));
+        }
         if (custom_build && unit.context != UnitContext::Host)
             || (!custom_build && !contexts.contains(&unit.context))
         {
@@ -356,6 +366,32 @@ pub(crate) fn reconcile(
     if binaries != 1 || compiled_ids != observed_ids {
         return Err(composition_error(
             "observed membership differs from compiled selected binary graph",
+        ));
+    }
+    let executed_ids: BTreeSet<_> = observed
+        .build_scripts
+        .iter()
+        .map(|script| script.package_id.as_str())
+        .collect();
+    if executed_ids != custom_build_ids {
+        return Err(composition_error(
+            "compiled build scripts differ from observed executions",
+        ));
+    }
+    let executed_contexts: BTreeSet<_> = observed
+        .build_scripts
+        .iter()
+        .map(|script| {
+            (
+                script.package_id.as_str(),
+                script.context == UnitContext::Target,
+            )
+        })
+        .collect();
+    consumer_contexts.retain(|(id, _)| custom_build_ids.contains(id));
+    if executed_contexts != consumer_contexts {
+        return Err(composition_error(
+            "build-script execution contexts differ from observed consumers",
         ));
     }
     Ok(GraphEvidence {

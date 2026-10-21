@@ -24,6 +24,116 @@ fn observed() -> CargoObservations {
 }
 
 #[test]
+fn compiled_build_script_requires_its_execution_observation() {
+    let mut messages = std::str::from_utf8(MESSAGES)
+        .expect("should read actual Cargo fixture")
+        .lines()
+        .filter(|line| {
+            let message: Value = serde_json::from_str(line).expect("should parse Cargo message");
+            message["reason"] != "build-script-executed"
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    messages.push('\n');
+    let layout = CargoLayout::new(
+        ReleaseTarget::Wasm32Wasip1,
+        PathBuf::from("/build/target"),
+        PathBuf::from("/build/source"),
+    )
+    .expect("should accept fixture layout");
+    let observed = observe_cargo(METADATA, messages.as_bytes(), &layout)
+        .expect("should parse the remaining compiler observations");
+    assert!(
+        reconcile(METADATA, TREE, &observed, ROOT).is_err(),
+        "should not seal a graph that loses build-script cfg, environment and link evidence"
+    );
+}
+
+#[test]
+fn build_script_execution_requires_a_matching_consumer_context() {
+    let messages = std::str::from_utf8(MESSAGES)
+        .expect("should read Cargo messages")
+        .replace(
+            "/build/target/wasm32-wasip1/release/build/example-app-f1024798a111146f/out",
+            "/build/target/release/build/example-app-f1024798a111146f/out",
+        );
+    let layout = CargoLayout::new(
+        ReleaseTarget::Wasm32Wasip1,
+        PathBuf::from("/build/target"),
+        PathBuf::from("/build/source"),
+    )
+    .expect("should accept fixture layout");
+    let observed = observe_cargo(METADATA, messages.as_bytes(), &layout)
+        .expect("should parse host-context script execution");
+    assert!(
+        reconcile(METADATA, TREE, &observed, ROOT).is_err(),
+        "should reject a host execution when only a target consumer was observed"
+    );
+}
+
+#[test]
+fn dual_role_build_scripts_require_execution_evidence_for_each_consumer_context() {
+    let helper = "path+file:///build/source/host-helper#example-host-helper@0.1.0";
+    let mut metadata: Value =
+        serde_json::from_slice(METADATA).expect("should parse fixture metadata");
+    metadata["resolve"]["nodes"][0]["deps"][0]["dep_kinds"]
+        .as_array_mut()
+        .expect("should hold dependency kinds")
+        .push(json!({"kind":null,"target":null}));
+    let metadata = serde_json::to_vec(&metadata).expect("should encode dual-role metadata");
+    let mut observations = observed();
+    let script_index = observations
+        .units
+        .iter()
+        .position(|unit| unit.target_kind.iter().any(|kind| kind == "custom-build"))
+        .expect("should contain script compilation");
+    let mut script_unit = observed().units.remove(script_index);
+    script_unit.package_id = helper.to_owned();
+    observations.units.push(script_unit);
+    let helper_execution = |context, out_dir| {
+        let mut execution = observed().build_scripts.remove(0);
+        execution.package_id = helper.to_owned();
+        execution.context = context;
+        execution.out_dir = PathBuf::from(out_dir);
+        execution
+    };
+    let execution = helper_execution(
+        UnitContext::Host,
+        "/build/target/release/build/example-helper/out",
+    );
+    observations.build_scripts.push(execution);
+    reconcile(&metadata, TREE, &observations, ROOT)
+        .expect("should accept matching host-only script and consumer");
+
+    let helper_index = observations
+        .units
+        .iter()
+        .position(|unit| unit.package_id == helper && unit.target_kind == ["lib"])
+        .expect("should contain host helper consumer");
+    let mut target_unit = observed().units.remove(helper_index);
+    target_unit.context = UnitContext::Target;
+    target_unit.features = vec!["target-feature".to_owned()];
+    observations.units.push(target_unit);
+    assert!(
+        reconcile(&metadata, TREE, &observations, ROOT).is_err(),
+        "should reject missing execution evidence for the second consuming context"
+    );
+
+    observations.build_scripts.push(helper_execution(
+        UnitContext::Target,
+        "/build/target/wasm32-wasip1/release/build/example-helper/out",
+    ));
+    reconcile(&metadata, TREE, &observations, ROOT)
+        .expect("should accept separate host and target executions without merging features");
+    observations.build_scripts.push(helper_execution(
+        UnitContext::Target,
+        "/build/target/wasm32-wasip1/release/build/example-helper-other/out",
+    ));
+    reconcile(&metadata, TREE, &observations, ROOT)
+        .expect("should allow distinct executions within the same consuming context");
+}
+
+#[test]
 fn actual_cross_build_preserves_host_only_dependencies_and_observed_units() {
     let observed = observed();
     let graph = reconcile(METADATA, TREE, &observed, ROOT)

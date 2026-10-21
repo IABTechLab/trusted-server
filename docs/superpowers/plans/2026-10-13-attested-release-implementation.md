@@ -378,8 +378,8 @@ Candidate SPDX now names both limitations as `gnu-tool-closure-unmeasured` and
 `gnu-privileged-helper-content-unmeasured` gap. These names are absent for
 non-GNU receipts and remain sorted/unique. No serialized receipt fields, schemas,
 workflow assertions, completeness flags or production constructors changed.
-Hosted Fastly/Linux/Apple candidate validation of this increment and inspection
-of their emitted gaps remain pending. Complete coverage and qualification stay
+Hosted Fastly/Linux/Apple candidate validation and emitted-gap inspection are
+recorded below for `e91d75b74`. Complete coverage and qualification stay
 false; this does not complete Task 10 or touch the parallel Task 12 adapter.
 
 Local verification for this increment passed 63 composition tests with the
@@ -477,16 +477,64 @@ invented by strengthening the receipt checks. Native material coverage stays
 incomplete. The existing Fastly unresolved-host-tool, GNU closure/acquisition/
 privileged-helper-content and Apple closure/toolchain-library gaps remain open;
 complete sysroot/tool execution closure and external platform inputs still need
-additional owner measurements and qualification. Real GNU acceptance of this
-guard awaits hosted CI; none of these changes completes Task 10.
+additional owner measurements and qualification. Hosted acceptance of this
+guard is recorded below; none of these changes completes Task 10.
 
 Scoped verification: nonzero guards selected 18 pure GNU tests, 67 pure SPDX
 tests and two unchanged producer golden checks; all passed. Strict host clippy,
 documentation and owned-file formatting pass. Independent spec and quality
 reviews approve this increment without blockers, including preservation of
 explicit GCC paths and same-identity aliases. No child-process or ignored tests
-were executed locally. All four candidate gap lists still require inspection
-after the code push; the earlier Task 14 run is not evidence for this new guard.
+were executed locally. The earlier Task 14 run is not evidence for this guard.
+
+Hosted guard acceptance (2026-10-21): [Run Tests 39616416485](https://github.com/IABTechLab/trusted-server/actions/runs/39616416485)
+and [Run Format 39616416604](https://github.com/IABTechLab/trusted-server/actions/runs/39616416604)
+succeeded at head `e91d75b7447c9611d6e1ccb5dc7c2dce07377ff6`. Candidate
+logs record built PR merge source `624cef618ffadbfad72c41c9072d8c5f5c1f4f64`.
+Actual SPDX gaps were inspected for all four assets:
+
+- Fastly [119278571153](https://github.com/IABTechLab/trusted-server/actions/runs/39616416485/job/119278571153):
+  `native-material-coverage-incomplete` and `native-tool-host-path-unresolved:`
+  for `archiver`, `assembler`, `build_tools`, `compiler` and `linker`.
+  Canonical and reproduction SPDX report the same gaps and identical document
+  bytes; document equality remains a measurement.
+- Linux CLI [119278571303](https://github.com/IABTechLab/trusted-server/actions/runs/39616416485/job/119278571303):
+  `gnu-original-acquisition-unverified`, `gnu-privileged-helper-content-unmeasured`,
+  `gnu-tool-closure-unmeasured` and `native-material-coverage-incomplete`.
+- Apple ARM [119287733613](https://github.com/IABTechLab/trusted-server/actions/runs/39616416485/job/119287733613)
+  and Intel [119287733492](https://github.com/IABTechLab/trusted-server/actions/runs/39616416485/job/119287733492):
+  `apple-coverage-excluded:toolchain_libraries`, `apple-tool-closure-unmeasured`
+  and `native-material-coverage-incomplete` on each asset.
+
+Every candidate keeps `material_native_coverage_complete: false` and SPDX
+`release_qualification: false`; optional native reproductions are absent, not
+invented successes. No unexpected gap difference was found. This closes hosted
+acceptance of `e91d75b74`, not Task 10/11 completeness. That run predates
+`5a98c18ad`'s strict real-receipt parser: acceptance of
+`check_composition_receipt` must be established by a later parser-inclusive run.
+
+Cargo script presence hardening (2026-10-21): graph sealing now requires every
+observed custom-build package to have execution evidence, and the execution
+package/context set to match the observed non-custom consumers of those
+packages. A compiled host script cannot substitute for its target execution;
+dual-role packages need evidence in both consuming contexts. Multiple executions
+within one context remain permitted, and effective unit features remain separate.
+This is package/context presence consistency, not proof that every feature-specific
+execution within a context was retained or an exact compiler dependency DAG.
+No serialized receipt field, SPDX rendering, completeness flag or collector
+fixture changes. Coverage remains incomplete.
+
+Two negative fixtures were observed failing for their intended reasons before
+the production checks: missing execution evidence and a host execution with only
+a target consumer. A dual-role regression also covers a missing second context,
+matching host/target executions and multiple executions in one context. Scoped
+nonzero guards passed 66 composition tests, 67 SPDX tests, 18 GNU tests, 46
+collection tests and two unchanged producer golden checks. The collection
+transfer module was excluded because it includes subprocess/network fixtures;
+one other ignored collection test was not executed. Strict host clippy,
+documentation and owned-file formatting passed. Independent review found no
+blocker and confirmed the package/context limitation stated above. Real-build
+acceptance of this new graph guard remains pending its own hosted run.
 
 ### Task 11: Generate complete artifact-specific SPDX
 
@@ -536,7 +584,7 @@ license facts or infer missing origins. Existing named native/tool/acquisition
 gaps remain present, and complete qualified generation remains closed.
 
 The local suite passes 66 pure SPDX tests plus the two pure golden checks.
-Real-artifact acceptance of the strengthened guard awaits hosted CI. Complete
+Real-artifact acceptance is recorded under Task 10 for `e91d75b74`. Complete
 native/tool coverage, complete qualified per-artifact SBOMs and the remaining
 Task 11 exits stay unchecked. Parallel Task 12 code and its fixtures are untouched.
 Task 11 resumes after recording Task 14's hosted preservation result and open
@@ -554,7 +602,8 @@ No license catalog is expanded and no existing measured package or relationship
 was found missing from its projection. Complete artifact-specific generation
 still requires the unmeasured closure/input facts and qualified owning adapters.
 Valid rendering, companion formats and candidate golden fixtures are unchanged;
-hosted acceptance of this strengthened guard remains pending.
+all four candidate jobs accepted the strengthened guard in the `e91d75b74`
+run recorded under Task 10. Complete generation remains closed.
 
 ### Task 12: Bind transfers and enforce selected comparisons
 
