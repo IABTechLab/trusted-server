@@ -193,6 +193,8 @@ fn flight_url_token_end(
 /// recomputed. Originals used for fallback must never pass through this function.
 /// `record_text` marks exactly one complete T-record body. Other spans can start
 /// mid-URL at a payload-script boundary and must not be routed as whole URLs.
+/// A record body may still span payloads: a boundary marker inside the routed
+/// prefix prevents routing, and one in the suffix is copied verbatim.
 pub(crate) fn rewrite_gtm_rsc_span(content: &str, record_text: bool) -> String {
     fn route(token: &str) -> Option<String> {
         let captures = GTM_RSC_WHOLE_URL_PATTERN.captures(token)?;
@@ -1132,6 +1134,8 @@ impl IntegrationScriptRewriter for GoogleTagManagerIntegration {
     }
 
     fn rewrite(&self, content: &str, ctx: &IntegrationScriptContext<'_>) -> ScriptRewriteAction {
+        // Per document, never per registry: a registry-lifetime buffer would
+        // carry one document's partial script into the next.
         let state = ctx
             .document_state
             .get_or_insert_with(GTM_INTEGRATION_ID, || Mutex::new(GtmScriptState::default()));

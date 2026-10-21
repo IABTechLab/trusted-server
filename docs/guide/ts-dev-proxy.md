@@ -302,6 +302,8 @@ transport host and scheme. An Axum upstream reached over plain HTTP emits
 Configuring `[trusted_forwarder]` alone does not change that; the proxy must also
 supply the matching credential.
 
+The selected host is syntax-validated before publisher processing, including requests for assets that never reach a script rewriter. A malformed, explicitly empty, or non-text selected host returns **400**, without reflecting the rejected value or falling back to a lower-priority source. Requests with no host metadata retain the existing empty-host behavior. Valid ports, bracketed IPv6, local hostnames, and ASCII underscores in host labels remain supported.
+
 By default `Host: <FROM>` too. Fastly routes by SNI (`= TO`) and passes `Host`
 through unchanged, so `Host: <FROM>` reaches the upstream — but the upstream still
 has to be configured to accept it, which a dev or staging service usually isn't.

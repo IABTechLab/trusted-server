@@ -265,6 +265,115 @@ mod tests {
     }
 
     #[test]
+    fn json_ld_data_head_preserves_later_flight_and_queued_originals() {
+        let data = json!({
+            "href": "https://origin.example.com/page",
+            "tag": "http://www.googletagmanager.com/gtm.js?id=GTM-MIX1",
+            "text": "é😀",
+        });
+        let body = data.to_string();
+        let row = format!("1:T{:x},{body}", body.len());
+        let flight = flight_html(&[&row]);
+        let hint = json!({"articleBody": "Example self.__next_f.push([1, is inert"});
+        let html = format!("{flight}<script type=\"application/ld+json\">{hint}</script>{flight}");
+        let mut rewritten = data.clone();
+        rewritten["href"] = json!("https://test.example.com/page");
+        rewritten["tag"] = json!("/integrations/google_tag_manager/gtm.js?id=GTM-MIX1");
+        for compression in [Compression::None, Compression::Gzip] {
+            for chunk_size in [16, 8192] {
+                let output = mixed_output_with_compression(&html, compression, chunk_size);
+                let payloads = flight_payloads(&output);
+                assert_eq!(payloads.len(), 2, "should retain both real Flight pushes");
+                assert_eq!(payloads[1], row, "should leave every later payload raw");
+                assert_mixed_t_model(&payloads[1], &data);
+                if chunk_size == 8192 {
+                    assert_eq!(payloads[0], row, "should restore queued earlier payloads");
+                    assert_mixed_t_model(&payloads[0], &data);
+                } else {
+                    assert_mixed_t_model(&payloads[0], &rewritten);
+                }
+                assert!(
+                    output.contains(&hint.to_string()),
+                    "should preserve JSON-LD source"
+                );
+                assert!(
+                    !output.contains("__ts_rsc_"),
+                    "should resolve every placeholder"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn foreign_references_before_flight_preserve_capture_at_every_split() {
+        let data = json!({
+            "href": "https://origin.example.com/page",
+            "tag": "http://www.googletagmanager.com/gtm.js?id=GTM-MIX1",
+        });
+        let body = data.to_string();
+        let row = format!("1:T{:x},{body}", body.len());
+        let encoded = serde_json::to_string(&row).expect("should encode Flight row");
+        let mut expected = data;
+        expected["href"] = json!("https://test.example.com/page");
+        expected["tag"] = json!("/integrations/google_tag_manager/gtm.js?id=GTM-MIX1");
+        for prefix in [
+            "window.app.__next_f=1;",
+            "foreign.__next_f=1;obj.window.__next_f=2;",
+            "const label='é😀';window.app.__next_f=1;",
+        ] {
+            for receiver in [
+                "self.__next_f",
+                "window.__next_f",
+                "(self.__next_f=self.__next_f||[])",
+            ] {
+                let source = format!("{prefix}{receiver}.push([1,{encoded}]);");
+                let later = flight_html(&[&row]);
+                for split in (0..=source.len()).filter(|split| source.is_char_boundary(*split)) {
+                    let mut processor = create_html_processor(mixed_config(10000, 10000));
+                    let first = format!("<script>{}", &source[..split]);
+                    let last = format!("{}</script>{later}", &source[split..]);
+                    let mut output = processor
+                        .process_chunk(first.as_bytes(), false)
+                        .expect("should accept foreign references before Flight");
+                    output.extend(
+                        processor
+                            .process_chunk(last.as_bytes(), true)
+                            .expect("should complete qualified Flight after foreign references"),
+                    );
+                    let output = String::from_utf8(output).expect("should emit UTF-8");
+                    let payloads = flight_payloads(&output);
+                    assert_eq!(payloads.len(), 2, "should retain current and later Flight");
+                    for payload in payloads {
+                        assert_mixed_t_model(&payload, &expected);
+                    }
+                    assert!(
+                        output.starts_with(&format!("<script>{prefix}")),
+                        "should preserve foreign source at split {split}"
+                    );
+                    assert!(
+                        !output.contains("__ts_rsc_"),
+                        "should resolve every placeholder"
+                    );
+                }
+                let html = format!("<script>{source}</script>{later}");
+                for chunk_size in [16, 8192] {
+                    let output =
+                        mixed_output_with_compression(&html, Compression::Gzip, chunk_size);
+                    let payloads = flight_payloads(&output);
+                    assert_eq!(payloads.len(), 2, "should retain both gzip Flight pushes");
+                    for payload in payloads {
+                        assert_mixed_t_model(&payload, &expected);
+                    }
+                    assert!(
+                        !output.contains("__ts_rsc_"),
+                        "should resolve every gzip placeholder"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn non_code_flight_hints_preserve_source_and_data_heads_bypass_later_flight() {
         let payload = "0:{\"url\":\"https://origin.example.com/page\"}\n";
         let flight = flight_html(&[payload]);
@@ -665,8 +774,13 @@ mod tests {
                 );
             }
         }
-        // A qualified head can be observed but not buffered when an earlier
-        // unrelated property makes the tentative receiver claim fail.
+        // An earlier foreign property no longer prevents the following qualified
+        // push from being buffered. With no lexer trap, all three rows are safe
+        // to capture and rewrite, even when the first T body arrives later.
+        let routed_body = "`/integrations/google_tag_manager/gtm.js`";
+        let routed_payload = format!("1:T{:x},{routed_body}", routed_body.len());
+        let rewritten_body = json!({"url": "https://test.example.com/page", "tag": "/integrations/google_tag_manager/gtm.js?id=GTM-MIX1"}).to_string();
+        let rewritten_payload = format!("1:T{:x},{rewritten_body}", rewritten_body.len());
         let body_start = missed_push.find('`').expect("should locate raw T body");
         let first = format!(
             "<script>var ref=foreign.__next_f;{}",
@@ -689,7 +803,20 @@ mod tests {
                     .process_chunk(last.as_bytes(), true)
                     .expect("should finish later safe captures"),
             );
-            assert_output(&String::from_utf8(bytes).expect("should emit UTF-8"), split);
+            let output = String::from_utf8(bytes).expect("should emit UTF-8");
+            assert_eq!(
+                flight_payloads(&output),
+                [
+                    routed_payload.as_str(),
+                    rewritten_payload.as_str(),
+                    rewritten_payload.as_str()
+                ],
+                "should capture qualified Flight after a foreign reference at split {split}"
+            );
+            assert!(
+                !output.contains("__ts_rsc_"),
+                "should resolve every captured payload"
+            );
         }
     }
 
@@ -1319,6 +1446,67 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn flight_url_split_after_scheme_is_preserved_at_every_span_site() {
+        for scheme in ["http:", "https:"] {
+            let body = json!({
+                "tag": format!("{scheme}//www.googletagmanager.com/gtm.js?id=GTM-MIX1"),
+                "href": "https://origin.example.com/p",
+            });
+            let payload = format!("0:{body}\n");
+            let split = payload
+                .find("//www.")
+                .expect("should locate the tag slashes");
+            let (head, continuation) = payload.split_at(split);
+            // The continuation precedes a T row, is grouped by a trailing hex run,
+            // or precedes a T row whose body spans the next payload.
+            for parts in [
+                vec![head.to_owned(), format!("{continuation}1:T5,hello")],
+                vec![
+                    head.to_owned(),
+                    format!("{continuation}2:\"ab"),
+                    "cd\"\n".to_owned(),
+                ],
+                vec![
+                    head.to_owned(),
+                    format!("{continuation}1:T5,he"),
+                    "llo".to_owned(),
+                ],
+            ] {
+                let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
+                let expected = parts
+                    .concat()
+                    .replace("origin.example.com", "test.example.com");
+                for chunk_size in [16, 8192] {
+                    let payloads = flight_payloads(&mixed_output(&flight_html(&refs), chunk_size));
+                    assert_eq!(
+                        payloads.len(),
+                        parts.len(),
+                        "should retain payload boundaries"
+                    );
+                    assert_eq!(
+                        payloads.concat(),
+                        expected,
+                        "should preserve a GTM URL split after its scheme at every span site"
+                    );
+                }
+            }
+        }
+        let url = "http://www.googletagmanager.com/gtm.js?id=GTM-MIX1";
+        let record = format!("1:T{:x},{url}", url.len());
+        let split = record.len() - "MIX1".len();
+        let payloads = flight_payloads(&mixed_output(
+            &flight_html(&[&record[..split], &record[split..]]),
+            8192,
+        ));
+        let routed = "/integrations/google_tag_manager/gtm.js?id=GTM-MIX1";
+        assert_eq!(
+            payloads.concat(),
+            format!("1:T{:x},{routed}", routed.len()),
+            "should route a whole T-record URL whose query spans payload scripts"
+        );
     }
 
     #[test]

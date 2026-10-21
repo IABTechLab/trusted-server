@@ -925,10 +925,6 @@ async fn first_party_proxy_rebuild_is_routed() {
 /// Fastly adapter alone and not by this test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nextjs_auction_output_holds_until_the_structural_body_close() {
-    use std::sync::Arc;
-
-    use trusted_server_core::test_support::nextjs_auction;
-
     let client = Arc::new(nextjs_auction::NextJsAuctionOrigin::default());
     let router = TrustedServerApp::routes_with_settings_and_services(
         nextjs_auction::settings(),

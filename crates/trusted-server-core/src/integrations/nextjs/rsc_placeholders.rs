@@ -64,6 +64,14 @@ pub(super) struct NextJsRscPlaceholderRewriter {
     config: Arc<NextJsIntegrationConfig>,
 }
 
+/// Enter document-wide fallback once, without logging publisher-controlled source.
+fn bypass_document(state: &mut super::rsc_stream::NextJsDocumentState, reason: &'static str) {
+    if !state.bypass_rsc {
+        state.bypass_rsc = true;
+        log::warn!("Next.js RSC fallback: {reason}; remaining Flight payloads stay raw");
+    }
+}
+
 impl NextJsRscPlaceholderRewriter {
     pub(super) fn new(config: Arc<NextJsIntegrationConfig>) -> Self {
         Self { config }
@@ -137,7 +145,9 @@ impl NextJsRscPlaceholderRewriter {
                 // A raw qualified push cannot safely continue a pending T group
                 // or be skipped by later captures. A bare property reference is
                 // ordinary script text and must not disable later Flight capture.
-                state.bypass_rsc |= state.flight_node_owned;
+                if state.flight_node_owned {
+                    bypass_document(state, "unsupported qualified push");
+                }
                 return if was_buffered {
                     ScriptRewriteAction::replace(content.to_owned())
                 } else {
@@ -159,7 +169,7 @@ impl NextJsRscPlaceholderRewriter {
                 || state.captured_payloads.len() + ranges.len() >= MAX_UNRESOLVED_RSC_PAYLOADS
                 || total.is_none_or(|bytes| bytes > max_queued_payload_bytes)
             {
-                state.bypass_rsc = true;
+                bypass_document(state, "capture byte or payload limit");
                 return if was_buffered {
                     ScriptRewriteAction::replace(content.to_owned())
                 } else {
@@ -179,7 +189,7 @@ impl NextJsRscPlaceholderRewriter {
         // a header that has already streamed from an uncaptured push.
         unclaimed_raw_data |= contains_qualified_flight_data(&content[cursor..]);
         if unclaimed_raw_data {
-            state.bypass_rsc = true;
+            bypass_document(state, "uncaptured data head");
             state.current_fragment_protected = true;
             return if was_buffered {
                 ScriptRewriteAction::replace(content.to_owned())
@@ -246,7 +256,9 @@ impl NextJsRscPlaceholderRewriter {
             }
             FragmentCapture::Restore(restored) => {
                 state.rsc_receiver_trimmed = false;
-                state.bypass_rsc |= state.flight_node_owned;
+                if state.flight_node_owned {
+                    bypass_document(state, "script byte limit during capture");
+                }
                 ScriptRewriteAction::replace(restored)
             }
             FragmentCapture::PassThrough => {
@@ -256,6 +268,8 @@ impl NextJsRscPlaceholderRewriter {
                     return ScriptRewriteAction::Keep;
                 }
                 if is_last && content.len() > limit && content.contains("__next_f") {
+                    // Defensive path for direct callers supplying a complete final fragment.
+                    // lol_html normally delivers non-last text followed by an empty final fragment.
                     let code = state.rsc_lexical_start.clone().mask(content);
                     debug_assert_eq!(
                         code.len(),
@@ -302,11 +316,14 @@ impl NextJsRscPlaceholderRewriter {
                         // rows cannot leave a continuation in another script.
                         state.raw_data_seen = false;
                     }
-                    state.bypass_rsc |= unsafe_continuation
+                    if unsafe_continuation
                         || state.captured_payload_bytes > 0
-                        || !state.captured_payloads.is_empty();
+                        || !state.captured_payloads.is_empty()
+                    {
+                        bypass_document(state, "oversized script with unresolved Flight");
+                    }
                 } else if !is_last && content.len() > limit {
-                    state.bypass_rsc = true;
+                    bypass_document(state, "script byte limit");
                 }
                 ScriptRewriteAction::Keep
             }
@@ -400,25 +417,43 @@ impl NextJsRscPlaceholderRewriter {
             };
         }
 
-        let identifier_start = combined_code
-            .find("__next_f")
-            .expect("should find the identifier that selected this branch");
         let mut context = state.rsc_receiver_context.clone();
-        context.push_str(&combined_code[..identifier_start]);
-        if !receiver_context_is_flight_push(&context) {
-            // Some other object owns a `__next_f` property. Release the text
-            // unchanged rather than claiming an unrelated publisher script.
+        let mut searched = 0;
+        let identifier_start = combined_code
+            .match_indices("__next_f")
+            .find_map(|(start, _)| {
+                // Foreign references do not rule out a later qualified receiver.
+                // Advance a bounded context instead of rescanning each whole prefix.
+                remember_released(&mut context, &combined_code[searched..start]);
+                searched = start;
+                receiver_context_is_flight_push(&context).then_some(start)
+            });
+        let Some(identifier_start) = identifier_start else {
+            // A later qualified identifier can still straddle the next fragment,
+            // even when this fragment already contains a complete foreign one.
+            let probe_length = if ctx.is_last_in_text_node {
+                0
+            } else {
+                longest_identifier_prefix(combined_code.as_bytes())
+            };
+            let ready_length = combined.len() - probe_length;
+            state.rsc_probe.push_str(&combined[ready_length..]);
             if ctx.is_last_in_text_node {
                 state.rsc_receiver_context.clear();
             } else {
-                remember_released(&mut state.rsc_receiver_context, &combined_code);
+                remember_released(
+                    &mut state.rsc_receiver_context,
+                    &combined_code[..ready_length],
+                );
             }
-            return if prior_probe.is_empty() {
+            return if ready_length == 0 {
+                ScriptRewriteAction::RemoveNode
+            } else if prior_probe.is_empty() && probe_length == 0 {
                 ScriptRewriteAction::Keep
             } else {
-                ScriptRewriteAction::replace(combined)
+                ScriptRewriteAction::replace(&combined[..ready_length])
             };
-        }
+        };
 
         // A receiver that survives inside `combined` keeps the claim qualified;
         // one that already streamed leaves a trimmed claim whose receiver this
@@ -429,7 +464,14 @@ impl NextJsRscPlaceholderRewriter {
         let claimed_start = if state.rsc_receiver_trimmed {
             identifier_start
         } else {
-            0
+            // Do not put an earlier rejected receiver back into the capture:
+            // its disqualifying prefix may already have streamed.
+            let receiver_length = if combined_code[..identifier_start].ends_with("self.") {
+                "self.".len()
+            } else {
+                "window.".len()
+            };
+            identifier_start - receiver_length
         };
         let prefix = &combined[..claimed_start];
         let claimed = &combined[claimed_start..];
@@ -524,7 +566,9 @@ impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
                 &QUALIFIED_FLIGHT_PUSH_PATTERN,
                 '(',
             );
-            state.bypass_rsc |= state.raw_data_seen;
+            if state.raw_data_seen {
+                bypass_document(state, "opaque script with a raw data head");
+            }
             head_end
         } else {
             observe_flight_qualifier(
@@ -555,7 +599,7 @@ impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
                 super::rsc_stream::FragmentState::BypassUntilLast
             )
         {
-            state.bypass_rsc = true;
+            bypass_document(state, "qualified push after script overflow");
         }
         state.current_fragment_protected = state.flight_node_owned || state.raw_flight_seen;
         let action = self.rewrite_fragment(content, &code, lexical_start, ctx, state);
@@ -583,7 +627,9 @@ impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
         if ctx.is_last_in_text_node {
             // Raw data can continue a row in the next script. Keep the entire
             // remaining Flight stream raw, not merely this GTM snapshot.
-            state.bypass_rsc |= state.raw_data_seen || state.raw_data_unclaimed;
+            if state.raw_data_seen || state.raw_data_unclaimed {
+                bypass_document(state, "uncaptured data head");
+            }
             state.raw_data_seen = false;
             state.raw_data_unclaimed = false;
             state.raw_data_tail.clear();
@@ -606,6 +652,8 @@ impl IntegrationScriptRewriter for NextJsRscPlaceholderRewriter {
 /// The containing script is already bounded by the capture limit. `IgnoredAny`
 /// checks serialized Next.js form state without allocating its values; binary
 /// channel 3 is deliberately not accepted because it belongs to the row stream.
+/// Its document-wide fallback also restores queued payloads, but cannot undo
+/// rewrites of complete groups that have already streamed to the client.
 fn inert_flight_control_end(arguments: &str) -> Option<usize> {
     if let Some(control) = INERT_FLIGHT_CONTROL_ARGUMENTS.find(arguments) {
         return Some(control.end());
@@ -753,6 +801,70 @@ mod tests {
             rewrite_attributes: vec!["href".into(), "link".into(), "url".into()],
             max_combined_payload_bytes: 10 * 1024 * 1024,
         })
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    mod fallback_logging {
+        use super::*;
+        use std::cell::RefCell;
+
+        struct FallbackLogger;
+
+        static LOGGER: FallbackLogger = FallbackLogger;
+        thread_local! {
+            static MESSAGES: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+        }
+
+        impl log::Log for FallbackLogger {
+            fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+                metadata.level() == log::Level::Warn
+            }
+
+            fn log(&self, record: &log::Record<'_>) {
+                if self.enabled(record.metadata())
+                    && record.target()
+                        == "trusted_server_core::integrations::nextjs::rsc_placeholders"
+                {
+                    MESSAGES.with(|messages| {
+                        if let Some(messages) = messages.borrow_mut().as_mut() {
+                            messages.push(record.args().to_string());
+                        }
+                    });
+                }
+            }
+
+            fn flush(&self) {}
+        }
+
+        #[test]
+        fn document_fallback_warns_once_without_publisher_source() {
+            log::set_logger(&LOGGER).expect("should install the fallback test logger");
+            let previous_level = log::max_level();
+            log::set_max_level(log::LevelFilter::Warn);
+            MESSAGES.with(|messages| *messages.borrow_mut() = Some(Vec::new()));
+            let document = IntegrationDocumentState::default();
+            let rewriter = NextJsRscPlaceholderRewriter::new(test_config());
+            rewriter.rewrite(
+                r#"const private_text='self.__next_f.push([1, publisher-secret';"#,
+                &ctx(false, &document),
+            );
+            rewriter.rewrite("", &ctx(true, &document));
+            for _ in 0..2 {
+                rewriter.rewrite(
+                    r#"self.__next_f.push([1,"1:T3,abc"])"#,
+                    &ctx(true, &document),
+                );
+            }
+            let messages = MESSAGES
+                .with(|messages| messages.borrow_mut().take())
+                .expect("should capture this thread's fallback warning");
+            log::set_max_level(previous_level);
+            assert_eq!(
+                messages,
+                ["Next.js RSC fallback: uncaptured data head; remaining Flight payloads stay raw"],
+                "should log only the first transition and its fixed reason, never source text"
+            );
+        }
     }
 
     #[test]
