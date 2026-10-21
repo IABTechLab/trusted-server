@@ -6,7 +6,9 @@
 //! acquisition are unqualified and unauthenticated, so nothing here
 //! qualifies a release. The canonical build is gated (ELF policy, debug
 //! info, remap scan, planted operator values, clean startup); the
-//! reproduction build is a recorded measurement only.
+//! reproduction build is a recorded measurement only, and runs only when
+//! `TS_RELEASE_NATIVE_REPRODUCTION=measure` (otherwise the measurement
+//! records it as deferred to the scheduled run).
 
 use std::ffi::OsString;
 use std::fs;
@@ -18,11 +20,12 @@ use super::super::compare::read_artifact;
 use super::super::native::{check_operator_values_absent, measure_native_repeatability};
 use super::super::remap::scan_remapped_bytes;
 use super::super::startup::{LINUX_CLI_ASSET, NativeStartupAccepted, StartupCopy};
-use super::candidate::{CargoFixture, cargo_docker_settings};
+use super::candidate::{CargoFixture, cargo_docker_settings, ci_build_provenance};
 use super::candidate_entry::{check_real_entry, js_inventory_sha256};
 use super::cli_candidate::{
-    CliCandidateFacts, CliFixture, OPERATOR_SENTINELS, ReproductionOutcome, check_build_budget,
-    cli_candidate_measurement, finish_cleanup, new_startup_client, reproduction_result,
+    CliCandidateFacts, CliFixture, NativeReproduction, OPERATOR_SENTINELS, ReproductionOutcome,
+    check_build_budget, cli_candidate_measurement, finish_cleanup, native_reproduction_from_env,
+    new_startup_client, reproduction_result,
 };
 use super::full::try_proven_boundary;
 use super::real_fixture::{
@@ -242,7 +245,10 @@ fn start_everywhere(completed: &RecipeCompleted, cli: &CliFixture) -> NativeStar
 #[test]
 #[ignore = "requires explicit JS, Cargo and CLI ordinary CI fixtures and Linux Docker; run separately in producer CI"]
 fn linux_cli_candidate_builds_inspects_and_starts_cleanly() {
+    // Read before any build so a missing selection fails in seconds.
+    let native_reproduction = native_reproduction_from_env();
     let fixture = cargo_fixture();
+    let provenance = ci_build_provenance(&fixture);
     let (cli_root, cli) = cli_fixture();
     preflight_cli_builder(&fixture, &cli, &cli_root)
         .expect("should load the staged probe and Rust tools on glibc 2.34 before JS builds");
@@ -288,6 +294,7 @@ fn linux_cli_candidate_builds_inspects_and_starts_cleanly() {
     });
     let inventory_sha256 = js_inventory_sha256(&canonical.completed);
     canonical_measurement["js_inventory_sha256"] = serde_json::json!(inventory_sha256);
+    canonical_measurement["ci_build_provenance"] = provenance.clone();
     fs::write(
         cli_root.join("linux-cli-candidate-measurement.json"),
         serde_json::to_vec_pretty(&canonical_measurement)
@@ -295,22 +302,30 @@ fn linux_cli_candidate_builds_inspects_and_starts_cleanly() {
     )
     .expect("should retain accepted canonical evidence before optional reproduction");
     let canonical_candidate = check_real_candidate(&canonical.completed, &js.source);
-    let reproduction_build = build_cli(&inputs, Role::Reproduction);
+    let reproduction_build = match native_reproduction {
+        NativeReproduction::Measure => Some(build_cli(&inputs, Role::Reproduction)),
+        NativeReproduction::Defer => None,
+    };
     let reproduction_candidate = reproduction_build
         .as_ref()
-        .ok()
+        .and_then(|build| build.as_ref().ok())
         .map(|reproduction| check_real_candidate(&reproduction.completed, &js.source));
 
-    let (measured, invariant) = reproduction_result(
-        reproduction_build
-            .as_ref()
-            .map_err(|error| recipe_error(format!("{error:?}"))),
-        |reproduction| measure_native_repeatability(&canonical.completed, &reproduction.completed),
-    );
-    let reproduction = match &measured {
-        Ok(measured) => ReproductionOutcome::Measured(measured),
-        Err(error) if invariant.is_some() => ReproductionOutcome::InvariantFailed(error.clone()),
-        Err(error) => ReproductionOutcome::BuildFailed(error.clone()),
+    let paired = reproduction_build.as_ref().map(|build| {
+        reproduction_result(
+            build
+                .as_ref()
+                .map_err(|error| recipe_error(format!("{error:?}"))),
+            |reproduction| {
+                measure_native_repeatability(&canonical.completed, &reproduction.completed)
+            },
+        )
+    });
+    let reproduction = match &paired {
+        None => ReproductionOutcome::Deferred,
+        Some((Ok(measured), _)) => ReproductionOutcome::Measured(measured),
+        Some((Err(error), Some(_))) => ReproductionOutcome::InvariantFailed(error.clone()),
+        Some((Err(error), None)) => ReproductionOutcome::BuildFailed(error.clone()),
     };
     let mut measurement = cli_candidate_measurement(&CliCandidateFacts {
         canonical: &canonical.completed,
@@ -326,8 +341,9 @@ fn linux_cli_candidate_builds_inspects_and_starts_cleanly() {
     measurement["candidate_spdx"] =
         candidate_spdx_measurement(&canonical_candidate, reproduction_candidate.as_ref());
     measurement["js_inventory_sha256"] = serde_json::json!(inventory_sha256);
+    measurement["ci_build_provenance"] = provenance;
     retain_cli_measurement(&cli_root, &measurement);
-    if let Some(error) = invariant {
+    if let Some((_, Some(error))) = &paired {
         panic!("should pair builds over identical inputs: {error:?}");
     }
     measurement["candidate_entry"] = check_real_entry(
@@ -341,7 +357,7 @@ fn linux_cli_candidate_builds_inspects_and_starts_cleanly() {
         |build| &build.completed,
         &startup,
     );
-    if let Ok(reproduction) = reproduction_build {
+    if let Some(Ok(reproduction)) = reproduction_build {
         super::candidate::check_export_after_cleanup(reproduction, |build| &build.completed);
     }
 }

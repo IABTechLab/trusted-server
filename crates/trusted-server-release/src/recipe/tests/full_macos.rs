@@ -20,7 +20,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
-use super::candidate::{CargoFixture, FixtureHost, denial_measurement, reported_errno};
+use super::candidate::{
+    CargoFixture, FixtureHost, ci_build_provenance, denial_measurement, reported_errno,
+};
 use super::macos_candidate::darwin_cli_asset;
 use super::real_fixture::{ATTEMPTS, DenialCase, DenialSelection, bind_denial_case, cargo_fixture};
 use super::*;
@@ -196,6 +198,7 @@ fn cargo_children_inherit_denial_macos() {
     measurement["boundary"] = json!("macos-sandbox-exec");
     measurement["descendant_cleanup"] = json!(control.descendant_cleanup().to_string());
     measurement["apple_developer_tools"] = apple.measurement();
+    measurement["ci_build_provenance"] = ci_build_provenance(&fixture);
     let text = serde_json::to_string_pretty(&measurement).expect("should encode the measurement");
     println!("{text}");
     fs::write(fixture.root.join("cargo-denial-measurement.json"), text)

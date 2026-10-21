@@ -251,4 +251,28 @@ fn macos_measurement_states_unqualified_reaped_unauthenticated_evidence() {
     });
     assert_eq!(pending["startup"]["status"], "not-run");
     assert_eq!(pending["reproduction"]["status"], "not-attempted");
+
+    let deferred = macos_cli_candidate_measurement(&MacosCliCandidateFacts {
+        startup_stdout: Some("ts example\n"),
+        reproduction: ReproductionOutcome::Deferred,
+        canonical: &canonical,
+        macho: &macho,
+        apple: &apple,
+        host: &host,
+        js_handoff: &js_handoff,
+        remap_found: &[],
+        operator_values_removed: &removed,
+    });
+    assert_eq!(
+        deferred["reproduction"]["status"], "deferred-to-scheduled-run",
+        "should record a deferred reproduction explicitly"
+    );
+    assert_eq!(
+        deferred["reproduction"]["gate"], "measurement-only",
+        "should keep a deferred reproduction a measurement"
+    );
+    assert_eq!(
+        deferred["release_qualification"], false,
+        "should never claim release qualification when deferring"
+    );
 }

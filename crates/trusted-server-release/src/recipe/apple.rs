@@ -450,12 +450,34 @@ impl AppleDeveloperTools {
         deadline: Instant,
         cancellation: &Cancellation,
     ) -> Result<Self, Report<ReleaseError>> {
+        let selected = Self::stage_detached_sdk(facts, deadline, cancellation)?;
+        selected.verify()?;
+        Ok(selected)
+    }
+
+    /// Stages the detached SDK of an explicit test selection without the
+    /// trailing full verification.
+    ///
+    /// The recorded tools and SDK settings are verified before staging. Only
+    /// a caller that runs a full [`Self::verify`] next, such as
+    /// [`Self::measure_selected_developer`] through
+    /// [`Self::with_measured_toolchain_for_tests`], may skip the trailing
+    /// pass; every other caller uses [`Self::with_detached_sdk_for_tests`].
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid source facts, unsafe trees, changes, cancellation or expiration.
+    #[cfg(test)]
+    fn stage_detached_sdk(
+        facts: AppleToolFacts,
+        deadline: Instant,
+        cancellation: &Cancellation,
+    ) -> Result<Self, Report<ReleaseError>> {
         let mut selected = Self::from_facts_for_tests(facts)?;
         selected.verify()?;
         let sdk = OwnedSdk::stage(&selected.facts.sdk_root, deadline, cancellation)?;
         plain_path("owned Apple SDK root", sdk.root())?;
         selected.sdk = Some(Arc::new(sdk));
-        selected.verify()?;
         Ok(selected)
     }
 
@@ -519,7 +541,10 @@ impl AppleDeveloperTools {
             xcode_version,
             sdk_version,
         };
-        Self::with_detached_sdk_for_tests(facts, deadline, cancellation)?
+        // The toolchain measurement ends with a full verification that
+        // rehashes the staged SDK as well, so staging skips its own trailing
+        // pass over the same tree.
+        Self::stage_detached_sdk(facts, deadline, cancellation)?
             .with_measured_toolchain_for_tests(deadline, cancellation)
     }
 

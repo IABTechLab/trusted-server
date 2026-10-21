@@ -7,7 +7,9 @@
 //! macOS sandbox only reaps descendants after each run. The canonical build
 //! is gated (Mach-O acceptance in completion, the debug map and measured
 //! SDK, the remap and final-path scans, planted operator values, native
-//! startup); the reproduction build is a recorded measurement only.
+//! startup); the reproduction build is a recorded measurement only, and
+//! runs only when `TS_RELEASE_NATIVE_REPRODUCTION=measure` (otherwise the
+//! measurement records it as deferred to the scheduled run).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,11 +20,11 @@ use super::super::native::{check_operator_values_absent, measure_native_repeatab
 use super::super::remap::scan_remapped_bytes;
 use super::super::startup::native::{NativeStartupLayout, measure_host_identity};
 use super::super::startup::{NativeStartupAccepted, StartupCopy};
-use super::candidate::CargoFixture;
+use super::candidate::{CargoFixture, ci_build_provenance};
 use super::candidate_entry::{check_real_entry, js_inventory_sha256};
 use super::cli_candidate::{
-    OPERATOR_SENTINELS, ReproductionOutcome, check_build_budget, finish_cleanup,
-    reproduction_result,
+    NativeReproduction, OPERATOR_SENTINELS, ReproductionOutcome, check_build_budget,
+    finish_cleanup, native_reproduction_from_env, reproduction_result,
 };
 use super::full_macos::{
     darwin_target_dir, job_host_asset, macos_cargo_fixture, remove_target_dir, try_proven_sandbox,
@@ -233,10 +235,12 @@ fn retain_measurement(
     fixture: &CargoFixture,
     facts: &MacosCliCandidateFacts<'_>,
     candidate_spdx: serde_json::Value,
+    provenance: &serde_json::Value,
 ) -> serde_json::Value {
     let mut measurement = macos_cli_candidate_measurement(facts);
     measurement["candidate_spdx"] = candidate_spdx;
     measurement["js_inventory_sha256"] = serde_json::json!(js_inventory_sha256(facts.canonical));
+    measurement["ci_build_provenance"] = provenance.clone();
     write_measurement(fixture, &measurement);
     measurement
 }
@@ -252,9 +256,12 @@ fn write_measurement(fixture: &CargoFixture, measurement: &serde_json::Value) {
 #[test]
 #[ignore = "requires the explicit macOS Cargo fixture, the exported Linux JS handoff, Xcode and a native macOS 15 runner; run separately in producer CI"]
 fn macos_cli_candidate_builds_inspects_and_starts_cleanly() {
+    // Read before measuring Xcode so a missing selection fails in seconds.
+    let native_reproduction = native_reproduction_from_env();
     let asset = job_host_asset();
     let target = asset.artifact().target;
     let fixture = macos_cargo_fixture();
+    let provenance = ci_build_provenance(&fixture);
     let commit = CommitId::parse(&fixture.source_commit).expect("should parse the fixture commit");
     let source = authenticate(
         &fixture.root.join("source"),
@@ -339,31 +346,41 @@ fn macos_cli_candidate_builds_inspects_and_starts_cleanly() {
         &fixture,
         &facts(ReproductionOutcome::NotAttempted),
         serde_json::Value::Null,
+        &provenance,
     );
     let canonical_candidate = check_real_candidate(&canonical.completed, &source);
 
-    let reproduction_build = build_macos_cli(&inputs, Role::Reproduction);
+    let reproduction_build = match native_reproduction {
+        NativeReproduction::Measure => Some(build_macos_cli(&inputs, Role::Reproduction)),
+        NativeReproduction::Defer => None,
+    };
     let reproduction_candidate = reproduction_build
         .as_ref()
-        .ok()
+        .and_then(|build| build.as_ref().ok())
         .map(|reproduction| check_real_candidate(&reproduction.completed, &source));
-    let (measured, invariant) = reproduction_result(
-        reproduction_build
-            .as_ref()
-            .map_err(|error| recipe_error(format!("{error:?}"))),
-        |reproduction| measure_native_repeatability(&canonical.completed, &reproduction.completed),
-    );
-    let reproduction = match &measured {
-        Ok(measured) => ReproductionOutcome::Measured(measured),
-        Err(error) if invariant.is_some() => ReproductionOutcome::InvariantFailed(error.clone()),
-        Err(error) => ReproductionOutcome::BuildFailed(error.clone()),
+    let paired = reproduction_build.as_ref().map(|build| {
+        reproduction_result(
+            build
+                .as_ref()
+                .map_err(|error| recipe_error(format!("{error:?}"))),
+            |reproduction| {
+                measure_native_repeatability(&canonical.completed, &reproduction.completed)
+            },
+        )
+    });
+    let reproduction = match &paired {
+        None => ReproductionOutcome::Deferred,
+        Some((Ok(measured), _)) => ReproductionOutcome::Measured(measured),
+        Some((Err(error), Some(_))) => ReproductionOutcome::InvariantFailed(error.clone()),
+        Some((Err(error), None)) => ReproductionOutcome::BuildFailed(error.clone()),
     };
     let mut measurement = retain_measurement(
         &fixture,
         &facts(reproduction),
         candidate_spdx_measurement(&canonical_candidate, reproduction_candidate.as_ref()),
+        &provenance,
     );
-    if let Some(error) = invariant {
+    if let Some((_, Some(error))) = &paired {
         panic!("should pair builds over identical inputs: {error:?}");
     }
     measurement["candidate_entry"] = check_real_entry(
@@ -377,7 +394,7 @@ fn macos_cli_candidate_builds_inspects_and_starts_cleanly() {
         |build| &build.completed,
         &startup,
     );
-    if let Ok(reproduction) = reproduction_build {
+    if let Some(Ok(reproduction)) = reproduction_build {
         super::candidate::check_export_after_cleanup(reproduction, |build| &build.completed);
     }
 }

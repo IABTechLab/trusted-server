@@ -107,15 +107,31 @@ impl PreparedRecipe {
     /// # Errors
     ///
     /// Returns [`ReleaseError::Recipe`] when anything under the tool root was
-    /// edited, linked, added or removed, or an Apple tool or the SDK settings
-    /// changed.
+    /// edited, linked, added or removed, or an Apple tool, the SDK settings,
+    /// the detached SDK or the measured toolchain changed.
     pub(super) fn check_tools(&self) -> Result<(), Report<ReleaseError>> {
-        if self.tools.digest()? != self.tools_digest {
-            return Err(recipe_error("Rust tools changed after binding"));
-        }
+        self.check_rust_tools()?;
         self.tools
             .apple()
             .map_or(Ok(()), super::apple::AppleDeveloperTools::verify)
+    }
+
+    /// Requires the Rust tools to be the tree measured at binding.
+    ///
+    /// Unlike [`Self::check_tools`] this never rehashes the Apple developer
+    /// tools. Callers use it only where a full [`Self::check_inputs`]
+    /// brackets the same step: before the run (followed by the pre-run
+    /// inputs check) and at completion (preceded by the post-run one).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReleaseError::Recipe`] when anything under the tool root was
+    /// edited, linked, added or removed.
+    pub(super) fn check_rust_tools(&self) -> Result<(), Report<ReleaseError>> {
+        if self.tools.digest()? != self.tools_digest {
+            return Err(recipe_error("Rust tools changed after binding"));
+        }
+        Ok(())
     }
 
     /// Requires the prepared materials to be unchanged.
@@ -179,17 +195,22 @@ impl PreparedRecipe {
     /// Requires unchanged inputs, a derivable plan, the exact planned roots
     /// and a descendant cleanup the selection accepts; returns that cleanup.
     ///
+    /// Only the Rust tools are rehashed here. The Apple developer tools are
+    /// rehashed by the full [`Self::check_inputs`] that [`Self::execute`]
+    /// runs next, with only pure plan and command derivation in between, so
+    /// a pass here would hash the same SDK and toolchain twice.
+    ///
     /// # Errors
     ///
-    /// Returns [`ReleaseError::Recipe`] when the tools or materials changed,
-    /// the plan cannot be derived in the boundary's namespace, the boundary
-    /// roots differ from [`Self::boundary_roots`], or [`cleanup_gate`]
-    /// rejects the boundary's descendant cleanup.
+    /// Returns [`ReleaseError::Recipe`] when the Rust tools or materials
+    /// changed, the plan cannot be derived in the boundary's namespace, the
+    /// boundary roots differ from [`Self::boundary_roots`], or
+    /// [`cleanup_gate`] rejects the boundary's descendant cleanup.
     fn check_boundary(
         &self,
         boundary: &Boundary,
     ) -> Result<DescendantCleanup, Report<ReleaseError>> {
-        self.check_tools()?;
+        self.check_rust_tools()?;
         self.check_materials()?;
         self.plan(boundary)?;
         if !boundary.matches_roots(&self.boundary_roots()?) {
@@ -336,9 +357,14 @@ impl PreparedRecipe {
     /// [`inspect_copied`]). Every target must also exclude all bound host and
     /// execution roots and contain a fixed remapped prefix.
     ///
+    /// Only the Rust tools are rehashed here, since the receipt binds their
+    /// digest. [`Self::execute`] already rehashed the Apple developer tools
+    /// in its post-run [`Self::check_inputs`], with only in-process checks
+    /// in between, and platform evidence rechecks them when it seals.
+    ///
     /// # Errors
     ///
-    /// Returns [`ReleaseError::Recipe`] when the tools or materials changed,
+    /// Returns [`ReleaseError::Recipe`] when the Rust tools or materials changed,
     /// the stream is not exactly one fresh debug-info binary, or the
     /// executable cannot be copied or rehashed, a bound path remains, no fixed
     /// remapped prefix exists, or [`ReleaseError::Inspect`] when the
@@ -349,7 +375,7 @@ impl PreparedRecipe {
         boundary_fingerprint: [u8; 32],
         paths: &dyn ExecutionPaths,
     ) -> Result<RecipeCompleted, Report<ReleaseError>> {
-        self.check_tools()?;
+        self.check_rust_tools()?;
         self.check_materials()?;
         let plan_digest = ExactInvocationDigest::from_plan(&self.plan(paths)?)?;
         let artifact = self.request.asset.artifact();

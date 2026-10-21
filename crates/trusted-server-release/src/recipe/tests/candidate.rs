@@ -10,6 +10,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::{Map, Value, json};
+use sha2::{Digest as _, Sha256};
 
 use super::super::ambient::Dimension;
 use super::super::compare::FastlyEqualityChecked;
@@ -591,6 +592,49 @@ pub(super) fn equality_measurement(
     })
 }
 
+/// Names the dependency build cache the CI job restored, or `miss`.
+const CI_BUILD_CACHE_VARIABLE: &str = "TS_RELEASE_CI_BUILD_CACHE";
+/// What the provenance records when the job reported no cache outcome.
+const UNREPORTED_BUILD_CACHE: &str = "unreported";
+
+/// How this run's producer probe and test binary were built, as ordinary CI
+/// evidence only.
+///
+/// CI jobs may restore third-party dependency artifacts written by an
+/// earlier main-branch run, which then link into the staged probe and this
+/// test binary. Recording both digests and the restored cache key makes that
+/// trust root auditable. A cache never makes the run release qualification:
+/// every measurement carrying this still states `release_qualification:
+/// false`.
+///
+/// # Panics
+///
+/// Panics when the staged probe or the running test binary cannot be read,
+/// or the cache variable is not UTF-8.
+pub(super) fn ci_build_provenance(fixture: &CargoFixture) -> Value {
+    let probe = std::fs::read(fixture.probe()).expect("should read the staged producer probe");
+    let test_binary = std::env::current_exe()
+        .and_then(std::fs::read)
+        .expect("should read the running test binary");
+    let cache = std::env::var_os(CI_BUILD_CACHE_VARIABLE).map(|value| {
+        value
+            .into_string()
+            .expect("should name the CI build cache in UTF-8")
+    });
+    build_provenance(&probe, &test_binary, cache.as_deref())
+}
+
+/// The provenance of explicit probe and test binary bytes and cache outcome.
+fn build_provenance(probe: &[u8], test_binary: &[u8], cache: Option<&str>) -> Value {
+    json!({
+        "producer_probe_sha256": hex::encode(Sha256::digest(probe)),
+        "test_binary_sha256": hex::encode(Sha256::digest(test_binary)),
+        "build_cache": cache
+            .filter(|cache| !cache.is_empty())
+            .unwrap_or(UNREPORTED_BUILD_CACHE),
+    })
+}
+
 /// The ordinary CI measurement of the Cargo denial fixture.
 pub(super) fn denial_measurement(
     proof_errno: i32,
@@ -771,6 +815,39 @@ fn cargo_container_settings_are_explicit_and_fit_the_runner() {
         2,
         "should never exceed host parallelism"
     );
+}
+
+#[test]
+fn build_provenance_records_digests_and_an_explicit_cache_outcome() {
+    let probe = b"fictional probe bytes";
+    let test_binary = b"fictional test binary bytes";
+    let restored = build_provenance(probe, test_binary, Some("release-tool-example-key"));
+    assert_eq!(
+        restored["producer_probe_sha256"],
+        hex::encode(Sha256::digest(probe)),
+        "should hash the exact probe bytes"
+    );
+    assert_eq!(
+        restored["test_binary_sha256"],
+        hex::encode(Sha256::digest(test_binary)),
+        "should hash the exact test binary bytes"
+    );
+    assert_eq!(
+        restored["build_cache"], "release-tool-example-key",
+        "should record the restored cache key"
+    );
+    assert_eq!(
+        build_provenance(probe, test_binary, Some("miss"))["build_cache"],
+        "miss",
+        "should record a reported miss"
+    );
+    for absent in [None, Some("")] {
+        assert_eq!(
+            build_provenance(probe, test_binary, absent)["build_cache"],
+            "unreported",
+            "should record an unreported cache rather than omit it"
+        );
+    }
 }
 
 #[test]

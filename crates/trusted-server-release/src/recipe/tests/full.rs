@@ -17,8 +17,8 @@ use super::super::runtime::{
     accept_fastly_runtime, run_gate,
 };
 use super::candidate::{
-    CargoFixture, SCHEMA_VERSION, cargo_docker_settings, cargo_measurement, denial_measurement,
-    equality_measurement, reported_errno,
+    CargoFixture, SCHEMA_VERSION, cargo_docker_settings, cargo_measurement, ci_build_provenance,
+    denial_measurement, equality_measurement, reported_errno,
 };
 use super::candidate_entry::{check_real_entry, js_inventory_sha256};
 use super::real_fixture::{
@@ -154,11 +154,12 @@ fn cargo_children_inherit_denial() {
         "denial-control.wasm",
         "should copy the control under its asset name"
     );
-    let measurement = denial_measurement(
+    let mut measurement = denial_measurement(
         proof_errno.expect("should observe every attempt"),
         &observed,
         &control,
     );
+    measurement["ci_build_provenance"] = ci_build_provenance(&fixture);
     let text = serde_json::to_string_pretty(&measurement).expect("should encode the measurement");
     println!("{text}");
     fs::write(fixture.root.join("cargo-denial-measurement.json"), text)
@@ -438,6 +439,7 @@ fn fastly_canonical_and_reproduction_builds_are_byte_identical() {
         candidate_spdx_measurement(&canonical_candidate, Some(&reproduction_candidate));
     measurement["js_inventory_sha256"] =
         serde_json::json!(js_inventory_sha256(&canonical.completed));
+    measurement["ci_build_provenance"] = ci_build_provenance(&fixture);
     retain_equality_measurement(&fixture, &measurement);
     let [canonical_runtime, reproduction_runtime] = run_runtime_gate(&RuntimeGateInputs {
         fixture: &fixture,

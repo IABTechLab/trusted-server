@@ -193,10 +193,90 @@ fn startup_measurement(runs: &[StartupObserved]) -> Value {
         .collect()
 }
 
+/// Selects whether a native CLI candidate job measures its reproduction build.
+///
+/// The ordinary CI workflow always sets it: `measure` on scheduled and
+/// dispatched runs (and on a labelled pull request), `defer` otherwise.
+pub(super) const NATIVE_REPRODUCTION_VARIABLE: &str = "TS_RELEASE_NATIVE_REPRODUCTION";
+/// The GitHub Actions variable naming the event that started the run.
+const GITHUB_EVENT_VARIABLE: &str = "GITHUB_EVENT_NAME";
+/// Events whose run exists to measure native reproduction, so may not defer it.
+const MEASURING_EVENTS: [&str; 2] = ["schedule", "workflow_dispatch"];
+
+/// Whether a native CLI candidate job builds and measures its reproduction.
+///
+/// The reproduction is a measurement, never a gate, for the native CLI
+/// candidates only; the Fastly equality step never reads this selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum NativeReproduction {
+    /// Build the reproduction and record how it compares.
+    Measure,
+    /// Skip the reproduction build and record that a scheduled run measures it.
+    Defer,
+}
+
+/// Parses the native reproduction selection and the GitHub event name.
+///
+/// # Errors
+///
+/// Returns a message for a missing or unknown selection (only the exact
+/// lowercase `measure` and `defer` are accepted), or for `defer` on a
+/// scheduled or dispatched run, which exists to measure the reproduction.
+pub(super) fn parse_native_reproduction(
+    value: Option<&str>,
+    event: Option<&str>,
+) -> Result<NativeReproduction, String> {
+    let selected = match value {
+        Some("measure") => NativeReproduction::Measure,
+        Some("defer") => NativeReproduction::Defer,
+        Some(other) => {
+            return Err(format!(
+                "{NATIVE_REPRODUCTION_VARIABLE} must be `measure` or `defer`, not {other:?}"
+            ));
+        }
+        None => {
+            return Err(format!(
+                "{NATIVE_REPRODUCTION_VARIABLE} must be set to `measure` or `defer`"
+            ));
+        }
+    };
+    if selected == NativeReproduction::Defer
+        && let Some(event) = event.filter(|event| MEASURING_EVENTS.contains(event))
+    {
+        return Err(format!(
+            "{NATIVE_REPRODUCTION_VARIABLE}=defer is not allowed on a {event} run, which exists to measure native reproduction"
+        ));
+    }
+    Ok(selected)
+}
+
+/// Reads the native reproduction selection from the test environment.
+///
+/// # Panics
+///
+/// Panics when [`parse_native_reproduction`] rejects the selection or either
+/// variable is not UTF-8, so a misconfigured job fails before any build.
+pub(super) fn native_reproduction_from_env() -> NativeReproduction {
+    let read = |name: &str| {
+        std::env::var_os(name).map(|value| {
+            value
+                .into_string()
+                .unwrap_or_else(|_| panic!("should name {name} in UTF-8"))
+        })
+    };
+    let value = read(NATIVE_REPRODUCTION_VARIABLE);
+    let event = read(GITHUB_EVENT_VARIABLE);
+    parse_native_reproduction(value.as_deref(), event.as_deref()).unwrap_or_else(|error| {
+        panic!("should select the native reproduction mode explicitly: {error}")
+    })
+}
+
 /// What the optional reproduction build produced.
 pub(super) enum ReproductionOutcome<'a> {
     /// Canonical evidence is retained before the optional build starts.
     NotAttempted,
+    /// The job selected `defer`; a scheduled or dispatched run measures it.
+    Deferred,
     /// A completed pair violated its input invariants.
     InvariantFailed(String),
     /// Both builds completed and were compared.
@@ -211,6 +291,12 @@ pub(super) fn reproduction_measurement(outcome: &ReproductionOutcome<'_>) -> Val
         ReproductionOutcome::NotAttempted => {
             json!({"status": "not-attempted", "gate": "measurement-only"})
         }
+        ReproductionOutcome::Deferred => json!({
+            "status": "deferred-to-scheduled-run",
+            "gate": "measurement-only",
+            "selector": format!("{NATIVE_REPRODUCTION_VARIABLE}=defer"),
+            "measured_by": "scheduled/dispatched Run Tests on main",
+        }),
         ReproductionOutcome::InvariantFailed(error) => {
             json!({"status": "invariant-failed", "error": error, "gate": "fatal-input-invariant"})
         }
@@ -476,6 +562,71 @@ fn optional_reproduction_setup_failure_preserves_canonical_evidence() {
     canonical
         .rehash_for_handoff()
         .expect("should preserve the accepted canonical bytes");
+}
+
+#[test]
+fn native_reproduction_selection_accepts_only_exact_modes() {
+    for (value, event, expected) in [
+        ("measure", None, NativeReproduction::Measure),
+        ("defer", None, NativeReproduction::Defer),
+        ("defer", Some("push"), NativeReproduction::Defer),
+        ("defer", Some("pull_request"), NativeReproduction::Defer),
+        ("measure", Some("schedule"), NativeReproduction::Measure),
+        (
+            "measure",
+            Some("workflow_dispatch"),
+            NativeReproduction::Measure,
+        ),
+    ] {
+        assert_eq!(
+            parse_native_reproduction(Some(value), event),
+            Ok(expected),
+            "should accept {value:?} on event {event:?}"
+        );
+    }
+    for value in [
+        None,
+        Some(""),
+        Some("MEASURE"),
+        Some("skip"),
+        Some(" defer"),
+    ] {
+        let error = parse_native_reproduction(value, Some("push"))
+            .expect_err("should reject a missing or unknown mode");
+        assert!(
+            error.contains(NATIVE_REPRODUCTION_VARIABLE),
+            "should name the selection variable: {error}"
+        );
+    }
+}
+
+#[test]
+fn native_reproduction_cannot_be_deferred_by_a_measuring_run() {
+    for event in MEASURING_EVENTS {
+        let error = parse_native_reproduction(Some("defer"), Some(event))
+            .expect_err("should refuse to defer on a scheduled or dispatched run");
+        assert!(
+            error.contains(event),
+            "should name the measuring event: {error}"
+        );
+    }
+}
+
+#[test]
+fn deferred_reproduction_is_recorded_explicitly() {
+    let recorded = reproduction_measurement(&ReproductionOutcome::Deferred);
+    assert_eq!(
+        recorded["status"], "deferred-to-scheduled-run",
+        "should state the deferral rather than omit the reproduction"
+    );
+    assert_eq!(
+        recorded["gate"], "measurement-only",
+        "should keep the reproduction a measurement"
+    );
+    assert_eq!(
+        recorded["selector"], "TS_RELEASE_NATIVE_REPRODUCTION=defer",
+        "should name the selection that deferred it"
+    );
 }
 
 #[test]

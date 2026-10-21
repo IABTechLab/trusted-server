@@ -7,6 +7,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The scheduled and dispatched runs measure the native CLI reproduction
+  # builds that push and pull request runs defer (TS_RELEASE_NATIVE_REPRODUCTION).
+  schedule:
+    - cron: '23 4 * * *'
+  workflow_dispatch:
 
 jobs:
   test-rust:
@@ -409,6 +414,24 @@ jobs:
           test -n "$HOST_TARGET"
           echo "HOST_TARGET=$HOST_TARGET" >> "$GITHUB_ENV"
 
+      # Restores the host release-tool build (third-party rlibs; Cargo still
+      # rebuilds trusted-server-release from the checkout). This calls
+      # actions/cache directly, not ./.github/actions/setup-rust, which the
+      # format.yml guard requires for Rust caching elsewhere: these jobs
+      # install the pinned toolchain with rustup on purpose, and setup-rust
+      # would export RUSTFLAGS and other environment into the release tool.
+      # The guard only rejects setup-rust-toolchain and rust-cache steps.
+      # Only main saves (below), so a pull request restores only main's
+      # entry, never another pull request's. ~/.cargo/registry is never
+      # cached. A restored build stays ordinary CI evidence only: every
+      # measurement records `release_qualification: false` and the key.
+      - name: Restore the release-tool host build cache
+        id: release-tool-cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0 (Node 24)
+        with:
+          path: target
+          key: release-tool-${{ runner.os }}-${{ env.HOST_TARGET }}-rust-${{ steps.tools.outputs.rust }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.tool-versions', 'crates/trusted-server-release/Cargo.toml') }}-test-o${{ env.CARGO_PROFILE_TEST_OPT_LEVEL }}-da${{ env.CARGO_PROFILE_TEST_DEBUG_ASSERTIONS }}-oc${{ env.CARGO_PROFILE_TEST_OVERFLOW_CHECKS }}
+
       # Same pinned source install as the other Viceroy jobs, but uncached and
       # into a private root: the runtime gate selects this exact absolute path,
       # checks its reported version and records its digest.
@@ -429,6 +452,8 @@ jobs:
         run: |
           set -euo pipefail
           cargo build -p trusted-server-release --target "$HOST_TARGET" --locked
+          # Build the test binary now so the cache below holds its dependencies.
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --locked --no-run
           PRODUCER="target/$HOST_TARGET/debug/trusted-server-release"
           JS_FIXTURE_ROOT="$RUNNER_TEMP/release-js-original-fixture"
           CARGO_FIXTURE_ROOT="$RUNNER_TEMP/release-cargo-fixture"
@@ -438,7 +463,24 @@ jobs:
           echo "TS_RELEASE_CARGO_FIXTURE_ROOT=$CARGO_FIXTURE_ROOT" >> "$GITHUB_ENV"
           df -h "$RUNNER_TEMP"
 
+      # Saved before any ignored fixture test runs, so no fixture output can
+      # enter the cache. The Linux CLI and JS handoff jobs restore this same
+      # key without saving it.
+      - name: Drop incremental state before saving the host build cache
+        if: github.ref == 'refs/heads/main' && steps.release-tool-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: rm -rf target/debug/incremental target/*/debug/incremental
+
+      - name: Save the release-tool host build cache (main only)
+        if: github.ref == 'refs/heads/main' && steps.release-tool-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0 (Node 24)
+        with:
+          path: target
+          key: ${{ steps.release-tool-cache.outputs.cache-primary-key }}
+
       - name: Prove Cargo build scripts and proc macros inherit denial (Linux)
+        env:
+          TS_RELEASE_CI_BUILD_CACHE: ${{ steps.release-tool-cache.outputs.cache-matched-key || 'miss' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -457,6 +499,8 @@ jobs:
       # byte-identical. Both outputs then pass the final-byte Viceroy runtime
       # gate, and a closed-origin run must be rejected despite a healthy probe.
       - name: Build canonical and reproduction Fastly from one JS handoff, compare final bytes and run the Viceroy gate (Linux)
+        env:
+          TS_RELEASE_CI_BUILD_CACHE: ${{ steps.release-tool-cache.outputs.cache-matched-key || 'miss' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -475,15 +519,20 @@ jobs:
     runs-on: ubuntu-24.04
     # Fixture preparation (~6 min, including the UBI 9 builder image and the
     # three startup image pulls), two fresh JS builds (~12 min), then the
-    # canonical and the measured reproduction confined CLI builds (~10-15 min
-    # each, about twice the Fastly dependency closure plus C code) and three
-    # clean-container startups.
+    # canonical and, when measured, the reproduction confined CLI builds
+    # (~10-15 min each, about twice the Fastly dependency closure plus C
+    # code) and three clean-container startups.
     timeout-minutes: 75
     env:
       # Optimize repeated whole-input hashes with test safety checks retained.
       CARGO_PROFILE_TEST_OPT_LEVEL: '2'
       CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: 'true'
       CARGO_PROFILE_TEST_OVERFLOW_CHECKS: 'true'
+      # The reproduction build is a measurement, never a gate. Scheduled and
+      # dispatched runs (and pull requests labelled before the push) measure
+      # it; every other run records it as deferred. The test rejects a
+      # missing value and `defer` on a scheduled or dispatched run.
+      TS_RELEASE_NATIVE_REPRODUCTION: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'release-native-reproduction')) && 'measure' || 'defer' }}
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0 (Node 24)
         with:
@@ -526,11 +575,23 @@ jobs:
           test "$HOST_TARGET" = x86_64-unknown-linux-gnu
           echo "HOST_TARGET=$HOST_TARGET" >> "$GITHUB_ENV"
 
+      # Restore only: the Cargo candidate job saves this key (see its comment
+      # for why this is actions/cache and what the cache may and may not
+      # hold). The fixture probes here come from the uncached in-container
+      # bootstrap below; only the host test binary uses the restored build.
+      - name: Restore the release-tool host build cache
+        id: release-tool-cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0 (Node 24)
+        with:
+          path: target
+          key: release-tool-${{ runner.os }}-${{ env.HOST_TARGET }}-rust-${{ steps.tools.outputs.rust }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.tool-versions', 'crates/trusted-server-release/Cargo.toml') }}-test-o${{ env.CARGO_PROFILE_TEST_OPT_LEVEL }}-da${{ env.CARGO_PROFILE_TEST_DEBUG_ASSERTIONS }}-oc${{ env.CARGO_PROFILE_TEST_OVERFLOW_CHECKS }}
+
       - name: Prepare ordinary CI JS, Cargo and CLI fixtures
         shell: bash
         run: |
           set -euo pipefail
           cargo build -p trusted-server-release --target "$HOST_TARGET" --locked
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --locked --no-run
           PRODUCER="target/$HOST_TARGET/debug/trusted-server-release"
           JS_FIXTURE_ROOT="$RUNNER_TEMP/release-js-original-fixture"
           CARGO_FIXTURE_ROOT="$RUNNER_TEMP/release-cargo-fixture"
@@ -611,11 +672,15 @@ jobs:
       # The canonical build is gated: glibc 2.34 ELF policy with retained
       # debug info, the remap scan, planted operator values absent and
       # `ts --version` in clean UBI 9, Ubuntu 22.04 and Debian 12 containers.
-      # The reproduction build is recorded, never a gate.
-      - name: Build, inspect and start the Linux ts candidate and measure its reproduction (Linux)
+      # The reproduction build is recorded, never a gate, and only built when
+      # TS_RELEASE_NATIVE_REPRODUCTION is `measure`.
+      - name: Build, inspect and start the Linux ts candidate; reproduction per TS_RELEASE_NATIVE_REPRODUCTION (Linux)
+        env:
+          TS_RELEASE_CI_BUILD_CACHE: ${{ steps.release-tool-cache.outputs.cache-matched-key || 'miss' }}
         shell: bash
         run: |
           set -euo pipefail
+          echo "Native reproduction: $TS_RELEASE_NATIVE_REPRODUCTION (event ${GITHUB_EVENT_NAME})"
           TEST_NAME=recipe::tests::cli::linux_cli_candidate_builds_inspects_and_starts_cleanly
           TEST_LIST="$(mktemp)"
           trap 'rm -f "$TEST_LIST"' EXIT
@@ -636,6 +701,19 @@ jobs:
               fi
             done
           fi
+
+      # Measured runs keep the reproduction measurement as an artifact so
+      # reports can cite it, not only the job log.
+      - name: Upload the measured Linux CLI candidate measurement
+        if: ${{ !cancelled() && env.TS_RELEASE_NATIVE_REPRODUCTION == 'measure' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0 (Node 24)
+        with:
+          name: linux-cli-candidate-measurement
+          path: ${{ env.TS_RELEASE_CLI_FIXTURE_ROOT }}/linux-cli-candidate-measurement.json
+          if-no-files-found: warn
+          retention-days: 90
+          # A re-run of this job replaces its own earlier upload.
+          overwrite: true
 
   # Decides whether the macOS candidate jobs and their Linux JS handoff run.
   # It fails open: any error, a new branch or an unknown event selects them.
@@ -739,11 +817,22 @@ jobs:
           test "$HOST_TARGET" = x86_64-unknown-linux-gnu
           echo "HOST_TARGET=$HOST_TARGET" >> "$GITHUB_ENV"
 
+      # Restore only: the Cargo candidate job saves this key (see its comment
+      # for why this is actions/cache and what the cache may and may not
+      # hold). The Wasm target it also installs does not change host output.
+      - name: Restore the release-tool host build cache
+        id: release-tool-cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0 (Node 24)
+        with:
+          path: target
+          key: release-tool-${{ runner.os }}-${{ env.HOST_TARGET }}-rust-${{ steps.tools.outputs.rust }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.tool-versions', 'crates/trusted-server-release/Cargo.toml') }}-test-o${{ env.CARGO_PROFILE_TEST_OPT_LEVEL }}-da${{ env.CARGO_PROFILE_TEST_DEBUG_ASSERTIONS }}-oc${{ env.CARGO_PROFILE_TEST_OVERFLOW_CHECKS }}
+
       - name: Prepare original-only full JS fixture
         shell: bash
         run: |
           set -euo pipefail
           cargo build -p trusted-server-release --target "$HOST_TARGET" --locked
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --locked --no-run
           FIXTURE_ROOT="$RUNNER_TEMP/release-js-original-fixture"
           EXPORT_ROOT="$RUNNER_TEMP/release-js-handoff"
           test ! -e "$EXPORT_ROOT"
@@ -790,16 +879,22 @@ jobs:
         os: [macos-15, macos-15-intel]
     runs-on: ${{ matrix.os }}
     # Setup, fixtures and the producer build (~16 min), four denial builds
-    # (~10 min), then the canonical and the measured reproduction confined CLI
-    # builds and one native startup. On macos-15-intel the canonical build
-    # alone measured 24 min and the two-job reproduction is slower, so a
-    # 90-minute limit cancelled run 39529002302 mid-reproduction.
+    # (~10 min), then the canonical and, when measured, the reproduction
+    # confined CLI builds and one native startup. On macos-15-intel the
+    # canonical build alone measured 24 min and the two-job reproduction is
+    # slower, so a 90-minute limit cancelled run 39529002302
+    # mid-reproduction.
     timeout-minutes: 150
     env:
       # Optimize repeated whole-input hashes with test safety checks retained.
       CARGO_PROFILE_TEST_OPT_LEVEL: '2'
       CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: 'true'
       CARGO_PROFILE_TEST_OVERFLOW_CHECKS: 'true'
+      # The reproduction build is a measurement, never a gate. Scheduled and
+      # dispatched runs (and pull requests labelled before the push) measure
+      # it; every other run records it as deferred. The test rejects a
+      # missing value and `defer` on a scheduled or dispatched run.
+      TS_RELEASE_NATIVE_REPRODUCTION: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'release-native-reproduction')) && 'measure' || 'defer' }}
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0 (Node 24)
         with:
@@ -848,11 +943,23 @@ jobs:
           echo "Selected Xcode developer directory: $(xcode-select -p)"
           echo "HOST_TARGET=$HOST_TARGET" >> "$GITHUB_ENV"
 
+      # Each matrix entry restores and (on main) saves its own host target's
+      # key. See the Cargo candidate job for why this is actions/cache and
+      # what the cache may and may not hold.
+      - name: Restore the release-tool host build cache
+        id: release-tool-cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0 (Node 24)
+        with:
+          path: target
+          key: release-tool-${{ runner.os }}-${{ env.HOST_TARGET }}-rust-${{ steps.tools.outputs.rust }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.tool-versions', 'crates/trusted-server-release/Cargo.toml') }}-test-o${{ env.CARGO_PROFILE_TEST_OPT_LEVEL }}-da${{ env.CARGO_PROFILE_TEST_DEBUG_ASSERTIONS }}-oc${{ env.CARGO_PROFILE_TEST_OVERFLOW_CHECKS }}
+
       - name: Prepare ordinary CI Darwin Cargo fixture
         shell: bash
         run: |
           set -euo pipefail
           cargo build -p trusted-server-release --target "$HOST_TARGET" --locked
+          # Build the test binary now so the cache below holds its dependencies.
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --locked --no-run
           CARGO_FIXTURE_ROOT="$RUNNER_TEMP/release-cargo-fixture"
           JS_HANDOFF_ROOT="$RUNNER_TEMP/release-js-handoff"
           test ! -e "$JS_HANDOFF_ROOT"
@@ -863,6 +970,20 @@ jobs:
           } >> "$GITHUB_ENV"
           df -h "$RUNNER_TEMP"
 
+      # Saved before any ignored fixture test runs, so no fixture output can
+      # enter the cache.
+      - name: Drop incremental state before saving the host build cache
+        if: github.ref == 'refs/heads/main' && steps.release-tool-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: rm -rf target/debug/incremental target/*/debug/incremental
+
+      - name: Save the release-tool host build cache (main only)
+        if: github.ref == 'refs/heads/main' && steps.release-tool-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0 (Node 24)
+        with:
+          path: target
+          key: ${{ steps.release-tool-cache.outputs.cache-primary-key }}
+
       - name: Download the Linux JS handoff into a fresh directory
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0 (Node 24)
         with:
@@ -870,6 +991,8 @@ jobs:
           path: ${{ env.TS_RELEASE_JS_HANDOFF_ROOT }}
 
       - name: Prove Cargo build scripts and proc macros inherit denial (macOS)
+        env:
+          TS_RELEASE_CI_BUILD_CACHE: ${{ steps.release-tool-cache.outputs.cache-matched-key || 'miss' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -884,11 +1007,15 @@ jobs:
       # The canonical build is gated: Mach-O acceptance with the measured SDK
       # and a relative debug map, the remap and final-path scans, planted
       # operator values absent and a native `ts --version` on the reviewed
-      # host. The reproduction build is recorded, never a gate.
-      - name: Build, inspect and start the macOS ts candidate and measure its reproduction (macOS)
+      # host. The reproduction build is recorded, never a gate, and only built
+      # when TS_RELEASE_NATIVE_REPRODUCTION is `measure`.
+      - name: Build, inspect and start the macOS ts candidate; reproduction per TS_RELEASE_NATIVE_REPRODUCTION (macOS)
+        env:
+          TS_RELEASE_CI_BUILD_CACHE: ${{ steps.release-tool-cache.outputs.cache-matched-key || 'miss' }}
         shell: bash
         run: |
           set -euo pipefail
+          echo "Native reproduction: $TS_RELEASE_NATIVE_REPRODUCTION (event ${GITHUB_EVENT_NAME})"
           TEST_NAME=recipe::tests::macos_cli::macos_cli_candidate_builds_inspects_and_starts_cleanly
           TEST_LIST="$(mktemp)"
           trap 'rm -f "$TEST_LIST"' EXIT
@@ -909,6 +1036,19 @@ jobs:
               fi
             done
           fi
+
+      # Measured runs keep the reproduction measurement as an artifact so
+      # reports can cite it, not only the job log.
+      - name: Upload the measured macOS CLI candidate measurement
+        if: ${{ !cancelled() && env.TS_RELEASE_NATIVE_REPRODUCTION == 'measure' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0 (Node 24)
+        with:
+          name: macos-cli-candidate-measurement-${{ matrix.os }}
+          path: ${{ env.TS_RELEASE_CARGO_FIXTURE_ROOT }}/macos-cli-candidate-measurement.json
+          if-no-files-found: warn
+          retention-days: 90
+          # A re-run of this job replaces its own earlier upload.
+          overwrite: true
 
       # Bounded: two minutes of wall time and the last 400 lines at most.
       - name: Show recent sandbox denials on failure

@@ -141,6 +141,10 @@ impl PlatformEvidence {
                 "Rust tools changed before platform measurement",
             ));
         }
+        // The Apple evidence is copied from the recorded facts after one
+        // verification inside `candidate_measurement`; nothing is read from
+        // disk afterwards, so a second Apple pass here would rehash the same
+        // SDK and toolchain without changing what the evidence states.
         let apple = tools
             .apple()
             .map(AppleDeveloperTools::candidate_measurement)
@@ -149,9 +153,6 @@ impl PlatformEvidence {
             return Err(composition_error(
                 "Rust tools changed during platform measurement",
             ));
-        }
-        if let Some(apple) = tools.apple() {
-            apple.verify()?;
         }
         Ok(Self {
             target: target.triple(),
