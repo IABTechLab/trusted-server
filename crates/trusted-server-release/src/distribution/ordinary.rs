@@ -130,7 +130,6 @@ fn real_four_job_candidate_index() {
         .expect("should read the tracked consumer policy from the authenticated clone");
     let index_root = PathBuf::from(required("TS_RELEASE_CANDIDATE_INDEX_ROOT"));
     let token = required("GH_TOKEN");
-    let deadline = Instant::now() + Duration::from_secs(20 * 60);
     let descriptors: Vec<EntryDescriptor> = DESCRIPTOR_SLOTS
         .iter()
         .map(|(variable, asset)| {
@@ -144,7 +143,12 @@ fn real_four_job_candidate_index() {
         .expect("should select four distinct uploads");
     let received: Vec<ReceivedEntry> = descriptors
         .into_iter()
-        .map(|descriptor| receive(descriptor, run_id, &head, &token, deadline))
+        .map(|descriptor| {
+            // Each download is its own bounded transport attempt, which the
+            // backend caps at 15 minutes; the largest upload is a ~285 MB CLI.
+            let deadline = Instant::now() + Duration::from_secs(10 * 60);
+            receive(descriptor, run_id, &head, &token, deadline)
+        })
         .collect();
     let index = assemble_received(&received, &source_commit, &policy)
         .unwrap_or_else(|error| panic!("should assemble the four real entries: {error:?}"));
