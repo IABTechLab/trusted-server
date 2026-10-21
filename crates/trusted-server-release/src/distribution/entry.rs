@@ -6,7 +6,11 @@
 //! renders build evidence, recipe and rebuild-check companions whose joins
 //! are rechecked by the producer copy of the consumer rules. [`EntryParts`]
 //! is a private plain struct so the pure renderer can be tested directly;
-//! there is no JSON constructor.
+//! production has no byte or JSON constructor. The one exception is
+//! test-only: `distribution::transfer` rebuilds an entry from the flat files
+//! an ordinary-CI candidate job uploaded, reruns every join above over those
+//! bytes and derives the policy identity from collector-read policy bytes.
+//! It exists only under `cfg(test)` and grants no release authority.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -29,16 +33,16 @@ use crate::source::ApprovedSource;
 use crate::spdx::candidate::candidate_from_completed;
 
 /// Gaps every candidate entry states until signing and workflow binding exist.
-const ENTRY_GAPS: [&str; 4] = [
+pub(super) const ENTRY_GAPS: [&str; 4] = [
     "authenticated-bootstrap-not-established",
     "signature-bundles-awaiting-signature",
     "trusted-workflow-transfer-not-bound",
     "workflow-run-identity-unavailable",
 ];
 /// Gap stated when no reproduction comparison exists for a native asset.
-const NATIVE_REPRODUCTION_GAP: &str = "native-reproduction-unavailable";
+pub(super) const NATIVE_REPRODUCTION_GAP: &str = "native-reproduction-unavailable";
 /// Longest accepted gap text.
-const MAX_GAP_LENGTH: usize = 256;
+pub(super) const MAX_GAP_LENGTH: usize = 256;
 /// Final-byte classification of a JS module retained in the executable.
 const EMBEDDED_CLASSIFICATION: &str = "conservative_embedded_js";
 /// Final-byte classification of a JS module absent from the executable.

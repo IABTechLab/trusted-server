@@ -21,7 +21,7 @@ use super::super::remap::scan_remapped_bytes;
 use super::super::startup::native::{NativeStartupLayout, measure_host_identity};
 use super::super::startup::{NativeStartupAccepted, StartupCopy};
 use super::candidate::{CargoFixture, ci_build_provenance};
-use super::candidate_entry::{check_real_entry, js_inventory_sha256};
+use super::candidate_entry::{EntryExport, check_real_entry, js_inventory_sha256};
 use super::cli_candidate::{
     NativeReproduction, OPERATOR_SENTINELS, ReproductionOutcome, check_build_budget,
     finish_cleanup, native_reproduction_from_env, reproduction_result,
@@ -383,10 +383,16 @@ fn macos_cli_candidate_builds_inspects_and_starts_cleanly() {
     if let Some((_, Some(error))) = &paired {
         panic!("should pair builds over identical inputs: {error:?}");
     }
+    let upload_directory = fixture.root.join("candidate-entry");
+    let transfer_file = fixture.root.join("candidate-entry-transfer.json");
     measurement["candidate_entry"] = check_real_entry(
         &canonical.completed,
         &source,
         &CandidateAcceptance::Native(&startup),
+        &EntryExport {
+            upload_directory: &upload_directory,
+            transfer_file: &transfer_file,
+        },
     );
     write_measurement(&fixture, &measurement);
     super::candidate::check_native_export_after_cleanup(

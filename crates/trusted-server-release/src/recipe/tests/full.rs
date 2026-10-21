@@ -20,7 +20,7 @@ use super::candidate::{
     CargoFixture, SCHEMA_VERSION, cargo_docker_settings, cargo_measurement, ci_build_provenance,
     denial_measurement, equality_measurement, reported_errno,
 };
-use super::candidate_entry::{check_real_entry, js_inventory_sha256};
+use super::candidate_entry::{EntryExport, check_real_entry, js_inventory_sha256};
 use super::real_fixture::{
     ATTEMPTS, DenialCase, DenialSelection, bind_denial_case, cargo_fixture, ordinary_ci_ambient,
     path_text, try_prepare_vendor,
@@ -460,12 +460,18 @@ fn fastly_canonical_and_reproduction_builds_are_byte_identical() {
             .is_err(),
         "should reject attaching reproduction acceptance to the equal-byte canonical role"
     );
+    let upload_directory = fixture.root.join("candidate-entry");
+    let transfer_file = fixture.root.join("candidate-entry-transfer.json");
     measurement["candidate_entry"] = check_real_entry(
         &canonical.completed,
         &js.source,
         &CandidateAcceptance::Fastly {
             runtime: &canonical_runtime,
             equality: &checked,
+        },
+        &EntryExport {
+            upload_directory: &upload_directory,
+            transfer_file: &transfer_file,
         },
     );
     retain_equality_measurement(&fixture, &measurement);

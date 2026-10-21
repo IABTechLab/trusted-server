@@ -367,11 +367,16 @@ jobs:
     # final-byte comparison: 45 minutes left too little headroom. The
     # uncached Viceroy install (~5-8 min) and three gate runs add to that.
     timeout-minutes: 75
+    outputs:
+      # CI-internal descriptor of the uploaded candidate entry, for the
+      # candidate index collector; not a release schema.
+      candidate-entry: ${{ steps.describe-entry.outputs.candidate-entry }}
     env:
       # Optimize repeated whole-input hashes with test safety checks retained.
       CARGO_PROFILE_TEST_OPT_LEVEL: '2'
       CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: 'true'
       CARGO_PROFILE_TEST_OVERFLOW_CHECKS: 'true'
+      TS_RELEASE_CANDIDATE_ENTRY_UPLOAD: candidate-entry-trusted-server-fastly.wasm-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0 (Node 24)
         with:
@@ -512,6 +517,33 @@ jobs:
           cat "$TS_RELEASE_CARGO_FIXTURE_ROOT/cargo-canonical-reproduction-equality-measurement.json"
           cat "$TS_RELEASE_CARGO_FIXTURE_ROOT/fastly-runtime-gate-measurement.json"
 
+      # The rechecked canonical entry and its final executable, as six flat
+      # files, for the candidate index collector. Unauthenticated ordinary CI
+      # evidence; fork pull requests skip it like the transfer fixture.
+      - name: Upload the unqualified Fastly candidate entry for the index collector
+        id: upload-entry
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0 (Node 24)
+        with:
+          name: ${{ env.TS_RELEASE_CANDIDATE_ENTRY_UPLOAD }}
+          path: ${{ env.TS_RELEASE_CARGO_FIXTURE_ROOT }}/candidate-entry
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Describe the uploaded Fastly candidate entry
+        id: describe-entry
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+        shell: bash
+        env:
+          TRANSFER_FILE: ${{ env.TS_RELEASE_CARGO_FIXTURE_ROOT }}/candidate-entry-transfer.json
+          ARTIFACT_ID: ${{ steps.upload-entry.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload-entry.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          DESCRIPTOR="$(jq -c --argjson id "$ARTIFACT_ID" --arg name "$TS_RELEASE_CANDIDATE_ENTRY_UPLOAD" --arg digest "$ARTIFACT_DIGEST" --argjson attempt "$GITHUB_RUN_ATTEMPT" '. + {artifact_id: $id, artifact_name: $name, archive_sha256: $digest, run_attempt: $attempt}' "$TRANSFER_FILE")"
+          echo "$DESCRIPTOR"
+          echo "candidate-entry=$DESCRIPTOR" >> "$GITHUB_OUTPUT"
+
   test-release-cli-candidate:
     name: cargo test (Linux ts CLI release candidate)
     runs-on: ubuntu-24.04
@@ -521,11 +553,16 @@ jobs:
     # (~10-15 min each, about twice the Fastly dependency closure plus C
     # code) and three clean-container startups.
     timeout-minutes: 75
+    outputs:
+      # CI-internal descriptor of the uploaded candidate entry, for the
+      # candidate index collector; not a release schema.
+      candidate-entry: ${{ steps.describe-entry.outputs.candidate-entry }}
     env:
       # Optimize repeated whole-input hashes with test safety checks retained.
       CARGO_PROFILE_TEST_OPT_LEVEL: '2'
       CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: 'true'
       CARGO_PROFILE_TEST_OVERFLOW_CHECKS: 'true'
+      TS_RELEASE_CANDIDATE_ENTRY_UPLOAD: candidate-entry-ts-x86_64-unknown-linux-gnu-${{ github.run_id }}-${{ github.run_attempt }}
       # The reproduction build is a measurement, never a gate. Scheduled and
       # dispatched runs (and pull requests labelled before the push) measure
       # it; every other run records it as deferred. The test rejects a
@@ -688,6 +725,33 @@ jobs:
           cat "$TS_RELEASE_CLI_FIXTURE_ROOT/linux-cli-candidate-measurement.json"
           df -h "$RUNNER_TEMP"
 
+      # The rechecked canonical entry and its final executable, as six flat
+      # files, for the candidate index collector. Unauthenticated ordinary CI
+      # evidence; fork pull requests skip it like the transfer fixture.
+      - name: Upload the unqualified Linux CLI candidate entry for the index collector
+        id: upload-entry
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0 (Node 24)
+        with:
+          name: ${{ env.TS_RELEASE_CANDIDATE_ENTRY_UPLOAD }}
+          path: ${{ env.TS_RELEASE_CLI_FIXTURE_ROOT }}/candidate-entry
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Describe the uploaded Linux CLI candidate entry
+        id: describe-entry
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+        shell: bash
+        env:
+          TRANSFER_FILE: ${{ env.TS_RELEASE_CLI_FIXTURE_ROOT }}/candidate-entry-transfer.json
+          ARTIFACT_ID: ${{ steps.upload-entry.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload-entry.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          DESCRIPTOR="$(jq -c --argjson id "$ARTIFACT_ID" --arg name "$TS_RELEASE_CANDIDATE_ENTRY_UPLOAD" --arg digest "$ARTIFACT_DIGEST" --argjson attempt "$GITHUB_RUN_ATTEMPT" '. + {artifact_id: $id, artifact_name: $name, archive_sha256: $digest, run_attempt: $attempt}' "$TRANSFER_FILE")"
+          echo "$DESCRIPTOR"
+          echo "candidate-entry=$DESCRIPTOR" >> "$GITHUB_OUTPUT"
+
       - name: Preserve available CLI candidate measurements in the job log
         if: always()
         shell: bash
@@ -715,7 +779,9 @@ jobs:
 
   # Decides whether the macOS candidate jobs and their Linux JS handoff run.
   # It fails open: any error, a new branch or an unknown event selects them.
-  # Skipped jobs report success, so nothing else depends on this filter.
+  # Skipped jobs report success. The candidate index collector needs all four
+  # candidate jobs to succeed, so a deselected range also skips it; the step
+  # summary records that reason. The collector is not a required check.
   changes:
     name: Detect release candidate changes
     runs-on: ubuntu-24.04
@@ -743,6 +809,9 @@ jobs:
           select_release() {
             echo "release=$1" >> "$GITHUB_OUTPUT"
             echo "Release candidate jobs selected: $1 ($2)"
+            if [[ "$1" != true ]]; then
+              echo "Candidate index collector not selected: the macOS candidates are deselected ($2), and the four-asset candidate index is assembled only when all four candidate jobs succeed." >> "$GITHUB_STEP_SUMMARY"
+            fi
             exit 0
           }
           case "$EVENT_NAME" in
@@ -883,11 +952,17 @@ jobs:
     # slower, so a 90-minute limit cancelled run 39529002302
     # mid-reproduction.
     timeout-minutes: 150
+    outputs:
+      # Per-leg keys: each leg sets only its own, so the two descriptors of
+      # the CI-internal candidate-entry upload stay apart in matrix outputs.
+      macos-15-candidate-entry: ${{ steps.describe-entry.outputs.macos-15-candidate-entry }}
+      macos-15-intel-candidate-entry: ${{ steps.describe-entry.outputs.macos-15-intel-candidate-entry }}
     env:
       # Optimize repeated whole-input hashes with test safety checks retained.
       CARGO_PROFILE_TEST_OPT_LEVEL: '2'
       CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: 'true'
       CARGO_PROFILE_TEST_OVERFLOW_CHECKS: 'true'
+      TS_RELEASE_CANDIDATE_ENTRY_UPLOAD: candidate-entry-${{ matrix.os == 'macos-15' && 'ts-aarch64-apple-darwin' || 'ts-x86_64-apple-darwin' }}-${{ github.run_id }}-${{ github.run_attempt }}
       # The reproduction build is a measurement, never a gate. Scheduled and
       # dispatched runs (and pull requests labelled before the push) measure
       # it; every other run records it as deferred. The test rejects a
@@ -1023,6 +1098,34 @@ jobs:
           cat "$TS_RELEASE_CARGO_FIXTURE_ROOT/macos-cli-candidate-measurement.json"
           df -h "$RUNNER_TEMP"
 
+      # The rechecked canonical entry and its final executable, as six flat
+      # files, for the candidate index collector. Unauthenticated ordinary CI
+      # evidence; fork pull requests skip it like the transfer fixture.
+      - name: Upload the unqualified macOS CLI candidate entry for the index collector
+        id: upload-entry
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0 (Node 24)
+        with:
+          name: ${{ env.TS_RELEASE_CANDIDATE_ENTRY_UPLOAD }}
+          path: ${{ env.TS_RELEASE_CARGO_FIXTURE_ROOT }}/candidate-entry
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Describe the uploaded macOS CLI candidate entry
+        id: describe-entry
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+        shell: bash
+        env:
+          TRANSFER_FILE: ${{ env.TS_RELEASE_CARGO_FIXTURE_ROOT }}/candidate-entry-transfer.json
+          ARTIFACT_ID: ${{ steps.upload-entry.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload-entry.outputs.artifact-digest }}
+          MATRIX_OS: ${{ matrix.os }}
+        run: |
+          set -euo pipefail
+          DESCRIPTOR="$(jq -c --argjson id "$ARTIFACT_ID" --arg name "$TS_RELEASE_CANDIDATE_ENTRY_UPLOAD" --arg digest "$ARTIFACT_DIGEST" --argjson attempt "$GITHUB_RUN_ATTEMPT" '. + {artifact_id: $id, artifact_name: $name, archive_sha256: $digest, run_attempt: $attempt}' "$TRANSFER_FILE")"
+          echo "$DESCRIPTOR"
+          echo "${MATRIX_OS}-candidate-entry=$DESCRIPTOR" >> "$GITHUB_OUTPUT"
+
       - name: Preserve available macOS candidate measurements in the job log
         if: always()
         shell: bash
@@ -1056,6 +1159,159 @@ jobs:
           perl -e 'alarm 120; exec @ARGV or die "cannot run log: $!"' \
             /usr/bin/log show --last 15m --style compact --predicate 'sender=="Sandbox"' \
             | tail -n 400 || true
+
+  # Joins the four real candidate entries into one unqualified candidate
+  # index. It downloads each candidate job's exact upload through the bounded
+  # release-tool backend, rebuilds every entry from its bytes, derives the
+  # policy from a source-checked clean clone, and runs the CLI consumer's
+  # unsigned joins. Ordinary CI evidence only: no signing, publication,
+  # trusted workflow binding or qualification. It runs only when all four
+  # candidate jobs succeeded (the macOS matrix result covers both legs), so it
+  # never assembles from fewer than four entries. It is not a required check.
+  test-release-candidate-index:
+    name: Assemble the unqualified four-asset candidate index
+    needs:
+      - test-release-cargo-candidate
+      - test-release-cli-candidate
+      - test-release-macos-cli-candidate
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && needs.test-release-cargo-candidate.result == 'success' && needs.test-release-cli-candidate.result == 'success' && needs.test-release-macos-cli-candidate.result == 'success' }}
+    runs-on: ubuntu-24.04
+    # Release-tool test build (1-3 min with a warm cache), the CLI library
+    # test build (3-5 min; its dependencies are outside the release-tool
+    # cache, and the embedded JS needs npm), then four downloads, the largest
+    # being the ~285 MB Linux CLI with debug info.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+    env:
+      # Same profile as the candidate jobs, so the restored cache key matches.
+      CARGO_PROFILE_TEST_OPT_LEVEL: '2'
+      CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: 'true'
+      CARGO_PROFILE_TEST_OVERFLOW_CHECKS: 'true'
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0 (Node 24)
+        with:
+          persist-credentials: false
+          # Full history: the retained clone below must not be shallow.
+          fetch-depth: 0
+
+      - name: Read pinned tool versions
+        id: tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "rust=$(awk '$1 == "rust" { print $2 }' .tool-versions)"
+            echo "node=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Use pinned Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0 (Node 24)
+        with:
+          node-version: ${{ steps.tools.outputs.node }}
+          cache: npm
+          cache-dependency-path: crates/trusted-server-js/lib/package-lock.json
+
+      - name: Install pinned native Rust toolchain
+        env:
+          RUST_VERSION: ${{ steps.tools.outputs.rust }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup override set "$RUST_VERSION"
+          HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+          test "$HOST_TARGET" = x86_64-unknown-linux-gnu
+          echo "HOST_TARGET=$HOST_TARGET" >> "$GITHUB_ENV"
+
+      # Restore only: the Cargo candidate job saves this key (see its comment
+      # for why this is actions/cache and what the cache may and may not hold).
+      - name: Restore the release-tool host build cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0 (Node 24)
+        with:
+          path: target
+          key: release-tool-${{ runner.os }}-${{ env.HOST_TARGET }}-rust-${{ steps.tools.outputs.rust }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.tool-versions', 'crates/trusted-server-release/Cargo.toml') }}-test-o${{ env.CARGO_PROFILE_TEST_OPT_LEVEL }}-da${{ env.CARGO_PROFILE_TEST_DEBUG_ASSERTIONS }}-oc${{ env.CARGO_PROFILE_TEST_OVERFLOW_CHECKS }}
+
+      # Source authentication rejects untracked paths such as this checkout's
+      # target/ and node_modules/, so the policy is read from a fresh clone of
+      # the checked-out commit with the minimal Git configuration the
+      # fixtures use.
+      - name: Retain a clean clone of the candidate commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          SOURCE_ROOT="$RUNNER_TEMP/release-candidate-source"
+          INDEX_ROOT="$RUNNER_TEMP/release-candidate-index"
+          test ! -e "$SOURCE_ROOT"
+          test ! -e "$INDEX_ROOT"
+          git clone --no-hardlinks --no-checkout -- "$GITHUB_WORKSPACE" "$SOURCE_ROOT"
+          git -C "$SOURCE_ROOT" checkout --detach --force HEAD
+          printf '[core]\nrepositoryformatversion = 0\nbare = false\nfilemode = true\n' > "$SOURCE_ROOT/.git/config"
+          test "$(git -C "$SOURCE_ROOT" rev-parse HEAD)" = "$GITHUB_SHA"
+          {
+            echo "TS_RELEASE_CANDIDATE_SOURCE_ROOT=$SOURCE_ROOT"
+            echo "TS_RELEASE_CANDIDATE_INDEX_ROOT=$INDEX_ROOT"
+          } >> "$GITHUB_ENV"
+
+      - name: Compile and require exactly one collector and one consumer fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          TEST_LIST="$(mktemp)"
+          trap 'rm -f "$TEST_LIST"' EXIT
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --locked distribution::ordinary::real_four_job_candidate_index -- --ignored --exact --list > "$TEST_LIST"
+          awk '/: test$/ { count++ } END { if (count != 1) { print "Expected exactly one candidate index collector"; exit 1 } }' "$TEST_LIST"
+          cargo test -p trusted-server-cli --target "$HOST_TARGET" --locked --lib release::evidence::candidate_fixture_tests::ordinary_ci_assembled_candidate_passes_unsigned_consumer_joins -- --ignored --exact --list > "$TEST_LIST"
+          awk '/: test$/ { count++ } END { if (count != 1) { print "Expected exactly one candidate index consumer check"; exit 1 } }' "$TEST_LIST"
+
+      - name: Download, rebuild and assemble the four real candidate entries
+        shell: bash
+        env:
+          # The read-only token (contents/actions read) is visible to this
+          # same-repository test binary, which needs it to download; build
+          # scripts already ran without it in the listing step above, and fork
+          # PRs never reach this job.
+          GH_TOKEN: ${{ github.token }}
+          TS_RELEASE_TRANSFER_RUN_ID: ${{ github.run_id }}
+          # REST identifies the PR head; the checkout and every candidate
+          # build use its synthetic merge, which is the candidate source.
+          # Neither identity grants approved-source or release authority here.
+          TS_RELEASE_TRANSFER_RUN_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          TS_RELEASE_CANDIDATE_SOURCE_COMMIT: ${{ github.sha }}
+          TS_RELEASE_CANDIDATE_ENTRY_FASTLY: ${{ needs.test-release-cargo-candidate.outputs.candidate-entry }}
+          TS_RELEASE_CANDIDATE_ENTRY_LINUX: ${{ needs.test-release-cli-candidate.outputs.candidate-entry }}
+          TS_RELEASE_CANDIDATE_ENTRY_MACOS_ARM: ${{ needs.test-release-macos-cli-candidate.outputs.macos-15-candidate-entry }}
+          TS_RELEASE_CANDIDATE_ENTRY_MACOS_INTEL: ${{ needs.test-release-macos-cli-candidate.outputs.macos-15-intel-candidate-entry }}
+        run: |
+          set -euo pipefail
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --locked distribution::ordinary::real_four_job_candidate_index -- --ignored --exact --nocapture
+
+      - name: Run the consumer's unsigned joins over the assembled index
+        shell: bash
+        env:
+          TS_RELEASE_CANDIDATE_SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          cargo test -p trusted-server-cli --target "$HOST_TARGET" --locked --lib release::evidence::candidate_fixture_tests::ordinary_ci_assembled_candidate_passes_unsigned_consumer_joins -- --ignored --exact --nocapture
+
+      - name: Print the unqualified candidate index and its SHA-256
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat "$TS_RELEASE_CANDIDATE_INDEX_ROOT/candidate-release-index.json"
+          echo
+          (cd "$TS_RELEASE_CANDIDATE_INDEX_ROOT" && sha256sum -- *)
+
+      # Short-retention citable evidence of an unqualified, unsigned candidate;
+      # never a release asset.
+      - name: Upload the assembled unqualified candidate index evidence
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0 (Node 24)
+        with:
+          name: unqualified-candidate-release-index-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.TS_RELEASE_CANDIDATE_INDEX_ROOT }}
+          if-no-files-found: error
+          retention-days: 7
 
   test-typescript:
     name: vitest

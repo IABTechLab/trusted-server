@@ -55,6 +55,11 @@ impl EntrySummary {
         &self.inventory_sha256
     }
 
+    /// SHA-256 of the canonical rendered index artifact entry.
+    pub(crate) fn entry_sha256(&self) -> &str {
+        &self.entry_sha256
+    }
+
     /// The ordinary CI measurement of this entry.
     pub(crate) fn measurement(&self) -> Value {
         let companions: serde_json::Map<String, Value> = self

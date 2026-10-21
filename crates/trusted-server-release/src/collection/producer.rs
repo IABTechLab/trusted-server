@@ -237,7 +237,12 @@ impl CandidateBuildExport {
     }
 }
 
-fn write_new(path: &Path, bytes: &[u8]) -> Result<(), Report<ReleaseError>> {
+/// Writes `bytes` to a new private file, refusing an existing path or link.
+///
+/// # Errors
+///
+/// Rejects an existing path, a symlink at `path` and any write or sync failure.
+pub(crate) fn write_new(path: &Path, bytes: &[u8]) -> Result<(), Report<ReleaseError>> {
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)

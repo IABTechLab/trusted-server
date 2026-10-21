@@ -28,8 +28,13 @@ Golden fixtures in `tests/fixtures/index/candidate/` and CLI
 `release/evidence/candidate_fixture_tests.rs` exercise unsigned structural joins
 and rejection boundaries. `recipe/tests/candidate_index.rs` covers pure owner
 wiring rejections. `candidate_entry.rs` checks each real canonical entry
-independently, with reporting in `distribution/summary.rs`; it does not collect
-and assemble four real entries across CI jobs.
+independently, with reporting in `distribution/summary.rs`. Collecting and
+assembling the four real entries across CI jobs is now implemented, pending a
+hosted run. Each candidate job uploads its rechecked entry and final
+executable. The `test-release-candidate-index` job rebuilds the four entries
+from the exact uploads (`distribution::transfer` and `distribution::ordinary`,
+test-only) and assembles them. It then runs the CLI consumer's unsigned joins
+over the result. No hosted all-four assembly has been observed yet.
 
 ## Real canonical-entry observations
 
@@ -71,7 +76,7 @@ built commits are not interchangeable. Other runs need their own verified values
 ## Remaining exits
 
 Task 12's trusted workflow dependency and transfer binding is the next
-prerequisite to a real cross-job candidate join. It is not the only remaining
+prerequisite to a trusted cross-job candidate join. It is not the only remaining
 release-attestation work. The logs explicitly retain missing authenticated
 bootstrap, incomplete native material coverage, unresolved Fastly host tools,
 three GNU privileged helpers with unmeasured content, incomplete Apple tool

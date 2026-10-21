@@ -21,7 +21,7 @@ use super::super::native::{check_operator_values_absent, measure_native_repeatab
 use super::super::remap::scan_remapped_bytes;
 use super::super::startup::{LINUX_CLI_ASSET, NativeStartupAccepted, StartupCopy};
 use super::candidate::{CargoFixture, cargo_docker_settings, ci_build_provenance};
-use super::candidate_entry::{check_real_entry, js_inventory_sha256};
+use super::candidate_entry::{EntryExport, check_real_entry, js_inventory_sha256};
 use super::cli_candidate::{
     CliCandidateFacts, CliFixture, NativeReproduction, OPERATOR_SENTINELS, ReproductionOutcome,
     check_build_budget, cli_candidate_measurement, finish_cleanup, native_reproduction_from_env,
@@ -346,10 +346,16 @@ fn linux_cli_candidate_builds_inspects_and_starts_cleanly() {
     if let Some((_, Some(error))) = &paired {
         panic!("should pair builds over identical inputs: {error:?}");
     }
+    let upload_directory = cli_root.join("candidate-entry");
+    let transfer_file = cli_root.join("candidate-entry-transfer.json");
     measurement["candidate_entry"] = check_real_entry(
         &canonical.completed,
         &js.source,
         &CandidateAcceptance::Native(&startup),
+        &EntryExport {
+            upload_directory: &upload_directory,
+            transfer_file: &transfer_file,
+        },
     );
     retain_cli_measurement(&cli_root, &measurement);
     super::candidate::check_native_export_after_cleanup(

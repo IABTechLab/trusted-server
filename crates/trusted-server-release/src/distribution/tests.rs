@@ -18,6 +18,7 @@ use crate::policy::{CLI_POLICY_VERSION, FixedArtifact};
 
 mod golden;
 mod summary;
+mod transfer;
 
 /// Fictional approved source commit of every entry.
 const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";

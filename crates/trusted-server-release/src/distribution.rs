@@ -13,8 +13,10 @@
 //! - every unsigned companion carries `"release_qualification": false` and
 //!   its explicit gaps.
 //!
-//! No command, writer, signer or publisher consumes this module. Nothing here
-//! grants signing, publication or qualification authority.
+//! No command, writer, signer or publisher consumes this module. Only the
+//! test-only `transfer` and `ordinary` modules write candidate files, for the
+//! ordinary-CI cross-job join. Nothing here grants signing, publication or
+//! qualification authority.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -33,7 +35,11 @@ use crate::recipe::AssetId;
 mod entry;
 mod joins;
 #[cfg(test)]
+mod ordinary;
+#[cfg(test)]
 mod summary;
+#[cfg(test)]
+pub(crate) mod transfer;
 
 #[cfg(test)]
 mod tests;
@@ -173,8 +179,11 @@ impl CompanionFile {
 
 /// One canonical cohort asset's checked index entry and companion bytes.
 ///
-/// Only [`candidate_entry_from_completed`] constructs it outside tests; its
-/// fields are private and no JSON constructor exists.
+/// Only [`candidate_entry_from_completed`] constructs it in production; its
+/// fields are private and production has no byte or JSON constructor. The
+/// single exception is test-only: `distribution::transfer` rebuilds an entry
+/// from an ordinary-CI job's transferred files and reruns every producer join
+/// over those bytes, so the four real entries can be joined across CI jobs.
 #[derive(Clone, Debug)]
 pub(crate) struct CandidateArtifactEntry {
     asset: AssetId,

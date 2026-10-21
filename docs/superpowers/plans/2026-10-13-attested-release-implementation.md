@@ -484,6 +484,8 @@ An ordinary-CI producer/receiver fixture now uploads four inert fictional flat m
 
 Local verification of this batch passed 853 native unit tests (seven ignored external/helper fixtures), 13 command tests, strict native Clippy, documentation generation, Rust/Markdown/YAML formatting, actionlint and staged domain lint. A full-suite failure exposed inherited nonblocking accepted sockets in the fictional macOS HTTP fixture; fragmented-header red/green and aborted-header regressions now cover the corrected test server. Independent review found no remaining findings. Linux cross-target Clippy on this Mac cannot compile the newly needed TLS C dependencies without a Linux C cross-compiler; hosted Linux validation remains required. No candidate or release qualification is inferred from these local checks.
 
+Cross-job candidate-entry transfer (2026-10-21, implemented; hosted run pending): each real candidate job (Fastly, Linux CLI and both macOS legs) now exports its rechecked entry as six flat files: the final executable `artifact`, `tsjs-inventory.json` and the four unsigned companions. It writes a separate CI-internal transfer file and uploads the files with the pinned upload action under `candidate-entry-<asset>-<run_id>-<run_attempt>` (1-day retention, fork PRs skipped). A describe step merges the exact upload ID, name and archive digest with the producing job's own run attempt into a job-output descriptor; the macOS matrix uses per-leg keys. The new `test-release-candidate-index` job (`contents`/`actions` read only, token only in the download step, restore-only cache) runs the ignored `distribution::ordinary::real_four_job_candidate_index`. It strictly parses the four descriptors, retrieves each exact upload through the unchanged bounded backend and ZIP reader with REST run/head/name/digest corroboration, and rehashes the executable against build-evidence `artifact_sha256`/`artifact_size`. Existing bounds cover the largest measured executable (Linux CLI about 285 MB; 512 MiB member, 768 MiB archive). The descriptor is not a release schema and grants no trusted workflow dependency: companions keep `null` workflow/transfer identities and the `trusted-workflow-transfer-not-bound` gap. Pure tests cover descriptor parsing, export writing and transfer rejections. The trusted dependency adapter, ambient pair claims and qualification remain open, so Task 12 stays open.
+
 ### Task 13: Assemble and validate the exact evidence graph
 
 **Create:** release tool `src/distribution.rs`, private `distribution::tests`, `crates/trusted-server-release/tests/fixtures/index/`.
@@ -509,6 +511,27 @@ per-asset integration, not real cross-job four-entry assembly. Task 12's trusted
 transfer adapter is the next join prerequisite; complete native/tool coverage,
 authenticated acquisition, signing, publication and qualification remain separate
 unfinished exits. Task 13 remains partial.
+
+Real cross-job assembly (2026-10-21, implemented; hosted run pending): the
+collector job rebuilds each transferred entry with the test-only
+`CandidateArtifactEntry::from_ordinary_ci_transfer`, the one documented
+exception to the production-only constructor. Production is unchanged. The
+rebuild reruns every producer join over the transferred bytes and derives
+`policy_version`/`policy_sha256` from the consumer policy read out of a
+retained clean clone authenticated at `github.sha`. Fastly must be `matched`
+with reproduction equal to canonical, native assets `unavailable`. Gaps must be
+sorted, unique, a superset of the fixed entry gaps and identical across
+companions. Every companion is rehashed, and each rebuilt entry must recheck to
+the producing job's entry digest. The unchanged `assemble_candidate_index` then
+writes `candidate-release-index.json`, the inventory and sixteen companions. The
+collector prints the index and its SHA-256, the CLI's ignored
+`ordinary_ci_assembled_candidate_passes_unsigned_consumer_joins` runs the
+consumer's unsigned joins and empty-bundle rejection over those files, and the
+directory is uploaded as 7-day unqualified candidate evidence. It runs only when
+all four candidate jobs succeed and is not a required check. A pure round trip
+reproduces the golden index byte for byte, alongside rejection, descriptor and
+writer tests. The first hosted all-four run remains to be recorded. Signing,
+publication and qualification stay open.
 
 ### Task 14: Expose trusted same-commit validation
 

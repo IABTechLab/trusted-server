@@ -3,8 +3,12 @@
 //! adds to that job's retained measurement.
 //!
 //! The four entries come from different CI jobs, so they are never joined
-//! here; each job only records its own entry and JS inventory digest, which
-//! later shows whether the four inventories differ.
+//! here. Each job records its own entry and JS inventory digest and exports
+//! the rechecked entry, with its final executable, as flat files that the
+//! ordinary-CI collector (`distribution::ordinary`) downloads, rebuilds and
+//! joins into the unqualified candidate index.
+
+use std::path::Path;
 
 use serde_json::Value;
 
@@ -39,19 +43,30 @@ pub(super) fn js_inventory_sha256(completed: &RecipeCompleted) -> String {
         .to_owned()
 }
 
-/// Builds and rechecks the candidate entry of one real canonical build and
-/// returns its measurement summary.
+/// Where one real candidate job exports its entry for the index collector.
+pub(super) struct EntryExport<'a> {
+    /// New directory whose flat files the job uploads.
+    pub(super) upload_directory: &'a Path,
+    /// New transfer file, outside the upload, the job's describe step reads.
+    pub(super) transfer_file: &'a Path,
+}
+
+/// Builds and rechecks the candidate entry of one real canonical build,
+/// exports it for the ordinary-CI index collector and returns its
+/// measurement summary.
 ///
 /// # Panics
 ///
 /// Panics when the entry cannot be constructed, its rendered artifact fails
 /// the `#/$defs/artifact` sub-schema, a producer join fails, a companion's
 /// recomputed digest or size differs, the gaps miss the target family's
-/// platform gaps, or the rebuild-check outcome is not the expected one.
+/// platform gaps, the rebuild-check outcome is not the expected one, or the
+/// final executable or export cannot be read or written.
 pub(super) fn check_real_entry(
     completed: &RecipeCompleted,
     source: &ApprovedSource,
     acceptance: &CandidateAcceptance<'_>,
+    export: &EntryExport<'_>,
 ) -> Value {
     let entry =
         candidate_entry_from_completed(completed, source, acceptance).unwrap_or_else(|error| {
@@ -87,6 +102,14 @@ pub(super) fn check_real_entry(
         artifact.target != ReleaseTarget::Wasm32Wasip1,
         "should state the native reproduction gap exactly for native assets"
     );
+    let final_bytes = completed
+        .read_final_bytes()
+        .expect("should read the rehashed final executable for export");
+    entry
+        .export_flat_for_ordinary_ci(&final_bytes, export.upload_directory, export.transfer_file)
+        .unwrap_or_else(|error| {
+            panic!("should export the real entry for the index collector: {error:?}")
+        });
     summary.measurement()
 }
 
