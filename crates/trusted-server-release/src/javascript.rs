@@ -274,8 +274,11 @@ impl JsBuildCompleted {
                 },
             )]),
             tests: [1, 1],
+            // Real-fixture denial cases bind after a full Apple developer-tool
+            // verify, which exceeded a 30-second lifetime on a hosted
+            // macos-15 runner (run 39552419463), so allow ten minutes.
             attempt: JsAttempt::new(
-                std::time::Instant::now() + std::time::Duration::from_secs(30),
+                std::time::Instant::now() + std::time::Duration::from_secs(10 * 60),
                 crate::process::Cancellation::default(),
             ),
         }
