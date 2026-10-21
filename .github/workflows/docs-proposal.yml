@@ -50,6 +50,8 @@ jobs:
   # Copilot runs here with a read-only token; it cannot push or open PRs.
   # Copilot can write files that later steps execute, so treat this job as
   # untrusted: it uses no dependency cache that later runs would restore.
+  # Because untrusted code runs on the main ref, it can still write other
+  # main-scoped caches, so privileged workflows must never restore caches.
   propose:
     runs-on: ubuntu-latest
     timeout-minutes: 30

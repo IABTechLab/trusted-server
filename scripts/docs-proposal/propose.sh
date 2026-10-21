@@ -50,7 +50,11 @@ render_prompt() {
 }
 
 # Reads are always permitted; writes are allowed so Copilot can edit pages,
-# and publish.sh enforces which paths may actually change.
+# and publish.sh enforces which paths may actually change. Treat this job as
+# allowing arbitrary code execution: `git diff`/`git log --output` can write
+# any file, and writes can add diff.external or textconv to .git/config. The
+# job therefore holds a read-only token and its artifact is re-checked
+# downstream.
 run_copilot() {
   copilot -p "Read $relative_dir/$1 and follow its instructions exactly." \
     --no-ask-user \

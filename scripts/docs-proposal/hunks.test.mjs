@@ -266,7 +266,7 @@ test("buildReview cites evidence and suggests reverts", () => {
       line: 2,
       side: "RIGHT",
       body: [
-        "**Source:** `crates/a.rs:9` — Renames the flag.",
+        "**Source:** `crates/a.rs:9` — `Renames the flag.`",
         "",
         "Apply this suggestion to revert the hunk.",
         "",
@@ -342,7 +342,7 @@ test("buildReview asks to delete a new file instead of emptying it", () => {
   assert.equal(
     comment.body,
     [
-      "**Source:** `crates/a.rs:1` — New page.",
+      "**Source:** `crates/a.rs:1` — `New page.`",
       "",
       "This hunk creates the file. Delete the file to revert it.",
     ].join("\n"),
@@ -369,4 +369,30 @@ test("buildReview adds start_line for multi-line spans", () => {
     "should anchor the start on the new side",
   );
   assert.equal(comment.line, 2, "should end at the last new line");
+});
+
+test("buildReview renders the evidence reason as inline code", () => {
+  const files = parseDiff(
+    [
+      "diff --git a/docs/guide/a.md b/docs/guide/a.md",
+      "--- a/docs/guide/a.md",
+      "+++ b/docs/guide/a.md",
+      "@@ -1 +1 @@",
+      "-a",
+      "+b",
+      "",
+    ].join("\n"),
+  );
+  const [hunk] = collectHunks(files);
+  const reason =
+    "See #1 and [click](https://example.com) ![](https://example.com/p.png) <img src=x>";
+  const evidence = indexEvidence({
+    hunks: [{ id: hunk.id, source: "x.rs:1", reason }],
+  });
+  const [comment] = buildReview(files, evidence, "abc123").comments;
+
+  assert.ok(
+    comment.body.startsWith(`**Source:** \`x.rs:1\` — \`${reason}\`\n`),
+    "should wrap the reason in inline code so Markdown and HTML stay inert",
+  );
 });

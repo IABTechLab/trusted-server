@@ -289,15 +289,17 @@ impl core::error::Error for MyError {}
 ## Other guidelines
 
 - Use only example or fictional information in comments, tests, docs, examples,
-  and similar non-runtime materials. (eg. for urls use: example.com domains only)
+  and similar non-runtime materials. (e.g. use example.com for URLs by default)
 - Do not write or commit real domains, customer names, credentials,
   configuration values, or other potentially sensitive real-world information in
   comments, tests, docs, or examples.
 - The one exception is hosts. A real host may appear when the URL-host
   allowlist in `crates/trusted-server-cli/src/commands/dev/lint/domains.rs`
-  covers it or the line carries a `// allow-domain: <host>` suppression. New
-  allowlist entries and suppressions need review; see the URL-host linter
-  section of `CONTRIBUTING.md`.
+  covers it or the line carries an `allow-domain: <host>` suppression comment.
+  Use the file's comment syntax: `//`, `#`, `<!-- -->`, or `*` followed by
+  whitespace. New allowlist entries need a justification comment and review
+  under the [allowlist maintenance policy](docs/superpowers/specs/2026-05-18-check-domains-design.md#allowlist-maintenance-policy).
+  Per-line suppressions also need review.
 
 ---
 
