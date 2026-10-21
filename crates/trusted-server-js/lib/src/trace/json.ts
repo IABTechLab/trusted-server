@@ -40,7 +40,11 @@ export function traceJsonSnapshot(
     if (Array.isArray(item)) {
       const array: unknown[] = [];
       owned = array;
-      const items = traceItems(item, maximumBytes);
+      // Every JSON element consumes at least one byte. This conservative item
+      // ceiling bounds structural copying; walk enforces the exact byte budget,
+      // and the schema validators apply their separate element-count limits.
+      const maximumArrayItems = maximumBytes;
+      const items = traceItems(item, maximumArrayItems);
       if (!items || !add('[')) okay = false;
       else {
         for (let index = 0; index < items.length && okay; index += 1) {

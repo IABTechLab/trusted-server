@@ -94,7 +94,7 @@ impl CloudflareWorkers {
         } else {
             "wrangler.toml".to_string()
         };
-        Self::spawn_wrangler(&wrangler_dir, &config, ready)
+        self.spawn_wrangler(&wrangler_dir, &config, ready)
     }
 
     /// Start `wrangler dev` with a test-specific `TRUSTED_SERVER_CONFIG` binding.
@@ -111,12 +111,13 @@ impl CloudflareWorkers {
     pub fn spawn_with_config_json(&self, config_json: &str) -> TestResult<RuntimeProcess> {
         let wrangler_dir = self.wrangler_dir();
         let config = write_generated_ci_config(&wrangler_dir, config_json)?;
-        Self::spawn_wrangler(&wrangler_dir, &config, |base_url| {
+        self.spawn_wrangler(&wrangler_dir, &config, |base_url| {
             super::wait_for_ready(base_url, self.health_check_path(), true)
         })
     }
 
     fn spawn_wrangler(
+        &self,
         wrangler_dir: &Path,
         config: &str,
         ready: impl FnOnce(&str) -> TestResult<()>,

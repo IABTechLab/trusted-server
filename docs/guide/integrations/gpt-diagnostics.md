@@ -243,6 +243,13 @@ no wall-clock timeout, memory-allocation guarantee or earlier raw-header access.
 Unsupported metadata and request-relative server milestones display **Unavailable**.
 There is no historical recovery or server-side report store.
 
+The masked client IP follows each adapter's established `ClientInfo` source.
+`trusted_client_ip` header resolution is Fastly-only. Axum uses the transport peer,
+Cloudflare uses its runtime client-IP header, and Spin uses its runtime client
+address. Behind a forwarder these adapters may therefore report the forwarder's
+masked address. Authenticated public-origin forwarding does not change client-IP
+trust or enable header-based IP resolution on those adapters.
+
 ### Release acceptance
 
 Keep `trace_page_enabled` off until the required automated checks in the
@@ -276,11 +283,27 @@ Until these checks are complete, physical mobile acceptance remains pending.
 
 ### Maintaining versioned assets
 
-The committed trace asset manifest covers source, compiler dependency locks and
-build options. After changing those inputs, rebuild and review the JS/CSS and
-refresh the source digest. Unchanged bytes keep their existing asset URL and
-digest. Once an asset set is published, changed bytes require a new versioned
-URL; the current feature's v1 set remains unpublished until release acceptance.
+The committed trace asset manifest covers the dedicated trace build settings,
+trace sources, pinned Node version and resolved Vite build-tool dependency graph.
+Rust and JavaScript read the same `trace-build-inputs.json` definition. Changes to
+unrelated publisher build settings or dependencies do not invalidate trace assets.
+
+While version one is unpublished, use the repository-pinned Node version and run:
+
+```bash
+cd crates/trusted-server-js/lib
+npm ci
+npm run build:trace-assets
+npm run build
+npm test
+```
+
+`build:trace-assets` rebuilds only the trace viewer, copies its exact JS/CSS bytes
+into `trace-assets/`, and refreshes the source and per-asset digests together.
+Review and commit both the bytes and manifest. Ordinary builds verify these
+records and never refresh committed assets automatically. Unchanged bytes keep
+their existing digest. Once an asset URL is published, add a new asset version
+instead of replacing bytes at that URL.
 
 ## What the Console Shows
 

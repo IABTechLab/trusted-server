@@ -612,8 +612,12 @@ header before deploying.
 
 Startup fails closed if the configured key is missing, empty, invalid UTF-8, or
 resolves to an invalid shared-secret value. Every adapter removes the configured
-IP and authentication headers before routing, although only Fastly uses them for
-client-IP resolution.
+IP and authentication headers before ordinary routing. Fastly uses them for
+client-IP resolution throughout request handling. Axum, Cloudflare and Spin also
+use them for the trace setup page's masked client IP; their ordinary request
+handling continues to use the runtime-provided address. The trace page omits
+runtime geolocation when it describes a different address from the authenticated
+reader.
 
 **Environment Overrides**:
 

@@ -16,7 +16,7 @@ pub fn integration_app_config_envelope(origin_port: u16) -> TestResult<String> {
 ///
 /// # Errors
 ///
-/// Returns a bounded fixture-generation error when configuration validation fails.
+/// Returns a fixture-generation error when configuration validation fails.
 pub fn integration_app_config_envelope_with_trace(
     origin_port: u16,
     trace: bool,

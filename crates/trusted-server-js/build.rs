@@ -6,6 +6,8 @@
 
 #[path = "build/bundle_set.rs"]
 mod bundle_set;
+#[path = "build/trace_sources.rs"]
+mod trace_sources;
 
 use std::env;
 use std::fmt::Write as _;
@@ -17,6 +19,7 @@ use build_print::info;
 use sha2::{Digest as _, Sha256};
 
 use crate::bundle_set::{bundle_file_name, check_bundle_set, expected_module_ids, scan_bundle_dir};
+use crate::trace_sources::trace_source_digest;
 
 const PREBUILT_DIR_VAR: &str = "TSJS_PREBUILT_DIR";
 const SKIP_BUILD_VAR: &str = "TSJS_SKIP_BUILD";
@@ -29,12 +32,15 @@ fn main() {
     for path in [
         "lib/src",
         "lib/build-all.mjs",
+        "lib/trace-asset-sources.mjs",
+        "lib/build-trace.mjs",
+        "lib/trace-build-inputs.json",
+        "../../.tool-versions",
+        "lib/trace-assets-manifest.json",
+        "lib/trace-assets",
         "lib/build-prebid-external.mjs",
         "lib/package.json",
         "lib/package-lock.json",
-        "lib/trace-asset-sources.mjs",
-        "lib/trace-assets",
-        "lib/trace-assets-manifest.json",
         "lib/tsconfig.json",
         "lib/vite.config.ts",
     ] {
@@ -280,6 +286,16 @@ fn write_module_table(expected: &[String], bundle_dir: &Path, out_dir: &Path) {
     });
 }
 
+fn bundle_sha256(path: &Path) -> String {
+    let content = fs::read(path).unwrap_or_else(|err| {
+        panic!(
+            "tsjs: failed to read bundle {} for hashing: {err}",
+            path.display()
+        );
+    });
+    hex::encode(Sha256::digest(&content))
+}
+
 fn embed_trace_assets(ts_dir: &Path, dist_dir: &Path, out_dir: &Path, rebuilt: bool) {
     let manifest: serde_json::Value = serde_json::from_slice(
         &fs::read(ts_dir.join("trace-assets-manifest.json"))
@@ -304,7 +320,7 @@ fn embed_trace_assets(ts_dir: &Path, dist_dir: &Path, out_dir: &Path, rebuilt: b
     assert_eq!(
         manifest["source_sha256"].as_str(),
         Some(trace_source_digest(ts_dir).as_str()),
-        "tsjs: trace build inputs changed; rebuild and review the unpublished versioned assets"
+        "tsjs: trace build inputs changed; run `npm run build:trace-assets` in crates/trusted-server-js/lib and review unpublished assets, or add a version after publication"
     );
     let assets = manifest["assets"]
         .as_array()
@@ -350,7 +366,7 @@ fn embed_trace_assets(ts_dir: &Path, dist_dir: &Path, out_dir: &Path, rebuilt: b
                 fs::read(dist_dir.join("trace").join(file))
                     .expect("should rebuild both versioned trace assets"),
                 content,
-                "tsjs: rebuilt trace bytes differ from committed assets; review the unpublished draft or add a version"
+                "tsjs: rebuilt trace bytes differ from committed assets; run `npm run build:trace-assets` in crates/trusted-server-js/lib and review the unpublished draft or add a version"
             );
         }
         fs::write(out_dir.join(format!("trace-{file}")), &content)
@@ -362,57 +378,4 @@ fn embed_trace_assets(ts_dir: &Path, dist_dir: &Path, out_dir: &Path, rebuilt: b
     generated.push_str("];\n");
     fs::write(out_dir.join("trace_assets.rs"), generated)
         .expect("should generate the trace asset lookup table");
-}
-
-fn trace_source_digest(ts_dir: &Path) -> String {
-    let mut sources = vec![
-        "build-all.mjs".to_owned(),
-        "trace-asset-sources.mjs".to_owned(),
-        "package-lock.json".to_owned(),
-    ];
-    let mut directories = vec![PathBuf::from("src/trace")];
-    while let Some(directory) = directories.pop() {
-        for entry in
-            fs::read_dir(ts_dir.join(&directory)).expect("should enumerate trace build inputs")
-        {
-            let entry = entry.expect("should read a trace build input entry");
-            let relative = directory.join(entry.file_name());
-            let kind = entry
-                .file_type()
-                .expect("should inspect the trace build input type");
-            if kind.is_dir() {
-                directories.push(relative);
-            } else if kind.is_file()
-                && relative
-                    .extension()
-                    .is_some_and(|extension| extension == "ts" || extension == "css")
-            {
-                sources.push(
-                    relative
-                        .to_str()
-                        .expect("should use UTF-8 trace build input filenames")
-                        .replace('\\', "/"),
-                );
-            }
-        }
-    }
-    sources.sort();
-    let mut hash = Sha256::new();
-    for source in sources {
-        hash.update(source.as_bytes());
-        hash.update([0]);
-        hash.update(fs::read(ts_dir.join(&source)).expect("should read a trace build input"));
-        hash.update([0]);
-    }
-    hex::encode(hash.finalize())
-}
-
-fn bundle_sha256(path: &Path) -> String {
-    let content = fs::read(path).unwrap_or_else(|err| {
-        panic!(
-            "tsjs: failed to read bundle {} for hashing: {err}",
-            path.display()
-        );
-    });
-    hex::encode(Sha256::digest(&content))
 }

@@ -779,10 +779,12 @@ fn trace_metadata(state: &AppState, request: &Request) -> TraceMetadata {
 mod trace_dispatch_tests {
     use super::*;
     use futures::executor::block_on;
+    use trusted_server_core::redacted::Redacted;
+    use trusted_server_core::settings::TrustedClientIpConfig;
     use trusted_server_core::trace::TraceTerminalResponse;
 
-    fn router(enabled: bool) -> RouterService {
-        let settings = Settings::from_toml(&format!(
+    fn trace_settings(enabled: bool) -> Settings {
+        Settings::from_toml(&format!(
             r#"
             [[handlers]]
             path = "^/_ts/admin"
@@ -804,8 +806,12 @@ mod trace_dispatch_tests {
             trace_page_enabled = {enabled}
         "#
         ))
-        .expect("should parse trace settings");
-        TrustedServerApp::routes_with_settings(settings).expect("should build adapter routes")
+        .expect("should parse trace settings")
+    }
+
+    fn router(enabled: bool) -> RouterService {
+        TrustedServerApp::routes_with_settings(trace_settings(enabled))
+            .expect("should build adapter routes")
     }
 
     #[tokio::test]
@@ -882,5 +888,129 @@ mod trace_dispatch_tests {
                 .is_some(),
             "should harden disabled feature"
         );
+    }
+
+    #[tokio::test]
+    async fn trace_setup_honors_authenticated_client_ip_and_preserves_runtime_fallback() {
+        for (ip_header, auth_header) in [
+            ("x-example-client-ip", "x-example-client-auth"),
+            ("fastly-client-ip", "x-example-client-auth"),
+            ("x-example-client-ip", "x-ts-forwarder-auth"),
+            ("x-forwarded-host", "x-example-client-auth"),
+        ] {
+            for (forwarded_ip, auth, duplicate, configured, expected) in [
+                (
+                    "198.51.100.7",
+                    Some("fictional-client-secret-0123456789"),
+                    None,
+                    true,
+                    "198.51.100.0/24",
+                ),
+                (
+                    "2001:db8:abcd::7",
+                    Some("fictional-client-secret-0123456789"),
+                    None,
+                    true,
+                    "2001:db8:abcd::/48",
+                ),
+                ("198.51.100.7", None, None, true, "192.0.2.0/24"),
+                (
+                    "198.51.100.7",
+                    Some("fictional-wrong-secret"),
+                    None,
+                    true,
+                    "192.0.2.0/24",
+                ),
+                (
+                    "198.51.100.7",
+                    Some("fictional-client-secret-0123456789"),
+                    Some(auth_header),
+                    true,
+                    "192.0.2.0/24",
+                ),
+                (
+                    "198.51.100.7",
+                    Some("fictional-client-secret-0123456789"),
+                    Some(ip_header),
+                    true,
+                    "192.0.2.0/24",
+                ),
+                (
+                    "198.51.100.7, 203.0.113.7",
+                    Some("fictional-client-secret-0123456789"),
+                    None,
+                    true,
+                    "192.0.2.0/24",
+                ),
+                (
+                    "198.51.100.7",
+                    Some("fictional-client-secret-0123456789"),
+                    None,
+                    false,
+                    "192.0.2.0/24",
+                ),
+            ] {
+                let mut settings = trace_settings(true);
+                if configured {
+                    settings.trusted_client_ip = Some(TrustedClientIpConfig {
+                        ip_header: ip_header.to_owned(),
+                        auth_header: auth_header.to_owned(),
+                        shared_secret: Redacted::new(
+                            "fictional-client-secret-0123456789".to_owned(),
+                        ),
+                    });
+                }
+                let router = TrustedServerApp::routes_with_settings(settings)
+                    .expect("should build configured trace routes");
+                let mut request = edgezero_core::http::request_builder()
+                    .uri("https://publisher.example.com/_ts/trace")
+                    .header(ip_header, forwarded_ip)
+                    .body(edgezero_core::body::Body::empty())
+                    .expect("should build trace setup request");
+                if let Some(auth) = auth {
+                    request
+                        .headers_mut()
+                        .insert(auth_header, HeaderValue::from_static(auth));
+                }
+                if let Some(name) = duplicate {
+                    let value = request
+                        .headers()
+                        .get(name)
+                        .expect("should have original header")
+                        .clone();
+                    request.headers_mut().append(name, value);
+                }
+                AxumRequestContext::insert(
+                    &mut request,
+                    AxumRequestContext {
+                        remote_addr: Some(
+                            "192.0.2.99:4321"
+                                .parse()
+                                .expect("should parse peer address"),
+                        ),
+                    },
+                );
+                let response =
+                    block_on(router.oneshot(request)).expect("should render trace setup");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "should accept setup request"
+                );
+                let bytes = response
+                    .into_body()
+                    .into_bytes()
+                    .expect("should buffer setup");
+                let html = String::from_utf8(bytes.to_vec()).expect("should render UTF8 setup");
+                assert!(
+                    html.contains(expected),
+                    "should mask resolved client IP for {ip_header} with {forwarded_ip} and duplicate {duplicate:?}"
+                );
+                assert!(
+                    !html.contains("fictional-client-secret"),
+                    "should omit credentials from setup"
+                );
+            }
+        }
     }
 }

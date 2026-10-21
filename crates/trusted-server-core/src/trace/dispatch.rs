@@ -1,12 +1,13 @@
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use edgezero_core::body::Body;
 use edgezero_core::error::EdgeError;
 use edgezero_core::request::RequestIngress;
 use edgezero_core::router::PreDispatchHook;
-use http::{Method, Request, Response, StatusCode};
+use http::{HeaderMap, Method, Request, Response, StatusCode};
 use trusted_server_js::trace_assets::trace_asset;
 
 use super::actions::action_response;
@@ -18,7 +19,7 @@ use crate::integrations::gpt_diagnostics::{
     GPT_DIAGNOSTICS_INTEGRATION_ID, GptDiagnosticsConfig, GptDiagnosticsRequestDecision,
 };
 use crate::platform::{ClientInfo, GeoInfo};
-use crate::settings::Settings;
+use crate::settings::{Settings, TrustedClientIpConfig};
 
 /// Immutable incoming-cookie gate captured before ordinary request preparation.
 #[derive(Clone, Copy, Debug)]
@@ -105,6 +106,20 @@ impl PreDispatchHook for TracePreDispatchHook {
         &self,
         request: &mut Request<Body>,
     ) -> Result<Option<Response<Body>>, EdgeError> {
+        self.handle_with_clock(request, Utc::now).await
+    }
+}
+
+impl TracePreDispatchHook {
+    async fn handle_with_clock(
+        &self,
+        request: &mut Request<Body>,
+        clock: impl FnOnce() -> DateTime<Utc>,
+    ) -> Result<Option<Response<Body>>, EdgeError> {
+        // Resolve before origin preparation removes headers that may also be
+        // configured as client-IP credentials. Retain only the authenticated IP.
+        let forwarded_client_ip =
+            authenticated_client_ip(request.headers(), self.settings.trusted_client_ip.as_ref());
         prepare_trusted_forwarder(request, &self.settings);
         let dispatch = match preflight(&self.settings, request) {
             TracePreflight::NotTrace => {
@@ -144,19 +159,38 @@ impl PreDispatchHook for TracePreDispatchHook {
                 );
                 state_response(&cookies)
             }
-            TraceRoute::Shell if request.method() == Method::HEAD => Response::new(Body::empty()),
             TraceRoute::Shell => {
                 let cookies = inspect_cookies(
                     request.headers(),
                     request.extensions().get::<RequestIngress>(),
                 );
-                let metadata = (self.metadata)(request);
+                // HEAD validates the same bounded projection without fetching geo
+                // or other platform metadata that cannot affect the response status.
+                let is_head = request.method() == Method::HEAD;
+                let metadata = if is_head {
+                    TraceMetadata {
+                        client_info: ClientInfo::default(),
+                        geo: None,
+                    }
+                } else {
+                    let mut metadata = (self.metadata)(request);
+                    if let Some(client_ip) = forwarded_client_ip {
+                        if metadata.client_info.client_ip != Some(client_ip) {
+                            // Runtime geolocation describes the forwarder when
+                            // its address differs from the authenticated reader.
+                            metadata.geo = None;
+                        }
+                        metadata.client_info.client_ip = Some(client_ip);
+                    }
+                    metadata
+                };
                 match project_request_context(
                     &metadata.client_info,
                     metadata.geo.as_ref(),
                     &cookies,
-                    Utc::now(),
+                    clock(),
                 ) {
+                    Ok(_) if is_head => Response::new(Body::empty()),
                     Ok(context) => match render_setup_shell(&context) {
                         Ok(shell) => Response::new(Body::from(shell)),
                         Err(_) => unavailable_response(),
@@ -169,6 +203,27 @@ impl PreDispatchHook for TracePreDispatchHook {
     }
 }
 
+fn authenticated_client_ip(
+    headers: &HeaderMap,
+    config: Option<&TrustedClientIpConfig>,
+) -> Option<IpAddr> {
+    let config = config?;
+    let credential = single_utf8_header(headers, &config.auth_header)?;
+    if !config.authenticates(credential) {
+        return None;
+    }
+    single_utf8_header(headers, &config.ip_header)?.parse().ok()
+}
+
+fn single_utf8_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    value.to_str().ok()
+}
+
 fn unavailable_response() -> Response<Body> {
     let mut response = Response::new(Body::from(br#"{"error":"trace unavailable"}"#.as_slice()));
     *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
@@ -179,13 +234,15 @@ fn unavailable_response() -> Response<Body> {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use chrono::TimeZone as _;
     use edgezero_core::context::RequestContext;
     use edgezero_core::middleware::{Middleware, Next};
     use edgezero_core::router::RouterService;
     use futures::executor::block_on;
-    use http::{Method, StatusCode, header};
+    use http::{HeaderValue, Method, StatusCode, header};
     use serde_json::json;
 
+    use crate::redacted::Redacted;
     use crate::test_support::tests::create_test_settings;
     use crate::trace::TraceTerminalResponse;
 
@@ -210,6 +267,104 @@ mod tests {
                 }
             }),
         )
+    }
+
+    fn trusted_client_ip_config() -> TrustedClientIpConfig {
+        TrustedClientIpConfig {
+            ip_header: "x-example-client-ip".to_owned(),
+            auth_header: "x-ts-forwarder-auth".to_owned(),
+            shared_secret: Redacted::new("fictional-client-secret-0123456789".to_owned()),
+        }
+    }
+
+    #[test]
+    fn authenticated_client_ip_rejects_missing_and_malformed_values() {
+        let config = trusted_client_ip_config();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-example-client-ip",
+            HeaderValue::from_static("198.51.100.7"),
+        );
+        headers.insert(
+            "x-ts-forwarder-auth",
+            HeaderValue::from_static("fictional-client-secret-0123456789"),
+        );
+        for name in ["x-example-client-ip", "x-ts-forwarder-auth"] {
+            for value in [
+                None,
+                Some(b"".as_slice()),
+                Some(b"\xff".as_slice()),
+                Some(b"invalid".as_slice()),
+            ] {
+                let mut malformed = headers.clone();
+                malformed.remove(name);
+                if let Some(value) = value {
+                    malformed.insert(
+                        name,
+                        HeaderValue::from_bytes(value).expect("should build malformed header"),
+                    );
+                }
+                assert_eq!(
+                    authenticated_client_ip(&malformed, Some(&config)),
+                    None,
+                    "should reject missing or malformed {name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn forwarded_client_ip_omits_geo_for_a_different_runtime_address() {
+        for runtime_ip in ["192.0.2.99", "198.51.100.7"] {
+            let mut hook = hook(true, Arc::new(AtomicUsize::new(0)));
+            Arc::get_mut(&mut hook.settings)
+                .expect("should own hook settings")
+                .trusted_client_ip = Some(trusted_client_ip_config());
+            let client_ip = runtime_ip.parse().expect("should parse runtime IP");
+            hook.metadata = Arc::new(move |_| TraceMetadata {
+                client_info: ClientInfo {
+                    client_ip: Some(client_ip),
+                    ..ClientInfo::default()
+                },
+                geo: Some(GeoInfo {
+                    city: String::new(),
+                    country: "EX".to_owned(),
+                    continent: String::new(),
+                    latitude: 0.0,
+                    longitude: 0.0,
+                    metro_code: 0,
+                    region: None,
+                    asn: None,
+                }),
+            });
+            let mut request = Request::builder()
+                .uri("/_ts/trace")
+                .header("x-example-client-ip", "198.51.100.7")
+                .header("x-ts-forwarder-auth", "fictional-client-secret-0123456789")
+                .body(Body::empty())
+                .expect("should build setup request");
+            let response = block_on(hook.handle(&mut request))
+                .expect("should dispatch trace")
+                .expect("should intercept setup");
+            let bytes = response
+                .into_body()
+                .into_bytes()
+                .expect("should buffer setup");
+            let html = String::from_utf8(bytes.to_vec()).expect("should render UTF8 setup");
+            assert!(
+                html.contains("198.51.100.0/24"),
+                "should retain authenticated reader address before sanitation"
+            );
+            assert_eq!(
+                html.contains("&quot;country&quot;:&quot;EX&quot;"),
+                runtime_ip == "198.51.100.7",
+                "should retain geo only when it describes the authenticated reader"
+            );
+            assert!(
+                !request.headers().contains_key("x-ts-forwarder-auth"),
+                "should still strip forwarding credentials"
+            );
+        }
     }
 
     #[test]
@@ -237,6 +392,51 @@ mod tests {
                 "should sanitize credentials before any preflight return"
             );
         }
+    }
+
+    #[test]
+    fn trace_shell_head_matches_get_status_with_unrepresentable_clock() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let hook = hook(true, Arc::clone(&calls));
+        let clock = Utc
+            .with_ymd_and_hms(10_000, 1, 1, 0, 0, 0)
+            .single()
+            .expect("should construct a clock outside the trace schema");
+        let mut responses = Vec::new();
+        for method in [Method::GET, Method::HEAD] {
+            calls.store(0, Ordering::SeqCst);
+            let is_head = method == Method::HEAD;
+            let mut request = Request::builder()
+                .method(method)
+                .uri("/_ts/trace")
+                .body(Body::empty())
+                .expect("should construct a shell request");
+            let response = block_on(hook.handle_with_clock(&mut request, || clock))
+                .expect("should dispatch the trace shell")
+                .expect("should intercept the shell");
+            assert_eq!(
+                response.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "should reject an unrepresentable clock on GET and HEAD"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                usize::from(!is_head),
+                "should retain lazy metadata and avoid a HEAD geo lookup"
+            );
+            if is_head {
+                assert!(
+                    response.body().as_bytes().is_some_and(<[u8]>::is_empty),
+                    "should omit the HEAD body on errors"
+                );
+            }
+            responses.push(response);
+        }
+        assert_eq!(
+            responses[0].headers(),
+            responses[1].headers(),
+            "should match GET error headers on HEAD"
+        );
     }
 
     #[test]
