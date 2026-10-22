@@ -136,3 +136,19 @@ pub(crate) fn test_keys() -> crate::ec::identity::revision::IdentityKeys {
         &crate::test_support::tests::create_test_settings(),
     )
 }
+
+/// A catalog with one provider that owns `source`.
+pub(crate) fn catalog_with_owner(
+    provider: &str,
+    source: &str,
+) -> crate::ec::identity::catalog::ProviderCatalog {
+    crate::ec::identity::catalog::ProviderCatalog::new(
+        vec![fixed_provider(provider, &[source])],
+        [(
+            source.parse().expect("should parse source"),
+            provider.parse().expect("should parse provider id"),
+        )]
+        .into_iter()
+        .collect(),
+    )
+}
