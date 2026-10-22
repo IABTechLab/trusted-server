@@ -10,9 +10,9 @@
 
 ## Scope and decisions
 
-The issue already specifies the desired policy. Filtering at the common PBS transport boundary covers planned provider dispatch and the legacy test wrapper. Copying then stripping more names is unsafe because unknown publisher cookies remain; changing the generic forwarding helper would affect a separate contract and is unnecessary because it has no production callers.
+The issue already specifies the desired policy. Filtering at the common PBS transport boundary covers planned provider dispatch and the legacy test wrapper. Copying then stripping more names is unsafe because unknown publisher cookies remain; the unused generic forwarding helper is removed so the old unrestricted forwarding path cannot be reused accidentally.
 
-A valid allowed pair has an exact case-sensitive allowlisted name, `=`, and an RFC 6265 cookie-octet value (optionally enclosed in double quotes). Invalid pairs are omitted; an unreadable header is omitted entirely. Values may contain `=`. Empty values are valid. Comma-separated decimal GPP section IDs are retained for compatibility with existing consent extraction. No cookie values are logged. Repeated inbound headers retain the existing selected-header behavior.
+Consent-cookie selection uses the same CookieJar parser as extraction, with case-sensitive allowlisted names and last-duplicate selection. A safe outbound value uses RFC 6265 cookie-octets (optionally enclosed in double quotes). Invalid pairs are omitted; an unreadable header is omitted entirely. Values may contain `=`. Empty values are valid. Comma-separated decimal GPP section IDs are normalized to remove section whitespace, preserving extraction semantics. If an extracted consent cookie cannot be framed safely, cookies_only carries consent in the body instead. No cookie values are logged. Repeated inbound headers retain the existing selected-header behavior.
 
 The existing cookies_only exception for policy-sourced body consent is preserved.
 
@@ -26,8 +26,7 @@ The existing cookies_only exception for policy-sourced body consent is preserved
 - [x] Run the regressions and adapter-matched tests; update stale expectations without weakening coverage.
 - [x] Document operator-visible PBS behavior and outbound audit results, keeping partner-specific exceptions explicit.
 - [x] Run all AGENTS.md CI gates and record command outcomes, including environmental limitations.
-- [x] Commit and push; create a draft PR using .claude/agents/pr-creator.md with Closes #763.
-- [x] Independently review the draft PR, fix validated findings with regressions, rerun affected checks, and push the fixes.
+- [x] Independently review transport, consent extraction, serialization, and outbound audit behavior.
 
 ## Review and regression evidence
 
@@ -47,8 +46,6 @@ The original transport baseline passed. New regressions then failed on the origi
 
 Validation used Rust 1.98.1, Node 24.12.0, and Viceroy 0.21.0. The initially installed Viceroy 0.17.0 could not load the current SDK imports; the pinned version was downloaded separately for verification. Axum's loopback tests and Viceroy's macOS certificate access required sandbox-enabled retries. Those retries passed. The existing proc-macro-error2 future-incompatibility notice remains. No manual publisher deployment was performed.
 
-## Independent PR review
+## Consent extraction alignment follow-up
 
-Draft PR #1429 was independently reviewed at commit `999d72394`. The reviewer examined the live issue and PR, complete diff, production dispatch, consent serialization, transport capture, and outbound audit. No actionable findings were reported, so no runtime follow-up was needed. The reviewer independently reran the two focused Prebid-cookie tests and all 197 cookie-related tests; both runs passed, and the diff passed whitespace checks.
-
-The PR remains a draft. Manual deployment/browser smoke tests and live PBS validation remain outside this verification. The project-board status could not be read or updated because the GitHub token lacks project-read permission; the PR's closing link to #763 is verified. The optional core rustdoc build completed with 31 link/private-item warnings in untouched documentation.
+A planned-dispatch regression reproduced loss of both `__gpp_sid=2, 6` and `us_privacy = 1YYN`: consent extraction accepted the values but transport dropped them, while cookies_only omitted the body. Transport now uses the same CookieJar parser, with last-duplicate selection and safe decimal GPP whitespace normalization. A framing failure enables the JSON-body consent fallback without forwarding unsafe bytes or unrelated cookies. Regressions cover all modes, decoded sale opt-out, GPP section IDs, duplicate values, quoted framing, and injected delimiters.

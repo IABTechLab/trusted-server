@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
@@ -37,7 +38,7 @@ use crate::auction::types::{AuctionResponse, Bid as AuctionBid};
 use crate::cache_policy::{CacheControlPolicy, EdgeCacheHeader};
 use crate::consent_config::ConsentForwardingMode;
 use crate::constants::COOKIE_GPP_SID;
-use crate::cookies::CONSENT_COOKIE_NAMES;
+use crate::cookies::{CONSENT_COOKIE_NAMES, parse_cookies_to_jar};
 use crate::error::TrustedServerError;
 #[cfg(test)]
 use crate::http_util::RequestInfo;
@@ -464,7 +465,7 @@ pub struct LegacyPrebidServerConfig {
     /// How consent signals are forwarded to Prebid Server.
     ///
     /// - `openrtb_only` — consent in `OpenRTB` body only, no `Cookie` header
-    /// - `cookies_only` — allowlisted consent cookies; cookie-sourced body consent omitted
+    /// - `cookies_only` — allowlisted consent cookies, with body fallback for unsafe values
     /// - `both` — allowlisted consent cookies and body consent (default)
     #[serde(default)]
     pub consent_forwarding: ConsentForwardingMode,
@@ -2090,25 +2091,78 @@ fn apply_prebid_header_values(
     if consent_forwarding == ConsentForwardingMode::OpenrtbOnly {
         return;
     }
-    let Some(cookie_header) = cookie.and_then(|value| value.to_str().ok()) else {
-        return;
-    };
-    let filtered = cookie_header
-        .split(';')
-        .map(str::trim)
-        .filter(|pair| {
-            let Some((name, value)) = pair.split_once('=') else {
-                return false;
-            };
-            CONSENT_COOKIE_NAMES.contains(&name) && valid_prebid_cookie_value(name, value)
-        })
-        .collect::<Vec<_>>()
-        .join("; ");
-    if !filtered.is_empty()
-        && let Ok(value) = HeaderValue::from_str(&filtered)
-    {
+    if let Some(value) = PrebidConsentCookies::from_header(cookie).header {
         to.headers_mut().insert(header::COOKIE, value);
     }
+}
+
+/// Consent cookies selected with the same parser used during consent extraction.
+///
+/// Unsafe values remain available only through the JSON body fallback. No raw
+/// cookie bytes are forwarded on a parsing or framing failure.
+pub(crate) struct PrebidConsentCookies {
+    pub(crate) header: Option<HeaderValue>,
+    pub(crate) requires_body: bool,
+}
+
+impl PrebidConsentCookies {
+    pub(crate) fn from_header(header: Option<&HeaderValue>) -> Self {
+        let mut result = Self {
+            header: None,
+            requires_body: false,
+        };
+        let Some(header) = header.and_then(|value| value.to_str().ok()) else {
+            return result;
+        };
+        let jar = parse_cookies_to_jar(header);
+        let mut pairs = Vec::new();
+        for name in CONSENT_COOKIE_NAMES {
+            let Some(cookie) = jar.get(name) else {
+                continue;
+            };
+            if let Some(value) = prebid_cookie_value(name, cookie.value()) {
+                pairs.push(format!("{name}={value}"));
+            } else {
+                result.requires_body = true;
+            }
+        }
+        if !pairs.is_empty() {
+            result.header = HeaderValue::from_str(&pairs.join("; ")).ok();
+            if result.header.is_none() {
+                result.requires_body = true;
+            }
+        }
+        result
+    }
+}
+
+/// Preserves safe values and normalizes decimal GPP section whitespace.
+fn prebid_cookie_value<'a>(name: &str, value: &'a str) -> Option<Cow<'a, str>> {
+    if valid_prebid_cookie_value(name, value) {
+        return Some(Cow::Borrowed(value));
+    }
+    if name != COOKIE_GPP_SID {
+        return None;
+    }
+    let quoted = value.len() >= 2 && value.starts_with('"') && value.ends_with('"');
+    let unquoted = if quoted {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    };
+    let sections = unquoted.split(',').map(str::trim).collect::<Vec<_>>();
+    if sections
+        .iter()
+        .any(|section| section.is_empty() || !section.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return None;
+    }
+    let normalized = sections.join(",");
+    Some(Cow::Owned(if quoted {
+        format!("\"{normalized}\"")
+    } else {
+        normalized
+    }))
 }
 
 /// Validates cookie framing without interpreting or modifying consent signals.
@@ -2728,10 +2782,13 @@ impl PrebidAuctionProvider {
         // and Prebid ext-based locations (dual placement).
         // In cookies_only mode, cookie-sourced consent travels through the
         // forwarded Cookie header. Policy-sourced consent has no inbound cookie
-        // to forward, so carry it in the OpenRTB body instead.
+        // to forward, so carry it in the OpenRTB body instead. Unsafe cookie
+        // values also need the body fallback to avoid dropping extracted consent.
         let consent_ctx = request.user.consent.as_ref().filter(|ctx| {
             self.config.consent_forwarding.includes_body_consent()
                 || !matches!(ctx.source, crate::consent::ConsentSource::Cookie)
+                || PrebidConsentCookies::from_header(context.request.headers().get(header::COOKIE))
+                    .requires_body
         });
         let raw_tc = consent_ctx.and_then(|c| c.raw_tc_string.clone());
         let user = Some(User {
@@ -9825,7 +9882,7 @@ set = { networkId = 42 }
                 ),
                 (
                     Some(
-                        "EUCONSENT-V2=secret; x__gpp=secret; __gpp_sid_extra=secret; us_privacy_extra=secret; euconsent-v2 =secret",
+                        "EUCONSENT-V2=secret; x__gpp=secret; __gpp_sid_extra=secret; us_privacy_extra=secret",
                     ),
                     None,
                 ),
@@ -9851,7 +9908,7 @@ set = { networkId = 42 }
                 ),
                 (
                     Some("__gpp=first; session=secret; __gpp=second"),
-                    Some("__gpp=first; __gpp=second"),
+                    Some("__gpp=second"),
                 ),
             ] {
                 let mut inbound = http::Request::new(EdgeBody::empty());
@@ -9908,6 +9965,59 @@ set = { networkId = 42 }
                     "should omit unreadable headers in {mode:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn prebid_cookie_selection_matches_extraction_and_preserves_safe_framing() {
+        for (input, expected, requires_body) in [
+            ("us_privacy = 1YYN", Some("us_privacy=1YYN"), false),
+            (
+                "euconsent-v2=\"TC==\"; __gpp_sid=\"2, 6\"",
+                Some("euconsent-v2=\"TC==\"; __gpp_sid=\"2,6\""),
+                false,
+            ),
+            (
+                "__gpp_sid=2, 6; __gpp_sid=7, 8",
+                Some("__gpp_sid=7,8"),
+                false,
+            ),
+            (
+                "__gpp=first; __gpp=bad\\value; us_privacy=1YYN",
+                Some("us_privacy=1YYN"),
+                true,
+            ),
+            ("__gpp_sid=\"", None, true),
+            (
+                "__gpp_sid=2, session=secret; us_privacy=1YYN",
+                Some("us_privacy=1YYN"),
+                true,
+            ),
+            (
+                "__gpp_sid=2,; us_privacy=1YYN",
+                Some("us_privacy=1YYN"),
+                true,
+            ),
+            (
+                "__gpp=bad\"quote; us_privacy=1YYN",
+                Some("us_privacy=1YYN"),
+                true,
+            ),
+        ] {
+            let header = HeaderValue::from_str(input).expect("should build cookie header");
+            let selected = PrebidConsentCookies::from_header(Some(&header));
+            assert_eq!(
+                selected
+                    .header
+                    .as_ref()
+                    .and_then(|value| value.to_str().ok()),
+                expected,
+                "should select safe last consent values from {input:?}"
+            );
+            assert_eq!(
+                selected.requires_body, requires_body,
+                "should retain unrepresentable consent in the body for {input:?}"
+            );
         }
     }
 

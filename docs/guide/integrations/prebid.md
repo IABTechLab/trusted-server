@@ -140,8 +140,11 @@ PBS never receives the browser's full `Cookie` header. `both` and
 `us_privacy`; `openrtb_only` sends no Cookie header. Identity and publisher
 session cookies are excluded in all modes. Unreadable headers and malformed
 cookie pairs are omitted, and no header is sent when no allowed pair remains.
-Cookie-sourced consent is omitted from the OpenRTB body in `cookies_only`;
-policy-sourced consent retains its existing body fallback.
+Cookie parsing matches consent extraction, including trimmed names/values and
+last-duplicate selection. Decimal GPP section whitespace is normalized.
+Cookie-sourced consent is omitted from the OpenRTB body in `cookies_only` when
+the extracted cookies can be forwarded safely; otherwise it falls back to the
+body. Policy-sourced consent retains its existing body fallback.
 
 See [Integration cookie forwarding](./cookie-forwarding) for the complete
 outbound audit and intentional partner-specific exceptions.

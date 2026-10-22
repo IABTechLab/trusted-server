@@ -13,13 +13,13 @@ Prebid Server (PBS) requests allow only these exact, case-sensitive consent cook
 
 The `consent_forwarding` setting selects how consent travels:
 
-| Mode             | Outbound `Cookie` header            | OpenRTB body consent                                                            |
-| ---------------- | ----------------------------------- | ------------------------------------------------------------------------------- |
-| `both` (default) | Only the four consent cookies above | Included                                                                        |
-| `cookies_only`   | Only the four consent cookies above | Cookie-sourced consent is omitted; policy-sourced consent can still be included |
-| `openrtb_only`   | Omitted                             | Included                                                                        |
+| Mode             | Outbound `Cookie` header            | OpenRTB body consent                                                                            |
+| ---------------- | ----------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `both` (default) | Only the four consent cookies above | Included                                                                                        |
+| `cookies_only`   | Only the four consent cookies above | Cookie-sourced consent is omitted when safely carried by cookies; otherwise consent is included |
+| `openrtb_only`   | Omitted                             | Included                                                                                        |
 
-Unrelated cookies are excluded in every mode. This includes publisher session and authentication cookies, `ts-ec`, `ts-eids`, and `sharedId`. An unreadable, non-ASCII Cookie header is omitted rather than forwarded unchanged. Malformed cookie pairs are omitted; accepted values retain their original framing, including quoted values and comma-separated decimal GPP section IDs. When filtering leaves no allowed cookies, the outbound Cookie header is omitted.
+Unrelated cookies are excluded in every mode. This includes publisher session and authentication cookies, `ts-ec`, `ts-eids`, and `sharedId`. An unreadable, non-ASCII Cookie header is omitted rather than forwarded unchanged. Cookie parsing uses the same parser as consent extraction: names and values are trimmed, and the last occurrence of each consent cookie wins. Values with unsafe outbound framing are omitted. In `cookies_only`, if an extracted consent cookie cannot be forwarded safely, consent is included in the OpenRTB body so it cannot disappear from both channels. Already valid values retain their framing, including quoted values. Decimal GPP section IDs with whitespace, such as `2, 6`, are normalized to `2,6`. When filtering leaves no allowed cookies, the outbound Cookie header is omitted.
 
 For example, in `both` mode this inbound header:
 
@@ -50,6 +50,16 @@ See [Prebid integration](./prebid) and [GDPR compliance](/guide/gdpr-compliance)
 | Sourcepoint                                                     | Uses its own partner-specific allowlist, described below                                                                       |
 | Ad server mock mediator and EC partner pull sync                | Construct fresh requests without copying the browser Cookie header                                                             |
 | Publisher origin                                                | Preserves browser cookies for the publisher application                                                                        |
+
+### Identity Values Outside Cookie Headers
+
+The table describes raw `Cookie` headers. Some upstream contracts also carry selected identity values separately:
+
+- The generic proxy adds the resolved EC ID as a `ts-ec` query parameter by default; routes can disable this with `forward_ec_id`.
+- Click redirects add the resolved EC ID as a `ts-ec` query parameter on the target URL.
+- Testlight puts the resolved EC ID into its rewritten request body and disables the generic proxy's EC query parameter.
+
+These selected-value contracts are independent of the PBS cookie allowlist; excluding an identity cookie from a raw header does not remove its other uses.
 
 ### Sourcepoint
 

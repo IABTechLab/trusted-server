@@ -133,7 +133,8 @@ pub enum ConsentMode {
 pub enum ConsentForwardingMode {
     /// Forward consent in the `OpenRTB` body only; PBS sends no `Cookie` header.
     OpenrtbOnly,
-    /// Forward consent cookies only; omit consent fields from the body.
+    /// Prefer consent cookies; omit cookie-sourced body consent when cookies
+    /// can carry it safely. Policy-sourced signals retain a body fallback.
     CookiesOnly,
     /// Forward consent in both cookies and body (default).
     #[default]

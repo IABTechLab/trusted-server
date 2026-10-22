@@ -19,6 +19,7 @@ use super::routing::{
 use super::types::{AdFormat, AdSlot, AuctionResponse, Bid};
 use crate::consent::ConsentSource;
 use crate::error::TrustedServerError;
+use crate::integrations::prebid::PrebidConsentCookies;
 use crate::openrtb::{
     Banner, ConsentedProvidersSettings, Device, Format, Geo, Imp, OpenRtbRequest, Publisher, Regs,
     RegsExt, Site, ToExt as _, TrustedServerExt, User, UserExt, to_openrtb_i32,
@@ -351,6 +352,8 @@ fn build_common_request(
         ProfilePolicy::Prebid(plan) => consent.filter(|value| {
             plan.consent_forwarding.includes_body_consent()
                 || !matches!(value.source, ConsentSource::Cookie)
+                || PrebidConsentCookies::from_header(routed.prebid_transport_headers().cookie())
+                    .requires_body
         }),
         _ => consent,
     };
