@@ -12,6 +12,12 @@ Phase 1 publishes SPDX 2.3 for a conservative selected-Cargo-target and installe
 
 The phase labels on requirement headings below apply only to the reduced Phase 1 subset described above; all additional clauses and requirements marked Phase 2+ remain deferred. The original assurance profiles, custom verifier, retained evidence graph and reproduction gates do not block the first Phase 1 release. The [implementation plan](../plans/2026-10-13-attested-release-implementation.md#phasing--2026-10-22) contains the acceptance mapping and exhaustive slice inventory.
 
+Rehearsal `.4` passed at exact implementation SHA
+`922c2211c0cc7941bfc8ffa9f775ef8ac0971232`; see the
+[full online transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6346483024)
+and [offline/local runtime proof](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6346428668).
+Later documentation-only commits do not change that rehearsed implementation.
+
 ### Phase 1 implementation checklist
 
 - [x] Copy reviewed spec, plan, feasibility and schemas from `122b78664b1235c717e9208fd200f9a9b0c335df`; preserve linked historical evidence.
@@ -24,8 +30,8 @@ The phase labels on requirement headings below apply only to the reduced Phase 1
 | #1235 acceptance item                                 | Phase 1 evidence                                                                 |
 | ----------------------------------------------------- | -------------------------------------------------------------------------------- |
 | Reviewed spec and compile-time input list             | Retained R-CONFIG/R-INPUTS, this phasing section; #1262 review history           |
-| Tag publishes immutable binaries, SBOMs and checksums | release.yml caller/publisher and release-build.yml signer; rehearsal `.3` passed |
-| Provenance, SBOM predicate and asset verification     | release-verification.md; rehearsal `.3` verification passed                      |
+| Tag publishes immutable binaries, SBOMs and checksums | release.yml caller/publisher and release-build.yml signer; rehearsal `.4` passed |
+| Provenance, SBOM predicate and asset verification     | release-verification.md; rehearsal `.4` verification passed                      |
 | Fresh JS; fail missing npm/install/skip               | Existing main build.rs plus clean npm ci and release preflight                   |
 | Deploy exact bytes                                    | Manual verified Fastly package route; no reproducibility claim                   |
 | Immutable setting and protected tags                  | Maintainer gate; no setting changes by this PR                                   |

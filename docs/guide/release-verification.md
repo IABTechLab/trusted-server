@@ -142,6 +142,50 @@ publisher service, runtime configuration or deployment operation. See the
 [GitHub CLI verification reference](https://cli.github.com/manual/gh_attestation_verify)
 and [immutable asset verification reference](https://cli.github.com/manual/gh_release_verify-asset).
 
+## Verify bundles offline
+
+While online, obtain the trust roots using an independently trusted GitHub CLI
+installation. GitHub CLI 2.102.0 supports the flags below; retain its version,
+the roots and their digest with the independently approved source identity.
+Do not accept replacement roots supplied only alongside an untrusted binary.
+
+```bash
+gh --version
+gh attestation trusted-root > trusted_root.jsonl
+shasum -a 256 trusted_root.jsonl
+```
+
+Transfer the binaries, their bundles, published SPDX documents, approved source
+pins and trusted roots to the offline machine. Reuse `REPO`, `TAG`, `COMMIT`,
+`ASSETS`, `WORKFLOW` and `IDENTITY` from above. Supplying both the bundle and
+custom roots avoids network acquisition; there is no `--offline` flag.
+
+```bash
+for asset in "${ASSETS[@]}"; do
+  for kind in provenance sbom; do
+    predicate=https://slsa.dev/provenance/v1
+    if [[ "$kind" == sbom ]]; then predicate=https://spdx.dev/Document/v2.3; fi
+    checks=(--repo "$REPO" --bundle "$asset.$kind.sigstore.json"
+      --custom-trusted-root trusted_root.jsonl
+      --source-ref "refs/tags/$TAG" --source-digest "$COMMIT"
+      --signer-digest "$COMMIT" --deny-self-hosted-runners --predicate-type "$predicate")
+    gh attestation verify "$asset" "${checks[@]}" --signer-workflow "$WORKFLOW"
+    gh attestation verify "$asset" "${checks[@]}" --cert-identity "$IDENTITY" \
+      --format json > "$asset.offline-$kind-verification.json"
+    if [[ "$kind" == sbom ]]; then
+      jq -e --slurpfile document "$asset.spdx.json" \
+        'length == 1 and .[0].verificationResult.statement.predicate == $document[0]' \
+        "$asset.offline-$kind-verification.json"
+    fi
+  done
+done
+```
+
+Offline success establishes signed build evidence for those retained bytes.
+It does not establish current release membership, immutability or deployment
+authorization. Retain the separate online release and asset verification record;
+checksums alone cannot replace it.
+
 ## Use the verified CLI
 
 `cargo install-cli` builds `ts` from source. The resulting local binary is not
@@ -203,6 +247,18 @@ verified wasm, manifest, package digest, previous active version and observed
 result. No build step may replace or annotate the verified wasm. Automated
 EdgeZero prepared-payload deployment and operation recovery are later phases.
 
+### Local runtime evidence
+
+The [rehearsal runtime transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6346428668)
+records local execution of the verified Fastly wasm at
+`922c2211c0cc7941bfc8ffa9f775ef8ac0971232` using pinned Viceroy 0.21.0.
+It uses the example configuration with loopback publisher/origin values,
+public development secrets and a local Node origin fixture. A real page request
+returned HTTP 200, the fixture marker, injected JS and the full source SHA in
+`x-ts-version`. Both the wasm and the CLI used to seed local config were verified
+before execution. No Fastly service was deployed. This proves the local prebuilt
+execution route; provider submission and production operation remain separate.
+
 ## Build inputs, policy and release administration
 
 Builds use the tracked source, manifests, `Cargo.lock`, pinned Rust and Node,
@@ -210,6 +266,18 @@ the JS lockfile and fresh JS bundles. The tracked `edgezero.toml` supplies the
 logical config-store ID and participates in the template build digest. Build
 facts include the source commit. The CLI carries the fictional example-config
 scaffold, not an operator config.
+
+Release Fastly responses report `x-ts-version` as the full 40-character source
+commit supplied by the release build. Development display fallbacks are not the
+release identity. `ts --version` reports the command name `ts` and Cargo package version, not a
+source-commit field. Source identity comes from the attestation pins above.
+The executable's SHA-256 is checked externally against the retained release
+bytes; exposing that digest as a runtime build fact belongs to #161.
+
+The current compile-time input audit is recorded in the spec's Phase 1 note.
+It includes Rust 1.98.1, tracked logical IDs, the private JS build path and its
+indirect build-module options, and the locked native dependencies. It does not
+claim a complete native tool closure or hermetic build.
 
 The three policy files are carried unchanged from the frozen reviewed design.
 They have **no Phase 1 readers** and do not authorize these builds or replace
@@ -300,3 +368,41 @@ lightweight `v0.0.0-rehearsal.N` tag for each attempt and retain verification
 outputs in the release PR. Keep rehearsal tags and releases out of the upstream
 repository. For production, confirm the required settings and checks, then
 follow the maintainer release authorization process before tagging or deploying.
+
+## Maintainer settings checklist
+
+An administrator must configure these settings before a production tag. The
+commands below only inspect settings; this workflow applies none of them.
+
+- **Settings → General → Releases:** enable immutable releases. See
+  [GitHub's immutability instructions](https://docs.github.com/en/code-security/how-tos/secure-your-supply-chain/establish-provenance-and-integrity/prevent-release-changes).
+- **Settings → Rules → Rulesets → New tag ruleset:** set enforcement to **Active**,
+  target `v*` (API pattern `refs/tags/v*`), and enable **Restrict creations**,
+  **Restrict updates** and **Restrict deletions**. Add only the designated release
+  maintainers' team to the bypass list, with **Always allow** bypass. Record the
+  team's name and ID in the maintainer release record; avoid broad role bypasses.
+  See [repository ruleset configuration](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/creating-rulesets-for-a-repository).
+- Optionally require the reviewed release build checks on the source branch
+  before approving a tag. Use actual check names from that commit. A tag-triggered
+  check cannot be required to pass before creating its own tag. Source eligibility
+  and the later policy reader are not enforced by Phase 1.
+
+```bash
+REPO=IABTechLab/trusted-server
+gh api "repos/$REPO/immutable-releases"
+gh api "repos/$REPO/rulesets?includes_parents=true" \
+  --jq '.[] | {id, name, target, enforcement}'
+RULESET_ID=12345
+gh api "repos/$REPO/rulesets/$RULESET_ID?includes_parents=true" \
+  --jq '{name, target, enforcement, conditions, rules, bypass_actors}'
+gh api "repos/$REPO/commits/$COMMIT/check-runs" \
+  --jq '.check_runs[] | {name, status, conclusion}'
+```
+
+The immutable-releases endpoint must return `enabled: true`; a disabled setting
+returns HTTP 404. Inspect the ruleset's tag target, active enforcement, exact
+patterns, creation/update/deletion rules and team bypass actors. The API exposes
+bypass actors only to callers with sufficient repository access; an omitted field
+is not proof of an empty bypass list. Also review inherited rulesets. These are
+maintainer gates, not evidence that Phase 1's publication token can administer
+repository settings.

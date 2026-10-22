@@ -21,6 +21,56 @@ Native reproduction is deferred to Phase 2+, where it is measured, not a release
 
 Phase 1 publishes SPDX 2.3 for a conservative selected-Cargo-target and installed-npm-build-tree inventory, with the final binary hash. CycloneDX is only an intermediate generator format. Complete composition qualification below remains Phase 2+; Phase 1 does not claim exact retained-code or native-source closure.
 
+### Phase 1 input audit and operator evidence
+
+The Phase 1 audit against main at `f9281917a7260b723f5f22175911c6d2147ef650`
+supplements the historical input table below without changing its destination
+requirements. Source references: [core build inputs](https://github.com/IABTechLab/trusted-server/blob/f9281917a7260b723f5f22175911c6d2147ef650/crates/trusted-server-core/build.rs),
+[JS private output](https://github.com/IABTechLab/trusted-server/blob/f9281917a7260b723f5f22175911c6d2147ef650/crates/trusted-server-js/build.rs),
+[JS module options](https://github.com/IABTechLab/trusted-server/blob/f9281917a7260b723f5f22175911c6d2147ef650/crates/trusted-server-js/lib/build-all.mjs),
+[Axum dependency features](https://github.com/IABTechLab/trusted-server/blob/f9281917a7260b723f5f22175911c6d2147ef650/crates/trusted-server-adapter-axum/Cargo.toml),
+and [CLI version output](https://github.com/IABTechLab/trusted-server/blob/f9281917a7260b723f5f22175911c6d2147ef650/crates/trusted-server-cli/src/run.rs).
+
+- Rust is pinned to **1.98.1**. The tracked `Cargo.toml`, `Cargo.lock`,
+  `.cargo/config.toml`, tool pins, source tree and release profile remain inputs.
+- The two workspace build scripts are core's `build.rs` and JS's `build.rs`.
+  Core also reads `build_support/git_version.rs`, its source tree, the root
+  manifest/lockfile and tracked `edgezero.toml`. The latter supplies the logical
+  `trusted_server_config` store ID, not a physical deployment binding.
+- JS inputs include `build/bundle_set.rs`, its declared source/manifests/lockfile,
+  `lib/build-all.mjs` and its indirect `lib/build-module-options.mjs` import.
+  Fresh npm installation precedes compilation. Cargo embeds modules through
+  generated `OUT_DIR/tsjs_modules.rs` from private `OUT_DIR/tsjs-dist`;
+  `crates/trusted-server-js/dist/` is not the release input. Phase 1 rejects the development
+  `TSJS_SKIP_BUILD`, `TSJS_PREBUILT_DIR` and `TSJS_TEST` overrides.
+- Production includes also cover the GPT bootstrap, CLI consent stub, CLI ad-template collector and
+  fictional example-config scaffolds. The CLI and locked EdgeZero dependency
+  contain developer checkout fallbacks via `CARGO_MANIFEST_DIR`; removing these
+  remains a later recipe requirement. Tracked OpenRTB generated source is an
+  ordinary Rust input, not ambient protobuf generation during this build.
+- Cargo supplies package/target facts and `OUT_DIR`; core's Git resolver reads
+  source refs unless overridden. Phase 1 already supplies the validated full
+  source SHA through `TRUSTED_SERVER__GIT_VERSION`. Locked EdgeZero CLI at
+  `85d933b8044dec29fe9e4685cae194eaf0290911` additionally generates its
+  linked-adapter registry from its own manifest and feature selection.
+- Axum has no own build script or compile-time `env!`/`include_*` inputs.
+  Its normal release dependency enables core defaults only; `test-utils` is
+  dev-only. Shared logical IDs and JS inputs above remain compiled inputs;
+  application configuration and secrets are runtime inputs. This audit does
+  not claim the deferred complete native compiler/library closure.
+
+For the R-OFFLINE decision below, Phase 1 uses the guide's
+[offline bundle verification](../../guide/release-verification.md#verify-bundles-offline)
+with independently obtained roots and source pins. Offline success is build
+proof, not current official membership or deployment authorization.
+
+For #161, release Fastly `x-ts-version` is the full 40-character source commit;
+`ts --version` currently exposes the command name `ts` and Cargo package version. The executable
+digest is verified externally; exposing it at runtime remains with #161.
+The [verification guide](../../guide/release-verification.md) records these facts
+and the maintainer settings gates. Local Viceroy execution proves a local route,
+not submission to a Fastly service.
+
 **Phase 2+ retains all remaining requirements:** two-build reproducibility, confined recipes, platform qualification, authenticated tool/image acquisition, complete composition/SPDX coverage, candidate collection/index, the custom consumer, publication owner, Task 14 same-commit validation, and Cloudflare/Spin/Axum. These slices remain closed to production selection and signing until separately qualified and authorized.
 
 The phase labels on requirement headings below apply only to the reduced Phase 1 subset described above; all additional clauses and requirements marked Phase 2+ remain deferred. The original assurance profiles, custom verifier, retained evidence graph and reproduction gates do not block the first Phase 1 release. The [implementation plan](../plans/2026-10-13-attested-release-implementation.md#phasing--2026-10-22) contains the acceptance mapping and exhaustive slice inventory.

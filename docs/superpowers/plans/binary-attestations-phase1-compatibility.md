@@ -1,6 +1,6 @@
 # Phase 1 compatibility audit and approved alignment
 
-**Audit baseline:** reviewed #1262 at `122b78664b1235c717e9208fd200f9a9b0c335df` versus #1435 at `4dd217125c6e38055e4bcb2cba32c0b95e739914`. The table records the audit of those commits. The approved status below supersedes earlier implementation suggestions in the audit; work in progress is not a claim of completed release qualification. The published SBOM format is **SPDX 2.3**. Rehearsal `.3` passed at `ca902b6fe`; the rehearsal history below records earlier outcomes.
+**Audit baseline:** reviewed #1262 at `122b78664b1235c717e9208fd200f9a9b0c335df` versus #1435 at `4dd217125c6e38055e4bcb2cba32c0b95e739914`. The table records the audit of those commits. The approved status below supersedes earlier implementation suggestions in the audit; work in progress is not a claim of completed release qualification. The published SBOM format is **SPDX 2.3**. Rehearsal `.4` passed at `922c2211c`; the rehearsal history below records earlier outcomes.
 
 **Conclusion:** the original Phase 1 signer path and CycloneDX public format would have required a later breaking policy replacement. Fix those now. Phase 1 is the first implementation slice of the existing contract: retain its public names, signer/caller distinction, SPDX semantics and original policy files. Introduce no competing release-index schema or weakened consumer policy.
 
@@ -18,8 +18,8 @@ unchanged; the phasing sections describe this slice and its rehearsal outcome. T
 Phase 1 audit baseline is `4dd217125c6e38055e4bcb2cba32c0b95e739914`; the
 following corrections are implemented in this slice, with verification and
 rehearsal tracked in the PR description at its current commit. Signing and
-immutable publication rehearsal `.3` passed at `ca902b6fe`; see the
-[full verification transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6343374330).
+immutable publication rehearsal `.4` passed at `922c2211c`; see the
+[full verification transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6346483024).
 
 The current correction aligns the local input-free `release-build.yml` signer
 with the `release.yml` caller/publisher, real SPDX 2.3 documents, all eight
@@ -131,5 +131,19 @@ qualified evidence.
   signer identity checks for each binary, checksums and SPDX predicate equality;
   see the [full verification transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6343374330).
 
-The immutable `.2` and `.3` releases remain intact; no drafts remain from
+- `v0.0.0-rehearsal.4` at `922c2211c0cc7941bfc8ffa9f775ef8ac0971232`:
+  all four builds, signing, immutable publication and post-publish checks passed.
+  Independent GitHub CLI 2.102.0 verification passed all 17 asset checks,
+  checksums, both predicates and signer checks, and SPDX equality. Offline
+  verification also passed with OS-enforced network denial; pinned Viceroy 0.21.0
+  served a configured page from the verified wasm with the exact source header.
+  See the [online transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6346483024)
+  and [offline/local runtime proof](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6346428668).
+  Bounded read-only retries were present, but no transient retry was observed.
+
+The exact rehearsed implementation SHA above is retained even when later
+commits change documentation only. This documentation update does not change
+workflows, scripts, tests or release bytes.
+
+The immutable `.2`, `.3` and `.4` releases remain intact; no drafts remain from
 these rehearsals. No upstream tags, releases or repository settings were changed.
