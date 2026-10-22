@@ -721,6 +721,33 @@ are fixed, with no relocated entropy warning or open release-tool finding.
 Existing core/adapter/JS baseline findings are separate. This is security
 acceptance of the entropy correction, not candidate-build qualification.
 
+Cargo 1.98 compatibility (2026-10-22): run `39725113066` rejects canonical
+Linux (`119647122855`) and Fastly (`119647122894`) candidates solely because a
+`registry` directory exists in their private Cargo homes. Source review of
+Cargo's 1.98 registry constructor and source-replacement loader shows that the
+original registry is initialized before replacement with the vendor source.
+Its backup-exclusion helper may create an empty directory or the exact
+177-byte `CACHEDIR.TAG`, without fetching registry data. Directory presence
+alone therefore cannot establish a source bypass.
+
+The recipe now admits only an absent registry, a direct empty directory or a
+direct directory holding only that exact tag. A held directory and matching
+before/after inode and metadata checks bind inspection; the existing bounded
+no-follow hasher requires a stable, single-link regular tag with the exact size
+and SHA-256. Registry `index`, `cache`, `src`, unexpected children, aliases,
+changed tags and all Git state remain rejected. No state is deleted or repaired;
+offline execution, source replacement and verified package-origin joins remain
+unchanged. The tag's upstream URL is runtime compatibility bytes, with a narrowly
+reviewed domain suppression; it is never fetched.
+
+The empty-directory regression first fails at the former presence-only gate,
+then passes. Verification selects 177 pure tests, including eight dedicated
+bookkeeping cases and 13 recipe tool tests, with nonzero-selection guards.
+Strict host-target clippy, documentation and read-only workspace formatting
+pass. Independent specification/security and code-quality reviews find no
+blockers. Actual candidate builds and their receipts still require hosted
+validation after this correction.
+
 ### Task 11: Generate complete artifact-specific SPDX
 
 JavaScript declaration guard (2026-10-22): projected JavaScript facts contain no

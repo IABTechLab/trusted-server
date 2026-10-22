@@ -254,6 +254,19 @@ fn tools_edited_after_binding_are_rejected_at_the_execute_gate() {
 }
 
 #[test]
+fn cargo_registry_bookkeeping_directory_is_not_a_fetched_source_cache() {
+    let fixture = Fixture::new(COMMIT);
+    let prepared = fixture
+        .bind("ts-aarch64-apple-darwin", Role::Canonical)
+        .expect("should bind the recipe");
+    fs::create_dir(fixture.base.join("cargo-state/cargo-home/registry"))
+        .expect("should create the registry bookkeeping directory");
+    prepared
+        .check_no_fetched_sources()
+        .expect("should accept the empty registry directory created before source replacement");
+}
+
+#[test]
 fn handoff_edits_and_cargo_home_caches_are_rejected_around_the_run() {
     let fixture = Fixture::new(COMMIT);
     let retained = fixture.retained();
@@ -287,6 +300,9 @@ fn handoff_edits_and_cargo_home_caches_are_rejected_around_the_run() {
     for cache in ["registry", "git"] {
         let path = fixture.base.join("cargo-state/cargo-home").join(cache);
         fs::create_dir(&path).expect("should create a Cargo cache");
+        if cache == "registry" {
+            fs::create_dir(path.join("index")).expect("should create fetched registry state");
+        }
         assert!(
             format!(
                 "{:?}",
@@ -297,7 +313,7 @@ fn handoff_edits_and_cargo_home_caches_are_rejected_around_the_run() {
             .contains(&format!("holds a {cache} cache")),
             "should name the {cache} cache"
         );
-        fs::remove_dir(&path).expect("should remove the Cargo cache");
+        fs::remove_dir_all(&path).expect("should remove the Cargo cache");
     }
 }
 

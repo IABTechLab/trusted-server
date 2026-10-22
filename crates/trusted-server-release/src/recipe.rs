@@ -41,6 +41,7 @@ use fresh::{
 mod ambient;
 mod apple;
 mod artifact;
+mod cargo_home;
 mod cargo_output;
 mod compare;
 mod completed;

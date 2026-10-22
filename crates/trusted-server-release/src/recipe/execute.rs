@@ -1,7 +1,7 @@
 //! The confined run of a bound recipe and the checks around it.
 //!
 //! Every input is rehashed immediately before and after the confined Cargo
-//! process, Cargo home must gain no registry or Git cache, and only a
+//! process, Cargo home must gain no fetched registry or Git sources, and only a
 //! successful run is parsed, copied and bound into a [`RecipeCompleted`].
 
 use std::path::Path;
@@ -168,26 +168,11 @@ impl PreparedRecipe {
 
     /// Requires Cargo's private home to hold no registry or Git cache.
     ///
-    /// Every dependency comes from the vendored directory source, so a cache
-    /// appearing in Cargo home means Cargo resolved something elsewhere.
+    /// Cargo may initialize its registry directory and cache tag before source
+    /// replacement. Only that exact bookkeeping is admitted; source/cache/index
+    /// entries and every Git cache remain forbidden.
     pub(super) fn check_no_fetched_sources(&self) -> Result<(), Report<ReleaseError>> {
-        let cargo_home = self.request.cargo_home();
-        for name in ["registry", "git"] {
-            match std::fs::symlink_metadata(cargo_home.join(name)) {
-                Ok(_) => {
-                    return Err(recipe_error(format!(
-                        "Cargo home holds a {name} cache; the build bypassed the vendored sources"
-                    )));
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    return Err(recipe_error(format!(
-                        "Cargo home {name} cache cannot be inspected: {error}"
-                    )));
-                }
-            }
-        }
-        Ok(())
+        super::cargo_home::check(&self.request.cargo_home(), &|| Ok(()))
     }
 
     /// Requires unchanged inputs, a derivable plan, the exact planned roots
@@ -228,7 +213,7 @@ impl PreparedRecipe {
     /// unqualified CI evidence; production builds can name no selection, so
     /// their gate stays closed. The JS handoff, tools and materials are
     /// rehashed immediately before and after the run, and Cargo home must
-    /// gain no registry or Git cache.
+    /// gain no fetched sources beyond exact Cargo registry bookkeeping.
     ///
     /// # Errors
     ///
