@@ -6220,15 +6220,145 @@ mod tests {
             .iter()
             .find(|(name, _)| name == "cookie")
             .map(|(_, value)| value.as_str());
-        assert_eq!(first_cookie, Some("consent=keep; other=value"));
+        assert_eq!(first_cookie, None, "should omit cookies in openrtb_only");
         let second_cookie = headers[1]
             .iter()
             .find(|(name, _)| name == "cookie")
             .map(|(_, value)| value.as_str());
-        assert_eq!(
-            second_cookie,
-            Some("consent=keep; euconsent-v2=drop; other=value")
-        );
+        assert_eq!(second_cookie, Some("euconsent-v2=drop"));
+    }
+
+    #[tokio::test]
+    async fn planned_prebid_cookie_modes_preserve_body_consent_policy() {
+        for (mode, forwards_body, forwards_cookies) in [
+            ("both", true, true),
+            ("cookies_only", false, true),
+            ("openrtb_only", true, false),
+        ] {
+            for source in [
+                crate::consent::ConsentSource::Cookie,
+                crate::consent::ConsentSource::PolicyDefault,
+            ] {
+                for (cookie, allowed_cookie) in [
+                    (
+                        Some(http::HeaderValue::from_static(
+                            "euconsent-v2=fictional-tcf; __gpp=fictional-gpp; __gpp_sid=2,6; us_privacy=1YNN; ts-ec=secret; ts-eids=secret; sharedId=secret; session=secret",
+                        )),
+                        Some(
+                            "euconsent-v2=fictional-tcf; __gpp=fictional-gpp; __gpp_sid=2,6; us_privacy=1YNN",
+                        ),
+                    ),
+                    (
+                        Some(
+                            http::HeaderValue::from_bytes(
+                                b"euconsent-v2=fictional-tcf; session=secret;\xffbroken",
+                            )
+                            .expect("should build malformed header"),
+                        ),
+                        None,
+                    ),
+                    (
+                        Some(http::HeaderValue::from_static(
+                            "session=secret; ts-ec=secret",
+                        )),
+                        None,
+                    ),
+                    (None, None),
+                ] {
+                    let http = Arc::new(StubHttpClient::new());
+                    http.push_response(204, Vec::new());
+                    let services = build_services_with_http_client(Arc::clone(&http) as Arc<_>);
+                    let plan = AuctionPlan::compile(planned_prebid_config(&[(
+                        "pbs",
+                        serde_json::json!({"consent_forwarding":mode}),
+                        NotificationConfig::default(),
+                    )]))
+                    .expect("should compile PBS plan");
+                    let orchestrator = AuctionOrchestratorHarness::new(plan, None);
+                    let mut request = planned_prebid_request();
+                    request.user.consent = Some(crate::consent::ConsentContext {
+                        source,
+                        gdpr_applies: true,
+                        raw_tc_string: Some("fictional-tcf".to_string()),
+                        raw_gpp_string: Some("fictional-gpp".to_string()),
+                        gpp_section_ids: Some(vec![2, 6]),
+                        raw_us_privacy: Some("1YNN".to_string()),
+                        raw_ac_string: Some("fictional-ac".to_string()),
+                        ..Default::default()
+                    });
+                    let settings = create_test_settings();
+                    let mut inbound = http::Request::new(edgezero_core::body::Body::empty());
+                    if let Some(cookie) = cookie {
+                        inbound.headers_mut().append(http::header::COOKIE, cookie);
+                        // A second Cookie field cannot bypass the selected-header policy.
+                        inbound.headers_mut().append(
+                            http::header::COOKIE,
+                            http::HeaderValue::from_static("session=second-secret"),
+                        );
+                    }
+                    let context = AuctionContext {
+                        settings: &settings,
+                        request: &inbound,
+                        timeout_ms: 777,
+                        transport_timeout_ms: 777,
+                        provider_responses: None,
+                        services: &services,
+                    };
+
+                    orchestrator
+                        .run_auction(&request, &context)
+                        .await
+                        .expect("should run PBS auction");
+
+                    let headers = http.recorded_request_header_bytes();
+                    assert_eq!(headers.len(), 1, "should dispatch one PBS request");
+                    let cookies = headers[0]
+                        .iter()
+                        .filter(|(name, _)| name.eq_ignore_ascii_case("cookie"))
+                        .map(|(_, value)| value.as_slice())
+                        .collect::<Vec<_>>();
+                    let expected = if forwards_cookies {
+                        allowed_cookie
+                    } else {
+                        None
+                    };
+                    assert_eq!(
+                        cookies,
+                        expected
+                            .map(|value| vec![value.as_bytes()])
+                            .unwrap_or_default(),
+                        "should apply {mode} cookie policy"
+                    );
+                    let bodies = http.recorded_request_bodies();
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&bodies[0]).expect("should parse PBS body");
+                    let includes_body =
+                        forwards_body || source == crate::consent::ConsentSource::PolicyDefault;
+                    for (pointer, value) in [
+                        ("/user/consent", serde_json::json!("fictional-tcf")),
+                        ("/user/ext/consent", serde_json::json!("fictional-tcf")),
+                        (
+                            "/user/ext/ConsentedProvidersSettings/consented_providers",
+                            serde_json::json!("fictional-ac"),
+                        ),
+                        ("/regs/gdpr", serde_json::json!(1)),
+                        ("/regs/gpp", serde_json::json!("fictional-gpp")),
+                        ("/regs/gpp_sid", serde_json::json!([2, 6])),
+                        ("/regs/us_privacy", serde_json::json!("1YNN")),
+                        ("/regs/ext/gdpr", serde_json::json!(1)),
+                        ("/regs/ext/gpp", serde_json::json!("fictional-gpp")),
+                        ("/regs/ext/gpp_sid", serde_json::json!([2, 6])),
+                        ("/regs/ext/us_privacy", serde_json::json!("1YNN")),
+                    ] {
+                        assert_eq!(
+                            body.pointer(pointer),
+                            includes_body.then_some(&value),
+                            "should preserve {mode} body policy at {pointer} for {source:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]

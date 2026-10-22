@@ -36,7 +36,8 @@ use crate::auction::types::{AuctionContext, AuctionRequest, MediaType};
 use crate::auction::types::{AuctionResponse, Bid as AuctionBid};
 use crate::cache_policy::{CacheControlPolicy, EdgeCacheHeader};
 use crate::consent_config::ConsentForwardingMode;
-use crate::cookies::{CONSENT_COOKIE_NAMES, strip_cookies};
+use crate::constants::COOKIE_GPP_SID;
+use crate::cookies::CONSENT_COOKIE_NAMES;
 use crate::error::TrustedServerError;
 #[cfg(test)]
 use crate::http_util::RequestInfo;
@@ -462,9 +463,9 @@ pub struct LegacyPrebidServerConfig {
     pub bid_param_override_rules: Vec<BidParamOverrideRule>,
     /// How consent signals are forwarded to Prebid Server.
     ///
-    /// - `openrtb_only` — consent in `OpenRTB` body only, consent cookies stripped
-    /// - `cookies_only` — consent cookies forwarded, body consent fields omitted
-    /// - `both` — consent in both cookies and body (default)
+    /// - `openrtb_only` — consent in `OpenRTB` body only, no `Cookie` header
+    /// - `cookies_only` — allowlisted consent cookies; cookie-sourced body consent omitted
+    /// - `both` — allowlisted consent cookies and body consent (default)
     #[serde(default)]
     pub consent_forwarding: ConsentForwardingMode,
     /// Strip `nurl` and `burl` from PBS bids before they reach `window.tsjs.bids`.
@@ -2016,9 +2017,8 @@ fn non_empty_override_object(
 /// synthesized from `client_ip` — the platform-attested client address —
 /// matching the trusted IP already sent in `OpenRTB` `device.ip`.
 ///
-/// In [`ConsentForwardingMode::OpenrtbOnly`] mode, consent cookies are
-/// stripped from the `Cookie` header since consent travels exclusively
-/// through the `OpenRTB` body.
+/// Only allowlisted consent cookies can reach PBS. In
+/// [`ConsentForwardingMode::OpenrtbOnly`] mode, the `Cookie` header is omitted.
 #[cfg(test)]
 fn copy_request_headers(
     from: &http::Request<EdgeBody>,
@@ -2037,7 +2037,7 @@ fn copy_request_headers(
     );
 }
 
-/// Apply the common raw-header transport policy for a planned PBS request.
+/// Applies the common browser-header and consent-cookie policy for PBS.
 pub(crate) fn apply_prebid_transport_headers(
     from: &PrebidTransportHeaders,
     to: &mut http::Request<EdgeBody>,
@@ -2085,28 +2085,48 @@ fn apply_prebid_header_values(
             .insert(header::HeaderName::from_static("x-forwarded-for"), value);
     }
 
-    let Some(cookie_value) = cookie else {
+    // Rebuild the destination header so no stale or arbitrary cookies survive.
+    to.headers_mut().remove(header::COOKIE);
+    if consent_forwarding == ConsentForwardingMode::OpenrtbOnly {
+        return;
+    }
+    let Some(cookie_header) = cookie.and_then(|value| value.to_str().ok()) else {
         return;
     };
-    if !consent_forwarding.strips_consent_cookies() {
-        to.headers_mut()
-            .insert(header::COOKIE, cookie_value.clone());
-        return;
+    let filtered = cookie_header
+        .split(';')
+        .map(str::trim)
+        .filter(|pair| {
+            let Some((name, value)) = pair.split_once('=') else {
+                return false;
+            };
+            CONSENT_COOKIE_NAMES.contains(&name) && valid_prebid_cookie_value(name, value)
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    if !filtered.is_empty()
+        && let Ok(value) = HeaderValue::from_str(&filtered)
+    {
+        to.headers_mut().insert(header::COOKIE, value);
     }
-    match cookie_value.to_str() {
-        Ok(value) => {
-            let stripped = strip_cookies(value, CONSENT_COOKIE_NAMES);
-            if !stripped.is_empty()
-                && let Ok(cookie_header) = HeaderValue::from_str(&stripped)
-            {
-                to.headers_mut().insert(header::COOKIE, cookie_header);
-            }
-        }
-        Err(_) => {
-            to.headers_mut()
-                .insert(header::COOKIE, cookie_value.clone());
-        }
+}
+
+/// Validates cookie framing without interpreting or modifying consent signals.
+fn valid_prebid_cookie_value(name: &str, value: &str) -> bool {
+    let value = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(value);
+    // GPP section IDs use comma-separated decimals, already accepted by consent extraction.
+    if name == COOKIE_GPP_SID && value.contains(',') {
+        return value.split(',').all(|section| {
+            !section.is_empty() && section.bytes().all(|byte| byte.is_ascii_digit())
+        });
     }
+    // RFC 6265 cookie-octet excludes whitespace, quotes, commas, semicolons and backslashes.
+    value
+        .bytes()
+        .all(|byte| matches!(byte, 0x21 | 0x23..=0x2b | 0x2d..=0x3a | 0x3c..=0x5b | 0x5d..=0x7e))
 }
 
 /// Appends query parameters to a URL, handling both URLs with and without existing query strings.
@@ -9732,7 +9752,7 @@ set = { networkId = 42 }
     }
 
     #[test]
-    fn planned_transport_preserves_malformed_cookie_bytes_and_attested_xff() {
+    fn planned_transport_omits_malformed_cookie_bytes_and_preserves_attested_xff() {
         let inbound = http::Request::builder()
             .uri("https://publisher.example/auction")
             .header(
@@ -9776,8 +9796,8 @@ set = { networkId = 42 }
                 .headers()
                 .get(header::COOKIE)
                 .map(HeaderValue::as_bytes),
-            Some(b"session=fictional;\xffbroken".as_slice()),
-            "should forward malformed cookie bytes unchanged"
+            None,
+            "should omit malformed cookie bytes"
         );
         assert_eq!(
             outbound
@@ -9787,6 +9807,108 @@ set = { networkId = 42 }
             Some("203.0.113.9"),
             "should use only attested XFF"
         );
+    }
+
+    #[test]
+    fn prebid_cookie_policy_rebuilds_only_valid_consent_pairs() {
+        for mode in [
+            ConsentForwardingMode::Both,
+            ConsentForwardingMode::CookiesOnly,
+            ConsentForwardingMode::OpenrtbOnly,
+        ] {
+            for (input, allowed) in [
+                (None, None),
+                (Some(""), None),
+                (
+                    Some("ts-ec=secret; ts-eids=secret; sharedId=secret; session=secret"),
+                    None,
+                ),
+                (
+                    Some(
+                        "EUCONSENT-V2=secret; x__gpp=secret; __gpp_sid_extra=secret; us_privacy_extra=secret; euconsent-v2 =secret",
+                    ),
+                    None,
+                ),
+                (
+                    Some(
+                        "euconsent-v2; =secret; __gpp=bad value; __gpp_sid=2,session=secret; us_privacy=bad,session=secret; __gpp_sid=\"unterminated",
+                    ),
+                    None,
+                ),
+                (
+                    Some("euconsent-v2=bad\\value; __gpp=bad\"quote; us_privacy=bad\tvalue"),
+                    None,
+                ),
+                (
+                    Some(
+                        " session=secret ; euconsent-v2=TC==; __gpp=GPP; __gpp_sid=2,6; us_privacy=1YNN",
+                    ),
+                    Some("euconsent-v2=TC==; __gpp=GPP; __gpp_sid=2,6; us_privacy=1YNN"),
+                ),
+                (
+                    Some("euconsent-v2=\"TC==\"; __gpp=; __gpp_sid=2; us_privacy=1YNN"),
+                    Some("euconsent-v2=\"TC==\"; __gpp=; __gpp_sid=2; us_privacy=1YNN"),
+                ),
+                (
+                    Some("__gpp=first; session=secret; __gpp=second"),
+                    Some("__gpp=first; __gpp=second"),
+                ),
+            ] {
+                let mut inbound = http::Request::new(EdgeBody::empty());
+                if let Some(input) = input {
+                    inbound.headers_mut().insert(
+                        header::COOKIE,
+                        HeaderValue::from_str(input).expect("should build cookie header"),
+                    );
+                }
+                let mut outbound = http::Request::new(EdgeBody::empty());
+                outbound
+                    .headers_mut()
+                    .append(header::COOKIE, HeaderValue::from_static("stale=secret"));
+                outbound
+                    .headers_mut()
+                    .append(header::COOKIE, HeaderValue::from_static("another=secret"));
+
+                copy_request_headers(&inbound, &mut outbound, mode, None);
+
+                let expected = if mode == ConsentForwardingMode::OpenrtbOnly {
+                    None
+                } else {
+                    allowed
+                };
+                assert_eq!(
+                    outbound
+                        .headers()
+                        .get(header::COOKIE)
+                        .and_then(|value| value.to_str().ok()),
+                    expected,
+                    "should rebuild only valid allowed pairs for {mode:?} with {input:?}"
+                );
+                assert_eq!(
+                    outbound.headers().get_all(header::COOKIE).iter().count(),
+                    usize::from(expected.is_some()),
+                    "should remove stale destination cookies"
+                );
+            }
+            for bytes in [
+                b"euconsent-v2=TC; session=secret;\xffbroken".as_slice(),
+                b"__gpp=GPP;\xc3\xa9=secret".as_slice(),
+            ] {
+                let mut inbound = http::Request::new(EdgeBody::empty());
+                inbound.headers_mut().insert(
+                    header::COOKIE,
+                    HeaderValue::from_bytes(bytes).expect("should build non-ASCII header"),
+                );
+                let mut outbound = http::Request::new(EdgeBody::empty());
+
+                copy_request_headers(&inbound, &mut outbound, mode, None);
+
+                assert!(
+                    !outbound.headers().contains_key(header::COOKIE),
+                    "should omit unreadable headers in {mode:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -9858,17 +9980,17 @@ set = { networkId = 42 }
             (
                 ConsentForwardingMode::Both,
                 HeaderValue::from_static("session=fictional; euconsent-v2=fictional-tcf"),
-                Some(b"session=fictional; euconsent-v2=fictional-tcf".as_slice()),
+                Some(b"euconsent-v2=fictional-tcf".as_slice()),
             ),
             (
                 ConsentForwardingMode::CookiesOnly,
                 HeaderValue::from_static("session=fictional; euconsent-v2=fictional-tcf"),
-                Some(b"session=fictional; euconsent-v2=fictional-tcf".as_slice()),
+                Some(b"euconsent-v2=fictional-tcf".as_slice()),
             ),
             (
                 ConsentForwardingMode::OpenrtbOnly,
                 HeaderValue::from_static("session=fictional; euconsent-v2=fictional-tcf"),
-                Some(b"session=fictional".as_slice()),
+                None,
             ),
             (
                 ConsentForwardingMode::OpenrtbOnly,
@@ -9879,7 +10001,7 @@ set = { networkId = 42 }
                 ConsentForwardingMode::OpenrtbOnly,
                 HeaderValue::from_bytes(b"session=fictional;\xffbroken")
                     .expect("should build malformed cookie header"),
-                Some(b"session=fictional;\xffbroken".as_slice()),
+                None,
             ),
         ] {
             let stub = Arc::new(StubHttpClient::new());

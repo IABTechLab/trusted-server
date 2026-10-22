@@ -16,9 +16,9 @@ use crate::error::TrustedServerError;
 
 /// Cookie names carrying privacy consent signals.
 ///
-/// Used by [`strip_cookies`] to remove consent signals from a `Cookie` header
-/// before forwarding requests to partners that receive consent through the
-/// `OpenRTB` body instead.
+/// Used as the PBS consent-cookie allowlist and by [`strip_cookies`] when
+/// removing consent signals. PBS omits the entire `Cookie` header when
+/// consent is sent exclusively through the `OpenRTB` body.
 pub const CONSENT_COOKIE_NAMES: &[&str] = &[
     COOKIE_EUCONSENT_V2,
     COOKIE_GPP,
