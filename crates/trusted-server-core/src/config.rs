@@ -13,6 +13,7 @@ use error_stack::Report;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use validator::{Validate, ValidationError, ValidationErrors};
 
+use crate::ec::identity::config::validate_identity_settings;
 use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
 use crate::integrations::{
@@ -32,7 +33,7 @@ use crate::integrations::{
     sourcepoint::SourcepointConfig,
     testlight::TestlightConfig,
 };
-use crate::settings::{AssetOriginAuth, IntegrationConfig, Settings};
+use crate::settings::{AssetOriginAuth, Ec, IntegrationConfig, Settings};
 
 const DEPLOY_VALIDATION_FIELD: &str = "trusted_server";
 #[cfg(test)]
@@ -258,6 +259,7 @@ pub fn validate_settings_for_deploy(settings: &Settings) -> Result<(), Report<Tr
     let plan = crate::auction::compile_auction_plan(settings)?;
     validate_enabled_integrations(settings, &plan, false)?;
     PartnerRegistry::validate_config_for_deploy(&settings.ec.partners)?;
+    validate_identity_settings(&settings.ec.identity)?;
     Ok(())
 }
 
@@ -276,6 +278,14 @@ pub fn validate_settings_for_runtime(
     let plan = crate::auction::compile_auction_plan(settings)?;
     validate_enabled_integrations(settings, &plan, true)?;
     PartnerRegistry::from_config(&settings.ec.partners).map(|_| ())?;
+    validate_identity_settings(&settings.ec.identity)?;
+    if settings.ec.identity.max_concurrency.is_none()
+        && settings.ec.pull_sync_concurrency != Ec::default_pull_sync_concurrency()
+    {
+        log::warn!(
+            "ec.pull_sync_concurrency is deprecated; set [ec.identity].max_concurrency instead"
+        );
+    }
     Ok(())
 }
 

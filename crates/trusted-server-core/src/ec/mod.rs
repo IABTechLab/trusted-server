@@ -41,6 +41,7 @@ pub mod eids;
 pub mod finalize;
 pub mod generation;
 pub mod identify;
+pub mod identity;
 pub mod kv;
 pub mod kv_backend;
 pub mod kv_types;
@@ -283,6 +284,10 @@ pub struct EcContext {
     pull_sync_marker: PullSyncMarkerState,
     /// Allowed returning-user EID persistence source, assigned only after request filters pass.
     eid_sync_source: Option<EidSyncSource>,
+    /// Request-scoped identity provider state: the writer decision, phase-1
+    /// signals, the identity cookies, the single mutation and the cookies
+    /// this response sets.
+    identity: identity::request::RequestIdentity,
 }
 
 impl EcContext {
@@ -365,6 +370,7 @@ impl EcContext {
             client_eids: None,
             pull_sync_marker: PullSyncMarkerState::from_cookie(parsed.pull_sync_marker),
             eid_sync_source: None,
+            identity: identity::request::RequestIdentity::capture(req.headers()),
         })
     }
 
@@ -419,6 +425,9 @@ impl EcContext {
                 .device_signals
                 .as_ref()
                 .map(DeviceSignals::to_kv_device);
+            // The create carries the request's browser ingest, so it is the
+            // page load's one write.
+            kv::apply_partner_id_updates(&mut entry, self.identity.seed());
 
             if let Some(graph) = kv {
                 match graph.create_if_absent(&ec_id, &entry) {
@@ -648,6 +657,57 @@ impl EcContext {
         self.ec_value.as_deref().map(generation::ec_hash)
     }
 
+    /// Request-scoped identity provider state.
+    #[must_use]
+    pub(crate) fn identity(&self) -> &identity::request::RequestIdentity {
+        &self.identity
+    }
+
+    /// Request-scoped identity provider state, to change it.
+    pub(crate) fn identity_mut(&mut self) -> &mut identity::request::RequestIdentity {
+        &mut self.identity
+    }
+
+    /// Prepares a new visitor's create to carry the browser EIDs of the
+    /// `ts-eids` and `sharedId` cookies, consent-gated. Call before
+    /// [`Self::generate_if_needed`].
+    pub fn seed_generation_from_cookies(
+        &mut self,
+        registry: &registry::PartnerRegistry,
+        eids_cookie: Option<&str>,
+        sharedid_cookie: Option<&str>,
+    ) {
+        if self.ec_value.is_some() {
+            return;
+        }
+        let seed =
+            finalize::browser_seed_updates(registry, &self.consent, eids_cookie, sharedid_cookie);
+        self.identity.set_seed(seed);
+    }
+
+    /// Decides whether this request is the page load's identity writer.
+    ///
+    /// Call once pre-route filters have allowed dispatch, where routing
+    /// decides EC generation. The writer is an organic route (the publisher
+    /// fallback or an integration proxy), a `Sec-Fetch-Dest: document`
+    /// navigation that is not a prefetch, from a real browser. It also records
+    /// the page URL for providers.
+    pub fn decide_writer(
+        &mut self,
+        req: &Request<EdgeBody>,
+        organic_route: bool,
+        is_real_browser: bool,
+    ) {
+        let writer = organic_route
+            && is_real_browser
+            && crate::http_util::is_document_navigation(req)
+            && !crate::http_util::is_prefetch_request(req);
+        self.identity.set_writer(writer);
+        if writer && let Ok(url) = url::Url::parse(&req.uri().to_string()) {
+            self.identity.set_page_url(url);
+        }
+    }
+
     /// Creates a test-only `EcContext` with explicit field values.
     #[cfg(test)]
     #[must_use]
@@ -666,6 +726,7 @@ impl EcContext {
             client_eids: None,
             pull_sync_marker: PullSyncMarkerState::Absent,
             eid_sync_source: None,
+            identity: identity::request::RequestIdentity::default(),
         }
     }
 
@@ -691,6 +752,7 @@ impl EcContext {
             client_eids: None,
             pull_sync_marker: PullSyncMarkerState::Absent,
             eid_sync_source: None,
+            identity: identity::request::RequestIdentity::default(),
         }
     }
 
@@ -719,6 +781,7 @@ impl EcContext {
             client_eids: None,
             pull_sync_marker: PullSyncMarkerState::Absent,
             eid_sync_source: None,
+            identity: identity::request::RequestIdentity::default(),
         }
     }
 }
@@ -773,6 +836,127 @@ mod tests {
     };
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::create_test_settings;
+
+    fn navigation_request() -> Request<EdgeBody> {
+        Request::builder()
+            .uri("https://www.example.com/a?b=c#d")
+            .header("sec-fetch-dest", "document")
+            .header(http::header::USER_AGENT, "ExampleBrowser/1.0")
+            .header("dnt", "1")
+            .header(
+                http::header::COOKIE,
+                "__Host-ts-eids-s=v1.a.b; __Host-ts-eids-r-0a1b2c3d=v1.c.d",
+            )
+            .body(EdgeBody::empty())
+            .expect("should build request")
+    }
+
+    #[test]
+    fn new_visitor_create_carries_the_browser_seed_in_one_write() {
+        let settings = create_test_settings();
+        let (graph, counter) = kv::KvIdentityGraph::write_counting("ec-store");
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::NonRegulated,
+            source: ConsentSource::Cookie,
+            ..ConsentContext::default()
+        };
+        let mut context =
+            EcContext::new_for_test_with_ip(None, consent, Some("192.0.2.10".to_owned()));
+        let registry = registry::PartnerRegistry::from_config(&[crate::settings::EcPartner {
+            name: "Shared".to_owned(),
+            source_domain: "sharedid.org".to_owned(),
+            openrtb_atype: crate::settings::EcPartner::default_openrtb_atype(),
+            bidstream_enabled: true,
+            api_token: None,
+            batch_rate_limit: crate::settings::EcPartner::default_batch_rate_limit(),
+            pull_sync_enabled: false,
+            pull_sync_url: None,
+            pull_sync_allowed_domains: vec![],
+            pull_sync_ttl_sec: crate::settings::EcPartner::default_pull_sync_ttl_sec(),
+            pull_sync_rate_limit: crate::settings::EcPartner::default_pull_sync_rate_limit(),
+            ts_pull_token: None,
+        }])
+        .expect("should build registry");
+
+        context.seed_generation_from_cookies(&registry, None, Some("shared-cookie-id"));
+        context
+            .generate_if_needed(&settings, Some(&graph))
+            .expect("should generate");
+
+        let ec_id = context
+            .ec_value()
+            .expect("should hold the new EC")
+            .to_owned();
+        let (stored, _) = graph
+            .get(&ec_id)
+            .expect("should read")
+            .expect("should exist");
+        assert_eq!(
+            stored
+                .ids
+                .get("sharedid.org")
+                .map(|record| record.uid.as_str()),
+            Some("shared-cookie-id"),
+            "the create carries the sharedId cookie"
+        );
+        assert_eq!(counter.writes().total(), 1, "one write: the create");
+        assert_eq!(counter.writes().add, 1, "an Add");
+    }
+
+    #[test]
+    fn decide_writer_needs_every_condition() {
+        let mut context = EcContext::default();
+        context.decide_writer(&navigation_request(), true, true);
+        assert!(
+            context.identity().writer(),
+            "organic real-browser document navigation"
+        );
+        assert_eq!(
+            context.identity().page_url().map(url::Url::as_str),
+            Some("https://www.example.com/a"),
+            "the page URL has no query or fragment"
+        );
+
+        let prefetch = Request::builder()
+            .header("sec-fetch-dest", "document")
+            .header("sec-purpose", "prefetch")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        let accept_only = Request::builder()
+            .header(http::header::ACCEPT, "text/html")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        for (name, organic, browser, request) in [
+            ("named route", false, true, navigation_request()),
+            ("bot", true, false, navigation_request()),
+            ("prefetch", true, true, prefetch),
+            ("no Sec-Fetch-Dest", true, true, accept_only),
+        ] {
+            let mut context = EcContext::default();
+            context.decide_writer(&request, organic, browser);
+            assert!(!context.identity().writer(), "not a writer: {name}");
+        }
+    }
+
+    #[test]
+    fn read_from_request_captures_identity_signals() {
+        let settings = create_test_settings();
+        let context =
+            EcContext::read_from_request(&settings, &navigation_request(), &noop_services())
+                .expect("should read the request");
+        let identity = context.identity();
+        assert_eq!(
+            identity.user_agent(),
+            Some("ExampleBrowser/1.0"),
+            "captures the user agent"
+        );
+        assert!(identity.dnt(), "captures DNT");
+        assert!(
+            identity.raw_cookies().has_any(),
+            "captures the raw identity cookies"
+        );
+        assert!(!identity.writer(), "reading alone never makes a writer");
+    }
 
     /// [`EcKvStore`] wrapper whose first `collisions` `Add` writes report a
     /// precondition failure, forcing generation to retry with a fresh suffix.

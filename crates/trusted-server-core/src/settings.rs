@@ -549,8 +549,15 @@ pub struct Ec {
     pub ec_store: Option<String>,
 
     /// Maximum number of concurrent pull-sync requests.
+    ///
+    /// Deprecated: use `[ec.identity].max_concurrency`. A value other than
+    /// the default is still honoured when that key is unset.
     #[serde(default = "Ec::default_pull_sync_concurrency")]
     pub pull_sync_concurrency: usize,
+
+    /// Server-side identity provider policy (`[ec.identity]`).
+    #[serde(default)]
+    pub identity: crate::ec::identity::config::IdentitySettings,
 
     /// Entries with `cluster_size` at or below this value are treated as
     /// individual users for identity resolution. B2B publishers should

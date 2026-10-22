@@ -2,7 +2,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::constants::{COOKIE_SHAREDID, COOKIE_TS_EC, COOKIE_TS_EIDS};
+use crate::constants::{
+    COOKIE_SHAREDID, COOKIE_TS_EC, COOKIE_TS_EIDS, COOKIE_TS_EIDS_R_PREFIX, COOKIE_TS_EIDS_S,
+};
 use crate::platform::TemplateCookieValue;
 
 /// Whether the request can share a template and its explicit cookie dimensions.
@@ -32,7 +34,14 @@ pub(crate) fn validate_cookie_names(
                 return Err(format!("{field} contains invalid cookie name `{name}`"));
             }
             if field == "template_cache_key_cookies"
-                && [COOKIE_TS_EC, COOKIE_TS_EIDS, COOKIE_SHAREDID].contains(&name.as_str())
+                && ([
+                    COOKIE_TS_EC,
+                    COOKIE_TS_EIDS,
+                    COOKIE_TS_EIDS_S,
+                    COOKIE_SHAREDID,
+                ]
+                .contains(&name.as_str())
+                    || name.starts_with(COOKIE_TS_EIDS_R_PREFIX))
             {
                 return Err(format!(
                     "{field} must not key on Trusted Server identity cookie `{name}`"
@@ -244,6 +253,22 @@ mod tests {
                 "should allow identity cookie bypass policies"
             );
         }
+    }
+
+    #[test]
+    fn template_cookie_policy_rejects_sealed_identity_cookie_keys() {
+        for name in ["__Host-ts-eids-s", "__Host-ts-eids-r-0a1b2c3d"] {
+            let error = validate_cookie_names(&names(&[name]), &[])
+                .expect_err("should reject identity cookie as a cache key");
+            assert!(
+                error.contains("must not key on Trusted Server identity cookie"),
+                "should explain the rejection for {name}, got {error}"
+            );
+        }
+        assert!(
+            validate_cookie_names(&names(&["session"]), &[]).is_ok(),
+            "should still accept an unrelated cookie"
+        );
     }
 
     #[test]

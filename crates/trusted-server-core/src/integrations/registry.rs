@@ -807,6 +807,9 @@ pub struct ProxyDispatchInput<'a> {
     pub ec_context: &'a mut EcContext,
     pub services: &'a RuntimeServices,
     pub req: Request<EdgeBody>,
+    /// Whether the bot gate recognised a real browser. Proxy EC generation
+    /// and the identity writer decision both require it.
+    pub is_real_browser: bool,
 }
 
 /// In-memory registry of integrations discovered from settings.
@@ -1040,18 +1043,20 @@ impl IntegrationRegistry {
             ec_context,
             services,
             mut req,
+            is_real_browser,
         } = input;
         if let Some((proxy, _)) = self.find_route(method, path) {
             // Organic proxy handler: generate if needed (best effort).
             // Only generate for document navigations — subresource requests
             // may lack consent signals such as the Sec-GPC header.
-            if is_navigation_request(&req) {
+            ec_context.decide_writer(&req, true, is_real_browser);
+            if is_real_browser && is_navigation_request(&req) {
                 if let Err(err) = ec_context.generate_if_needed(settings, kv) {
                     log::warn!("EC generation failed for integration proxy: {err:?}");
                 }
             } else {
                 log::debug!(
-                    "EC generation skipped for integration proxy: non-document request (path={path})",
+                    "EC generation skipped for integration proxy: not a real-browser document request (path={path})",
                 );
             }
 
@@ -1691,6 +1696,7 @@ mod tests {
             ec_context: &mut ec_context,
             services: &noop_services(),
             req,
+            is_real_browser: true,
         }))
         .expect("should match route")
         .expect("proxy should succeed");
@@ -2048,6 +2054,7 @@ mod tests {
             ec_context: &mut ec_context,
             services: &services,
             req,
+            is_real_browser: true,
         }));
 
         // Should have matched and returned a response
@@ -2061,6 +2068,59 @@ mod tests {
             response.headers().get("x-echo-ts-ec").is_none(),
             "should not have x-ts-ec header on integration request"
         );
+    }
+
+    fn proxy_navigation(is_real_browser: bool) -> EcContext {
+        let settings = create_test_settings();
+        let routes = vec![(
+            Method::GET,
+            "/integrations/test/ec",
+            (
+                Arc::new(EcTestProxy) as Arc<dyn IntegrationProxy>,
+                "ec_test",
+            ),
+        )];
+        let registry = IntegrationRegistry::from_routes(routes);
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("https://test-publisher.com/integrations/test/ec")
+            .header("sec-fetch-dest", "document")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        let consent = crate::consent::ConsentContext {
+            jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+            ..crate::consent::ConsentContext::default()
+        };
+        let mut ec_context =
+            EcContext::new_for_test_with_ip(None, consent, Some("192.0.2.10".to_owned()));
+        let kv = crate::ec::kv::KvIdentityGraph::in_memory("proxy_store");
+        let services = noop_services();
+        let result = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
+            method: &Method::GET,
+            path: "/integrations/test/ec",
+            settings: &settings,
+            kv: Some(&kv),
+            ec_context: &mut ec_context,
+            services: &services,
+            req,
+            is_real_browser,
+        }));
+        assert!(result.is_some(), "should find the route");
+        ec_context
+    }
+
+    #[test]
+    fn handle_proxy_mints_ec_and_decides_writer_only_for_real_browsers() {
+        let browser = proxy_navigation(true);
+        assert!(
+            browser.ec_generated(),
+            "a real browser's navigation mints an EC"
+        );
+        assert!(browser.identity().writer(), "and is the writer");
+
+        let bot = proxy_navigation(false);
+        assert!(!bot.ec_generated(), "a bot's navigation mints no EC");
+        assert!(!bot.identity().writer(), "and is not the writer");
     }
 
     #[test]
@@ -2098,6 +2158,7 @@ mod tests {
             ec_context: &mut ec_context,
             services: &services,
             req,
+            is_real_browser: true,
         }))
         .expect("should handle proxy request");
 
@@ -2147,6 +2208,7 @@ mod tests {
             ec_context: &mut ec_context,
             services: &services,
             req,
+            is_real_browser: true,
         }))
         .expect("should handle proxy request");
 
@@ -2193,6 +2255,7 @@ mod tests {
             ec_context: &mut ec_context,
             services: &services,
             req,
+            is_real_browser: true,
         }));
 
         assert!(result.is_some(), "Should find POST route");

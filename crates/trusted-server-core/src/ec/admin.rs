@@ -26,6 +26,7 @@ use serde_json::Value as JsonValue;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt as _};
 
+use crate::consent::ConsentContext;
 use crate::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
 use crate::cookies::extract_cookie_value;
 use crate::error::TrustedServerError;
@@ -33,6 +34,10 @@ use crate::openrtb::Eid;
 
 use super::eids::{resolve_partner_ids, to_eids};
 use super::generation::is_valid_ec_id;
+use super::identity::UnixTime;
+use super::identity::catalog::ProviderCatalog;
+use super::identity::policy::PolicySignals;
+use super::identity::servable::{ServeContext, kv_opted_out};
 use super::kv::KvIdentityGraph;
 use super::kv_backend::EcKvLookup;
 use super::kv_types::{KvEntry, KvMetadata};
@@ -368,6 +373,19 @@ fn requested_ec_id(req: &Request<EdgeBody>) -> Result<String, Box<Response<EdgeB
     Ok(ec_id)
 }
 
+/// Replaces every `ps.<provider>.st` with a marker. Provider state is never
+/// returned by the admin lookup.
+fn redact_provider_state(entry_json: &mut JsonValue) {
+    let Some(states) = entry_json.get_mut("ps").and_then(JsonValue::as_object_mut) else {
+        return;
+    };
+    for state in states.values_mut() {
+        if let Some(st) = state.get_mut("st") {
+            *st = JsonValue::String("[redacted]".to_owned());
+        }
+    }
+}
+
 /// Builds the success payload from a raw KV lookup.
 ///
 /// Parse failures are reported in the payload rather than propagated, so
@@ -393,6 +411,7 @@ fn build_lookup_response(
 
     match serde_json::from_slice::<JsonValue>(&lookup.body) {
         Ok(mut entry_json) => {
+            redact_provider_state(&mut entry_json);
             add_iso_timestamp_companions(&mut entry_json);
             payload.entry = Some(entry_json);
 
@@ -481,8 +500,21 @@ fn iso_timestamp(unix_seconds: u64) -> Option<String> {
 
 /// Derives the auction EID view for a valid entry, mirroring the filters in
 /// [`resolve_partner_ids`] and reporting why each stored ID was skipped.
+///
+/// The admin request carries no visitor consent, so the view applies expiry,
+/// writer presence and opt-outs with a default consent context.
 fn build_auction_view(registry: &PartnerRegistry, entry: &KvEntry) -> AuctionEidsView {
-    let resolved = resolve_partner_ids(registry, entry);
+    let consent = ConsentContext::default();
+    let catalog = ProviderCatalog::empty();
+    let opted_out = kv_opted_out(entry);
+    let serve = ServeContext {
+        now: UnixTime::from_secs(super::current_timestamp()),
+        consent: &consent,
+        signals: PolicySignals::default(),
+        catalog: &catalog,
+        opted_out: &opted_out,
+    };
+    let resolved = resolve_partner_ids(registry, entry, &serve);
     let eids = to_eids(&resolved);
 
     let mut skipped = Vec::new();
@@ -778,15 +810,11 @@ mod tests {
         let mut entry = KvEntry::minimal("bidstream.example", "uid-live", 1_741_824_000);
         entry.ids.insert(
             "disabled.example".to_owned(),
-            KvPartnerId {
-                uid: "uid-disabled".to_owned(),
-            },
+            KvPartnerId::new("uid-disabled".to_owned()),
         );
         entry.ids.insert(
             "unknown.example".to_owned(),
-            KvPartnerId {
-                uid: "uid-unknown".to_owned(),
-            },
+            KvPartnerId::new("uid-unknown".to_owned()),
         );
         entry
     }
@@ -1305,6 +1333,44 @@ mod tests {
             handle_admin_ec_lookup(None, &test_registry(), &req).expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[test]
+    fn admin_lookup_redacts_provider_state() {
+        let mut entry = KvEntry::minimal("example.com", "example-uid", 1_760_000_000);
+        entry.ps.insert(
+            "id5".to_owned(),
+            crate::ec::kv_types::KvProviderState {
+                n: Some(5),
+                st: Some(serde_json::json!({ "signature": "secret-state" })),
+                ..crate::ec::kv_types::KvProviderState::default()
+            },
+        );
+        let lookup = EcKvLookup {
+            body: serde_json::to_vec(&entry).expect("should serialize entry"),
+            metadata: None,
+            generation: 1,
+        };
+        let registry = PartnerRegistry::from_config(&[]).expect("should build empty registry");
+
+        let payload = build_lookup_response(&registry, "ec-store", "ec".to_owned(), &lookup);
+        let body = payload.entry.expect("should include the entry");
+
+        assert_eq!(
+            body["ps"]["id5"]["st"],
+            serde_json::json!("[redacted]"),
+            "should redact the state"
+        );
+        assert_eq!(
+            body["ps"]["id5"]["n"],
+            serde_json::json!(5),
+            "should keep the rest of ps"
+        );
+        assert_eq!(
+            body["ids"]["example.com"]["uid"],
+            serde_json::json!("example-uid"),
+            "should keep the ids"
+        );
     }
 
     #[test]

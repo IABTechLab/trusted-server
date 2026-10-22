@@ -58,8 +58,11 @@ use crate::cache_policy::{
 };
 use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
 use crate::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS, HEADER_X_COMPRESS_HINT};
-use crate::cookies::handle_request_cookies;
 use crate::cookies::template_cache_policy::{TemplateCookieDecision, evaluate_cookie_policy};
+use crate::cookies::{
+    TS_IDENTITY_COOKIE_PREFIXES, TS_ORIGIN_STRIPPED_COOKIE_NAMES, handle_request_cookies,
+    strip_cookie_headers,
+};
 use crate::creative_opportunities::{
     AdStackGateInput, AssemblyMode, CreativeOpportunitiesConfig, RuntimeAdStackExpected,
     evaluate_ad_stack_gate,
@@ -69,7 +72,9 @@ use crate::ec::registry::PartnerRegistry;
 use crate::ec::{EcContext, EidSyncSource};
 use crate::error::TrustedServerError;
 use crate::html_processor::BodyCloseInjection;
-use crate::http_util::{RequestInfo, is_navigation_request, serve_static_with_etag};
+use crate::http_util::{
+    RequestInfo, is_navigation_request, is_prefetch_request, serve_static_with_etag,
+};
 use crate::integrations::IntegrationRegistry;
 use crate::platform::{
     GeoInfo, PlatformBackendSpec, PlatformHttpRequest, RuntimeServices,
@@ -3136,6 +3141,13 @@ fn rewrite_origin_request(
     // separate change. Until then we strip it here so the edge signal never
     // reaches publisher backends.
     req.headers_mut().remove("fastly-ssl");
+    // The publisher origin keeps `ts-ec` but never receives the ID cookies,
+    // which can push its `Cookie` header past common 8 KB limits.
+    strip_cookie_headers(
+        req.headers_mut(),
+        TS_ORIGIN_STRIPPED_COOKIE_NAMES,
+        TS_IDENTITY_COOKIE_PREFIXES,
+    );
     *req.uri_mut() = target_uri;
     req.headers_mut().insert(
         header::HOST,
@@ -3193,18 +3205,6 @@ pub(crate) fn is_bot_user_agent(req: &Request<EdgeBody>) -> bool {
     BOT_USER_AGENT_FRAGMENTS
         .iter()
         .any(|frag| ua.contains(frag))
-}
-
-/// Returns true when the request advertises itself as a prefetch via either
-/// the standard `Sec-Purpose` or the legacy `Purpose` header.
-pub(crate) fn is_prefetch_request(req: &Request<EdgeBody>) -> bool {
-    let header = |name: &str| {
-        req.headers()
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.contains("prefetch"))
-    };
-    header("sec-purpose") || header("purpose")
 }
 
 /// Returns whether request-scoped signals permit an ad-eligible navigation.
@@ -4931,6 +4931,7 @@ pub async fn handle_publisher_request(
             apply_auction_eids_and_device(
                 &mut auction_request,
                 &AuctionEidTargeting {
+                    settings,
                     cookie_jar: cookie_jar.as_ref(),
                     ec_id,
                     kv_snapshot: ec_context.kv_snapshot(),
@@ -5527,6 +5528,7 @@ pub(crate) struct MatchedSlotsContext<'a> {
 /// Borrowed inputs for [`apply_auction_eids_and_device`], bundled to keep the
 /// helper within the project's 7-argument cap.
 struct AuctionEidTargeting<'a> {
+    settings: &'a Settings,
     cookie_jar: Option<&'a CookieJar>,
     ec_id: Option<&'a str>,
     kv_snapshot: &'a crate::ec::EcKvSnapshot,
@@ -5558,6 +5560,7 @@ fn apply_auction_eids_and_device(
         None
     };
     let kv_eids = resolve_auction_eids(
+        targeting.settings,
         targeting.kv_snapshot,
         targeting.partner_registry,
         targeting.ec_context,
@@ -7106,6 +7109,7 @@ pub async fn handle_page_bids(
             apply_auction_eids_and_device(
                 &mut auction_request,
                 &AuctionEidTargeting {
+                    settings,
                     cookie_jar: cookie_jar.as_ref(),
                     ec_id: ec_id.as_deref(),
                     kv_snapshot: &page_bids_kv_snapshot,
@@ -7919,9 +7923,7 @@ mod tests {
         let mut entry = KvEntry::minimal("ids.example.com", "kv-stale", 1000);
         entry.ids.insert(
             "other.example.com".to_owned(),
-            KvPartnerId {
-                uid: "kv-other".to_owned(),
-            },
+            KvPartnerId::new("kv-other".to_owned()),
         );
         let snapshot = EcKvSnapshot::Present {
             ec_id: ec_id.clone(),
@@ -7950,9 +7952,11 @@ mod tests {
         auction_request.user.consent = None;
         auction_request.user.eids = None;
 
+        let settings = create_test_settings();
         apply_auction_eids_and_device(
             &mut auction_request,
             &AuctionEidTargeting {
+                settings: &settings,
                 cookie_jar: Some(&jar),
                 ec_id: Some(ec_id.as_str()),
                 kv_snapshot: &snapshot,
@@ -25322,5 +25326,67 @@ mod tests {
 
             assert_only_renderable_slot_was_auctioned(&captured);
         }
+    }
+}
+
+#[cfg(test)]
+mod origin_cookie_strip_tests {
+    use super::*;
+
+    #[test]
+    fn rewrite_origin_request_strips_id_cookies_and_keeps_ts_ec() {
+        let mut req = Request::builder()
+            .uri("https://www.example.com/article")
+            .header(header::COOKIE, "ts-ec=abc; ts-eids=W10; session=1")
+            .header(
+                header::COOKIE,
+                "__Host-ts-eids-s=v1.a.b; __Host-ts-eids-r-0a1b2c3d=v1.c.d; ts-ec-pull-complete=v1",
+            )
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        rewrite_origin_request(
+            &mut req,
+            "https://origin.example.com/article"
+                .parse()
+                .expect("should parse uri"),
+            "origin.example.com",
+        )
+        .expect("should rewrite request");
+
+        let cookies: Vec<_> = req.headers().get_all(header::COOKIE).iter().collect();
+        assert_eq!(cookies.len(), 1, "should send one Cookie header");
+        assert_eq!(
+            cookies[0], "ts-ec=abc; session=1; ts-ec-pull-complete=v1",
+            "should keep ts-ec, the pull marker and unrelated cookies, and drop the ID cookies"
+        );
+    }
+
+    #[test]
+    fn rewrite_origin_request_drops_cookie_header_when_only_id_cookies() {
+        let mut req = Request::builder()
+            .uri("https://www.example.com/")
+            .header(header::COOKIE, "ts-eids=W10; __Host-ts-eids-s=v1.a.b")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        rewrite_origin_request(
+            &mut req,
+            "https://origin.example.com/"
+                .parse()
+                .expect("should parse uri"),
+            "origin.example.com",
+        )
+        .expect("should rewrite request");
+
+        assert!(
+            req.headers().get(header::COOKIE).is_none(),
+            "should drop the empty Cookie header"
+        );
+        assert_eq!(
+            req.headers()[header::HOST],
+            "origin.example.com",
+            "should still set Host"
+        );
     }
 }

@@ -34,11 +34,22 @@ pub const MAX_STORED_DOMAIN_LENGTH: usize = 255;
 /// validation.
 pub const MAX_UID_LENGTH: usize = 512;
 
+/// Maximum serialized bytes of a stored UID-level `ext`.
+pub const MAX_PARTNER_EXT_BYTES: usize = 256;
+/// Maximum serialized bytes of one provider's private state (`ps.st`).
+pub const MAX_PROVIDER_STATE_BYTES: usize = 1024;
+/// Maximum number of providers with a `ps` entry in one row.
+pub const MAX_PROVIDER_STATES: usize = 32;
+/// Maximum number of invalidated-UID hashes kept per provider (`ps.iv`).
+pub const MAX_INVALIDATED_UIDS: usize = 4;
+/// Length of a record revision (`rv`) in lowercase hex digits.
+pub const RECORD_REVISION_HEX_LEN: usize = 16;
+
 /// Full KV entry stored as the body of an EC identity graph record.
 ///
 /// **KV key:** Full EC ID (`{64hex}.{6alnum}`).
 /// **KV value:** JSON-serialized `KvEntry` (max ~5KB).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct KvEntry {
     /// Schema version — always [`SCHEMA_VERSION`].
     pub v: u8,
@@ -62,10 +73,14 @@ pub struct KvEntry {
     /// Populated by pixel sync, batch sync, and pull sync operations.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub ids: BTreeMap<String, KvPartnerId>,
+    /// Per-provider scheduling, opt-out and private state, keyed by identity
+    /// provider ID. Never sent to bidders or cookies.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub ps: BTreeMap<String, KvProviderState>,
 }
 
 /// Consent state within a KV entry.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct KvConsent {
     /// Raw TCF v2 consent string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -80,7 +95,7 @@ pub struct KvConsent {
 }
 
 /// Geo location within a KV entry.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct KvGeo {
     /// ISO 3166-1 alpha-2 country code (e.g. `"US"`).
     pub country: String,
@@ -98,10 +113,98 @@ pub struct KvGeo {
 }
 
 /// A partner user ID within a KV entry.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// Every field but `uid` is optional and omitted when absent, so legacy rows
+/// read and write unchanged and [`SCHEMA_VERSION`] stays 1.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct KvPartnerId {
     /// The partner's user identifier.
     pub uid: String,
+    /// Writer: an identity provider ID. Absent for browser ingest and legacy rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub w: Option<String>,
+    /// Record revision: 16 lowercase hex digits, random on every write.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rv: Option<String>,
+    /// Unix seconds when the ID was acquired or last refreshed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<u64>,
+    /// Unix seconds after which the ID must not be sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exp: Option<u64>,
+    /// Unix seconds after which the ID is due for refresh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ra: Option<u64>,
+    /// Unix seconds after which the ID can no longer be refreshed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ru: Option<u64>,
+    /// Provider-supplied `atype`. Absent: use the partner's `openrtb_atype`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub atype: Option<i32>,
+    /// UID-level `ext`, at most [`MAX_PARTNER_EXT_BYTES`] serialized bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ext: Option<serde_json::Value>,
+}
+
+impl KvPartnerId {
+    /// A bare record holding only a UID.
+    #[must_use]
+    pub fn new(uid: impl Into<String>) -> Self {
+        Self {
+            uid: uid.into(),
+            ..Self::default()
+        }
+    }
+
+    /// A browser-ingested record: no writer, with its acquisition time.
+    #[must_use]
+    pub fn browser(uid: impl Into<String>, acquired_at: Option<u64>) -> Self {
+        Self {
+            uid: uid.into(),
+            at: acquired_at,
+            ..Self::default()
+        }
+    }
+}
+
+/// A provider's sticky opt-out.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvOptOut {
+    /// Unix seconds when the opt-out was reported.
+    pub at: u64,
+    /// Consent fingerprint at that time: 16 lowercase hex digits.
+    pub fp: String,
+}
+
+/// Per-provider state in a KV row (`ps.<provider>`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct KvProviderState {
+    /// Unix seconds before which the provider must not be called.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub n: Option<u64>,
+    /// Consecutive failures, for backoff.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub f: u32,
+    /// Sticky opt-out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub o: Option<KvOptOut>,
+    /// When the provider's opt-out was last cleared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oc: Option<u64>,
+    /// Keyed hashes of UIDs the owner invalidated, newest last.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub iv: Vec<String>,
+    /// The provider's private state as embedded JSON. KV only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub st: Option<serde_json::Value>,
+}
+
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if passes the field by reference"
+)]
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 /// Publisher property metadata captured when an EC entry is created.
@@ -293,6 +396,7 @@ impl KvEntry {
             device: None,
             network: None,
             ids: BTreeMap::new(),
+            ps: BTreeMap::new(),
         }
     }
 
@@ -303,12 +407,7 @@ impl KvEntry {
     #[must_use]
     pub fn minimal(partner_id: &str, uid: &str, now: u64) -> Self {
         let mut ids = BTreeMap::new();
-        ids.insert(
-            partner_id.to_owned(),
-            KvPartnerId {
-                uid: uid.to_owned(),
-            },
-        );
+        ids.insert(partner_id.to_owned(), KvPartnerId::new(uid.to_owned()));
         Self {
             v: SCHEMA_VERSION,
             created: now,
@@ -328,6 +427,7 @@ impl KvEntry {
             device: None,
             network: None,
             ids,
+            ps: BTreeMap::new(),
         }
     }
 
@@ -360,6 +460,7 @@ impl KvEntry {
             device: None,
             network: None,
             ids: BTreeMap::new(),
+            ps: BTreeMap::new(),
         }
     }
 
@@ -385,6 +486,41 @@ impl KvEntry {
                 return Err(format!(
                     "partner ID '{partner_id}' exceeds MAX_UID_LENGTH ({})",
                     partner_uid.uid.len()
+                ));
+            }
+            if let Some(ext) = &partner_uid.ext
+                && serialized_len(ext) > MAX_PARTNER_EXT_BYTES
+            {
+                return Err(format!(
+                    "partner ID '{partner_id}' ext exceeds {MAX_PARTNER_EXT_BYTES} bytes"
+                ));
+            }
+            if let Some(rv) = &partner_uid.rv
+                && !is_record_revision(rv)
+            {
+                return Err(format!(
+                    "partner ID '{partner_id}' rv is not {RECORD_REVISION_HEX_LEN} lowercase hex digits"
+                ));
+            }
+        }
+
+        if self.ps.len() > MAX_PROVIDER_STATES {
+            return Err(format!(
+                "ps exceeds MAX_PROVIDER_STATES ({})",
+                self.ps.len()
+            ));
+        }
+        for (provider, state) in &self.ps {
+            if state.iv.len() > MAX_INVALIDATED_UIDS {
+                return Err(format!(
+                    "ps '{provider}' iv exceeds {MAX_INVALIDATED_UIDS} hashes"
+                ));
+            }
+            if let Some(st) = &state.st
+                && serialized_len(st) > MAX_PROVIDER_STATE_BYTES
+            {
+                return Err(format!(
+                    "ps '{provider}' st exceeds {MAX_PROVIDER_STATE_BYTES} bytes"
                 ));
             }
         }
@@ -460,9 +596,155 @@ impl KvGeo {
     }
 }
 
+/// Serialized JSON length of a value. A value that cannot serialize counts
+/// as unbounded, so it always fails a size check.
+fn serialized_len(value: &serde_json::Value) -> usize {
+    serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len())
+}
+
+/// Whether `value` is a record revision: 16 lowercase hex digits.
+fn is_record_revision(value: &str) -> bool {
+    value.len() == RECORD_REVISION_HEX_LEN
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_partner_record_reads_and_writes_unchanged() {
+        let legacy = serde_json::json!({ "uid": "example-uid" });
+        let record: KvPartnerId =
+            serde_json::from_value(legacy.clone()).expect("should read legacy");
+        assert_eq!(
+            record,
+            KvPartnerId::new("example-uid"),
+            "should fill every new field with None"
+        );
+        assert_eq!(
+            serde_json::to_value(&record).expect("should write"),
+            legacy,
+            "should add no fields"
+        );
+    }
+
+    #[test]
+    fn provider_record_and_state_round_trip() {
+        let stored = serde_json::json!({
+            "v": 1,
+            "created": 1_760_000_000,
+            "consent": { "ok": true, "updated": 1_760_000_000 },
+            "geo": { "country": "US" },
+            "ids": {
+                "id5-sync.com": {
+                    "uid": "ID5*example",
+                    "w": "id5",
+                    "rv": "9c1d04b7e6a83f2a",
+                    "at": 1_760_000_000,
+                    "exp": 1_767_776_000,
+                    "ra": 1_760_086_400,
+                    "ru": 1_770_000_000,
+                    "atype": 1,
+                    "ext": { "linkType": 2 }
+                }
+            },
+            "ps": {
+                "id5": {
+                    "n": 1_760_003_600,
+                    "f": 1,
+                    "o": { "at": 1_759_000_000, "fp": "0123456789abcdef" },
+                    "oc": 1_759_500_000,
+                    "iv": ["aaaaaaaaaaaaaaaa"],
+                    "st": { "signature": "example-opaque-state" }
+                }
+            }
+        });
+
+        let entry: KvEntry = serde_json::from_value(stored.clone()).expect("should read");
+        entry.validate().expect("should be valid");
+        assert_eq!(
+            serde_json::to_value(&entry).expect("should write"),
+            stored,
+            "should round-trip exactly"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_oversized_ext_state_rv_and_too_many_providers() {
+        let mut entry = KvEntry::minimal("example.com", "example-uid", 1);
+        entry.ids.get_mut("example.com").expect("should exist").ext =
+            Some(serde_json::json!({ "pad": "x".repeat(MAX_PARTNER_EXT_BYTES) }));
+        assert!(
+            entry
+                .validate()
+                .expect_err("should reject ext")
+                .contains("ext"),
+            "should name ext"
+        );
+
+        let mut entry = KvEntry::minimal("example.com", "example-uid", 1);
+        entry.ps.insert(
+            "id5".to_owned(),
+            KvProviderState {
+                st: Some(serde_json::json!("x".repeat(MAX_PROVIDER_STATE_BYTES))),
+                ..KvProviderState::default()
+            },
+        );
+        assert!(
+            entry
+                .validate()
+                .expect_err("should reject st")
+                .contains("st"),
+            "should name st"
+        );
+
+        let mut entry = KvEntry::minimal("example.com", "example-uid", 1);
+        for index in 0..=MAX_PROVIDER_STATES {
+            entry
+                .ps
+                .insert(format!("p{index}"), KvProviderState::default());
+        }
+        assert!(
+            entry
+                .validate()
+                .expect_err("should reject ps size")
+                .contains("ps"),
+            "should name ps"
+        );
+
+        let mut entry = KvEntry::minimal("example.com", "example-uid", 1);
+        entry.ps.insert(
+            "id5".to_owned(),
+            KvProviderState {
+                iv: vec!["a".repeat(16); MAX_INVALIDATED_UIDS + 1],
+                ..KvProviderState::default()
+            },
+        );
+        assert!(
+            entry
+                .validate()
+                .expect_err("should reject iv")
+                .contains("iv"),
+            "should name iv"
+        );
+
+        let mut entry = KvEntry::minimal("example.com", "example-uid", 1);
+        entry.ids.get_mut("example.com").expect("should exist").rv = Some("not-hex".to_owned());
+        assert!(
+            entry
+                .validate()
+                .expect_err("should reject rv")
+                .contains("rv"),
+            "should name rv"
+        );
+
+        KvEntry::minimal("example.com", "example-uid", 1)
+            .validate()
+            .expect("control entry should be valid");
+    }
 
     fn sample_consent_context() -> ConsentContext {
         ConsentContext {
@@ -490,12 +772,9 @@ mod tests {
         let geo = sample_geo_info();
         let consent = sample_consent_context();
         let mut entry = KvEntry::new(&consent, Some(&geo), 1_741_824_000, "example.com");
-        entry.ids.insert(
-            "liveramp".to_owned(),
-            KvPartnerId {
-                uid: "LR_xyz".to_owned(),
-            },
-        );
+        entry
+            .ids
+            .insert("liveramp".to_owned(), KvPartnerId::new("LR_xyz".to_owned()));
 
         let json = serde_json::to_string(&entry).expect("should serialize KvEntry");
         let deserialized: KvEntry =
@@ -737,9 +1016,7 @@ mod tests {
         let mut entry = KvEntry::tombstone(1000);
         entry.ids.insert(
             "ssp_x".to_owned(),
-            KvPartnerId {
-                uid: "x".repeat(MAX_UID_LENGTH + 1),
-            },
+            KvPartnerId::new("x".repeat(MAX_UID_LENGTH + 1)),
         );
 
         let err = entry

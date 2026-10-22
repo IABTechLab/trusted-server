@@ -15,7 +15,14 @@ use crate::cookies::extract_cookie_value;
 use crate::ec::EcContext;
 use crate::ec::EcKvSnapshot;
 use crate::ec::client_eids::parse_client_eids;
-use crate::ec::eids::{resolve_partner_ids, to_eids};
+use crate::ec::eids::{resolve_partner_records, to_eids};
+use crate::ec::identity::UnixTime;
+use crate::ec::identity::catalog::ProviderCatalog;
+use crate::ec::identity::cookie::RBatch;
+use crate::ec::identity::coordinator::EligibilityView;
+use crate::ec::identity::policy::PolicySignals;
+use crate::ec::identity::revision::IdentityKeys;
+use crate::ec::identity::servable::ServeContext;
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::partner::normalize_partner_source_domain;
 use crate::ec::prebid_eids::parse_prebid_eids_cookie;
@@ -287,14 +294,22 @@ pub async fn handle_auction(
     // only strips on TCF/GDPR signals. This matches the publisher and
     // `/_ts/page-bids` paths, which also resolve client EIDs only when
     // `ec_id.is_some()`.
+    let body_eids = ec_id
+        .as_ref()
+        .and(body.eids.as_deref())
+        .map(parse_client_eids)
+        .filter(|eids| !eids.is_empty());
+    let client_eids_from_body = body_eids.is_some();
     let client_eids = if ec_id.is_some() {
-        resolve_client_auction_eids(
-            body.eids.as_deref(),
-            extract_cookie_value(&http_req, COOKIE_TS_EIDS).as_deref(),
-        )
+        body_eids.or_else(|| {
+            parse_cookie_auction_eids(extract_cookie_value(&http_req, COOKIE_TS_EIDS).as_deref())
+        })
     } else {
         None
     };
+    ec_context
+        .identity_mut()
+        .set_client_eids_from_body(client_eids_from_body);
     // Carry the full request-local EID set to response finalization so KV
     // ingestion uses what this request actually sent, not just whatever fits
     // in the size-capped `ts-eids` cookie (see `ec::finalize::ec_finalize_response`).
@@ -317,7 +332,7 @@ pub async fn handle_auction(
     if !matches!(auction_kv_snapshot, EcKvSnapshot::NotRead) {
         ec_context.set_kv_snapshot(auction_kv_snapshot.clone());
     }
-    let eids = resolve_auction_eids(&auction_kv_snapshot, registry, ec_context);
+    let eids = resolve_auction_eids(settings, &auction_kv_snapshot, registry, ec_context);
 
     // Look up geo for device info.
     let geo = services
@@ -442,6 +457,7 @@ pub async fn handle_auction(
 /// store, no EC, consent denied). On KV or partner-resolution errors, logs a
 /// warning and returns empty EIDs so the auction can proceed in degraded mode.
 pub(crate) fn resolve_auction_eids(
+    settings: &Settings,
     snapshot: &EcKvSnapshot,
     registry: Option<&PartnerRegistry>,
     ec_context: &EcContext,
@@ -454,15 +470,49 @@ pub(crate) fn resolve_auction_eids(
 
     let ec_id = ec_context.ec_value()?;
 
-    let Some(entry) = snapshot.entry_for(ec_id) else {
-        return Some(Vec::new());
+    // A read that found the row missing or failed yields no server set; a
+    // tombstone yields none either. Without a read the cookie view stands in.
+    let entry = match snapshot {
+        EcKvSnapshot::NotRead => None,
+        _ => match snapshot.entry_for(ec_id) {
+            Some(entry) if entry.consent.ok => Some(entry),
+            _ => return Some(Vec::new()),
+        },
     };
 
-    if !entry.consent.ok {
+    // Without a trustworthy clock every expiry check would pass, so no
+    // server-side ID is served.
+    let Some(now) = crate::ec::checked_current_timestamp() else {
+        log::warn!("Skipping server-side EIDs because the clock is unavailable");
         return Some(Vec::new());
-    }
-
-    let resolved = resolve_partner_ids(registry, entry);
+    };
+    let keys = IdentityKeys::from_settings(settings);
+    let catalog =
+        ProviderCatalog::from_partners(registry).unwrap_or_else(|_| ProviderCatalog::empty());
+    let opened = ec_context.identity().opened_or_open(&keys, &catalog, ec_id);
+    let batches: Vec<RBatch> = opened
+        .removals
+        .cookies
+        .iter()
+        .map(|(_, batch)| batch.clone())
+        .collect();
+    let view = EligibilityView::merge(entry, opened.s.cookie(), &batches, &catalog, &keys);
+    let opted_out = view.opted_out_providers();
+    let serve = ServeContext {
+        now: UnixTime::from_secs(now),
+        consent: ec_context.consent(),
+        signals: PolicySignals {
+            dnt: ec_context.identity().dnt(),
+        },
+        catalog: &catalog,
+        opted_out: &opted_out,
+    };
+    let resolved = resolve_partner_records(
+        registry,
+        view.records()
+            .map(|(source, record)| (source.clone(), record)),
+        &serve,
+    );
     Some(to_eids(&resolved))
 }
 
@@ -620,8 +670,195 @@ mod tests {
         }
     }
 
+    mod server_set {
+        use super::*;
+        use crate::ec::identity::cookie::{RRemoval, SCookie, SEntry, seal};
+        use crate::ec::identity::input::SeededRandom;
+        use crate::ec::identity::test_support::test_keys;
+        use crate::ec::kv_types::{KvEntry, KvPartnerId};
+
+        const PULL_SOURCE: &str = "pull.example.com";
+
+        fn ec_id() -> String {
+            format!("{}.ABC123", "a".repeat(64))
+        }
+
+        fn registry() -> PartnerRegistry {
+            let mut pull = counting_test_partner(PULL_SOURCE);
+            pull.pull_sync_enabled = true;
+            pull.pull_sync_url = Some("https://sync.pull.example.com/pull".to_owned());
+            pull.pull_sync_allowed_domains = vec!["sync.pull.example.com".to_owned()];
+            pull.ts_pull_token = Some(crate::redacted::Redacted::new(
+                "example-token-value-0123456789abcdef".to_owned(),
+            ));
+            PartnerRegistry::from_config(&[
+                counting_test_partner("a.example.com"),
+                counting_test_partner("b.example.com"),
+                pull,
+            ])
+            .expect("should build registry")
+        }
+
+        fn context_with_cookies(cookies: &str) -> EcContext {
+            let mut context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id()));
+            let mut headers = http::HeaderMap::new();
+            if !cookies.is_empty() {
+                headers.insert(
+                    header::COOKIE,
+                    http::HeaderValue::from_str(cookies).expect("should build header"),
+                );
+            }
+            context.identity_mut().set_raw_cookies_for_test(&headers);
+            context
+        }
+
+        fn present(entry: KvEntry) -> EcKvSnapshot {
+            EcKvSnapshot::Present {
+                ec_id: ec_id(),
+                entry: Box::new(entry),
+                generation: Some(1),
+            }
+        }
+
+        fn sources(eids: Option<Vec<Eid>>) -> Vec<(String, String)> {
+            eids.unwrap_or_default()
+                .into_iter()
+                .map(|eid| (eid.source, eid.uids[0].id.clone()))
+                .collect()
+        }
+
+        #[test]
+        fn staged_cookie_entry_fills_a_source_the_browser_did_not_send() {
+            let registry = registry();
+            let catalog = crate::ec::identity::catalog::ProviderCatalog::from_partners(&registry)
+                .expect("should build catalog");
+            let index = catalog
+                .configured_sources()
+                .iter()
+                .position(|source| source.as_str() == "b.example.com")
+                .expect("should index b");
+            let mut cookie = SCookie::new(&catalog, crate::ec::current_timestamp());
+            cookie
+                .ids
+                .push(SEntry::staged_browser(index, "staged-uid", 1));
+            let sealed = seal(
+                &test_keys().cookie_s,
+                &ec_id(),
+                &serde_json::to_vec(&cookie).expect("should serialize"),
+                &SeededRandom::new(1),
+            );
+            let context = context_with_cookies(&format!("__Host-ts-eids-s={sealed}"));
+            let mut entry = KvEntry::minimal("z.example.com", "x", 1);
+            entry
+                .ids
+                .insert("a.example.com".to_owned(), KvPartnerId::new("server-a"));
+
+            let server = resolve_auction_eids(
+                &create_test_settings(),
+                &present(entry),
+                Some(&registry),
+                &context,
+            );
+            let client = Some(vec![Eid::new(
+                "a.example.com".to_owned(),
+                vec![Uid {
+                    id: "browser-a".to_owned(),
+                    atype: Some(1),
+                    ext: None,
+                }],
+            )]);
+            let merged = merge_auction_eids(client, server);
+
+            assert_eq!(
+                sources(merged),
+                vec![
+                    ("a.example.com".to_owned(), "browser-a".to_owned()),
+                    ("b.example.com".to_owned(), "staged-uid".to_owned()),
+                ],
+                "the browser wins an unowned source, and a staged entry fills one it did not send"
+            );
+        }
+
+        #[test]
+        fn removal_cookie_hides_a_record_before_the_removal_reaches_kv() {
+            let registry = registry();
+            let mut entry = KvEntry::minimal("z.example.com", "x", 1);
+            entry.ids.insert(
+                PULL_SOURCE.to_owned(),
+                KvPartnerId {
+                    w: Some("pull-pull-example-com".to_owned()),
+                    at: Some(5),
+                    ..KvPartnerId::new("pull-uid")
+                },
+            );
+            let control = resolve_auction_eids(
+                &create_test_settings(),
+                &present(entry.clone()),
+                Some(&registry),
+                &context_with_cookies(""),
+            );
+            assert_eq!(
+                sources(control),
+                vec![(PULL_SOURCE.to_owned(), "pull-uid".to_owned())],
+                "control: the pull partner's record is served"
+            );
+
+            let batch = crate::ec::identity::cookie::RBatch {
+                rm: vec![RRemoval {
+                    s: PULL_SOURCE.to_owned(),
+                    w: "pull-pull-example-com".to_owned(),
+                    pv: None,
+                    sa: 5,
+                }],
+                ..crate::ec::identity::cookie::RBatch::default()
+            };
+            let sealed = seal(
+                &test_keys().cookie_r,
+                &ec_id(),
+                &serde_json::to_vec(&batch).expect("should serialize"),
+                &SeededRandom::new(2),
+            );
+            let hidden = resolve_auction_eids(
+                &create_test_settings(),
+                &present(entry),
+                Some(&registry),
+                &context_with_cookies(&format!("__Host-ts-eids-r-0a1b2c3d={sealed}")),
+            );
+            assert!(
+                sources(hidden).is_empty(),
+                "a staged removal stops the record at once"
+            );
+        }
+
+        #[test]
+        fn missing_or_tombstoned_rows_yield_no_server_set() {
+            let registry = registry();
+            let context = context_with_cookies("");
+            assert_eq!(
+                resolve_auction_eids(
+                    &create_test_settings(),
+                    &EcKvSnapshot::Missing { ec_id: ec_id() },
+                    Some(&registry),
+                    &context
+                ),
+                Some(Vec::new()),
+                "a missing row"
+            );
+            assert_eq!(
+                resolve_auction_eids(
+                    &create_test_settings(),
+                    &present(KvEntry::tombstone(1)),
+                    Some(&registry),
+                    &context
+                ),
+                Some(Vec::new()),
+                "a tombstone"
+            );
+        }
+    }
+
     #[tokio::test]
-    async fn auction_endpoint_snapshot_is_reused_by_response_finalization() {
+    async fn auction_endpoint_snapshot_is_reused_and_finalize_writes_nothing() {
         // `/auction` loads the identity-graph row to resolve server-side EIDs.
         // Finalization runs afterwards on the same EC context and ingests
         // `ts-eids`/`sharedId` updates. Both must be served by a single billable
@@ -710,10 +947,9 @@ mod tests {
             .get(&ec_id)
             .expect("should read store")
             .expect("row should exist");
-        assert_eq!(
-            stored.ids.get("sharedid.org").map(|id| id.uid.as_str()),
-            Some("shared-cookie-id"),
-            "the sharedId update must still be ingested from the shared snapshot"
+        assert!(
+            stored.ids.is_empty(),
+            "/auction is a stager: the sharedId cookie waits for the next navigation"
         );
     }
 
@@ -757,7 +993,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auction_ingests_its_body_eids_and_not_a_cookie_only_source() {
+    async fn auction_stages_its_body_eids_and_not_a_cookie_only_source() {
         let settings = create_test_settings();
         let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
             enabled: true,
@@ -810,14 +1046,18 @@ mod tests {
         );
 
         assert_eq!(
-            stored_ids(&graph, &ec_id),
+            crate::ec::identity::test_support::staged_browser_entries(&response, &ec_id, &registry),
             vec![("body.example.com".to_owned(), "body-uid".to_owned())],
-            "KV should learn the body's source and not the cookie-only source"
+            "the KV gap holds the body's source and not the cookie-only source"
+        );
+        assert!(
+            stored_ids(&graph, &ec_id).is_empty(),
+            "/auction writes nothing"
         );
     }
 
     #[tokio::test]
-    async fn disabled_auction_ingests_nothing_from_the_cookie_but_keeps_shared_id() {
+    async fn disabled_auction_stages_and_writes_nothing() {
         let settings = create_test_settings();
         let orchestrator = AuctionOrchestrator::new(AuctionConfig {
             enabled: false,
@@ -857,15 +1097,19 @@ mod tests {
             &mut response,
         );
 
-        assert_eq!(
-            stored_ids(&graph, &ec_id),
-            vec![("sharedid.org".to_owned(), "shared-cookie-id".to_owned())],
-            "an /auction that resolved no client set should ingest only the sharedId cookie"
+        assert!(
+            crate::ec::identity::test_support::staged_browser_entries(&response, &ec_id, &registry)
+                .is_empty(),
+            "an /auction that resolved no body set stages no KV gap"
+        );
+        assert!(
+            stored_ids(&graph, &ec_id).is_empty(),
+            "and writes nothing: the cookies wait for the next navigation"
         );
     }
 
     #[test]
-    fn navigation_ingests_the_cookie_only_source() {
+    fn writer_navigation_queues_the_cookie_only_source() {
         // Control for the two tests above: the registry does match the
         // cookie-only source when the route reads the cookie.
         let settings = create_test_settings();
@@ -874,6 +1118,7 @@ mod tests {
         let graph = seeded_graph(&ec_id);
         let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
         ec_context.set_eid_sync_source(crate::ec::EidSyncSource::Navigation);
+        ec_context.identity_mut().set_writer(true);
         let cookie = cookie_only_ts_eids();
         let mut response = http::Response::new(EdgeBody::empty());
 
@@ -888,14 +1133,18 @@ mod tests {
         );
 
         assert_eq!(
-            stored_ids(&graph, &ec_id),
+            crate::ec::identity::test_support::queued_fills(&ec_context),
             vec![(COOKIE_ONLY_SOURCE.to_owned(), "cookie-uid".to_owned())],
-            "a navigation should ingest the cookie's registered source"
+            "the writer navigation queues the cookie's registered source"
+        );
+        assert!(
+            stored_ids(&graph, &ec_id).is_empty(),
+            "the single flush runs after send, not in finalize"
         );
     }
 
     #[tokio::test]
-    async fn auction_body_eids_reach_kv_even_when_the_ts_eids_cookie_is_absent() {
+    async fn auction_body_eids_are_staged_as_a_kv_gap_without_a_ts_eids_cookie() {
         // Regression test for #1184: `/auction` sends every EID it has in the
         // request body, but response finalization used to ingest identity
         // graph updates only from the `ts-eids` cookie — which the browser
@@ -976,14 +1225,14 @@ mod tests {
             &mut response,
         );
 
-        let (stored, _) = graph
-            .get(&ec_id)
-            .expect("should read store")
-            .expect("row should exist");
         assert_eq!(
-            stored.ids.get("id5-sync.com").map(|id| id.uid.as_str()),
-            Some("ID5_from_body"),
-            "the body's EID must be ingested into KV without a ts-eids cookie"
+            crate::ec::identity::test_support::staged_browser_entries(&response, &ec_id, &registry),
+            vec![("id5-sync.com".to_owned(), "ID5_from_body".to_owned())],
+            "the body's EID must be staged as a KV gap without a ts-eids cookie"
+        );
+        assert!(
+            stored_ids(&graph, &ec_id).is_empty(),
+            "/auction never writes KV; the next navigation flushes the gap"
         );
     }
 
@@ -1669,7 +1918,12 @@ mod tests {
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
 
-        let result = resolve_auction_eids(&EcKvSnapshot::NotRead, Some(&registry), &ec_context);
+        let result = resolve_auction_eids(
+            &create_test_settings(),
+            &EcKvSnapshot::NotRead,
+            Some(&registry),
+            &ec_context,
+        );
         assert!(
             result.is_some_and(|eids| eids.is_empty()),
             "should degrade to empty EIDs without a snapshot"
@@ -1681,7 +1935,12 @@ mod tests {
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
 
-        let result = resolve_auction_eids(&EcKvSnapshot::NotRead, None, &ec_context);
+        let result = resolve_auction_eids(
+            &create_test_settings(),
+            &EcKvSnapshot::NotRead,
+            None,
+            &ec_context,
+        );
         assert!(
             result.is_none(),
             "should return None when registry is missing"
@@ -1694,7 +1953,12 @@ mod tests {
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let ec_context = make_ec_context(Jurisdiction::Unknown, Some(&ec_id));
 
-        let result = resolve_auction_eids(&EcKvSnapshot::NotRead, Some(&registry), &ec_context);
+        let result = resolve_auction_eids(
+            &create_test_settings(),
+            &EcKvSnapshot::NotRead,
+            Some(&registry),
+            &ec_context,
+        );
         assert!(
             result.is_none(),
             "should return None when consent is denied"
@@ -1706,7 +1970,12 @@ mod tests {
         let registry = PartnerRegistry::empty();
         let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
 
-        let result = resolve_auction_eids(&EcKvSnapshot::NotRead, Some(&registry), &ec_context);
+        let result = resolve_auction_eids(
+            &create_test_settings(),
+            &EcKvSnapshot::NotRead,
+            Some(&registry),
+            &ec_context,
+        );
         assert!(
             result.is_none(),
             "should return None when no EC value is present"
@@ -1722,7 +1991,12 @@ mod tests {
         let snapshot = EcKvSnapshot::Failed {
             ec_id: ec_id.clone(),
         };
-        let result = resolve_auction_eids(&snapshot, Some(&registry), &ec_context);
+        let result = resolve_auction_eids(
+            &create_test_settings(),
+            &snapshot,
+            Some(&registry),
+            &ec_context,
+        );
         let eids = result.expect("should return Some on KV error (degraded mode)");
         assert!(
             eids.is_empty(),

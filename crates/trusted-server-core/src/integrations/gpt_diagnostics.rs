@@ -271,7 +271,7 @@ pub fn prepare_request(
     let cookie_state = console_cookie_state(request);
     let eligible_navigation = request.method() == Method::GET
         && is_navigation_request(request)
-        && !crate::publisher::is_prefetch_request(request)
+        && !crate::http_util::is_prefetch_request(request)
         && !crate::publisher::is_bot_user_agent(request);
 
     sanitize_console_cookie(request);

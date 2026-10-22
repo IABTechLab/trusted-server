@@ -643,7 +643,7 @@ be at least 32 bytes. Keep it stable to preserve EC identifier continuity.
 | ------------------------- | -------------- | -------- | ----------------------------------------------------------------------- |
 | `passphrase`              | String         | Yes      | Publisher passphrase used as HMAC key                                   |
 | `ec_store`                | String or null | No       | Fastly KV store name for EC identity graph and withdrawal state         |
-| `pull_sync_concurrency`   | Integer        | No       | Maximum concurrent pull-sync requests per organic response              |
+| `pull_sync_concurrency`   | Integer        | No       | Deprecated: use `[ec.identity].max_concurrency`                         |
 | `cluster_trust_threshold` | Integer        | No       | Cluster size threshold for identity trust decisions                     |
 | `cluster_recheck_secs`    | Integer        | No       | Legacy compatibility setting; cluster rechecks no longer use timestamps |
 | `partners`                | Array          | No       | Static partner registry entries                                         |
@@ -682,6 +682,44 @@ bidstream_enabled = true
 ```bash
 TRUSTED_SERVER__EC__PASSPHRASE=ec_passphrase
 TRUSTED_SERVER__EC__EC_STORE=ec_identity_store
+```
+
+### `[ec.identity]`
+
+Coordinator policy for server-side identity providers. Pull partners
+(`[[ec.partners]]` with `pull_sync_enabled = true`) run as providers. Every
+table is optional; the defaults below apply when it is absent.
+
+| Field                | Default  | Description                                                                                                            |
+| -------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `max_concurrency`    | `4`      | Providers dispatched at once. Replaces `ec.pull_sync_concurrency`, which is still honoured when changed and unset here |
+| `hold_budget_ms`     | `100`    | Shared wall-clock budget for hold-mode providers. At most 1,000                                                        |
+| `hold_retry_sec`     | `300`    | Wait after a hold-mode call is cut off by the budget                                                                   |
+| `max_response_bytes` | `65536`  | Largest provider response, before and after decoding                                                                   |
+| `pending_grace_sec`  | `300`    | How long a pending marker outlives its provider's timeout                                                              |
+| `staged_max_age_sec` | `604800` | Staged cookie entries older than this are not written                                                                  |
+| `kv_revalidate_sec`  | `3600`   | A cookie not confirmed against KV for this long forces a KV read. Must be below 86,400                                 |
+
+Per-provider tables are keyed by provider ID. A pull partner's ID is `pull-`
+plus its source domain with dots replaced by `-`, for example
+`pull-ssp-example-com`.
+
+| Field                         | Default                                    | Description                                                         |
+| ----------------------------- | ------------------------------------------ | ------------------------------------------------------------------- |
+| `mode`                        | `"after_send"`                             | `"hold"` (before the auction) or `"after_send"`                     |
+| `timeout_ms`                  | `hold_budget_ms` in hold mode, else `1000` | Per-call timeout. In hold mode it must not exceed `hold_budget_ms`  |
+| `sources`                     | every declared source                      | Narrows the sources the provider may write                          |
+| `refresh_after_sec`           | `86400`                                    | Refresh interval without a provider hint, and the wait after a skip |
+| `max_calls_per_minute`        | `1`; a pull partner's legacy hourly limit  | Burst cap per visitor                                               |
+| `breaker_failures_per_minute` | `50`                                       | Transport failures per minute that pause the provider               |
+| `cookie_priority`             | `0`                                        | Lower is dropped first when `__Host-ts-eids-s` is over its cap      |
+
+```toml
+[ec.identity]
+kv_revalidate_sec = 3600
+
+[ec.identity.providers.pull-ssp-example-com]
+max_calls_per_minute = 2
 ```
 
 ### Field Details

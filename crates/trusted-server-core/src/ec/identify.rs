@@ -16,7 +16,12 @@ use crate::openrtb::{Eid, Uid};
 use crate::settings::Settings;
 
 use super::EcContext;
+use super::identity::catalog::ProviderCatalog;
+use super::identity::policy::PolicySignals;
+use super::identity::servable::{ServeContext, is_servable, kv_opted_out};
+use super::identity::{SourceDomain, UnixTime};
 use super::kv::KvIdentityGraph;
+use super::kv_types::KvEntry;
 use super::log_id;
 use super::registry::PartnerRegistry;
 
@@ -88,23 +93,21 @@ pub fn handle_identify(
     let mut cluster_size: Option<u32> = None;
 
     match kv.get(ec_id) {
-        Ok(Some((entry, generation))) => {
+        Ok(Some((entry, _generation))) => {
             if !entry.consent.ok {
                 // Tombstone entries preserve the withdrawal signal for 24 hours.
                 // Do not extract IDs or evaluate cluster size because that would
                 // write back with the live-entry TTL.
                 log::trace!("Identify found tombstone for '{}'", log_id(ec_id));
             } else {
-                // Extract only this partner's UID.
-                if let Some(partner_uid) = entry.ids.get(&partner.source_domain)
-                    && !partner_uid.uid.is_empty()
-                {
-                    uid = Some(partner_uid.uid.clone());
-                }
+                // Extract only this partner's UID, through the shared
+                // servability check, against this request's visitor consent
+                // and never the row's stored consent snapshot.
+                uid = servable_partner_uid(&entry, &partner.source_domain, ec_context);
 
-                // Evaluate cluster size lazily for identify responses. Existing
-                // stored cluster_size values are reused without a prefix-list call.
-                match kv.evaluate_cluster(ec_id, &entry, generation) {
+                // Use a stored cluster size, or compute one without writing it.
+                // The writer navigation stores it in its single mutation.
+                match kv.cluster_size(ec_id, &entry) {
                     Ok(size) => {
                         cluster_size = size;
                     }
@@ -329,6 +332,28 @@ fn apply_cors_headers(response: &mut Response<EdgeBody>, origin: &str) {
         header::VARY,
         HeaderValue::from_static("Origin, Authorization"),
     );
+}
+
+/// The partner's stored UID, when the shared servability check lets this
+/// request see it.
+fn servable_partner_uid(
+    entry: &KvEntry,
+    source_domain: &str,
+    ec_context: &EcContext,
+) -> Option<String> {
+    let record = entry.ids.get(source_domain)?;
+    let source = source_domain.parse::<SourceDomain>().ok()?;
+    let now = super::checked_current_timestamp()?;
+    let catalog = ProviderCatalog::empty();
+    let opted_out = kv_opted_out(entry);
+    let serve = ServeContext {
+        now: UnixTime::from_secs(now),
+        consent: ec_context.consent(),
+        signals: PolicySignals::default(),
+        catalog: &catalog,
+        opted_out: &opted_out,
+    };
+    is_servable(&serve, &source, record).then(|| record.uid.clone())
 }
 
 #[cfg(test)]
@@ -638,6 +663,92 @@ mod tests {
         assert!(
             body.get("eid").is_none(),
             "eid should be omitted when KV read fails"
+        );
+    }
+
+    fn identify_uid_for_record(record: crate::ec::kv_types::KvPartnerId) -> Option<String> {
+        let settings = create_test_settings();
+        let kv = KvIdentityGraph::in_memory("identify_store");
+        let partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let mut entry = crate::ec::kv_types::KvEntry::minimal("other.example.com", "x", 1);
+        entry.ids.insert("ssp.example.com".to_owned(), record);
+        kv.create(&ec_id, &entry).expect("should seed the row");
+        let req = Request::builder()
+            .method("GET")
+            .uri("https://edge.test-publisher.com/identify")
+            .header("authorization", format!("Bearer {VALID_API_TOKEN}"))
+            .body(EdgeBody::empty())
+            .expect("should build test request");
+        let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+
+        let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
+            .expect("should answer identify");
+        let body = serde_json::from_slice::<serde_json::Value>(
+            &response.into_body().into_bytes().unwrap_or_default(),
+        )
+        .expect("should decode identify response JSON");
+        body.get("uid")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
+    }
+
+    #[test]
+    fn handle_identify_computes_cluster_size_without_writing() {
+        let settings = create_test_settings();
+        let (kv, counter) = KvIdentityGraph::write_counting("identify_store");
+        let partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        kv.create(
+            &ec_id,
+            &crate::ec::kv_types::KvEntry::minimal("ssp.example.com", "u", 1),
+        )
+        .expect("should seed the row");
+        let writes_before = counter.writes().total();
+        let req = Request::builder()
+            .method("GET")
+            .uri("https://edge.test-publisher.com/identify")
+            .header("authorization", format!("Bearer {VALID_API_TOKEN}"))
+            .body(EdgeBody::empty())
+            .expect("should build test request");
+        let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+
+        let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
+            .expect("should answer identify");
+        let body = serde_json::from_slice::<serde_json::Value>(
+            &response.into_body().into_bytes().unwrap_or_default(),
+        )
+        .expect("should decode identify response JSON");
+
+        assert_eq!(
+            body["cluster_size"],
+            serde_json::json!(1),
+            "should report a size"
+        );
+        assert_eq!(
+            counter.writes().total(),
+            writes_before,
+            "should not write the computed size"
+        );
+    }
+
+    #[test]
+    fn handle_identify_omits_expired_ids() {
+        let expired = crate::ec::kv_types::KvPartnerId {
+            exp: Some(1),
+            ..crate::ec::kv_types::KvPartnerId::new("expired-uid")
+        };
+        assert_eq!(
+            identify_uid_for_record(expired),
+            None,
+            "should not return an expired ID"
+        );
+        assert_eq!(
+            identify_uid_for_record(crate::ec::kv_types::KvPartnerId::new("live-uid")),
+            Some("live-uid".to_owned()),
+            "control: should return a live ID"
         );
     }
 

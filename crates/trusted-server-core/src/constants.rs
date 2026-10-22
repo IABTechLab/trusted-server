@@ -6,6 +6,10 @@ pub const COOKIE_TS_EC_PULL_COMPLETE: &str = "ts-ec-pull-complete";
 /// Cookie written by the Trusted Server JS SDK containing a standard-base64-encoded
 /// JSON array of Extended User IDs (`[{ source, uids }]`) from identity providers.
 pub const COOKIE_TS_EIDS: &str = "ts-eids";
+/// Server-owned, sealed cache of provider-collected EIDs.
+pub const COOKIE_TS_EIDS_S: &str = "__Host-ts-eids-s";
+/// Name prefix of the per-batch removal cookies, `__Host-ts-eids-r-<8 hex>`.
+pub const COOKIE_TS_EIDS_R_PREFIX: &str = "__Host-ts-eids-r-";
 pub const COOKIE_TS_TESTER: &str = "ts-tester";
 pub const COOKIE_SHAREDID: &str = "sharedId";
 

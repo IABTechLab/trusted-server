@@ -1,8 +1,10 @@
 //! Shared EID resolution and formatting helpers.
 //!
-//! Used by both `/_ts/api/v1/identify` and `/auction` to resolve source-domain
-//! keyed IDs from KV entries, convert them to `OpenRTB` EID structures, and
-//! build base64-encoded response headers.
+//! Used by `/auction`, the navigation auction and the admin view to resolve
+//! source-domain keyed IDs from KV entries, convert them to `OpenRTB` EID
+//! structures, and build base64-encoded response headers. Every KV ID passes
+//! the shared servability check in [`crate::ec::identity::servable`], so
+//! expired IDs and IDs a writer or owner may not disclose are never sent.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use error_stack::{Report, ResultExt as _};
@@ -10,7 +12,9 @@ use error_stack::{Report, ResultExt as _};
 use crate::error::TrustedServerError;
 use crate::openrtb::{Eid, Uid};
 
-use super::kv_types::KvEntry;
+use super::identity::servable::{ServeContext, is_servable};
+use super::identity::{EidProvenance, SourceDomain};
+use super::kv_types::{KvEntry, KvPartnerId};
 use super::registry::PartnerRegistry;
 
 /// Maximum size (in bytes) for the base64-encoded `x-ts-eids` header value.
@@ -24,8 +28,12 @@ pub struct ResolvedPartnerId {
     pub source_domain: String,
     /// The synced user ID value.
     pub uid: String,
-    /// `OpenRTB` agent type for this partner's identifiers.
+    /// `OpenRTB` agent type: the stored provider `atype`, else the partner's.
     pub openrtb_atype: i32,
+    /// Stored UID-level `ext`, when a provider supplied one.
+    pub ext: Option<serde_json::Value>,
+    /// EID-level fields the writing provider declared for this source.
+    pub provenance: Option<EidProvenance>,
 }
 
 /// Resolves source-domain keyed IDs from a KV entry against the partner registry.
@@ -33,25 +41,50 @@ pub struct ResolvedPartnerId {
 /// Filters to partners with `bidstream_enabled = true` and non-empty UIDs,
 /// sorted deterministically by source domain.
 #[must_use]
-pub fn resolve_partner_ids(registry: &PartnerRegistry, entry: &KvEntry) -> Vec<ResolvedPartnerId> {
+pub(crate) fn resolve_partner_ids(
+    registry: &PartnerRegistry,
+    entry: &KvEntry,
+    serve: &ServeContext<'_>,
+) -> Vec<ResolvedPartnerId> {
+    resolve_partner_records(
+        registry,
+        entry
+            .ids
+            .iter()
+            .filter_map(|(source, record)| Some((source.parse::<SourceDomain>().ok()?, record))),
+        serve,
+    )
+}
+
+/// Resolves any set of records, such as the merged server set of KV and the
+/// identity cookies, the way [`resolve_partner_ids`] resolves a KV entry.
+pub(crate) fn resolve_partner_records<'r>(
+    registry: &PartnerRegistry,
+    records: impl IntoIterator<Item = (SourceDomain, &'r KvPartnerId)>,
+    serve: &ServeContext<'_>,
+) -> Vec<ResolvedPartnerId> {
     let mut resolved = Vec::new();
 
-    for (source_domain, partner_uid) in &entry.ids {
-        if partner_uid.uid.is_empty() {
-            continue;
-        }
-
-        let Some(partner) = registry.get(source_domain) else {
+    for (source, record) in records {
+        let Some(partner) = registry.get(source.as_str()) else {
             continue;
         };
-        if !partner.bidstream_enabled {
+        if !partner.bidstream_enabled || !is_servable(serve, &source, record) {
             continue;
         }
+        let provenance = record
+            .w
+            .as_deref()
+            .and_then(|writer| writer.parse().ok())
+            .and_then(|writer| serve.catalog.get(&writer))
+            .and_then(|provider| provider.descriptor().provenance(&source).cloned());
 
         resolved.push(ResolvedPartnerId {
             source_domain: partner.source_domain.clone(),
-            uid: partner_uid.uid.clone(),
-            openrtb_atype: partner.openrtb_atype,
+            uid: record.uid.clone(),
+            openrtb_atype: record.atype.unwrap_or(partner.openrtb_atype),
+            ext: record.ext.clone(),
+            provenance,
         });
     }
 
@@ -65,14 +98,20 @@ pub fn to_eids(resolved: &[ResolvedPartnerId]) -> Vec<Eid> {
     resolved
         .iter()
         .map(|item| {
-            Eid::new(
+            let mut eid = Eid::new(
                 item.source_domain.clone(),
                 vec![Uid {
                     id: item.uid.clone(),
                     atype: Some(item.openrtb_atype),
-                    ext: None,
+                    ext: item.ext.clone(),
                 }],
-            )
+            );
+            if let Some(provenance) = &item.provenance {
+                eid.inserter = provenance.inserter().map(str::to_owned);
+                eid.matcher = provenance.matcher().map(str::to_owned);
+                eid.mm = provenance.mm();
+            }
+            eid
         })
         .collect()
 }
@@ -181,18 +220,14 @@ mod tests {
         entry.consent.ok = true;
         entry.ids.insert(
             "zeta.example.com".to_owned(),
-            super::super::kv_types::KvPartnerId {
-                uid: "uid-z".to_owned(),
-            },
+            super::super::kv_types::KvPartnerId::new("uid-z".to_owned()),
         );
         entry.ids.insert(
             "alpha.example.com".to_owned(),
-            super::super::kv_types::KvPartnerId {
-                uid: "uid-a".to_owned(),
-            },
+            super::super::kv_types::KvPartnerId::new("uid-a".to_owned()),
         );
 
-        let resolved = resolve_partner_ids(&registry, &entry);
+        let resolved = resolve_partner_ids(&registry, &entry, &serve_context(&serve_parts()));
         let source_domains: Vec<&str> = resolved
             .iter()
             .map(|item| item.source_domain.as_str())
@@ -205,6 +240,65 @@ mod tests {
         );
     }
 
+    struct ServeParts {
+        consent: crate::consent::ConsentContext,
+        catalog: crate::ec::identity::catalog::ProviderCatalog,
+        opted_out: std::collections::BTreeSet<crate::ec::identity::IdentityProviderId>,
+    }
+
+    fn serve_parts() -> ServeParts {
+        ServeParts {
+            consent: crate::ec::identity::test_support::allowing_consent(),
+            catalog: crate::ec::identity::catalog::ProviderCatalog::empty(),
+            opted_out: std::collections::BTreeSet::new(),
+        }
+    }
+
+    fn serve_context(parts: &ServeParts) -> ServeContext<'_> {
+        ServeContext {
+            now: crate::ec::identity::UnixTime::from_secs(100),
+            consent: &parts.consent,
+            signals: crate::ec::identity::policy::PolicySignals::default(),
+            catalog: &parts.catalog,
+            opted_out: &parts.opted_out,
+        }
+    }
+
+    #[test]
+    fn resolve_partner_ids_skips_expired_records_and_uses_stored_atype_and_ext() {
+        let partners = vec![
+            make_test_partner("a.example.com"),
+            make_test_partner("b.example.com"),
+        ];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+        let mut entry = KvEntry::minimal("a.example.com", "ua", 1);
+        entry.ids.insert(
+            "b.example.com".to_owned(),
+            super::super::kv_types::KvPartnerId {
+                exp: Some(50),
+                ..super::super::kv_types::KvPartnerId::new("ub")
+            },
+        );
+        let stored = entry.ids.get_mut("a.example.com").expect("should hold a");
+        stored.atype = Some(3);
+        stored.ext = Some(serde_json::json!({ "linkType": 2 }));
+
+        let resolved = resolve_partner_ids(&registry, &entry, &serve_context(&serve_parts()));
+
+        assert_eq!(resolved.len(), 1, "should drop the expired b");
+        assert_eq!(resolved[0].source_domain, "a.example.com", "should keep a");
+        assert_eq!(
+            resolved[0].openrtb_atype, 3,
+            "should prefer the stored atype"
+        );
+        let eids = to_eids(&resolved);
+        assert_eq!(
+            eids[0].uids[0].ext,
+            Some(serde_json::json!({ "linkType": 2 })),
+            "should emit the stored UID-level ext"
+        );
+    }
+
     #[test]
     fn to_eids_maps_resolved_ids_correctly() {
         let resolved = vec![
@@ -212,16 +306,22 @@ mod tests {
                 uid: "LR_xyz".to_owned(),
                 source_domain: "liveramp.com".to_owned(),
                 openrtb_atype: 3,
+                ext: None,
+                provenance: None,
             },
             ResolvedPartnerId {
                 uid: "ID5_abc".to_owned(),
                 source_domain: "id5-sync.com".to_owned(),
                 openrtb_atype: 1,
+                ext: None,
+                provenance: None,
             },
             ResolvedPartnerId {
                 uid: "pair-id".to_owned(),
                 source_domain: "google.com".to_owned(),
                 openrtb_atype: 571187,
+                ext: None,
+                provenance: None,
             },
         ];
 
@@ -251,6 +351,8 @@ mod tests {
                 uid: format!("uid_{}", "x".repeat(100)),
                 source_domain: format!("partner-{idx}.example.com"),
                 openrtb_atype: 3,
+                ext: None,
+                provenance: None,
             });
         }
 
@@ -270,6 +372,8 @@ mod tests {
             uid: "u1".to_owned(),
             source_domain: "ssp.com".to_owned(),
             openrtb_atype: 3,
+            ext: None,
+            provenance: None,
         }];
 
         let (encoded, truncated) =
