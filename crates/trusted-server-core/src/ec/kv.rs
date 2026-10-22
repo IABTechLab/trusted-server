@@ -125,6 +125,17 @@ pub(crate) fn apply_partner_id_updates(entry: &mut KvEntry, updates: &[PartnerId
     changed
 }
 
+/// Outcome of [`KvIdentityGraph::apply_removals_now`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemovalWriteOutcome {
+    /// The removals were written.
+    Written,
+    /// The row already shows them applied, or holds nothing to remove.
+    AlreadyApplied,
+    /// The write failed; the caller keeps the batch in cookies.
+    Failed,
+}
+
 /// EC identity graph on top of the platform KV store primitives.
 ///
 /// Each EC ID (`{64hex}.{6alnum}`) maps to a JSON-encoded [`KvEntry`]
@@ -1222,6 +1233,69 @@ impl KvIdentityGraph {
         // store context to list failures, so propagate without re-wrapping.
         self.store
             .count_keys_with_prefix(hash_prefix, CLUSTER_LIST_LIMIT)
+    }
+
+    /// Writes a removal batch before send: the removal overflow write, the
+    /// second page-load exception to the one-write rule.
+    ///
+    /// Reads the row and applies only the batch's removals, opt-outs, clears
+    /// and invalidated-UID hashes. Like the withdrawal path it retries up to
+    /// five times, and only when the CAS generation no longer matches. Any
+    /// other failure, the per-key write limit included, ends at once.
+    pub(crate) fn apply_removals_now(
+        &self,
+        ec_id: &str,
+        removals: &super::identity::mutation::IdentityMutation,
+        context: &super::identity::mutation::ApplyContext<'_>,
+    ) -> RemovalWriteOutcome {
+        for attempt in 0..MAX_CAS_RETRIES {
+            let (entry, generation) = match self.get(ec_id) {
+                Ok(Some(found)) => found,
+                Ok(None) => return RemovalWriteOutcome::AlreadyApplied,
+                Err(error) => {
+                    log::warn!(
+                        "Removal overflow read failed for '{}': {}",
+                        log_id(ec_id),
+                        error.current_context()
+                    );
+                    return RemovalWriteOutcome::Failed;
+                }
+            };
+            let Some(applied) = super::identity::mutation::apply(removals, &entry, context) else {
+                return RemovalWriteOutcome::AlreadyApplied;
+            };
+            if !applied.changed {
+                return RemovalWriteOutcome::AlreadyApplied;
+            }
+            let Ok((body, meta)) = Self::serialize_entry(&applied.entry, self.store_name()) else {
+                return RemovalWriteOutcome::Failed;
+            };
+            match self.write_entry(
+                ec_id,
+                &body,
+                &meta,
+                ENTRY_TTL,
+                EcKvWriteMode::IfGenerationMatch(generation),
+            ) {
+                Ok(EcKvWriteOutcome::Written) => return RemovalWriteOutcome::Written,
+                Ok(EcKvWriteOutcome::PreconditionFailed) => {
+                    log::debug!(
+                        "Removal overflow CAS conflict on attempt {}/{MAX_CAS_RETRIES} for '{}'",
+                        attempt + 1,
+                        log_id(ec_id)
+                    );
+                }
+                Err(error) => {
+                    log::warn!(
+                        "Removal overflow write failed for '{}': {}",
+                        log_id(ec_id),
+                        error.current_context()
+                    );
+                    return RemovalWriteOutcome::Failed;
+                }
+            }
+        }
+        RemovalWriteOutcome::Failed
     }
 
     /// Returns the cluster size for an entry, without writing it.

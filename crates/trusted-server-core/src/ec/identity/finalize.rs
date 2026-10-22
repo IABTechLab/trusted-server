@@ -19,13 +19,13 @@ use super::cookie::{
 use super::coordinator::{EligibilityView, claimed_sources};
 use super::ids::{IdentityProviderId, SourceDomain};
 use super::input::{RandomSource, ThreadRandom};
-use super::mutation::{IdentityMutation, PartnerIdChange, ProviderStateChange};
+use super::mutation::{ApplyContext, IdentityMutation, PartnerIdChange, ProviderStateChange};
 use super::policy::{PolicySignals, policy_allows};
 use super::revision::{IdentityKeys, Revision, invalidated_uid_hash};
 use crate::consent::allows_eid_persistence;
 use crate::constants::COOKIE_TS_EIDS_S;
 use crate::ec::EidSyncSource;
-use crate::ec::kv::PartnerIdUpdate;
+use crate::ec::kv::{KvIdentityGraph, PartnerIdUpdate, RemovalWriteOutcome};
 use crate::ec::kv_types::{KvEntry, KvPartnerId};
 use crate::ec::prebid_eids::collect_eid_updates;
 use crate::ec::registry::PartnerRegistry;
@@ -532,11 +532,30 @@ fn append_set_cookie(response: &mut Response<EdgeBody>, value: &str) {
     }
 }
 
+/// A removal batch as a removals-only mutation.
+fn batch_mutation(batch: &RBatch) -> IdentityMutation {
+    let (removals, states) = r_batch_to_changes(batch);
+    let mut mutation = IdentityMutation::default();
+    for change in removals {
+        mutation.add_change(change);
+    }
+    for (provider, state) in states {
+        mutation.merge_state(provider, state);
+    }
+    mutation.removals_only()
+}
+
 /// Sets and deletes the identity cookies this response staged. The only
 /// place `__Host-ts-eids-*` cookies are written.
+///
+/// A removal batch that does not fit one cookie, or meets four removal
+/// cookies already present, is written to KV before send. Only when that
+/// write fails is it set in new cookies of its own, split but never
+/// coarsened.
 pub(crate) fn emit_identity_cookies(
     context: &mut EcContext,
     finalize: &IdentityFinalize,
+    graph: Option<&KvIdentityGraph>,
     response: &mut Response<EdgeBody>,
 ) {
     let ec_id = context.ec_value().map(str::to_owned);
@@ -581,12 +600,31 @@ pub(crate) fn emit_identity_cookies(
             finalize.random(),
         ) {
             RPlan::Cookie { name, value } => vec![(name, value)],
-            RPlan::Overflow => split_r_batch(
-                &finalize.keys,
-                ec_id,
-                &staged.new_r_batch,
-                finalize.random(),
-            ),
+            RPlan::Overflow => {
+                let outcome = graph.map_or(RemovalWriteOutcome::Failed, |graph| {
+                    graph.apply_removals_now(
+                        ec_id,
+                        &batch_mutation(&staged.new_r_batch),
+                        &ApplyContext {
+                            now: finalize.now,
+                            keys: &finalize.keys,
+                            random: finalize.random(),
+                            catalog: &finalize.catalog,
+                        },
+                    )
+                });
+                match outcome {
+                    RemovalWriteOutcome::Written | RemovalWriteOutcome::AlreadyApplied => {
+                        Vec::new()
+                    }
+                    RemovalWriteOutcome::Failed => split_r_batch(
+                        &finalize.keys,
+                        ec_id,
+                        &staged.new_r_batch,
+                        finalize.random(),
+                    ),
+                }
+            }
         };
         for (name, value) in cookies {
             append_set_cookie(response, &set_cookie_header(&name, &value));
@@ -897,6 +935,169 @@ mod tests {
                 .any(|value| value.starts_with("__Host-ts-eids-r-")),
             "keeps the removal cookie until a writer applies it"
         );
+    }
+
+    fn big_batch(count: usize) -> RBatch {
+        RBatch {
+            rm: (0..count)
+                .map(|index| RRemoval {
+                    s: format!("s{index}.example.com"),
+                    w: "p".to_owned(),
+                    pv: None,
+                    sa: current_timestamp(),
+                })
+                .collect(),
+            ..RBatch::default()
+        }
+    }
+
+    fn row_with_records(count: usize) -> KvEntry {
+        let mut entry = KvEntry::minimal("z.example.com", "x", 1);
+        for index in 0..count {
+            entry.ids.insert(
+                format!("s{index}.example.com"),
+                KvPartnerId {
+                    w: Some("p".to_owned()),
+                    at: Some(1),
+                    ..KvPartnerId::new("u")
+                },
+            );
+        }
+        entry
+    }
+
+    fn emit_with(graph: &KvIdentityGraph, cookies: &str, batch: RBatch) -> Response<EdgeBody> {
+        let registry = registry();
+        let finalize = IdentityFinalize::for_test(
+            ProviderCatalog::from_partners(&registry).expect("should build catalog"),
+            current_timestamp(),
+        );
+        let mut context = context_with(cookies, false, Jurisdiction::NonRegulated);
+        open_identity_cookies(&mut context, &finalize);
+        context.identity_mut().staged_mut().new_r_batch = batch;
+        let mut response = Response::new(EdgeBody::empty());
+        emit_identity_cookies(&mut context, &finalize, Some(graph), &mut response);
+        response
+    }
+
+    fn removal_cookie_count(response: &Response<EdgeBody>) -> usize {
+        set_cookies(response)
+            .iter()
+            .filter(|value| value.starts_with("__Host-ts-eids-r-") && !value.contains("Max-Age=0"))
+            .count()
+    }
+
+    #[test]
+    fn overflow_batch_is_written_before_send_with_no_cookie() {
+        let (graph, counter) = KvIdentityGraph::write_counting("ec-store");
+        graph
+            .create(&ec_id(), &row_with_records(12))
+            .expect("should seed");
+        let before = counter.writes();
+
+        let response = emit_with(&graph, "x=1", big_batch(12));
+
+        assert_eq!(
+            counter.writes().if_generation_match - before.if_generation_match,
+            1,
+            "one conditional write before send"
+        );
+        assert_eq!(
+            removal_cookie_count(&response),
+            0,
+            "no removal cookie is set"
+        );
+        let (stored, _) = graph
+            .get(&ec_id())
+            .expect("should read")
+            .expect("should exist");
+        assert_eq!(
+            stored.ids.len(),
+            1,
+            "every named record is removed, the control kept"
+        );
+    }
+
+    #[test]
+    fn overflow_retries_only_on_generation_mismatch() {
+        let (graph, counter) = KvIdentityGraph::write_counting("ec-store");
+        graph
+            .create(&ec_id(), &row_with_records(12))
+            .expect("should seed");
+        counter.conflict_next(2);
+        let before = counter.writes();
+
+        let response = emit_with(&graph, "x=1", big_batch(12));
+
+        assert_eq!(
+            counter.writes().if_generation_match - before.if_generation_match,
+            3,
+            "two conflicts, then the write lands"
+        );
+        assert_eq!(
+            removal_cookie_count(&response),
+            0,
+            "no removal cookie is set"
+        );
+    }
+
+    #[test]
+    fn overflow_write_failure_falls_back_to_split_cookies() {
+        let graph = KvIdentityGraph::failing("ec-store");
+
+        let response = emit_with(&graph, "x=1", big_batch(12));
+
+        assert!(
+            removal_cookie_count(&response) >= 2,
+            "the batch is split across new cookies when the write fails"
+        );
+        assert!(
+            !set_cookies(&response)
+                .iter()
+                .any(|value| value.starts_with("__Host-ts-eids-s=")),
+            "no other cookie is rewritten"
+        );
+    }
+
+    #[test]
+    fn four_openable_removal_cookies_force_overflow() {
+        let (graph, counter) = KvIdentityGraph::write_counting("ec-store");
+        graph
+            .create(&ec_id(), &row_with_records(1))
+            .expect("should seed");
+        let existing = sealed_r(&big_batch(1));
+        let cookies = (0..4)
+            .map(|index| format!("__Host-ts-eids-r-0000000{index}={existing}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let before = counter.writes();
+
+        let response = emit_with(&graph, &cookies, big_batch(1));
+
+        assert_eq!(
+            counter.writes().if_generation_match - before.if_generation_match,
+            1,
+            "a small batch is written when four cookies are present"
+        );
+        assert_eq!(
+            removal_cookie_count(&response),
+            0,
+            "and adds no fifth cookie"
+        );
+    }
+
+    #[test]
+    fn a_small_batch_gets_a_cookie_of_its_own() {
+        let (graph, counter) = KvIdentityGraph::write_counting("ec-store");
+        graph
+            .create(&ec_id(), &row_with_records(1))
+            .expect("should seed");
+        let before = counter.writes();
+
+        let response = emit_with(&graph, "x=1", big_batch(1));
+
+        assert_eq!(counter.writes().total() - before.total(), 0, "no write");
+        assert_eq!(removal_cookie_count(&response), 1, "one removal cookie");
     }
 
     #[test]

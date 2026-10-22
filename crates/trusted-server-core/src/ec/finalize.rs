@@ -87,7 +87,7 @@ pub fn ec_finalize_response(
             // Removals stay in their cookies unless a tombstone now covers
             // them; `__Host-ts-eids-s` never outlives usable consent.
             stage_consent_loss(ec_context, tombstoned);
-            emit_identity_cookies(ec_context, identity, response);
+            emit_identity_cookies(ec_context, identity, kv, response);
         }
         return;
     }
@@ -149,7 +149,7 @@ pub fn ec_finalize_response(
 
         reconcile_pull_sync_marker(settings, registry, ec_context, response);
         if let Some(identity) = &identity {
-            emit_identity_cookies(ec_context, identity, response);
+            emit_identity_cookies(ec_context, identity, kv, response);
         }
 
         // Ordinary returning-user page views no longer refresh the browser
@@ -181,7 +181,7 @@ pub fn ec_finalize_response(
 
     reconcile_pull_sync_marker(settings, registry, ec_context, response);
     if let Some(identity) = &identity {
-        emit_identity_cookies(ec_context, identity, response);
+        emit_identity_cookies(ec_context, identity, kv, response);
     }
 }
 
