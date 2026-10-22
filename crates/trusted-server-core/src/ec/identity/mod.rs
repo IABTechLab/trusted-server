@@ -18,6 +18,7 @@ pub mod config;
 pub(crate) mod cookie;
 pub(crate) mod coordinator;
 pub mod descriptor;
+pub(crate) mod dispatch;
 pub mod exchange;
 pub mod ids;
 pub mod input;

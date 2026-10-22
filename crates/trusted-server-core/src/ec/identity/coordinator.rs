@@ -490,6 +490,9 @@ pub(crate) enum CallOutcome {
     TransportFailure,
     /// The circuit breaker was open.
     BreakerOpen,
+    /// Not sent for a reason the stored row does not show, such as the
+    /// per-visitor burst cap. Phase 4 backs a marked provider off by a minute.
+    NotDispatched,
 }
 
 /// What turning an outcome into changes needs.
@@ -537,7 +540,7 @@ pub(crate) fn outcome_to_changes(
     let now = context.now;
     let mut changes = OutcomeChanges::default();
     match outcome {
-        CallOutcome::BreakerOpen => {}
+        CallOutcome::BreakerOpen | CallOutcome::NotDispatched => {}
         CallOutcome::Skipped | CallOutcome::InputUnavailable => {
             changes.state.n = Some(now + context.provider_settings.refresh_after_sec);
         }

@@ -104,6 +104,10 @@ fn checked_sources() -> &'static [(&'static str, &'static str)] {
             include_str!("ec/identity/descriptor.rs"),
         ),
         (
+            "ec/identity/dispatch.rs",
+            include_str!("ec/identity/dispatch.rs"),
+        ),
+        (
             "ec/identity/exchange.rs",
             include_str!("ec/identity/exchange.rs"),
         ),

@@ -332,6 +332,33 @@ pub(crate) struct ResolveSignals<'a> {
     pub(crate) dry_run: bool,
 }
 
+impl<'a> ResolveSignals<'a> {
+    /// The signals for one provider: its own stored records and state.
+    #[must_use]
+    pub(crate) fn for_provider(
+        &self,
+        stored: BTreeMap<SourceDomain, StoredId>,
+        state_json: Option<String>,
+        dry_run: bool,
+    ) -> ResolveSignals<'a> {
+        ResolveSignals {
+            client_ip: self.client_ip,
+            user_agent: self.user_agent,
+            page_url: self.page_url.clone(),
+            region: self.region.clone(),
+            hashed_email: self.hashed_email.clone(),
+            consent: self.consent.clone(),
+            publisher_domain: self.publisher_domain,
+            now: self.now,
+            random: self.random,
+            ec_id: self.ec_id.clone(),
+            stored,
+            state_json,
+            dry_run,
+        }
+    }
+}
+
 /// What one provider may read for one call.
 ///
 /// Every accessor checks the descriptor. Reading something undeclared fails
