@@ -1,11 +1,10 @@
 name: Binary attestations
-
 on:
   push:
     tags: ['v*']
   pull_request:
     paths:
-      - '.github/workflows/release.yml'
+      - '.github/workflows/release*.yml'
       - 'scripts/release/phase1*'
       - 'Cargo.toml'
       - 'Cargo.lock'
@@ -13,123 +12,27 @@ on:
       - '.tool-versions'
       - '.cargo/**'
       - 'edgezero.toml'
-      - 'crates/**'
-
+      - 'crates/trusted-server-core/**'
+      - 'crates/trusted-server-cli/**'
+      - 'crates/trusted-server-js/**'
+      - 'crates/trusted-server-adapter-fastly/**'
+      - 'crates/trusted-server-openrtb*/**'
 permissions:
   contents: read
-
 concurrency:
   group: binary-attestations-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
-    name: Build ${{ matrix.asset }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
-    permissions:
-      contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-24.04
-            package: trusted-server-adapter-fastly
-            target: wasm32-wasip1
-            asset: trusted-server-fastly.wasm
-          - os: ubuntu-24.04
-            package: trusted-server-cli
-            target: x86_64-unknown-linux-gnu
-            asset: ts-x86_64-unknown-linux-gnu
-          - os: macos-15
-            package: trusted-server-cli
-            target: aarch64-apple-darwin
-            asset: ts-aarch64-apple-darwin
-          - os: macos-15-intel
-            package: trusted-server-cli
-            target: x86_64-apple-darwin
-            asset: ts-x86_64-apple-darwin
-    steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-        with:
-          persist-credentials: false
-      - name: Read pinned toolchains
-        id: tools
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "node=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
-          echo "rust=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
-      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
-        with:
-          node-version: ${{ steps.tools.outputs.node }}
-      - name: Install the pinned Rust toolchain without build caches
-        env:
-          RUST_VERSION: ${{ steps.tools.outputs.rust }}
-          BUILD_TARGET: ${{ matrix.target }}
-        run: rustup toolchain install "$RUST_VERSION" --profile minimal --target "$BUILD_TARGET"
-      - name: Test local release checks
-        run: node --test scripts/release/phase1.test.mjs
-      - name: Build and generate the build inventory in a clean environment
-        shell: bash
-        env:
-          BUILD_PACKAGE: ${{ matrix.package }}
-          BUILD_TARGET: ${{ matrix.target }}
-          RELEASE_ASSET: ${{ matrix.asset }}
-          SOURCE_COMMIT: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-          env -i PATH="$PATH" HOME="$HOME" \
-            CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
-            RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
-            TMPDIR="${TMPDIR:-/tmp}" RUNNER_TEMP="$RUNNER_TEMP" \
-            SOURCE_COMMIT="$SOURCE_COMMIT" \
-            bash scripts/release/phase1-build.sh "$BUILD_PACKAGE" "$BUILD_TARGET" "$RELEASE_ASSET"
-      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
-        with:
-          name: release-${{ matrix.asset }}
-          path: release-assets/*
-          if-no-files-found: error
-          retention-days: 7
-
-  sign:
-    name: Attest ${{ matrix.asset }}
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: build
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    uses: ./.github/workflows/release-build.yml
     permissions:
       contents: read
       id-token: write
       attestations: write
-    strategy:
-      fail-fast: false
-      matrix:
-        asset:
-          - trusted-server-fastly.wasm
-          - ts-x86_64-unknown-linux-gnu
-          - ts-aarch64-apple-darwin
-          - ts-x86_64-apple-darwin
-    steps:
-      # No checkout, build scripts or executables from the artifacts run here.
-      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
-        with:
-          name: release-${{ matrix.asset }}
-          path: release-assets
-      - name: Attest SLSA build provenance
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        with:
-          subject-path: release-assets/${{ matrix.asset }}
-      - name: Attest the binary's SBOM
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        with:
-          subject-path: release-assets/${{ matrix.asset }}
-          sbom-path: release-assets/${{ matrix.asset }}.cdx.json
-
   release:
-    name: Publish the immutable release
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: sign
+    needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -137,45 +40,111 @@ jobs:
     steps:
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
-          pattern: release-*
-          merge-multiple: true
-          path: release-assets
-      - name: Draft, upload, publish and verify immutability
-        shell: bash
+          name: release-trusted-server-fastly.wasm
+          path: build/trusted-server-fastly.wasm
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: signed-trusted-server-fastly.wasm
+          path: signed/trusted-server-fastly.wasm
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-ts-aarch64-apple-darwin
+          path: build/ts-aarch64-apple-darwin
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: signed-ts-aarch64-apple-darwin
+          path: signed/ts-aarch64-apple-darwin
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-ts-x86_64-apple-darwin
+          path: build/ts-x86_64-apple-darwin
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: signed-ts-x86_64-apple-darwin
+          path: signed/ts-x86_64-apple-darwin
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-ts-x86_64-unknown-linux-gnu
+          path: build/ts-x86_64-unknown-linux-gnu
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: signed-ts-x86_64-unknown-linux-gnu
+          path: signed/ts-x86_64-unknown-linux-gnu
+      - name: Verify handoff, create once, publish by release ID and verify
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
+          SOURCE_COMMIT: ${{ github.sha }}
         run: |
           set -euo pipefail
-          # Treat all API errors except an explicit 404 as fatal.
-          if gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" > existing.json 2> lookup-error.txt; then
-            echo '::error::A release already exists for this tag; refusing to overwrite it.'
-            exit 1
-          elif ! grep -q 'HTTP 404' lookup-error.txt; then
-            cat lookup-error.txt >&2
-            exit 1
-          fi
-          cd release-assets
-          expected=(trusted-server-fastly.wasm ts-x86_64-unknown-linux-gnu ts-aarch64-apple-darwin ts-x86_64-apple-darwin)
-          files=()
-          for asset in "${expected[@]}"; do
-            test -s "$asset"
-            test -s "$asset.cdx.json"
-            files+=("$asset" "$asset.cdx.json")
-          done
-          test "$(find . -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 8
-          sha256sum "${files[@]}" > SHA256SUMS
-          gh release create "$RELEASE_TAG" --repo "$GH_REPO" --draft --verify-tag \
-            --title "$RELEASE_TAG" --notes 'Attested release binaries. Verify provenance, SBOM and immutable asset membership before use; see the release verification guide at this tag.'
-          gh release upload "$RELEASE_TAG" "${files[@]}" SHA256SUMS --repo "$GH_REPO"
-          gh release edit "$RELEASE_TAG" --draft=false --repo "$GH_REPO"
-          immutable=$(gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" --jq '.immutable')
-          if [ "$immutable" != true ]; then
-            echo '::error::Published release is NOT immutable. Maintainer action required; do not use these assets.'
-            exit 1
-          fi
-          gh release verify "$RELEASE_TAG" --repo "$GH_REPO"
-          for asset in "${files[@]}" SHA256SUMS; do
-            gh release verify-asset "$RELEASE_TAG" "$asset" --repo "$GH_REPO"
-          done
+          gh --version
+          node <<'NODE'
+          ;(async () => {
+          // BEGIN PUBLICATION
+          const fs = require('node:fs');
+          const { createHash } = require('node:crypto');
+          const { execFileSync } = require('node:child_process');
+          const { GH_REPO: repo, RELEASE_TAG: tag, GH_TOKEN: token, SOURCE_COMMIT: source } = process.env;
+          if (!/^[\w-]+\/[\w.-]+$/.test(repo) || !/^v[\w.+-]+$/.test(tag)) throw Error('Invalid repository or tag');
+          const names = ['trusted-server-fastly.wasm', 'ts-aarch64-apple-darwin', 'ts-x86_64-apple-darwin', 'ts-x86_64-unknown-linux-gnu'];
+          const hash = bytes => createHash('sha256').update(bytes).digest('hex');
+          const regular = path => { const stat = fs.lstatSync(path); if (!stat.isFile() || stat.size === 0) throw Error(`Invalid file: ${path}`); return fs.readFileSync(path); };
+          const exact = (dir, expected) => { if (JSON.stringify(fs.readdirSync(dir).sort()) !== JSON.stringify([...expected].sort())) throw Error(`Unexpected artifact contents: ${dir}`); };
+          fs.mkdirSync('release-assets');
+          const files = [];
+          for (const name of names) {
+            const build = `build/${name}`, signed = `signed/${name}`;
+            const inputs = [name, `${name}.spdx.json`], bundles = [`${name}.provenance.sigstore.json`, `${name}.sbom.sigstore.json`];
+            exact(build, inputs); exact(signed, [...bundles, 'SHA256SUMS']);
+            const receipt = [...inputs.map(file => [build, file]), ...bundles.map(file => [signed, file])].map(([dir, file]) => {
+              const bytes = regular(`${dir}/${file}`);
+              fs.writeFileSync(`release-assets/${file}`, bytes); files.push(file);
+              return `${hash(bytes)}  ${file}\n`;
+            }).join('');
+            if (regular(`${signed}/SHA256SUMS`).toString() !== receipt) throw Error('Signing handoff digest mismatch');
+          }
+          fs.writeFileSync('release-assets/SHA256SUMS', files.map(file => `${hash(regular(`release-assets/${file}`))}  ${file}\n`).join(''));
+          files.push('SHA256SUMS');
+          const api = async (path, method = 'GET', body) => {
+            const response = await fetch(`https://api.github.com/repos/${repo}/${path}`, {method, headers:{Authorization:`Bearer ${token}`, Accept:'application/vnd.github+json', 'Content-Type':'application/json'}, ...(body ? {body:JSON.stringify(body)} : {})}); // allow-domain: api.github.com
+            if (!response.ok) throw Error(`GitHub API failed: ${method} ${path} ${response.status}`);
+            return response.json();
+          };
+          // List releases, including drafts. Never resume, overwrite or delete a matching tag.
+          for (let page = 1; ; page++) {
+            if (page > 1000) throw Error('Release listing exceeded bound');
+            const releases = await api(`releases?per_page=100&page=${page}`);
+            if (!Array.isArray(releases)) throw Error('Invalid release listing');
+            if (releases.some(release => release.tag_name === tag)) throw Error('Release or draft already exists');
+            if (releases.length < 100) break;
+          }
+          const created = await api('releases', 'POST', {tag_name:tag, target_commitish:source, name:tag, draft:true, body:'Verify binary provenance, SPDX SBOM and immutable release membership using the release verification guide at this tag.'});
+          if (!Number.isSafeInteger(created.id) || created.id <= 0 || created.tag_name !== tag || created.draft !== true) throw Error('Invalid created release identity');
+          const id = created.id;
+          console.log(`Created release ID: ${id}`);
+          for (const file of files) {
+            const bytes = regular(`release-assets/${file}`);
+            const response = await fetch(`https://uploads.github.com/repos/${repo}/releases/${id}/assets?name=${encodeURIComponent(file)}`, {method:'POST', headers:{Authorization:`Bearer ${token}`, 'Content-Type':'application/octet-stream'}, body:bytes}); // allow-domain: uploads.github.com
+            if (!response.ok) throw Error(`Asset upload failed: ${file}`);
+            const asset = await response.json();
+            if (asset.name !== file || asset.state !== 'uploaded' || asset.size !== bytes.length || asset.digest !== `sha256:${hash(bytes)}`) throw Error(`Upload mismatch: ${file}`);
+          }
+          const published = await api(`releases/${id}`, 'PATCH', {draft:false});
+          const verifyIdentity = async () => {
+            const release = await api(`releases/${id}`), byTag = await api(`releases/tags/${encodeURIComponent(tag)}`);
+            if (published.id !== id || release.id !== id || byTag.id !== id || release.tag_name !== tag || release.draft !== false || release.immutable !== true) throw Error('Published release identity or immutability mismatch');
+            if (!Array.isArray(release.assets) || release.assets.length !== files.length || new Set(release.assets.map(asset => asset.name)).size !== files.length) throw Error('Published asset set mismatch');
+            for (const asset of release.assets) {
+              if (!files.includes(asset.name)) throw Error('Unexpected published asset');
+              const bytes = regular(`release-assets/${asset.name}`);
+              if (asset.size !== bytes.length || asset.digest !== `sha256:${hash(bytes)}`) throw Error('Published asset digest mismatch');
+            }
+          };
+          await verifyIdentity();
+          execFileSync('gh', ['release','verify',tag,'--repo',repo], {stdio:'inherit'});
+          for (const file of files) execFileSync('gh', ['release','verify-asset',tag,`release-assets/${file}`,'--repo',repo], {stdio:'inherit'});
+          await verifyIdentity();
+          // END PUBLICATION
+          })().catch(error => { console.error(error); process.exitCode = 1; });
+          NODE

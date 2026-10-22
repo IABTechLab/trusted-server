@@ -4,6 +4,113 @@ import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 
+/** Complete converter output with the actual binary's SPDX package. */
+export function completeSpdx(document, binary, original) {
+  if (
+    document.documentDescribes?.length ||
+    document.relationships?.length ||
+    document.packages.some((entry) => entry.SPDXID === 'SPDXRef-Artifact')
+  )
+    throw new Error('Unexpected converter root or relationships')
+  const root = original.metadata.component
+  document.packages.push({
+    SPDXID: 'SPDXRef-Artifact',
+    name: root.name,
+    versionInfo: root.version,
+    downloadLocation: 'NOASSERTION',
+    filesAnalyzed: false,
+    licenseConcluded: 'NOASSERTION',
+    licenseDeclared: 'NOASSERTION',
+    copyrightText: 'NOASSERTION',
+    externalRefs: root.purl
+      ? [
+          {
+            referenceCategory: 'PACKAGE-MANAGER',
+            referenceType: 'purl',
+            referenceLocator: root.purl,
+          },
+        ]
+      : [],
+    checksums: [
+      {
+        algorithm: 'SHA256',
+        checksumValue: createHash('sha256').update(binary).digest('hex'),
+      },
+    ],
+  })
+  document.documentDescribes = ['SPDXRef-Artifact']
+  document.relationships = [
+    {
+      spdxElementId: 'SPDXRef-DOCUMENT',
+      relationshipType: 'DESCRIBES',
+      relatedSpdxElement: 'SPDXRef-Artifact',
+    },
+  ]
+  return validateSpdx(document, binary, original)
+}
+
+/** Check the frozen SPDX root/hash join and preserved package identities. */
+export function validateSpdx(document, binary, original) {
+  checkBinary(binary)
+  if (
+    document.spdxVersion !== 'SPDX-2.3' ||
+    document.SPDXID !== 'SPDXRef-DOCUMENT'
+  )
+    throw new Error('Expected an SPDX 2.3 document')
+  const packages = document.packages ?? []
+  const ids = new Set(packages.map((entry) => entry.SPDXID))
+  if (ids.size !== packages.length)
+    throw new Error('Duplicate SPDX package identity')
+  if ([...ids].some((id) => !/^SPDXRef-[A-Za-z0-9.-]+$/.test(id)))
+    throw new Error('Invalid SPDX package identifier')
+  const described = new Set(document.documentDescribes ?? [])
+  for (const edge of document.relationships ?? []) {
+    if (
+      edge.spdxElementId === document.SPDXID &&
+      edge.relationshipType === 'DESCRIBES'
+    )
+      described.add(edge.relatedSpdxElement)
+  }
+  const root = packages.find((entry) => entry.SPDXID === [...described][0])
+  if (described.size !== 1 || !root)
+    throw new Error('SPDX must describe exactly one root package')
+  const hashes = (root.checksums ?? []).filter(
+    (hash) => hash.algorithm === 'SHA256'
+  )
+  if (
+    hashes.length !== 1 ||
+    hashes[0].checksumValue !==
+      createHash('sha256').update(binary).digest('hex')
+  )
+    throw new Error('SPDX root SHA256 differs from binary')
+  const flatten = (items) =>
+    items.flatMap((item) => [item, ...flatten(item.components ?? [])])
+  const components = [
+    original.metadata.component,
+    ...flatten(original.components ?? []),
+  ]
+  const used = new Set()
+  for (const component of components) {
+    const match = packages.find(
+      (entry) =>
+        !used.has(entry.SPDXID) &&
+        entry.name === component.name &&
+        (!component.version || entry.versionInfo === component.version) &&
+        (!component.purl ||
+          entry.externalRefs?.some(
+            (ref) =>
+              ref.referenceType === 'purl' &&
+              ref.referenceLocator === component.purl
+          ))
+    )
+    if (!match) throw new Error('SPDX lost component identity or PURL')
+    if (component === original.metadata.component && match !== root)
+      throw new Error('SPDX describes a different inventory root')
+    used.add(match.SPDXID)
+  }
+  return document
+}
+
 // Adapted from #1262's native recipe scanner at 10167c6017b725d0a4d5ad0a0c8e6a96fd4aa807.
 export const sentinels = [
   'phase1-origin-canary.example.com',
@@ -58,7 +165,7 @@ function namespace(bom, prefix) {
       )
     return typeof value === 'string' &&
       ['bom-ref', 'ref', 'dependsOn', 'provides'].includes(key)
-      ? `${prefix}:${value}`
+      ? `${prefix}-${createHash('sha256').update(value).digest('hex')}`
       : value
   }
   return rename(bom)
@@ -97,12 +204,13 @@ export function mergeSboms(cargo, npm, binary, name) {
         {
           name: 'trusted-server:coverage',
           value:
-            'Selected Cargo dependency graph plus the installed npm build tree used for this release build. Conservative inventory: components may be removed by linking, tree-shaking or minification. External Prebid is not bundled; its installed package is a build-tree entry only. Native C/assembly, system libraries, Rust standard library and compiler runtimes are not completely inventoried. Complete composition is Phase 2.',
+            'Selected Cargo packages plus the installed npm build tree used for this release build. Conservative inventory: components may be removed by linking, tree-shaking or minification. External Prebid is not bundled; its installed package is a build-tree entry only. SPDX conversion does not retain dependency relationships. Native C/assembly, system libraries, Rust standard library and compiler runtimes are not completely inventoried. Complete composition is Phase 2.',
         },
       ],
     },
     components: [
       ...(rust.components ?? []),
+      ...(root.components ?? []),
       npmRoot,
       ...(javascript.components ?? []),
     ],
@@ -149,9 +257,23 @@ if (
         2
       ) + '\n'
     )
+  } else if (command === 'validate-spdx' && args.length === 3) {
+    const [file, binary, original] = args
+    const document = JSON.parse(readFileSync(file))
+    const inventory = JSON.parse(readFileSync(original))
+    completeSpdx(document, readFileSync(binary), inventory)
+    const coverage = inventory.metadata.properties?.find(
+      (entry) => entry.name === 'trusted-server:coverage'
+    )?.value
+    if (typeof coverage !== 'string' || coverage.length === 0)
+      throw new Error('Missing conservative inventory coverage')
+    document.creationInfo.comment = [document.creationInfo.comment, coverage]
+      .filter(Boolean)
+      .join('\n')
+    writeFileSync(file, JSON.stringify(document, null, 2) + '\n')
   } else {
     throw new Error(
-      'Expected audit, check <binary...>, or merge <cargo> <npm> <binary> <output>'
+      'Expected audit, check <binary...>, merge <cargo> <npm> <binary> <output>, or validate-spdx <spdx> <binary> <merged-cdx>'
     )
   }
 }
