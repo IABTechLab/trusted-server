@@ -244,12 +244,14 @@ no wall-clock timeout, memory-allocation guarantee or earlier raw-header access.
 Unsupported metadata and request-relative server milestones display **Unavailable**.
 There is no historical recovery or server-side report store.
 
-The masked client IP follows each adapter's established `ClientInfo` source.
-`trusted_client_ip` header resolution is Fastly-only. Axum uses the transport peer,
-Cloudflare uses its runtime client-IP header, and Spin uses its runtime client
-address. Behind a forwarder these adapters may therefore report the forwarder's
-masked address. Authenticated public-origin forwarding does not change client-IP
-trust or enable header-based IP resolution on those adapters.
+Both the setup page and traced publisher document prefer the reader IP resolved
+from authenticated `trusted_client_ip` headers at the request boundary, before
+header sanitation. Missing, duplicate, malformed or unauthenticated values fall
+back to the adapter's runtime address. Runtime geolocation is omitted whenever
+that address differs from the authenticated reader. Fastly applies trusted client
+IP resolution throughout request handling; Axum, Cloudflare and Spin use it only
+for these trace surfaces. Public-origin forwarding has separate authentication
+and does not itself establish client-IP trust.
 
 ### Release acceptance
 
@@ -285,9 +287,14 @@ Until these checks are complete, physical mobile acceptance remains pending.
 ### Maintaining versioned assets
 
 The committed trace asset manifest covers the dedicated trace build settings,
-trace sources, pinned Node version and resolved Vite build-tool dependency graph.
+trace sources and resolved Vite build-tool dependency graph.
 Rust and JavaScript read the same `trace-build-inputs.json` definition. Changes to
-unrelated publisher build settings or dependencies do not invalidate trace assets.
+publisher-only build settings or dependencies do not invalidate trace assets.
+The Node pin is excluded. Shared Vite toolchain changes update source provenance,
+but normal builds compare rebuilt bytes with committed assets instead of rejecting
+source-digest drift. `TSJS_PREBUILT_DIR` builds cannot rebuild, so they require an
+exact `source_sha256` match as well as the committed asset digests. Trace builds
+disable ambient PostCSS configuration discovery.
 
 While version one is unpublished, use the repository-pinned Node version and run:
 
@@ -301,10 +308,12 @@ npm test
 
 `build:trace-assets` rebuilds only the trace viewer, copies its exact JS/CSS bytes
 into `trace-assets/`, and refreshes the source and per-asset digests together.
-Review and commit both the bytes and manifest. Ordinary builds verify these
-records and never refresh committed assets automatically. Unchanged bytes keep
+Review and commit both the bytes and manifest. Ordinary builds verify the rebuilt bytes and never refresh committed assets
+automatically. Unchanged bytes keep
 their existing digest. Once an asset URL is published, add a new asset version
-instead of replacing bytes at that URL.
+instead of replacing bytes at that URL. The current tooling supports only v1;
+the [asset versioning follow-up](../../superpowers/plans/2026-10-22-trace-asset-versioning-follow-up.md)
+must be completed before introducing v2.
 
 ## What the Console Shows
 

@@ -22,15 +22,6 @@ export function traceSourceDigest(library) {
   ))
     add(relative, fs.readFileSync(path.join(library, relative)));
 
-  const versions = fs.readFileSync(path.resolve(library, inputs.node_version_file), 'utf8');
-  const node = versions
-    .split(/\r?\n/)
-    .find((line) => /^nodejs\s/.test(line))
-    ?.trim()
-    .split(/\s+/)[1];
-  if (!node) throw new Error('trace assets require a pinned Node version');
-  add('nodejs', node);
-
   const { packages } = JSON.parse(fs.readFileSync(path.join(library, 'package-lock.json'), 'utf8'));
   const selected = new Set();
   const pending = inputs.toolchain_roots.map((name) => `node_modules/${name}`);

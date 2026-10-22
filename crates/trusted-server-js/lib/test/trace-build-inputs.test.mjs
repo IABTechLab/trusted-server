@@ -60,15 +60,14 @@ describe('trace build provenance', () => {
       '\n// publisher-only change\n'
     );
     changePackage(directory, 'prebid.js');
+    fs.writeFileSync(path.resolve(directory, '../../../.tool-versions'), 'nodejs 25.0.0\n');
     expect(traceSourceDigest(directory)).toBe(before);
   });
-  it('tracks trace build settings, nested sources, Node and resolved toolchain dependencies', () => {
+  it('tracks trace build settings, nested sources and resolved toolchain dependencies', () => {
     for (const change of [
       (directory) =>
         fs.appendFileSync(path.join(directory, 'build-trace.mjs'), '\n// trace setting\n'),
       (directory) => fs.writeFileSync(path.join(directory, 'src/trace/new-input.json'), '{}'),
-      (directory) =>
-        fs.writeFileSync(path.resolve(directory, '../../../.tool-versions'), 'nodejs 25.0.0\n'),
       (directory) => fs.appendFileSync(path.join(directory, 'tsconfig.json'), '\n'),
       (directory) => changePackage(directory, 'vite'),
       (directory) => changePackage(directory, 'esbuild'),
@@ -94,10 +93,18 @@ describe('trace build provenance', () => {
       );
     build();
     const first = snapshot();
+    // Ambient PostCSS configuration must not participate in this isolated build.
+    fs.writeFileSync(
+      path.join(directory, 'postcss.config.mjs'),
+      'throw new Error("ambient PostCSS config should not load");\n'
+    );
     build();
     expect(snapshot()).toEqual(first);
     const manifest = JSON.parse(first[0].toString('utf8'));
-    expect(manifest.source_sha256).toBe(traceSourceDigest(directory));
+    expect(
+      manifest.source_sha256,
+      'should match trace build inputs; run `npm run build:trace-assets` to regenerate'
+    ).toBe(traceSourceDigest(directory));
     for (const asset of manifest.assets) {
       expect(
         createHash('sha256')

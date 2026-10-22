@@ -8,15 +8,6 @@ import { buildTraceAssets } from './build-trace.mjs';
 import { traceSourceDigest } from './trace-asset-sources.mjs';
 
 const library = path.dirname(fileURLToPath(import.meta.url));
-const versions = fs.readFileSync(path.resolve(library, '../../../.tool-versions'), 'utf8');
-const expectedNode = versions
-  .split(/\r?\n/)
-  .find((line) => /^nodejs\s/.test(line))
-  ?.trim()
-  .split(/\s+/)[1];
-if (process.versions.node !== expectedNode)
-  throw new Error(`Use pinned Node ${expectedNode} to regenerate trace assets`);
-
 // v1 is still unpublished. Once released, add a version rather than replacing its bytes.
 const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'trace-assets-build-'));
 try {

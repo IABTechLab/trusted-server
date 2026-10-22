@@ -5876,8 +5876,17 @@ fn trace_document_bootstrap(
     geo: Option<&GeoInfo>,
     captured_at: DateTime<Utc>,
 ) -> String {
+    let mut client = client.clone();
+    let mut geo = geo;
+    if let Some(client_ip) = gate.client_ip() {
+        if client.client_ip != Some(client_ip) {
+            // Runtime geo describes the forwarder when the reader differs.
+            geo = None;
+        }
+        client.client_ip = Some(client_ip);
+    }
     let mut bootstrap = String::from("<script>window.__tsjs_trace_active=true;");
-    match project_request_context(client, geo, gate.cookies(), captured_at) {
+    match project_request_context(&client, geo, gate.cookies(), captured_at) {
         Ok(context) => {
             if let Some(script) = trace_document_context_script(&context) {
                 bootstrap.push_str(&script);
@@ -10057,6 +10066,85 @@ mod tests {
                     assert!(
                         html.contains("192.0.2.0/24") && !html.contains("192.0.2.99"),
                         "should project only masked trusted client IP"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn trace_document_uses_authenticated_reader_ip_and_matching_geo() {
+            for authenticated in [false, true] {
+                let mut settings = settings(true);
+                settings.trusted_client_ip = Some(crate::settings::TrustedClientIpConfig {
+                    ip_header: "x-example-client-ip".to_owned(),
+                    auth_header: "x-ts-forwarder-auth".to_owned(),
+                    shared_secret: crate::redacted::Redacted::new(
+                        "fictional-client-secret-0123456789".to_owned(),
+                    ),
+                });
+                let mut request = request("", Some("__Host-ts-console=1"), "document");
+                request.headers_mut().insert(
+                    "x-example-client-ip",
+                    HeaderValue::from_static("198.51.100.7"),
+                );
+                if authenticated {
+                    request.headers_mut().insert(
+                        "x-ts-forwarder-auth",
+                        HeaderValue::from_static("fictional-client-secret-0123456789"),
+                    );
+                }
+                let mut publisher_request = HttpRequest::builder()
+                    .uri(request.uri().clone())
+                    .body(EdgeBody::empty())
+                    .expect("should build publisher request");
+                *publisher_request.headers_mut() = request.headers().clone();
+                let (_, html) = render(&settings, publisher_request, "text/html");
+                assert!(
+                    html.contains(if authenticated {
+                        "198.51.100.0/24"
+                    } else {
+                        "192.0.2.0/24"
+                    }),
+                    "should project the authenticated reader or runtime fallback in the publisher report"
+                );
+                let hook = TracePreDispatchHook::new(
+                    Arc::new(settings),
+                    Arc::new(|_| panic!("should not fetch setup metadata for a document")),
+                );
+                block_on(hook.handle(&mut request)).expect("should capture document gate");
+                let gate = request
+                    .extensions()
+                    .get::<TraceCaptureGate>()
+                    .expect("should retain document gate");
+                assert!(
+                    !request.headers().contains_key("x-ts-forwarder-auth"),
+                    "should sanitize credentials before document rendering"
+                );
+                for runtime_ip in ["192.0.2.99", "198.51.100.7"] {
+                    let client = ClientInfo {
+                        client_ip: Some(runtime_ip.parse().expect("should parse runtime IP")),
+                        ..ClientInfo::default()
+                    };
+                    let geo = GeoInfo {
+                        country: "EX".to_owned(),
+                        city: String::new(),
+                        continent: String::new(),
+                        latitude: 0.0,
+                        longitude: 0.0,
+                        metro_code: 0,
+                        region: None,
+                        asn: None,
+                    };
+                    let context = context_from_script(&trace_document_bootstrap(
+                        gate,
+                        &client,
+                        Some(&geo),
+                        fixed_clock(),
+                    ));
+                    assert_eq!(
+                        context["network"].get("country").is_some(),
+                        !authenticated || runtime_ip == "198.51.100.7",
+                        "should retain geo only for the reported client address"
                     );
                 }
             }

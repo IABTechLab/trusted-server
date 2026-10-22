@@ -204,7 +204,9 @@ fn reject(mut response: Response<EdgeBody>, head: bool) -> TracePreflight {
 
 /// Return whether the visible pathname is reserved for local trace handling.
 ///
-/// Encoded aliases are reserved for rejection and never become supported routes.
+/// Aliases still visible at dispatch are reserved for rejection. Runtime URL
+/// normalization may collapse aliases before this check; Cloudflare's WHATWG
+/// parsing can expose an exact route where Fastly retains a rejectable alias.
 /// No original-target metadata participates in this decision.
 ///
 /// # Examples

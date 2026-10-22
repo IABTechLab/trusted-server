@@ -21,14 +21,27 @@ use crate::integrations::gpt_diagnostics::{
 use crate::platform::{ClientInfo, GeoInfo};
 use crate::settings::{Settings, TrustedClientIpConfig};
 
-/// Immutable incoming-cookie gate captured before ordinary request preparation.
+/// Immutable trace state captured before ordinary request preparation.
 #[derive(Clone, Copy, Debug)]
 pub struct TraceCaptureGate {
     cookies: TraceCookies,
     base_active: bool,
+    client_ip: Option<IpAddr>,
 }
 
 impl TraceCaptureGate {
+    /// Return the authenticated reader address frozen before header sanitation.
+    ///
+    /// # Examples
+    ///
+    /// ```ignore
+    /// let reader = gate.client_ip().or(runtime_client_ip);
+    /// ```
+    #[must_use]
+    pub fn client_ip(&self) -> Option<IpAddr> {
+        self.client_ip
+    }
+
     /// Return cookie health frozen at the runtime-visible request boundary.
     ///
     /// # Examples
@@ -136,6 +149,7 @@ impl TracePreDispatchHook {
                     );
                     request.extensions_mut().insert(TraceCaptureGate {
                         base_active: cookies.observed_active(),
+                        client_ip: forwarded_client_ip,
                         cookies,
                     });
                 }

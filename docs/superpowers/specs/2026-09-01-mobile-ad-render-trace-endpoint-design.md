@@ -567,10 +567,22 @@ Rules (route responses below apply after configured authentication):
 - `GET` and `HEAD` on exactly `/_ts/trace/assets/v1.js` and
   `/_ts/trace/assets/v1.css` return fixed versioned assets. They contain no
   request or report data and may use immutable public caching. Other methods
-  return local 405 responses. These v1 URLs are immutable byte contracts: any
+  return local 405 responses. Once published, these v1 URLs are immutable byte contracts: any
   JS or CSS byte change requires a new asset-set URL such as `v2.js`/`v2.css`
   and an updated shell reference; a release never replaces bytes at a published
   immutable URL.
+  Before first publication, v1 is an unpublished draft and may be regenerated
+  with `npm run build:trace-assets` in `crates/trusted-server-js/lib`. Review and
+  commit the resulting bytes and `trace-assets-manifest.json` together. Its
+  `source_sha256` hashes the shared `trace-build-inputs.json` definition, trace
+  sources/build settings and locked Vite dependency subgraph. The Node version
+  in `.tool-versions` is recommended for regeneration but excluded from this
+  digest. Normal builds compare freshly rebuilt bytes against committed bytes;
+  `TSJS_PREBUILT_DIR` builds instead require matching source provenance, and all
+  builds verify per-asset SHA-256 digests. Ambient PostCSS config discovery is
+  disabled. Current tooling represents v1 only; complete the
+  [versioning follow-up](../plans/2026-10-22-trace-asset-versioning-follow-up.md)
+  before adding a version while retaining published URL/digest pairs.
 - `POST /_ts/trace/enable` accepts no query parameters, validates an empty body,
   the exact `X-TS-Trace-Action: enable` header, and same-origin request signals;
   sets the diagnostics cookie; and returns a small local JSON result. A success
@@ -1554,15 +1566,20 @@ Supported categories:
 
 Initial provenance and adapter support are:
 
-| Public field                   | Source                                                                                         | Fastly                      | Axum                   | Cloudflare                           | Spin        |
-| ------------------------------ | ---------------------------------------------------------------------------------------------- | --------------------------- | ---------------------- | ------------------------------------ | ----------- |
-| `masked_client_ip`             | `RuntimeServices.client_info.client_ip`, after trusted-client-IP resolution, then core masking | expected                    | expected               | expected                             | expected    |
-| `country`, `region`            | `RuntimeServices.geo.lookup(client_info.client_ip)` projected to `GeoInfo.country/region`      | expected                    | unavailable by default | country expected, region unavailable | unavailable |
-| `asn`                          | `GeoInfo.asn`                                                                                  | unavailable until populated | unavailable            | unavailable until populated          | unavailable |
-| `http_version`                 | new bounded adapter mapping from inbound protocol metadata                                     | optional                    | expected               | optional                             | optional    |
-| `tls_protocol`, `tls_cipher`   | `ClientInfo.tls_protocol/tls_cipher`                                                           | expected                    | unavailable            | unavailable                          | unavailable |
-| `edge_hostname`, `edge_region` | `ClientInfo.server_hostname/server_region`                                                     | expected                    | unavailable            | unavailable                          | unavailable |
-| `edge_pop`                     | new bounded adapter mapping from documented runtime metadata                                   | optional                    | unavailable            | optional                             | unavailable |
+| Public field                   | Source                                                                                                                    | Fastly                      | Axum                   | Cloudflare                           | Spin        |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------- | --------------------------- | ---------------------- | ------------------------------------ | ----------- |
+| `masked_client_ip`             | Frozen trace-boundary authenticated reader IP, falling back to `RuntimeServices.client_info.client_ip`, then core masking | expected                    | expected               | expected                             | expected    |
+| `country`, `region`            | `RuntimeServices.geo.lookup(client_info.client_ip)` projected to `GeoInfo.country/region`                                 | expected                    | unavailable by default | country expected, region unavailable | unavailable |
+| `asn`                          | `GeoInfo.asn`                                                                                                             | unavailable until populated | unavailable            | unavailable until populated          | unavailable |
+| `http_version`                 | new bounded adapter mapping from inbound protocol metadata                                                                | optional                    | expected               | optional                             | optional    |
+| `tls_protocol`, `tls_cipher`   | `ClientInfo.tls_protocol/tls_cipher`                                                                                      | expected                    | unavailable            | unavailable                          | unavailable |
+| `edge_hostname`, `edge_region` | `ClientInfo.server_hostname/server_region`                                                                                | expected                    | unavailable            | unavailable                          | unavailable |
+| `edge_pop`                     | new bounded adapter mapping from documented runtime metadata                                                              | optional                    | unavailable            | optional                             | unavailable |
+
+Both setup and publisher-document metadata omit runtime country/region/ASN when
+the authenticated reader IP differs from the runtime client IP: the runtime geo
+would describe the forwarder. Cloudflare country is therefore conditional on
+matching addresses; no lookup for a different reader address is implied.
 
 `expected` means the implementation plan must map and test an existing source;
 `optional` means the adapter includes it only when its supported SDK exposes a

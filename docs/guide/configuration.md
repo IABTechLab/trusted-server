@@ -485,9 +485,9 @@ TRUSTED_SERVER__PUBLISHER__MAX_BUFFERED_BODY_BYTES=16777216
 
 Use this optional section when a trusted CDN service forwards requests to the
 Fastly service running Trusted Server. It lets Trusted Server use the reader's
-address instead of the immediate fronting edge node's address. Only the Fastly
-adapter honours this section; the Cloudflare, Spin, and Axum adapters validate
-it but keep using their own runtime client address.
+address instead of the immediate fronting edge node's address. Fastly applies this section throughout request handling. Cloudflare, Spin,
+and Axum apply it to trace setup and traced publisher-document metadata; their
+ordinary request handling keeps using the runtime client address.
 
 ### `[trusted_forwarder]`
 
@@ -610,8 +610,9 @@ Startup fails closed if the configured key is missing, empty, invalid UTF-8, or
 resolves to an invalid shared-secret value. Every adapter removes the configured
 IP and authentication headers before ordinary routing. Fastly uses them for
 client-IP resolution throughout request handling. Axum, Cloudflare and Spin also
-use them for the trace setup page's masked client IP; their ordinary request
-handling continues to use the runtime-provided address. The trace page omits
+use them for the masked client IP in both trace setup and traced publisher
+documents; their ordinary request
+handling continues to use the runtime-provided address. Both trace surfaces omit
 runtime geolocation when it describes a different address from the authenticated
 reader.
 
