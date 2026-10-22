@@ -52,7 +52,7 @@ fn libtapi_projects_only_present_measured_bytes_as_a_build_tool() {
         assert!(
             coverage_gaps(&platform)
                 .contains(&"apple-coverage-excluded:toolchain_libraries".to_owned()),
-            "should retain unmeasured library coverage"
+            "should retain unresolved library dependency/load closure coverage"
         );
         let receipt = serde_json::to_value(&platform).expect("should serialize platform receipt");
         assert_eq!(
@@ -253,12 +253,17 @@ fn detached_sdk_is_structured_material_without_raw_file_checksum() {
 }
 
 #[test]
-fn measured_toolchain_projects_liblto_resource_and_helper_components_and_drops_their_gaps() {
+fn measured_toolchain_projects_library_resource_and_helper_trees_and_retains_closure_gaps() {
     let platform = crate::composition::platform::tests::projection_measured_toolchain_fixture();
     let owner = Owner::fixture(&platform);
     let components = project(&platform, &owner).expect("should project measured toolchain");
     let apple = platform.apple().expect("should retain Apple receipt");
     for (name, sha256, role) in [
+        (
+            "Measured Apple toolchain library directory tree",
+            apple.library_tree_sha256(),
+            ComponentRole::BuildMaterial,
+        ),
         (
             "Measured Apple clang resource directory tree",
             apple.clang_resource_tree_sha256(),
@@ -280,6 +285,41 @@ fn measured_toolchain_projects_liblto_resource_and_helper_components_and_drops_t
                 && matches!(&tree.origin, Some(Origin::StructuredTree { sha256: digest }) if digest == sha256),
             "should project {name} as a structured tree"
         );
+        assert!(
+            tree.declared_license.is_none(),
+            "should not invent a tree license"
+        );
+        if name == "Measured Apple toolchain library directory tree" {
+            let inputs = super::super::SpdxInputs {
+                executable: b"",
+                expected_artifact_sha256: owner.artifact.clone(),
+                name: "fictional-artifact".to_owned(),
+                version: "1.0.0".to_owned(),
+                source_commit: owner.source.clone(),
+                target: owner.target,
+                created: "2026-01-01T00:00:00Z".to_owned(),
+                document_comment: None,
+                components: vec![],
+                dependencies: vec![],
+            };
+            let (location, comment, checksum) = super::super::origin_fields(tree, &inputs)
+                .expect("should render structured library material");
+            assert_eq!(location, "NOASSERTION", "should not invent acquisition");
+            assert!(
+                checksum.is_none(),
+                "should not render a raw-file checksum for a tree"
+            );
+            assert!(
+                comment.contains("Structured installed-tree evidence"),
+                "should state only installed-tree evidence"
+            );
+            assert_eq!(
+                tree.identity,
+                identity(owner.target, "apple-toolchain-library-tree", sha256)
+                    .expect("should construct stable library material identity"),
+                "should retain stable library tree role"
+            );
+        }
     }
     assert!(
         components

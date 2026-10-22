@@ -1,13 +1,13 @@
 //! In-place identity of the selected toolchain's helpers, `libLTO`, optional
-//! `libtapi` and clang resource directory.
+//! `libtapi`, clang resources and the entire library directory.
 //!
 //! Everything is read below the selected `clang`'s toolchain `usr` directory,
 //! which stays part of the vendor developer root: nothing is copied, executed
 //! or resolved through `xcrun`. Vendor hard links are accepted because the
 //! tree is not owned; every measured file is rehashed at each verification
 //! point instead. The receipt states which bytes were present, not which of
-//! them clang actually read or ran, and other toolchain libraries remain
-//! unmeasured.
+//! them clang actually read or ran. Libraries outside the selected directories
+//! and the dependency/load closure remain unresolved.
 //!
 //! # Swap window
 //!
@@ -91,6 +91,14 @@ const HELPER_POLICY: TreePolicy = TreePolicy {
     entries: 4_000,
 };
 
+/// Policy for the selected toolchain's entire `usr/lib` directory.
+const LIBRARY_POLICY: TreePolicy = TreePolicy {
+    kind: "toolchain-library-directory",
+    file_bytes: 512 * 1024 * 1024,
+    tree_bytes: 4 * 1024 * 1024 * 1024,
+    entries: 20_000,
+};
+
 /// Structured digest of one vendor tree measured in place.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(super) struct VendorTreeReceipt {
@@ -108,6 +116,7 @@ pub(super) struct ToolchainReceipt {
     liblto_sha256: String,
     libtapi_sha256: Option<String>,
     helper_tree: VendorTreeReceipt,
+    library_tree: VendorTreeReceipt,
 }
 
 impl ToolchainReceipt {
@@ -127,6 +136,10 @@ impl ToolchainReceipt {
     pub(super) fn helper_tree_sha256(&self) -> &str {
         &self.helper_tree.tree_sha256
     }
+    /// Returns the entire library directory's structured-tree digest.
+    pub(super) fn library_tree_sha256(&self) -> &str {
+        &self.library_tree.tree_sha256
+    }
 }
 
 /// A toolchain receipt bound to the attempt budget that rechecks it.
@@ -140,7 +153,9 @@ pub(super) struct MeasuredToolchain {
 }
 
 impl MeasuredToolchain {
-    /// Measures the toolchain that holds `clang`, strictly below `developer_dir`.
+    /// Measures helpers, resources and the entire selected `usr/lib` in place.
+    ///
+    /// The toolchain holds `clang` strictly below `developer_dir`.
     ///
     /// # Errors
     ///
@@ -254,6 +269,7 @@ fn measure_receipt(
     let (liblto_sha256, _) = hash_vendor_file(&usr_dir.join(LIBLTO), LIBLTO_LIMIT, check)?;
     let libtapi_sha256 = optional_libtapi_digest(&usr_dir.join(LIBTAPI), check)?;
     let helper_tree = vendor_tree_digest(helper_dir, HELPER_POLICY, check)?;
+    let library_tree = vendor_tree_digest(&usr_dir.join(TOOLCHAIN_LIB), LIBRARY_POLICY, check)?;
     Ok(ToolchainReceipt {
         clang_resource_version,
         clang_resource_aliases,
@@ -261,6 +277,7 @@ fn measure_receipt(
         liblto_sha256,
         libtapi_sha256,
         helper_tree,
+        library_tree,
     })
 }
 

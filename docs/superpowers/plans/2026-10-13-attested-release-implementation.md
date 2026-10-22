@@ -603,6 +603,44 @@ measurement ran on both architectures. The unqualified four-asset candidate
 index job also succeeded in the `b6f` run. No collector edits or field-mismatch
 workaround was needed. Tasks 10/11 remain partial.
 
+Selected Apple library-directory inventory (2026-10-22): extend the in-place
+toolchain receipt to the entire selected `usr/lib` directory. A read-only
+metadata inventory of local Xcode 16.4 (the version recorded by both hosted
+Apple candidates) found 6,205 entries, 2,601,020,072 regular-file bytes, a largest
+file of 354,743,440 bytes and 41 contained relative aliases. This establishes
+local sizing only, not hosted performance or qualification.
+
+The existing vendor-tree collector measures every file, directory, mode and
+alias target under that root with its own `toolchain-library-directory` digest
+domain. Limits are 512 MiB per file, 4 GiB per tree and 20,000 entries. Reads
+retain the existing cancellation/deadline, no-follow, stable-descriptor and
+alias-containment checks. The receipt's new `library_tree` stays inside opaque
+`platform.apple.toolchain`; strictly checked collector fields are unchanged.
+Every verification rehashes the tree: prior metadata equality cannot substitute
+for fresh content measurement. No digest cache or extra attempt time is added.
+
+The `toolchain_libraries` exclusion now denotes unresolved dependency/loading
+coverage and libraries outside the measured selected directories. It does not
+mean the selected `usr/lib` files are unhashed. Host runtime, dynamic loading,
+original acquisition and full closure remain unresolved, so no completeness
+or qualification flag changes. This inventory deliberately overlaps the
+separate LTO/TAPI/resource identities and proves neither which files the tools
+read nor which bytes contributed to the final artifact. Its extra hashing cost
+must be accepted by a later hosted run under the existing attempt budgets;
+the earlier green runs do not validate this increment.
+
+Local verification passed 66 composition, 68 SPDX, 25 Apple toolchain, 18 GNU,
+46 collection and two unchanged producer golden tests, each with a nonzero
+selection guard. The collection transfer module and ignored tests were excluded
+under the local execution restrictions. The added-library regression first
+failed against the previous collector and then passed with the full inventory.
+Fixtures also cover nested entries, edits/removals, alias targets, unsafe files,
+limits, cancellation, expiry and structured SPDX rendering. Strict host clippy,
+documentation and owned-file formatting passed. Spec review corrected two stale
+comments so exclusions describe unresolved coverage rather than claiming the
+newly inventoried files are unhashed. Independent code quality review found no
+blocking findings and confirmed that hosted read-cost acceptance is still needed.
+
 ### Task 11: Generate complete artifact-specific SPDX
 
 **Create:** release tool `src/spdx.rs`, private `spdx::tests`, `crates/trusted-server-release/tests/fixtures/spdx/`.
@@ -681,6 +719,12 @@ fixtures are unchanged. This adds measured bytes to candidate SPDX without
 opening complete qualified generation or closing Task 11. Hosted receipt and
 candidate SPDX acceptance for both increments is recorded under Task 10 in the
 2026-10-22 note; all named coverage gaps remain present.
+
+Selected Apple library-directory projection (2026-10-22): retain the new
+structured inventory as a build material with no raw-file checksum, original
+download or license claim. Candidate SPDX retains the same named coverage gaps.
+The measured directory is an input inventory, not an asserted executable
+dependency set; complete qualified SPDX generation remains closed.
 
 ### Task 12: Bind transfers and enforce selected comparisons
 

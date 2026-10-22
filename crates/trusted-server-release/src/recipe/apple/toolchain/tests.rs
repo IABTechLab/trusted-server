@@ -85,6 +85,201 @@ fn make_fifo(path: &Path) {
 }
 
 #[test]
+fn library_tree_detects_an_added_sibling_library() {
+    let toolchain = Toolchain::new();
+    let measured = toolchain
+        .measure()
+        .expect("should measure selected toolchain");
+    fs::write(
+        toolchain.usr.join("lib/additional.dylib"),
+        b"fictional library",
+    )
+    .expect("should add sibling library");
+    assert!(
+        measured.verify().is_err(),
+        "should reject a library added after measurement"
+    );
+}
+
+#[test]
+fn library_tree_records_all_subdirectories_and_structured_identity() {
+    let toolchain = Toolchain::new();
+    fs::create_dir_all(toolchain.usr.join("lib/swift/nested"))
+        .expect("should create library subdirectories");
+    fs::write(toolchain.usr.join("lib/swift/nested/extra.dylib"), b"extra")
+        .expect("should write nested library");
+    symlink("nested", toolchain.usr.join("lib/swift/current"))
+        .expect("should alias nested library directory");
+    let measured = toolchain
+        .measure()
+        .expect("should measure library inventory");
+    let receipt = measured.receipt();
+    assert_eq!(
+        receipt.library_tree.entries, 13,
+        "should count every library entry"
+    );
+    assert_eq!(
+        receipt.library_tree.regular_bytes,
+        u64::try_from(
+            b"fictional libLTO".len()
+                + b"fictional header".len()
+                + b"fictional runtime".len()
+                + b"extra".len()
+        )
+        .expect("should fit fixture size"),
+        "should include resources and LTO without following aliases"
+    );
+    let direct = vendor_tree_digest(&toolchain.usr.join("lib"), LIBRARY_POLICY, &|| Ok(()))
+        .expect("should independently measure entire library directory");
+    assert_eq!(
+        receipt.library_tree, direct,
+        "should preserve complete structured inventory"
+    );
+    assert_eq!(
+        receipt.library_tree_sha256(),
+        direct.tree_sha256,
+        "should expose structured digest"
+    );
+    assert_ne!(
+        receipt.library_tree_sha256(),
+        receipt.liblto_sha256(),
+        "should not expose a raw-file digest as tree identity"
+    );
+    assert_eq!(
+        toolchain.receipt(),
+        *receipt,
+        "should retain identical unchanged receipt"
+    );
+    measured
+        .verify()
+        .expect("should verify unchanged complete library tree");
+}
+
+#[test]
+fn library_tree_detects_content_deletion_and_alias_retargeting() {
+    for mutation in [
+        (
+            "content",
+            (|lib: &Path| {
+                fs::write(lib.join("extra.dylib"), b"changed")
+                    .expect("should edit sibling library");
+            }) as Mutation,
+        ),
+        ("deletion", |lib: &Path| {
+            fs::remove_file(lib.join("current.dylib")).expect("should remove library alias");
+            fs::remove_file(lib.join("extra.dylib")).expect("should delete sibling library");
+        }),
+        ("alias target", |lib: &Path| {
+            fs::remove_file(lib.join("current.dylib")).expect("should remove alias");
+            symlink("libLTO.dylib", lib.join("current.dylib")).expect("should retarget alias");
+        }),
+    ] {
+        let toolchain = Toolchain::new();
+        let lib = toolchain.usr.join("lib");
+        fs::write(lib.join("extra.dylib"), b"extra").expect("should write sibling library");
+        symlink("extra.dylib", lib.join("current.dylib")).expect("should add library alias");
+        let measured = toolchain.measure().expect("should measure sibling library");
+        mutation.1(&lib);
+        assert!(
+            measured.verify().is_err(),
+            "should reject changed {}",
+            mutation.0
+        );
+        assert_ne!(
+            toolchain.receipt().library_tree_sha256(),
+            measured.receipt().library_tree_sha256(),
+            "should bind changed {} in digest",
+            mutation.0
+        );
+    }
+}
+
+#[test]
+fn library_tree_rejects_unsafe_entries_and_oversized_files() {
+    let cases: [(&str, Mutation); 5] = [
+        ("absolute alias", |lib| {
+            symlink("/usr/lib", lib.join("absolute")).expect("should add absolute alias");
+        }),
+        ("escaping alias", |lib| {
+            symlink("../bin/clang", lib.join("escape")).expect("should add escaping alias");
+        }),
+        ("dangling alias", |lib| {
+            symlink("missing", lib.join("dangling")).expect("should add dangling alias");
+        }),
+        ("special file", |lib| make_fifo(&lib.join("fifo"))),
+        ("oversized file", |lib| {
+            File::create(lib.join("oversized.dylib"))
+                .expect("should create sparse library")
+                .set_len(LIBRARY_POLICY.file_bytes + 1)
+                .expect("should exceed library file bound");
+        }),
+    ];
+    for (label, mutate) in cases {
+        let toolchain = Toolchain::new();
+        mutate(&toolchain.usr.join("lib"));
+        assert!(
+            toolchain.measure().is_err(),
+            "should reject library {label}"
+        );
+    }
+}
+
+#[test]
+fn library_tree_requires_a_real_unaliased_directory_root() {
+    for alias in [false, true] {
+        let toolchain = Toolchain::new();
+        let lib = toolchain.usr.join("lib");
+        let measured = toolchain
+            .measure()
+            .expect("should measure real library directory");
+        fs::rename(&lib, toolchain.usr.join("other-lib")).expect("should move library directory");
+        if alias {
+            symlink("other-lib", &lib).expect("should alias library root");
+        } else {
+            fs::write(&lib, b"not a directory").expect("should replace library root with file");
+        }
+        assert!(
+            toolchain.measure().is_err(),
+            "should reject non-directory or aliased library root"
+        );
+        assert!(
+            measured.verify().is_err(),
+            "should reject changed library root"
+        );
+    }
+}
+
+#[test]
+fn library_tree_rejects_unreadable_entries_and_obeys_shared_budget() {
+    let toolchain = Toolchain::new();
+    let lib = toolchain.usr.join("lib");
+    let extra = lib.join("extra.dylib");
+    fs::write(&extra, b"extra").expect("should write extra library");
+    let measured = toolchain.measure().expect("should measure extra library");
+    fs::set_permissions(&extra, fs::Permissions::from_mode(0o0))
+        .expect("should remove library read permissions");
+    assert!(
+        measured.verify().is_err(),
+        "should reject unreadable library"
+    );
+    fs::set_permissions(&extra, fs::Permissions::from_mode(0o600))
+        .expect("should restore library read permissions");
+    for expired in [false, true] {
+        let cancellation = Cancellation::default();
+        let deadline = if expired {
+            Instant::now() - Duration::from_secs(1)
+        } else {
+            cancellation.cancel();
+            Instant::now() + Duration::from_secs(30)
+        };
+        assert!(
+            vendor_tree_digest(&lib, LIBRARY_POLICY, &|| budget(deadline, &cancellation)).is_err(),
+            "should reject exhausted library tree attempt budget"
+        );
+    }
+}
+
+#[test]
 fn libtapi_absence_requires_a_real_unaliased_parent() {
     let toolchain = Toolchain::new();
     let missing = toolchain.usr.join("missing");
@@ -217,7 +412,7 @@ fn libtapi_change_is_detected_during_remeasurement() {
 }
 
 #[test]
-fn receipt_records_single_resource_version_aliases_and_three_digests() {
+fn receipt_records_single_resource_version_aliases_and_measured_trees() {
     let toolchain = Toolchain::new();
     let receipt = toolchain.receipt();
     assert_eq!(
@@ -482,6 +677,13 @@ fn tree_kinds_are_domain_separated() {
         as_helpers.tree_sha256, as_resources.tree_sha256,
         "should separate identical contents by tree kind"
     );
+    let as_libraries =
+        vendor_tree_digest(&bin, LIBRARY_POLICY, &unbounded).expect("should digest as libraries");
+    assert!(
+        as_libraries.tree_sha256 != as_helpers.tree_sha256
+            && as_libraries.tree_sha256 != as_resources.tree_sha256,
+        "should separate library identity from both other tree kinds"
+    );
 }
 
 #[test]
@@ -543,24 +745,23 @@ fn vendor_tree_enforces_entry_file_and_tree_bounds() {
     let toolchain = Toolchain::new();
     let bin = toolchain.usr.join("bin");
     let unbounded = || Ok(());
-    for policy in [
-        TreePolicy {
-            entries: 3,
-            ..HELPER_POLICY
-        },
-        TreePolicy {
-            file_bytes: 4,
-            ..HELPER_POLICY
-        },
-        TreePolicy {
-            tree_bytes: 20,
-            ..HELPER_POLICY
-        },
-    ] {
-        assert!(
-            vendor_tree_digest(&bin, policy, &unbounded).is_err(),
-            "should reject exhausted {policy:?}"
-        );
+    for base in [HELPER_POLICY, LIBRARY_POLICY] {
+        for policy in [
+            TreePolicy { entries: 3, ..base },
+            TreePolicy {
+                file_bytes: 4,
+                ..base
+            },
+            TreePolicy {
+                tree_bytes: 20,
+                ..base
+            },
+        ] {
+            assert!(
+                vendor_tree_digest(&bin, policy, &unbounded).is_err(),
+                "should reject exhausted {policy:?}"
+            );
+        }
     }
     assert!(
         vendor_tree_digest(&bin, HELPER_POLICY, &unbounded).is_ok(),

@@ -229,6 +229,12 @@ fn project(
         }
         let toolchain_trees = [
             (
+                "apple-toolchain-library-tree",
+                apple.library_tree_sha256(),
+                "Measured Apple toolchain library directory tree",
+                ComponentRole::BuildMaterial,
+            ),
+            (
                 "apple-clang-resource-tree",
                 apple.clang_resource_tree_sha256(),
                 "Measured Apple clang resource directory tree",

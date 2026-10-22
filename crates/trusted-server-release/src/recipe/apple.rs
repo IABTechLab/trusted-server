@@ -17,12 +17,13 @@
 //! fixtures retain only the four-file record and never claim SDK coverage.
 //!
 //! Ordinary CI selection also measures, in place below the selected `clang`'s
-//! toolchain, a tree digest of the toolchain helper directory, the single
-//! versioned clang resource directory and the SHA-256 of `libLTO.dylib` and
+//! toolchain, tree digests of the helper directory, the entire selected
+//! `usr/lib` directory and the single versioned clang resource directory,
+//! plus the SHA-256 of `libLTO.dylib` and
 //! optional `libtapi.dylib`, and rechecks them at every verification point.
-//! Which helpers clang actually ran, other toolchain libraries, host runtime
-//! and original acquisition
-//! remain unresolved. The developer directory still permits broad
+//! Which helpers clang actually ran, the dependency/load closure, libraries
+//! outside the selected measured directories, host runtime and original
+//! acquisition remain unresolved. The developer directory still permits broad
 //! read/execute access; neither receipt proves every compiler input came from
 //! the measured trees.
 //!
@@ -128,7 +129,7 @@ pub(crate) struct AppleDeveloperTools {
 
 /// Candidate identity of the explicitly measured Apple files.
 ///
-/// The exclusions describe inputs this selection does not hash. A detached
+/// The exclusions describe input classes with unresolved coverage. A detached
 /// SDK receipt is present only for a measured owned snapshot, and a
 /// toolchain receipt only for a measured in-place toolchain.
 #[derive(Debug, Serialize)]
@@ -189,11 +190,17 @@ impl AppleToolEvidence {
             .as_ref()
             .map(ToolchainReceipt::helper_tree_sha256)
     }
+    /// Returns the selected toolchain library directory's structured-tree digest, when measured.
+    pub(crate) fn library_tree_sha256(&self) -> Option<&str> {
+        self.toolchain
+            .as_ref()
+            .map(ToolchainReceipt::library_tree_sha256)
+    }
     /// Returns the SDK version used to check the accepted executable.
     pub(crate) fn sdk_version(&self) -> &str {
         &self.sdk_version
     }
-    /// Returns the reviewed input classes this selection does not hash.
+    /// Returns the reviewed input classes with unresolved coverage.
     pub(crate) fn coverage_exclusions(&self) -> &[&'static str] {
         &self.coverage_exclusions
     }
@@ -375,10 +382,10 @@ impl AppleDeveloperTools {
         })
     }
 
-    /// Names the reviewed input classes this selection does not hash.
+    /// Names the reviewed input classes with unresolved coverage.
     ///
-    /// Toolchain libraries beyond `libLTO` and optional `libtapi` remain
-    /// unmeasured, so the list is never empty.
+    /// The dependency/load closure and libraries outside selected measured
+    /// directories remain unresolved, so the list is never empty.
     fn coverage_exclusions(&self) -> Vec<&'static str> {
         let mut exclusions = Vec::new();
         if self.sdk.is_none() {
@@ -418,8 +425,8 @@ impl AppleDeveloperTools {
         })
     }
 
-    /// Measures the selected toolchain's helpers, `libLTO`, optional `libtapi`
-    /// and clang resource directory in place and binds them into this record.
+    /// Measures the selected toolchain's helpers, entire `usr/lib`, `libLTO`,
+    /// optional `libtapi` and clang resources in place and binds them into this record.
     ///
     /// # Errors
     ///
