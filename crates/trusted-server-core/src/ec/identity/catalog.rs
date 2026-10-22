@@ -3,10 +3,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use error_stack::Report;
 use sha2::{Digest as _, Sha256};
 
+use super::config::{IdentitySettings, ProviderSettings};
+use super::generic_pull::{GenericPullProvider, generic_pull_settings};
 use super::ids::{IdentityProviderId, SourceDomain};
 use super::provider::IdentityProvider;
+use crate::ec::kv_types::MAX_PROVIDER_STATES;
+use crate::ec::registry::PartnerRegistry;
+use crate::error::TrustedServerError;
 
 /// Enabled providers, source owners, and the derived source index and `cf`.
 /// Built once per settings load.
@@ -16,6 +22,9 @@ pub(crate) struct ProviderCatalog {
     owners: BTreeMap<SourceDomain, IdentityProviderId>,
     sources: Vec<SourceDomain>,
     fingerprint: String,
+    /// Provider defaults that an operator table replaces, such as a pull
+    /// partner's legacy rate limit.
+    bases: BTreeMap<IdentityProviderId, ProviderSettings>,
 }
 
 impl core::fmt::Debug for ProviderCatalog {
@@ -70,7 +79,67 @@ impl ProviderCatalog {
             owners,
             sources,
             fingerprint,
+            bases: BTreeMap::new(),
         }
+    }
+
+    /// The catalog for the partner registry: one generic pull provider per
+    /// pull-enabled partner. A partner that cannot form a provider is logged
+    /// and left out.
+    ///
+    /// # Errors
+    ///
+    /// [`TrustedServerError::Configuration`] for two providers with one ID or
+    /// more than 32 enabled providers.
+    pub(crate) fn from_partners(
+        registry: &PartnerRegistry,
+    ) -> Result<Self, Report<TrustedServerError>> {
+        let mut providers: Vec<Arc<dyn IdentityProvider>> = Vec::new();
+        let mut bases = BTreeMap::new();
+        let mut seen = BTreeSet::new();
+        for partner in registry.pull_enabled_partners() {
+            let provider = match GenericPullProvider::from_partner(partner) {
+                Ok(provider) => provider,
+                Err(error) => {
+                    log::warn!(
+                        "Pull partner {} cannot run as an identity provider: {}",
+                        partner.source_domain,
+                        error.current_context()
+                    );
+                    continue;
+                }
+            };
+            let id = provider.descriptor().id().clone();
+            if !seen.insert(id.clone()) {
+                return Err(Report::new(TrustedServerError::Configuration {
+                    message: format!("two identity providers share the id `{id}`"),
+                }));
+            }
+            bases.insert(id, generic_pull_settings(partner));
+            providers.push(Arc::new(provider));
+        }
+        if providers.len() > MAX_PROVIDER_STATES {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: format!(
+                    "{} identity providers are enabled; at most {MAX_PROVIDER_STATES} are allowed",
+                    providers.len()
+                ),
+            }));
+        }
+        let mut catalog = Self::new(providers, BTreeMap::new());
+        catalog.bases = bases;
+        Ok(catalog)
+    }
+
+    /// The operator settings for `id`: its `[ec.identity.providers.<id>]`
+    /// table, else the provider's own defaults, else the global defaults.
+    #[must_use]
+    pub(crate) fn provider_settings(
+        &self,
+        identity: &IdentitySettings,
+        id: &IdentityProviderId,
+    ) -> ProviderSettings {
+        identity.provider(id, self.bases.get(id).cloned())
     }
 
     /// A provider by ID.

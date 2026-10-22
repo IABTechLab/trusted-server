@@ -20,6 +20,7 @@ pub(crate) mod coordinator;
 pub mod descriptor;
 pub(crate) mod dispatch;
 pub mod exchange;
+pub(crate) mod generic_pull;
 pub mod ids;
 pub mod input;
 pub(crate) mod mutation;

@@ -233,6 +233,129 @@ pub(crate) mod test_support {
         }
     }
 
+    /// Writes and reads a [`WriteCountingEcKv`] performed, by mode.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub(crate) struct WriteCounts {
+        /// `lookup` calls.
+        pub(crate) lookups: usize,
+        /// `Add` writes attempted.
+        pub(crate) add: usize,
+        /// `IfGenerationMatch` writes attempted.
+        pub(crate) if_generation_match: usize,
+        /// `Overwrite` writes attempted.
+        pub(crate) overwrite: usize,
+    }
+
+    impl WriteCounts {
+        /// Every write attempted, whatever its mode or outcome.
+        pub(crate) fn total(&self) -> usize {
+            self.add + self.if_generation_match + self.overwrite
+        }
+    }
+
+    /// [`EcKvStore`] that counts reads and writes by mode, and can fail the
+    /// next conditional writes with a precondition failure.
+    pub(crate) struct WriteCountingEcKv {
+        inner: InMemoryEcKv,
+        counts: std::sync::Arc<Mutex<WriteCounts>>,
+        conflicts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    /// A handle that reads a [`WriteCountingEcKv`]'s counts and arms its
+    /// conflicts after the store moved into a graph.
+    #[derive(Clone)]
+    pub(crate) struct WriteCounter {
+        counts: std::sync::Arc<Mutex<WriteCounts>>,
+        conflicts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl WriteCounter {
+        /// The counts so far.
+        pub(crate) fn writes(&self) -> WriteCounts {
+            *self.counts.lock().expect("should lock write counts")
+        }
+
+        /// Fails the next `count` `IfGenerationMatch` writes with a
+        /// precondition failure, as a concurrent writer would.
+        pub(crate) fn conflict_next(&self, count: usize) {
+            self.conflicts
+                .store(count, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    impl WriteCountingEcKv {
+        pub(crate) fn new(name: impl Into<String>) -> (Self, WriteCounter) {
+            let counts = std::sync::Arc::new(Mutex::new(WriteCounts::default()));
+            let conflicts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                Self {
+                    inner: InMemoryEcKv::new(name),
+                    counts: std::sync::Arc::clone(&counts),
+                    conflicts: std::sync::Arc::clone(&conflicts),
+                },
+                WriteCounter { counts, conflicts },
+            )
+        }
+    }
+
+    impl EcKvStore for WriteCountingEcKv {
+        fn store_name(&self) -> &str {
+            self.inner.store_name()
+        }
+
+        fn lookup(&self, key: &str) -> Result<Option<EcKvLookup>, Report<TrustedServerError>> {
+            self.counts
+                .lock()
+                .expect("should lock write counts")
+                .lookups += 1;
+            self.inner.lookup(key)
+        }
+
+        fn key_exists(&self, key: &str) -> Result<bool, Report<TrustedServerError>> {
+            self.inner.key_exists(key)
+        }
+
+        fn insert(
+            &self,
+            key: &str,
+            write: EcKvWrite<'_>,
+        ) -> Result<EcKvWriteOutcome, Report<TrustedServerError>> {
+            {
+                let mut counts = self.counts.lock().expect("should lock write counts");
+                match write.mode {
+                    EcKvWriteMode::Add => counts.add += 1,
+                    EcKvWriteMode::IfGenerationMatch(_) => counts.if_generation_match += 1,
+                    EcKvWriteMode::Overwrite => counts.overwrite += 1,
+                }
+            }
+            if matches!(write.mode, EcKvWriteMode::IfGenerationMatch(_))
+                && self
+                    .conflicts
+                    .fetch_update(
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                        |remaining| remaining.checked_sub(1),
+                    )
+                    .is_ok()
+            {
+                return Ok(EcKvWriteOutcome::PreconditionFailed);
+            }
+            self.inner.insert(key, write)
+        }
+
+        fn list_keys_with_prefix(
+            &self,
+            prefix: &str,
+            limit: u32,
+        ) -> Result<Vec<String>, Report<TrustedServerError>> {
+            self.inner.list_keys_with_prefix(prefix, limit)
+        }
+
+        fn delete(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+            self.inner.delete(key)
+        }
+    }
+
     /// [`EcKvStore`] wrapper that models an eventually-consistent point read.
     ///
     /// The first `stale_lookups` calls to [`EcKvStore::lookup`] report the key

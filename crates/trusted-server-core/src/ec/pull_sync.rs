@@ -315,7 +315,7 @@ fn is_partner_pull_eligible(partner: &PartnerConfig, kv_entry: Option<&KvEntry>)
         .is_none()
 }
 
-fn validated_pull_sync_url(partner: &PartnerConfig) -> Option<Url> {
+pub(crate) fn validated_pull_sync_url(partner: &PartnerConfig) -> Option<Url> {
     let pull_sync_url = partner.pull_sync_url.as_deref()?;
     let parsed = match Url::parse(pull_sync_url) {
         Ok(url) => url,
@@ -365,7 +365,7 @@ fn validated_pull_sync_url(partner: &PartnerConfig) -> Option<Url> {
     Some(parsed)
 }
 
-fn build_pull_request_url(mut base_url: Url, ec_id: &str) -> Url {
+pub(crate) fn build_pull_request_url(mut base_url: Url, ec_id: &str) -> Url {
     base_url.query_pairs_mut().append_pair("ec_id", ec_id);
     base_url
 }

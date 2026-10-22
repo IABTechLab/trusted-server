@@ -1604,6 +1604,14 @@ impl KvIdentityGraph {
         ))
     }
 
+    /// Test helper: an in-memory graph that counts reads and writes by mode.
+    pub(crate) fn write_counting(
+        store_name: impl Into<String>,
+    ) -> (Self, super::kv_backend::test_support::WriteCounter) {
+        let (store, counter) = super::kv_backend::test_support::WriteCountingEcKv::new(store_name);
+        (Self::new(store), counter)
+    }
+
     /// Test helper: a graph whose point reads always miss and whose list API
     /// errors, so absence can neither be observed nor proved.
     pub(crate) fn unprovable_absence(store_name: impl Into<String>) -> Self {
@@ -1619,6 +1627,39 @@ impl KvIdentityGraph {
 mod tests {
     use super::*;
     use crate::ec::kv_backend::test_support::InMemoryEcKv;
+
+    #[test]
+    fn write_counting_graph_counts_by_mode_and_injects_conflicts() {
+        let (graph, counter) = KvIdentityGraph::write_counting("ec-store");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        graph
+            .create(&ec_id, &KvEntry::minimal("a.example.com", "u", 1))
+            .expect("should create");
+        let (_, generation) = graph
+            .get(&ec_id)
+            .expect("should read")
+            .expect("should exist");
+        counter.conflict_next(1);
+        let first = graph.store.insert(
+            &ec_id,
+            EcKvWrite {
+                body: "{}",
+                metadata: "{}",
+                ttl: ENTRY_TTL,
+                mode: EcKvWriteMode::IfGenerationMatch(generation),
+            },
+        );
+        assert_eq!(
+            first.expect("should answer"),
+            EcKvWriteOutcome::PreconditionFailed,
+            "the armed conflict fails the first CAS"
+        );
+        let counts = counter.writes();
+        assert_eq!(counts.add, 1, "one create");
+        assert_eq!(counts.if_generation_match, 1, "one CAS attempt");
+        assert_eq!(counts.lookups, 1, "one read");
+        assert_eq!(counts.total(), 2, "two writes in total");
+    }
 
     #[test]
     fn browser_ingest_records_acquisition_time() {
