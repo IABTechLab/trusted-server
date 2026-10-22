@@ -543,6 +543,7 @@ mod tests {
     use crate::auction::types::{AuctionRequest, AuctionResponse};
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::ConsentContext;
+    use crate::ec::kv_types::MAX_UID_LENGTH;
     use crate::error::IntoHttpResponse as _;
     use crate::openrtb::Uid;
     use crate::platform::test_support::{
@@ -1905,6 +1906,29 @@ mod tests {
             ]),
             "browser entries should come first and KV-only sources after"
         );
+    }
+
+    #[test]
+    fn invalid_legacy_cookie_uids_neither_reach_providers_nor_displace_kv() {
+        for (case, invalid_id) in [
+            ("whitespace-only", "   ".to_owned()),
+            ("oversized", "x".repeat(MAX_UID_LENGTH + 1)),
+        ] {
+            let cookie_payload = json!([{ "source": SOURCE_S, "id": invalid_id, "atype": 1 }]);
+            let encoded = BASE64.encode(
+                serde_json::to_vec(&cookie_payload).expect("should serialize legacy cookie"),
+            );
+
+            let client = resolve_client_auction_eids(None, Some(&encoded));
+            let merged = merged_json(client.clone(), Some(vec![kv_eid(SOURCE_S, "kv-uid", 3)]));
+
+            assert_eq!(client, None, "should drop the {case} legacy cookie UID");
+            assert_eq!(
+                merged,
+                json!([{ "source": SOURCE_S, "uids": [{ "id": "kv-uid", "atype": 3 }] }]),
+                "should keep the KV identity when the {case} legacy UID is dropped"
+            );
+        }
     }
 
     #[test]

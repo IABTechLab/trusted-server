@@ -691,8 +691,11 @@ Callers:
   longer fails the body parse. `AdRequest` has no `flatten` or untagged enum,
   which would break raw capture. `/auction` still treats an empty result as
   absent.
-- **Cookie.** The legacy flattened branch is unchanged and still tried first
-  (`ec/prebid_eids.rs:90-92`). The structured branch base64-decodes the value,
+- **Cookie.** The legacy flattened branch is still tried first
+  (`ec/prebid_eids.rs:90-92`). It now drops an entry whose `id` is blank or
+  longer than `MAX_UID_LENGTH`, or whose `source` is blank, the parser's UID
+  and blank-source rules, because the merge (4.5) lets any browser entry
+  displace KV's entry for its source. The structured branch base64-decodes the value,
   captures it with `serde_json::from_slice::<Box<RawValue>>`, and calls
   `parse_client_eids`. A mistyped field or a bad entry now costs only itself;
   previously it rejected the whole cookie. The body's caps now apply to the

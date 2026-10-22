@@ -293,7 +293,7 @@ fn sharedid_cookie_exceeds_size_limit(cookie_value: &str) -> bool {
 fn legacy_cookie_eids_to_openrtb(entries: Vec<LegacyCookieEid>) -> Vec<Eid> {
     entries
         .into_iter()
-        .filter(|entry| !entry.source.is_empty() && !entry.id.is_empty())
+        .filter(|entry| !entry.source.trim().is_empty() && is_valid_eid_uid(&entry.id))
         .map(|entry| {
             Eid::new(
                 entry.source,
