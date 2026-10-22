@@ -152,3 +152,25 @@ pub(crate) fn catalog_with_owner(
         .collect(),
     )
 }
+
+/// Facts for a returning visitor's writer navigation with no auction and
+/// every input available.
+pub(crate) fn facts_for_writer() -> crate::ec::identity::coordinator::RequestFacts {
+    crate::ec::identity::coordinator::RequestFacts {
+        is_real_browser: true,
+        ec_persistence_allowed: true,
+        policy_signals: crate::ec::identity::policy::PolicySignals::default(),
+        writer: true,
+        new_visitor: false,
+        runs_auction: false,
+        now: crate::ec::identity::UnixTime::from_secs(1_000),
+        available_inputs: [
+            crate::ec::identity::Input::ClientIp,
+            crate::ec::identity::Input::UserAgent,
+            crate::ec::identity::Input::PageUrl,
+            crate::ec::identity::Input::Region,
+        ]
+        .into_iter()
+        .collect(),
+    }
+}

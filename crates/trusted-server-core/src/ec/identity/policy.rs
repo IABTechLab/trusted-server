@@ -84,6 +84,40 @@ pub(crate) fn policy_allows(
     true
 }
 
+/// The canonical consent signals `policy` reads, for the opt-out
+/// fingerprint. Built from decoded decisions, never from the raw consent
+/// string, which changes whenever a CMP re-saves it.
+#[must_use]
+pub(crate) fn fingerprint_bits(
+    policy: &ConsentPolicy,
+    consent: &ConsentContext,
+    signals: PolicySignals,
+) -> String {
+    let tcf = effective_tcf(consent);
+    let mut bits: Vec<String> = policy
+        .tcf_purposes()
+        .iter()
+        .map(|purpose| {
+            let granted = tcf.is_some_and(|tcf| tcf.has_purpose_consent(usize::from(*purpose)));
+            format!("p{purpose}={}", u8::from(granted))
+        })
+        .collect();
+    if let Some(vendor) = policy.tcf_vendor() {
+        let granted = tcf.is_some_and(|tcf| tcf.has_vendor_consent(vendor));
+        bits.push(format!("v{vendor}={}", u8::from(granted)));
+    }
+    if !policy.allows_us_opt_out(UsOptOut::Sale) {
+        bits.push(format!("sale={}", u8::from(us_sale_opted_out(consent))));
+    }
+    if !policy.allows_gpc() {
+        bits.push(format!("gpc={}", u8::from(consent.gpc)));
+    }
+    if !policy.allows_dnt() {
+        bits.push(format!("dnt={}", u8::from(signals.dnt)));
+    }
+    bits.join(";")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,6 +262,48 @@ mod tests {
                 PolicySignals { dnt: true }
             ),
             "generic pull's parity policy checks only the global gates"
+        );
+    }
+
+    #[test]
+    fn fingerprint_bits_follow_decisions_not_raw_strings() {
+        let policy = ConsentPolicy::strict().with_tcf_vendor(9999);
+        let mut granted = consent_with(&TestSignals {
+            gdpr: true,
+            purposes: vec![1, 4],
+            vendors: vec![9999],
+            ..TestSignals::default()
+        });
+        let before = fingerprint_bits(&policy, &granted, NO_DNT);
+        assert_eq!(
+            before, "p1=1;p4=1;v9999=1;sale=0;gpc=0;dnt=0",
+            "should list each decision the policy reads"
+        );
+        granted.raw_tc_string = Some("re-saved-by-the-cmp".to_owned());
+        assert_eq!(
+            fingerprint_bits(&policy, &granted, NO_DNT),
+            before,
+            "a re-saved string with the same decisions keeps the bits"
+        );
+        let denied = consent_with(&TestSignals {
+            gdpr: true,
+            purposes: vec![1],
+            vendors: vec![9999],
+            ..TestSignals::default()
+        });
+        assert_ne!(
+            fingerprint_bits(&policy, &denied, NO_DNT),
+            before,
+            "dropping purpose 4 changes the bits"
+        );
+        assert_eq!(
+            fingerprint_bits(
+                &ConsentPolicy::strict().allowing_gpc().allowing_dnt(),
+                &granted,
+                NO_DNT
+            ),
+            "p1=1;p4=1;sale=0",
+            "relaxed signals are left out"
         );
     }
 

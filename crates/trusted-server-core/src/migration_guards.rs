@@ -96,6 +96,10 @@ fn checked_sources() -> &'static [(&'static str, &'static str)] {
             include_str!("ec/identity/cookie.rs"),
         ),
         (
+            "ec/identity/coordinator.rs",
+            include_str!("ec/identity/coordinator.rs"),
+        ),
+        (
             "ec/identity/descriptor.rs",
             include_str!("ec/identity/descriptor.rs"),
         ),

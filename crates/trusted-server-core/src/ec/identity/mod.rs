@@ -16,6 +16,7 @@
 pub(crate) mod catalog;
 pub mod config;
 pub(crate) mod cookie;
+pub(crate) mod coordinator;
 pub mod descriptor;
 pub mod exchange;
 pub mod ids;
