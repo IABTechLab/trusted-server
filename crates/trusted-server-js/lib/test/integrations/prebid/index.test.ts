@@ -2683,18 +2683,25 @@ describe('prebid/installPrebidNpm', () => {
         });
       }
 
-      function gdprConsentWithPurposeOne(purposeOne: boolean): Record<string, unknown> {
+      function gdprConsentWithPurposes(
+        purposeOne: boolean,
+        purposeFour: boolean
+      ): Record<string, unknown> {
         return {
           gdprApplies: true,
           consentString: 'CPexampleTCStringForTests',
           vendorData: {
-            purpose: { consents: { 1: purposeOne, 2: true }, legitimateInterests: {} },
+            purpose: {
+              consents: { 1: purposeOne, 2: true, 4: purposeFour },
+              legitimateInterests: {},
+            },
           },
         };
       }
 
       it.each([
-        ['Purpose 1 is denied', gdprConsentWithPurposeOne(false)],
+        ['Purpose 1 is denied', gdprConsentWithPurposes(false, true)],
+        ['Purpose 4 is denied', gdprConsentWithPurposes(true, false)],
         ['GDPR applies without a TCF purpose record', { gdprApplies: true, consentString: '' }],
       ])('forwards EIDs but clears ts-eids when %s', (_case, gdprConsent) => {
         const spec = getAdapterSpec();
@@ -2708,18 +2715,21 @@ describe('prebid/installPrebidNpm', () => {
         expect(JSON.parse(String(result.data)).eids, 'should still forward the EIDs').toEqual([
           storedEid,
         ]);
-        expect(readTsEidsCookie(), 'should clear ts-eids without storage consent').toBeUndefined();
+        expect(
+          readTsEidsCookie(),
+          'should clear ts-eids without persistence consent'
+        ).toBeUndefined();
       });
 
       it.each([
-        ['Purpose 1 is granted', gdprConsentWithPurposeOne(true)],
+        ['Purposes 1 and 4 are granted', gdprConsentWithPurposes(true, true)],
         ['GDPR does not apply', { gdprApplies: false }],
       ])('writes ts-eids when %s', (_case, gdprConsent) => {
         const spec = getAdapterSpec();
 
         spec.buildRequests(trustedServerBidRequests(), consentedBidderRequest(gdprConsent));
 
-        expect(decodedTsEidsCookie(), 'should write ts-eids with storage consent').toEqual([
+        expect(decodedTsEidsCookie(), 'should write ts-eids with persistence consent').toEqual([
           storedEid,
         ]);
       });

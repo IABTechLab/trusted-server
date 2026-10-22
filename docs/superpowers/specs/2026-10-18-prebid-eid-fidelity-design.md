@@ -650,12 +650,17 @@ becomes `unknown`, since the server defines the contract.
   `trustedServer`. A blocked bidder never reaches `buildRequests`, so without
   the listener a cookie written before consent changed would live for a day.
 - **Storage consent.** Where the bidder request's `gdprConsent` says GDPR
-  applies, `buildRequests` writes the cookie only with TCF Purpose 1 consent
-  in `vendorData.purpose.consents`, the purpose Prebid's own storage rules
-  check. Otherwise, including GDPR data without a purpose record, it clears
+  applies, `buildRequests` writes the cookie only with TCF Purpose 1 and
+  Purpose 4 consent in `vendorData.purpose.consents`. That is the server's
+  rule for using or storing these EIDs (`allows_eid_persistence`,
+  `gate_eids_by_consent`), so the cookie never holds IDs no server path would
+  read. Otherwise, including GDPR data without a purpose record, it clears
   the cookie and still forwards the EIDs in the body. Forwarding follows
   Prebid's `transmitEids` decision, which any purpose from 2 to 10 satisfies,
-  so it does not establish storage consent.
+  so it establishes neither purpose. The check applies only when
+  `gdprApplies` is `true`: many CMPs answer outside the EU with
+  `gdprApplies: false` and an empty purpose record, and the server keeps
+  using browser EIDs for that traffic.
 - **Why no EID-level `ext`.** It carries vendor data such as LiveIntent
   `segments` and oneKey `preferences`, which should not persist for a day in a
   script-readable cookie or reach body-less routes. A few hundred bytes of it
@@ -892,17 +897,17 @@ Residual exposure:
    per-vendor consent, browser US-state rules) applies only once the next
    `trustedServer` request rewrites or clears it. Accepted to keep browser IDs
    on body-less routes (O1).
-2. **The cookie now holds `ortb2` EIDs, gated on Purpose 1 but not on a
-   vendor.** IDs any vendor or the publisher put into Prebid's `ortb2` for
+2. **The cookie now holds `ortb2` EIDs, gated on Purposes 1 and 4 but not
+   on a vendor.** IDs any vendor or the publisher put into Prebid's `ortb2` for
    `trustedServer`, and their provenance fields, now persist in it. Today it
    holds only User ID module output, which passed Prebid's Purpose 1
    `enrichEids` rule (`modules/tcfControl.ts:285`). An `ortb2` EID needs only
    what `transmitEids` requires for `trustedServer`: under TCF, a purpose from
    2 to 10 with vendor consent or a soft exception. The shim therefore checks
-   Purpose 1 itself before storing (4.3). It cannot check vendor consent,
+   Purposes 1 and 4 itself before storing, as the server does before using
+   the cookie (4.3). It cannot check vendor consent,
    because `trustedServer` has no GVL ID; that waits for TS's TCF identity
-   (8.5). The server still uses the cookie only behind the EC and Purpose 1
-   and 4 gates.
+   (8.5).
 3. **`x-ts-eids` is visible to the page.** The `/auction` response shows the
    consent-gated outbound set, including KV-only partner IDs. Any page script
    that wraps `fetch` can read it. Kept for troubleshooting (G7).
@@ -1400,7 +1405,7 @@ reviewable:
 | Publishers                                       | TS stops overwriting `syncEnabled`, `filterSettings`, `syncsPerBidder`, `syncDelay` and `auctionDelay`. Iframe syncs are no longer force-enabled. Auctions wait up to `auctionDelay` (500 ms by default) while IDs are pending, including after `window.load`. Unchanged: a late managed seed still leaves `autoRefresh: true` for the page |
 | Server-side bidders folded into `trustedServer`  | IDs restricted to them are no longer forwarded (4.8)                                                                                                                                                                                                                                                                                        |
 | GDPR traffic without a `trustedServer` exception | Already no `trustedServer` demand. The cookie is now cleared instead of written from `getUserIdsAsEids()`, so body-less routes and KV ingestion lose browser EIDs for that traffic, including the IdentityLink flow                                                                                                                         |
-| Cookie contents                                  | Holds `ortb2` EIDs and provenance fields, written only with TCF Purpose 1 consent where GDPR applies (4.8); never EID-level `ext`. Written at request time, not at auction end                                                                                                                                                              |
+| Cookie contents                                  | Holds `ortb2` EIDs and provenance fields, written only with TCF Purpose 1 and 4 consent where GDPR applies (4.8); never EID-level `ext`. Written at request time, not at auction end                                                                                                                                                        |
 | KV ingestion on `/auction`                       | No longer reads the cookie next to the body                                                                                                                                                                                                                                                                                                 |
 | Providers                                        | Additive fields and possibly repeated sources                                                                                                                                                                                                                                                                                               |
 | `/_ts/admin/eids` consumers                      | New fields in the cookie entries. A mistyped field is dropped instead of failing the whole cookie                                                                                                                                                                                                                                           |
@@ -1449,7 +1454,8 @@ cookie decoder change is small.
 - Restore the publisher's `autoRefresh` after a late managed seed; today it
   stays `true` for the page because `userSync` settings accumulate (4.9).
 - Add a vendor-level storage check to the `ts-eids` write (4.8, residual 2),
-  together with TS's TCF identity. The Purpose 1 check ships with this work.
+  together with TS's TCF identity. The Purpose 1 and 4 check ships with this
+  work.
 - A server-written cookie (alternative 6), with server-side ID provider work.
 - A lenient parse of the rest of the `/auction` body.
 

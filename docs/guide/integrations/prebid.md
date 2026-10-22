@@ -879,9 +879,9 @@ Where GDPR applies and Prebid's TCF enforcement is active, Prebid sends the
 `trustedServer` adapter no bid requests unless the publisher grants it an
 exception (see [TCF and the `trustedServer` adapter](#tcf-and-the-trustedserver-adapter)),
 and the adapter clears `ts-eids`, so no browser EIDs reach Trusted Server.
-With such an exception but without TCF Purpose 1 (store/access device)
-consent, the adapter still forwards the EIDs in the `/auction` body but clears
-`ts-eids` instead of writing it.
+With such an exception but without TCF Purpose 1 (store/access device) and
+Purpose 4 (personalized ads) consent, the adapter still forwards the EIDs in the
+`/auction` body but clears `ts-eids` instead of writing it.
 
 Trusted Server treats the RampID envelope as an opaque string. Do not log,
 decode, publish, or dimension metrics by the value. Source names, counts,
