@@ -94,6 +94,9 @@ pub const REFERENCE_HOSTS: &[&str] = &[
     "docs.github.com",
     "help.github.com",
     "token.actions.githubusercontent.com",
+    // GitHub Actions SLSA buildType URI used in the carried release policy:
+    // https://actions.github.io/buildtypes/workflow/v1
+    "actions.github.io",
     // Git commit conventions
     "chris.beams.io",
     // Rust
@@ -120,7 +123,7 @@ pub const REFERENCE_HOSTS: &[&str] = &[
     "slsa.dev",
     // SPDX: canonical document predicate in the retained reviewed contract.
     "spdx.dev",
-    // CycloneDX: canonical SBOM predicate used by Phase 1 verification.
+    // CycloneDX: canonical format reference for the build inventory generator.
     "cyclonedx.org",
     // Specs (other)
     "webassembly.org",
@@ -345,6 +348,23 @@ mod allow_check_tests {
         );
         // But NOT subdomains of REFERENCE_HOSTS (exact-match).
         assert!(!is_allowed("other.github.com", &nothing_suppressed()));
+    }
+
+    #[test]
+    fn actions_build_type_host_is_exact() {
+        assert!(
+            is_allowed("actions.github.io", &nothing_suppressed()),
+            "should allow the GitHub Actions build type reference"
+        );
+        for host in [
+            "unapproved.actions.github.io",
+            "actions.github.io.invalid-host.com",
+        ] {
+            assert!(
+                !is_allowed(host, &nothing_suppressed()),
+                "should reject Actions host subdomains and lookalikes"
+            );
+        }
     }
 
     #[test]
