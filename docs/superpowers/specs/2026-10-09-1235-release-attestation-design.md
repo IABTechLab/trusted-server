@@ -6,9 +6,22 @@ This is the phased rework of [#1262](https://github.com/IABTechLab/trusted-serve
 
 **Phase 1 closes #1235:** tag-triggered builds of Fastly wasm and three native CLI binaries; SLSA provenance and a shipped, attested SBOM for each binary; draft/upload/publish of an immutable release with `SHA256SUMS`; GitHub CLI verification pinned to the release workflow and predicate; and CI enforcement of configuration independence. Operators deploy the verified release bytes. Reproducibility is not a Phase 1 claim or gate. The source-version and fresh JS mechanisms already on main are reused.
 
+The phase boundaries follow [aram356's round-1 architecture review](https://github.com/IABTechLab/trusted-server/pull/1262#pullrequestreview-5484754857):
+
+| Reviewer boundary                                                            | Phase ownership                                                                                                                                                                             |
+| ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1. Controlled build and composition evidence                                 | Phase 1: standard pinned, locked builds and conservative Cargo/npm SBOMs. Phase 2.1–2.7 and 2.9: reviewed controlled recipes, qualification, composition and candidate evidence from #1262. |
+| 2. Signing and immutable publication                                         | Phase 1: actions/attest and an immutable GitHub Release. Phase 2.8: the reviewed publication owner.                                                                                         |
+| 3. Trusted Server verifier library, trusted local policy and source approval | Phase 1: users invoke GitHub's gh attestation verify. Phase 2.10: the reviewed custom consumer and policy from #1262.                                                                       |
+| 4. Opaque VerifiedArtifact with retained bytes                               | Phase 2.10: the reviewed consumer retains verified bytes; no custom verified value is required for Phase 1.                                                                                 |
+| 5. EdgeZero prepared payload and resolved context                            | Later phase, not started; does not block #1235.                                                                                                                                             |
+| 6. Observed operation state and recovery record                              | Later phase, not started; does not block #1235.                                                                                                                                             |
+
+Native reproduction is deferred to Phase 2+, where it is measured, not a release gate. Fastly-first byte-for-byte reproducibility is a later phase; Phase 1 makes no reproducibility claim. One artifact's reproduction therefore cannot hold up the first attested release.
+
 **Phase 2+ retains all remaining requirements:** two-build reproducibility, confined recipes, platform qualification, authenticated tool/image acquisition, complete composition/SPDX coverage, candidate collection/index, the custom consumer, publication owner, Task 14 same-commit validation, and Cloudflare/Spin/Axum. These slices remain closed to production selection and signing until separately qualified and authorized.
 
-For requirement headings below, R-CONFIG, R-INPUTS, R-SIGN and R-PUBLISH apply only to the Phase 1 subset described above; all additional clauses and every other R-ID belong to Phase 2+. The original assurance profiles, custom verifier, retained evidence graph and reproduction gates do not block the first Phase 1 release. The [implementation plan](../plans/2026-10-13-attested-release-implementation.md#phasing--2026-10-22) contains the acceptance mapping and exhaustive slice inventory.
+The phase labels on requirement headings below apply only to the reduced Phase 1 subset described above; all additional clauses and requirements marked Phase 2+ remain deferred. The original assurance profiles, custom verifier, retained evidence graph and reproduction gates do not block the first Phase 1 release. The [implementation plan](../plans/2026-10-13-attested-release-implementation.md#phasing--2026-10-22) contains the acceptance mapping and exhaustive slice inventory.
 
 **Issue:** [#1235 — Publish attested release binaries with build provenance and SBOMs](https://github.com/IABTechLab/trusted-server/issues/1235)
 
