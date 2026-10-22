@@ -358,7 +358,7 @@ impl OwnedSdk {
 mod tests {
     use std::ffi::CString;
     use std::fs;
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+    use std::os::unix::fs::symlink;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 

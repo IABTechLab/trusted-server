@@ -10,7 +10,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::{Map, Value, json};
-use sha2::{Digest as _, Sha256};
+use sha2::Sha256;
 
 use super::super::ambient::Dimension;
 use super::super::compare::FastlyEqualityChecked;

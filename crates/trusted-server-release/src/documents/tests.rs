@@ -2,10 +2,10 @@ use std::cell::Cell;
 use std::ffi::CString;
 use std::fs;
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::{MetadataExt as _, symlink};
+use std::os::unix::fs::symlink;
 
 use serde_json::json;
-use sha2::{Digest as _, Sha256};
+use sha2::Sha256;
 use tempfile::tempdir;
 
 use super::*;

@@ -3,7 +3,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use flate2::{Compression, write::GzEncoder};
 use serde_json::json;
-use sha2::{Digest as _, Sha512};
+use sha2::Sha512;
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::symlink;

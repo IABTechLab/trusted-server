@@ -1,5 +1,5 @@
 use std::fs;
-use std::os::unix::fs::{PermissionsExt as _, symlink};
+use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 
 use super::*;

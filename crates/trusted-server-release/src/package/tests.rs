@@ -4,7 +4,7 @@ use std::os::unix::ffi::OsStringExt as _;
 use std::os::unix::fs::symlink;
 
 use flate2::{Compression, write::GzEncoder};
-use sha2::{Digest as _, Sha256};
+use sha2::Sha256;
 
 use super::*;
 
@@ -175,7 +175,7 @@ fn rejects_raw_path_aliases_and_traversal() {
 
 #[test]
 fn rejects_links_metadata_and_special_entries() {
-    for kind in [b'1', b'2', b'3', b'4', b'6', b'x', b'g', b'L', b'K', b'S'] {
+    for kind in *b"12346xgLKS" {
         let mut tar = tar_bytes();
         change_header(&mut tar, 1024, |header| {
             header.set_entry_type(tar::EntryType::new(kind))

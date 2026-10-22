@@ -1,8 +1,8 @@
 use std::fs;
-use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 
-use sha2::{Digest as _, Sha256};
+use sha2::Sha256;
 
 use super::*;
 

@@ -1,12 +1,11 @@
 use std::fs;
 use std::io;
-use std::io::Write as _;
 use std::time::{Duration, Instant};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use flate2::{Compression, write::GzEncoder};
 use serde_json::json;
-use sha2::{Digest as _, Sha256, Sha512};
+use sha2::{Sha256, Sha512};
 
 use super::*;
 use crate::materials::archive::{Expected, verify};

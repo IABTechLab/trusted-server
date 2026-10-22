@@ -252,8 +252,10 @@ fn validate_symbols(
     let symbol_bytes = symbols.data(endian, bytes).map_err(invalid)?;
     let version_bytes = versions.data(endian, bytes).map_err(invalid)?;
     for (symbol, version) in symbol_bytes
-        .chunks_exact(24)
-        .zip(version_bytes.chunks_exact(2))
+        .as_chunks::<24>()
+        .0
+        .iter()
+        .zip(version_bytes.as_chunks::<2>().0)
     {
         let index = u16::from_le_bytes([version[0], version[1]]) & 0x7fff;
         let undefined = u16::from_le_bytes([symbol[6], symbol[7]]) == format::SHN_UNDEF;

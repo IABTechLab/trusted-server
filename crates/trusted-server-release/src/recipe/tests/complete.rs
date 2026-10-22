@@ -3,7 +3,7 @@ use std::os::unix::fs::symlink;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use sha2::{Digest as _, Sha256};
+use sha2::Sha256;
 
 use super::complete_darwin::{darwin_executable, darwin_executable_with, rejects_embedded_path};
 use super::fixture::*;

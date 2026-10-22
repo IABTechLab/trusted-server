@@ -1,7 +1,7 @@
 use std::fs;
 use std::os::unix::fs::symlink;
 
-use sha2::{Digest as _, Sha256};
+use sha2::Sha256;
 
 use super::*;
 use crate::javascript::JsBuildCompleted;

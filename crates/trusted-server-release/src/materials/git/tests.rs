@@ -1,7 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Write as _;
-use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 use std::time::{Duration, Instant};
 

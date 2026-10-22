@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use serde_json::{Value, json};
-use sha2::{Digest as _, Sha256};
+use sha2::Sha256;
 
 use super::*;
 use crate::spdx::{ComponentRole, Origin, valid_created};
