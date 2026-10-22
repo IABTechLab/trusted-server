@@ -70,7 +70,7 @@ DOCKERFILE
       git config --global --add safe.directory /source
       ldd --version | head -1 | grep -F "2.34"
       rust_version=$(sed -n '\''s/^channel = "\([^"]*\)"/\1/p'\'' rust-toolchain.toml)
-      rustup toolchain install "$rust_version" --profile minimal
+      rustup toolchain install "$rust_version" --profile minimal --no-self-update
       rustup target add --toolchain "$rust_version" "$2"
       rustup run "$rust_version" cargo build --package "$1" --release --target "$2" --locked
     ' phase1 "$build_package" "$build_target"
