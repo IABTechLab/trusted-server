@@ -101,6 +101,10 @@ export default withMermaid(
             { text: 'EdgeZero Lifecycle', link: '/guide/edgezero' },
             { text: 'Configuration', link: '/guide/configuration' },
             { text: 'CLI', link: '/guide/cli' },
+            {
+              text: 'Release Verification',
+              link: '/guide/release-verification',
+            },
             { text: 'Dev Proxy', link: '/guide/ts-dev-proxy' },
             { text: 'Testing', link: '/guide/testing' },
             { text: 'Auction Testing', link: '/guide/auction-testing' },

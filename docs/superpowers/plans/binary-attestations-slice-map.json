@@ -590,5 +590,18 @@
       "phase": "2.11",
       "state": "Closed; no triggers or production selection"
     }
-  }
+  },
+  "phase1_code_reuse": [
+    {
+      "path": "crates/trusted-server-cli/src/commands/dev/lint/domains.rs",
+      "source_commit": "6d0efda7210983021ab3c9efe8a0a3190e9eb81b",
+      "subset": "SLSA and SPDX exact reference-host entries. Other source scanner changes and tests stay in the consumer slice."
+    },
+    {
+      "source_path": "crates/trusted-server-release/src/recipe/native.rs",
+      "source_commit": "10167c6017b725d0a4d5ad0a0c8e6a96fd4aa807",
+      "destination": "scripts/release/phase1.mjs",
+      "subset": "Translate the small planted-operator-value byte scanner; no producer crate or qualification machinery is imported."
+    }
+  ]
 }

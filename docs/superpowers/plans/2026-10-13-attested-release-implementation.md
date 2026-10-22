@@ -6,6 +6,8 @@ This is the phased rework of [#1262](https://github.com/IABTechLab/trusted-serve
 
 **Phase 1 closes #1235:** tag-triggered builds of Fastly wasm and three native CLI binaries; SLSA provenance and a shipped, attested SBOM for each binary; draft/upload/publish of an immutable release with `SHA256SUMS`; GitHub CLI verification pinned to the release workflow and predicate; and CI enforcement of configuration independence. Operators deploy the verified release bytes. Reproducibility is not a Phase 1 claim or gate. The source-version and fresh JS mechanisms already on main are reused.
 
+Phase 1 uses CycloneDX 1.5 for a conservative selected-Cargo-target and installed-npm-build-tree inventory, with the final binary hash. The complete SPDX/composition contract below remains Phase 2+; Phase 1 does not claim exact retained-code or native-source closure.
+
 **Phase 2+ retains all remaining requirements:** two-build reproducibility, confined recipes, platform qualification, authenticated tool/image acquisition, complete composition/SPDX coverage, candidate collection/index, the custom consumer, publication owner, Task 14 same-commit validation, and Cloudflare/Spin/Axum. These slices remain closed to production selection and signing until separately qualified and authorized.
 
 The phase labels on requirement headings below apply only to the reduced Phase 1 subset described above; all additional clauses and requirements marked Phase 2+ remain deferred. The original assurance profiles, custom verifier, retained evidence graph and reproduction gates do not block the first Phase 1 release. The [implementation plan](../plans/2026-10-13-attested-release-implementation.md#phasing--2026-10-22) contains the acceptance mapping and exhaustive slice inventory.
@@ -13,11 +15,11 @@ The phase labels on requirement headings below apply only to the reduced Phase 1
 ### Phase 1 implementation checklist
 
 - [x] Copy reviewed spec, plan, feasibility and schemas from `122b78664b1235c717e9208fd200f9a9b0c335df`; preserve linked historical evidence.
-- [ ] Add `.github/workflows/release.yml`: four tag builds, isolated provenance/SBOM signing, draft/upload/publish and immutable readback; optional read-only PR builds.
-- [ ] Generate CycloneDX 1.5 from the selected Cargo target after its locked release build and npm's installed tree from that same build; merge without reference collisions and bind the final binary hash. Record conservative build-dependency coverage, including npm build tools; do not claim exact retained-byte or native-source closure.
-- [ ] Enforce fresh npm install, prohibit skip/prebuilt overrides, audit compile-time config inputs and reject planted operator values in every binary.
-- [ ] Document exact GitHub CLI provenance/SBOM and immutable-asset verification, native baselines and deployment of verified Fastly bytes; update CLI guide, navigation and changelog.
-- [ ] Run pure local tests, actionlint, format/domain checks, touched build gates, independent and security review; push this branch and open only the requested draft PR.
+- [x] Add `.github/workflows/release.yml`: four tag builds, isolated provenance/SBOM signing, draft/upload/publish and immutable readback; optional read-only PR builds.
+- [x] Generate CycloneDX 1.5 from the selected Cargo target after its locked release build and npm's installed tree from that same build; merge without reference collisions and bind the final binary hash. Record conservative build-dependency coverage, including npm build tools; do not claim exact retained-byte or native-source closure.
+- [x] Enforce fresh npm install, prohibit skip/prebuilt overrides, audit compile-time config inputs and reject planted operator values in every binary.
+- [x] Document exact GitHub CLI provenance/SBOM and immutable-asset verification, native baselines and deployment of verified Fastly bytes; update CLI guide, navigation and changelog.
+- [x] Run pure local tests, actionlint, format/domain checks, touched build gates, independent and security review; push this branch and open only the requested draft PR.
 
 | #1235 acceptance item                                 | Phase 1 evidence                                                       |
 | ----------------------------------------------------- | ---------------------------------------------------------------------- |

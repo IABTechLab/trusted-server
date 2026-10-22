@@ -1,5 +1,7 @@
 # Trusted Server CLI
 
+Prebuilt release binaries must pass the [release verification procedure](/guide/release-verification) before execution or deployment. That guide lists the Linux/macOS baselines and the manual Fastly route that preserves verified wasm bytes.
+
 The Trusted Server CLI binary is `ts`. It is a host-target operator tool for
 configuration, page audits, and EdgeZero-backed lifecycle commands.
 

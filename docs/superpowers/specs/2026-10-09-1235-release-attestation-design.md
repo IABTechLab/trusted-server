@@ -19,6 +19,8 @@ The phase boundaries follow [aram356's round-1 architecture review](https://gith
 
 Native reproduction is deferred to Phase 2+, where it is measured, not a release gate. Fastly-first byte-for-byte reproducibility is a later phase; Phase 1 makes no reproducibility claim. One artifact's reproduction therefore cannot hold up the first attested release.
 
+Phase 1 uses CycloneDX 1.5 for a conservative selected-Cargo-target and installed-npm-build-tree inventory, with the final binary hash. The complete SPDX/composition contract below remains Phase 2+; Phase 1 does not claim exact retained-code or native-source closure.
+
 **Phase 2+ retains all remaining requirements:** two-build reproducibility, confined recipes, platform qualification, authenticated tool/image acquisition, complete composition/SPDX coverage, candidate collection/index, the custom consumer, publication owner, Task 14 same-commit validation, and Cloudflare/Spin/Axum. These slices remain closed to production selection and signing until separately qualified and authorized.
 
 The phase labels on requirement headings below apply only to the reduced Phase 1 subset described above; all additional clauses and requirements marked Phase 2+ remain deferred. The original assurance profiles, custom verifier, retained evidence graph and reproduction gates do not block the first Phase 1 release. The [implementation plan](../plans/2026-10-13-attested-release-implementation.md#phasing--2026-10-22) contains the acceptance mapping and exhaustive slice inventory.
@@ -351,7 +353,7 @@ The initial verified tool contract is GitHub CLI **2.97.0** and `actions/attest`
 | Certificate issuer                      | `https://token.actions.githubusercontent.com`                                                                                                                                 |
 | Source ref / source digest              | Exact `refs/tags/<tag>` / independently approved 40-character commit                                                                                                          |
 | Build signer digest                     | Same source commit for this same-revision local reusable workflow                                                                                                             |
-| Provenance predicate / build type       | `https://slsa.dev/provenance/v1` / `https://actions.github.io/buildtypes/workflow/v1`                                                                                         |
+| Provenance predicate / build type       | `https://slsa.dev/provenance/v1` / `https://actions.github.io/buildtypes/workflow/v1` <!-- allow-domain: actions.github.io -->                                                |
 | Caller / external parameters            | Exactly `workflow: {ref: "refs/tags/<tag>", repository: "https://github.com/IABTechLab/trusted-server", path: ".github/workflows/release.yml"}`; no arbitrary inputs/commands |
 | Source resolved dependency              | `git+https://github.com/IABTechLab/trusted-server@refs/tags/<tag>` with `gitCommit` equal to approved commit                                                                  |
 | Event / runner                          | `push` / `github-hosted`                                                                                                                                                      |
