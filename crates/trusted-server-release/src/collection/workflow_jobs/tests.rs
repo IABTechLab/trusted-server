@@ -1,207 +1,16 @@
 use serde_json::{Value, json};
 
 use super::*;
-use crate::collection::records::{Outcome, RoleProfile};
-use crate::collection::{
-    ArtifactSource, Download, Invocation, TrustedDependencies, digest, tests::zip,
-    validate_transfers,
+use crate::collection::records::Outcome;
+
+mod support;
+mod transfer;
+
+use support::{
+    DEADLINE, RUN_ATTEMPT, RUN_ID, all_uploads, archive, assert_rejected, executed_steps,
+    expected_jobs, head_sha, job, optional_outcomes, response, run_identity, skipped_steps, step,
+    successful_jobs, topology, upload, with_native_reproductions,
 };
-
-/// Fictional run identity used by every fixture job.
-const RUN_ID: u64 = 7001;
-const RUN_ATTEMPT: u64 = 2;
-const DEADLINE: u64 = 1800;
-
-fn head_sha() -> String {
-    "a".repeat(40)
-}
-
-fn job_name(asset: &str, role: Role) -> String {
-    let label = match role {
-        Role::Canonical => "canonical",
-        Role::Reproduction => "reproduction",
-    };
-    format!("build {asset} {label}")
-}
-
-fn expected_jobs() -> Vec<ExpectedJob> {
-    FIXED_ARTIFACTS
-        .iter()
-        .flat_map(|asset| {
-            [Role::Canonical, Role::Reproduction].map(|role| ExpectedJob {
-                asset: asset.name.to_owned(),
-                role,
-                name: job_name(asset.name, role),
-                recipe_sha256: "c".repeat(64),
-            })
-        })
-        .collect()
-}
-
-fn topology() -> ExpectedTopology {
-    ExpectedTopology::new(
-        RunIdentity {
-            run_id: RUN_ID,
-            run_attempt: RUN_ATTEMPT,
-            head_sha: head_sha(),
-        },
-        expected_jobs(),
-        DEADLINE,
-    )
-    .expect("should accept the complete fictional topology")
-}
-
-fn step(number: u64, status: &str, conclusion: Value) -> Value {
-    let mut step = json!({
-        "name": format!("Step {number}"),
-        "status": status,
-        "number": number,
-        "started_at": "2026-01-01T00:00:00Z",
-        "completed_at": "2026-01-01T00:01:00Z",
-    });
-    step["conclusion"] = conclusion;
-    step
-}
-
-fn executed_steps() -> Vec<Value> {
-    (1..=3)
-        .map(|number| step(number, "completed", json!("success")))
-        .collect()
-}
-
-fn skipped_steps() -> Vec<Value> {
-    (1..=3)
-        .map(|number| step(number, "completed", json!("skipped")))
-        .collect()
-}
-
-fn job(id: u64, name: &str, status: &str, conclusion: Value, steps: Vec<Value>) -> Value {
-    let mut job = json!({
-        "id": id,
-        "name": name,
-        "run_id": RUN_ID,
-        "run_attempt": RUN_ATTEMPT,
-        "head_sha": head_sha(),
-        "status": status,
-        "started_at": "2026-01-01T00:00:00Z",
-        "completed_at": "2026-01-01T00:05:00Z",
-        "html_url": "https://example.com/job",
-    });
-    job["conclusion"] = conclusion;
-    job["steps"] = Value::Array(steps);
-    job
-}
-
-/// Every expected job succeeded with executed steps, plus one unrelated job.
-fn successful_jobs() -> Vec<Value> {
-    let mut jobs = expected_jobs()
-        .iter()
-        .enumerate()
-        .map(|(index, expected)| {
-            job(
-                100 + index as u64,
-                &expected.name,
-                "completed",
-                json!("success"),
-                executed_steps(),
-            )
-        })
-        .collect::<Vec<_>>();
-    jobs.push(job(
-        900,
-        "unrelated JavaScript job",
-        "completed",
-        json!("success"),
-        executed_steps(),
-    ));
-    jobs
-}
-
-fn response(jobs: &[Value]) -> Vec<u8> {
-    serde_json::to_vec(&json!({"total_count": jobs.len(), "jobs": jobs}))
-        .expect("should serialize fictional jobs response")
-}
-
-fn upload(name: &str, artifact_id: u64) -> JobUpload {
-    JobUpload {
-        job: name.to_owned(),
-        output: UploadOutput {
-            artifact_id,
-            artifact_name: format!("upload-{artifact_id}"),
-            archive_sha256: digest(&archive()),
-            members: BTreeMap::from([("artifact".to_owned(), 1)]),
-        },
-    }
-}
-
-fn archive() -> Vec<u8> {
-    zip(&[("artifact", b"x")], false)
-}
-
-fn all_uploads() -> Vec<JobUpload> {
-    expected_jobs()
-        .iter()
-        .enumerate()
-        .map(|(index, expected)| upload(&expected.name, 500 + index as u64))
-        .collect()
-}
-
-fn is_native_reproduction(expected: &ExpectedJob) -> bool {
-    expected.role == Role::Reproduction && !expected.mandatory()
-}
-
-/// Replaces every native reproduction job and drops its upload.
-fn with_native_reproductions(
-    status: &str,
-    conclusion: &Value,
-    steps: &[Value],
-) -> (Vec<Value>, Vec<JobUpload>) {
-    let expected = expected_jobs();
-    let mut jobs = successful_jobs();
-    for (index, slot) in expected.iter().enumerate() {
-        if is_native_reproduction(slot) {
-            jobs[index] = job(
-                100 + index as u64,
-                &slot.name,
-                status,
-                conclusion.clone(),
-                steps.to_vec(),
-            );
-        }
-    }
-    let uploads = all_uploads()
-        .into_iter()
-        .filter(|upload| {
-            !expected
-                .iter()
-                .any(|slot| slot.name == upload.job && is_native_reproduction(slot))
-        })
-        .collect();
-    (jobs, uploads)
-}
-
-/// Requires a rejection whose report names the expected reason.
-///
-/// A rejection for an unrelated reason would let a mutated fixture pass
-/// without exercising the check under test.
-fn assert_rejected<T: std::fmt::Debug>(result: Result<T>, reason: &str) {
-    let error = result.expect_err("should reject the observation");
-    assert!(
-        format!("{error:?}").contains(reason),
-        "should reject because {reason:?}, got {error:?}"
-    );
-}
-
-fn optional_outcomes(adapted: &AdaptedJobs) -> Vec<Option<Outcome>> {
-    adapted
-        .optional
-        .iter()
-        .map(|build| match build {
-            OptionalBuild::Uploaded { .. } => None,
-            OptionalBuild::NotUploaded(absent) => absent.outcome(),
-        })
-        .collect()
-}
 
 #[test]
 fn successful_run_binds_every_fixed_asset_to_its_exact_job_and_upload() {
@@ -251,6 +60,20 @@ fn successful_run_binds_every_fixed_asset_to_its_exact_job_and_upload() {
         )),
         "should feed successful native reproduction uploads into the optional channel"
     );
+}
+
+#[test]
+fn only_the_wasm_asset_reproduction_is_mandatory() {
+    for expected in expected_jobs() {
+        let wasm = FIXED_ARTIFACTS.iter().any(|fixed| {
+            fixed.name == expected.asset && fixed.target == ReleaseTarget::Wasm32Wasip1
+        });
+        assert_eq!(
+            expected.mandatory(),
+            expected.role == Role::Canonical || wasm,
+            "should make every canonical build and only the Wasm reproduction mandatory"
+        );
+    }
 }
 
 /// Label, job status, conclusion, steps, elapsed wait and derived outcome.
@@ -410,6 +233,8 @@ fn mandatory_jobs_must_start_succeed_and_upload_under_every_wait() {
         ("completed", json!("cancelled"), skipped_steps()),
         ("completed", json!("skipped"), Vec::new()),
         ("queued", Value::Null, Vec::new()),
+        ("waiting", Value::Null, Vec::new()),
+        ("requested", Value::Null, Vec::new()),
     ] {
         for index in [0, 1, 2] {
             let mut jobs = successful_jobs();
@@ -430,9 +255,9 @@ fn mandatory_jobs_must_start_succeed_and_upload_under_every_wait() {
         cases.push((successful_jobs(), uploads));
     }
     for (jobs, uploads) in cases {
-        let queued = jobs.iter().any(|job| job["status"] == "queued");
+        let unconcluded = jobs.iter().any(|job| job["conclusion"].is_null());
         for elapsed in [600, DEADLINE] {
-            let reason = if queued && elapsed < DEADLINE {
+            let reason = if unconcluded && elapsed < DEADLINE {
                 "before the collector deadline"
             } else {
                 "mandatory job did not succeed with an upload"
@@ -446,10 +271,23 @@ fn mandatory_jobs_must_start_succeed_and_upload_under_every_wait() {
 }
 
 #[test]
-fn jobs_from_another_run_attempt_or_source_are_rejected() {
+fn completed_job_without_a_conclusion_is_rejected_for_every_role() {
+    for index in [0, 1, 3] {
+        let mut jobs = successful_jobs();
+        jobs[index]["conclusion"] = Value::Null;
+        for elapsed in [600, DEADLINE] {
+            assert_rejected(
+                adapt_jobs(&topology(), &response(&jobs), &all_uploads(), elapsed),
+                "job status and conclusion disagree",
+            );
+        }
+    }
+}
+
+#[test]
+fn jobs_from_another_run_or_source_are_rejected() {
     for (field, value) in [
         ("run_id", json!(RUN_ID + 1)),
-        ("run_attempt", json!(RUN_ATTEMPT - 1)),
         ("head_sha", json!("d".repeat(40))),
     ] {
         for index in [0, 3, 8] {
@@ -457,9 +295,32 @@ fn jobs_from_another_run_attempt_or_source_are_rejected() {
             jobs[index][field] = value.clone();
             assert_rejected(
                 adapt_jobs(&topology(), &response(&jobs), &all_uploads(), 600),
-                "another run, attempt or source",
+                "another run or source",
             );
         }
+    }
+}
+
+#[test]
+fn only_a_single_fresh_attempt_is_attestable() {
+    // A "re-run failed jobs" attempt lists carried-over jobs with their older
+    // attempt, whether they are expected or unrelated.
+    for index in [0, 3, 8] {
+        let mut carried_over = successful_jobs();
+        carried_over[index]["run_attempt"] = json!(RUN_ATTEMPT - 1);
+        assert_rejected(
+            adapt_jobs(&topology(), &response(&carried_over), &all_uploads(), 600),
+            "only a single fresh attempt is attestable",
+        );
+        let mut unattributed = successful_jobs();
+        unattributed[index]
+            .as_object_mut()
+            .expect("should be a job object")
+            .remove("run_attempt");
+        assert_rejected(
+            adapt_jobs(&topology(), &response(&unattributed), &all_uploads(), 600),
+            "has no run_attempt",
+        );
     }
 }
 
@@ -517,16 +378,56 @@ fn upload_outputs_must_name_exactly_one_expected_job() {
 }
 
 #[test]
-fn optional_upload_requires_a_started_successful_job() {
-    for (status, conclusion, steps) in [
-        ("completed", json!("failure"), executed_steps()),
-        ("completed", json!("cancelled"), skipped_steps()),
-        ("queued", Value::Null, Vec::new()),
+fn unsuccessful_optional_reproduction_upload_output_is_dropped_without_blocking() {
+    for (status, conclusion, steps, elapsed, outcome) in [
+        (
+            "completed",
+            json!("failure"),
+            executed_steps(),
+            600,
+            Outcome::Failed,
+        ),
+        (
+            "completed",
+            json!("timed_out"),
+            executed_steps(),
+            600,
+            Outcome::Failed,
+        ),
+        (
+            "in_progress",
+            Value::Null,
+            vec![step(1, "in_progress", Value::Null)],
+            DEADLINE,
+            Outcome::Failed,
+        ),
+        (
+            "completed",
+            json!("cancelled"),
+            skipped_steps(),
+            600,
+            Outcome::Unavailable,
+        ),
+        (
+            "queued",
+            Value::Null,
+            Vec::new(),
+            DEADLINE,
+            Outcome::Unavailable,
+        ),
     ] {
         let (jobs, _) = with_native_reproductions(status, &conclusion, &steps);
-        assert_rejected(
-            adapt_jobs(&topology(), &response(&jobs), &all_uploads(), DEADLINE),
-            "optional upload output from a job that did not succeed",
+        let adapted = adapt_jobs(&topology(), &response(&jobs), &all_uploads(), elapsed)
+            .expect("should not let an optional reproduction block the collection");
+        assert_eq!(
+            adapted.required.len(),
+            5,
+            "should keep every mandatory upload"
+        );
+        assert_eq!(
+            optional_outcomes(&adapted),
+            vec![Some(outcome); 3],
+            "should record the derived outcome instead of the upload identity"
         );
     }
 }
@@ -614,6 +515,18 @@ fn unknown_or_inconsistent_github_states_are_rejected() {
 }
 
 #[test]
+fn a_truncated_default_page_is_rejected_as_incomplete() {
+    // A fetch without `per_page=100` lists at most 30 of a larger run.
+    let jobs = successful_jobs();
+    let truncated = serde_json::to_vec(&json!({"total_count": jobs.len() + 31, "jobs": jobs}))
+        .expect("should serialize fictional jobs response");
+    assert_rejected(
+        adapt_jobs(&topology(), &truncated, &all_uploads(), 600),
+        "not one complete page",
+    );
+}
+
+#[test]
 fn malformed_oversized_incomplete_or_duplicate_key_responses_are_rejected() {
     const STRICT: &str = "not strict bounded JSON";
     const PAGE: &str = "not one complete page";
@@ -663,15 +576,10 @@ fn malformed_oversized_incomplete_or_duplicate_key_responses_are_rejected() {
 
 #[test]
 fn expected_topology_must_name_every_fixed_build_exactly_once() {
-    let run = || RunIdentity {
-        run_id: RUN_ID,
-        run_attempt: RUN_ATTEMPT,
-        head_sha: head_sha(),
-    };
     let mut missing = expected_jobs();
     missing.pop();
     assert_rejected(
-        ExpectedTopology::new(run(), missing, DEADLINE),
+        ExpectedTopology::new(run_identity(), missing, DEADLINE),
         "must name every fixed canonical and reproduction job",
     );
     let mut cases = Vec::new();
@@ -694,18 +602,25 @@ fn expected_topology_must_name_every_fixed_build_exactly_once() {
     cases.push(invalid_recipe);
     for jobs in cases {
         assert_rejected(
-            ExpectedTopology::new(run(), jobs, DEADLINE),
+            ExpectedTopology::new(run_identity(), jobs, DEADLINE),
             "expected job is invalid, unknown or not unique",
         );
     }
     const IDENTITY: &str = "expected run identity is invalid";
     const DEADLINE_BOUND: &str = "collector deadline is not bounded";
     for (identity, deadline, reason) in [
-        (RunIdentity { run_id: 0, ..run() }, DEADLINE, IDENTITY),
+        (
+            RunIdentity {
+                run_id: 0,
+                ..run_identity()
+            },
+            DEADLINE,
+            IDENTITY,
+        ),
         (
             RunIdentity {
                 run_attempt: 0,
-                ..run()
+                ..run_identity()
             },
             DEADLINE,
             IDENTITY,
@@ -713,94 +628,17 @@ fn expected_topology_must_name_every_fixed_build_exactly_once() {
         (
             RunIdentity {
                 head_sha: "a".repeat(39),
-                ..run()
+                ..run_identity()
             },
             DEADLINE,
             IDENTITY,
         ),
-        (run(), 0, DEADLINE_BOUND),
-        (run(), 5401, DEADLINE_BOUND),
+        (run_identity(), 0, DEADLINE_BOUND),
+        (run_identity(), 5401, DEADLINE_BOUND),
     ] {
         assert_rejected(
             ExpectedTopology::new(identity, expected_jobs(), deadline),
             reason,
         );
     }
-}
-
-struct RecordingSource {
-    archive: Vec<u8>,
-    requested: Vec<u64>,
-}
-
-impl ArtifactSource for RecordingSource {
-    fn metadata(&mut self, _repository: &str, id: u64) -> Result<Vec<u8>> {
-        self.requested.push(id);
-        Ok(serde_json::to_vec(&json!({
-            "id": id,
-            "name": format!("upload-{id}"),
-            "expired": false,
-            "digest": format!("sha256:{}", digest(&self.archive)),
-            "workflow_run": {
-                "id": RUN_ID,
-                "head_sha": head_sha(),
-                "repository_id": 17,
-                "head_repository_id": 17,
-            },
-        }))
-        .expect("should serialize fictional metadata"))
-    }
-
-    fn download(&mut self, _repository: &str, id: u64) -> Result<Download> {
-        self.requested.push(id);
-        Ok(Download {
-            archive: self.archive.clone(),
-            transfer_warning: false,
-        })
-    }
-}
-
-#[test]
-fn adapted_jobs_feed_exact_uploads_and_absent_reproductions_into_transfer_validation() {
-    let (jobs, uploads) = with_native_reproductions("queued", &Value::Null, &[]);
-    let adapted = adapt_jobs(&topology(), &response(&jobs), &uploads, DEADLINE)
-        .expect("should adapt a run whose native reproductions never started");
-    let dependencies = TrustedDependencies {
-        invocation: Invocation {
-            repository: "example/project".to_owned(),
-            repository_id: 17,
-            run_id: RUN_ID,
-            source_commit: head_sha(),
-            inventory_sha256: "b".repeat(64),
-            profiles: RoleProfile::fixtures(),
-        },
-        required: adapted.required,
-        optional: adapted.optional,
-    };
-    let mut source = RecordingSource {
-        archive: archive(),
-        requested: Vec::new(),
-    };
-
-    let validated = validate_transfers(&dependencies, &mut source)
-        .expect("should validate adapted exact-ID transfers");
-
-    assert_eq!(
-        validated.transfers.len(),
-        5,
-        "should fetch every mandatory upload"
-    );
-    assert_eq!(
-        validated.absent.len(),
-        3,
-        "should keep absent native reproductions"
-    );
-    let mut fetched = source.requested.clone();
-    fetched.dedup();
-    let mandatory = uploads.iter().map(|upload| upload.output.artifact_id);
-    assert_eq!(
-        fetched,
-        mandatory.collect::<Vec<_>>(),
-        "should fetch only the supplied upload identities, never one for an absent job"
-    );
 }

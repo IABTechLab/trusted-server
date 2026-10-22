@@ -26,7 +26,7 @@ use super::{
 };
 use crate::documents::{self, lower_hex, parse_json};
 use crate::error::ReleaseError;
-use crate::policy::FIXED_ARTIFACTS;
+use crate::policy::{FIXED_ARTIFACTS, ReleaseTarget};
 use crate::recipe::Role;
 
 #[cfg(test)]
@@ -67,10 +67,15 @@ pub(super) struct ExpectedJob {
 impl ExpectedJob {
     /// Every canonical build and the Fastly reproduction are mandatory.
     ///
-    /// Native reproductions are optional measurements (spec R-REPEAT): they
-    /// record an outcome but never block their asset.
+    /// The Fastly asset is identified by its compiled
+    /// [`ReleaseTarget::Wasm32Wasip1`] target, not by its position in
+    /// [`FIXED_ARTIFACTS`]. Native reproductions are optional measurements
+    /// (spec R-REPEAT): they record an outcome but never block their asset.
     fn mandatory(&self) -> bool {
-        self.role == Role::Canonical || self.asset == FIXED_ARTIFACTS[0].name
+        self.role == Role::Canonical
+            || FIXED_ARTIFACTS.iter().any(|fixed| {
+                fixed.name == self.asset && fixed.target == ReleaseTarget::Wasm32Wasip1
+            })
     }
 }
 
@@ -162,9 +167,19 @@ pub(super) struct AdaptedJobs {
 /// `response`. A job without a terminal conclusion is accepted only once that
 /// wait reached the topology deadline, and only for an optional native
 /// reproduction. Mandatory jobs must have started, succeeded and uploaded.
-/// An optional reproduction with an upload must have started and succeeded;
-/// one without an upload becomes a [`NoUpload`] whose outcome must be
-/// derivable.
+///
+/// An optional native reproduction never blocks (spec R-REPEAT). Its upload
+/// output is used only when the job started and succeeded. Otherwise that
+/// output is dropped unused and the job becomes a [`NoUpload`] with its
+/// derived outcome (`failed` for a started or self-failed job), so a
+/// reproduction that did not succeed can never lend its upload identity to
+/// the collection.
+///
+/// Only a single fresh attempt is attestable: every expected job must have
+/// run in the expected attempt, which holds for attempt 1 and for "re-run all
+/// jobs". A "re-run failed jobs" attempt is rejected, because GitHub lists
+/// its carried-over jobs with their older `run_attempt` (or omits them), and
+/// their uploads were not produced by this attempt.
 ///
 /// # Errors
 ///
@@ -213,17 +228,14 @@ pub(super) fn adapt_jobs(
                 .filter(|_| job == SUCCEEDED)
                 .ok_or_else(|| collection_error("mandatory job did not succeed with an upload"))?;
             required.push(upload(topology, expected, output, elapsed_seconds));
-        } else if let Some(output) = output {
-            if job != SUCCEEDED {
-                return Err(collection_error(
-                    "optional upload output from a job that did not succeed",
-                ));
-            }
+        } else if let Some(output) = output.filter(|_| job == SUCCEEDED) {
             optional.push(OptionalBuild::Uploaded {
                 upload: upload(topology, expected, output, elapsed_seconds),
                 job,
             });
         } else {
+            // Any upload output of an unsuccessful optional job is dropped
+            // here: it never becomes upload identity.
             let absent = NoUpload {
                 asset: expected.asset.clone(),
                 job,
@@ -263,6 +275,17 @@ fn upload(
 }
 
 /// Parses the strict jobs page and observes each expected job exactly once.
+///
+/// The page must be complete: `total_count` must equal the listed jobs and at
+/// most [`JOB_PAGE_LIMIT`] may be listed. The future fetch must therefore
+/// request `per_page=100`; GitHub's default page of 30 would be rejected as
+/// incomplete for a larger run rather than merged across pages.
+///
+/// `run_attempt` is optional in GitHub's job schema but required here on every
+/// listed job, together with the exact `run_id` and `head_sha`. A job listed
+/// with another attempt, as a "re-run failed jobs" attempt lists its
+/// carried-over jobs, rejects the whole response: only a single fresh attempt
+/// is attestable (see [`adapt_jobs`]).
 fn observe_jobs<'topology>(
     topology: &'topology ExpectedTopology,
     response: &[u8],
@@ -289,12 +312,20 @@ fn observe_jobs<'topology>(
         // response for another run cannot be mixed in through unrelated jobs.
         if !ids.insert(id)
             || job["run_id"].as_u64() != Some(run.run_id)
-            || job["run_attempt"].as_u64() != Some(run.run_attempt)
             || job["head_sha"].as_str() != Some(run.head_sha.as_str())
         {
             return Err(collection_error(
-                "workflow job is reused or belongs to another run, attempt or source",
+                "workflow job is reused or belongs to another run or source",
             ));
+        }
+        match job["run_attempt"].as_u64() {
+            Some(attempt) if attempt == run.run_attempt => {}
+            Some(_) => {
+                return Err(collection_error(
+                    "workflow job ran in another attempt; only a single fresh attempt is attestable",
+                ));
+            }
+            None => return Err(collection_error("workflow job has no run_attempt")),
         }
         let Some(expected) = topology.jobs.iter().find(|expected| expected.name == name) else {
             continue;
