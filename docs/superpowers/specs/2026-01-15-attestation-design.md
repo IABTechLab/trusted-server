@@ -1,6 +1,6 @@
 # Runtime Integration Attestation Architecture
 
-> **Status:** Proposal
+> **Status:** Historical proposal. Binary-attestation sections are superseded in direction by the [October release artifact specification](2026-10-09-1235-release-attestation-design.md), which becomes the implementation contract upon approval. Runtime/configuration proposals remain reference material for #161.
 > **Author:** Architecture Team
 > **Date:** January 2026
 
@@ -563,7 +563,7 @@ Sigstore uses DSSE envelopes carrying in-toto Statements. The runtime attestatio
       "attested_by": {
         "identity": "iab-tech-lab",
         "oidc_issuer": "https://token.actions.githubusercontent.com",
-        "certificate_subject": "https://github.com/IABTechLab/trusted-server/.github/workflows/release.yml@refs/tags/v1.5.0"
+        "certificate_subject": "https://github.com/IABTechLab/trusted-server/.github/workflows/release-build.yml@refs/tags/v1.5.0"
       }
     },
     "integrations": [
@@ -1163,6 +1163,12 @@ The attestation document exposed at `/.well-known/trusted-server-attestation.jso
 This section provides detailed code examples and implementation patterns for the attestation system.
 
 ### GitHub Artifact Attestations (CI/CD)
+
+This binary workflow example is historical and superseded by the [October
+release contract](2026-10-09-1235-release-attestation-design.md#r-sign). Its
+current certificate SAN names `release-build.yml`; the caller `release.yml`
+does not satisfy that signer identity. Runtime/configuration and publisher
+proposals below remain historical #161 material.
 
 Use [GitHub Artifact Attestations](https://docs.github.com/actions/security-for-github-actions/using-artifact-attestations/using-artifact-attestations-to-establish-provenance-for-builds) to create SLSA Build Level 2/3 provenance for the WASM binary.
 
