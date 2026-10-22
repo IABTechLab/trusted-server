@@ -302,8 +302,8 @@ export function installLifecycleObserver({
 }) {
   if (
     strictJson(readBounded(path.join(npmRoot, 'package.json'))).version !==
-      '11.6.2' ||
-    process.versions.node !== '24.12.0' ||
+      '11.19.0' ||
+    process.versions.node !== '24.20.0' ||
     fs.realpathSync(nodePath) !== fs.realpathSync(process.execPath)
   )
     fail()

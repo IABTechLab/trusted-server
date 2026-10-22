@@ -248,9 +248,9 @@ construct approval state or turn pending/null pins into success:
    candidate selections. It cannot require its own future production-qualified
    result, accept downloaded commands or introduce a public local-fixture bypass.
 2. Review independently approved-source native Rust bootstrap and actually acquire
-   Git/shell, signed Rust 1.95.0 components/sysroot, compiler/linker/archiver,
-   Node 24.12.0,
-   npm 11.6.2 and the selected runtime tools through source-owned authenticators.
+   Git/shell, signed Rust 1.98.1 components/sysroot, compiler/linker/archiver,
+   Node 24.20.0,
+   npm 11.19.0 and the selected runtime tools through source-owned authenticators.
    Node uses signed checksums and independently reviewed keys; Rust uses signed
    manifests/components; gh uses its verified archive and independent bootstrap.
    A colocated checksum alone does not authenticate Fastly or an SDK. Retain raw
@@ -265,7 +265,9 @@ construct approval state or turn pending/null pins into success:
    that builder. Select the three runtime-only images by their actual digests.
    Record native archive/link/sysroot identities: aws-lc-sys 0.42 target-suffix
    overrides and generic/target system-use=0, AWS-LC 5.1 source, ring 0.17.14
-   pregenerated source membership, and SQLite 0.30.1 bundled 3.46/pkg-config=0.
+   pregenerated source membership, and libsqlite3-sys 0.38.2 bundled SQLite
+   source/pkg-config=0. Wrapper versions do not establish the native
+   implementation version in emitted evidence.
 4. Network-enabled authenticated archive/tool acquisition precedes fresh offline
    installation and compilation. Execute actual lifecycle hooks under the selected
    native denial boundary; recording an install flag alone is insufficient.

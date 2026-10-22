@@ -123,13 +123,13 @@ fn reviewed(name: &str) -> Option<ReviewedNative> {
             source_subtrees: &["crypto", "include", "pregenerated"],
         },
         "libsqlite3-sys" => ReviewedNative {
-            version: "0.30.1",
+            version: "0.38.2",
             allowed_features: &[
                 "bundled",
                 "bundled_bindings",
                 "cc",
                 "default",
-                "min_sqlite_version_3_14_0",
+                "min_sqlite_version_3_34_1",
                 "pkg-config",
                 "vcpkg",
                 "unlock_notify",

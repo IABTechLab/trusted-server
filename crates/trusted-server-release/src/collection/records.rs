@@ -375,7 +375,7 @@ fn check_record(transfer: &Transfer, all: &ValidatedTransfers) -> Result<BuildRe
                 && runtime.publisher_status == 200
                 && runtime.injected_scripts == 1
                 && runtime.origin_marker_matched
-                && runtime.viceroy_version == "0.17.0",
+                && runtime.viceroy_version == "0.21.0",
             "runtime diagnostic is not bound to accepted final Wasm bytes and publisher request",
         )?;
     } else {

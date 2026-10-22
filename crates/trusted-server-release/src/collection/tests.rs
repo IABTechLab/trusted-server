@@ -391,7 +391,7 @@ pub(super) fn cohort_fixture() -> ValidatedTransfers {
                 record["ambient"]["host_timezone"] = json!("Pacific/Auckland");
             }
             if index == 0 {
-                record["runtime"] = json!({"role":role,"source_commit":invocation.source_commit,"final_wasm_sha256":digest(&artifact),"final_wasm_size":artifact.len(),"publisher_status":200,"injected_scripts":1,"origin_marker_matched":true,"viceroy_version":"0.17.0"});
+                record["runtime"] = json!({"role":role,"source_commit":invocation.source_commit,"final_wasm_sha256":digest(&artifact),"final_wasm_size":artifact.len(),"publisher_status":200,"injected_scripts":1,"origin_marker_matched":true,"viceroy_version":"0.21.0"});
             }
             let upload = Upload {
                 asset: asset.name.to_owned(),
@@ -1546,6 +1546,7 @@ fn fastly_runtime_proof_is_required_for_both_roles_and_absent_from_native() {
             ("/runtime/source_commit", json!("9".repeat(40))),
             ("/runtime/final_wasm_size", json!(1)),
             ("/runtime/viceroy_version", json!("0.0.0")),
+            ("/runtime/viceroy_version", json!("0.17.0")),
         ] {
             let mut fixture = cohort_fixture();
             mutate_record(&mut fixture, index, pointer, value);

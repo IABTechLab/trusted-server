@@ -14,7 +14,7 @@ fn accepted() -> FastlyRuntimeAccepted {
         observed: GateObservation {
             artifact_sha256: "b".repeat(64),
             artifact_size: 12,
-            viceroy_version: "0.17.0".to_owned(),
+            viceroy_version: "0.21.0".to_owned(),
             viceroy_sha256: "c".repeat(64),
             fixture_sha256: "d".repeat(64),
             config_sha256: "e".repeat(64),

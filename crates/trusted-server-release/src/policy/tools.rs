@@ -16,9 +16,9 @@ use crate::documents::lower_hex;
 use crate::error::ReleaseError;
 use crate::recipe::AmbientProfile;
 
-const RUST_VERSION: &str = "1.95.0";
-const NODE_VERSION: &str = "24.12.0";
-const NPM_VERSION: &str = "11.6.2";
+const RUST_VERSION: &str = "1.98.1";
+const NODE_VERSION: &str = "24.20.0";
+const NPM_VERSION: &str = "11.19.0";
 const ATTEST_NAME: &str = "actions/attest:github-action";
 const ARTIFACT_SCRIPT: &str = "scripts/release/build.sh";
 const JS_RECIPE: &str = "tsjs";
@@ -31,13 +31,13 @@ const TOOL_HOSTS: [&str; 3] = [
     "x86_64-unknown-linux-gnu",
 ];
 const PER_HOST_TOOLS: [(&str, &str); 7] = [
-    ("fastly", "15.1.0"),
+    ("fastly", "16.0.0"),
     ("gh", GH_VERSION),
     ("node", NODE_VERSION),
     ("npm", NPM_VERSION),
     ("rust", RUST_VERSION),
-    ("viceroy", "0.17.0"),
-    ("wasmtime", "44.0.1"),
+    ("viceroy", "0.21.0"),
+    ("wasmtime", "48.0.1"),
 ];
 
 /// Fixed environment identity: id, kind, role and kind-specific constant.

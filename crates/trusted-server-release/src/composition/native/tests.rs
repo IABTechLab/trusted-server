@@ -13,6 +13,25 @@ use crate::composition::{
     BuildScriptObservation, CargoObservations, RustPackage, RustUnit, UnitContext,
 };
 
+#[test]
+fn reviewed_native_wrapper_versions_are_present_in_the_source_lockfile() {
+    let lock: toml::Value = toml::from_str(include_str!("../../../../../Cargo.lock"))
+        .expect("should parse the source lockfile");
+    let packages = lock["package"]
+        .as_array()
+        .expect("should hold locked packages");
+    for name in ["aws-lc-sys", "ring", "libsqlite3-sys"] {
+        let reviewed = reviewed_wrapper_version(name).expect("should review native wrapper");
+        assert!(
+            packages.iter().any(|package| {
+                package["name"].as_str() == Some(name)
+                    && package["version"].as_str() == Some(reviewed)
+            }),
+            "should retain a source-locked version matching reviewed native wrapper {name}"
+        );
+    }
+}
+
 struct Fixture {
     _temporary: TempDir,
     root: PathBuf,
@@ -40,13 +59,13 @@ impl Fixture {
                     &["crypto", "include", "pregenerated"],
                 ),
                 "libsqlite3-sys" => (
-                    "0.30.1",
+                    "0.38.2",
                     &[
                         "bundled",
                         "bundled_bindings",
                         "cc",
                         "default",
-                        "min_sqlite_version_3_14_0",
+                        "min_sqlite_version_3_34_1",
                         "pkg-config",
                         "vcpkg",
                     ],

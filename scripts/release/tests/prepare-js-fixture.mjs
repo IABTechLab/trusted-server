@@ -11,8 +11,8 @@ const root = path.resolve(
   '../../..'
 )
 const [destinationArgument, producerArgument] = process.argv.slice(2)
-if (process.platform !== 'linux' || process.version !== 'v24.12.0')
-  throw new Error('Full JS fixture requires Linux and Node 24.12.0')
+if (process.platform !== 'linux' || process.version !== 'v24.20.0')
+  throw new Error('Full JS fixture requires Linux and Node 24.20.0')
 if (!destinationArgument || !producerArgument || process.argv.length !== 4)
   throw new Error(
     'Expected fresh fixture destination and source-built producer'
@@ -28,7 +28,7 @@ const originals = path.join(destination, 'originals')
 const environment = {
   PATH: process.env.PATH,
   HOME: os.homedir(),
-  RUSTUP_TOOLCHAIN: '1.95.0',
+  RUSTUP_TOOLCHAIN: '1.98.1',
   ...(process.env.RUSTUP_HOME ? { RUSTUP_HOME: process.env.RUSTUP_HOME } : {}),
   GIT_CONFIG_NOSYSTEM: '1',
   GIT_CONFIG_GLOBAL: '/dev/null',
@@ -56,7 +56,7 @@ const nodeRoot = path.resolve(
 const npm = JSON.parse(
   fs.readFileSync(path.join(nodeRoot, 'lib/node_modules/npm/package.json'))
 )
-if (npm.version !== '11.6.2') throw new Error('Fixture requires npm 11.6.2')
+if (npm.version !== '11.19.0') throw new Error('Fixture requires npm 11.19.0')
 fs.cpSync(nodeRoot, tools, {
   recursive: true,
   dereference: false,
@@ -64,8 +64,8 @@ fs.cpSync(nodeRoot, tools, {
 })
 fs.copyFileSync(producer, path.join(tools, 'probe'), fs.constants.COPYFILE_EXCL)
 fs.chmodSync(path.join(tools, 'probe'), 0o700)
-if (!execute('rustc', ['--version']).startsWith('rustc 1.95.0 '))
-  throw new Error('Fixture requires selected Rust 1.95.0')
+if (!execute('rustc', ['--version']).startsWith('rustc 1.98.1 '))
+  throw new Error('Fixture requires selected Rust 1.98.1')
 execute('rustc', [
   '--crate-type',
   'cdylib',

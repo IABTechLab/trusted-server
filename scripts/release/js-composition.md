@@ -176,13 +176,13 @@ ownership, timestamps and other permission bits do not propagate. This stage
 does not establish an installed dependency, executed hook or completed JS build.
 
 Seed each private cache through selected npm's public `cache add` API with only
-verified archives, offline and scripts disabled. Run fresh pinned npm 11.6.2
+verified archives, offline and scripts disabled. Run fresh pinned npm 11.19.0
 `ci --offline --include=dev --no-audit --no-fund` with hooks in the foreground
 under the qualified lifecycle denial boundary. Reject root install/prepare hooks
 and implicit binding.gyp installs. Preserve the two exact reviewed dependency
 hooks and actual starts/completions/failures/script hashes/changed-owned-files,
 including no-output hooks and swallowed optional failures. Bind bare `node` to
-selected Node 24.12.0 despite package-bin shadowing. Missing prepared native
+selected Node 24.20.0 despite package-bin shadowing. Missing prepared native
 Vite/esbuild tools MUST fail without fetching substitutes. Observed lifecycle
 records cannot be inferred from lockfile flags or successful npm exit alone.
 
@@ -205,7 +205,7 @@ results describe declarations only. They grant no execution authority and supply
 no starts, completions, failures or changed-file observations. Full installation
 tree mutation checks and actual lifecycle observations remain separate gates.
 
-`observe-npm.mjs` adapts the selected npm 11.6.2 lifecycle entry before npm loads
+`observe-npm.mjs` adapts the selected npm 11.19.0 lifecycle entry before npm loads
 its dependency graph. It records real starts, fulfilled/rejected execution,
 exit status and changed owned-file facts in memory. This includes hooks with no
 output and optional hook failures that npm would otherwise swallow. Root calls

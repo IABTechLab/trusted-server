@@ -17,7 +17,7 @@ use crate::error::ReleaseError;
 use crate::process::{BoundedCommand, ProcessLimits};
 
 /// The Viceroy version pinned by `.tool-versions`.
-pub(crate) const PINNED_VICEROY_VERSION: &str = "0.17.0";
+pub(crate) const PINNED_VICEROY_VERSION: &str = "0.21.0";
 /// Upper bound on the Viceroy executable size.
 const VICEROY_LIMIT: u64 = 512 * 1024 * 1024;
 

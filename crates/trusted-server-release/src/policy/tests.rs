@@ -8,6 +8,40 @@ const TOOLS: &[u8] = include_bytes!("../../../../scripts/release/release-tools.j
 const CLI_POLICY: &[u8] =
     include_bytes!("../../../../crates/trusted-server-cli/release-policy.json");
 
+#[test]
+fn pending_tool_versions_match_the_source_selected_toolchain() {
+    let tools = value(TOOLS);
+    let source = include_str!("../../../../.tool-versions");
+    for (release_name, source_name) in [
+        ("node", "nodejs"),
+        ("rust", "rust"),
+        ("fastly", "fastly"),
+        ("viceroy", "viceroy"),
+        ("wasmtime", "wasmtime"),
+    ] {
+        let version = source
+            .lines()
+            .find_map(|line| {
+                let mut fields = line.split_whitespace();
+                (fields.next() == Some(source_name))
+                    .then(|| fields.next())
+                    .flatten()
+            })
+            .expect("should contain the source tool version");
+        for tool in tools["tools"].as_array().expect("should hold tool pins") {
+            if tool["name"]
+                .as_str()
+                .is_some_and(|name| name.split(':').next() == Some(release_name))
+            {
+                assert_eq!(
+                    tool["version"], version,
+                    "should keep pending {release_name} pins aligned with source selection"
+                );
+            }
+        }
+    }
+}
+
 fn value(bytes: &[u8]) -> Value {
     serde_json::from_slice(bytes).expect("should parse tracked fixture input")
 }

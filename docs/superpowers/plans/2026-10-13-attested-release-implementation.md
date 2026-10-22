@@ -641,6 +641,43 @@ comments so exclusions describe unresolved coverage rather than claiming the
 newly inventoried files are unhashed. Independent code quality review found no
 blocking findings and confirmed that hosted read-cost acceptance is still needed.
 
+Main-merge candidate compatibility (2026-10-22): main `43a25619a` upgrades Rust
+to 1.98.1, Node to 24.20.0, Viceroy to 0.21.0 and `libsqlite3-sys` to 0.38.2.
+Run `39716862538` failed before the real candidates could complete: three
+preparation jobs rejected the old Node pin, nine npm-observer tests rejected
+the old Node/npm pins, and both native release-tool suites detected the stale
+Viceroy pin. These failures provide no acceptance of the library-directory
+inventory above.
+
+Align the pending compiled/JSON tool and recipe pins with main, including npm
+11.19.0 observed in the source-selected Node distribution. Original acquisition,
+digests and qualification remain pending/null. The JS execution/settings checks,
+fixture preparation and paired producer/collector Viceroy checks remain exact
+version checks; no range, bypass or fallback is introduced. The user authorized
+the minimal collector version check and fixture update. Receipt fields, nullable
+members and enum tags are unchanged, and candidate index goldens are untouched.
+
+Review of the new SQLite wrapper confirms the bundled `sqlite3` archive and
+source subtree remain the same selection, with default feature
+`min_sqlite_version_3_34_1` replacing `min_sqlite_version_3_14_0`. Update only its
+reviewed wrapper version/features; AWS-LC 0.42.0 and ring 0.17.14 stay fixed.
+The native implementation version and native license are not inferred from the
+wrapper version. Source-lock and source-tool-pin regressions first fail against
+the stale rules, then guard the aligned cohort.
+
+Source review of npm 11.19.0 found the intercepted lifecycle entry points and
+spawn adapter byte-identical to npm 11.6.2; the new script-policy defaults leave
+the current reviewed hooks enabled. Do not add an `--allow-scripts` override.
+Actual lifecycle, runtime, native-source and receipt acceptance require a new
+hosted run; no local process-spawning tests are authorized by this migration.
+
+Migration verification: 370 selected pure tests pass, including unchanged
+candidate-index goldens and rejection of the previous Viceroy version. Strict
+host-target clippy, documentation, read-only workspace rustfmt, changed-file
+Prettier, JavaScript syntax and diff checks pass. Independent specification/security
+and code-quality reviews found no blocking findings. Hosted validation remains
+pending for the actual npm lifecycle, four candidate builds and their receipts.
+
 ### Task 11: Generate complete artifact-specific SPDX
 
 **Create:** release tool `src/spdx.rs`, private `spdx::tests`, `crates/trusted-server-release/tests/fixtures/spdx/`.

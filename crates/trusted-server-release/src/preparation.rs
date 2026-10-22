@@ -439,7 +439,7 @@ impl<'a> PreparedJsBuild<'a> {
         let cache = boundary.execution_path(&side.state.path().join("cache"))?;
         let versions =
             self.run_command(index, boundary, proof, vec![OsString::from("--version")])?;
-        if versions != b"v24.12.0\n" {
+        if versions != b"v24.20.0\n" {
             return Err(preparation_error(
                 "selected Node version differs from approved pin",
             ));
@@ -450,7 +450,7 @@ impl<'a> PreparedJsBuild<'a> {
             proof,
             vec![npm.as_os_str().to_owned(), OsString::from("--version")],
         )?;
-        if version != b"11.6.2\n" {
+        if version != b"11.19.0\n" {
             return Err(preparation_error(
                 "selected npm version differs from approved pin",
             ));

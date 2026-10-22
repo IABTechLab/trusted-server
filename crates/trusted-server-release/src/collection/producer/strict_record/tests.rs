@@ -56,7 +56,7 @@ fn producer_record(fixture: &ValidatedTransfers, index: usize) -> StrictBuildRec
         final_wasm_sha256: digest(artifact),
         final_wasm_size: artifact.len() as u64,
         publisher_status: 200,
-        viceroy_version: "0.17.0".to_owned(),
+        viceroy_version: "0.21.0".to_owned(),
     });
     StrictBuildRecord {
         source_commit: fixture.invocation.source_commit.clone(),
@@ -203,7 +203,7 @@ fn each_changed_producer_fact_is_rejected_by_the_collector() {
                 final_wasm_sha256: record.artifact_sha256.clone(),
                 final_wasm_size: record.artifact_size,
                 publisher_status: 200,
-                viceroy_version: "0.17.0".to_owned(),
+                viceroy_version: "0.21.0".to_owned(),
             });
         }),
         ("unnormalized child locale", 0, |record| {

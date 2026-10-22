@@ -93,7 +93,7 @@ fn verify_captured_output(
 
 fn settings_digest(fingerprints: &[[u8; 32]; 2]) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"source-owned-js-two-install-v2\nnode24.12.0\nnpm11.6.2\nLinux-owned-PID-cleanup\noffline-include-dev\ninstall-umask022\nLANG=C.UTF-8\nLC_ALL=C.UTF-8\nTZ=UTC\nrelease-tests-1\nfull-registered-typecheck\nfull-final-module-bytes\n");
+    digest.update(b"source-owned-js-two-install-v2\nnode24.20.0\nnpm11.19.0\nLinux-owned-PID-cleanup\noffline-include-dev\ninstall-umask022\nLANG=C.UTF-8\nLC_ALL=C.UTF-8\nTZ=UTC\nrelease-tests-1\nfull-registered-typecheck\nfull-final-module-bytes\n");
     for fingerprint in fingerprints {
         digest.update(fingerprint);
     }

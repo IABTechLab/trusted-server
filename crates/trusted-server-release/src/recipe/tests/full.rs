@@ -515,7 +515,7 @@ fn pinned_viceroy() -> SelectedViceroy {
     let path = std::env::var_os("TS_RELEASE_VICEROY")
         .map(PathBuf::from)
         .expect("should explicitly supply the pinned Viceroy executable");
-    SelectedViceroy::select(&path).expect("should select the pinned Viceroy 0.17.0")
+    SelectedViceroy::select(&path).expect("should select the pinned Viceroy 0.21.0")
 }
 
 /// The ordinary CI measurement of one accepted runtime gate run.

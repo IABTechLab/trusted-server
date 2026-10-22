@@ -71,19 +71,20 @@ fn pinned_viceroy_version_matches_tool_versions() {
 #[test]
 fn viceroy_version_output_must_be_exactly_the_pin() {
     assert_eq!(
-        parse_version_output(b"viceroy 0.17.0\n").expect("should accept the pinned output"),
-        "0.17.0"
+        parse_version_output(b"viceroy 0.21.0\n").expect("should accept the pinned output"),
+        "0.21.0"
     );
     for output in [
         &b""[..],
-        b"viceroy 0.17.0",
-        b"viceroy 0.17.1\n",
+        b"viceroy 0.21.0",
+        b"viceroy 0.21.1\n",
+        b"viceroy 0.17.0\n",
         b"viceroy 0.16.0\n",
-        b"viceroy 0.17.0-rc.1\n",
-        b"Viceroy 0.17.0\n",
-        b"viceroy  0.17.0\n",
-        b"viceroy 0.17.0\nextra\n",
-        b"fastly 0.17.0\n",
+        b"viceroy 0.21.0-rc.1\n",
+        b"Viceroy 0.21.0\n",
+        b"viceroy  0.21.0\n",
+        b"viceroy 0.21.0\nextra\n",
+        b"fastly 0.21.0\n",
         b"viceroy \xff\n",
     ] {
         assert_eq!(

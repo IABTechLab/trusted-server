@@ -107,10 +107,8 @@
         "npm_lifecycle": "reviewed-preparation-only",
         "release_debug": 1,
         "release_strip": "none",
-        "rust_toolchain": "1.95.0",
-        "sqlite_features": [
-          "bundled"
-        ],
+        "rust_toolchain": "1.98.1",
+        "sqlite_features": ["bundled"],
         "sqlite_use_pkg_config": false,
         "sysroot": "authenticated-sdk-required",
         "tool_paths": "authenticated-absolute-paths-required",
@@ -163,10 +161,8 @@
         "npm_lifecycle": "reviewed-preparation-only",
         "release_debug": 1,
         "release_strip": "none",
-        "rust_toolchain": "1.95.0",
-        "sqlite_features": [
-          "bundled"
-        ],
+        "rust_toolchain": "1.98.1",
+        "sqlite_features": ["bundled"],
         "sqlite_use_pkg_config": false,
         "sysroot": "authenticated-sdk-required",
         "tool_paths": "authenticated-absolute-paths-required",
@@ -219,10 +215,8 @@
         "npm_lifecycle": "reviewed-preparation-only",
         "release_debug": 1,
         "release_strip": "none",
-        "rust_toolchain": "1.95.0",
-        "sqlite_features": [
-          "bundled"
-        ],
+        "rust_toolchain": "1.98.1",
+        "sqlite_features": ["bundled"],
         "sqlite_use_pkg_config": false,
         "sysroot": "authenticated-sdk-required",
         "tool_paths": "authenticated-absolute-paths-required",
@@ -275,10 +269,8 @@
         "npm_lifecycle": "reviewed-preparation-only",
         "release_debug": 1,
         "release_strip": "none",
-        "rust_toolchain": "1.95.0",
-        "sqlite_features": [
-          "bundled"
-        ],
+        "rust_toolchain": "1.98.1",
+        "sqlite_features": ["bundled"],
         "sqlite_use_pkg_config": false,
         "sysroot": "authenticated-sdk-required",
         "tool_paths": "authenticated-absolute-paths-required",
@@ -300,13 +292,13 @@
         "fresh_source": "tracked-objects-only",
         "mandatory_tests": true,
         "network_boundary": "source-owned-os-denial-v1",
-        "node_version": "24.12.0",
+        "node_version": "24.20.0",
         "npm_audit": false,
         "npm_fund": false,
         "npm_include_dev": true,
         "npm_lifecycle": "reviewed-observed-foreground",
         "npm_offline": true,
-        "npm_version": "11.6.2",
+        "npm_version": "11.19.0",
         "publish": "A-only-after-equality",
         "tool_paths": "authenticated-absolute-paths-required",
         "vite_config_loading": false,
@@ -332,7 +324,7 @@
       "qualification": "pending",
       "revision": null,
       "sha256": null,
-      "version": "15.1.0"
+      "version": "16.0.0"
     },
     {
       "acquisition": null,
@@ -340,7 +332,7 @@
       "qualification": "pending",
       "revision": null,
       "sha256": null,
-      "version": "15.1.0"
+      "version": "16.0.0"
     },
     {
       "acquisition": null,
@@ -348,7 +340,7 @@
       "qualification": "pending",
       "revision": null,
       "sha256": null,
-      "version": "15.1.0"
+      "version": "16.0.0"
     },
     {
       "acquisition": null,
@@ -380,7 +372,7 @@
       "qualification": "pending",
       "revision": null,
       "sha256": null,
-      "version": "24.12.0"
+      "version": "24.20.0"
     },
     {
       "acquisition": null,
@@ -388,7 +380,7 @@
       "qualification": "pending",
       "revision": null,
       "sha256": null,
-      "version": "24.12.0"
+      "version": "24.20.0"
     },
     {
       "acquisition": null,
@@ -396,7 +388,7 @@
       "qualification": "pending",
       "revision": null,
       "sha256": null,
-      "version": "24.12.0"
+      "version": "24.20.0"
     },
     {
       "acquisition": null,
@@ -404,7 +396,7 @@
       "qualification": "pending",
       "revision": null,
       "sha256": null,
-      "version": "11.6.2"
+      "version": "11.19.0"
     },
     {
       "acquisition": null,
@@ -412,7 +404,7 @@
       "qualification": "pending",
       "revision": null,
       "sha256": null,
-      "version": "11.6.2"
+      "version": "11.19.0"
     },
     {
       "acquisition": null,
@@ -420,7 +412,7 @@
       "qualification": "pending",
       "revision": null,
       "sha256": null,
-      "version": "11.6.2"
+      "version": "11.19.0"
     },
     {
       "acquisition": null,
@@ -428,7 +420,7 @@
       "qualification": "pending",
       "revision": null,
       "sha256": null,
-      "version": "1.95.0"
+      "version": "1.98.1"
     },
     {
       "acquisition": null,
@@ -436,7 +428,7 @@
       "qualification": "pending",
       "revision": null,
       "sha256": null,
-      "version": "1.95.0"
+      "version": "1.98.1"
     },
     {
       "acquisition": null,
@@ -444,7 +436,7 @@
       "qualification": "pending",
       "revision": null,
       "sha256": null,
-      "version": "1.95.0"
+      "version": "1.98.1"
     },
     {
       "acquisition": null,
@@ -452,7 +444,7 @@
       "qualification": "pending",
       "revision": null,
       "sha256": null,
-      "version": "0.17.0"
+      "version": "0.21.0"
     },
     {
       "acquisition": null,
@@ -460,7 +452,7 @@
       "qualification": "pending",
       "revision": null,
       "sha256": null,
-      "version": "0.17.0"
+      "version": "0.21.0"
     },
     {
       "acquisition": null,
@@ -468,7 +460,7 @@
       "qualification": "pending",
       "revision": null,
       "sha256": null,
-      "version": "0.17.0"
+      "version": "0.21.0"
     },
     {
       "acquisition": null,
@@ -476,7 +468,7 @@
       "qualification": "pending",
       "revision": null,
       "sha256": null,
-      "version": "44.0.1"
+      "version": "48.0.1"
     },
     {
       "acquisition": null,
@@ -484,7 +476,7 @@
       "qualification": "pending",
       "revision": null,
       "sha256": null,
-      "version": "44.0.1"
+      "version": "48.0.1"
     },
     {
       "acquisition": null,
@@ -492,7 +484,7 @@
       "qualification": "pending",
       "revision": null,
       "sha256": null,
-      "version": "44.0.1"
+      "version": "48.0.1"
     }
   ]
 }
