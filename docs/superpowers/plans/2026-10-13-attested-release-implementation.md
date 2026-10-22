@@ -510,8 +510,8 @@ Every candidate keeps `material_native_coverage_complete: false` and SPDX
 `release_qualification: false`; optional native reproductions are absent, not
 invented successes. No unexpected gap difference was found. This closes hosted
 acceptance of `e91d75b74`, not Task 10/11 completeness. That run predates
-`5a98c18ad`'s strict real-receipt parser: acceptance of
-`check_composition_receipt` must be established by a later parser-inclusive run.
+`5a98c18ad`'s strict real-receipt parser; parser-inclusive acceptance is recorded
+in the 2026-10-22 note below.
 
 Cargo script presence hardening (2026-10-21): graph sealing now requires every
 observed custom-build package to have execution evidence, and the execution
@@ -534,7 +534,7 @@ transfer module was excluded because it includes subprocess/network fixtures;
 one other ignored collection test was not executed. Strict host clippy,
 documentation and owned-file formatting passed. Independent review found no
 blocker and confirmed the package/context limitation stated above. Real-build
-acceptance of this new graph guard remains pending its own hosted run.
+acceptance of this graph guard is recorded in the 2026-10-22 note below.
 
 Selected Apple library measurement (2026-10-21): the in-place toolchain receipt
 now records the SHA-256 of the exact `usr/lib/libtapi.dylib` when present,
@@ -550,8 +550,8 @@ This measures one selected toolchain library, not its execution or loading.
 Other toolchain libraries, runtime inputs, original acquisition and the full
 tool closure remain unresolved. The existing `toolchain_libraries` exclusion,
 `apple-tool-closure-unmeasured` gap and incomplete coverage flags are retained.
-Hosted acceptance of this additional measurement requires its own later run;
-run `39637275502` contains the preceding graph checks only.
+Hosted acceptance of this additional measurement is recorded below for
+`39639053390`; run `39637275502` contains the preceding graph checks only.
 
 Verification of this increment selected and passed 66 composition, 68 SPDX,
 19 Apple toolchain, 18 GNU, 46 collection and two unchanged producer golden
@@ -562,6 +562,46 @@ quality reviews approved the increment. Review also strengthened the absence
 check: a missing or aliased parent cannot be recorded as a missing library.
 The existing vendor-tree intermediate-directory swap limitation still applies;
 no stronger isolation guarantee is claimed.
+
+Hosted receipt acceptance (verified 2026-10-22): [Run Tests 39637275502](https://github.com/IABTechLab/trusted-server/actions/runs/39637275502)
+succeeded at head `416b43f43c5d7e69c08bca32753240abded8523c`, building PR
+merge source `17251a872e295e4f13047efd14b10077944620fb`. [Run Tests 39639053390](https://github.com/IABTechLab/trusted-server/actions/runs/39639053390)
+succeeded at head `b6f5d92e4bc4483f81b1e0d8a376e7d67c9da8fd`, building PR
+merge source `c7b1a9cb04ab8abf8e4fa2d5198c4c1337a96b1f`. Format,
+Integration Tests and CodeQL also succeeded at both heads. All four actual
+candidate fixtures selected and passed one test each in both runs. Each invokes
+the unconditional real-receipt check in `check_owned_export_after_cleanup`;
+none of the eight job logs contains the receipt-check panic. This establishes
+producer/collector receipt acceptance for these builds, not complete coverage.
+
+The full job logs were inspected for exact candidate SPDX gap lists:
+
+- Fastly: [416 job 119351108924](https://github.com/IABTechLab/trusted-server/actions/runs/39637275502/job/119351108924)
+  and [b6f job 119357467783](https://github.com/IABTechLab/trusted-server/actions/runs/39639053390/job/119357467783).
+  Both roles report `native-material-coverage-incomplete` and
+  `native-tool-host-path-unresolved:` for `archiver`, `assembler`, `build_tools`,
+  `compiler` and `linker`.
+- Linux CLI: [416 job 119351108938](https://github.com/IABTechLab/trusted-server/actions/runs/39637275502/job/119351108938)
+  and [b6f job 119357467960](https://github.com/IABTechLab/trusted-server/actions/runs/39639053390/job/119357467960).
+  Exactly `gnu-original-acquisition-unverified`,
+  `gnu-privileged-helper-content-unmeasured`, `gnu-tool-closure-unmeasured`
+  and `native-material-coverage-incomplete`.
+- Apple ARM: [416 job 119360930044](https://github.com/IABTechLab/trusted-server/actions/runs/39637275502/job/119360930044)
+  and [b6f job 119367262345](https://github.com/IABTechLab/trusted-server/actions/runs/39639053390/job/119367262345).
+  Apple Intel: [416 job 119360930038](https://github.com/IABTechLab/trusted-server/actions/runs/39637275502/job/119360930038)
+  and [b6f job 119367262261](https://github.com/IABTechLab/trusted-server/actions/runs/39639053390/job/119367262261).
+  Each reports exactly `apple-coverage-excluded:toolchain_libraries`,
+  `apple-tool-closure-unmeasured` and `native-material-coverage-incomplete`.
+
+No GNU gaps leak onto Fastly or Apple. Every candidate retains
+`material_native_coverage_complete: false` and SPDX `release_qualification: false`.
+Fastly canonical/reproduction SPDX documents are byte-identical in each run;
+SPDX equality remains measurement-only. Native reproductions are deferred and
+their SPDX comparisons remain null. Both Apple jobs in the `b6f` run record a
+non-null `apple_developer_tools.toolchain.libtapi_sha256`, confirming the new
+measurement ran on both architectures. The unqualified four-asset candidate
+index job also succeeded in the `b6f` run. No collector edits or field-mismatch
+workaround was needed. Tasks 10/11 remain partial.
 
 ### Task 11: Generate complete artifact-specific SPDX
 
@@ -638,7 +678,9 @@ creates no package. The projection asserts no original download, license,
 runtime bytes or execution, and retains `NOASSERTION` through the existing
 renderer. Other package projections, relationship policies and candidate golden
 fixtures are unchanged. This adds measured bytes to candidate SPDX without
-opening complete qualified generation or closing Task 11.
+opening complete qualified generation or closing Task 11. Hosted receipt and
+candidate SPDX acceptance for both increments is recorded under Task 10 in the
+2026-10-22 note; all named coverage gaps remain present.
 
 ### Task 12: Bind transfers and enforce selected comparisons
 
