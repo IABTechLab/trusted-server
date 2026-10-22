@@ -850,12 +850,23 @@ async fn dispatch_fallback(
         }
         ec.ec_context.decide_writer(&req, true, ec.is_real_browser);
         let is_publisher_navigation = ec.is_real_browser && is_navigation;
-        if is_publisher_navigation
-            && let Err(err) = ec
+        if is_publisher_navigation {
+            // A new visitor's create carries the browser EIDs, so it stays
+            // the page load's one KV write.
+            if let Ok(partner_registry) = PartnerRegistry::from_config(&state.settings.ec.partners)
+            {
+                ec.ec_context.seed_generation_from_cookies(
+                    &partner_registry,
+                    ec.eids_cookie.as_deref(),
+                    ec.sharedid_cookie.as_deref(),
+                );
+            }
+            if let Err(err) = ec
                 .ec_context
                 .generate_if_needed(&state.settings, ec.kv_graph.as_ref())
-        {
-            log::warn!("EC generation failed for publisher proxy: {err:?}");
+            {
+                log::warn!("EC generation failed for publisher proxy: {err:?}");
+            }
         }
 
         // Run the server-side auction with the configured creative-

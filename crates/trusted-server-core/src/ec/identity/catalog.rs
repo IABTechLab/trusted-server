@@ -56,31 +56,55 @@ impl ProviderCatalog {
             .into_iter()
             .map(|provider| (provider.descriptor().id().clone(), provider))
             .collect();
-        let sources: Vec<SourceDomain> = providers
+        let mut catalog = Self {
+            providers,
+            owners,
+            sources: Vec::new(),
+            fingerprint: String::new(),
+            bases: BTreeMap::new(),
+        };
+        catalog.index(BTreeSet::new());
+        catalog
+    }
+
+    /// Adds registered `[[ec.partners]]` sources to the source index, so a
+    /// browser KV-gap entry for any registered source can be staged.
+    #[must_use]
+    pub(crate) fn with_registered_sources(
+        mut self,
+        sources: impl IntoIterator<Item = SourceDomain>,
+    ) -> Self {
+        let registered = sources.into_iter().collect();
+        self.index(registered);
+        self
+    }
+
+    /// Recomputes the sorted source index and `cf`.
+    fn index(&mut self, registered: BTreeSet<SourceDomain>) {
+        self.sources = self
+            .providers
             .values()
             .flat_map(|provider| provider.descriptor().sources().iter().cloned())
-            .chain(owners.keys().cloned())
+            .chain(self.owners.keys().cloned())
+            .chain(registered)
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
         let mut hasher = Sha256::new();
-        for (id, provider) in &providers {
+        for source in &self.sources {
+            hasher.update(format!("source|{source}\n").as_bytes());
+        }
+        for (id, provider) in &self.providers {
             for source in provider.descriptor().sources() {
-                let owner = owners
+                let owner = self
+                    .owners
                     .get(source)
                     .map(IdentityProviderId::as_str)
                     .unwrap_or_default();
                 hasher.update(format!("{id}|{source}|{owner}\n").as_bytes());
             }
         }
-        let fingerprint = hex::encode(&hasher.finalize()[..4]);
-        Self {
-            providers,
-            owners,
-            sources,
-            fingerprint,
-            bases: BTreeMap::new(),
-        }
+        self.fingerprint = hex::encode(&hasher.finalize()[..4]);
     }
 
     /// The catalog for the partner registry: one generic pull provider per
@@ -126,7 +150,10 @@ impl ProviderCatalog {
                 ),
             }));
         }
-        let mut catalog = Self::new(providers, BTreeMap::new());
+        let registered = registry
+            .all()
+            .filter_map(|partner| partner.source_domain.parse::<SourceDomain>().ok());
+        let mut catalog = Self::new(providers, BTreeMap::new()).with_registered_sources(registered);
         catalog.bases = bases;
         Ok(catalog)
     }
@@ -165,8 +192,9 @@ impl ProviderCatalog {
         self.owners.get(source)
     }
 
-    /// Every configured source, sorted. Indexes into this list are the `s`
-    /// values of `ts-eids-s`.
+    /// Every configured source, sorted: provider-claimed, owned and
+    /// registered partner sources. Indexes into this list are the `s` values
+    /// of `ts-eids-s`.
     #[must_use]
     pub(crate) fn configured_sources(&self) -> &[SourceDomain] {
         &self.sources

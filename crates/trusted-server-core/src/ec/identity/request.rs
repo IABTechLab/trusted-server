@@ -12,6 +12,7 @@ use super::cookie::{
 use super::mutation::IdentityMutation;
 use super::revision::IdentityKeys;
 use crate::constants::{COOKIE_TS_EIDS_R_PREFIX, COOKIE_TS_EIDS_S};
+use crate::ec::kv::PartnerIdUpdate;
 
 /// The identity cookies' raw values, captured when the request is read and
 /// opened only by the routes that use identity.
@@ -39,6 +40,18 @@ impl RawIdentityCookies {
     #[must_use]
     pub(crate) fn has_any(&self) -> bool {
         self.s.is_some() || !self.r.is_empty()
+    }
+
+    /// Whether the request carried `__Host-ts-eids-s`.
+    #[must_use]
+    pub(crate) fn has_s(&self) -> bool {
+        self.s.is_some()
+    }
+
+    /// The names of every removal cookie the request carried.
+    #[must_use]
+    pub(crate) fn r_names(&self) -> Vec<String> {
+        self.r.iter().map(|(name, _)| name.clone()).collect()
     }
 }
 
@@ -73,6 +86,8 @@ pub(crate) struct RequestIdentity {
     opened: Option<OpenedIdentity>,
     mutation: IdentityMutation,
     staged: StagedCookies,
+    seed: Vec<PartnerIdUpdate>,
+    client_eids_from_body: bool,
 }
 
 impl RequestIdentity {
@@ -87,6 +102,13 @@ impl RequestIdentity {
             raw: RawIdentityCookies::capture(headers),
             ..Self::default()
         }
+    }
+
+    /// Replaces the captured cookies, for tests that build a context by hand.
+    #[cfg(test)]
+    pub(crate) fn set_raw_cookies_for_test(&mut self, headers: &HeaderMap) {
+        self.raw = RawIdentityCookies::capture(headers);
+        self.opened = None;
     }
 
     /// Whether this request is the page load's writer.
@@ -188,6 +210,27 @@ impl RequestIdentity {
     #[must_use]
     pub(crate) fn staged(&self) -> &StagedCookies {
         &self.staged
+    }
+
+    /// Whether `/auction`'s client set came from its JSON body rather than
+    /// the `ts-eids` cookie. Only a body set is saved as a KV gap.
+    #[must_use]
+    pub(crate) fn client_eids_from_body(&self) -> bool {
+        self.client_eids_from_body
+    }
+
+    pub(crate) fn set_client_eids_from_body(&mut self, from_body: bool) {
+        self.client_eids_from_body = from_body;
+    }
+
+    /// Browser ingest a new visitor's create carries.
+    #[must_use]
+    pub(crate) fn seed(&self) -> &[PartnerIdUpdate] {
+        &self.seed
+    }
+
+    pub(crate) fn set_seed(&mut self, seed: Vec<PartnerIdUpdate>) {
+        self.seed = seed;
     }
 
     /// What the response must do with the identity cookies, to change it.

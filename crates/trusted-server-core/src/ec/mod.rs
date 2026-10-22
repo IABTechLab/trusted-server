@@ -425,6 +425,9 @@ impl EcContext {
                 .device_signals
                 .as_ref()
                 .map(DeviceSignals::to_kv_device);
+            // The create carries the request's browser ingest, so it is the
+            // page load's one write.
+            kv::apply_partner_id_updates(&mut entry, self.identity.seed());
 
             if let Some(graph) = kv {
                 match graph.create_if_absent(&ec_id, &entry) {
@@ -655,22 +658,31 @@ impl EcContext {
     }
 
     /// Request-scoped identity provider state.
-    #[allow(
-        dead_code,
-        reason = "identity finalize, which reads this, lands in a following commit"
-    )]
     #[must_use]
     pub(crate) fn identity(&self) -> &identity::request::RequestIdentity {
         &self.identity
     }
 
     /// Request-scoped identity provider state, to change it.
-    #[allow(
-        dead_code,
-        reason = "identity finalize, which writes this, lands in a following commit"
-    )]
     pub(crate) fn identity_mut(&mut self) -> &mut identity::request::RequestIdentity {
         &mut self.identity
+    }
+
+    /// Prepares a new visitor's create to carry the browser EIDs of the
+    /// `ts-eids` and `sharedId` cookies, consent-gated. Call before
+    /// [`Self::generate_if_needed`].
+    pub fn seed_generation_from_cookies(
+        &mut self,
+        registry: &registry::PartnerRegistry,
+        eids_cookie: Option<&str>,
+        sharedid_cookie: Option<&str>,
+    ) {
+        if self.ec_value.is_some() {
+            return;
+        }
+        let seed =
+            finalize::browser_seed_updates(registry, &self.consent, eids_cookie, sharedid_cookie);
+        self.identity.set_seed(seed);
     }
 
     /// Decides whether this request is the page load's identity writer.
@@ -837,6 +849,58 @@ mod tests {
             )
             .body(EdgeBody::empty())
             .expect("should build request")
+    }
+
+    #[test]
+    fn new_visitor_create_carries_the_browser_seed_in_one_write() {
+        let settings = create_test_settings();
+        let (graph, counter) = kv::KvIdentityGraph::write_counting("ec-store");
+        let consent = ConsentContext {
+            jurisdiction: Jurisdiction::NonRegulated,
+            source: ConsentSource::Cookie,
+            ..ConsentContext::default()
+        };
+        let mut context =
+            EcContext::new_for_test_with_ip(None, consent, Some("192.0.2.10".to_owned()));
+        let registry = registry::PartnerRegistry::from_config(&[crate::settings::EcPartner {
+            name: "Shared".to_owned(),
+            source_domain: "sharedid.org".to_owned(),
+            openrtb_atype: crate::settings::EcPartner::default_openrtb_atype(),
+            bidstream_enabled: true,
+            api_token: None,
+            batch_rate_limit: crate::settings::EcPartner::default_batch_rate_limit(),
+            pull_sync_enabled: false,
+            pull_sync_url: None,
+            pull_sync_allowed_domains: vec![],
+            pull_sync_ttl_sec: crate::settings::EcPartner::default_pull_sync_ttl_sec(),
+            pull_sync_rate_limit: crate::settings::EcPartner::default_pull_sync_rate_limit(),
+            ts_pull_token: None,
+        }])
+        .expect("should build registry");
+
+        context.seed_generation_from_cookies(&registry, None, Some("shared-cookie-id"));
+        context
+            .generate_if_needed(&settings, Some(&graph))
+            .expect("should generate");
+
+        let ec_id = context
+            .ec_value()
+            .expect("should hold the new EC")
+            .to_owned();
+        let (stored, _) = graph
+            .get(&ec_id)
+            .expect("should read")
+            .expect("should exist");
+        assert_eq!(
+            stored
+                .ids
+                .get("sharedid.org")
+                .map(|record| record.uid.as_str()),
+            Some("shared-cookie-id"),
+            "the create carries the sharedId cookie"
+        );
+        assert_eq!(counter.writes().total(), 1, "one write: the create");
+        assert_eq!(counter.writes().add, 1, "an Add");
     }
 
     #[test]

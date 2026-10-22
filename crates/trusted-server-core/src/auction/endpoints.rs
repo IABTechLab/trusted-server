@@ -291,14 +291,22 @@ pub async fn handle_auction(
     // only strips on TCF/GDPR signals. This matches the publisher and
     // `/_ts/page-bids` paths, which also resolve client EIDs only when
     // `ec_id.is_some()`.
+    let body_eids = ec_id
+        .as_ref()
+        .and(body.eids.as_deref())
+        .map(parse_client_eids)
+        .filter(|eids| !eids.is_empty());
+    let client_eids_from_body = body_eids.is_some();
     let client_eids = if ec_id.is_some() {
-        resolve_client_auction_eids(
-            body.eids.as_deref(),
-            extract_cookie_value(&http_req, COOKIE_TS_EIDS).as_deref(),
-        )
+        body_eids.or_else(|| {
+            parse_cookie_auction_eids(extract_cookie_value(&http_req, COOKIE_TS_EIDS).as_deref())
+        })
     } else {
         None
     };
+    ec_context
+        .identity_mut()
+        .set_client_eids_from_body(client_eids_from_body);
     // Carry the full request-local EID set to response finalization so KV
     // ingestion uses what this request actually sent, not just whatever fits
     // in the size-capped `ts-eids` cookie (see `ec::finalize::ec_finalize_response`).
@@ -640,7 +648,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auction_endpoint_snapshot_is_reused_by_response_finalization() {
+    async fn auction_endpoint_snapshot_is_reused_and_finalize_writes_nothing() {
         // `/auction` loads the identity-graph row to resolve server-side EIDs.
         // Finalization runs afterwards on the same EC context and ingests
         // `ts-eids`/`sharedId` updates. Both must be served by a single billable
@@ -729,10 +737,9 @@ mod tests {
             .get(&ec_id)
             .expect("should read store")
             .expect("row should exist");
-        assert_eq!(
-            stored.ids.get("sharedid.org").map(|id| id.uid.as_str()),
-            Some("shared-cookie-id"),
-            "the sharedId update must still be ingested from the shared snapshot"
+        assert!(
+            stored.ids.is_empty(),
+            "/auction is a stager: the sharedId cookie waits for the next navigation"
         );
     }
 
@@ -776,7 +783,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auction_ingests_its_body_eids_and_not_a_cookie_only_source() {
+    async fn auction_stages_its_body_eids_and_not_a_cookie_only_source() {
         let settings = create_test_settings();
         let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
             enabled: true,
@@ -829,14 +836,18 @@ mod tests {
         );
 
         assert_eq!(
-            stored_ids(&graph, &ec_id),
+            crate::ec::identity::test_support::staged_browser_entries(&response, &ec_id, &registry),
             vec![("body.example.com".to_owned(), "body-uid".to_owned())],
-            "KV should learn the body's source and not the cookie-only source"
+            "the KV gap holds the body's source and not the cookie-only source"
+        );
+        assert!(
+            stored_ids(&graph, &ec_id).is_empty(),
+            "/auction writes nothing"
         );
     }
 
     #[tokio::test]
-    async fn disabled_auction_ingests_nothing_from_the_cookie_but_keeps_shared_id() {
+    async fn disabled_auction_stages_and_writes_nothing() {
         let settings = create_test_settings();
         let orchestrator = AuctionOrchestrator::new(AuctionConfig {
             enabled: false,
@@ -876,15 +887,19 @@ mod tests {
             &mut response,
         );
 
-        assert_eq!(
-            stored_ids(&graph, &ec_id),
-            vec![("sharedid.org".to_owned(), "shared-cookie-id".to_owned())],
-            "an /auction that resolved no client set should ingest only the sharedId cookie"
+        assert!(
+            crate::ec::identity::test_support::staged_browser_entries(&response, &ec_id, &registry)
+                .is_empty(),
+            "an /auction that resolved no body set stages no KV gap"
+        );
+        assert!(
+            stored_ids(&graph, &ec_id).is_empty(),
+            "and writes nothing: the cookies wait for the next navigation"
         );
     }
 
     #[test]
-    fn navigation_ingests_the_cookie_only_source() {
+    fn writer_navigation_queues_the_cookie_only_source() {
         // Control for the two tests above: the registry does match the
         // cookie-only source when the route reads the cookie.
         let settings = create_test_settings();
@@ -893,6 +908,7 @@ mod tests {
         let graph = seeded_graph(&ec_id);
         let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
         ec_context.set_eid_sync_source(crate::ec::EidSyncSource::Navigation);
+        ec_context.identity_mut().set_writer(true);
         let cookie = cookie_only_ts_eids();
         let mut response = http::Response::new(EdgeBody::empty());
 
@@ -907,14 +923,18 @@ mod tests {
         );
 
         assert_eq!(
-            stored_ids(&graph, &ec_id),
+            crate::ec::identity::test_support::queued_fills(&ec_context),
             vec![(COOKIE_ONLY_SOURCE.to_owned(), "cookie-uid".to_owned())],
-            "a navigation should ingest the cookie's registered source"
+            "the writer navigation queues the cookie's registered source"
+        );
+        assert!(
+            stored_ids(&graph, &ec_id).is_empty(),
+            "the single flush runs after send, not in finalize"
         );
     }
 
     #[tokio::test]
-    async fn auction_body_eids_reach_kv_even_when_the_ts_eids_cookie_is_absent() {
+    async fn auction_body_eids_are_staged_as_a_kv_gap_without_a_ts_eids_cookie() {
         // Regression test for #1184: `/auction` sends every EID it has in the
         // request body, but response finalization used to ingest identity
         // graph updates only from the `ts-eids` cookie — which the browser
@@ -995,14 +1015,14 @@ mod tests {
             &mut response,
         );
 
-        let (stored, _) = graph
-            .get(&ec_id)
-            .expect("should read store")
-            .expect("row should exist");
         assert_eq!(
-            stored.ids.get("id5-sync.com").map(|id| id.uid.as_str()),
-            Some("ID5_from_body"),
-            "the body's EID must be ingested into KV without a ts-eids cookie"
+            crate::ec::identity::test_support::staged_browser_entries(&response, &ec_id, &registry),
+            vec![("id5-sync.com".to_owned(), "ID5_from_body".to_owned())],
+            "the body's EID must be staged as a KV gap without a ts-eids cookie"
+        );
+        assert!(
+            stored_ids(&graph, &ec_id).is_empty(),
+            "/auction never writes KV; the next navigation flushes the gap"
         );
     }
 

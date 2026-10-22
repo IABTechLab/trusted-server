@@ -208,6 +208,13 @@ impl IdentityMutation {
                 .any(ProviderStateChange::has_removal)
     }
 
+    /// The plain changes, for tests.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn changes(&self) -> &[PartnerIdChange] {
+        &self.partner_ids
+    }
+
     /// Only the removals, opt-outs, clears and `iv` hashes.
     #[must_use]
     pub(crate) fn removals_only(&self) -> Self {

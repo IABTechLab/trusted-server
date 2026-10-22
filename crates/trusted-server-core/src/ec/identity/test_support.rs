@@ -373,3 +373,67 @@ impl<'p> ProviderHarness<'p> {
         self.provider.response(&response, &input)
     }
 }
+
+/// The `__Host-ts-eids-s` cookie a response set, opened for `ec_id`.
+pub(crate) fn staged_s_cookie(
+    response: &http::Response<edgezero_core::body::Body>,
+    ec_id: &str,
+) -> Option<crate::ec::identity::cookie::SCookie> {
+    let prefix = format!("{}=", crate::constants::COOKIE_TS_EIDS_S);
+    let value = response
+        .headers()
+        .get_all(http::header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(|value| value.strip_prefix(&prefix))
+        .and_then(|rest| rest.split(';').next())
+        .filter(|value| !value.is_empty())?;
+    let payload = crate::ec::identity::cookie::open(&test_keys().cookie_s, ec_id, value)
+        .expect("should open the identity cookie");
+    Some(serde_json::from_slice(&payload).expect("should decode the identity cookie"))
+}
+
+/// The `(source, uid)` of every browser KV-gap entry in the
+/// `__Host-ts-eids-s` cookie a response set, opened for `ec_id`.
+pub(crate) fn staged_browser_entries(
+    response: &http::Response<edgezero_core::body::Body>,
+    ec_id: &str,
+    registry: &crate::ec::registry::PartnerRegistry,
+) -> Vec<(String, String)> {
+    let catalog = crate::ec::identity::catalog::ProviderCatalog::from_partners(registry)
+        .expect("should build the catalog");
+    staged_s_cookie(response, ec_id)
+        .map(|cookie| {
+            cookie
+                .ids
+                .iter()
+                .filter(|entry| entry.is_browser_gap())
+                .map(|entry| {
+                    (
+                        catalog.configured_sources()[entry.s].to_string(),
+                        entry.uid().unwrap_or_default().to_owned(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The `(source, uid)` of every browser fill the writer queued.
+pub(crate) fn queued_fills(context: &crate::ec::EcContext) -> Vec<(String, String)> {
+    context
+        .identity()
+        .mutation()
+        .changes()
+        .iter()
+        .filter_map(|change| match change {
+            crate::ec::identity::mutation::PartnerIdChange::FillMissing {
+                source,
+                record,
+                writer: None,
+                ..
+            } => Some((source.to_string(), record.uid.clone())),
+            _ => None,
+        })
+        .collect()
+}

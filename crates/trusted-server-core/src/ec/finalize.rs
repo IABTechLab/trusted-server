@@ -16,9 +16,14 @@ use crate::settings::Settings;
 use super::EcContext;
 use super::cookies::{expire_ec_cookie, set_ec_cookie};
 use super::generation::{generate_ec_id, is_valid_ec_id};
+use super::identity::finalize::{
+    IdentityFinalize, after_rotation, emit_identity_cookies, open_identity_cookies,
+    phase1_read_needed, queue_writer_changes, reconcile_with_snapshot, rotation_removals,
+    stage_consent_loss, stage_kv_gap, stage_new_ec_cookie,
+};
+use super::identity::mutation::{ApplyContext, apply as apply_mutation};
 use super::kv::{
-    CreateIfAbsentOutcome, EidCookieSyncOutcome, KvIdentityGraph, PartnerIdUpdate,
-    apply_partner_id_updates,
+    CreateIfAbsentOutcome, KvIdentityGraph, PartnerIdUpdate, apply_partner_id_updates,
 };
 use super::kv_types::KvEntry;
 use super::prebid_eids::collect_eid_updates;
@@ -56,6 +61,10 @@ pub fn ec_finalize_response(
     response: &mut Response<EdgeBody>,
 ) {
     ec_context.validate_pull_sync_marker(settings, registry);
+    let identity = IdentityFinalize::from_settings(settings, registry);
+    if let Some(identity) = &identity {
+        open_identity_cookies(ec_context, identity);
+    }
     let consent_allows_ec = ec_consent_granted(ec_context.consent());
     let consent_withdrawn = ec_consent_withdrawn(ec_context.consent());
 
@@ -66,7 +75,7 @@ pub fn ec_finalize_response(
             expire_marker(ec_context.pull_sync_marker_mut(), response);
         }
 
-        finalize_unusable_consent(
+        let tombstoned = finalize_unusable_consent(
             settings,
             ec_context,
             kv,
@@ -74,6 +83,12 @@ pub fn ec_finalize_response(
             consent_withdrawn,
             response,
         );
+        if let Some(identity) = &identity {
+            // Removals stay in their cookies unless a tombstone now covers
+            // them; `__Host-ts-eids-s` never outlives usable consent.
+            stage_consent_loss(ec_context, tombstoned);
+            emit_identity_cookies(ec_context, identity, response);
+        }
         return;
     }
 
@@ -90,37 +105,52 @@ pub fn ec_finalize_response(
             let had_eid_updates = !collected.is_empty();
             let updates =
                 stamp_acquired_at(gate_eid_updates_by_consent(collected, ec_context.consent()));
-            // `sync_eid_cookie_updates` early-returns without refreshing the
-            // snapshot when `updates` is empty, which is correct when there
-            // was never anything to write (an unconfigured registry, no sync
-            // source, or no EID cookies/body this request — the case
-            // `finalize_not_read_snapshot_does_not_rotate` covers). But when
-            // consent gating (e.g. TCF Purpose 4 denial) is what emptied
-            // `updates`, the request *did* have EID data, and orphan recovery
-            // below still needs an actual `Missing` read to detect an
-            // orphaned cookie. An unread `NotRead` snapshot proves nothing, so
-            // consent gating must not also skip that one read on a
-            // recovery-eligible request.
-            if updates.is_empty()
-                && had_eid_updates
-                && ec_context.recovery_eligible()
-                && matches!(ec_context.kv_snapshot(), EcKvSnapshot::NotRead)
-            {
+            let writer = ec_context.identity().writer();
+            // The writer reads KV before send when its cookie needs
+            // reconciling or it has browser ingest to compare. A request whose
+            // consent gating emptied its updates still reads on a
+            // recovery-eligible navigation, because orphan recovery needs an
+            // actual `Missing` read: an unread snapshot proves nothing.
+            let needs_read = (writer
+                && (!updates.is_empty()
+                    || identity
+                        .as_ref()
+                        .is_some_and(|identity| phase1_read_needed(ec_context, identity))))
+                || (updates.is_empty() && had_eid_updates && ec_context.recovery_eligible());
+            if needs_read && matches!(ec_context.kv_snapshot(), EcKvSnapshot::NotRead) {
                 let snapshot = graph.load_snapshot(&ec_id);
                 ec_context.set_kv_snapshot(snapshot);
-            } else if let Some(source) = source {
-                sync_eid_cookie_updates(graph, ec_context, &ec_id, &updates, source);
             }
             if matches!(ec_context.kv_snapshot(), EcKvSnapshot::Missing { .. })
                 && ec_context.recovery_eligible()
             {
                 confirm_then_recover_orphaned_ec(
-                    settings, ec_context, graph, &ec_id, &updates, response,
+                    settings,
+                    ec_context,
+                    graph,
+                    &ec_id,
+                    &updates,
+                    identity.as_ref(),
+                    response,
                 );
+            }
+            let rotated = ec_context.ec_value() != Some(ec_id.as_str());
+            if let Some(identity) = &identity
+                && !rotated
+            {
+                reconcile_with_snapshot(ec_context, identity);
+                if writer {
+                    queue_writer_changes(ec_context, identity, &updates);
+                } else {
+                    stage_kv_gap(ec_context, identity, registry);
+                }
             }
         }
 
         reconcile_pull_sync_marker(settings, registry, ec_context, response);
+        if let Some(identity) = &identity {
+            emit_identity_cookies(ec_context, identity, response);
+        }
 
         // Ordinary returning-user page views no longer refresh the browser
         // cookie, emit the EC header, or update KV TTL.
@@ -129,28 +159,44 @@ pub fn ec_finalize_response(
 
     // Newly generated EC in this request. Do not emit a generated EC when
     // there is no KV graph: that would mint a browser cookie with no backing
-    // identity-graph row, producing a phantom ID on later requests.
+    // identity-graph row, producing a phantom ID on later requests. The
+    // create already carried this request's browser ingest, so finalize
+    // writes nothing more.
     if ec_context.ec_generated() {
-        let (Some(graph), Some(ec_id)) = (kv, ec_context.ec_value().map(str::to_owned)) else {
+        let (Some(_graph), Some(ec_id)) = (kv, ec_context.ec_value().map(str::to_owned)) else {
             log::info!("Skipping generated EC response write because KV graph is unavailable");
             reconcile_pull_sync_marker(settings, registry, ec_context, response);
             return;
         };
 
-        let (cookie_input, client_input) = browser_eid_input(ec_context, eids_cookie);
-        let updates = stamp_acquired_at(gate_eid_updates_by_consent(
-            collect_eid_updates(cookie_input, sharedid_cookie, client_input, registry),
-            ec_context.consent(),
-        ));
-        sync_eid_cookie_updates(graph, ec_context, &ec_id, &updates, EidSyncSource::NewEc);
         if ec_context.kv_snapshot().entry_for(&ec_id).is_some() {
             set_ec_cookie_on_response(settings, ec_context, response);
+            if let Some(identity) = &identity {
+                stage_new_ec_cookie(ec_context, identity);
+            }
         } else {
             log::warn!("Skipping generated EC cookie because backing row is not authoritative");
         }
     }
 
     reconcile_pull_sync_marker(settings, registry, ec_context, response);
+    if let Some(identity) = &identity {
+        emit_identity_cookies(ec_context, identity, response);
+    }
+}
+
+/// Browser EID updates for a new visitor's create, consent-gated and stamped
+/// with the time they were seen.
+pub(crate) fn browser_seed_updates(
+    registry: &PartnerRegistry,
+    consent: &ConsentContext,
+    eids_cookie: Option<&str>,
+    sharedid_cookie: Option<&str>,
+) -> Vec<PartnerIdUpdate> {
+    stamp_acquired_at(gate_eid_updates_by_consent(
+        collect_eid_updates(eids_cookie, sharedid_cookie, None, registry),
+        consent,
+    ))
 }
 
 /// Records when this request saw each browser ID, so ingest stores `at`.
@@ -182,72 +228,6 @@ fn browser_eid_input<'a>(
         Some(EidSyncSource::Auction) => (None, ec_context.client_eids()),
         _ => (eids_cookie, None),
     }
-}
-
-fn sync_eid_cookie_updates(
-    graph: &KvIdentityGraph,
-    ec_context: &mut EcContext,
-    ec_id: &str,
-    updates: &[PartnerIdUpdate],
-    source: EidSyncSource,
-) {
-    if updates.is_empty() {
-        return;
-    }
-
-    let (snapshot, outcome) = graph.sync_eid_cookie_updates_from_snapshot(
-        ec_id,
-        updates,
-        ec_context.kv_snapshot().clone(),
-    );
-    ec_context.set_kv_snapshot(snapshot);
-    record_eid_sync_terminal(source, outcome);
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct EidSyncMeasurement {
-    source: EidSyncSource,
-    outcome: EidCookieSyncOutcome,
-    already_matched: u8,
-    written: u8,
-    conflict_duplicate: u8,
-    deferred: u8,
-}
-
-impl EidSyncMeasurement {
-    fn new(source: EidSyncSource, outcome: EidCookieSyncOutcome) -> Self {
-        Self {
-            source,
-            outcome,
-            already_matched: u8::from(matches!(outcome, EidCookieSyncOutcome::AlreadyMatched)),
-            written: u8::from(matches!(
-                outcome,
-                EidCookieSyncOutcome::Written | EidCookieSyncOutcome::WrittenWithDeferredFreshness
-            )),
-            conflict_duplicate: u8::from(matches!(outcome, EidCookieSyncOutcome::ConflictMatched)),
-            deferred: u8::from(matches!(
-                outcome,
-                EidCookieSyncOutcome::WrittenWithDeferredFreshness
-                    | EidCookieSyncOutcome::DeferredConflict
-                    | EidCookieSyncOutcome::DeferredFreshness
-                    | EidCookieSyncOutcome::DeferredStaleRead
-            )),
-        }
-    }
-}
-
-fn record_eid_sync_terminal(source: EidSyncSource, outcome: EidCookieSyncOutcome) {
-    let measurement = EidSyncMeasurement::new(source, outcome);
-    log::info!(
-        "EID sync measurement: source={} outcome={} attempted=1 already_matched={} written={} \
-         conflict_duplicate={} deferred={}",
-        measurement.source,
-        measurement.outcome,
-        measurement.already_matched,
-        measurement.written,
-        measurement.conflict_duplicate,
-        measurement.deferred,
-    );
 }
 
 fn reconcile_pull_sync_marker(
@@ -299,6 +279,7 @@ fn recover_orphaned_ec(
     ec_context: &mut EcContext,
     graph: &KvIdentityGraph,
     updates: &[super::kv::PartnerIdUpdate],
+    identity: Option<&IdentityFinalize>,
     response: &mut Response<EdgeBody>,
 ) {
     // Snapshot the orphaned ID once so every fail-closed exit binds the failed
@@ -336,6 +317,12 @@ fn recover_orphaned_ec(
             .device_signals()
             .map(super::device::DeviceSignals::to_kv_device);
         apply_partner_id_updates(&mut entry, updates);
+        // The new row carries the request's removals, opt-outs, clears and
+        // invalidated-UID hashes, never positive staged IDs, so a deletion
+        // is never undone through the cookie.
+        if let Some(identity) = identity {
+            entry = carry_removals(ec_context, identity, entry);
+        }
 
         match graph.create_if_absent(&ec_id, &entry) {
             Ok(CreateIfAbsentOutcome::Written) => {
@@ -346,6 +333,9 @@ fn recover_orphaned_ec(
                 };
                 ec_context.replace_with_generated(ec_id, snapshot);
                 set_ec_cookie_on_response(settings, ec_context, response);
+                if let Some(identity) = identity {
+                    after_rotation(ec_context, identity);
+                }
                 return;
             }
             Ok(CreateIfAbsentOutcome::AlreadyExists) => continue,
@@ -363,6 +353,25 @@ fn recover_orphaned_ec(
     ec_context.set_kv_snapshot(EcKvSnapshot::Failed {
         ec_id: orphan_id.clone(),
     });
+}
+
+/// Applies the request's removal cookies to a rotation's new row.
+fn carry_removals(ec_context: &EcContext, identity: &IdentityFinalize, entry: KvEntry) -> KvEntry {
+    let removals = rotation_removals(ec_context);
+    if removals.is_empty() {
+        return entry;
+    }
+    let applied = apply_mutation(
+        &removals,
+        &entry,
+        &ApplyContext {
+            now: identity.now,
+            keys: &identity.keys,
+            random: identity.random(),
+            catalog: &identity.catalog,
+        },
+    );
+    applied.map_or(entry, |applied| applied.entry)
 }
 
 /// Proves an orphaned cookie is genuinely absent before rotating it.
@@ -389,18 +398,21 @@ fn confirm_then_recover_orphaned_ec(
     graph: &KvIdentityGraph,
     ec_id: &str,
     updates: &[super::kv::PartnerIdUpdate],
+    identity: Option<&IdentityFinalize>,
     response: &mut Response<EdgeBody>,
 ) {
     let confirmed = graph.load_snapshot(ec_id);
     match confirmed {
         EcKvSnapshot::Present { .. } => {
-            // The row became visible after the origin round trip: adopt it and
-            // merge any pending updates rather than rotating a valid identity.
+            // The row became visible after the origin round trip: adopt it
+            // rather than rotating a valid identity. Its pending updates join
+            // the writer's single mutation.
             ec_context.set_kv_snapshot(confirmed);
-            sync_eid_cookie_updates(graph, ec_context, ec_id, updates, EidSyncSource::Navigation);
         }
         EcKvSnapshot::Missing { .. } => match graph.key_exists_confirmed(ec_id) {
-            Ok(false) => recover_orphaned_ec(settings, ec_context, graph, updates, response),
+            Ok(false) => {
+                recover_orphaned_ec(settings, ec_context, graph, updates, identity, response);
+            }
             Ok(true) => {
                 log::warn!(
                     "Orphan EC recovery skipped: both point reads missed a row the store still \
@@ -476,11 +488,11 @@ fn finalize_unusable_consent(
     registry: &PartnerRegistry,
     consent_withdrawn: bool,
     response: &mut Response<EdgeBody>,
-) {
+) -> bool {
     clear_ec_headers_on_response(response, Some(registry));
 
     if !(consent_withdrawn && ec_context.cookie_was_present()) {
-        return;
+        return false;
     }
 
     expire_ec_cookie(settings, response);
@@ -490,6 +502,7 @@ fn finalize_unusable_consent(
 
     // The identity-graph tombstone is the authoritative withdrawal marker
     // for subsequent EC behavior.
+    let mut all_tombstoned = kv.is_some() && !ids_to_withdraw.is_empty();
     if let Some(graph) = kv {
         apply_withdrawal_tombstones(&ids_to_withdraw, |ec_id| {
             // The graph hands back the post-withdrawal snapshot rather than
@@ -508,6 +521,7 @@ fn finalize_unusable_consent(
             // consented. Report every failure, including the non-active cookie
             // ID whose outcome is not retained on the request context.
             if matches!(outcome, EcKvSnapshot::Failed { .. }) {
+                all_tombstoned = false;
                 log::warn!(
                     "EC withdrawal tombstone failed for '{}': the identity-graph row may \
                      still be live with consent granted",
@@ -519,6 +533,7 @@ fn finalize_unusable_consent(
             }
         });
     }
+    all_tombstoned
 }
 
 fn withdrawal_ec_ids(ec_context: &EcContext) -> HashSet<String> {
@@ -1272,7 +1287,7 @@ mod tests {
     }
 
     #[test]
-    fn finalize_navigation_routes_persist_returning_user_eid_updates() {
+    fn finalize_writer_navigation_queues_ingest_and_page_bids_does_not() {
         for (source, suffix, cookie_id) in [
             (EidSyncSource::Navigation, "naveid", "navigation-cookie-id"),
             (EidSyncSource::PageBids, "spaeid", "page-bids-cookie-id"),
@@ -1291,6 +1306,8 @@ mod tests {
                 .expect("should seed the live row");
             let mut ec_context = returning_user_context(&ec_id, graph.load_snapshot(&ec_id), true);
             ec_context.set_eid_sync_source(source);
+            let writer = source == EidSyncSource::Navigation;
+            ec_context.identity_mut().set_writer(writer);
             let partners = vec![make_partner("sharedid.org")];
             let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
             let mut response = empty_response();
@@ -1309,68 +1326,22 @@ mod tests {
                 .get(&ec_id)
                 .expect("should read store")
                 .expect("row should remain");
+            assert!(stored.ids.is_empty(), "{source}: finalize never writes KV");
+            let expected = if writer {
+                vec![("sharedid.org".to_owned(), cookie_id.to_owned())]
+            } else {
+                Vec::new()
+            };
             assert_eq!(
-                stored.ids.get("sharedid.org").map(|id| id.uid.as_str()),
-                Some(cookie_id),
-                "{source} should persist the returning-user EID cookie"
+                crate::ec::identity::test_support::queued_fills(&ec_context),
+                expected,
+                "{source}: only the writer queues the returning-user EID cookie"
             );
         }
     }
 
     #[test]
-    fn finalize_generated_ec_without_sync_source_ingests_the_ts_eids_cookie() {
-        let settings = create_test_settings();
-        let ec_id = sample_ec_id("genck1");
-        let graph = KvIdentityGraph::in_memory("test_store");
-        let live = KvEntry::new(
-            &granting_consent(),
-            None,
-            current_timestamp(),
-            &settings.publisher.domain,
-        );
-        graph
-            .create(&ec_id, &live)
-            .expect("should seed generated row");
-        let mut ec_context =
-            make_context(Some(&ec_id), None, false, true, Jurisdiction::NonRegulated);
-        ec_context.set_kv_snapshot(graph.load_snapshot(&ec_id));
-        let registry = PartnerRegistry::from_config(&[make_partner("ids.example.com")])
-            .expect("should build registry");
-        let eids_cookie = base64::engine::general_purpose::STANDARD.encode(
-            serde_json::to_vec(&serde_json::json!([
-                { "source": "ids.example.com", "uids": [{ "id": "cookie-uid" }] }
-            ]))
-            .expect("should serialize test cookie payload"),
-        );
-        let mut response = empty_response();
-
-        ec_finalize_response(
-            &settings,
-            &mut ec_context,
-            Some(&graph),
-            &registry,
-            Some(&eids_cookie),
-            None,
-            &mut response,
-        );
-
-        let (stored, _) = graph
-            .get(&ec_id)
-            .expect("should read store")
-            .expect("row should remain");
-        assert_eq!(
-            stored
-                .ids
-                .iter()
-                .map(|(source, id)| (source.as_str(), id.uid.as_str()))
-                .collect::<Vec<_>>(),
-            vec![("ids.example.com", "cookie-uid")],
-            "a new EC with no sync source should ingest the cookie"
-        );
-    }
-
-    #[test]
-    fn finalize_generated_ec_persists_eid_updates() {
+    fn finalize_generated_ec_writes_nothing_more() {
         let settings = create_test_settings();
         let ec_id = sample_ec_id("geneid");
         let graph = KvIdentityGraph::in_memory("test_store");
@@ -1404,113 +1375,22 @@ mod tests {
             .get(&ec_id)
             .expect("should read store")
             .expect("row should remain");
-        assert_eq!(
-            stored.ids.get("sharedid.org").map(|id| id.uid.as_str()),
-            Some("generated-cookie-id")
+        assert!(
+            stored.ids.is_empty(),
+            "the create carried any seed; finalize writes nothing more"
+        );
+        assert!(
+            get_header_str(&response, "set-cookie")
+                .is_some_and(|value| value.starts_with("ts-ec=")),
+            "the new EC cookie is still set"
         );
     }
 
     #[test]
-    fn eid_sync_measurement_dimensions_are_bounded_and_identity_free() {
-        let sources = [
-            EidSyncSource::Navigation,
-            EidSyncSource::Auction,
-            EidSyncSource::PageBids,
-            EidSyncSource::NewEc,
-        ];
-        let outcomes = [
-            EidCookieSyncOutcome::AlreadyMatched,
-            EidCookieSyncOutcome::Written,
-            EidCookieSyncOutcome::WrittenWithDeferredFreshness,
-            EidCookieSyncOutcome::ConflictMatched,
-            EidCookieSyncOutcome::DeferredConflict,
-            EidCookieSyncOutcome::DeferredFreshness,
-            EidCookieSyncOutcome::DeferredStaleRead,
-            EidCookieSyncOutcome::Missing,
-            EidCookieSyncOutcome::ConsentWithdrawn,
-            EidCookieSyncOutcome::Failed,
-        ];
-
-        assert_eq!(
-            sources.map(|source| source.to_string()),
-            ["navigation", "auction", "page_bids", "new_ec"]
-        );
-        assert_eq!(
-            outcomes.map(|outcome| outcome.to_string()),
-            [
-                "already_matched",
-                "written",
-                "written_with_deferred_freshness",
-                "conflict_matched",
-                "deferred_conflict",
-                "deferred_freshness",
-                "deferred_stale_read",
-                "missing",
-                "consent_withdrawn",
-                "failed",
-            ]
-        );
-
-        assert_eq!(
-            EidSyncMeasurement::new(
-                EidSyncSource::Navigation,
-                EidCookieSyncOutcome::AlreadyMatched,
-            ),
-            EidSyncMeasurement {
-                source: EidSyncSource::Navigation,
-                outcome: EidCookieSyncOutcome::AlreadyMatched,
-                already_matched: 1,
-                written: 0,
-                conflict_duplicate: 0,
-                deferred: 0,
-            }
-        );
-        assert_eq!(
-            EidSyncMeasurement::new(
-                EidSyncSource::Auction,
-                EidCookieSyncOutcome::WrittenWithDeferredFreshness,
-            ),
-            EidSyncMeasurement {
-                source: EidSyncSource::Auction,
-                outcome: EidCookieSyncOutcome::WrittenWithDeferredFreshness,
-                already_matched: 0,
-                written: 1,
-                conflict_duplicate: 0,
-                deferred: 1,
-            }
-        );
-        assert_eq!(
-            EidSyncMeasurement::new(EidSyncSource::NewEc, EidCookieSyncOutcome::ConflictMatched,),
-            EidSyncMeasurement {
-                source: EidSyncSource::NewEc,
-                outcome: EidCookieSyncOutcome::ConflictMatched,
-                already_matched: 0,
-                written: 0,
-                conflict_duplicate: 1,
-                deferred: 0,
-            }
-        );
-        assert_eq!(
-            EidSyncMeasurement::new(
-                EidSyncSource::PageBids,
-                EidCookieSyncOutcome::DeferredStaleRead,
-            ),
-            EidSyncMeasurement {
-                source: EidSyncSource::PageBids,
-                outcome: EidCookieSyncOutcome::DeferredStaleRead,
-                already_matched: 0,
-                written: 0,
-                conflict_duplicate: 0,
-                deferred: 1,
-            }
-        );
-    }
-
-    #[test]
-    fn finalize_auction_transient_miss_still_persists_eid_updates() {
+    fn finalize_auction_stale_miss_writes_nothing_and_marks_the_cookie() {
         // `/auction` saves its first lookup into the context and is never
-        // recovery eligible, so a stale miss there has no later chance to
-        // retry. Finalization must revalidate before dropping collected IDs.
+        // recovery eligible. A stale miss there writes nothing and marks the
+        // identity cookie, so the next writer navigation reads KV.
         let settings = create_test_settings();
         let ec_id = sample_ec_id("named1");
         let graph = KvIdentityGraph::in_memory("test_store");
@@ -1550,20 +1430,21 @@ mod tests {
             .get(&ec_id)
             .expect("should read store")
             .expect("row should remain");
-        assert_eq!(
-            stored.ids.get("sharedid.org").map(|id| id.uid.as_str()),
-            Some("shared-cookie-id"),
-            "a stale endpoint miss must not suppress EID persistence"
+        assert!(stored.ids.is_empty(), "a stager never writes KV");
+        assert!(
+            crate::ec::identity::test_support::staged_s_cookie(&response, &ec_id)
+                .is_some_and(|cookie| cookie.m && cookie.ids.is_empty()),
+            "a stale miss sets the minimal m cookie, so the next writer reads KV and finds the row"
         );
     }
 
     #[test]
-    fn finalize_persists_every_configured_partner_from_client_eids_over_a_trimmed_cookie() {
+    fn finalize_stages_every_configured_partner_from_the_body_over_a_trimmed_cookie() {
         // Regression test for #1184: the `ts-eids` cookie only carries what
         // the browser could fit under its size cap, but `/auction` also
         // hands finalization the full EID set from the request body via
-        // `EcContext::set_client_eids`. That full set must land in KV even
-        // when the cookie alone would have dropped a configured partner.
+        // `EcContext::set_client_eids`. That full set must be staged for KV
+        // even when the cookie alone would have dropped a configured partner.
         let settings = create_test_settings();
         let ec_id = sample_ec_id("cleids1");
         let graph = KvIdentityGraph::in_memory("test_store");
@@ -1576,14 +1457,9 @@ mod tests {
         graph
             .create(&ec_id, &live)
             .expect("should seed the live row this request updates");
-        let mut ec_context = returning_user_context(
-            &ec_id,
-            EcKvSnapshot::Missing {
-                ec_id: ec_id.clone(),
-            },
-            false,
-        );
+        let mut ec_context = returning_user_context(&ec_id, graph.load_snapshot(&ec_id), false);
         ec_context.set_eid_sync_source(EidSyncSource::Auction);
+        ec_context.identity_mut().set_client_eids_from_body(true);
         // Only `id5-sync.com` "fit" in the (simulated) trimmed cookie;
         // `liveramp.com` was dropped by the browser's size cap.
         let eids_cookie = base64::engine::general_purpose::STANDARD.encode(
@@ -1624,19 +1500,24 @@ mod tests {
             &mut response,
         );
 
+        let mut staged =
+            crate::ec::identity::test_support::staged_browser_entries(&response, &ec_id, &registry);
+        staged.sort();
+        assert_eq!(
+            staged,
+            vec![
+                ("id5-sync.com".to_owned(), "ID5_from_body".to_owned()),
+                ("liveramp.com".to_owned(), "LR_from_body".to_owned()),
+            ],
+            "the body's EIDs, including a partner the cookie trimmed, are staged as a KV gap"
+        );
         let (stored, _) = graph
             .get(&ec_id)
             .expect("should read store")
-            .expect("row should exist after ingestion");
-        assert_eq!(
-            stored.ids.get("id5-sync.com").map(|id| id.uid.as_str()),
-            Some("ID5_from_body"),
-            "the request body's EID should win over the cookie's stale value"
-        );
-        assert_eq!(
-            stored.ids.get("liveramp.com").map(|id| id.uid.as_str()),
-            Some("LR_from_body"),
-            "a partner the cookie trimmed must still be ingested from the body"
+            .expect("row should exist");
+        assert!(
+            stored.ids.is_empty(),
+            "the next writer navigation writes them"
         );
     }
 
@@ -2066,8 +1947,14 @@ mod tests {
         );
         assert!(!ec_context.ec_generated(), "must not mark a rotated EC");
         assert!(
-            get_header(response, "set-cookie").is_none(),
-            "must not emit a replacement cookie"
+            !response
+                .headers()
+                .get_all("set-cookie")
+                .iter()
+                .any(|value| value
+                    .to_str()
+                    .is_ok_and(|value| value.starts_with("ts-ec="))),
+            "must not emit a replacement EC cookie"
         );
     }
 
