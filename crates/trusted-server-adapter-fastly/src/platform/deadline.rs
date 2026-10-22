@@ -707,7 +707,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the local origin started by tests/deadline_origin.py"]
+    #[ignore = "requires the local origin started by tests/deadline-origin.mjs"]
     fn network_slow_origin_preserves_ready_bid_without_waiting_for_stalled_sibling() {
         let fast = network_pending("fast", "GET");
         let stalled = network_pending("stalled", "GET");
@@ -734,7 +734,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the local origin started by tests/deadline_origin.py"]
+    #[ignore = "requires the local origin started by tests/deadline-origin.mjs"]
     fn network_stalled_headers_stop_at_deadline() {
         let pending = network_pending("stalled", "GET");
         let started = Instant::now();
@@ -754,7 +754,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the local origin started by tests/deadline_origin.py"]
+    #[ignore = "requires the local origin started by tests/deadline-origin.mjs"]
     fn network_trickling_body_stops_at_deadline() {
         let pending = network_pending("trickle", "GET");
         let started = Instant::now();
@@ -774,7 +774,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the local origin started by tests/deadline_origin.py"]
+    #[ignore = "requires the local origin started by tests/deadline-origin.mjs"]
     fn network_fast_sibling_completes_while_another_body_trickles() {
         let slow = network_pending("trickle", "GET");
         let fast = network_pending("fast", "GET");
@@ -801,7 +801,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the local origin started by tests/deadline_origin.py"]
+    #[ignore = "requires the local origin started by tests/deadline-origin.mjs"]
     fn network_head_skips_the_body_and_its_declared_length_limit() {
         let pending = network_pending("head", "HEAD");
         let result = futures::executor::block_on(

@@ -64,10 +64,10 @@ jobs:
       - name: Exercise delayed headers, trickling bodies, and slow publisher work
         shell: bash
         env:
-          WRANGLER_SEND_METRICS: "false"
+          WRANGLER_SEND_METRICS: 'false'
         run: |
           if [ "${{ matrix.adapter }}" = cloudflare ]; then
-            python3 scripts/test-worker-auction-deadlines.py cloudflare --runtime "$(command -v wrangler)"
+            node scripts/test-worker-auction-deadlines.mjs cloudflare --runtime "$(command -v wrangler)"
           else
-            python3 scripts/test-worker-auction-deadlines.py spin --runtime "$(command -v spin)"
+            node scripts/test-worker-auction-deadlines.mjs spin --runtime "$(command -v spin)"
           fi

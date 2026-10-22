@@ -54,7 +54,7 @@ jobs:
         run: cargo test-fastly
 
       - name: Run Fastly absolute deadline slow-network tests
-        run: python3 crates/trusted-server-adapter-fastly/tests/deadline_origin.py "$(command -v viceroy)"
+        run: node crates/trusted-server-adapter-fastly/tests/deadline-origin.mjs "$(command -v viceroy)"
 
       - name: Run tests (reusable-sandbox feature)
         run: cargo test-fastly-reuse
