@@ -2,19 +2,18 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
-use std::fs::{self, File};
-use std::io::Read as _;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use error_stack::Report;
+use error_stack::{Report, ResultExt as _};
 use hmac::{Hmac, KeyInit as _, Mac as _};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
-use crate::boundary::{Boundary, BoundaryRoots, ConfinedCommand, DenialProof};
+use crate::boundary::{Boundary, BoundaryRoots, ConfinedCommand, DenialProof, random_bytes};
 #[cfg(test)]
 use crate::documents::hash_bounded_with_check;
 use crate::documents::{Role, parse_json};
@@ -482,14 +481,8 @@ impl<'a> PreparedJsBuild<'a> {
             arguments.extend([OsString::from("--cache"), cache.as_os_str().to_owned()]);
             self.run_command(index, boundary, proof, arguments)?;
         }
-        let mut key = [0_u8; 32];
-        let mut nonce = [0_u8; 32];
-        File::open("/dev/urandom")
-            .and_then(|mut file| {
-                file.read_exact(&mut key)?;
-                file.read_exact(&mut nonce)
-            })
-            .map_err(preparation_error)?;
+        let key = random_bytes::<32>().change_context(ReleaseError::Material)?;
+        let nonce = random_bytes::<32>().change_context(ReleaseError::Material)?;
         let guard = boundary.execution_path(&self.tools.guard())?;
         let request = json!({"schema_version":1,"key":hex::encode(key),"nonce":hex::encode(nonce),"source_commit":self.source.commit().as_str(),"repo_root":boundary.execution_path(side.source.root())?,"cache":cache,"guard_path":guard,"native_esbuild":self.originals.native_esbuild(std::env::consts::ARCH)?});
         let command = self

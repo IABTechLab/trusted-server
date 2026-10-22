@@ -27,10 +27,12 @@ fn seal(value: &Value, key: &[u8; 32]) -> Vec<u8> {
 }
 #[test]
 fn unauthenticated_child_output_cannot_construct_an_install_observation() {
-    let key = [7_u8; 32];
+    let key = random_bytes::<32>().expect("should read an authentication key");
+    let mut forged_key = key;
+    forged_key[0] ^= 1;
     assert!(
         authenticate_observation(
-            &seal(&summary(), &[8_u8; 32]),
+            &seal(&summary(), &forged_key),
             &key,
             &request(),
             &BTreeMap::new()
@@ -41,7 +43,7 @@ fn unauthenticated_child_output_cannot_construct_an_install_observation() {
 }
 #[test]
 fn observation_requires_one_successful_private_request() {
-    let key = [7_u8; 32];
+    let key = random_bytes::<32>().expect("should read an authentication key");
     authenticate_observation(&seal(&summary(), &key), &key, &request(), &BTreeMap::new())
         .expect("should accept an authenticated protocol fixture");
     for field in [
@@ -72,7 +74,7 @@ fn observation_requires_one_successful_private_request() {
 }
 #[test]
 fn hook_start_does_not_substitute_for_successful_terminal_execution() {
-    let key = [7_u8; 32];
+    let key = random_bytes::<32>().expect("should read an authentication key");
     let digest = "d".repeat(64);
     let declarations = BTreeMap::from([(
         ("node_modules/example".to_owned(), "postinstall".to_owned()),
@@ -106,7 +108,7 @@ pub(crate) mod full;
 
 #[test]
 fn normalization_receipt_cannot_assert_another_native_tool_identity() {
-    let key = [7_u8; 32];
+    let key = random_bytes::<32>().expect("should read an authentication key");
     let mut value = summary();
     value["normalizations"] = json!([{"kind":"esbuild-hardlink-copy-v1","path":"node_modules/esbuild/bin/esbuild","native_path":"node_modules/@esbuild/linux-x64/bin/esbuild","sha256":"f".repeat(64),"size":1,"mode":493}]);
     assert!(
