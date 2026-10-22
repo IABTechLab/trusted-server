@@ -187,8 +187,9 @@ place of `main` when it targets another branch.
 
 To allow a new host, add it to the allowlist constants in
 `crates/trusted-server-cli/src/commands/dev/lint/domains.rs`. To suppress a
-single line, append `// allow-domain: <host>` in a comment
-(`<!-- allow-domain: <host> -->` in Markdown).
+single line, append `allow-domain: <host>` in the file's comment syntax:
+`// allow-domain: <host>`, `# allow-domain: <host>`,
+`<!-- allow-domain: <host> -->`, or `* allow-domain: <host>`.
 
 ## Commits
 
