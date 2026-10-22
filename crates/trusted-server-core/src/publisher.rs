@@ -21122,6 +21122,8 @@ mod tests {
         );
     }
 
+    // Manually polled fixture for publisher injection order, not timer scheduling.
+    // Adapter runtime tests cover autonomous deadline wakeups and cancellation.
     struct GatedAuctionHttpClient {
         inner: StubHttpClient,
         released: std::sync::atomic::AtomicBool,
@@ -21154,11 +21156,23 @@ mod tests {
             Option<crate::platform::PlatformSelectResult>,
             Report<crate::platform::PlatformError>,
         > {
-            if web_time::Instant::now() >= deadline {
-                return Ok(None);
+            self.collections.fetch_add(1, Ordering::SeqCst);
+            let ready = futures::future::poll_fn(|_| {
+                // The gate models completion, so probe it before checking expiry.
+                if self.released.load(Ordering::SeqCst) {
+                    std::task::Poll::Ready(true)
+                } else if web_time::Instant::now() >= deadline {
+                    std::task::Poll::Ready(false)
+                } else {
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+            if ready {
+                self.inner.select_until(pending, deadline).await
+            } else {
+                Ok(None)
             }
-            let result = self.select(pending).await?;
-            Ok((web_time::Instant::now() < deadline).then_some(result))
         }
 
         async fn select(

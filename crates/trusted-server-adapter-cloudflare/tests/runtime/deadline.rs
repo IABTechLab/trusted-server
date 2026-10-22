@@ -61,7 +61,12 @@ async fn exercise(
         .await?;
     let status = match collected {
         Some(result) => {
-            result.ready?;
+            let response = result.ready?;
+            assert_eq!(
+                response.response.body().as_bytes(),
+                Some(b"okay".as_slice()),
+                "should retain the complete nonempty upstream body"
+            );
             "complete"
         }
         None => "timeout",

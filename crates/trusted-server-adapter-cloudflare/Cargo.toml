@@ -52,3 +52,4 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 name = "deadline-runtime"
 path = "tests/runtime/deadline.rs"
 crate-type = ["cdylib"]
+required-features = ["cloudflare"]

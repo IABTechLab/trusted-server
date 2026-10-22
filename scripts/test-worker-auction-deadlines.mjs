@@ -116,6 +116,12 @@ const origin = http.createServer(async (request, response) => {
     if (request.url === '/headers') {
       await delay(700, undefined, { signal: cancellation.signal })
     }
+    if (request.url === '/large') {
+      const body = Buffer.alloc(8 * 1024 * 1024 + 1)
+      response.writeHead(200, { 'Content-Length': String(body.length) })
+      response.end(body)
+      return
+    }
     response.writeHead(200, { 'Content-Length': '4' })
     if (request.url === '/body') {
       response.write('a')
@@ -248,6 +254,12 @@ allowed_outbound_hosts = ["http://127.0.0.1:*"]
     ['/body', 80, 0, 'timeout', 350],
     ['/headers', 80, 200, 'timeout', 500],
   ]
+  if (adapter === 'spin') cases.push(['/large', 2000, 0, 'oversized', 2500])
+  assert.equal(
+    cases.length,
+    adapter === 'spin' ? 5 : 4,
+    'should exercise every runtime case'
+  )
   for (const [endpoint, budget, originDelay, expected, maximum] of cases) {
     observed.delete(endpoint)
     const uri = `http://127.0.0.1:${port}/?upstream=http://127.0.0.1:${originPort}${endpoint}&budget_ms=${budget}&origin_ms=${originDelay}`

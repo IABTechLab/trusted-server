@@ -126,11 +126,17 @@ async function main() {
       ],
       {
         env: environment,
-        stdio: 'inherit',
+        stdio: ['inherit', 'pipe', 'inherit'],
         signal: interruption.signal,
         killSignal: 'SIGKILL',
       }
     )
+    let output = ''
+    child.stdout.setEncoding('utf8')
+    child.stdout.on('data', (chunk) => {
+      output += chunk
+      process.stdout.write(chunk)
+    })
     // Clear the watchdog even if spawning fails: Node's built-in child timeout
     // can otherwise keep the harness alive after an ENOENT startup error.
     const watchdog = setTimeout(() => child.kill('SIGKILL'), 120_000)
@@ -138,6 +144,12 @@ async function main() {
     try {
       const [code] = await once(child, 'close')
       if (originError) throw originError
+      assert.equal(code, 0, 'should run the network tests successfully')
+      assert.match(
+        output,
+        /^test result: ok\. 5 passed; 0 failed; 0 ignored; 0 measured;/m,
+        'should execute all five network tests, including when the filter changes'
+      )
       return code ?? 1
     } finally {
       clearTimeout(watchdog)

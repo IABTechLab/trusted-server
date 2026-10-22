@@ -297,13 +297,10 @@ pub mod nextjs_auction {
         async fn select_until(
             &self,
             pending_requests: Vec<PlatformPendingRequest>,
-            deadline: web_time::Instant,
+            _deadline: web_time::Instant,
         ) -> Result<Option<PlatformSelectResult>, Report<PlatformError>> {
-            if web_time::Instant::now() >= deadline {
-                return Ok(None);
-            }
-            let response = self.select(pending_requests).await?;
-            Ok((web_time::Instant::now() < deadline).then_some(response))
+            // All fixture responses are deterministic and already available.
+            self.select(pending_requests).await.map(Some)
         }
 
         async fn select(

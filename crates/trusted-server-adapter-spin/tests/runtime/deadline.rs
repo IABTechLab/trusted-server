@@ -55,10 +55,25 @@ async fn exercise(
         .select_until(vec![pending], started + Duration::from_millis(budget_ms))
         .await?;
     let status = match collected {
-        Some(result) => {
-            result.ready?;
-            "complete"
-        }
+        Some(result) => match result.ready {
+            Ok(response) => {
+                assert_eq!(
+                    response.response.body().as_bytes(),
+                    Some(b"okay".as_slice()),
+                    "should retain the complete nonempty upstream body"
+                );
+                "complete"
+            }
+            Err(error) if format!("{error:?}").contains("length limit exceeded") => {
+                assert_eq!(
+                    result.failed_backend_name.as_deref(),
+                    Some("fixture"),
+                    "should attribute oversized response to its provider"
+                );
+                "oversized"
+            }
+            Err(error) => return Err(error),
+        },
         None => "timeout",
     };
     Ok(format!("{status}:{}", started.elapsed().as_millis()))

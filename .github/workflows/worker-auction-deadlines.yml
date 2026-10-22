@@ -46,20 +46,39 @@ jobs:
           else
             cargo build --locked -p trusted-server-adapter-spin --example deadline-runtime --target wasm32-wasip1 --features spin
           fi
+      - name: Lint runtime fixture
+        shell: bash
+        run: |
+          if [ "${{ matrix.adapter }}" = cloudflare ]; then
+            cargo clippy --locked -p trusted-server-adapter-cloudflare --example deadline-runtime --target wasm32-unknown-unknown --features cloudflare -- -D warnings
+          else
+            cargo clippy --locked -p trusted-server-adapter-spin --example deadline-runtime --target wasm32-wasip1 --features spin -- -D warnings
+          fi
       - name: Install local Cloudflare tools
         if: matrix.adapter == 'cloudflare'
         shell: bash
         run: |
           npm install --global wrangler@4.83.0
           mkdir -p "$RUNNER_TEMP/bindgen"
-          curl --fail --location --silent --show-error "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${{ steps.versions.outputs.bindgen }}/wasm-bindgen-${{ steps.versions.outputs.bindgen }}-x86_64-unknown-linux-musl.tar.gz" | tar -xz --strip-components=1 -C "$RUNNER_TEMP/bindgen"
+          # Digests are published with the upstream GitHub release assets.
+          # Update the digest alongside the pinned version.
+          test "${{ steps.versions.outputs.bindgen }}" = 0.2.126
+          archive="$RUNNER_TEMP/wasm-bindgen.tar.gz"
+          curl --fail --location --silent --show-error "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/${{ steps.versions.outputs.bindgen }}/wasm-bindgen-${{ steps.versions.outputs.bindgen }}-x86_64-unknown-linux-musl.tar.gz" --output "$archive"
+          echo "064948d58e2d6c0a745216477a639ba696216d6309aaa902939d1b865b1d869d  $archive" | sha256sum --check
+          tar -xz --strip-components=1 -C "$RUNNER_TEMP/bindgen" -f "$archive"
           echo "$RUNNER_TEMP/bindgen" >> "$GITHUB_PATH"
       - name: Install pinned Spin runtime
         if: matrix.adapter == 'spin'
         shell: bash
         run: |
           mkdir -p "$RUNNER_TEMP/spin"
-          curl --fail --location --silent --show-error "https://github.com/spinframework/spin/releases/download/v${{ steps.versions.outputs.spin }}/spin-v${{ steps.versions.outputs.spin }}-linux-amd64.tar.gz" | tar -xz -C "$RUNNER_TEMP/spin"
+          # Update the published upstream digest alongside the pinned version.
+          test "${{ steps.versions.outputs.spin }}" = 4.1.0
+          archive="$RUNNER_TEMP/spin.tar.gz"
+          curl --fail --location --silent --show-error "https://github.com/spinframework/spin/releases/download/v${{ steps.versions.outputs.spin }}/spin-v${{ steps.versions.outputs.spin }}-linux-amd64.tar.gz" --output "$archive"
+          echo "aeeb892f94cf861f5302546faa0bdaa82cc4be30539621299746a6dc011f3b5a  $archive" | sha256sum --check
+          tar -xz -C "$RUNNER_TEMP/spin" -f "$archive"
           echo "$RUNNER_TEMP/spin" >> "$GITHUB_PATH"
       - name: Exercise delayed headers, trickling bodies, and slow publisher work
         shell: bash

@@ -224,8 +224,9 @@ fn body_is_ready(body: &BodyHandle) -> Result<bool, Report<PlatformError>> {
 ///
 /// # Errors
 ///
-/// Returns an error for invalid handles or a failure of the timed wait hostcall.
-/// Provider errors are attributed in the returned collection result.
+/// Returns an error for an empty request list, invalid aggregate buffer state,
+/// or a failure of the timed wait hostcall. Individual provider errors, including
+/// unsupported pending handles, are attributed in the returned collection result.
 pub(super) fn select_until(
     pending_requests: Vec<PlatformPendingRequest>,
     deadline: Instant,
@@ -236,8 +237,19 @@ pub(super) fn select_until(
     }
     let mut pending = pending_requests
         .into_iter()
-        .map(DeadlinePending::from_platform)
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|pending| {
+            let backend_name = pending.backend_name().unwrap_or("<unknown>").to_owned();
+            let request_method = pending.request_method().cloned();
+            match DeadlinePending::from_platform(pending) {
+                Ok(pending) => pending,
+                Err(error) => DeadlinePending {
+                    backend_name,
+                    request_method,
+                    state: Some(PendingState::Ready(Err(error))),
+                },
+            }
+        })
+        .collect::<Vec<_>>();
     let mut buffered_bytes: usize = pending.iter().map(DeadlinePending::buffered_bytes).sum();
     if buffered_bytes > MAX_TOTAL_BUFFERED_BODY_BYTES {
         return Err(Report::new(PlatformError::HttpClient)
@@ -410,15 +422,24 @@ mod tests {
     use web_time::Instant;
 
     #[test]
-    fn expired_deadline_rejects_an_invalid_pending_handle() {
+    fn expired_deadline_attributes_an_invalid_pending_handle() {
         let result = futures::executor::block_on(FastlyPlatformHttpClient.select_until(
             vec![PlatformPendingRequest::new(42_u32).with_backend_name("example")],
             Instant::now(),
         ))
-        .expect_err("should reject invalid handles even in the nonblocking snapshot");
+        .expect("should isolate invalid handles even in the nonblocking snapshot")
+        .expect("should report the invalid pending handle");
+        assert_eq!(
+            result.failed_backend_name.as_deref(),
+            Some("example"),
+            "should attribute the invalid pending handle"
+        );
+        let error = result
+            .ready
+            .expect_err("should reject the invalid pending handle");
         assert!(
             matches!(
-                result.current_context(),
+                error.current_context(),
                 trusted_server_core::platform::PlatformError::Unsupported
             ),
             "should reject unsupported deadline handles without panicking"
@@ -431,7 +452,17 @@ mod tests {
             vec![PlatformPendingRequest::new(42_u32).with_backend_name("example")],
             Instant::now() + Duration::from_secs(1),
         ));
-        let error = result.expect_err("should reject a malformed pending handle");
+        let result = result
+            .expect("should isolate malformed pending handles")
+            .expect("should return the malformed provider's failure");
+        assert_eq!(
+            result.failed_backend_name.as_deref(),
+            Some("example"),
+            "should attribute the malformed handle"
+        );
+        let error = result
+            .ready
+            .expect_err("should reject a malformed pending handle");
         assert!(
             format!("{error:?}").contains("example"),
             "should identify the malformed handle's backend"
@@ -454,15 +485,57 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_provider_does_not_discard_a_healthy_sibling() {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let failed = PlatformPendingRequest::new(42_u32).with_backend_name("unsupported");
+        let healthy = buffered_pending(b"healthy".to_vec(), "healthy");
+        let result = futures::executor::block_on(
+            FastlyPlatformHttpClient.select_until(vec![failed, healthy], deadline),
+        )
+        .expect("should isolate a provider with an unsupported pending handle")
+        .expect("should report the failed provider");
+        assert_eq!(
+            result.failed_backend_name.as_deref(),
+            Some("unsupported"),
+            "should attribute the conversion error to its provider"
+        );
+        assert!(
+            result.ready.is_err(),
+            "should report the unsupported handle"
+        );
+        let result = futures::executor::block_on(
+            FastlyPlatformHttpClient.select_until(result.remaining, deadline),
+        )
+        .expect("should continue collecting the healthy sibling")
+        .expect("should complete the healthy sibling");
+        let response = result.ready.expect("should retain the healthy response");
+        assert_eq!(
+            response.backend_name.as_deref(),
+            Some("healthy"),
+            "should preserve the unaffected provider's bid"
+        );
+    }
+
+    #[test]
     fn expired_deadline_preserves_an_already_ready_body() {
         let pending = buffered_pending(b"ready".to_vec(), "example");
         let result = futures::executor::block_on(
             FastlyPlatformHttpClient.select_until(vec![pending], Instant::now()),
         )
-        .expect("should discard an expired ready response");
-        assert!(
-            result.is_some(),
-            "should preserve an already complete response without waiting"
+        .expect("should snapshot an expired ready response")
+        .expect("should preserve an already complete response without waiting");
+        let response = result
+            .ready
+            .expect("should retain a successful buffered response");
+        assert_eq!(
+            response.backend_name.as_deref(),
+            Some("example"),
+            "should retain the ready response's backend"
+        );
+        assert_eq!(
+            response.response.body().as_bytes(),
+            Some(b"ready".as_slice()),
+            "should retain the complete ready payload"
         );
     }
 
@@ -778,10 +851,39 @@ mod tests {
     fn network_fast_sibling_completes_while_another_body_trickles() {
         let slow = network_pending("trickle", "GET");
         let fast = network_pending("fast", "GET");
-        let started = Instant::now();
-        let result = futures::executor::block_on(
+        let request = edgezero_core::http::request_builder()
+            .uri("http://example.com/fast")
+            .body(Body::empty())
+            .expect("should build the request missing cache bypass");
+        let unsupported = futures::executor::block_on(
             FastlyPlatformHttpClient
-                .select_until(vec![slow, fast], started + Duration::from_millis(200)),
+                .send_async(PlatformHttpRequest::new(request, "deadline_origin")),
+        )
+        .expect("should dispatch the request missing cache bypass");
+        let started = Instant::now();
+        let deadline = started + Duration::from_millis(200);
+        let result = futures::executor::block_on(
+            FastlyPlatformHttpClient.select_until(vec![unsupported, slow, fast], deadline),
+        )
+        .expect("should isolate a request missing cache bypass")
+        .expect("should return the unsupported provider's failure");
+        assert_eq!(
+            result.failed_backend_name.as_deref(),
+            Some("deadline_origin"),
+            "should attribute missing cache bypass to that request"
+        );
+        let error = result
+            .ready
+            .expect_err("should reject the unsupported handle");
+        assert!(
+            matches!(
+                error.current_context(),
+                trusted_server_core::platform::PlatformError::Unsupported
+            ),
+            "should reject SDK guest-caching handles before direct handle conversion"
+        );
+        let result = futures::executor::block_on(
+            FastlyPlatformHttpClient.select_until(result.remaining, deadline),
         )
         .expect("should collect the completed sibling")
         .expect("should finish before deadline");

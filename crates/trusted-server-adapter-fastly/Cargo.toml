@@ -29,7 +29,7 @@ error-stack = { workspace = true }
 esi = { workspace = true }
 fastly = { workspace = true }
 # The SDK keeps timed body readiness private; auction deadlines use the ABI.
-fastly-sys = "0.13.1"
+fastly-sys = { workspace = true }
 fern = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }

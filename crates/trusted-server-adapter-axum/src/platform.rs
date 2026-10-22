@@ -649,11 +649,6 @@ mod tests {
             .capabilities();
         assert!(client.supports_concurrent_fanout());
         assert!(capabilities.supports_concurrent_provider_fanout());
-        assert!(!client.has_enforceable_total_request_deadline());
-        assert!(
-            !capabilities.has_enforceable_total_request_deadline(),
-            "reqwest's transport timeout is not an adapter-enforced auction deadline"
-        );
     }
 
     #[test]

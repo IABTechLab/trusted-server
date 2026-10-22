@@ -824,6 +824,8 @@ not bid eligibility based on an exact server-side arrival time. A mediator start
 only with remaining budget and uses the earlier of the auction cutoff and its own
 logical timeout.
 
+Provider bids complete at the final nonblocking snapshot remain eligible even after `tmax`; mediation starts only with remaining budget and rejects responses collected after its cutoff.
+
 Personalized auction and mediator requests explicitly bypass intermediary caches.
 Fastly uses the SDK's direct pending-request handles and body readiness handles in
 a timed wait; it neither polls headers every millisecond nor waits on an empty
@@ -831,7 +833,7 @@ handle list. Retained partial payloads share a 10 MiB budget. Under memory press
 the largest partial response is rejected with its own backend attribution so a
 large stalled provider cannot make a small healthy sibling take the failure.
 Completed payloads move directly into the platform body without a host-buffer
-round trip. This cap covers retained payloads, not every allocator or host buffer.
+round trip. This cap covers retained payloads, not every allocator or host buffer. The final nonblocking body drain is bounded by this payload limit; its local CPU work can extend beyond the network cutoff.
 
 On expiry Fastly closes acquired response bodies and abandons unfinished requests;
 the installed SDK has no pending-request cancellation API. Axum aborts outstanding

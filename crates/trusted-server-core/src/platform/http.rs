@@ -373,16 +373,6 @@ pub trait PlatformHttpClient: Send + Sync {
         true
     }
 
-    /// Whether the adapter enforces a hard total deadline for each request.
-    ///
-    /// First-byte and between-byte timers do not qualify: connection setup or a
-    /// byte-trickling response can still overrun the logical auction budget. The
-    /// capability describes unbounded sends, independently of the stricter
-    /// [`Self::select_until`] contract used for auction collection.
-    fn has_enforceable_total_request_deadline(&self) -> bool {
-        false
-    }
-
     /// Whether [`send`](Self::send) can preserve upstream response bodies as
     /// [`Body::Stream`](edgezero_core::body::Body::Stream) when requested via
     /// [`PlatformHttpRequest::with_stream_response`].
@@ -452,15 +442,11 @@ pub trait PlatformHttpClient: Send + Sync {
     async fn select_until(
         &self,
         pending_requests: Vec<PlatformPendingRequest>,
-        deadline: Instant,
+        _deadline: Instant,
     ) -> Result<Option<PlatformSelectResult>, Report<PlatformError>> {
         drop(pending_requests);
-        if Instant::now() >= deadline {
-            Ok(None)
-        } else {
-            Err(Report::new(PlatformError::Unsupported)
-                .attach("absolute-deadline HTTP collection is unavailable"))
-        }
+        Err(Report::new(PlatformError::Unsupported)
+            .attach("absolute-deadline HTTP collection is unavailable"))
     }
 
     /// Waits for a complete buffered response before an absolute deadline.
@@ -539,11 +525,11 @@ mod tests {
             vec![PlatformPendingRequest::new(DropProbe(Arc::clone(&dropped)))],
             Instant::now(),
         ))
-        .expect("should classify expiry without polling");
-        assert!(
-            response.is_none(),
-            "should expire before accepting ready input"
-        );
+        .expect_err("should reject unsupported collection even after expiry");
+        assert!(matches!(
+            response.current_context(),
+            PlatformError::Unsupported
+        ));
         assert_eq!(
             dropped.load(Ordering::SeqCst),
             1,
@@ -565,14 +551,14 @@ mod tests {
     }
 
     #[test]
-    fn bounded_wait_reports_deadline_exceeded() {
+    fn unsupported_bounded_wait_reports_unsupported() {
         let error = futures::executor::block_on(
             UnavailableHttpClient.wait_until(PlatformPendingRequest::new(()), Instant::now()),
         )
-        .expect_err("should report an expired wait");
+        .expect_err("should reject an unsupported wait");
         assert!(
-            matches!(error.current_context(), PlatformError::DeadlineExceeded),
-            "should distinguish expiry from transport failure"
+            matches!(error.current_context(), PlatformError::Unsupported),
+            "should preserve the unsupported collection contract"
         );
     }
 

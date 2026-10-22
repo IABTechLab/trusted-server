@@ -248,9 +248,6 @@ pub(crate) struct StubHttpClient {
     // Reported by supports_concurrent_fanout(); set false to emulate
     // platforms whose collection contract permits only a single provider.
     concurrent_fanout: std::sync::atomic::AtomicBool,
-    // Reported by has_enforceable_total_request_deadline(); set true to emulate
-    // unbounded request transport with a hard total request deadline.
-    enforceable_total_request_deadline: std::sync::atomic::AtomicBool,
     // Reported by supports_streaming_responses(); set true to emulate Fastly's
     // streaming response support.
     streaming_responses_supported: std::sync::atomic::AtomicBool,
@@ -284,7 +281,6 @@ impl StubHttpClient {
             pending_backend_name_overrides: Mutex::new(VecDeque::new()),
             select_delays: Mutex::new(VecDeque::new()),
             concurrent_fanout: std::sync::atomic::AtomicBool::new(true),
-            enforceable_total_request_deadline: std::sync::atomic::AtomicBool::new(false),
             streaming_responses_supported: std::sync::atomic::AtomicBool::new(false),
             pending_streaming_responses_supported: std::sync::atomic::AtomicBool::new(false),
             image_optimizer_options: Mutex::new(Vec::new()),
@@ -299,12 +295,6 @@ impl StubHttpClient {
     /// Make `supports_concurrent_fanout()` report the given value.
     pub fn set_concurrent_fanout(&self, supported: bool) {
         self.concurrent_fanout
-            .store(supported, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Make `has_enforceable_total_request_deadline()` report the given value.
-    pub(crate) fn set_enforceable_total_request_deadline(&self, supported: bool) {
-        self.enforceable_total_request_deadline
             .store(supported, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -497,11 +487,6 @@ impl StubHttpClient {
 impl PlatformHttpClient for StubHttpClient {
     fn supports_concurrent_fanout(&self) -> bool {
         self.concurrent_fanout
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    fn has_enforceable_total_request_deadline(&self) -> bool {
-        self.enforceable_total_request_deadline
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -763,6 +748,9 @@ impl PlatformHttpClient for StubHttpClient {
             .front()
             .copied()
             .unwrap_or_default();
+        if delay.is_zero() {
+            return self.wait(pending).await;
+        }
         if remaining.is_zero() || delay >= remaining {
             self.wait_delays
                 .lock()
@@ -1150,6 +1138,29 @@ mod tests {
     use edgezero_core::http::request_builder;
 
     use super::*;
+
+    #[test]
+    fn bounded_stub_wait_preserves_an_already_ready_response_after_expiry() {
+        let stub = StubHttpClient::new();
+        stub.push_response(200, b"ready".to_vec());
+        let pending = futures::executor::block_on(
+            stub.send_async(PlatformHttpRequest::new(
+                request_builder()
+                    .uri("https://example.com/ready")
+                    .body(Body::empty())
+                    .expect("should build request"),
+                "ready-backend",
+            )),
+        )
+        .expect("should dispatch ready response");
+        let response = futures::executor::block_on(stub.wait_until(pending, Instant::now()))
+            .expect("should retain the ready response after expiry");
+        assert_eq!(
+            response.response.status().as_u16(),
+            200,
+            "should preserve ready status"
+        );
+    }
 
     #[test]
     fn stub_http_client_records_send_calls_and_returns_canned_response() {
