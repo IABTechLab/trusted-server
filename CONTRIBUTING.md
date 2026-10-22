@@ -6,13 +6,14 @@ Apache License 2.0.
 
 ## Before implementation
 
-Search the issue tracker before opening a new issue. For a substantial change,
-describe the problem, intended behavior, affected adapters, and compatibility
-constraints before investing in an implementation. Do not place credentials or
-non-public vulnerability details in an issue; contact the maintainers privately
-before disclosure.
+Search the issue tracker before opening a new issue. Features and other
+substantial changes need an issue that describes the problem, intended behavior,
+affected adapters, and compatibility constraints; open it before you invest in
+an implementation. Smaller pull requests link an issue when one exists. Do not
+place credentials or non-public vulnerability details in an issue; contact the
+maintainers privately before disclosure.
 
-Read [CLAUDE.md](CLAUDE.md) for repository architecture, target constraints,
+Read [AGENTS.md](AGENTS.md) for repository architecture, target constraints,
 coding conventions, error handling, documentation rules, and commit policy.
 The [project governance document](ProjectGovernance.md) defines decision and
 release responsibilities.
@@ -139,8 +140,9 @@ link it in the description, and mark it ready for review again.
 - Keep platform-specific dependencies out of `trusted-server-core`.
 - Use `error-stack` reports for production errors; the Spin entry-point FFI is
   the sole documented `anyhow` exception.
-- Use fictional example data by default. A real public vendor endpoint requires
-  the exact reviewed exception described in `CLAUDE.md`.
+- Use fictional example data by default. A real host needs a reviewed entry in
+  the URL-host allowlist or a per-line `allow-domain` suppression; see
+  [Pre-commit URL-host linter](#pre-commit-url-host-linter).
 - Update the canonical guide or crate README when a user-visible contract
   changes; do not copy volatile matrices into multiple documents.
 
