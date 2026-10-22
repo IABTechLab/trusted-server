@@ -59,6 +59,13 @@ commands are shown explicitly.
 
 ## Install from source
 
+`cargo install-cli` builds `ts` from source. The resulting local binary is not
+covered by the release attestation. Operators who need an attested CLI should
+download the matching `ts-<target>` release asset, verify it with the documented
+`gh attestation verify` and `gh release verify-asset` commands in the
+[release verification guide](/guide/release-verification), and install that
+verified file.
+
 From the repository root, install the `ts` binary with the workspace Cargo alias:
 
 ```bash

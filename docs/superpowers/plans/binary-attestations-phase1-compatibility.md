@@ -1,6 +1,6 @@
 # Phase 1 compatibility audit and approved alignment
 
-**Audit baseline:** reviewed #1262 at `122b78664b1235c717e9208fd200f9a9b0c335df` versus #1435 at `4dd217125c6e38055e4bcb2cba32c0b95e739914`. The table records the audit of those commits. The approved status below supersedes earlier implementation suggestions in the audit; work in progress is not a claim of completed release qualification. The user selected **SPDX 2.3**. The fork rehearsal `v0.0.0-rehearsal.1` was canceled before signing/publication; its tag will never be reused. Further rehearsal requires a fresh approved tag.
+**Audit baseline:** reviewed #1262 at `122b78664b1235c717e9208fd200f9a9b0c335df` versus #1435 at `4dd217125c6e38055e4bcb2cba32c0b95e739914`. The table records the audit of those commits. The approved status below supersedes earlier implementation suggestions in the audit; work in progress is not a claim of completed release qualification. The published SBOM format is **SPDX 2.3**. Rehearsal `.3` passed at `ca902b6fe`; the rehearsal history below records earlier outcomes.
 
 **Conclusion:** the original Phase 1 signer path and CycloneDX public format would have required a later breaking policy replacement. Fix those now. Phase 1 is the first implementation slice of the existing contract: retain its public names, signer/caller distinction, SPDX semantics and original policy files. Introduce no competing release-index schema or weakened consumer policy.
 
@@ -13,12 +13,13 @@ Frozen source references below mean:
 
 ## Approved scope after audit
 
-The user approved the audit before further edits. This document contains the
-new decisions; carried spec and plan sentences remain unchanged beyond phase
-labels. The frozen source remains the destination contract. The pre-correction
+This document records the alignment decisions. Carried requirements remain
+unchanged; the phasing sections describe this slice and its rehearsal outcome. The frozen source remains the destination contract. The pre-correction
 Phase 1 audit baseline is `4dd217125c6e38055e4bcb2cba32c0b95e739914`; the
 following corrections are implemented in this slice, with verification and
-rehearsal tracked in the PR description at its current commit. No successful signing/publication rehearsal is claimed.
+rehearsal tracked in the PR description at its current commit. Signing and
+immutable publication rehearsal `.3` passed at `ca902b6fe`; see the
+[full verification transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6343374330).
 
 The current correction aligns the local input-free `release-build.yml` signer
 with the `release.yml` caller/publisher, real SPDX 2.3 documents, all eight
@@ -32,7 +33,7 @@ retries and verifies immutable membership after publication.
 
 All three original policy files are carried unchanged, with **no Phase 1
 readers**. Checked cohort selection, a supplemental tool policy, environment
-normalization/remapping, stricter tag/source validation, upload readback,
+normalization/remapping, stricter tag/source validation, uploaded-byte re-download,
 macOS 13 targeting, GNU glibc 2.34 qualification, additional binary/runtime
 checks and CLI immutable build facts are additive later work. Current builds
 retain the hosted GNU glibc 2.39 baseline and macOS 15.0 deployment target;
@@ -101,33 +102,34 @@ qualified evidence.
 
 ### Publication contract and nonbreaking recovery plan
 
-| Contract point                  | Frozen #1262 value                                                           | #1435 value at audit                                | Alignment / adoption                                                                                                                                                                                                  |
-| ------------------------------- | ---------------------------------------------------------------------------- | --------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Publication owner / permissions | `release.yml`, contents-write only (Task 16)                                 | Matches                                             | Preserve; no signer/OIDC/settings credential in publisher.                                                                                                                                                            |
-| Artifact transfer               | Validated current-run outputs, exact bytes/sets (Tasks 12/15/16)             | Wildcard `release-*` merge                          | Fix now: exact named downloads in separate directories, signing-owned digest manifests, reject missing/extra/changed files before creation.                                                                           |
-| Draft lookup/recovery           | Published refused; matching draft resumable only after source/assets match   | Tag lookup + refuse existing; no full draft listing | List all releases including drafts and refuse every matching tag in Phase 1. Capture created ID for mutations and identity-bound verification. Later matching-draft resume is an additive recovery capability.        |
-| Prepublication validation       | Upload, re-download and validate intended set                                | Upload then publish                                 | Upload readback/digest validation remains additive later work. This correction binds the exact signing-approved 17 assets locally and mutations to the created release ID.                                            |
-| Checks after publish            | Immutable=true; signed release/membership and exact intended source/bytes    | Immutable check and normal gh verification          | Preserve and bind checks to created release ID. `gh release verify` accepts tags, so bracket it with created-ID/tag correspondence checks rather than invent an ID attestation endpoint.                              |
-| Mutable/lost/unknown outcomes   | Controlled cleanup for confirmed mutable; read-only reconciliation otherwise | Loud failure, manual recovery                       | Planned narrower Phase 1 behavior: leave failed/unknown state for explicit inspection, no blind retry/deletion. Later owner adds safe reconciliation without changing immutable assets or user verification commands. |
-| Concurrency                     | Tag scoped; never cancel publishing run                                      | Same rule also applies to PR builds                 | Preserve tags; cancel superseded PR builds only.                                                                                                                                                                      |
-| Public deployment route         | Verified raw Fastly bytes; prepared EdgeZero context/recovery later          | Manual clean package/member comparison              | Preserve manual verification/deployment while later adding prepared-payload APIs; #1235 does not wait for boundaries 5–6.                                                                                             |
+| Contract point                  | Frozen #1262 value                                                           | #1435 value at audit                                | Alignment / adoption                                                                                                                                                                                                            |
+| ------------------------------- | ---------------------------------------------------------------------------- | --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Publication owner / permissions | `release.yml`, contents-write only (Task 16)                                 | Matches                                             | Preserve; no signer/OIDC/settings credential in publisher.                                                                                                                                                                      |
+| Artifact transfer               | Validated current-run outputs, exact bytes/sets (Tasks 12/15/16)             | Wildcard `release-*` merge                          | Fix now: exact named downloads in separate directories, signing-owned digest manifests, reject missing/extra/changed files before creation.                                                                                     |
+| Draft lookup/recovery           | Published refused; matching draft resumable only after source/assets match   | Tag lookup + refuse existing; no full draft listing | List all releases including drafts and refuse every matching tag in Phase 1. Capture created ID for mutations and identity-bound verification. Later matching-draft resume is an additive recovery capability.                  |
+| Prepublication validation       | Upload, re-download and validate intended set                                | Upload then publish                                 | Upload responses already validate size and SHA-256 digest before publication. Re-downloading uploaded bytes remains additive later work. Exact signing-approved local assets and mutations are bound to the created release ID. |
+| Checks after publish            | Immutable=true; signed release/membership and exact intended source/bytes    | Immutable check and normal gh verification          | Preserve and bind checks to created release ID. `gh release verify` accepts tags, so bracket it with created-ID/tag correspondence checks rather than invent an ID attestation endpoint.                                        |
+| Mutable/lost/unknown outcomes   | Controlled cleanup for confirmed mutable; read-only reconciliation otherwise | Loud failure, manual recovery                       | Planned narrower Phase 1 behavior: leave failed/unknown state for explicit inspection, no blind retry/deletion. Later owner adds safe reconciliation without changing immutable assets or user verification commands.           |
+| Concurrency                     | Tag scoped; never cancel publishing run                                      | Same rule also applies to PR builds                 | Preserve tags; cancel superseded PR builds only.                                                                                                                                                                                |
+| Public deployment route         | Verified raw Fastly bytes; prepared EdgeZero context/recovery later          | Manual clean package/member comparison              | Preserve manual verification/deployment while later adding prepared-payload APIs; #1235 does not wait for boundaries 5–6.                                                                                                       |
 
 **Nonbreaking adoption rule:** existing `gh` checks remain valid when later releases add real companions, index and richer evidence. The full custom verifier is introduced for index-bearing releases; it must not reinterpret the first slice as having complete graph/reproducibility/qualification evidence. No fake index or placeholder successful companions will be published. The unavoidable missing-evidence/recovery/platform-qualification limits are explicit; signer path, cohort, SPDX predicate/names and reserved companion names are aligned before the next publication attempt.
 
-## First rehearsal record
+## Rehearsal history
 
-The user approved the first rehearsal tag in the earlier session. The coding
-agent pushed the implementation commit and created the annotated fork-only
-`v0.0.0-rehearsal.1` tag at `4dd217125`.
-[Run 39768688430](https://github.com/prk-Jr/trusted-server/actions/runs/39768688430)
-completed the Fastly build. Its three native builds were canceled after review
-feedback; the signing and publication jobs executed no steps, so this run
-produced no attestations. Read-only reconciliation on 2026-10-22 found the tag
-still present and no releases, including drafts, on the fork. Immutable releases
-had previously been enabled on the fork under the user's sandbox authorization.
-No IAB tags, releases or settings were changed.
+- `v0.0.0-rehearsal.1` at `4dd217125`: Fastly build passed; native builds
+  were canceled after review. Signing and publication executed no steps, so
+  the run produced no attestations or release. The original annotated tag remains
+  unused; later rehearsal tags are lightweight and never reused.
+- `v0.0.0-rehearsal.2` at `41896cb07`: all builds and signing passed and
+  an immutable 17-asset release was published. The final API read failed because
+  of a stale pooled connection after synchronous verification. Independent
+  verification passed; see the [verification transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6341078344).
+- `v0.0.0-rehearsal.3` at `ca902b6fe`: all builds, signing, publication
+  and the final API read passed. Independent verification with GitHub CLI 2.102.0
+  passed release verification, all 17 asset checks, both predicates and both
+  signer identity checks for each binary, checksums and SPDX predicate equality;
+  see the [full verification transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6343374330).
 
-The old tag remains unused and is never reused. From this point, no fork push
-or tag creation is authorized until the user writes
-`approved: v0.0.0-rehearsal.N` for a fresh tag. Every future rehearsal tag must
-be lightweight.
+The immutable `.2` and `.3` releases remain intact; no drafts remain from
+these rehearsals. No upstream tags, releases or repository settings were changed.

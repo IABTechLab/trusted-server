@@ -49,8 +49,8 @@ vulnerability scan.
 ## Download and verify
 
 Use an independently trusted GitHub CLI installation with `gh attestation verify`,
-`gh release verify`, and `gh release verify-asset`; use the version recorded in
-the release job's recorded version. The SBOM comparison below also uses `jq`.
+`gh release verify`, and `gh release verify-asset`. Use the GitHub CLI version
+recorded in the release job log. The SBOM comparison below also uses `jq`.
 Verification needs GitHub network access. Obtain the approved tag
 and its 40-character source commit through an independent source-review process.
 The retained strict SemVer/lightweight-tag validation is deferred; use a
@@ -144,10 +144,13 @@ and [immutable asset verification reference](https://cli.github.com/manual/gh_re
 
 ## Use the verified CLI
 
-Choose the executable matching your platform, verify it as above, then copy it
-into a directory on your `PATH` as `ts` and make it executable. Verify before
-first execution. Individual commands may still require a source checkout and
-provider tools; see [CLI](/guide/cli).
+`cargo install-cli` builds `ts` from source. The resulting local binary is not
+covered by the release attestation. Operators who need an attested CLI should
+download the `ts-<target>` release asset matching their platform, verify it with
+the `gh attestation verify` and `gh release verify-asset` commands above, then
+copy that verified file into a directory on their `PATH` as `ts` and make it
+executable. Verify before first execution. Individual commands may still require
+a source checkout and provider tools; see [CLI](/guide/cli).
 
 ## Deploy the verified Fastly wasm
 
@@ -237,7 +240,8 @@ violation can expose a mutable release before the workflow reports failure.
 Publication lists releases, including drafts, and refuses every existing
 matching tag. It creates one draft, retains its release ID, and binds uploads
 and the final publish mutation to that ID. It checks the exact signing-approved asset
-set and checks immutable membership after publication. Full upload readback
+set, validates each upload response's size and SHA-256 digest before publication,
+and checks immutable membership after publication. Re-downloading uploaded bytes
 and the reviewed publication owner remain additive later work. There are no
 automatic mutation retries or draft-resume claims.
 
@@ -247,8 +251,9 @@ the tag without an independently approved recovery decision. Published immutable
 releases are never overwritten. A fresh release needs a fresh approved tag;
 Phase 2's full reconciliation and incident owner remains deferred.
 
-First rehearse the approved commit in the user's public sandbox with Actions
-and immutable releases enabled. The user must approve **each** new
-`v0.0.0-rehearsal.N` tag before it is pushed. Record the verification outputs
-in the draft PR. Never use the upstream repository for rehearsal tags or
-releases. The first real tag and every deployment require separate authorization.
+Before the first production release, rehearse the reviewed commit in a separate
+public repository with Actions and immutable releases enabled. Use a fresh,
+lightweight `v0.0.0-rehearsal.N` tag for each attempt and retain verification
+outputs in the release PR. Keep rehearsal tags and releases out of the upstream
+repository. For production, confirm the required settings and checks, then
+follow the maintainer release authorization process before tagging or deploying.

@@ -4,7 +4,7 @@
 
 This is the phased rework of [#1262](https://github.com/IABTechLab/trusted-server/pull/1262), frozen at `122b78664b1235c717e9208fd200f9a9b0c335df`. The reviewed contract below is retained as the destination design. This section controls phase applicability; historical statements about first-release gates and PR ownership below refer to the original combined proposal. No new spec approval cycle is introduced by reducing scope.
 
-**Phase 1 closes #1235:** tag-triggered builds of Fastly wasm and three native CLI binaries; SLSA provenance and a shipped, attested SBOM for each binary; draft/upload/publish of an immutable release with `SHA256SUMS`; GitHub CLI verification pinned to the release workflow and predicate; and CI enforcement of configuration independence. Operators deploy the verified release bytes. Reproducibility is not a Phase 1 claim or gate. The source-version and fresh JS mechanisms already on main are reused.
+**Phase 1 closes #1235:** tag-triggered builds of Fastly wasm and three native CLI binaries; SLSA provenance and a shipped, attested SBOM for each binary; draft/upload/publish of an immutable release with `SHA256SUMS`; GitHub CLI verification pinned to the reusable `release-build.yml` signer and predicate; and CI enforcement of configuration independence. Operators deploy the verified release bytes. Reproducibility is not a Phase 1 claim or gate. The source-version and fresh JS mechanisms already on main are reused.
 
 The phase boundaries follow [aram356's round-1 architecture review](https://github.com/IABTechLab/trusted-server/pull/1262#pullrequestreview-5484754857):
 
@@ -19,7 +19,7 @@ The phase boundaries follow [aram356's round-1 architecture review](https://gith
 
 Native reproduction is deferred to Phase 2+, where it is measured, not a release gate. Fastly-first byte-for-byte reproducibility is a later phase; Phase 1 makes no reproducibility claim. One artifact's reproduction therefore cannot hold up the first attested release.
 
-Phase 1 uses CycloneDX 1.5 for a conservative selected-Cargo-target and installed-npm-build-tree inventory, with the final binary hash. The complete SPDX/composition contract below remains Phase 2+; Phase 1 does not claim exact retained-code or native-source closure.
+Phase 1 publishes SPDX 2.3 for a conservative selected-Cargo-target and installed-npm-build-tree inventory, with the final binary hash. CycloneDX is only an intermediate generator format. Complete composition qualification below remains Phase 2+; Phase 1 does not claim exact retained-code or native-source closure.
 
 **Phase 2+ retains all remaining requirements:** two-build reproducibility, confined recipes, platform qualification, authenticated tool/image acquisition, complete composition/SPDX coverage, candidate collection/index, the custom consumer, publication owner, Task 14 same-commit validation, and Cloudflare/Spin/Axum. These slices remain closed to production selection and signing until separately qualified and authorized.
 
@@ -353,7 +353,7 @@ The initial verified tool contract is GitHub CLI **2.97.0** and `actions/attest`
 | Certificate issuer                      | `https://token.actions.githubusercontent.com`                                                                                                                                 |
 | Source ref / source digest              | Exact `refs/tags/<tag>` / independently approved 40-character commit                                                                                                          |
 | Build signer digest                     | Same source commit for this same-revision local reusable workflow                                                                                                             |
-| Provenance predicate / build type       | `https://slsa.dev/provenance/v1` / `https://actions.github.io/buildtypes/workflow/v1` <!-- allow-domain: actions.github.io -->                                                |
+| Provenance predicate / build type       | `https://slsa.dev/provenance/v1` / `https://actions.github.io/buildtypes/workflow/v1`                                                                                         |
 | Caller / external parameters            | Exactly `workflow: {ref: "refs/tags/<tag>", repository: "https://github.com/IABTechLab/trusted-server", path: ".github/workflows/release.yml"}`; no arbitrary inputs/commands |
 | Source resolved dependency              | `git+https://github.com/IABTechLab/trusted-server@refs/tags/<tag>` with `gitCommit` equal to approved commit                                                                  |
 | Event / runner                          | `push` / `github-hosted`                                                                                                                                                      |

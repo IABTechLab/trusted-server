@@ -6,7 +6,7 @@ This is the phased rework of [#1262](https://github.com/IABTechLab/trusted-serve
 
 **Phase 1 closes #1235:** tag-triggered builds of Fastly wasm and three native CLI binaries; SLSA provenance and a shipped, attested SBOM for each binary; draft/upload/publish of an immutable release with `SHA256SUMS`; GitHub CLI verification pinned to the release workflow and predicate; and CI enforcement of configuration independence. Operators deploy the verified release bytes. Reproducibility is not a Phase 1 claim or gate. The source-version and fresh JS mechanisms already on main are reused.
 
-Phase 1 uses CycloneDX 1.5 for a conservative selected-Cargo-target and installed-npm-build-tree inventory, with the final binary hash. The complete SPDX/composition contract below remains Phase 2+; Phase 1 does not claim exact retained-code or native-source closure.
+Phase 1 publishes SPDX 2.3 for a conservative selected-Cargo-target and installed-npm-build-tree inventory, with the final binary hash. CycloneDX is only an intermediate generator format. Complete composition qualification below remains Phase 2+; Phase 1 does not claim exact retained-code or native-source closure.
 
 **Phase 2+ retains all remaining requirements:** two-build reproducibility, confined recipes, platform qualification, authenticated tool/image acquisition, complete composition/SPDX coverage, candidate collection/index, the custom consumer, publication owner, Task 14 same-commit validation, and Cloudflare/Spin/Axum. These slices remain closed to production selection and signing until separately qualified and authorized.
 
@@ -15,21 +15,21 @@ The phase labels on requirement headings below apply only to the reduced Phase 1
 ### Phase 1 implementation checklist
 
 - [x] Copy reviewed spec, plan, feasibility and schemas from `122b78664b1235c717e9208fd200f9a9b0c335df`; preserve linked historical evidence.
-- [x] Add `.github/workflows/release.yml`: four tag builds, isolated provenance/SBOM signing, draft/upload/publish and immutable readback; optional read-only PR builds.
-- [x] Generate CycloneDX 1.5 from the selected Cargo target after its locked release build and npm's installed tree from that same build; merge without reference collisions and bind the final binary hash. Record conservative build-dependency coverage, including npm build tools; do not claim exact retained-byte or native-source closure.
+- [x] Add `.github/workflows/release.yml` as caller/publisher and reusable `release-build.yml` as builder/signer: four tag builds, isolated provenance/SBOM signing, draft/upload/publish and immutable readback; optional read-only PR builds.
+- [x] Generate intermediate CycloneDX from the selected Cargo target after its locked release build and npm's installed tree from that same build; merge without reference collisions, convert to published SPDX 2.3 and bind the final binary hash. Record conservative build-dependency coverage, including npm build tools; do not claim exact retained-byte or native-source closure.
 - [x] Enforce fresh npm install, prohibit skip/prebuilt overrides, audit compile-time config inputs and reject planted operator values in every binary.
 - [x] Document exact GitHub CLI provenance/SBOM and immutable-asset verification, native baselines and deployment of verified Fastly bytes; update CLI guide, navigation and changelog.
 - [x] Run pure local tests, actionlint, format/domain checks, touched build gates, independent and security review; push this branch and open only the requested draft PR.
 
-| #1235 acceptance item                                 | Phase 1 evidence                                                       |
-| ----------------------------------------------------- | ---------------------------------------------------------------------- |
-| Reviewed spec and compile-time input list             | Retained R-CONFIG/R-INPUTS, this phasing section; #1262 review history |
-| Tag publishes immutable binaries, SBOMs and checksums | release.yml build/sign/release jobs; human rehearsal pending           |
-| Provenance, SBOM predicate and asset verification     | release-verification.md; human rehearsal pending                       |
-| Fresh JS; fail missing npm/install/skip               | Existing main build.rs plus clean npm ci and release preflight         |
-| Deploy exact bytes                                    | Manual verified Fastly package route; no reproducibility claim         |
-| Immutable setting and protected tags                  | Maintainer gate; no setting changes by this PR                         |
-| Operator documentation                                | CLI guide, release-verification, CHANGELOG                             |
+| #1235 acceptance item                                 | Phase 1 evidence                                                                 |
+| ----------------------------------------------------- | -------------------------------------------------------------------------------- |
+| Reviewed spec and compile-time input list             | Retained R-CONFIG/R-INPUTS, this phasing section; #1262 review history           |
+| Tag publishes immutable binaries, SBOMs and checksums | release.yml caller/publisher and release-build.yml signer; rehearsal `.3` passed |
+| Provenance, SBOM predicate and asset verification     | release-verification.md; rehearsal `.3` verification passed                      |
+| Fresh JS; fail missing npm/install/skip               | Existing main build.rs plus clean npm ci and release preflight                   |
+| Deploy exact bytes                                    | Manual verified Fastly package route; no reproducibility claim                   |
+| Immutable setting and protected tags                  | Maintainer gate; no setting changes by this PR                                   |
+| Operator documentation                                | CLI guide, release-verification, CHANGELOG                                       |
 
 ### Complete remaining-work slice map
 
@@ -49,7 +49,7 @@ The [machine-readable inventory](binary-attestations-slice-map.json) assigns eve
 | 2.10              | consumer cli                                  |
 | 2.11              | docs and format misc                          |
 
-All PR titles begin `Binary attestations: phase 2.N –`; all branches begin `feature/binary-attestations-phase2-N-`. Stack slices in order except the consumer CLI, which may branch directly from Phase 1. Keep every later slice closed: no signing triggers, production selector or qualification bypass. The source PR remains frozen and open until the user decides it is superseded. Cloudflare, Spin and Axum distribution/qualification follow these slices. Task 14 remains Phase 2.9. Human gates are immutable releases/tag protection, a user-provided throwaway signing rehearsal, and explicit authorization of the first real tag.
+All PR titles begin `Binary attestations: phase 2.N –`; all branches begin `feature/binary-attestations-phase2-N-`. Stack slices in order except the consumer CLI, which may branch directly from Phase 1. Keep every later slice closed: no signing triggers, production selector or qualification bypass. The source PR remains frozen and open until the user decides it is superseded. Cloudflare, Spin and Axum distribution/qualification follow these slices. Task 14 remains Phase 2.9. Human gates are immutable releases/tag protection and explicit authorization of the first real tag; signing/publication rehearsal `.3` passed at `ca902b6fe`.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
