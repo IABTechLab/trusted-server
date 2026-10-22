@@ -116,7 +116,7 @@ impl TraceDispatch {
         }
         // Private assets also retain their byte-derived validator. The shared
         // privacy helper removes validators from dynamic responses first.
-        let etag = format!("\"{:x}\"", Sha256::digest(bytes));
+        let etag = format!("\"{}\"", hex::encode(Sha256::digest(bytes)));
         response.headers_mut().insert(
             header::ETAG,
             HeaderValue::from_str(&etag).expect("should encode an ASCII SHA-256 ETag"),
