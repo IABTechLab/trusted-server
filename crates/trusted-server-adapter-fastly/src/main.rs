@@ -640,7 +640,7 @@ fn run_identity_after_send(
         status,
         rate_limiter: Some(&limiter),
     });
-    log::debug!("Identity flush outcome: {outcome}");
+    log::info!("Identity flush measurement: outcome={outcome}");
 }
 
 fn prepare_identity_after_send<F>(

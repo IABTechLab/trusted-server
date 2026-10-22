@@ -156,6 +156,8 @@ pub fn ec_finalize_response(
         reconcile_pull_sync_marker(settings, registry, ec_context, response);
         if let Some(identity) = &identity {
             emit_identity_cookies(ec_context, identity, kv, response);
+            let kv_read = !matches!(ec_context.kv_snapshot(), EcKvSnapshot::NotRead);
+            log::info!("{}", ec_context.identity().measurement(kv_read));
         }
 
         // Ordinary returning-user page views no longer refresh the browser

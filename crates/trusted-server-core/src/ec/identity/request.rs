@@ -124,6 +124,7 @@ pub(crate) struct RequestIdentity {
     seed: Vec<PartnerIdUpdate>,
     client_eids_from_body: bool,
     marked: Vec<super::ids::IdentityProviderId>,
+    cookie_header_bytes: usize,
 }
 
 impl RequestIdentity {
@@ -136,8 +137,33 @@ impl RequestIdentity {
             user_agent: header("user-agent").map(str::to_owned),
             dnt: header("dnt").is_some_and(|value| value.trim() == "1"),
             raw: RawIdentityCookies::capture(headers),
+            cookie_header_bytes: headers
+                .get_all(http::header::COOKIE)
+                .iter()
+                .map(|value| value.as_bytes().len())
+                .sum(),
             ..Self::default()
         }
+    }
+
+    /// One log line per identity request, with no IDs or cookie values: the
+    /// inbound `Cookie` header size, the removal cookies' count and total
+    /// size, and whether this request is the writer and read KV.
+    pub(crate) fn measurement(&self, kv_read: bool) -> String {
+        format!(
+            "Identity measurement: writer={} kv_read={} cookie_header_bytes={} \
+             removal_cookies={} removal_cookie_bytes={} queued_changes={}",
+            self.writer,
+            kv_read,
+            self.cookie_header_bytes,
+            self.raw.r.len(),
+            self.raw
+                .r
+                .iter()
+                .map(|(name, value)| name.len() + value.len() + 1)
+                .sum::<usize>(),
+            !self.mutation.is_empty(),
+        )
     }
 
     /// Replaces the captured cookies, for tests that build a context by hand.
@@ -272,5 +298,37 @@ impl RequestIdentity {
     /// What the response must do with the identity cookies, to change it.
     pub(crate) fn staged_mut(&mut self) -> &mut StagedCookies {
         &mut self.staged
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use http::{HeaderMap, HeaderValue, header};
+
+    use super::*;
+
+    #[test]
+    fn measurement_reports_sizes_without_values() {
+        let mut headers = HeaderMap::new();
+        headers.append(header::COOKIE, HeaderValue::from_static("a=1"));
+        headers.append(
+            header::COOKIE,
+            HeaderValue::from_static("__Host-ts-eids-r-0a1b2c3d=secret-value"),
+        );
+        let identity = RequestIdentity::capture(&headers);
+        let line = identity.measurement(true);
+        assert!(
+            line.contains("cookie_header_bytes=41"),
+            "sums every Cookie field: {line}"
+        );
+        assert!(
+            line.contains("removal_cookies=1"),
+            "counts removal cookies: {line}"
+        );
+        assert!(
+            line.contains("removal_cookie_bytes=38"),
+            "sizes them: {line}"
+        );
+        assert!(!line.contains("secret-value"), "never logs a value");
     }
 }
