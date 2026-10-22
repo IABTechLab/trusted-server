@@ -15,11 +15,14 @@ use crate::cookies::extract_cookie_value;
 use crate::ec::EcContext;
 use crate::ec::EcKvSnapshot;
 use crate::ec::client_eids::parse_client_eids;
-use crate::ec::eids::{resolve_partner_ids, to_eids};
+use crate::ec::eids::{resolve_partner_records, to_eids};
 use crate::ec::identity::UnixTime;
 use crate::ec::identity::catalog::ProviderCatalog;
+use crate::ec::identity::cookie::RBatch;
+use crate::ec::identity::coordinator::EligibilityView;
 use crate::ec::identity::policy::PolicySignals;
-use crate::ec::identity::servable::{ServeContext, kv_opted_out};
+use crate::ec::identity::revision::IdentityKeys;
+use crate::ec::identity::servable::ServeContext;
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::partner::normalize_partner_source_domain;
 use crate::ec::prebid_eids::parse_prebid_eids_cookie;
@@ -329,7 +332,7 @@ pub async fn handle_auction(
     if !matches!(auction_kv_snapshot, EcKvSnapshot::NotRead) {
         ec_context.set_kv_snapshot(auction_kv_snapshot.clone());
     }
-    let eids = resolve_auction_eids(&auction_kv_snapshot, registry, ec_context);
+    let eids = resolve_auction_eids(settings, &auction_kv_snapshot, registry, ec_context);
 
     // Look up geo for device info.
     let geo = services
@@ -454,6 +457,7 @@ pub async fn handle_auction(
 /// store, no EC, consent denied). On KV or partner-resolution errors, logs a
 /// warning and returns empty EIDs so the auction can proceed in degraded mode.
 pub(crate) fn resolve_auction_eids(
+    settings: &Settings,
     snapshot: &EcKvSnapshot,
     registry: Option<&PartnerRegistry>,
     ec_context: &EcContext,
@@ -466,30 +470,49 @@ pub(crate) fn resolve_auction_eids(
 
     let ec_id = ec_context.ec_value()?;
 
-    let Some(entry) = snapshot.entry_for(ec_id) else {
-        return Some(Vec::new());
+    // A read that found the row missing or failed yields no server set; a
+    // tombstone yields none either. Without a read the cookie view stands in.
+    let entry = match snapshot {
+        EcKvSnapshot::NotRead => None,
+        _ => match snapshot.entry_for(ec_id) {
+            Some(entry) if entry.consent.ok => Some(entry),
+            _ => return Some(Vec::new()),
+        },
     };
 
-    if !entry.consent.ok {
-        return Some(Vec::new());
-    }
-
-    // Without a trustworthy clock every expiry check would pass, so no KV ID
-    // is served.
+    // Without a trustworthy clock every expiry check would pass, so no
+    // server-side ID is served.
     let Some(now) = crate::ec::checked_current_timestamp() else {
-        log::warn!("Skipping KV EIDs because the clock is unavailable");
+        log::warn!("Skipping server-side EIDs because the clock is unavailable");
         return Some(Vec::new());
     };
-    let catalog = ProviderCatalog::empty();
-    let opted_out = kv_opted_out(entry);
+    let keys = IdentityKeys::from_settings(settings);
+    let catalog =
+        ProviderCatalog::from_partners(registry).unwrap_or_else(|_| ProviderCatalog::empty());
+    let opened = ec_context.identity().opened_or_open(&keys, &catalog, ec_id);
+    let batches: Vec<RBatch> = opened
+        .removals
+        .cookies
+        .iter()
+        .map(|(_, batch)| batch.clone())
+        .collect();
+    let view = EligibilityView::merge(entry, opened.s.cookie(), &batches, &catalog, &keys);
+    let opted_out = view.opted_out_providers();
     let serve = ServeContext {
         now: UnixTime::from_secs(now),
         consent: ec_context.consent(),
-        signals: PolicySignals::default(),
+        signals: PolicySignals {
+            dnt: ec_context.identity().dnt(),
+        },
         catalog: &catalog,
         opted_out: &opted_out,
     };
-    let resolved = resolve_partner_ids(registry, entry, &serve);
+    let resolved = resolve_partner_records(
+        registry,
+        view.records()
+            .map(|(source, record)| (source.clone(), record)),
+        &serve,
+    );
     Some(to_eids(&resolved))
 }
 
@@ -644,6 +667,193 @@ mod tests {
             pull_sync_ttl_sec: crate::settings::EcPartner::default_pull_sync_ttl_sec(),
             pull_sync_rate_limit: crate::settings::EcPartner::default_pull_sync_rate_limit(),
             ts_pull_token: None,
+        }
+    }
+
+    mod server_set {
+        use super::*;
+        use crate::ec::identity::cookie::{RRemoval, SCookie, SEntry, seal};
+        use crate::ec::identity::input::SeededRandom;
+        use crate::ec::identity::test_support::test_keys;
+        use crate::ec::kv_types::{KvEntry, KvPartnerId};
+
+        const PULL_SOURCE: &str = "pull.example.com";
+
+        fn ec_id() -> String {
+            format!("{}.ABC123", "a".repeat(64))
+        }
+
+        fn registry() -> PartnerRegistry {
+            let mut pull = counting_test_partner(PULL_SOURCE);
+            pull.pull_sync_enabled = true;
+            pull.pull_sync_url = Some("https://sync.pull.example.com/pull".to_owned());
+            pull.pull_sync_allowed_domains = vec!["sync.pull.example.com".to_owned()];
+            pull.ts_pull_token = Some(crate::redacted::Redacted::new(
+                "example-token-value-0123456789abcdef".to_owned(),
+            ));
+            PartnerRegistry::from_config(&[
+                counting_test_partner("a.example.com"),
+                counting_test_partner("b.example.com"),
+                pull,
+            ])
+            .expect("should build registry")
+        }
+
+        fn context_with_cookies(cookies: &str) -> EcContext {
+            let mut context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id()));
+            let mut headers = http::HeaderMap::new();
+            if !cookies.is_empty() {
+                headers.insert(
+                    header::COOKIE,
+                    http::HeaderValue::from_str(cookies).expect("should build header"),
+                );
+            }
+            context.identity_mut().set_raw_cookies_for_test(&headers);
+            context
+        }
+
+        fn present(entry: KvEntry) -> EcKvSnapshot {
+            EcKvSnapshot::Present {
+                ec_id: ec_id(),
+                entry: Box::new(entry),
+                generation: Some(1),
+            }
+        }
+
+        fn sources(eids: Option<Vec<Eid>>) -> Vec<(String, String)> {
+            eids.unwrap_or_default()
+                .into_iter()
+                .map(|eid| (eid.source, eid.uids[0].id.clone()))
+                .collect()
+        }
+
+        #[test]
+        fn staged_cookie_entry_fills_a_source_the_browser_did_not_send() {
+            let registry = registry();
+            let catalog = crate::ec::identity::catalog::ProviderCatalog::from_partners(&registry)
+                .expect("should build catalog");
+            let index = catalog
+                .configured_sources()
+                .iter()
+                .position(|source| source.as_str() == "b.example.com")
+                .expect("should index b");
+            let mut cookie = SCookie::new(&catalog, crate::ec::current_timestamp());
+            cookie
+                .ids
+                .push(SEntry::staged_browser(index, "staged-uid", 1));
+            let sealed = seal(
+                &test_keys().cookie_s,
+                &ec_id(),
+                &serde_json::to_vec(&cookie).expect("should serialize"),
+                &SeededRandom::new(1),
+            );
+            let context = context_with_cookies(&format!("__Host-ts-eids-s={sealed}"));
+            let mut entry = KvEntry::minimal("z.example.com", "x", 1);
+            entry
+                .ids
+                .insert("a.example.com".to_owned(), KvPartnerId::new("server-a"));
+
+            let server = resolve_auction_eids(
+                &create_test_settings(),
+                &present(entry),
+                Some(&registry),
+                &context,
+            );
+            let client = Some(vec![Eid::new(
+                "a.example.com".to_owned(),
+                vec![Uid {
+                    id: "browser-a".to_owned(),
+                    atype: Some(1),
+                    ext: None,
+                }],
+            )]);
+            let merged = merge_auction_eids(client, server);
+
+            assert_eq!(
+                sources(merged),
+                vec![
+                    ("a.example.com".to_owned(), "browser-a".to_owned()),
+                    ("b.example.com".to_owned(), "staged-uid".to_owned()),
+                ],
+                "the browser wins an unowned source, and a staged entry fills one it did not send"
+            );
+        }
+
+        #[test]
+        fn removal_cookie_hides_a_record_before_the_removal_reaches_kv() {
+            let registry = registry();
+            let mut entry = KvEntry::minimal("z.example.com", "x", 1);
+            entry.ids.insert(
+                PULL_SOURCE.to_owned(),
+                KvPartnerId {
+                    w: Some("pull-pull-example-com".to_owned()),
+                    at: Some(5),
+                    ..KvPartnerId::new("pull-uid")
+                },
+            );
+            let control = resolve_auction_eids(
+                &create_test_settings(),
+                &present(entry.clone()),
+                Some(&registry),
+                &context_with_cookies(""),
+            );
+            assert_eq!(
+                sources(control),
+                vec![(PULL_SOURCE.to_owned(), "pull-uid".to_owned())],
+                "control: the pull partner's record is served"
+            );
+
+            let batch = crate::ec::identity::cookie::RBatch {
+                rm: vec![RRemoval {
+                    s: PULL_SOURCE.to_owned(),
+                    w: "pull-pull-example-com".to_owned(),
+                    pv: None,
+                    sa: 5,
+                }],
+                ..crate::ec::identity::cookie::RBatch::default()
+            };
+            let sealed = seal(
+                &test_keys().cookie_r,
+                &ec_id(),
+                &serde_json::to_vec(&batch).expect("should serialize"),
+                &SeededRandom::new(2),
+            );
+            let hidden = resolve_auction_eids(
+                &create_test_settings(),
+                &present(entry),
+                Some(&registry),
+                &context_with_cookies(&format!("__Host-ts-eids-r-0a1b2c3d={sealed}")),
+            );
+            assert!(
+                sources(hidden).is_empty(),
+                "a staged removal stops the record at once"
+            );
+        }
+
+        #[test]
+        fn missing_or_tombstoned_rows_yield_no_server_set() {
+            let registry = registry();
+            let context = context_with_cookies("");
+            assert_eq!(
+                resolve_auction_eids(
+                    &create_test_settings(),
+                    &EcKvSnapshot::Missing { ec_id: ec_id() },
+                    Some(&registry),
+                    &context
+                ),
+                Some(Vec::new()),
+                "a missing row"
+            );
+            assert_eq!(
+                resolve_auction_eids(
+                    &create_test_settings(),
+                    &present(KvEntry::tombstone(1)),
+                    Some(&registry),
+                    &context
+                ),
+                Some(Vec::new()),
+                "a tombstone"
+            );
         }
     }
 
@@ -1708,7 +1918,12 @@ mod tests {
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
 
-        let result = resolve_auction_eids(&EcKvSnapshot::NotRead, Some(&registry), &ec_context);
+        let result = resolve_auction_eids(
+            &create_test_settings(),
+            &EcKvSnapshot::NotRead,
+            Some(&registry),
+            &ec_context,
+        );
         assert!(
             result.is_some_and(|eids| eids.is_empty()),
             "should degrade to empty EIDs without a snapshot"
@@ -1720,7 +1935,12 @@ mod tests {
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
 
-        let result = resolve_auction_eids(&EcKvSnapshot::NotRead, None, &ec_context);
+        let result = resolve_auction_eids(
+            &create_test_settings(),
+            &EcKvSnapshot::NotRead,
+            None,
+            &ec_context,
+        );
         assert!(
             result.is_none(),
             "should return None when registry is missing"
@@ -1733,7 +1953,12 @@ mod tests {
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let ec_context = make_ec_context(Jurisdiction::Unknown, Some(&ec_id));
 
-        let result = resolve_auction_eids(&EcKvSnapshot::NotRead, Some(&registry), &ec_context);
+        let result = resolve_auction_eids(
+            &create_test_settings(),
+            &EcKvSnapshot::NotRead,
+            Some(&registry),
+            &ec_context,
+        );
         assert!(
             result.is_none(),
             "should return None when consent is denied"
@@ -1745,7 +1970,12 @@ mod tests {
         let registry = PartnerRegistry::empty();
         let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
 
-        let result = resolve_auction_eids(&EcKvSnapshot::NotRead, Some(&registry), &ec_context);
+        let result = resolve_auction_eids(
+            &create_test_settings(),
+            &EcKvSnapshot::NotRead,
+            Some(&registry),
+            &ec_context,
+        );
         assert!(
             result.is_none(),
             "should return None when no EC value is present"
@@ -1761,7 +1991,12 @@ mod tests {
         let snapshot = EcKvSnapshot::Failed {
             ec_id: ec_id.clone(),
         };
-        let result = resolve_auction_eids(&snapshot, Some(&registry), &ec_context);
+        let result = resolve_auction_eids(
+            &create_test_settings(),
+            &snapshot,
+            Some(&registry),
+            &ec_context,
+        );
         let eids = result.expect("should return Some on KV error (degraded mode)");
         assert!(
             eids.is_empty(),

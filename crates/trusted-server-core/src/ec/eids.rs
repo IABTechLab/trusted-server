@@ -12,9 +12,9 @@ use error_stack::{Report, ResultExt as _};
 use crate::error::TrustedServerError;
 use crate::openrtb::{Eid, Uid};
 
-use super::identity::SourceDomain;
 use super::identity::servable::{ServeContext, is_servable};
-use super::kv_types::KvEntry;
+use super::identity::{EidProvenance, SourceDomain};
+use super::kv_types::{KvEntry, KvPartnerId};
 use super::registry::PartnerRegistry;
 
 /// Maximum size (in bytes) for the base64-encoded `x-ts-eids` header value.
@@ -32,6 +32,8 @@ pub struct ResolvedPartnerId {
     pub openrtb_atype: i32,
     /// Stored UID-level `ext`, when a provider supplied one.
     pub ext: Option<serde_json::Value>,
+    /// EID-level fields the writing provider declared for this source.
+    pub provenance: Option<EidProvenance>,
 }
 
 /// Resolves source-domain keyed IDs from a KV entry against the partner registry.
@@ -44,27 +46,45 @@ pub(crate) fn resolve_partner_ids(
     entry: &KvEntry,
     serve: &ServeContext<'_>,
 ) -> Vec<ResolvedPartnerId> {
+    resolve_partner_records(
+        registry,
+        entry
+            .ids
+            .iter()
+            .filter_map(|(source, record)| Some((source.parse::<SourceDomain>().ok()?, record))),
+        serve,
+    )
+}
+
+/// Resolves any set of records, such as the merged server set of KV and the
+/// identity cookies, the way [`resolve_partner_ids`] resolves a KV entry.
+pub(crate) fn resolve_partner_records<'r>(
+    registry: &PartnerRegistry,
+    records: impl IntoIterator<Item = (SourceDomain, &'r KvPartnerId)>,
+    serve: &ServeContext<'_>,
+) -> Vec<ResolvedPartnerId> {
     let mut resolved = Vec::new();
 
-    for (source_domain, partner_uid) in &entry.ids {
-        let Some(partner) = registry.get(source_domain) else {
+    for (source, record) in records {
+        let Some(partner) = registry.get(source.as_str()) else {
             continue;
         };
-        if !partner.bidstream_enabled {
+        if !partner.bidstream_enabled || !is_servable(serve, &source, record) {
             continue;
         }
-        let Ok(source) = source_domain.parse::<SourceDomain>() else {
-            continue;
-        };
-        if !is_servable(serve, &source, partner_uid) {
-            continue;
-        }
+        let provenance = record
+            .w
+            .as_deref()
+            .and_then(|writer| writer.parse().ok())
+            .and_then(|writer| serve.catalog.get(&writer))
+            .and_then(|provider| provider.descriptor().provenance(&source).cloned());
 
         resolved.push(ResolvedPartnerId {
             source_domain: partner.source_domain.clone(),
-            uid: partner_uid.uid.clone(),
-            openrtb_atype: partner_uid.atype.unwrap_or(partner.openrtb_atype),
-            ext: partner_uid.ext.clone(),
+            uid: record.uid.clone(),
+            openrtb_atype: record.atype.unwrap_or(partner.openrtb_atype),
+            ext: record.ext.clone(),
+            provenance,
         });
     }
 
@@ -78,14 +98,20 @@ pub fn to_eids(resolved: &[ResolvedPartnerId]) -> Vec<Eid> {
     resolved
         .iter()
         .map(|item| {
-            Eid::new(
+            let mut eid = Eid::new(
                 item.source_domain.clone(),
                 vec![Uid {
                     id: item.uid.clone(),
                     atype: Some(item.openrtb_atype),
                     ext: item.ext.clone(),
                 }],
-            )
+            );
+            if let Some(provenance) = &item.provenance {
+                eid.inserter = provenance.inserter().map(str::to_owned);
+                eid.matcher = provenance.matcher().map(str::to_owned);
+                eid.mm = provenance.mm();
+            }
+            eid
         })
         .collect()
 }
@@ -281,18 +307,21 @@ mod tests {
                 source_domain: "liveramp.com".to_owned(),
                 openrtb_atype: 3,
                 ext: None,
+                provenance: None,
             },
             ResolvedPartnerId {
                 uid: "ID5_abc".to_owned(),
                 source_domain: "id5-sync.com".to_owned(),
                 openrtb_atype: 1,
                 ext: None,
+                provenance: None,
             },
             ResolvedPartnerId {
                 uid: "pair-id".to_owned(),
                 source_domain: "google.com".to_owned(),
                 openrtb_atype: 571187,
                 ext: None,
+                provenance: None,
             },
         ];
 
@@ -323,6 +352,7 @@ mod tests {
                 source_domain: format!("partner-{idx}.example.com"),
                 openrtb_atype: 3,
                 ext: None,
+                provenance: None,
             });
         }
 
@@ -343,6 +373,7 @@ mod tests {
             source_domain: "ssp.com".to_owned(),
             openrtb_atype: 3,
             ext: None,
+            provenance: None,
         }];
 
         let (encoded, truncated) =

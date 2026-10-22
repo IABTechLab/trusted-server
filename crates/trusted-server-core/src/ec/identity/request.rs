@@ -42,6 +42,40 @@ impl RawIdentityCookies {
         self.s.is_some() || !self.r.is_empty()
     }
 
+    /// Opens both cookie kinds for `ec_id`.
+    #[must_use]
+    pub(crate) fn open(
+        &self,
+        keys: &IdentityKeys,
+        catalog: &ProviderCatalog,
+        ec_id: &str,
+    ) -> OpenedIdentity {
+        let s = match &self.s {
+            None => SOpen::Missing,
+            Some(CookieRead::Value(value)) => {
+                let mut headers = HeaderMap::new();
+                match http::HeaderValue::from_str(&format!("{COOKIE_TS_EIDS_S}={value}")) {
+                    Ok(header) => {
+                        headers.insert(http::header::COOKIE, header);
+                        super::cookie::open_s_cookie(keys, ec_id, catalog, &headers)
+                    }
+                    Err(_) => SOpen::Failed,
+                }
+            }
+            Some(_) => SOpen::Failed,
+        };
+        let mut removals = OpenedRemovals::default();
+        for (name, value) in &self.r {
+            match open(&keys.cookie_r, ec_id, value)
+                .and_then(|payload| serde_json::from_slice::<RBatch>(&payload).ok())
+            {
+                Some(batch) => removals.cookies.push((name.clone(), batch)),
+                None => removals.unopenable.push(name.clone()),
+            }
+        }
+        OpenedIdentity { s, removals }
+    }
+
     /// Whether the request carried `__Host-ts-eids-s`.
     #[must_use]
     pub(crate) fn has_s(&self) -> bool {
@@ -159,34 +193,22 @@ impl RequestIdentity {
         catalog: &ProviderCatalog,
         ec_id: &str,
     ) {
-        if self.opened.is_some() {
-            return;
+        if self.opened.is_none() {
+            self.opened = Some(self.raw.open(keys, catalog, ec_id));
         }
-        let s = match &self.raw.s {
-            None => SOpen::Missing,
-            Some(raw) => {
-                let mut headers = HeaderMap::new();
-                if let CookieRead::Value(value) = raw
-                    && let Ok(header) =
-                        http::HeaderValue::from_str(&format!("{COOKIE_TS_EIDS_S}={value}"))
-                {
-                    headers.insert(http::header::COOKIE, header);
-                    super::cookie::open_s_cookie(keys, ec_id, catalog, &headers)
-                } else {
-                    SOpen::Failed
-                }
-            }
-        };
-        let mut removals = OpenedRemovals::default();
-        for (name, value) in &self.raw.r {
-            match open(&keys.cookie_r, ec_id, value)
-                .and_then(|payload| serde_json::from_slice::<RBatch>(&payload).ok())
-            {
-                Some(batch) => removals.cookies.push((name.clone(), batch)),
-                None => removals.unopenable.push(name.clone()),
-            }
-        }
-        self.opened = Some(OpenedIdentity { s, removals });
+    }
+
+    /// The opened cookies, or the raw ones opened now without keeping them.
+    #[must_use]
+    pub(crate) fn opened_or_open(
+        &self,
+        keys: &IdentityKeys,
+        catalog: &ProviderCatalog,
+        ec_id: &str,
+    ) -> OpenedIdentity {
+        self.opened
+            .clone()
+            .unwrap_or_else(|| self.raw.open(keys, catalog, ec_id))
     }
 
     /// The opened cookies, once [`Self::open_cookies`] ran.

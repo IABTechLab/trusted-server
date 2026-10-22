@@ -4931,6 +4931,7 @@ pub async fn handle_publisher_request(
             apply_auction_eids_and_device(
                 &mut auction_request,
                 &AuctionEidTargeting {
+                    settings,
                     cookie_jar: cookie_jar.as_ref(),
                     ec_id,
                     kv_snapshot: ec_context.kv_snapshot(),
@@ -5527,6 +5528,7 @@ pub(crate) struct MatchedSlotsContext<'a> {
 /// Borrowed inputs for [`apply_auction_eids_and_device`], bundled to keep the
 /// helper within the project's 7-argument cap.
 struct AuctionEidTargeting<'a> {
+    settings: &'a Settings,
     cookie_jar: Option<&'a CookieJar>,
     ec_id: Option<&'a str>,
     kv_snapshot: &'a crate::ec::EcKvSnapshot,
@@ -5558,6 +5560,7 @@ fn apply_auction_eids_and_device(
         None
     };
     let kv_eids = resolve_auction_eids(
+        targeting.settings,
         targeting.kv_snapshot,
         targeting.partner_registry,
         targeting.ec_context,
@@ -7106,6 +7109,7 @@ pub async fn handle_page_bids(
             apply_auction_eids_and_device(
                 &mut auction_request,
                 &AuctionEidTargeting {
+                    settings,
                     cookie_jar: cookie_jar.as_ref(),
                     ec_id: ec_id.as_deref(),
                     kv_snapshot: &page_bids_kv_snapshot,
@@ -7948,9 +7952,11 @@ mod tests {
         auction_request.user.consent = None;
         auction_request.user.eids = None;
 
+        let settings = create_test_settings();
         apply_auction_eids_and_device(
             &mut auction_request,
             &AuctionEidTargeting {
+                settings: &settings,
                 cookie_jar: Some(&jar),
                 ec_id: Some(ec_id.as_str()),
                 kv_snapshot: &snapshot,

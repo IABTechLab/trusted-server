@@ -215,6 +215,21 @@ impl EligibilityView {
         self.states.get(provider)
     }
 
+    /// Every merged record, by source.
+    pub(crate) fn records(&self) -> impl Iterator<Item = (&SourceDomain, &KvPartnerId)> {
+        self.records.iter()
+    }
+
+    /// Providers with a sticky opt-out that is not cleared.
+    #[must_use]
+    pub(crate) fn opted_out_providers(&self) -> BTreeSet<IdentityProviderId> {
+        self.states
+            .iter()
+            .filter(|(_, state)| state.opted_out())
+            .filter_map(|(provider, _)| provider.parse().ok())
+            .collect()
+    }
+
     /// Whether `provider` has a sticky opt-out that is not cleared.
     #[must_use]
     pub(crate) fn is_opted_out(&self, provider: &IdentityProviderId) -> bool {
