@@ -2011,12 +2011,16 @@ export function installTsRenderBridge(): void {
         const tombstone = consumedPrebidApsIds.get(failedAdId);
         let failedSlotId: string | undefined;
         if (tombstone) {
-          // The Prebid path tombstones the publisher's ad unit code, which is a
-          // div id. The store keys associations by the configured Trusted Server
-          // slot id, so resolve it; a div Trusted Server never associated has no
-          // slot id and is left alone rather than recorded under the wrong key.
+          // The Prebid path tombstones the publisher's ad unit code, which can
+          // be a configured prefix rather than a DOM id. The store keys
+          // associations by Trusted Server slot id, so resolve the slot through
+          // the authenticated frame rather than treating the code as a map key:
+          // that resolver handles exact ids, prefixes, and ambiguity, and
+          // `divToSlotId` holds only resolved ids. The capability's own source
+          // check still gates it, so a sender outside the served ad unit is
+          // rejected before the slot is resolved.
           if (sourceFrameForAdUnit(e.source, tombstone.adUnitCode)) {
-            failedSlotId = window.tsjs?.divToSlotId?.[tombstone.adUnitCode];
+            failedSlotId = slotFrameForMessageSource(e.source)?.slotId;
           }
         } else {
           // Server-side APS winners are served the same renderer and emit the
