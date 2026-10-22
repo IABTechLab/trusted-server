@@ -2834,7 +2834,31 @@ const EID_COOKIE_NAME = 'ts-eids';
 const EID_COOKIE_MAX_AGE = 86400;
 
 /** What `buildRequests` did with `ts-eids`, for debug logs. */
-type EidCookieDecision = 'written' | 'trimmed' | 'cleared';
+type EidCookieDecision = 'written' | 'trimmed' | 'cleared' | 'cleared: no storage consent';
+
+/**
+ * Whether the consent Prebid attached to this bidder request permits storing
+ * `ts-eids`.
+ *
+ * Where GDPR applies, writing the cookie needs TCF Purpose 1 (store and/or
+ * access information on a device), the purpose Prebid's own storage rules
+ * check. Prebid lets `trustedServer` see `ortb2` EIDs on any purpose from 2 to
+ * 10, so forwarding them does not establish storage consent. GDPR data without
+ * a TCF purpose record fails closed. Without GDPR data, or with
+ * `gdprApplies: false`, nothing restricts the write.
+ */
+function hasEidStorageConsent(bidderRequest: object): boolean {
+  const { gdprConsent } = bidderRequest as { gdprConsent?: unknown };
+  if (!isRecord(gdprConsent) || gdprConsent.gdprApplies !== true) {
+    return true;
+  }
+  const { vendorData } = gdprConsent;
+  if (!isRecord(vendorData) || !isRecord(vendorData.purpose)) {
+    return false;
+  }
+  const { consents } = vendorData.purpose;
+  return isRecord(consents) && consents[1] === true;
+}
 
 /** Clears any previously persisted Prebid EIDs cookie. */
 function clearPrebidEidsCookie(): void {
@@ -2894,7 +2918,8 @@ function writePrebidEidsCookie(eids: unknown[]): EidCookieDecision {
 /**
  * Collects the EIDs Prebid placed in this `trustedServer` bidder request and
  * mirrors them into `ts-eids` synchronously, before Prebid sends the request,
- * so the server never falls back to a stale cookie for it.
+ * so the server never falls back to a stale cookie for it. Without storage
+ * consent the EIDs are still forwarded and `ts-eids` is cleared instead.
  *
  * `bidderRequest.ortb2` is what Prebid lets `trustedServer` see: global
  * first-party data merged with its own bidder fragment, IDs restricted to
@@ -2916,7 +2941,12 @@ function forwardBidderEids(bidderRequest: unknown): unknown[] | undefined {
   };
   const eids = collectBidderEids(bidderRequest, stats);
   let cookie: EidCookieDecision;
-  if (eids) {
+  if (!hasEidStorageConsent(bidderRequest)) {
+    // Forwarding still follows Prebid's transmit decision; only the copy that
+    // outlives the page needs storage consent.
+    clearPrebidEidsCookie();
+    cookie = 'cleared: no storage consent';
+  } else if (eids) {
     cookie = writePrebidEidsCookie(eids);
   } else {
     clearPrebidEidsCookie();

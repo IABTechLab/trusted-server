@@ -82,7 +82,7 @@ afterAll(() => {
   fs.rmSync(outputDirectory, { recursive: true, force: true });
 });
 
-function tcfData(vendorConsents) {
+function tcfData(vendorConsents, purposeOneConsent) {
   return {
     gdprApplies: true,
     tcString: 'CPexampleTCStringForTests',
@@ -90,7 +90,7 @@ function tcfData(vendorConsents) {
     cmpStatus: 'loaded',
     apiVersion: '2',
     purpose: {
-      consents: { 1: true, 2: true, 3: true, 4: true },
+      consents: { 1: purposeOneConsent, 2: true, 3: true, 4: true },
       legitimateInterests: {},
     },
     vendor: { consents: vendorConsents, legitimateInterests: {} },
@@ -99,14 +99,20 @@ function tcfData(vendorConsents) {
   };
 }
 
-/** A CMP that answers at once: Purposes 1 to 4 consented, the given vendors only. */
-function tcfApi(vendorConsents) {
+/**
+ * A CMP that answers at once: Purposes 2 to 4 consented, Purpose 1 as given,
+ * the given vendors only.
+ */
+function tcfApi(vendorConsents, purposeOneConsent) {
   let nextListenerId = 1;
   return (command, _version, callback) => {
     if (command === 'addEventListener') {
-      callback({ ...tcfData(vendorConsents), listenerId: nextListenerId++ }, true);
+      callback(
+        { ...tcfData(vendorConsents, purposeOneConsent), listenerId: nextListenerId++ },
+        true
+      );
     } else if (command === 'getTCData') {
-      callback(tcfData(vendorConsents), true);
+      callback(tcfData(vendorConsents, purposeOneConsent), true);
     } else if (command === 'removeEventListener') {
       callback(true, true);
     }
@@ -119,7 +125,7 @@ function tcfApi(vendorConsents) {
  * evaluated, that records /auction bodies and answers the unifiedId endpoint
  * after UNIFIED_ID_DELAY_MS.
  */
-function createPage({ cookies = [], vendorConsents } = {}) {
+function createPage({ cookies = [], vendorConsents, purposeOneConsent = true } = {}) {
   let releaseHeldLoad;
   const loadHeld = new Promise((resolve) => {
     releaseHeldLoad = resolve;
@@ -190,7 +196,7 @@ function createPage({ cookies = [], vendorConsents } = {}) {
     pageWindow.isSecureContext = true;
   }
   if (vendorConsents) {
-    pageWindow.__tcfapi = tcfApi(vendorConsents);
+    pageWindow.__tcfapi = tcfApi(vendorConsents, purposeOneConsent);
   }
 
   // Mirror the server's head-injected state.
@@ -413,10 +419,11 @@ describe('trustedServer EIDs with real Prebid.js', () => {
     }
   }, 60_000);
 
-  async function runTcfPage({ withRule }) {
+  async function runTcfPage({ withRule, purposeOneConsent = true }) {
     const page = createPage({
       cookies: ['idl_env=fictional-idl-envelope; Path=/', presetTsEidsCookie()],
       vendorConsents: { [IDENTITY_LINK_GVL_ID]: true },
+      purposeOneConsent,
     });
     page.install();
     expect(page.pageWindow.document.readyState, 'install runs before load').toBe('loading');
@@ -478,6 +485,34 @@ describe('trustedServer EIDs with real Prebid.js', () => {
         results.some((result) => result.biddersBlocked.includes('trustedServer')),
         'trustedServer should not be blocked with the rule'
       ).toBe(false);
+      expect(readTsEidsCookie(page.pageWindow), 'ts-eids should copy the body set').toEqual([
+        CONTROL_EID,
+        LIVERAMP_EID,
+      ]);
+    } finally {
+      await page.close();
+    }
+  }, 60_000);
+
+  it('TCF: with the full basicAds rule and Purpose 1 denied, TS gets its ortb2 EIDs and ts-eids is cleared', async () => {
+    const page = await runTcfPage({ withRule: true, purposeOneConsent: false });
+    try {
+      // Purpose 1 gates the User ID module (enrichEids), not ortb2 EIDs
+      // (transmitEids), so only the control reaches TS.
+      expect(
+        page.auctionBodies.map((body) => body.eids),
+        'Prebid should still let trustedServer forward the ortb2 EID'
+      ).toEqual([[CONTROL_EID]]);
+      expect(
+        tcfEnforcementResults(page.pageWindow).some((result) =>
+          result.biddersBlocked.includes('trustedServer')
+        ),
+        'trustedServer should not be blocked with the rule'
+      ).toBe(false);
+      expect(
+        readTsEidsCookie(page.pageWindow),
+        'ts-eids should be cleared without Purpose 1'
+      ).toBeUndefined();
     } finally {
       await page.close();
     }

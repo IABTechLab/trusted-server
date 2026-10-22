@@ -2671,6 +2671,60 @@ describe('prebid/installPrebidNpm', () => {
       expect(readTsEidsCookie(), 'the cookie should be cleared').toBeUndefined();
     });
 
+    describe('storage consent', () => {
+      const storedEid = { source: 'ids.example.com', uids: [{ id: 'ids-uid', atype: 1 }] };
+
+      function consentedBidderRequest(gdprConsent: unknown): Record<string, unknown> {
+        return deepFreeze({
+          bidderCode: 'trustedServer',
+          auctionId: null,
+          ortb2: { user: { ext: { eids: [storedEid] } } },
+          gdprConsent,
+        });
+      }
+
+      function gdprConsentWithPurposeOne(purposeOne: boolean): Record<string, unknown> {
+        return {
+          gdprApplies: true,
+          consentString: 'CPexampleTCStringForTests',
+          vendorData: {
+            purpose: { consents: { 1: purposeOne, 2: true }, legitimateInterests: {} },
+          },
+        };
+      }
+
+      it.each([
+        ['Purpose 1 is denied', gdprConsentWithPurposeOne(false)],
+        ['GDPR applies without a TCF purpose record', { gdprApplies: true, consentString: '' }],
+      ])('forwards EIDs but clears ts-eids when %s', (_case, gdprConsent) => {
+        const spec = getAdapterSpec();
+        presetTsEidsCookie('preset-value');
+
+        const result = spec.buildRequests(
+          trustedServerBidRequests(),
+          consentedBidderRequest(gdprConsent)
+        );
+
+        expect(JSON.parse(String(result.data)).eids, 'should still forward the EIDs').toEqual([
+          storedEid,
+        ]);
+        expect(readTsEidsCookie(), 'should clear ts-eids without storage consent').toBeUndefined();
+      });
+
+      it.each([
+        ['Purpose 1 is granted', gdprConsentWithPurposeOne(true)],
+        ['GDPR does not apply', { gdprApplies: false }],
+      ])('writes ts-eids when %s', (_case, gdprConsent) => {
+        const spec = getAdapterSpec();
+
+        spec.buildRequests(trustedServerBidRequests(), consentedBidderRequest(gdprConsent));
+
+        expect(decodedTsEidsCookie(), 'should write ts-eids with storage consent').toEqual([
+          storedEid,
+        ]);
+      });
+    });
+
     it('clears ts-eids when no EID fits the cookie budget but still sends the body', () => {
       const debugSpy = vi.spyOn(log, 'debug').mockImplementation(() => {});
       const spec = getAdapterSpec();

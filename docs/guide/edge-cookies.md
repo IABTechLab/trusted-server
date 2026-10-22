@@ -161,8 +161,11 @@ response. Which browser input it reads depends on the route:
 The TSJS Prebid adapter writes `ts-eids` in `buildRequests`, before each
 `trustedServer` request is sent: the request's EIDs without EID-level `ext`,
 trimmed to 3,072 bytes, as base64 of UTF-8 JSON. It clears the cookie when that
-set is empty or when Prebid's TCF rules block `trustedServer`. Auctions that do
-not include `trustedServer` leave it unchanged.
+set is empty or when Prebid's TCF rules block `trustedServer`. Where GDPR
+applies, it writes the cookie only with TCF Purpose 1 (store/access device)
+consent; without it, the adapter clears the cookie and still sends the EIDs in
+the `/auction` body. Auctions that do not include `trustedServer` leave it
+unchanged.
 
 These Prebid EID writes follow the same consent rule as bidstream EID forwarding: when a TCF signal is present, Purpose 1 (store/access device) and Purpose 4 (personalized ads) must both be consented, and when GDPR applies without a TCF signal the writes are withheld. A user who consents to Purpose 1 but not Purpose 4 keeps their EC, but no EIDs from the request are persisted.
 
