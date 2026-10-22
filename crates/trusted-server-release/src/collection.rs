@@ -20,6 +20,7 @@ mod archive;
 pub(crate) mod producer;
 mod records;
 pub(crate) mod transfer;
+mod workflow_jobs;
 pub(crate) use records::CollectionDiagnostic;
 #[cfg(test)]
 pub(crate) use records::{ReceiptFacts, check_composition_receipt};

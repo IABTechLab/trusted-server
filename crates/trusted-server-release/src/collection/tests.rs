@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 
 use super::*;
 
-fn zip(members: &[(&str, &[u8])], descriptor: bool) -> Vec<u8> {
+pub(super) fn zip(members: &[(&str, &[u8])], descriptor: bool) -> Vec<u8> {
     let mut bytes = Vec::new();
     let mut central = Vec::new();
     for (name, body) in members {
