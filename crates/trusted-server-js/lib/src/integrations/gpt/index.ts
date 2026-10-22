@@ -17,10 +17,10 @@ import type {
   TsjsApi,
 } from '../../core/types';
 import {
-  APS_NATIVE_RENDERER_TIMEOUT_MS,
   APS_RENDER_FAILED_MESSAGE,
   APS_UNIVERSAL_CREATIVE_RENDERER,
   APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+  RENDERER_READY_TIMEOUT_MS,
   apsRenderFailureReason,
   apsRendererUrl,
   dispatchApsRendering,
@@ -1945,10 +1945,13 @@ function recordConsumedPrebidApsId(
   adUnitCode: string
 ): void {
   // A capability consumed with little TTL left would otherwise lose its
-  // tombstone before the renderer frame's timeout fires, dropping the relayed
-  // reason. Holding it for at least that long also keeps the ad ID blocked
-  // longer, which is the safer direction for a security tombstone.
-  const minimum = Date.now() + APS_NATIVE_RENDERER_TIMEOUT_MS;
+  // tombstone before the renderer frame's timeout relay arrives, dropping the
+  // reason. The frame starts its timer only after the capability round trip, so
+  // the relay lands later than one timeout after consumption: hold the
+  // tombstone for twice that window rather than exactly it. Bounded by the
+  // frame's own timeout so the two cannot drift apart. This also keeps the ad ID
+  // blocked longer, which is the safer direction for a security tombstone.
+  const minimum = Date.now() + 2 * RENDERER_READY_TIMEOUT_MS;
   consumedIds.set(adId, { expiresAt: Math.max(expiresAt, minimum), adUnitCode });
 }
 

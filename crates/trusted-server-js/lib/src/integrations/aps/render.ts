@@ -37,7 +37,14 @@ const activeFrames = new WeakMap<HTMLElement, HTMLIFrameElement>();
 const pendingFrameCancels = new WeakMap<HTMLElement, () => void>();
 const RENDERER_READY_MESSAGE = 'trusted-server/aps/renderer-ready';
 const RENDERER_FAILED_MESSAGE = 'trusted-server/aps/renderer-failed';
-const RENDERER_READY_TIMEOUT_MS = 10_000;
+/**
+ * How long a renderer frame has to acknowledge before its render is failed.
+ *
+ * Exported because the consumed-ad-ID tombstone has to outlive this window: the
+ * frame starts its timer only after the capability round trip, so a timeout
+ * relay arrives later than this many milliseconds after the ad ID was consumed.
+ */
+export const RENDERER_READY_TIMEOUT_MS = 10_000;
 
 /**
  * Message the Universal Creative frame relays to the top window when an APS

@@ -3324,11 +3324,13 @@ mod tests {
     /// Guards the properties of the failure report that a substring check can
     /// actually establish.
     ///
-    /// Reachability of each reason is covered on the JavaScript side, where the
-    /// document is evaluated rather than read as text. The assertions kept here
-    /// are the ones that stay meaningful against a string: that a reason is a
-    /// fixed category rather than attacker-influenced content, that reporting is
-    /// one-shot, and that the frame never answers the sender.
+    /// The browser spec evaluates the document and asserts `bad_hash`,
+    /// `nonce_mismatch`, and `descriptor_keys`; `descriptor_fields`,
+    /// `descriptor_envelope`, and `amazon_script_error` are not executed
+    /// anywhere yet. The assertions kept here are the ones that stay meaningful
+    /// against a string: that a reason is a fixed category rather than
+    /// attacker-influenced content, that reporting is one-shot, and that the
+    /// frame never answers the sender.
     #[test]
     fn renderer_document_reports_a_fixed_reason_category() {
         // A reason is a literal category, never a copy of the rejected input.

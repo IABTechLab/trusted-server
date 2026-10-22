@@ -15,6 +15,7 @@ import {
   APS_RENDERING_MODE_ATTRIBUTE_NAME,
   APS_RENDER_FAILED_MESSAGE,
   APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+  RENDERER_READY_TIMEOUT_MS,
 } from '../../../src/integrations/aps/render';
 import { GptDiagnosticsStore } from '../../../src/integrations/gpt_diagnostics/store';
 
@@ -3721,6 +3722,69 @@ describe('installTsRenderBridge', () => {
         'aps_frame_timeout',
       ]);
     } finally {
+      delete (window as TestWindow).tsjs.gptDiagnosticsRecorder;
+    }
+  });
+
+  it('records a frame timeout relayed after a short-TTL capability would have expired', async () => {
+    const renderer = apsRenderer();
+    const prebidAdId = 'prebid-short-ttl-ad-id';
+    const store = new GptDiagnosticsStore({ defer: () => undefined });
+    (window as TestWindow).tsjs.gptDiagnosticsRecorder = store as never;
+    // The renderer entry expires almost immediately, so only the tombstone's
+    // own minimum keeps the ad ID known long enough to attribute the relay.
+    (window as TestWindow).tsjs.apsPrebidRenderers = {
+      [prebidAdId]: {
+        adUnitCode: 'div-header',
+        renderer,
+        registeredAt: Date.now(),
+        expiresAt: Date.now() + 1_000,
+        markUsed: vi.fn(),
+      },
+    };
+
+    const nowSpy = vi.spyOn(Date, 'now');
+    try {
+      const bridgeListener = await captureBridgeListener();
+      const source = createTrustedSlotIframe();
+      const slot = {
+        getSlotElementId: () => 'div-header',
+        getAdUnitPath: () => '/example/div-header',
+      };
+      (window as TestWindow).tsjs.divToSlotId = { 'div-header': 'homepage_header' };
+      store.recordTrustedServerOpportunity(slot, 'homepage_header', 'renderable_candidate');
+      store.recordSlotRequested(slot);
+
+      const consumedAt = Date.now();
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: JSON.stringify({ message: 'Prebid Request', adId: prebidAdId }),
+          ports: [{ postMessage: () => {} }],
+          source,
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent
+      );
+
+      // The frame starts its own timer only after the capability round trip, so
+      // its timeout relay lands after consumption plus the frame timeout.
+      nowSpy.mockReturnValue(consumedAt + RENDERER_READY_TIMEOUT_MS + 50);
+      bridgeListener(
+        Object.assign(new Event('message'), {
+          data: {
+            message: APS_RENDER_FAILED_MESSAGE,
+            adId: prebidAdId,
+            reason: 'frame_timeout',
+          },
+          source,
+          stopImmediatePropagation: vi.fn(),
+        }) as unknown as MessageEvent
+      );
+
+      expect(store.snapshot().slots[0].requests[0].trustedServerCreativeFailures).toEqual([
+        'aps_frame_timeout',
+      ]);
+    } finally {
+      nowSpy.mockRestore();
       delete (window as TestWindow).tsjs.gptDiagnosticsRecorder;
     }
   });
