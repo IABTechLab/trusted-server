@@ -4,7 +4,7 @@
 
 This is the phased rework of [#1262](https://github.com/IABTechLab/trusted-server/pull/1262), frozen at `122b78664b1235c717e9208fd200f9a9b0c335df`. The reviewed contract below is retained as the destination design. This section controls phase applicability; historical statements about first-release gates and PR ownership below refer to the original combined proposal. No new spec approval cycle is introduced by reducing scope.
 
-**Phase 1 closes #1235:** tag-triggered builds of Fastly wasm and three native CLI binaries; SLSA provenance and a shipped, attested SBOM for each binary; draft/upload/publish of an immutable release with `SHA256SUMS`; GitHub CLI verification pinned to the reusable `release-build.yml` signer and predicate; and CI enforcement of configuration independence. Operators deploy the verified release bytes. Reproducibility is not a Phase 1 claim or gate. The source-version and fresh JS mechanisms already on main are reused.
+**Phase 1 closes #1235:** tag-triggered builds of Fastly wasm, three native CLI binaries and three production Axum binaries; SLSA provenance and a shipped, attested SBOM for each binary; draft/upload/publish of an immutable release with `SHA256SUMS`; GitHub CLI verification pinned to the reusable `release-build.yml` signer and predicate; and CI enforcement of configuration independence. Operators deploy the verified release bytes. Reproducibility is not a Phase 1 claim or gate. The source-version and fresh JS mechanisms already on main are reused.
 
 The phase boundaries follow [aram356's round-1 architecture review](https://github.com/IABTechLab/trusted-server/pull/1262#pullrequestreview-5484754857):
 
@@ -71,7 +71,17 @@ The [verification guide](../../guide/release-verification.md) records these fact
 and the maintainer settings gates. Local Viceroy execution proves a local route,
 not submission to a Fastly service.
 
-**Phase 2+ retains all remaining requirements:** two-build reproducibility, confined recipes, platform qualification, authenticated tool/image acquisition, complete composition/SPDX coverage, candidate collection/index, the custom consumer, publication owner, Task 14 same-commit validation, and Cloudflare/Spin/Axum. These slices remain closed to production selection and signing until separately qualified and authorized.
+**Phase 2+ retains all remaining requirements:** two-build reproducibility, confined recipes, platform qualification, authenticated tool/image acquisition, complete composition/SPDX coverage, candidate collection/index, the custom consumer, publication owner, Task 14 same-commit validation, and Cloudflare/Spin distributions plus full custom-verifier qualification of Axum. These slices remain closed to production selection and signing until separately qualified and authorized.
+
+**Phase 1 Axum extension:** the original four asset names remain unchanged;
+three named Axum variants extend this slice to seven binaries and 29 files.
+GNU builds enforce a maximum glibc requirement of 2.34; musl is fully static.
+The cohort records this explicit extension, but tools/policy and the frozen v1
+index schema remain unchanged. Phase 1 emits no index. The later index/consumer
+slices need a reviewed seven-artifact amendment, including new target/capability
+forms; see the [compatibility audit](../plans/binary-attestations-phase1-compatibility.md)
+and slice-map annotations. Rehearsal `.4` covers the original four assets only;
+the expanded implementation requires rehearsal `.5`.
 
 The phase labels on requirement headings below apply only to the reduced Phase 1 subset described above; all additional clauses and requirements marked Phase 2+ remain deferred. The original assurance profiles, custom verifier, retained evidence graph and reproduction gates do not block the first Phase 1 release. The [implementation plan](../plans/2026-10-13-attested-release-implementation.md#phasing--2026-10-22) contains the acceptance mapping and exhaustive slice inventory.
 

@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Add Phase 1 attested Fastly wasm and Linux/macOS CLI releases through a reusable signer workflow, with conservative SPDX 2.3 inventories, published provenance/SBOM bundles, immutable release verification and a manual verified-byte Fastly route. Platform qualification, reproducibility and the custom verifier remain later work; rehearsal `.4` passed at `922c2211c`, while production publication requires maintainer settings.
+- Add Phase 1 attested Fastly wasm, three Linux/macOS CLI and three production Axum binaries, with SPDX 2.3 inventories, provenance/SBOM bundles, immutable verification, GNU glibc 2.34 and static musl startup checks. Reproducibility and the custom verifier remain later work; production publication requires maintainer settings.
 
 ### Changed
 

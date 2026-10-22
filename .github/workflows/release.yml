@@ -16,6 +16,7 @@ on:
       - 'crates/trusted-server-cli/**'
       - 'crates/trusted-server-js/**'
       - 'crates/trusted-server-adapter-fastly/**'
+      - 'crates/trusted-server-adapter-axum/**'
       - 'crates/trusted-server-openrtb*/**'
 permissions:
   contents: read
@@ -69,6 +70,30 @@ jobs:
         with:
           name: signed-ts-x86_64-unknown-linux-gnu
           path: signed/ts-x86_64-unknown-linux-gnu
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-trusted-server-axum-x86_64-unknown-linux-gnu
+          path: build/trusted-server-axum-x86_64-unknown-linux-gnu
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: signed-trusted-server-axum-x86_64-unknown-linux-gnu
+          path: signed/trusted-server-axum-x86_64-unknown-linux-gnu
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-trusted-server-axum-x86_64-unknown-linux-musl
+          path: build/trusted-server-axum-x86_64-unknown-linux-musl
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: signed-trusted-server-axum-x86_64-unknown-linux-musl
+          path: signed/trusted-server-axum-x86_64-unknown-linux-musl
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-trusted-server-axum-aarch64-unknown-linux-gnu
+          path: build/trusted-server-axum-aarch64-unknown-linux-gnu
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: signed-trusted-server-axum-aarch64-unknown-linux-gnu
+          path: signed/trusted-server-axum-aarch64-unknown-linux-gnu
       - name: Verify handoff, create once, publish by release ID and verify
         env:
           GH_TOKEN: ${{ github.token }}
@@ -86,7 +111,7 @@ jobs:
           const { execFileSync } = require('node:child_process');
           const { GH_REPO: repo, RELEASE_TAG: tag, GH_TOKEN: token, SOURCE_COMMIT: source } = process.env;
           if (!/^[\w-]+\/[\w.-]+$/.test(repo) || !/^v[\w.+-]+$/.test(tag)) throw Error('Invalid repository or tag');
-          const names = ['trusted-server-fastly.wasm', 'ts-aarch64-apple-darwin', 'ts-x86_64-apple-darwin', 'ts-x86_64-unknown-linux-gnu'];
+          const names = ['trusted-server-axum-x86_64-unknown-linux-gnu', 'trusted-server-axum-x86_64-unknown-linux-musl', 'trusted-server-axum-aarch64-unknown-linux-gnu', 'trusted-server-fastly.wasm', 'ts-aarch64-apple-darwin', 'ts-x86_64-apple-darwin', 'ts-x86_64-unknown-linux-gnu'];
           const hash = bytes => createHash('sha256').update(bytes).digest('hex');
           const regular = path => { const stat = fs.lstatSync(path); if (!stat.isFile() || stat.size === 0) throw Error(`Invalid file: ${path}`); return fs.readFileSync(path); };
           const exact = (dir, expected) => { if (JSON.stringify(fs.readdirSync(dir).sort()) !== JSON.stringify([...expected].sort())) throw Error(`Unexpected artifact contents: ${dir}`); };
@@ -119,7 +144,20 @@ jobs:
             if (releases.some(release => release.tag_name === tag)) throw Error('Release or draft already exists');
             if (releases.length < 100) break;
           }
-          const created = await api('releases', 'POST', {tag_name:tag, target_commitish:source, name:tag, draft:true, body:'Verify binary provenance, SPDX SBOM and immutable release membership using the release verification guide at this tag.'});
+          const body = [
+            `[Verification guide](https://github.com/${repo}/blob/${tag}/docs/guide/release-verification.md)`, '', '```bash', 'set -euo pipefail',
+            `REPO=${repo}`, `TAG=${tag}`, `COMMIT=${source}`, `ASSETS=(${names.join(' ')})`,
+            'gh release download "$TAG" --repo "$REPO"', 'gh release verify "$TAG" --repo "$REPO"',
+            'for asset in "${ASSETS[@]}"; do',
+            '  for suffix in "" .spdx.json .provenance.sigstore.json .sbom.sigstore.json; do gh release verify-asset "$TAG" "$asset$suffix" --repo "$REPO"; done',
+            '  for kind in provenance sbom; do',
+            '    predicate=https://slsa.dev/provenance/v1; if [[ "$kind" == sbom ]]; then predicate=https://spdx.dev/Document/v2.3; fi',
+            '    checks=(--repo "$REPO" --bundle "$asset.$kind.sigstore.json" --source-ref "refs/tags/$TAG" --source-digest "$COMMIT" --signer-digest "$COMMIT" --deny-self-hosted-runners --predicate-type "$predicate")',
+            '    gh attestation verify "$asset" "${checks[@]}" --signer-workflow "$REPO/.github/workflows/release-build.yml"',
+            '    gh attestation verify "$asset" "${checks[@]}" --cert-identity "https://github.com/$REPO/.github/workflows/release-build.yml@refs/tags/$TAG"',
+            '  done', 'done', 'gh release verify-asset "$TAG" SHA256SUMS --repo "$REPO"', 'shasum -a 256 --check SHA256SUMS', '```',
+          ].join('\n');
+          const created = await api('releases', 'POST', {tag_name:tag, target_commitish:source, name:tag, draft:true, body});
           if (!Number.isSafeInteger(created.id) || created.id <= 0 || created.tag_name !== tag || created.draft !== true) throw Error('Invalid created release identity');
           const id = created.id;
           console.log(`Created release ID: ${id}`);

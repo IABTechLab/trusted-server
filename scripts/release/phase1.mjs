@@ -1,8 +1,36 @@
 /** Small Phase 1 build-inventory and configuration checks, without release authority. */
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
+import { execFileSync } from 'node:child_process'
+import { createServer } from 'node:net'
+import { once } from 'node:events'
 import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
+
+/** Check minimal wasm headers and final Linux loader requirements. */
+export function checkReleaseFormat(bytes, target, elf = '') {
+  if (target === 'wasm32-wasip1') {
+    if (!bytes.subarray(0, 8).equals(Buffer.from('0061736d01000000', 'hex')))
+      throw Error('Invalid wasm magic or version')
+  } else if (target.includes('-linux-')) {
+    if (!bytes.subarray(0, 4).equals(Buffer.from('7f454c46', 'hex')))
+      throw Error('Expected ELF binary')
+    if (target.endsWith('-musl')) {
+      if (/INTERP|\(NEEDED\)/.test(elf))
+        throw Error('Expected fully static musl binary')
+    } else {
+      if (/GLIBC_[A-Z]/.test(elf)) throw Error('Unknown GLIBC requirement')
+      for (const [, major, minor, patch] of elf.matchAll(
+        /GLIBC_(\d+)\.(\d+)(?:\.(\d+))?/g
+      ))
+        if (
+          +major > 2 ||
+          (+major === 2 && (+minor > 34 || (+minor === 34 && +patch > 0)))
+        )
+          throw Error('GLIBC requirement exceeds 2.34')
+    }
+  }
+}
 
 /** Complete converter output with the actual binary's SPDX package. */
 export function completeSpdx(document, binary, original) {
@@ -229,6 +257,195 @@ function audit(root) {
   }
 }
 
+async function smokeRelease(file, target) {
+  const elf = target.includes('-linux-')
+    ? execFileSync(
+        'readelf',
+        ['--program-headers', '--dynamic', '--version-info', file],
+        { encoding: 'utf8', maxBuffer: 8388608 }
+      )
+    : ''
+  checkReleaseFormat(readFileSync(file), target, elf)
+  console.log(
+    'SUCCESS: final-byte checks',
+    target,
+    [...new Set(elf.match(/GLIBC_[\w.]+/g) ?? [])].join(' ')
+  )
+  if (target === 'wasm32-wasip1') return
+  const cli = file.split('/').at(-1).startsWith('ts-')
+  const expected =
+    'ts ' +
+    readFileSync('Cargo.toml', 'utf8').match(
+      /\[workspace\.package\][\s\S]*?^version = "([^"]+)"/m
+    )[1]
+  const version = (output) => {
+    if (output.trim() !== expected) throw Error('Unexpected CLI version')
+    console.log('SUCCESS:', output.trim())
+  }
+  if (cli)
+    version(
+      execFileSync(resolve(file), ['--version'], {
+        encoding: 'utf8',
+        timeout: 10000,
+      })
+    )
+  if (!target.includes('-linux-')) return
+  const docker = (args, input) =>
+    execFileSync('docker', args, {
+      input,
+      encoding: 'utf8',
+      timeout: args[0] === 'pull' ? 180000 : 10000,
+      maxBuffer: 8388608,
+    })
+  const images = target.endsWith('-musl')
+    ? [
+        'alpine:3.22.2@sha256:4b7ce07002c69e8f3d704a9c5d6fd3053be500b7f1c69fc0d80990c2ad8dd412',
+        'scratch',
+      ]
+    : target.startsWith('aarch64-')
+      ? ['debian:12-slim']
+      : [
+          'debian:12-slim',
+          'ubuntu:22.04',
+          'registry.access.redhat.com/ubi9/ubi-minimal:9.6',
+        ]
+  for (const reference of images) {
+    let image
+    if (reference === 'scratch')
+      image = docker(['import', '-'], Buffer.alloc(1024)).trim()
+    else {
+      docker(['pull', reference])
+      image = docker([
+        'image',
+        'inspect',
+        '--format',
+        '{{.Id}}',
+        reference,
+      ]).trim()
+    }
+    console.log('Runtime image:', reference, image)
+    const restrictions = [
+      '--read-only',
+      '--cap-drop=ALL',
+      '--security-opt=no-new-privileges',
+      '--user=65534:65534',
+      '--entrypoint=/release',
+      '--mount',
+      `type=bind,src=${resolve(file)},dst=/release,readonly`,
+    ]
+    const container = 'phase1-smoke-' + randomUUID()
+    let failed
+    try {
+      if (cli) {
+        version(
+          docker([
+            'run',
+            '--name',
+            container,
+            '--network=none',
+            ...restrictions,
+            image,
+            '--version',
+          ])
+        )
+        continue
+      }
+      const reservation = createServer().listen(0, '127.0.0.1')
+      await once(reservation, 'listening')
+      const port = reservation.address().port
+      await new Promise((resolve) => reservation.close(resolve))
+      // Fixed ASCII fixture keys are sorted for the envelope's canonical hash.
+      const data = {
+        ec: { passphrase: 'ec_passphrase' },
+        handlers: [
+          {
+            password: 'handler_password',
+            path: '^/_ts/admin',
+            username: 'smoke',
+          },
+        ],
+        publisher: {
+          cookie_domain: '127.0.0.1',
+          domain: '127.0.0.1',
+          origin_url: 'http://127.0.0.1:9',
+          proxy_secret: 'publisher_proxy_secret',
+        },
+      }
+      const envelope = {
+        data,
+        generated_at: '2026-01-01T00:00:00Z',
+        sha256: createHash('sha256').update(JSON.stringify(data)).digest('hex'),
+        version: 1,
+      }
+      const environment = [
+        `PORT=${port}`,
+        `TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG=${JSON.stringify(envelope)}`,
+        'TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_EC_PASSPHRASE=smoke-edge-cookie-passphrase-32-bytes',
+        'TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_HANDLER_PASSWORD=smoke-admin-password-32-bytes-ok',
+        'TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_PUBLISHER_PROXY_SECRET=smoke-publisher-proxy-secret-32-bytes',
+      ]
+      docker([
+        'run',
+        '--name',
+        container,
+        '-d',
+        '--network=host',
+        ...restrictions,
+        ...environment.flatMap((value) => ['--env', value]),
+        image,
+      ])
+      let healthy = false
+      for (let attempt = 0; attempt < 30; attempt++) {
+        if (
+          docker([
+            'inspect',
+            '--format',
+            '{{.State.Running}}',
+            container,
+          ]).trim() !== 'true'
+        )
+          throw Error('Axum exited before readiness')
+        let response
+        try {
+          response = await fetch(`http://127.0.0.1:${port}/health`, {
+            signal: AbortSignal.timeout(1000),
+          })
+        } catch {
+          await new Promise((resolve) => setTimeout(resolve, 100))
+          continue
+        }
+        if (response.status !== 200 || (await response.text()) !== 'ok')
+          throw Error('Axum configuration or health mismatch')
+        healthy = true
+        break
+      }
+      if (!healthy) throw Error('Axum startup deadline exhausted')
+      console.log(
+        'SUCCESS: configured Axum health returned 200 ok:',
+        reference,
+        image
+      )
+    } catch (error) {
+      failed = error
+      try {
+        console.error(docker(['logs', container]).slice(-4000))
+      } catch {}
+      throw error
+    } finally {
+      try {
+        docker(['rm', '-f', container])
+      } catch (error) {
+        if (
+          !error.stderr?.toString().includes(`No such container: ${container}`)
+        ) {
+          if (!failed) throw error
+          console.error('Smoke container cleanup failed:', error.message)
+        }
+      }
+    }
+  }
+}
+
 if (
   process.argv[1] &&
   import.meta.url === pathToFileURL(resolve(process.argv[1])).href
@@ -242,6 +459,8 @@ if (
         throw new Error('Expected regular release binary')
       checkBinary(readFileSync(file))
     }
+  } else if (command === 'smoke' && args.length === 2) {
+    await smokeRelease(...args)
   } else if (command === 'merge' && args.length === 4) {
     const [cargo, npm, binary, output] = args
     writeFileSync(

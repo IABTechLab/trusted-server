@@ -7,6 +7,7 @@ release_asset=${3:?asset required}
 case "$build_package/$build_target/$release_asset" in
   trusted-server-adapter-fastly/wasm32-wasip1/trusted-server-fastly.wasm) executable=trusted-server-adapter-fastly.wasm ;;
   trusted-server-cli/x86_64-unknown-linux-gnu/ts-x86_64-unknown-linux-gnu|trusted-server-cli/aarch64-apple-darwin/ts-aarch64-apple-darwin|trusted-server-cli/x86_64-apple-darwin/ts-x86_64-apple-darwin) executable=ts ;;
+  trusted-server-adapter-axum/x86_64-unknown-linux-gnu/trusted-server-axum-x86_64-unknown-linux-gnu|trusted-server-adapter-axum/x86_64-unknown-linux-musl/trusted-server-axum-x86_64-unknown-linux-musl|trusted-server-adapter-axum/aarch64-unknown-linux-gnu/trusted-server-axum-aarch64-unknown-linux-gnu) executable=trusted-server-axum ;;
   *) echo 'Unsupported release build selection' >&2; exit 1 ;;
 esac
 : "${RUNNER_TEMP:?}"
@@ -37,7 +38,7 @@ proxy_secret = "phase1-secret-canary-32-characters"
 [permissions]
 policy = "phase1-permission-policy-canary"
 CONFIG
-trap 'rm -f trusted-server.toml' EXIT
+trap 'rm -f trusted-server.toml; if [[ -n "${build_container:-}" ]]; then docker rm -f "$build_container" >/dev/null 2>&1 || true; fi' EXIT
 export CARGO_TARGET_DIR="$RUNNER_TEMP/phase1-target"
 [[ ! -e "$CARGO_TARGET_DIR" ]]
 mkdir -p release-assets
@@ -45,9 +46,47 @@ mkdir -p release-assets
 # The pinned Node distribution includes npm. npm verifies lockfile integrity for
 # fetched packages; no generator dependencies are installed with unpinned npx.
 npm --prefix crates/trusted-server-js/lib ci
-cargo build --package "$build_package" --release --target "$build_target" --locked
+if [[ "$build_target" == *-linux-gnu ]]; then
+  builder_base=registry.access.redhat.com/ubi9/ubi:9.6@sha256:dec374e05cc13ebbc0975c9f521f3db6942d27f8ccdf06b180160490eef8bdbc
+  docker build --build-arg "BASE_IMAGE=$builder_base" --iidfile "$RUNNER_TEMP/phase1-builder-id" - <<'DOCKERFILE'
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+RUN dnf install -y gcc gcc-c++ glibc-devel git-core cmake make perl && dnf clean all
+DOCKERFILE
+  builder=$(cat "$RUNNER_TEMP/phase1-builder-id")
+  echo "GNU builder: $builder_base $builder"
+  build_container=phase1-build-$RANDOM-$$
+  mkdir "$CARGO_TARGET_DIR"
+  docker run --rm --name "$build_container" --workdir /source \
+    --mount "type=bind,src=$PWD,dst=/source" \
+    --mount "type=bind,src=$CARGO_TARGET_DIR,dst=/target" \
+    --mount "type=bind,src=$(dirname "$(dirname "$(node -p process.execPath)")"),dst=/opt/node,readonly" \
+    --mount "type=bind,src=$(readlink -f "$(command -v rustup)"),dst=/usr/local/bin/rustup,readonly" \
+    --env TRUSTED_SERVER__GIT_VERSION --env TRUSTED_SERVER__PUBLISHER__ORIGIN_URL \
+    --env TRUSTED_SERVER__PUBLISHER__PROXY_SECRET --env EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME \
+    --env FASTLY_SERVICE_ID --env CARGO_TARGET_DIR=/target \
+    "$builder" bash -euc '
+      export PATH=/usr/local/bin:/opt/node/bin:/usr/bin:/bin CARGO_HOME=/tmp/cargo RUSTUP_HOME=/tmp/rustup
+      git config --global --add safe.directory /source
+      ldd --version | head -1 | grep -F "2.34"
+      rust_version=$(sed -n '\''s/^channel = "\([^"]*\)"/\1/p'\'' rust-toolchain.toml)
+      rustup toolchain install "$rust_version" --profile minimal
+      rustup target add --toolchain "$rust_version" "$2"
+      rustup run "$rust_version" cargo build --package "$1" --release --target "$2" --locked
+    ' phase1 "$build_package" "$build_target"
+else
+  if [[ "$build_target" == x86_64-unknown-linux-musl ]]; then
+    sudo apt-get update
+    sudo apt-get install --yes --no-install-recommends musl=1.2.4-2 musl-dev=1.2.4-2 musl-tools=1.2.4-2
+    export REALGCC=gcc-13 CC_x86_64_unknown_linux_musl=musl-gcc CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
+    export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS='-C target-feature=+crt-static'
+    musl-gcc -dumpfullversion
+  fi
+  cargo build --package "$build_package" --release --target "$build_target" --locked
+fi
 cp "$CARGO_TARGET_DIR/$build_target/release/$executable" "release-assets/$release_asset"
 node scripts/release/phase1.mjs check "release-assets/$release_asset"
+node scripts/release/phase1.mjs smoke "release-assets/$release_asset" "$build_target"
 # Pin and checksum the generator source before extraction or execution. Cargo's
 # --locked installation authenticates its transitive crates via its shipped lock.
 tool_root="$RUNNER_TEMP/phase1-cyclonedx"
@@ -73,9 +112,12 @@ node scripts/release/phase1.mjs merge \
   "release-assets/$release_asset" "$tool_root/combined.cdx.json"
 # Convert the internal dependency graph into real SPDX 2.3 before publication.
 case "$build_target" in
-  wasm32-wasip1|x86_64-unknown-linux-gnu)
+  wasm32-wasip1|x86_64-unknown-linux-gnu|x86_64-unknown-linux-musl)
     converter_asset=cyclonedx-linux-x64
     converter_sha=bfc8b2538da86fe239bc53658bbb63c1c8c510a293c1e6891aa5bea5d3c58746 ;;
+  aarch64-unknown-linux-gnu)
+    converter_asset=cyclonedx-linux-arm64
+    converter_sha=b2e9fdf9665ef49868a2ec012171c6e785dcd69745bc5869e53e4f4bfb096a5f ;;
   aarch64-apple-darwin)
     converter_asset=cyclonedx-osx-arm64
     converter_sha=750c148780154833f6401f9067d08c5a4c31567b6ee3c26c062c3a95c62d741c ;;

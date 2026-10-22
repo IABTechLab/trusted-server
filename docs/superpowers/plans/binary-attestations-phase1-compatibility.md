@@ -31,14 +31,14 @@ The publisher lists all releases including drafts, refuses a matching tag,
 retains the created release ID for mutations, performs no automatic mutation
 retries and verifies immutable membership after publication.
 
-All three original policy files are carried unchanged, with **no Phase 1
+The tools and consumer policy files remain unchanged. The cohort adds the
+three descriptive Axum entries below; all three policies still have **no Phase 1
 readers**. Checked cohort selection, a supplemental tool policy, environment
 normalization/remapping, stricter tag/source validation, uploaded-byte re-download,
-macOS 13 targeting, GNU glibc 2.34 qualification, additional binary/runtime
-checks and CLI immutable build facts are additive later work. Current builds
-retain the hosted GNU glibc 2.39 baseline and macOS 15.0 deployment target;
-copying the destination policies does not establish their older-runtime
-compatibility requirements. Native reproduction is a later measurement, not a
+macOS 13 targeting, full platform qualification and CLI immutable build facts
+are additive later work. The next batch adds UBI GNU glibc 2.34 checks and
+startup smokes, while retaining the macOS 15.0 deployment target; copying a
+destination policy alone never establishes its qualification requirements. Native reproduction is a later measurement, not a
 Phase 1 release gate. Full Task 16 resume/reconciliation remains deferred.
 
 The [operator guide](/guide/release-verification) describes the corrected
@@ -114,6 +114,74 @@ qualified evidence.
 | Public deployment route         | Verified raw Fastly bytes; prepared EdgeZero context/recovery later          | Manual clean package/member comparison              | Preserve manual verification/deployment while later adding prepared-payload APIs; #1235 does not wait for boundaries 5–6.                                                                                                       |
 
 **Nonbreaking adoption rule:** existing `gh` checks remain valid when later releases add real companions, index and richer evidence. The full custom verifier is introduced for index-bearing releases; it must not reinterpret the first slice as having complete graph/reproducibility/qualification evidence. No fake index or placeholder successful companions will be published. The unavoidable missing-evidence/recovery/platform-qualification limits are explicit; signer path, cohort, SPDX predicate/names and reserved companion names are aligned before the next publication attempt.
+
+### Approved seven-binary Axum extension
+
+The next implementation batch deliberately extends the frozen cohort from four
+to **seven binaries / 29 release files**, retaining all four original names.
+Rehearsal `.4` at `922c2211c` proves only the original four-binary/17-file
+implementation. The seven-binary batch requires fresh rehearsal `.5`; it is not
+claimed rehearsed by the `.4` evidence.
+
+The exact cohort diff is three appended records, all default features, empty
+extra features, `variant: default`, `assurance_profile: provenance-sbom`,
+`role: server`, `bin: trusted-server-axum`, package
+`trusted-server-adapter-axum`, and descriptive capability `axum-production`:
+
+| Added name / target                                                           | Compatibility record                 |
+| ----------------------------------------------------------------------------- | ------------------------------------ |
+| `trusted-server-axum-x86_64-unknown-linux-gnu` / `x86_64-unknown-linux-gnu`   | `x86_64`, `linux-gnu`, `glibc-2.34`  |
+| `trusted-server-axum-x86_64-unknown-linux-musl` / `x86_64-unknown-linux-musl` | `x86_64`, `linux-musl`, `static`     |
+| `trusted-server-axum-aarch64-unknown-linux-gnu` / `aarch64-unknown-linux-gnu` | `aarch64`, `linux-gnu`, `glibc-2.34` |
+
+This adds production Axum distributions by explicit scope decision. `static`
+means no dynamic libc/loader requirement, not qualification of every Linux
+kernel. The historical cohort identifier `phase1-fastly-cli` and its original
+four entries remain unchanged. **No Phase 1 reader** enforces these records or
+their destination assurance profiles/capability labels. `release-tools.json` and
+consumer `release-policy.json` remain byte-for-byte unchanged. The workflow's
+explicit seven selections own the Phase 1 builds; no supplemental tool file or
+policy reader is introduced.
+
+Every binary gets `<asset>.spdx.json`, `<asset>.provenance.sigstore.json` and
+`<asset>.sbom.sigstore.json`; only actual actions/attest outputs are retained.
+`SHA256SUMS` covers the other **28** files and never itself. Exact-name downloads,
+signing receipts and release membership checks cover the entire 29-file set.
+Signer identity stays at reusable `release-build.yml` with the exact tag ref.
+Existing users' four asset names and verification commands continue to work.
+
+GNU compilation runs in digest-pinned UBI 9.6 with pinned Rust installed through
+rustup, explicit target installation and `--locked`; final ELF requirements above
+glibc 2.34 fail. Node is the existing pinned distribution mounted read-only.
+The builder's system packages are acquired through DNF and are not a fully
+qualified or pinned native tool closure. Musl uses Ubuntu's exact `1.2.4-2`
+`musl`, `musl-dev` and `musl-tools` packages, the explicit `musl-gcc` linker and
+GCC 13 driver, whose actual version is logged. Target-specific C/linker/static
+flags leave host SBOM-tool builds unchanged. No allocator or Rust source changes
+are included; consider mimalloc/jemalloc for musl under load later.
+
+Builds scan the final bytes for config canaries and check locked inputs are
+unchanged. Before upload they check wasm magic/version, each CLI's existing
+`ts 0.1.0` package-version output, GNU symbol ceilings and static-musl loader
+requirements. GNU x86 binaries start on Debian 12-slim, Ubuntu 22.04 and UBI 9.6
+minimal; ARM Axum starts on Debian 12-slim on the ARM runner; musl starts on
+pinned Alpine and an empty root filesystem. Acquired builder/runtime image IDs
+are logged. Axum has no help/version mode; its isolated, read-only, nonroot
+container receives only a fictional runtime envelope/secrets and must return
+`200 ok` from its configured health router. This does not establish publisher
+proxy/load qualification or complete native composition.
+
+The carried **v1 index schema remains unchanged**: its closed four-entry graph
+cannot represent this cohort. Phase 1 publishes no index or deferred companions.
+Phase 2 must review a seven-entry schema/policy amendment including musl/ARM
+compatibility and `axum-production` capability forms before reopening its custom
+consumer. The [slice-map annotations](binary-attestations-slice-map.json) mark
+producer/consumer `FIXED_ARTIFACTS`, `cohort_order`, descriptor slots, bounds,
+qualification enums, candidate workflows and fixtures as **update for Axum**.
+The full frozen graph would have 53 files for seven artifacts; Phase 1's 29 is
+not a replacement for those deferred bounds. Richer companions and consumer
+support remain additive later work; existing manual GitHub verification stays
+valid.
 
 ## Rehearsal history
 

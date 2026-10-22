@@ -1,7 +1,7 @@
 # Verify release binaries
 
-Phase 1 publishes four binaries, four SPDX 2.3 SBOMs, eight Sigstore bundles
-and `SHA256SUMS`: **17 immutable release assets**. Each binary has SLSA build
+Phase 1 publishes seven binaries, seven SPDX 2.3 SBOMs, fourteen Sigstore bundles
+and `SHA256SUMS`: **29 immutable release assets**. Each binary has SLSA build
 provenance and an SBOM attestation. Verify the downloaded bytes before execution
 or deployment. Reproducibility, complete composition and the custom Trusted
 Server verifier remain later phases.
@@ -14,21 +14,31 @@ and signing jobs do not check out, compile or execute the downloaded binaries.
 
 ## Platforms and coverage
 
-| Asset                         | Phase 1 baseline and qualification limit                                                                           |
-| ----------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `trusted-server-fastly.wasm`  | Fastly Compute, `wasm32-wasip1`, default features; reproducibility and hosted runtime qualification remain pending |
-| `ts-x86_64-unknown-linux-gnu` | Ubuntu 24.04 x86-64, glibc 2.39 baseline; the retained policy's glibc 2.34 ceiling is not yet established          |
-| `ts-aarch64-apple-darwin`     | macOS 15 Apple Silicon runner, deployment target 15.0; runtime compatibility qualification remains pending         |
-| `ts-x86_64-apple-darwin`      | macOS 15 Intel runner, deployment target 15.0; runtime compatibility qualification remains pending                 |
+| Asset                                           | Phase 1 baseline and qualification limit                                                                           |
+| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `trusted-server-fastly.wasm`                    | Fastly Compute, `wasm32-wasip1`, default features; reproducibility and hosted runtime qualification remain pending |
+| `ts-x86_64-unknown-linux-gnu`                   | GNU x86-64; UBI 9 builder; maximum required glibc 2.34; Debian 12, Ubuntu 22.04 and UBI 9 startup smokes           |
+| `ts-aarch64-apple-darwin`                       | macOS 15 Apple Silicon runner, deployment target 15.0; runtime compatibility qualification remains pending         |
+| `ts-x86_64-apple-darwin`                        | macOS 15 Intel runner, deployment target 15.0; runtime compatibility qualification remains pending                 |
+| `trusted-server-axum-x86_64-unknown-linux-gnu`  | GNU x86-64; UBI 9 build; maximum glibc 2.34; Debian 12, Ubuntu 22.04 and UBI 9 startup smokes                      |
+| `trusted-server-axum-x86_64-unknown-linux-musl` | Fully static x86-64; musl 1.2.4 build; pinned Alpine and empty-rootfs startup smokes                               |
+| `trusted-server-axum-aarch64-unknown-linux-gnu` | ARM64 GNU; native ARM UBI 9 build; maximum glibc 2.34; Debian 12 startup smoke                                     |
 
 The retained destination design calls for a macOS 13.0 deployment target;
 Phase 1 still builds with 15.0. Lowering that floor and proving older-runtime
 compatibility are additive later work.
-The executables are not notarized. Compatibility with older Linux runtimes and
-the retained GNU policy's clean startup images remains unqualified. Native
+The executables are not notarized. GNU builds require no GLIBC symbol newer than 2.34; glibc 2.34 and newer are
+the selected baseline. This includes
+Debian 12/bookworm-slim, Ubuntu 22.04+ and RHEL/UBI 9+. Distroless
+cc-debian12 has a compatible libc floor but is not a Phase 1 smoke image.
+The musl asset needs no dynamic loader or libraries; Alpine and an empty-rootfs
+container are required smoke images, while distroless-static is another deployment option
+without a separate Phase 1 runtime test. Build logs record acquired runtime image
+IDs. These required startup checks do not establish complete platform/tool qualification.
+The expanded seven-binary batch awaits hosted CI and rehearsal `.5`; `.4`
+proves only the original four binaries. Native
 libraries and provider tools needed by individual `ts` commands retain their
-existing prerequisites. Cloudflare, Spin, Axum, Windows and Linux ARM64 releases
-follow separately.
+existing prerequisites. Cloudflare, Spin, Windows and Linux ARM64 CLI releases follow separately.
 
 Each `<binary>.spdx.json` is a **conservative build dependency inventory** of
 the selected Cargo target and the installed npm build tree used for that build.
@@ -67,7 +77,10 @@ REPO=IABTechLab/trusted-server
 TAG=v1.2.3
 COMMIT=0123456789abcdef0123456789abcdef01234567
 ASSETS=(trusted-server-fastly.wasm ts-x86_64-unknown-linux-gnu \
-  ts-aarch64-apple-darwin ts-x86_64-apple-darwin)
+  ts-aarch64-apple-darwin ts-x86_64-apple-darwin \
+  trusted-server-axum-x86_64-unknown-linux-gnu \
+  trusted-server-axum-x86_64-unknown-linux-musl \
+  trusted-server-axum-aarch64-unknown-linux-gnu)
 
 gh release download "$TAG" --repo "$REPO" --dir .
 test "$(gh api "repos/$REPO/releases/tags/$TAG" --jq '.immutable')" = true
@@ -81,7 +94,7 @@ gh release verify-asset "$TAG" SHA256SUMS --repo "$REPO"
 shasum -a 256 --check SHA256SUMS
 ```
 
-The checksums cover the other 16 assets, never `SHA256SUMS` itself. Immutable
+The checksums cover the other 28 assets, never `SHA256SUMS` itself. Immutable
 release verification establishes membership; provenance verification establishes
 the reviewed signer and source. Both are required.
 
@@ -196,6 +209,51 @@ copy that verified file into a directory on their `PATH` as `ts` and make it
 executable. Verify before first execution. Individual commands may still require
 a source checkout and provider tools; see [CLI](/guide/cli).
 
+## Run a verified Axum release
+
+Select one of the three `trusted-server-axum-<target>` assets above, download it
+and complete the same online/offline attestation and immutable membership checks
+before execution. The aarch64 GNU variant is for ARM servers. Copy the verified
+file into your deployment directory, make it executable, and retain its digest.
+
+Application configuration and secrets stay external. With a reviewed checkout's
+`edgezero.toml` and adapter manifests available, use the verified `ts` CLI to
+validate and publish your private `trusted-server.toml` into the local config
+store envelope; this does not rebuild Axum:
+
+```bash
+ts config push --adapter axum --local --manifest ./edgezero.toml \
+  --app-config ./trusted-server.toml --no-diff --yes
+export TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG="$(
+  jq -er '.trusted_server_config' .edgezero/local-config-trusted_server_config.json
+)"
+```
+
+Supply these runtime secret environment variables through your private secret
+management, matching the secret key references in your configuration:
+
+- `TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_HANDLER_PASSWORD`
+- `TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_PUBLISHER_PROXY_SECRET`
+- `TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_EC_PASSPHRASE`
+
+For example, after verifying the x86-64 GNU asset and supplying those variables:
+
+```bash
+chmod u+x ./trusted-server-axum-x86_64-unknown-linux-gnu
+PORT=8080 ./trusted-server-axum-x86_64-unknown-linux-gnu
+```
+
+`PORT` binds Axum to loopback (`127.0.0.1`); use your reviewed reverse proxy and
+TLS configuration for public traffic. Axum has no help/version or dry-run mode.
+Its build smoke starts an isolated server with a fictional external config
+envelope and requires `/health` to return `200` and `ok`, distinguishing a
+configured router from the configuration-error router. This is a startup check,
+not production proxy/load qualification.
+
+An Axum source build, like `cargo install-cli`, is not covered by these release
+attestations. The musl asset is fully static; no allocator change is included.
+Later work should consider mimalloc/jemalloc for musl under load.
+
 ## Deploy the verified Fastly wasm
 
 Keep the verified download unchanged. The ordinary source-build route does not
@@ -279,13 +337,15 @@ It includes Rust 1.98.1, tracked logical IDs, the private JS build path and its
 indirect build-module options, and the locked native dependencies. It does not
 claim a complete native tool closure or hermetic build.
 
-The three policy files are carried unchanged from the frozen reviewed design.
-They have **no Phase 1 readers** and do not authorize these builds or replace
+The tools and consumer policy files are carried unchanged. The cohort retains
+its original four entries and adds the three Axum entries documented in the
+[release PR’s compatibility audit](https://github.com/IABTechLab/trusted-server/pull/1435).
+All three have **no Phase 1 readers** and do not authorize these builds or replace
 the workflow's explicit selections.
 
 | Policy                                          | Current use                                                            | Additive later adoption                                                                          |
 | ----------------------------------------------- | ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
-| `scripts/release/release-cohort.json`           | Retained destination contract; no reader                               | Checked fixed cohort selection, original assurance profiles and compatibility qualification      |
+| `scripts/release/release-cohort.json`           | Original four plus three descriptive Axum entries; no reader           | Checked fixed cohort selection, original assurance profiles and compatibility qualification      |
 | `scripts/release/release-tools.json`            | Retained pending/null qualification records; no reader                 | Checked tool identities, authenticated acquisition, image/SDK measurements and qualified recipes |
 | `crates/trusted-server-cli/release-policy.json` | Retained signer/caller and SPDX contract; no reader or custom verifier | Embedded consumer policy, bounds, historical-policy acceptance and complete index/evidence joins |
 

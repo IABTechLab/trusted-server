@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { completeSpdx, validateSpdx } from './phase1.mjs'
+import { execFileSync } from 'node:child_process'
+import { completeSpdx, validateSpdx, checkReleaseFormat } from './phase1.mjs'
 import { test } from 'node:test'
 import {
   readFileSync,
@@ -121,6 +122,10 @@ test('workflow signs only tags, separates privileged jobs, and never checks out 
   }
 })
 const assets = [
+  'trusted-server-axum-x86_64-unknown-linux-gnu',
+  'trusted-server-axum-x86_64-unknown-linux-musl',
+  'trusted-server-axum-aarch64-unknown-linux-gnu',
+
   'trusted-server-fastly.wasm',
   'ts-aarch64-apple-darwin',
   'ts-x86_64-apple-darwin',
@@ -221,8 +226,17 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           return mode === 'api-error'
             ? response('denied', 503)
             : response(mode === 'draft' ? [release(true)] : [])
-        if (u.pathname.endsWith('/releases') && method === 'POST')
+        if (u.pathname.endsWith('/releases') && method === 'POST') {
+          const body = JSON.parse(options.body).body
+          assert.match(body, /--signer-workflow.*release-build\.yml/)
+          assert.match(body, /--cert-identity.*release-build\.yml@refs\/tags/)
+          assert.ok(body.includes('COMMIT=' + 'a'.repeat(40)))
+          for (const asset of assets) assert.ok(body.includes(asset))
+          execFileSync('bash', ['-n'], {
+            input: body.match(/```bash\n([\s\S]*?)\n```/)[1],
+          })
           return response(release(true), 201)
+        }
         if (u.pathname.endsWith('/assets') && method === 'POST') {
           if (mode === 'upload-error') return response('upload failed', 500)
           const bytes = Buffer.from(options.body)
@@ -302,8 +316,8 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
       if (['upload-error'].includes(mode))
         assert.ok(!calls.some(([method]) => method === 'PATCH'), mode)
       if (['success', 'idle-socket'].includes(mode)) {
-        assert.equal(uploaded.length, 17)
-        assert.equal(calls.filter(([method]) => method === 'gh').length, 18)
+        assert.equal(uploaded.length, 29)
+        assert.equal(calls.filter(([method]) => method === 'gh').length, 30)
       }
     } finally {
       rmSync(root, { recursive: true, force: true })
@@ -465,4 +479,30 @@ test('post-publish retries distinguish transient failures and cap Retry-After', 
     assert.equal(logs.length, expected.length)
     assert.ok(logs.every((line) => /attempt [23]\/3/.test(line)))
   }
+})
+
+test('rejects invalid wasm, GNU symbols above 2.34 and dynamic musl', () => {
+  const wasm = Buffer.from('0061736d01000000', 'hex')
+  checkReleaseFormat(wasm, 'wasm32-wasip1')
+  for (const bytes of [
+    wasm.subarray(0, 7),
+    Buffer.alloc(8),
+    Buffer.from('0061736d02000000', 'hex'),
+  ])
+    assert.throws(() => checkReleaseFormat(bytes, 'wasm32-wasip1'), /wasm/)
+  const elf = Buffer.from('7f454c46', 'hex')
+  const gnu = 'x86_64-unknown-linux-gnu',
+    musl = 'x86_64-unknown-linux-musl'
+  checkReleaseFormat(elf, gnu, 'GLIBC_2.2.5 GLIBC_2.34')
+  for (const versions of [
+    'GLIBC_2.35',
+    'GLIBC_3.0',
+    'GLIBC_2.34.1',
+    'GLIBC_ABI_DT_RELR',
+  ])
+    assert.throws(() => checkReleaseFormat(elf, gnu, versions), /GLIBC/)
+  checkReleaseFormat(elf, musl, 'There is no dynamic section')
+  for (const dynamic of ['INTERP', '(NEEDED) libgcc_s.so.1'])
+    assert.throws(() => checkReleaseFormat(elf, musl, dynamic), /static/)
+  assert.throws(() => checkReleaseFormat(wasm, gnu, 'GLIBC_2.34'), /ELF/)
 })
