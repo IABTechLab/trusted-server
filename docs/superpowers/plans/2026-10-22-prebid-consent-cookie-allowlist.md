@@ -26,8 +26,8 @@ The existing cookies_only exception for policy-sourced body consent is preserved
 - [x] Run the regressions and adapter-matched tests; update stale expectations without weakening coverage.
 - [x] Document operator-visible PBS behavior and outbound audit results, keeping partner-specific exceptions explicit.
 - [x] Run all AGENTS.md CI gates and record command outcomes, including environmental limitations.
-- [ ] Commit and push; create a draft PR using .claude/agents/pr-creator.md with Closes #763.
-- [ ] Independently review the draft PR, fix validated findings with regressions, rerun affected checks, and push the fixes.
+- [x] Commit and push; create a draft PR using .claude/agents/pr-creator.md with Closes #763.
+- [x] Independently review the draft PR, fix validated findings with regressions, rerun affected checks, and push the fixes.
 
 ## Review and regression evidence
 
@@ -46,3 +46,9 @@ The original transport baseline passed. New regressions then failed on the origi
 - Optimized Fastly WASM build passed.
 
 Validation used Rust 1.98.1, Node 24.12.0, and Viceroy 0.21.0. The initially installed Viceroy 0.17.0 could not load the current SDK imports; the pinned version was downloaded separately for verification. Axum's loopback tests and Viceroy's macOS certificate access required sandbox-enabled retries. Those retries passed. The existing proc-macro-error2 future-incompatibility notice remains. No manual publisher deployment was performed.
+
+## Independent PR review
+
+Draft PR #1429 was independently reviewed at commit `999d72394`. The reviewer examined the live issue and PR, complete diff, production dispatch, consent serialization, transport capture, and outbound audit. No actionable findings were reported, so no runtime follow-up was needed. The reviewer independently reran the two focused Prebid-cookie tests and all 197 cookie-related tests; both runs passed, and the diff passed whitespace checks.
+
+The PR remains a draft. Manual deployment/browser smoke tests and live PBS validation remain outside this verification. The project-board status could not be read or updated because the GitHub token lacks project-read permission; the PR's closing link to #763 is verified. The optional core rustdoc build completed with 31 link/private-item warnings in untouched documentation.
