@@ -36,6 +36,7 @@ publish = false
 version = "0.1.0"
 
 [workspace.dependencies]
+aes-gcm = "0.10"
 anyhow = "1"
 assert_cmd = "2"
 async-stream = "0.3"

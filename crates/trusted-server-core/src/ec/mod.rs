@@ -41,6 +41,7 @@ pub mod eids;
 pub mod finalize;
 pub mod generation;
 pub mod identify;
+pub mod identity;
 pub mod kv;
 pub mod kv_backend;
 pub mod kv_types;
