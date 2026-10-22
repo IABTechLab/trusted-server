@@ -219,7 +219,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           )
         if (u.pathname.endsWith('/releases') && method === 'GET')
           return mode === 'api-error'
-            ? response('denied', 403)
+            ? response('denied', 503)
             : response(mode === 'draft' ? [release(true)] : [])
         if (u.pathname.endsWith('/releases') && method === 'POST')
           return response(release(true), 201)
@@ -249,6 +249,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
       }
       const context = {
         Buffer,
+        AbortSignal,
         URL,
         console,
         fetch,
@@ -296,6 +297,8 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         ].includes(mode)
       )
         assert.ok(!calls.some(([method]) => method === 'POST'), mode)
+      if (mode === 'api-error' || mode === 'upload-error')
+        assert.equal(calls.length, mode === 'api-error' ? 1 : 3)
       if (['upload-error'].includes(mode))
         assert.ok(!calls.some(([method]) => method === 'PATCH'), mode)
       if (['success', 'idle-socket'].includes(mode)) {
@@ -418,4 +421,48 @@ test('completes real converter package output with a binary-bound root', () => {
   assert.deepEqual(document.documentDescribes, ['SPDXRef-Artifact'])
   assert.equal(document.packages.at(-1).filesAnalyzed, false)
   assert.throws(() => completeSpdx(document, binary, original), /Unexpected/)
+})
+test('post-publish retries distinguish transient failures and cap Retry-After', async () => {
+  const code = publicationScript()
+    .split('// BEGIN READ RETRIES')[1]
+    ?.split('// END READ RETRIES')[0]
+  assert.ok(code, 'should exercise the actual post-publish retry helper')
+  for (const [error, failures, expected] of [
+    [{ cause: { code: 'UND_ERR_SOCKET' } }, 1, [2000]],
+    [{ status: 503 }, 9, [2000, 5000]],
+    [{ status: 503, elapsed: 180000 }, 9, []],
+    [{ status: 429, retryAfter: '30' }, 1, [10000]],
+    [{ status: 429, retryAfter: '3' }, 1, [3000]],
+    [{ status: 403 }, 9, []],
+    [{ name: 'TimeoutError' }, 1, [2000]],
+    [{ status: 429, retryAfter: 'Thu, 01 Jan 1970 00:00:03 GMT' }, 1, [3000]],
+    [new Error('Published asset digest mismatch'), 9, []],
+    [{ stderr: Buffer.from('HTTP 503: Service Unavailable') }, 1, [2000]],
+    [{ stderr: Buffer.from('verification failed: HTTP 503') }, 9, []],
+  ]) {
+    const waits = [],
+      logs = []
+    let attempts = 0,
+      now = 0
+    const retry = vm.runInNewContext(`${code}; retryRead`, {
+      Date: { now: () => now, parse: Date.parse },
+      setTimeout: (resolve, ms) => {
+        waits.push(ms)
+        now += ms
+        resolve()
+      },
+      console: { warn: (line) => logs.push(line) },
+    })
+    const operation = () => {
+      now += error.elapsed ?? 0
+      if (++attempts <= failures) throw error
+      return 'verified'
+    }
+    if (failures === 1) assert.equal(await retry(operation), 'verified')
+    else await assert.rejects(() => retry(operation))
+    assert.deepEqual(waits, expected)
+    assert.equal(attempts, expected.length + 1)
+    assert.equal(logs.length, expected.length)
+    assert.ok(logs.every((line) => /attempt [23]\/3/.test(line)))
+  }
 })

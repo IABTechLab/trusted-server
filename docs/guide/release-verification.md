@@ -245,6 +245,49 @@ and checks immutable membership after publication. Re-downloading uploaded bytes
 and the reviewed publication owner remain additive later work. There are no
 automatic mutation retries or draft-resume claims.
 
+Only post-publish reads may retry: release/asset metadata GETs and the GitHub
+CLI release/asset verification calls. Each check has at most three attempts,
+with 2s then 5s backoff. A supplied `Retry-After` can increase a delay, capped
+at 10s (at most 20s waiting per check). A shared three-minute window bounds
+retry scheduling across the job, and individual read requests/commands time out
+after 10s. `Connection: close` remains enabled for API calls.
+
+Retries require a recognized transport error, timeout, HTTP 5xx or 429.
+GitHub CLI errors are classified conservatively: an otherwise empty-output
+HTTP 5xx/429 diagnostic or a recognized transport/timeout code may retry;
+ambiguous failures stop. Successful responses with wrong identity, immutability,
+membership or digests, and definitive verification failures stop immediately.
+Release listing before creation and every create/upload/publish mutation remain
+single-shot.
+
+If these retries are exhausted, the release has already been published; a
+failure does not undo publication or establish that immutability was verified.
+Confirm its state using the recorded release ID. For an immutable release, keep
+its tag and assets unchanged and rerun only the following read-only checks in
+the directory containing the downloaded assets. Set `RELEASE_ID` to the ID from
+the release job log; retain the reviewed `REPO`, `TAG`, `COMMIT` and `ASSETS`
+values from the verification procedure above.
+
+```bash
+gh api "repos/$REPO/releases/$RELEASE_ID" \
+  --jq '{id, tag_name, draft, immutable, assets: [.assets[] | {name, size, digest}]}'
+test "$(gh api "repos/$REPO/releases/tags/$TAG" --jq '.id')" = "$RELEASE_ID"
+test "$(gh api "repos/$REPO/releases/$RELEASE_ID" --jq '.immutable')" = true
+gh release verify "$TAG" --repo "$REPO"
+for asset in "${ASSETS[@]}"; do
+  for suffix in '' .spdx.json .provenance.sigstore.json .sbom.sigstore.json; do
+    gh release verify-asset "$TAG" "$asset$suffix" --repo "$REPO"
+  done
+done
+gh release verify-asset "$TAG" SHA256SUMS --repo "$REPO"
+shasum -a 256 --check SHA256SUMS
+```
+
+Then rerun both signer identity checks for provenance and SPDX for each binary,
+including the SPDX predicate comparison, exactly as documented above. Preserve
+the successful verification outputs with the release record; do not rerun the
+publication job to recover a failed read-only check.
+
 After a failed or indeterminate mutation, inspect the recorded release ID and
 all matching drafts read-only. Do not rerun uploads, delete a release, or reuse
 the tag without an independently approved recovery decision. Published immutable
