@@ -1112,3 +1112,23 @@ Each gets an issue linked from #361.
 | Return upstream `exp` unchanged                                                           | Extends the bidder's validity window by the auction time already spent.                                                              |
 | Prohibit `media = ["video"]`                                                              | A video-only demand endpoint is a valid configuration; gating banner retention on `Banner` costs one condition.                      |
 | Bundle the `/auction` origin, cache, and first-price fixes here                           | They change behavior for every service and need their own approvals.                                                                 |
+
+## Review log
+
+- Round 1 (Codex, separate session): checked the current-behavior claims against
+  the source and found them accurate. Found six issues. Caller substitution of
+  `${AUCTION_PRICE}` with the bid price is wrong while requests still declare
+  second price. The PBS stored-impression merge can bring back fields other
+  than `banner` and `video.api`, and the generated `Video` type drops empty
+  arrays. Routing would still send banners to a `media = ["video"]` provider.
+  The banner dimension index would include the video player size on mixed
+  slots. Reaching EOF in `quick-xml` does not prove the XML is well formed.
+  Returning upstream `exp` unchanged extends the bidder's validity window.
+  Fixed all six: first-price requests became a blocking prerequisite (20.1),
+  PBS video impressions became authoritative (10.2), banner retention is gated
+  on `Banner` (9.1), the banner index holds banner formats only (11), the VAST
+  check tracks depth, attributes, references, and content outside the root
+  (11.4), and `exp` is returned as remaining lifetime (12.2). Also closed the
+  playback method question.
+- Next: round 1 found blocking issues, so round 2 is required, in a fresh
+  session, and review continues until a round finds nothing blocking.
