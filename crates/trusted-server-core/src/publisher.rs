@@ -58,8 +58,11 @@ use crate::cache_policy::{
 };
 use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
 use crate::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS, HEADER_X_COMPRESS_HINT};
-use crate::cookies::handle_request_cookies;
 use crate::cookies::template_cache_policy::{TemplateCookieDecision, evaluate_cookie_policy};
+use crate::cookies::{
+    TS_IDENTITY_COOKIE_PREFIXES, TS_ORIGIN_STRIPPED_COOKIE_NAMES, handle_request_cookies,
+    strip_cookie_headers,
+};
 use crate::creative_opportunities::{
     AdStackGateInput, AssemblyMode, CreativeOpportunitiesConfig, RuntimeAdStackExpected,
     evaluate_ad_stack_gate,
@@ -3136,6 +3139,13 @@ fn rewrite_origin_request(
     // separate change. Until then we strip it here so the edge signal never
     // reaches publisher backends.
     req.headers_mut().remove("fastly-ssl");
+    // The publisher origin keeps `ts-ec` but never receives the ID cookies,
+    // which can push its `Cookie` header past common 8 KB limits.
+    strip_cookie_headers(
+        req.headers_mut(),
+        TS_ORIGIN_STRIPPED_COOKIE_NAMES,
+        TS_IDENTITY_COOKIE_PREFIXES,
+    );
     *req.uri_mut() = target_uri;
     req.headers_mut().insert(
         header::HOST,
@@ -25322,5 +25332,67 @@ mod tests {
 
             assert_only_renderable_slot_was_auctioned(&captured);
         }
+    }
+}
+
+#[cfg(test)]
+mod origin_cookie_strip_tests {
+    use super::*;
+
+    #[test]
+    fn rewrite_origin_request_strips_id_cookies_and_keeps_ts_ec() {
+        let mut req = Request::builder()
+            .uri("https://www.example.com/article")
+            .header(header::COOKIE, "ts-ec=abc; ts-eids=W10; session=1")
+            .header(
+                header::COOKIE,
+                "__Host-ts-eids-s=v1.a.b; __Host-ts-eids-r-0a1b2c3d=v1.c.d; ts-ec-pull-complete=v1",
+            )
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        rewrite_origin_request(
+            &mut req,
+            "https://origin.example.com/article"
+                .parse()
+                .expect("should parse uri"),
+            "origin.example.com",
+        )
+        .expect("should rewrite request");
+
+        let cookies: Vec<_> = req.headers().get_all(header::COOKIE).iter().collect();
+        assert_eq!(cookies.len(), 1, "should send one Cookie header");
+        assert_eq!(
+            cookies[0], "ts-ec=abc; session=1; ts-ec-pull-complete=v1",
+            "should keep ts-ec, the pull marker and unrelated cookies, and drop the ID cookies"
+        );
+    }
+
+    #[test]
+    fn rewrite_origin_request_drops_cookie_header_when_only_id_cookies() {
+        let mut req = Request::builder()
+            .uri("https://www.example.com/")
+            .header(header::COOKIE, "ts-eids=W10; __Host-ts-eids-s=v1.a.b")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        rewrite_origin_request(
+            &mut req,
+            "https://origin.example.com/"
+                .parse()
+                .expect("should parse uri"),
+            "origin.example.com",
+        )
+        .expect("should rewrite request");
+
+        assert!(
+            req.headers().get(header::COOKIE).is_none(),
+            "should drop the empty Cookie header"
+        );
+        assert_eq!(
+            req.headers()[header::HOST],
+            "origin.example.com",
+            "should still set Host"
+        );
     }
 }
