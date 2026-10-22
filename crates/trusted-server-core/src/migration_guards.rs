@@ -95,12 +95,20 @@ fn checked_sources() -> &'static [(&'static str, &'static str)] {
         ("ec/identity/input.rs", include_str!("ec/identity/input.rs")),
         ("ec/identity/mod.rs", include_str!("ec/identity/mod.rs")),
         (
+            "ec/identity/policy.rs",
+            include_str!("ec/identity/policy.rs"),
+        ),
+        (
             "ec/identity/provider.rs",
             include_str!("ec/identity/provider.rs"),
         ),
         (
             "ec/identity/resolution.rs",
             include_str!("ec/identity/resolution.rs"),
+        ),
+        (
+            "ec/identity/test_support.rs",
+            include_str!("ec/identity/test_support.rs"),
         ),
         ("ec/kv.rs", include_str!("ec/kv.rs")),
         ("ec/kv_types.rs", include_str!("ec/kv_types.rs")),

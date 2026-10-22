@@ -280,7 +280,7 @@ fn has_eu_tcf_signal(raw_tc_present: bool, gpp_section_ids: Option<&[u16]>) -> b
 
 /// Returns the effective decoded TCF consent for enforcement decisions.
 #[must_use]
-fn effective_tcf(ctx: &ConsentContext) -> Option<&types::TcfConsent> {
+pub(crate) fn effective_tcf(ctx: &ConsentContext) -> Option<&types::TcfConsent> {
     ctx.tcf.as_ref().or_else(|| {
         let g = ctx.gpp.as_ref()?;
         g.eu_tcf.as_ref()

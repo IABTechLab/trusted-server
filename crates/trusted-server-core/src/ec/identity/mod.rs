@@ -17,8 +17,11 @@ pub mod descriptor;
 pub mod exchange;
 pub mod ids;
 pub mod input;
+pub(crate) mod policy;
 pub mod provider;
 pub mod resolution;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 pub use descriptor::{
     Access, Captures, ConsentPolicy, EidProvenance, Input, ProviderDescriptor,
