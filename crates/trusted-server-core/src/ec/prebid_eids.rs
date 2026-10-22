@@ -110,7 +110,7 @@ impl DecodedCookieEids {
 /// Reports every source and raw UID string in a structured cookie, before
 /// validation, so admin diagnostics can tell "no partner" from "no valid UID".
 fn raw_diagnostic_sources(raw: &RawValue) -> Vec<DiagnosticEidSource> {
-    let Ok(elements) = serde_json::from_str::<Vec<Box<RawValue>>>(raw.get()) else {
+    let Ok(elements) = serde_json::from_str::<Vec<&RawValue>>(raw.get()) else {
         return Vec::new();
     };
 

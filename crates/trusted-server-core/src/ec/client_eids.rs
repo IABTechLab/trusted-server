@@ -60,7 +60,7 @@ pub(crate) const MAX_CLIENT_EID_EXT_BYTES: usize = 2048;
 pub(crate) fn parse_client_eids(raw: &RawValue) -> Vec<Eid> {
     // Capturing elements as raw JSON does not validate string escapes, so an
     // element holding a lone surrogate fails only its own parse below.
-    let Ok(elements) = serde_json::from_str::<Vec<Box<RawValue>>>(raw.get()) else {
+    let Ok(elements) = serde_json::from_str::<Vec<&RawValue>>(raw.get()) else {
         log::debug!("Client EIDs: payload is not a JSON array; ignoring it");
         return Vec::new();
     };
