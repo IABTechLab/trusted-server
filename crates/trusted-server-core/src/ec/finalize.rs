@@ -88,7 +88,8 @@ pub fn ec_finalize_response(
                 })
                 .unwrap_or_default();
             let had_eid_updates = !collected.is_empty();
-            let updates = gate_eid_updates_by_consent(collected, ec_context.consent());
+            let updates =
+                stamp_acquired_at(gate_eid_updates_by_consent(collected, ec_context.consent()));
             // `sync_eid_cookie_updates` early-returns without refreshing the
             // snapshot when `updates` is empty, which is correct when there
             // was never anything to write (an unconfigured registry, no sync
@@ -137,10 +138,10 @@ pub fn ec_finalize_response(
         };
 
         let (cookie_input, client_input) = browser_eid_input(ec_context, eids_cookie);
-        let updates = gate_eid_updates_by_consent(
+        let updates = stamp_acquired_at(gate_eid_updates_by_consent(
             collect_eid_updates(cookie_input, sharedid_cookie, client_input, registry),
             ec_context.consent(),
-        );
+        ));
         sync_eid_cookie_updates(graph, ec_context, &ec_id, &updates, EidSyncSource::NewEc);
         if ec_context.kv_snapshot().entry_for(&ec_id).is_some() {
             set_ec_cookie_on_response(settings, ec_context, response);
@@ -150,6 +151,20 @@ pub fn ec_finalize_response(
     }
 
     reconcile_pull_sync_marker(settings, registry, ec_context, response);
+}
+
+/// Records when this request saw each browser ID, so ingest stores `at`.
+///
+/// Without a trustworthy clock the updates are left unstamped rather than
+/// stamped with zero.
+fn stamp_acquired_at(updates: Vec<PartnerIdUpdate>) -> Vec<PartnerIdUpdate> {
+    let Some(now) = super::checked_current_timestamp() else {
+        return updates;
+    };
+    updates
+        .into_iter()
+        .map(|update| update.with_acquired_at(now))
+        .collect()
 }
 
 /// Chooses the browser EID input KV ingestion reads for this request.

@@ -21,7 +21,7 @@ use crate::error::TrustedServerError;
 
 use super::generation::ec_hash;
 use super::kv_backend::{EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome};
-use super::kv_types::{KvEntry, KvMetadata, KvNetwork};
+use super::kv_types::{KvEntry, KvMetadata, KvNetwork, KvPartnerId};
 use super::{EcKvSnapshot, checked_current_timestamp, current_timestamp, log_id};
 
 /// Maximum number of CAS retry attempts before giving up.
@@ -77,6 +77,8 @@ pub(crate) struct PartnerIdUpdate {
     pub(crate) partner_id: String,
     /// Partner-scoped user ID value.
     pub(crate) uid: String,
+    /// Unix seconds this request saw the ID. Stored as the record's `at`.
+    pub(crate) acquired_at: Option<u64>,
 }
 
 impl PartnerIdUpdate {
@@ -85,7 +87,15 @@ impl PartnerIdUpdate {
         Self {
             partner_id: partner_id.into(),
             uid: uid.into(),
+            acquired_at: None,
         }
+    }
+
+    /// Records when this request saw the ID.
+    #[must_use]
+    pub(crate) fn with_acquired_at(mut self, at: u64) -> Self {
+        self.acquired_at = Some(at);
+        self
     }
 }
 
@@ -137,14 +147,14 @@ fn apply_cookie_partner_id_updates(
 ) -> CookieUpdateApplication {
     let mut latest_updates = BTreeMap::new();
     for update in updates {
-        latest_updates.insert(update.partner_id.as_str(), update.uid.as_str());
+        latest_updates.insert(update.partner_id.as_str(), update);
     }
 
     let mut changed = false;
     let mut deferred = false;
-    for (partner_id, uid) in latest_updates {
+    for (partner_id, update) in latest_updates {
         match entry.ids.get(partner_id) {
-            Some(existing) if existing.uid == uid => continue,
+            Some(existing) if existing.uid == update.uid => continue,
             // Browser EID cookies carry no value-owned sequence or timestamp.
             // A different value therefore has unknown freshness and must not
             // replace the stored value.
@@ -157,7 +167,7 @@ fn apply_cookie_partner_id_updates(
 
         entry.ids.insert(
             partner_id.to_owned(),
-            super::kv_types::KvPartnerId::new(uid.to_owned()),
+            KvPartnerId::browser(update.uid.clone(), update.acquired_at),
         );
         changed = true;
     }
@@ -188,22 +198,22 @@ fn partner_id_updates_match(entry: &KvEntry, updates: &[PartnerIdUpdate]) -> boo
 pub(crate) fn apply_partner_id_updates(entry: &mut KvEntry, updates: &[PartnerIdUpdate]) -> bool {
     let mut latest_updates = BTreeMap::new();
     for update in updates {
-        latest_updates.insert(update.partner_id.as_str(), update.uid.as_str());
+        latest_updates.insert(update.partner_id.as_str(), update);
     }
 
     let mut changed = false;
-    for (partner_id, uid) in latest_updates {
+    for (partner_id, update) in latest_updates {
         if entry
             .ids
             .get(partner_id)
-            .is_some_and(|existing| existing.uid == uid)
+            .is_some_and(|existing| existing.uid == update.uid)
         {
             continue;
         }
 
         entry.ids.insert(
             partner_id.to_owned(),
-            super::kv_types::KvPartnerId::new(uid.to_owned()),
+            KvPartnerId::browser(update.uid.clone(), update.acquired_at),
         );
         changed = true;
     }
@@ -914,10 +924,9 @@ impl KvIdentityGraph {
                 return Ok(());
             }
 
-            entry.ids.insert(
-                partner_id.to_owned(),
-                super::kv_types::KvPartnerId::new(uid.to_owned()),
-            );
+            entry
+                .ids
+                .insert(partner_id.to_owned(), KvPartnerId::new(uid.to_owned()));
 
             let (body, meta_str) = Self::serialize_entry(&entry, self.store_name())?;
 
@@ -984,10 +993,9 @@ impl KvIdentityGraph {
                 return Ok(UpsertResult::Unchanged);
             }
 
-            entry.ids.insert(
-                partner_id.to_owned(),
-                super::kv_types::KvPartnerId::new(uid.to_owned()),
-            );
+            entry
+                .ids
+                .insert(partner_id.to_owned(), KvPartnerId::new(uid.to_owned()));
 
             let (body, meta_str) = Self::serialize_entry(&entry, self.store_name())?;
 
@@ -1611,6 +1619,48 @@ impl KvIdentityGraph {
 mod tests {
     use super::*;
     use crate::ec::kv_backend::test_support::InMemoryEcKv;
+
+    #[test]
+    fn browser_ingest_records_acquisition_time() {
+        let mut entry = KvEntry::minimal("sharedid.org", "existing", 1);
+        let updates = [
+            PartnerIdUpdate::new("example.com", "new-uid").with_acquired_at(1_760_000_000),
+            PartnerIdUpdate::new("sharedid.org", "existing").with_acquired_at(1_760_000_000),
+        ];
+
+        let changed = apply_partner_id_updates(&mut entry, &updates);
+
+        assert!(changed, "should report a change");
+        assert_eq!(
+            entry.ids["example.com"],
+            KvPartnerId::browser("new-uid", Some(1_760_000_000)),
+            "should store the UID with at and no writer"
+        );
+        assert_eq!(
+            entry.ids["sharedid.org"],
+            KvPartnerId::new("existing"),
+            "should not rewrite an unchanged UID just to bump at"
+        );
+    }
+
+    #[test]
+    fn cookie_ingest_records_acquisition_time() {
+        let mut entry = KvEntry::minimal("sharedid.org", "existing", 1);
+        let updates = [PartnerIdUpdate::new("example.com", "new-uid").with_acquired_at(7)];
+
+        let outcome = apply_cookie_partner_id_updates(&mut entry, &updates);
+
+        assert_eq!(
+            outcome,
+            CookieUpdateApplication::Changed { deferred: false },
+            "should change"
+        );
+        assert_eq!(
+            entry.ids["example.com"],
+            KvPartnerId::browser("new-uid", Some(7)),
+            "should store at"
+        );
+    }
 
     /// [`EcKvStore`] wrapper whose first CAS write both fails the precondition
     /// and deletes the key, simulating a concurrent withdrawal that removes the
