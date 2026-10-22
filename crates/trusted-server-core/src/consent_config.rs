@@ -125,14 +125,16 @@ pub enum ConsentMode {
 
 /// How consent signals are forwarded to a specific partner integration.
 ///
-/// Controls whether consent travels through the `OpenRTB` body, raw `Cookie`
-/// headers, or both. The default (`Both`) preserves backward compatibility.
+/// Controls whether consent travels through the `OpenRTB` body, consent
+/// cookies, or both. PBS permits only allowlisted consent cookies and omits
+/// the entire `Cookie` header in [`Self::OpenrtbOnly`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ConsentForwardingMode {
-    /// Forward consent in the `OpenRTB` body only; strip consent cookies.
+    /// Forward consent in the `OpenRTB` body only; PBS sends no `Cookie` header.
     OpenrtbOnly,
-    /// Forward consent cookies only; omit consent fields from the body.
+    /// Prefer consent cookies; omit cookie-sourced body consent when cookies
+    /// can carry it safely. Policy-sourced signals retain a body fallback.
     CookiesOnly,
     /// Forward consent in both cookies and body (default).
     #[default]

@@ -199,8 +199,10 @@ impl ProviderSlotInput {
 
 /// Request headers approved for later Prebid transport forwarding.
 ///
-/// Values remain as raw [`HeaderValue`] instances so non-ASCII bytes retain
-/// the same legacy handling. Client-supplied `X-Forwarded-For` is never read.
+/// Values are captured as [`HeaderValue`] instances. The PBS transport policy
+/// filters consent cookies and omits unreadable Cookie headers before sending;
+/// other captured headers retain their bytes. Client-supplied
+/// `X-Forwarded-For` is never read.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PrebidTransportHeaders {
     cookie: Option<HeaderValue>,
