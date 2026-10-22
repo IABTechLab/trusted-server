@@ -145,6 +145,8 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
   const script = publicationScript()
   for (const mode of [
     'success',
+    'idle-socket',
+    'post-read-error',
     'draft',
     'api-error',
     'missing',
@@ -201,6 +203,12 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
       const fetch = async (url, options = {}) => {
         const u = new URL(url)
         const method = options.method ?? 'GET'
+        if (
+          calls.some(([kind]) => kind === 'gh') &&
+          (mode === 'post-read-error' ||
+            (mode === 'idle-socket' && options.headers.Connection !== 'close'))
+        )
+          throw new TypeError('other side closed')
         calls.push([method, u.pathname])
         const response = (body, status = 200) =>
           new Response(
@@ -229,12 +237,6 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           }
           uploaded.push(item)
           return response(item, 201)
-        }
-        if (/\/releases\/assets\/\d+$/.test(u.pathname)) {
-          const asset = uploaded.find(
-            (a) => a.id === Number(u.pathname.split('/').at(-1))
-          )
-          return response(mode === 'readback-error' ? 'corrupt' : asset.bytes)
         }
         if (u.pathname.includes('/releases/tags/'))
           return response({
@@ -281,7 +283,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
       }
       const execute = () =>
         vm.runInNewContext(`(async()=>{${script}\n})()`, context)
-      if (mode === 'success') await execute()
+      if (['success', 'idle-socket'].includes(mode)) await execute()
       else await assert.rejects(execute, undefined, mode)
       if (
         [
@@ -296,7 +298,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         assert.ok(!calls.some(([method]) => method === 'POST'), mode)
       if (['upload-error'].includes(mode))
         assert.ok(!calls.some(([method]) => method === 'PATCH'), mode)
-      if (mode === 'success') {
+      if (['success', 'idle-socket'].includes(mode)) {
         assert.equal(uploaded.length, 17)
         assert.equal(calls.filter(([method]) => method === 'gh').length, 18)
       }
@@ -305,7 +307,6 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
     }
   }
 })
-
 test('acquires the locked workspace graph before offline SBOM resolution', () => {
   const script = readFileSync(
     new URL('./phase1-build.sh', import.meta.url),
@@ -323,7 +324,6 @@ test('acquires the locked workspace graph before offline SBOM resolution', () =>
     'should acquire before offline generation'
   )
 })
-
 // SPDX conversion retains the binary root and conservative package inventory.
 const binary = Buffer.from('fictional binary')
 function spdxFixture() {
@@ -371,14 +371,12 @@ function spdxFixture() {
   }
   return { original, document }
 }
-
 test('SPDX preserves a binary-bound root and package versions/PURLs', () => {
   const { original, document } = spdxFixture()
   assert.equal(validateSpdx(document, binary, original), document)
   delete document.documentDescribes
   assert.doesNotThrow(() => validateSpdx(document, binary, original))
 })
-
 test('SPDX rejects root/hash ambiguity and lost package identities', () => {
   for (const mutate of [
     (d) => {
@@ -411,7 +409,6 @@ test('SPDX rejects root/hash ambiguity and lost package identities', () => {
     assert.throws(() => validateSpdx(document, binary, original))
   }
 })
-
 test('completes real converter package output with a binary-bound root', () => {
   const { original, document } = spdxFixture()
   document.packages.shift()

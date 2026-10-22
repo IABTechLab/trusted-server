@@ -106,8 +106,9 @@ jobs:
           }
           fs.writeFileSync('release-assets/SHA256SUMS', files.map(file => `${hash(regular(`release-assets/${file}`))}  ${file}\n`).join(''));
           files.push('SHA256SUMS');
+          // Close API connections before synchronous gh checks can leave pooled sockets idle.
           const api = async (path, method = 'GET', body) => {
-            const response = await fetch(`https://api.github.com/repos/${repo}/${path}`, {method, headers:{Authorization:`Bearer ${token}`, Accept:'application/vnd.github+json', 'Content-Type':'application/json'}, ...(body ? {body:JSON.stringify(body)} : {})}); // allow-domain: api.github.com
+            const response = await fetch(`https://api.github.com/repos/${repo}/${path}`, {method, headers:{Connection:'close', Authorization:`Bearer ${token}`, Accept:'application/vnd.github+json', 'Content-Type':'application/json'}, ...(body ? {body:JSON.stringify(body)} : {})}); // allow-domain: api.github.com
             if (!response.ok) throw Error(`GitHub API failed: ${method} ${path} ${response.status}`);
             return response.json();
           };
