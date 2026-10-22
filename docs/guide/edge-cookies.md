@@ -304,6 +304,21 @@ sets `Path=/`, `Secure`, `HttpOnly`, `SameSite=Lax`, and a `Max-Age`.
 `Domain` is computed as `.{publisher.domain}`. The separate
 `cookie_domain` setting applies only to non-EC cookies.
 
+## Cookies Forwarded Upstream
+
+Trusted Server keeps its identity cookies away from third parties and out of
+the publisher origin's `Cookie` header:
+
+- **Publisher origin.** `ts-ec` and `ts-ec-pull-complete` are still forwarded,
+  because publisher servers may read the EC. `ts-eids` and the server-owned
+  `__Host-ts-eids-s` and `__Host-ts-eids-r-*` cookies are removed, so they
+  cannot push the origin's `Cookie` header past common 8 KB limits. Origin
+  code that read `ts-eids` should read the `x-ts-eids` response header
+  instead.
+- **Prebid Server.** No Trusted Server identity cookie is forwarded, in any
+  consent-forwarding mode. A `Cookie` header that is not valid UTF-8 is
+  dropped rather than forwarded.
+
 ## Operational Notes
 
 - Rotate the secret periodically. Rotation produces a new 64-hex base
