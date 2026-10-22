@@ -13,13 +13,13 @@ Prebid Server (PBS) requests allow only these exact, case-sensitive consent cook
 
 The `consent_forwarding` setting selects how consent travels:
 
-| Mode             | Outbound `Cookie` header            | OpenRTB body consent                                                                            |
-| ---------------- | ----------------------------------- | ----------------------------------------------------------------------------------------------- |
-| `both` (default) | Only the four consent cookies above | Included                                                                                        |
-| `cookies_only`   | Only the four consent cookies above | Cookie-sourced consent is omitted when safely carried by cookies; otherwise consent is included |
-| `openrtb_only`   | Omitted                             | Included                                                                                        |
+| Mode             | Outbound `Cookie` header            | OpenRTB body consent                                                                         |
+| ---------------- | ----------------------------------- | -------------------------------------------------------------------------------------------- |
+| `both` (default) | Only the four consent cookies above | Included                                                                                     |
+| `cookies_only`   | Only the four consent cookies above | Only affected unsafe signals fall back to the body; other cookie-sourced signals are omitted |
+| `openrtb_only`   | Omitted                             | Included                                                                                     |
 
-Unrelated cookies are excluded in every mode. This includes publisher session and authentication cookies, `ts-ec`, `ts-eids`, and `sharedId`. An unreadable, non-ASCII Cookie header is omitted rather than forwarded unchanged. Cookie parsing uses the same parser as consent extraction: names and values are trimmed, and the last occurrence of each consent cookie wins. Values with unsafe outbound framing are omitted. In `cookies_only`, if an extracted consent cookie cannot be forwarded safely, consent is included in the OpenRTB body so it cannot disappear from both channels. Already valid values retain their framing, including quoted values. Decimal GPP section IDs with whitespace, such as `2, 6`, are normalized to `2,6`. When filtering leaves no allowed cookies, the outbound Cookie header is omitted.
+Unrelated cookies are excluded in every mode. This includes publisher session and authentication cookies, `ts-ec`, `ts-eids`, and `sharedId`. An unreadable, non-ASCII Cookie header is omitted rather than forwarded unchanged. Cookie parsing uses the same parser as consent extraction: names and values are trimmed, and the last occurrence of each consent cookie wins. Values with unsafe outbound framing are omitted. In `cookies_only`, only the signal whose cookie cannot be forwarded safely is included in the OpenRTB body, so it cannot disappear from both channels. The GPP string and its section IDs fall back together if either GPP cookie is unsafe; safely forwarded TC and US Privacy signals remain omitted. Already valid values retain their framing, including quoted values. Decimal GPP section IDs with whitespace, such as `2, 6`, are normalized to `2,6`. When filtering leaves no allowed cookies, the outbound Cookie header is omitted.
 
 For example, in `both` mode this inbound header:
 
@@ -39,17 +39,17 @@ See [Prebid integration](./prebid) and [GDPR compliance](/guide/gdpr-compliance)
 
 ## Reviewed Upstream Surfaces
 
-| Surface                                                         | Cookie behavior                                                                                                                |
-| --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| PBS auction provider                                            | Uses the mode-dependent consent cookie allowlist above                                                                         |
-| Standard OpenRTB and APS auction providers                      | Construct fresh requests without copying the browser Cookie header                                                             |
-| Lockr                                                           | Omits the browser Cookie header; the SDK supplies selected identity data through its `firstPartyCookies` request-body contract |
-| Permutive and Didomi                                            | Copy curated request headers that exclude Cookie                                                                               |
-| DataDome SDK and browser API proxy                              | Copy curated request headers that exclude Cookie                                                                               |
-| GTM, GPT, Testlight, generic third-party proxy, and asset proxy | Default forwarded-header sets exclude Cookie                                                                                   |
-| Sourcepoint                                                     | Uses its own partner-specific allowlist, described below                                                                       |
-| Ad server mock mediator and EC partner pull sync                | Construct fresh requests without copying the browser Cookie header                                                             |
-| Publisher origin                                                | Preserves browser cookies for the publisher application                                                                        |
+| Surface                                                         | Cookie behavior                                                                                                                                                             |
+| --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| PBS auction provider                                            | Uses the mode-dependent consent cookie allowlist above                                                                                                                      |
+| Standard OpenRTB and APS auction providers                      | Construct fresh requests without copying the browser Cookie header                                                                                                          |
+| Lockr                                                           | Omits Cookie; forwards selected standard headers and client `x-*` headers except TS-internal names; the SDK supplies selected identity data in its `firstPartyCookies` body |
+| Permutive                                                       | Copies selected standard headers and client `x-*` headers except TS-internal names; excludes Cookie                                                                         |
+| Didomi, DataDome SDK and browser API proxy                      | Copy curated request headers that exclude Cookie                                                                                                                            |
+| GTM, GPT, Testlight, generic third-party proxy, and asset proxy | Default forwarded-header sets exclude Cookie                                                                                                                                |
+| Sourcepoint                                                     | Uses its own partner-specific allowlist, described below                                                                                                                    |
+| Ad server mock mediator and EC partner pull sync                | Construct fresh requests without copying the browser Cookie header                                                                                                          |
+| Publisher origin                                                | Preserves browser cookies for the publisher application                                                                                                                     |
 
 ### Identity Values Outside Cookie Headers
 

@@ -460,7 +460,7 @@ The compiled Prebid profile selects `openrtb_only`, `cookies_only`, or `both`. T
 - `openrtb_only` omits the entire `Cookie` header.
 - Unreadable headers and unsafe cookie values are omitted; raw headers are never forwarded as a fallback.
 - Decimal GPP section IDs are normalized to remove surrounding whitespace in each section.
-- `cookies_only` retains body consent for KV/policy-sourced signals and whenever an extracted consent cookie cannot be forwarded safely.
+- `cookies_only` retains body consent for KV/policy-sourced signals. Cookie-sourced fallback includes only the unsafe affected signal, with the GPP string and section IDs coupled if either GPP cookie cannot be forwarded safely.
 - No other publisher session, authentication, or identity cookie reaches PBS.
 
 No other first-version profile receives a browser `Cookie` header. See [Integration Cookie Forwarding](../../guide/integrations/cookie-forwarding.md) for the current consent-focused transport contract.

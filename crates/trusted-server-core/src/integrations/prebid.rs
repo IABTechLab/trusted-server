@@ -37,7 +37,7 @@ use crate::auction::types::{AuctionContext, AuctionRequest, MediaType};
 use crate::auction::types::{AuctionResponse, Bid as AuctionBid};
 use crate::cache_policy::{CacheControlPolicy, EdgeCacheHeader};
 use crate::consent_config::ConsentForwardingMode;
-use crate::constants::COOKIE_GPP_SID;
+use crate::constants::{COOKIE_EUCONSENT_V2, COOKIE_GPP, COOKIE_GPP_SID, COOKIE_US_PRIVACY};
 use crate::cookies::{CONSENT_COOKIE_NAMES, parse_cookies_to_jar};
 use crate::error::TrustedServerError;
 #[cfg(test)]
@@ -2102,14 +2102,18 @@ fn apply_prebid_header_values(
 /// cookie bytes are forwarded on a parsing or framing failure.
 pub(crate) struct PrebidConsentCookies {
     pub(crate) header: Option<HeaderValue>,
-    pub(crate) requires_body: bool,
+    unsafe_tc: bool,
+    unsafe_gpp: bool,
+    unsafe_us_privacy: bool,
 }
 
 impl PrebidConsentCookies {
     pub(crate) fn from_header(header: Option<&HeaderValue>) -> Self {
         let mut result = Self {
             header: None,
-            requires_body: false,
+            unsafe_tc: false,
+            unsafe_gpp: false,
+            unsafe_us_privacy: false,
         };
         let Some(header) = header.and_then(|value| value.to_str().ok()) else {
             return result;
@@ -2123,16 +2127,74 @@ impl PrebidConsentCookies {
             if let Some(value) = prebid_cookie_value(name, cookie.value()) {
                 pairs.push(format!("{name}={value}"));
             } else {
-                result.requires_body = true;
+                match *name {
+                    COOKIE_EUCONSENT_V2 => result.unsafe_tc = true,
+                    COOKIE_GPP | COOKIE_GPP_SID => result.unsafe_gpp = true,
+                    COOKIE_US_PRIVACY => result.unsafe_us_privacy = true,
+                    _ => unreachable!("should inspect only allowlisted consent names"),
+                }
             }
         }
         if !pairs.is_empty() {
             result.header = HeaderValue::from_str(&pairs.join("; ")).ok();
             if result.header.is_none() {
-                result.requires_body = true;
+                result.unsafe_tc = true;
+                result.unsafe_gpp = true;
+                result.unsafe_us_privacy = true;
             }
         }
         result
+    }
+
+    fn requires_body(&self) -> bool {
+        self.unsafe_tc || self.unsafe_gpp || self.unsafe_us_privacy
+    }
+
+    /// Selects only the consent signals whose cookies need a JSON fallback.
+    ///
+    /// GPP and its section IDs travel together. This subset is used only for
+    /// serialization; the original context remains intact for consent gating.
+    pub(crate) fn body_consent<'a>(
+        &self,
+        context: Option<&'a crate::consent::ConsentContext>,
+        mode: ConsentForwardingMode,
+    ) -> Option<Cow<'a, crate::consent::ConsentContext>> {
+        let context = context?;
+        if mode.includes_body_consent()
+            || !matches!(context.source, crate::consent::ConsentSource::Cookie)
+        {
+            return Some(Cow::Borrowed(context));
+        }
+        if !self.requires_body() {
+            return None;
+        }
+        let carries_gdpr = self.unsafe_tc || self.unsafe_gpp;
+        Some(Cow::Owned(crate::consent::ConsentContext {
+            raw_tc_string: self
+                .unsafe_tc
+                .then(|| context.raw_tc_string.clone())
+                .flatten(),
+            raw_gpp_string: self
+                .unsafe_gpp
+                .then(|| context.raw_gpp_string.clone())
+                .flatten(),
+            gpp_section_ids: self
+                .unsafe_gpp
+                .then(|| context.gpp_section_ids.clone())
+                .flatten(),
+            raw_us_privacy: self
+                .unsafe_us_privacy
+                .then(|| context.raw_us_privacy.clone())
+                .flatten(),
+            gdpr_applies: carries_gdpr && context.gdpr_applies,
+            jurisdiction: if carries_gdpr {
+                context.jurisdiction.clone()
+            } else {
+                crate::consent::jurisdiction::Jurisdiction::Unknown
+            },
+            source: crate::consent::ConsentSource::Cookie,
+            ..Default::default()
+        }))
     }
 }
 
@@ -2778,18 +2840,16 @@ impl PrebidAuctionProvider {
             }
         });
 
-        // Build user object — populate consent at both OpenRTB 2.6 top-level
-        // and Prebid ext-based locations (dual placement).
-        // In cookies_only mode, cookie-sourced consent travels through the
-        // forwarded Cookie header. Policy-sourced consent has no inbound cookie
-        // to forward, so carry it in the OpenRTB body instead. Unsafe cookie
-        // values also need the body fallback to avoid dropping extracted consent.
-        let consent_ctx = request.user.consent.as_ref().filter(|ctx| {
-            self.config.consent_forwarding.includes_body_consent()
-                || !matches!(ctx.source, crate::consent::ConsentSource::Cookie)
-                || PrebidConsentCookies::from_header(context.request.headers().get(header::COOKIE))
-                    .requires_body
-        });
+        // Select consent independently per signal: safely forwarded cookies
+        // remain omitted in cookies_only, while unsafe GPP and its IDs fall
+        // back together. Identity gating still uses the original context.
+        let body_consent =
+            PrebidConsentCookies::from_header(context.request.headers().get(header::COOKIE))
+                .body_consent(
+                    request.user.consent.as_ref(),
+                    self.config.consent_forwarding,
+                );
+        let consent_ctx = body_consent.as_deref();
         let raw_tc = consent_ctx.and_then(|c| c.raw_tc_string.clone());
         let user = Some(User {
             id: request.user.id.clone(),
@@ -10015,7 +10075,8 @@ set = { networkId = 42 }
                 "should select safe last consent values from {input:?}"
             );
             assert_eq!(
-                selected.requires_body, requires_body,
+                selected.requires_body(),
+                requires_body,
                 "should retain unrepresentable consent in the body for {input:?}"
             );
         }

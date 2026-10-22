@@ -1,6 +1,6 @@
 //! Cookie handling utilities.
 //!
-//! This module provides functionality for parsing, stripping, and forwarding cookies used in the
+//! This module provides functionality for parsing and extracting cookies used in the
 //! trusted server system.
 
 pub(crate) mod template_cache_policy;
@@ -16,9 +16,8 @@ use crate::error::TrustedServerError;
 
 /// Cookie names carrying privacy consent signals.
 ///
-/// Used as the PBS consent-cookie allowlist and by [`strip_cookies`] when
-/// removing consent signals. PBS omits the entire `Cookie` header when
-/// consent is sent exclusively through the `OpenRTB` body.
+/// Used as the PBS consent-cookie allowlist. PBS omits the entire `Cookie`
+/// header when consent is sent exclusively through the `OpenRTB` body.
 pub const CONSENT_COOKIE_NAMES: &[&str] = &[
     COOKIE_EUCONSENT_V2,
     COOKIE_GPP,
@@ -79,29 +78,6 @@ pub fn extract_cookie_value<B>(req: &Request<B>, name: &str) -> Option<String> {
         let (key, value) = pair.trim().split_once('=')?;
         (key.trim() == name).then(|| value.trim().to_owned())
     })
-}
-
-/// Strips named cookies from a `Cookie` header value string.
-///
-/// Parses the semicolon-separated cookie pairs, filters out any whose name
-/// matches one of `cookie_names`, and reconstructs the header string.
-///
-/// Returns an empty string if all cookies were stripped or the input was empty.
-#[must_use]
-pub fn strip_cookies(cookie_header: &str, cookie_names: &[&str]) -> String {
-    cookie_header
-        .split(';')
-        .map(str::trim)
-        .filter(|pair| {
-            if let Some(name) = pair.split('=').next() {
-                !cookie_names.contains(&name.trim())
-            } else {
-                true
-            }
-        })
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("; ")
 }
 
 #[cfg(test)]
@@ -248,44 +224,5 @@ mod tests {
         );
 
         assert_eq!(extract_cookie_value(&req, "session"), None);
-    }
-
-    // ---------------------------------------------------------------
-    // strip_cookies tests
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn test_strip_cookies_removes_consent() {
-        let header = "euconsent-v2=BOE; __gpp=DBAC; session=abc123; us_privacy=1YNN";
-        let stripped = strip_cookies(header, CONSENT_COOKIE_NAMES);
-        assert_eq!(stripped, "session=abc123");
-    }
-
-    #[test]
-    fn test_strip_cookies_preserves_non_consent() {
-        let header = "session=abc123; theme=dark";
-        let stripped = strip_cookies(header, CONSENT_COOKIE_NAMES);
-        assert_eq!(stripped, "session=abc123; theme=dark");
-    }
-
-    #[test]
-    fn test_strip_cookies_empty_input() {
-        let stripped = strip_cookies("", CONSENT_COOKIE_NAMES);
-        assert_eq!(stripped, "");
-    }
-
-    #[test]
-    fn test_strip_cookies_all_stripped() {
-        let header = "euconsent-v2=BOE; __gpp=DBAC; __gpp_sid=2,6; us_privacy=1YNN";
-        let stripped = strip_cookies(header, CONSENT_COOKIE_NAMES);
-        assert_eq!(stripped, "");
-    }
-
-    #[test]
-    fn test_strip_cookies_with_complex_values() {
-        // Cookie values can contain '=' characters.
-        let header = "euconsent-v2=BOE=xyz; session=abc=123=def";
-        let stripped = strip_cookies(header, CONSENT_COOKIE_NAMES);
-        assert_eq!(stripped, "session=abc=123=def");
     }
 }

@@ -143,8 +143,10 @@ cookie pairs are omitted, and no header is sent when no allowed pair remains.
 Cookie parsing matches consent extraction, including trimmed names/values and
 last-duplicate selection. Decimal GPP section whitespace is normalized.
 Cookie-sourced consent is omitted from the OpenRTB body in `cookies_only` when
-the extracted cookies can be forwarded safely; otherwise it falls back to the
-body. Policy-sourced consent retains its existing body fallback.
+the extracted cookies can be forwarded safely. Only an affected unsafe signal
+falls back to the body; the GPP string and section IDs fall back together if
+either GPP cookie is unsafe. Policy-sourced consent retains its existing body
+fallback.
 
 See [Integration cookie forwarding](./cookie-forwarding) for the complete
 outbound audit and intentional partner-specific exceptions.

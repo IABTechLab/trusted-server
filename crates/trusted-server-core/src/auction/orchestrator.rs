@@ -6399,7 +6399,12 @@ mod tests {
                     .expect("should parse browser cookies");
                 let signals = crate::consent::extract_consent_signals(jar.as_ref(), &inbound);
                 let consent = crate::consent::build_context_from_signals(&signals);
-                assert!(consent.us_privacy.as_ref().is_some_and(|value| value.opt_out_sale == crate::consent::PrivacyFlag::Yes), "should decode the browser opt-out before dispatch");
+                assert!(
+                    consent.us_privacy.as_ref().is_some_and(|value| {
+                        value.opt_out_sale == crate::consent::PrivacyFlag::Yes
+                    }),
+                    "should decode the browser opt-out before dispatch"
+                );
                 let mut request = planned_prebid_request();
                 request.user.consent = Some(consent);
                 let settings = create_test_settings();
@@ -6427,7 +6432,7 @@ mod tests {
                 let body: serde_json::Value =
                     serde_json::from_slice(&http.recorded_request_bodies()[0])
                         .expect("should parse PBS body");
-                let includes_body = mode != "cookies_only" || body_fallback;
+                let includes_body = mode != "cookies_only";
                 assert_eq!(
                     body.pointer("/regs/us_privacy"),
                     includes_body.then_some(&serde_json::json!("1YYN")),
@@ -6447,6 +6452,108 @@ mod tests {
                         "should carry unsafe cookie framing only as a JSON string"
                     );
                 }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn planned_prebid_cookies_only_falls_back_only_for_unsafe_signal() {
+        for (cookie, forwarded, expected_tc, expected_gpp, expected_sid, expected_us) in [
+            (
+                r"euconsent-v2=bad\value; __gpp=GPP; __gpp_sid=2,6; us_privacy=1YYN",
+                "__gpp=GPP; __gpp_sid=2,6; us_privacy=1YYN",
+                Some(r"bad\value"),
+                None,
+                None,
+                None,
+            ),
+            (
+                "euconsent-v2=TC; __gpp=GPP; __gpp_sid=2, 6,; us_privacy=1YYN",
+                "euconsent-v2=TC; __gpp=GPP; us_privacy=1YYN",
+                None,
+                Some("GPP"),
+                Some(serde_json::json!([2, 6])),
+                None,
+            ),
+            (
+                r"euconsent-v2=TC; __gpp=GPP; __gpp_sid=2,6; us_privacy=bad\value",
+                "euconsent-v2=TC; __gpp=GPP; __gpp_sid=2,6",
+                None,
+                None,
+                None,
+                Some(r"bad\value"),
+            ),
+        ] {
+            let http = Arc::new(StubHttpClient::new());
+            http.push_response(204, Vec::new());
+            let services = build_services_with_http_client(Arc::clone(&http) as Arc<_>);
+            let plan = AuctionPlan::compile(planned_prebid_config(&[(
+                "pbs",
+                serde_json::json!({"consent_forwarding":"cookies_only"}),
+                NotificationConfig::default(),
+            )]))
+            .expect("should compile PBS plan");
+            let orchestrator = AuctionOrchestratorHarness::new(plan, None);
+            let inbound = http::Request::builder()
+                .header(http::header::COOKIE, cookie)
+                .body(edgezero_core::body::Body::empty())
+                .expect("should build browser request");
+            let jar = crate::cookies::handle_request_cookies(&inbound)
+                .expect("should parse browser cookies");
+            let signals = crate::consent::extract_consent_signals(jar.as_ref(), &inbound);
+            let mut request = planned_prebid_request();
+            request.user.consent = Some(crate::consent::build_context_from_signals(&signals));
+            let settings = create_test_settings();
+            let context = AuctionContext {
+                settings: &settings,
+                request: &inbound,
+                timeout_ms: 777,
+                transport_timeout_ms: 777,
+                provider_responses: None,
+                services: &services,
+            };
+
+            orchestrator
+                .run_auction(&request, &context)
+                .await
+                .expect("should dispatch PBS auction");
+
+            let headers = http.recorded_request_headers();
+            assert_eq!(headers.len(), 1, "should dispatch exactly one PBS request");
+            assert_eq!(
+                headers[0]
+                    .iter()
+                    .find(|(name, _)| name == "cookie")
+                    .map(|(_, value)| value.as_str()),
+                Some(forwarded),
+                "should keep unaffected safe consent cookies"
+            );
+            let bodies = http.recorded_request_bodies();
+            let body: serde_json::Value =
+                serde_json::from_slice(&bodies[0]).expect("should parse PBS body");
+            for path in ["/user/consent", "/user/ext/consent"] {
+                assert_eq!(
+                    body.pointer(path),
+                    expected_tc.map(serde_json::Value::from).as_ref(),
+                    "should fall back only for affected TC"
+                );
+            }
+            for prefix in ["/regs", "/regs/ext"] {
+                assert_eq!(
+                    body.pointer(&format!("{prefix}/gpp")),
+                    expected_gpp.map(serde_json::Value::from).as_ref(),
+                    "should fall back for the coupled GPP string"
+                );
+                assert_eq!(
+                    body.pointer(&format!("{prefix}/gpp_sid")),
+                    expected_sid.as_ref(),
+                    "should fall back for coupled GPP sections"
+                );
+                assert_eq!(
+                    body.pointer(&format!("{prefix}/us_privacy")),
+                    expected_us.map(serde_json::Value::from).as_ref(),
+                    "should fall back only for affected US Privacy"
+                );
             }
         }
     }
