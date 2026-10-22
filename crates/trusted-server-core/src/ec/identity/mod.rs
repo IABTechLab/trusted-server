@@ -25,6 +25,8 @@ pub mod flush;
 pub(crate) mod generic_pull;
 pub mod ids;
 pub mod input;
+#[cfg(test)]
+mod invariant_tests;
 pub(crate) mod mutation;
 pub(crate) mod policy;
 pub mod provider;
