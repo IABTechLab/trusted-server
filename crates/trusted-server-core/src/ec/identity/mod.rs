@@ -1,6 +1,6 @@
 //! Server-side identity providers.
 //!
-//! An [`IdentityProvider`](provider::IdentityProvider) turns request signals
+//! An [`IdentityProvider`] turns request signals
 //! into `OpenRTB` EIDs. Providers only build requests and parse buffered
 //! responses. The coordinator owns eligibility, consent, transport limits and
 //! KV write-back, so every page load makes at most one browser-driven KV
@@ -17,6 +17,7 @@ pub mod descriptor;
 pub mod exchange;
 pub mod ids;
 pub mod input;
+pub mod provider;
 pub mod resolution;
 
 pub use descriptor::{
@@ -26,4 +27,5 @@ pub use descriptor::{
 pub use exchange::{ProviderRequest, ProviderResponse};
 pub use ids::{IdentityProviderId, SourceDomain, UnixTime};
 pub use input::{CaptureInput, HashedEmail, ProviderConsent, Region, ResolveInput, StoredId};
+pub use provider::{IdentityProvider, IdentityProviderConfig};
 pub use resolution::{IdentityProviderError, Resolution, ResolvedId, StateChange, When};
