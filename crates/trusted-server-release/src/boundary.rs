@@ -73,6 +73,7 @@
 mod command;
 pub(crate) mod daemon;
 mod docker;
+mod entropy;
 mod host_inputs;
 mod macos;
 mod probe;
@@ -84,8 +85,6 @@ mod survivors;
 #[cfg(test)]
 mod tests;
 
-use std::fs::File;
-use std::io::Read as _;
 use std::path::Path;
 
 use error_stack::Report;
@@ -93,6 +92,7 @@ use sha2::{Digest as _, Sha256};
 
 pub(crate) use command::{ConfinedCommand, Umask};
 pub(crate) use docker::{DockerSettings, ImageSelection};
+pub(crate) use entropy::random_bytes;
 pub(crate) use probe::{DENIED_STATUS, ProbeProgram, ProbeReport, connect_probe, parse_loopback};
 pub(crate) use proof::{DenialProof, DenialReceipt};
 pub(crate) use roots::BoundaryRoots;
@@ -106,15 +106,6 @@ const INSTANCE_DOMAIN: &[u8] = b"trusted-server-boundary-instance-v1\n";
 
 fn boundary_error(message: impl std::fmt::Display) -> Report<ReleaseError> {
     Report::new(ReleaseError::Boundary).attach(message.to_string())
-}
-
-/// Returns `N` bytes from the kernel random source.
-pub(crate) fn random_bytes<const N: usize>() -> Result<[u8; N], Report<ReleaseError>> {
-    let mut bytes = [0_u8; N];
-    File::open("/dev/urandom")
-        .and_then(|mut file| file.read_exact(&mut bytes))
-        .map_err(|error| boundary_error(format!("cannot read kernel randomness: {error}")))?;
-    Ok(bytes)
 }
 
 /// A macOS sandbox profile that passed Task 8 qualification.
