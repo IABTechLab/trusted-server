@@ -36,7 +36,9 @@ use crate::auction::types::{AuctionContext, AuctionRequest, MediaType};
 use crate::auction::types::{AuctionResponse, Bid as AuctionBid};
 use crate::cache_policy::{CacheControlPolicy, EdgeCacheHeader};
 use crate::consent_config::ConsentForwardingMode;
-use crate::cookies::{CONSENT_COOKIE_NAMES, strip_cookies};
+use crate::cookies::{
+    CONSENT_COOKIE_NAMES, TS_IDENTITY_COOKIE_NAMES, TS_IDENTITY_COOKIE_PREFIXES, strip_cookie_pairs,
+};
 use crate::error::TrustedServerError;
 #[cfg(test)]
 use crate::http_util::RequestInfo;
@@ -2026,8 +2028,14 @@ fn copy_request_headers(
     consent_forwarding: ConsentForwardingMode,
     client_ip: Option<std::net::IpAddr>,
 ) {
+    let cookies: Vec<HeaderValue> = from
+        .headers()
+        .get_all(header::COOKIE)
+        .iter()
+        .cloned()
+        .collect();
     apply_prebid_header_values(
-        from.headers().get(header::COOKIE),
+        &cookies,
         from.headers().get(header::USER_AGENT),
         from.headers().get(header::REFERER),
         from.headers().get(header::ACCEPT_LANGUAGE),
@@ -2045,7 +2053,7 @@ pub(crate) fn apply_prebid_transport_headers(
     client_ip: Option<std::net::IpAddr>,
 ) {
     apply_prebid_header_values(
-        from.cookie(),
+        from.cookies(),
         from.user_agent(),
         from.referer(),
         from.accept_language(),
@@ -2060,7 +2068,7 @@ pub(crate) fn apply_prebid_transport_headers(
     reason = "the helper preserves four independently optional raw headers plus transport policy"
 )]
 fn apply_prebid_header_values(
-    cookie: Option<&HeaderValue>,
+    cookies: &[HeaderValue],
     user_agent: Option<&HeaderValue>,
     referer: Option<&HeaderValue>,
     accept_language: Option<&HeaderValue>,
@@ -2085,27 +2093,27 @@ fn apply_prebid_header_values(
             .insert(header::HeaderName::from_static("x-forwarded-for"), value);
     }
 
-    let Some(cookie_value) = cookie else {
-        return;
+    // Identity cookies are stripped in every mode, before the consent mode is
+    // checked, so no mode forwards the raw header.
+    let consent_names: &[&str] = if consent_forwarding.strips_consent_cookies() {
+        CONSENT_COOKIE_NAMES
+    } else {
+        &[]
     };
-    if !consent_forwarding.strips_consent_cookies() {
-        to.headers_mut()
-            .insert(header::COOKIE, cookie_value.clone());
-        return;
-    }
-    match cookie_value.to_str() {
-        Ok(value) => {
-            let stripped = strip_cookies(value, CONSENT_COOKIE_NAMES);
-            if !stripped.is_empty()
-                && let Ok(cookie_header) = HeaderValue::from_str(&stripped)
-            {
-                to.headers_mut().insert(header::COOKIE, cookie_header);
-            }
-        }
-        Err(_) => {
-            to.headers_mut()
-                .insert(header::COOKIE, cookie_value.clone());
-        }
+    let retained = cookies
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(|value| {
+            strip_cookie_pairs(value, TS_IDENTITY_COOKIE_NAMES, TS_IDENTITY_COOKIE_PREFIXES)
+        })
+        .map(|value| strip_cookie_pairs(&value, consent_names, &[]))
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ");
+    if !retained.is_empty()
+        && let Ok(cookie_header) = HeaderValue::from_str(&retained)
+    {
+        to.headers_mut().insert(header::COOKIE, cookie_header);
     }
 }
 
@@ -9757,7 +9765,7 @@ set = { networkId = 42 }
     }
 
     #[test]
-    fn planned_transport_preserves_malformed_cookie_bytes_and_attested_xff() {
+    fn planned_transport_drops_malformed_cookie_bytes_and_uses_attested_xff() {
         let inbound = http::Request::builder()
             .uri("https://publisher.example/auction")
             .header(
@@ -9801,8 +9809,8 @@ set = { networkId = 42 }
                 .headers()
                 .get(header::COOKIE)
                 .map(HeaderValue::as_bytes),
-            Some(b"session=fictional;\xffbroken".as_slice()),
-            "should forward malformed cookie bytes unchanged"
+            None,
+            "should drop a non-UTF-8 Cookie field, which cannot be checked for identity cookies"
         );
         assert_eq!(
             outbound
@@ -9811,6 +9819,89 @@ set = { networkId = 42 }
                 .and_then(|value| value.to_str().ok()),
             Some("203.0.113.9"),
             "should use only attested XFF"
+        );
+    }
+
+    fn cookie_values(request: &http::Request<EdgeBody>) -> Vec<String> {
+        request
+            .headers()
+            .get_all(header::COOKIE)
+            .iter()
+            .map(|value| value.to_str().expect("should be ASCII").to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn prebid_headers_strip_identity_cookies_when_consent_cookies_are_forwarded() {
+        let cookies = [
+            HeaderValue::from_static("ts-ec=abc; euconsent-v2=tcf; other=1"),
+            HeaderValue::from_static("__Host-ts-eids-s=v1.a.b; __Host-ts-eids-r-0a1b2c3d=v1.c.d"),
+            HeaderValue::from_static("ts-eids=W10; ts-ec-pull-complete=v1; second=2"),
+        ];
+        let mut to = http::Request::new(EdgeBody::empty());
+
+        apply_prebid_header_values(
+            &cookies,
+            None,
+            None,
+            None,
+            &mut to,
+            ConsentForwardingMode::Both,
+            None,
+        );
+
+        assert_eq!(
+            cookie_values(&to),
+            vec!["euconsent-v2=tcf; other=1; second=2".to_owned()],
+            "should drop identity cookies, keep consent and unrelated cookies, and read every field"
+        );
+    }
+
+    #[test]
+    fn prebid_headers_strip_identity_and_consent_cookies_in_openrtb_only_mode() {
+        let cookies = [HeaderValue::from_static(
+            "ts-ec=abc; euconsent-v2=tcf; other=1",
+        )];
+        let mut to = http::Request::new(EdgeBody::empty());
+
+        apply_prebid_header_values(
+            &cookies,
+            None,
+            None,
+            None,
+            &mut to,
+            ConsentForwardingMode::OpenrtbOnly,
+            None,
+        );
+
+        assert_eq!(
+            cookie_values(&to),
+            vec!["other=1".to_owned()],
+            "should keep only other=1"
+        );
+    }
+
+    #[test]
+    fn prebid_headers_drop_non_utf8_cookie_fields_and_empty_results() {
+        let cookies = [
+            HeaderValue::from_bytes(b"x=\xff").expect("should build an opaque header"),
+            HeaderValue::from_static("ts-ec=abc"),
+        ];
+        let mut to = http::Request::new(EdgeBody::empty());
+
+        apply_prebid_header_values(
+            &cookies,
+            None,
+            None,
+            None,
+            &mut to,
+            ConsentForwardingMode::Both,
+            None,
+        );
+
+        assert!(
+            to.headers().get(header::COOKIE).is_none(),
+            "should send no Cookie header"
         );
     }
 
@@ -9904,7 +9995,16 @@ set = { networkId = 42 }
                 ConsentForwardingMode::OpenrtbOnly,
                 HeaderValue::from_bytes(b"session=fictional;\xffbroken")
                     .expect("should build malformed cookie header"),
-                Some(b"session=fictional;\xffbroken".as_slice()),
+                // A non-UTF-8 Cookie field cannot be checked for identity
+                // cookies, so it is dropped rather than forwarded.
+                None,
+            ),
+            (
+                ConsentForwardingMode::Both,
+                HeaderValue::from_static(
+                    "ts-ec=fictional; session=fictional; __Host-ts-eids-s=v1.a.b; ts-eids=W10",
+                ),
+                Some(b"session=fictional".as_slice()),
             ),
         ] {
             let stub = Arc::new(StubHttpClient::new());

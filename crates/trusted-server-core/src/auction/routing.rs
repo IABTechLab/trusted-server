@@ -203,15 +203,16 @@ impl ProviderSlotInput {
 /// the same legacy handling. Client-supplied `X-Forwarded-For` is never read.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PrebidTransportHeaders {
-    cookie: Option<HeaderValue>,
+    cookies: Vec<HeaderValue>,
     user_agent: Option<HeaderValue>,
     referer: Option<HeaderValue>,
     accept_language: Option<HeaderValue>,
 }
 
 impl PrebidTransportHeaders {
-    pub(crate) fn cookie(&self) -> Option<&HeaderValue> {
-        self.cookie.as_ref()
+    /// Every inbound `Cookie` field, in order.
+    pub(crate) fn cookies(&self) -> &[HeaderValue] {
+        &self.cookies
     }
 
     pub(crate) fn user_agent(&self) -> Option<&HeaderValue> {
@@ -228,7 +229,12 @@ impl PrebidTransportHeaders {
 
     fn snapshot(request: &Request<EdgeBody>) -> Self {
         Self {
-            cookie: request.headers().get(header::COOKIE).cloned(),
+            cookies: request
+                .headers()
+                .get_all(header::COOKIE)
+                .iter()
+                .cloned()
+                .collect(),
             user_agent: request.headers().get(header::USER_AGENT).cloned(),
             referer: request.headers().get(header::REFERER).cloned(),
             accept_language: request.headers().get(header::ACCEPT_LANGUAGE).cloned(),
@@ -1336,7 +1342,14 @@ mod tests {
             Some(attested),
         );
         let headers = routed.prebid_transport_headers();
-        assert_eq!(headers.cookie(), Some(&HeaderValue::from_static("first=1")));
+        assert_eq!(
+            headers.cookies(),
+            &[
+                HeaderValue::from_static("first=1"),
+                HeaderValue::from_static("second=2")
+            ],
+            "should retain every Cookie field so identity cookies can be stripped from each"
+        );
         assert_eq!(
             headers.user_agent().expect("should retain UA").as_bytes(),
             b"agent-\x80"
