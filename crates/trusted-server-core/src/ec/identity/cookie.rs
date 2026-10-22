@@ -17,10 +17,11 @@ use http::{HeaderMap, header};
 use serde::{Deserialize, Serialize};
 
 use super::catalog::ProviderCatalog;
-use super::ids::SourceDomain;
+use super::ids::{IdentityProviderId, SourceDomain};
 use super::input::RandomSource;
-use super::revision::{IdentityKeys, record_revision};
-use crate::constants::COOKIE_TS_EIDS_S as COOKIE_S;
+use super::mutation::{PartnerIdChange, ProviderStateChange};
+use super::revision::{IdentityKeys, Revision, record_revision};
+use crate::constants::{COOKIE_TS_EIDS_R_PREFIX, COOKIE_TS_EIDS_S as COOKIE_S};
 use crate::ec::EcKvSnapshot;
 use crate::ec::kv_types::{KvEntry, KvOptOut, KvPartnerId};
 
@@ -881,6 +882,287 @@ pub(crate) fn cookie_view(
         .collect()
 }
 
+/// Maximum sealed bytes of one `__Host-ts-eids-r-*` cookie.
+pub(crate) const MAX_R_COOKIE_BYTES: usize = 512;
+/// Openable removal cookies at which TS writes overflow batches to KV
+/// instead of adding another cookie.
+pub(crate) const R_COOKIE_SOFT_LIMIT: usize = 4;
+
+/// One staged removal. `s` is the source domain itself, never an index,
+/// because removal cookies carry no `cf`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RRemoval {
+    /// The source domain.
+    pub(crate) s: String,
+    /// The writer whose record is removed.
+    pub(crate) w: String,
+    /// The revision removed. Absent: whatever `w` acquired at or before `sa`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) pv: Option<String>,
+    /// When the removal was staged.
+    pub(crate) sa: u64,
+}
+
+/// One response's batch of removals, opt-outs and invalidated-UID hashes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RBatch {
+    /// Removals.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) rm: Vec<RRemoval>,
+    /// Opt-outs: provider to the time it was reported.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) o: BTreeMap<String, u64>,
+    /// Invalidated-UID hashes per provider.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) iv: BTreeMap<String, Vec<String>>,
+}
+
+impl RBatch {
+    /// Whether the batch holds nothing.
+    #[must_use]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.rm.is_empty() && self.o.is_empty() && self.iv.is_empty()
+    }
+
+    fn item_count(&self) -> usize {
+        self.rm.len() + self.o.len() + self.iv.values().map(Vec::len).sum::<usize>()
+    }
+}
+
+/// The removal cookies a request carried.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct OpenedRemovals {
+    /// Cookies that opened, by name.
+    pub(crate) cookies: Vec<(String, RBatch)>,
+    /// Names of cookies that failed to open. The writer deletes them.
+    pub(crate) unopenable: Vec<String>,
+}
+
+/// Opens every `__Host-ts-eids-r-*` cookie for this EC.
+#[must_use]
+pub(crate) fn open_r_cookies(
+    keys: &IdentityKeys,
+    ec_id: &str,
+    headers: &HeaderMap,
+) -> OpenedRemovals {
+    let mut opened = OpenedRemovals::default();
+    for (name, value) in read_prefixed_cookies(headers, COOKIE_TS_EIDS_R_PREFIX) {
+        match open(&keys.cookie_r, ec_id, &value)
+            .and_then(|payload| serde_json::from_slice::<RBatch>(&payload).ok())
+        {
+            Some(batch) => opened.cookies.push((name, batch)),
+            None => {
+                log::debug!("Ignoring removal cookie that failed to open");
+                opened.unopenable.push(name);
+            }
+        }
+    }
+    opened
+}
+
+/// Turns a batch into mutation changes. Entries whose source or provider
+/// does not parse are dropped.
+#[must_use]
+pub(crate) fn r_batch_to_changes(
+    batch: &RBatch,
+) -> (
+    Vec<PartnerIdChange>,
+    BTreeMap<IdentityProviderId, ProviderStateChange>,
+) {
+    let mut changes = Vec::new();
+    for removal in &batch.rm {
+        let (Ok(source), Ok(writer)) = (
+            removal.s.parse::<SourceDomain>(),
+            removal.w.parse::<IdentityProviderId>(),
+        ) else {
+            continue;
+        };
+        changes.push(match &removal.pv {
+            Some(pv) => PartnerIdChange::OwnerRemove {
+                source,
+                writer,
+                expected: Revision::from_stored(pv),
+            },
+            None => PartnerIdChange::WriterRemove {
+                source,
+                writer,
+                staged_at: Some(removal.sa),
+            },
+        });
+    }
+
+    let mut states: BTreeMap<IdentityProviderId, ProviderStateChange> = BTreeMap::new();
+    for (provider, at) in &batch.o {
+        let Ok(provider) = provider.parse::<IdentityProviderId>() else {
+            continue;
+        };
+        // The batch carries no fingerprint: a re-grant by GPP section values
+        // cannot be compared against it, so only the other clears apply.
+        states.entry(provider).or_default().opt_out = Some(KvOptOut {
+            at: *at,
+            fp: String::new(),
+        });
+    }
+    for (provider, hashes) in &batch.iv {
+        let Ok(provider) = provider.parse::<IdentityProviderId>() else {
+            continue;
+        };
+        states
+            .entry(provider)
+            .or_default()
+            .iv_add
+            .extend(hashes.iter().cloned());
+    }
+    (changes, states)
+}
+
+/// Whether the live row shows every removal and opt-out of the batch
+/// applied. `iv` hashes never keep a cookie alive.
+#[must_use]
+pub(crate) fn r_batch_applied(batch: &RBatch, entry: &KvEntry, keys: &IdentityKeys) -> bool {
+    let removals_applied = batch.rm.iter().all(|removal| {
+        let Some(record) = entry.ids.get(&removal.s) else {
+            return true;
+        };
+        match &removal.pv {
+            Some(pv) => record_revision(keys, record).as_str() != pv,
+            None => {
+                record.w.as_deref() != Some(removal.w.as_str())
+                    || record.at.is_some_and(|at| at > removal.sa)
+            }
+        }
+    });
+    let opt_outs_applied = batch.o.iter().all(|(provider, at)| {
+        entry.ps.get(provider).is_some_and(|state| {
+            state.o.as_ref().is_some_and(|opt_out| opt_out.at >= *at)
+                || state.oc.is_some_and(|cleared| cleared > *at)
+        })
+    });
+    removals_applied && opt_outs_applied
+}
+
+/// A new removal cookie name: the prefix and 8 random hex digits.
+#[must_use]
+pub(crate) fn new_r_cookie_name(random: &dyn RandomSource) -> String {
+    let mut bytes = [0u8; 4];
+    random.fill(&mut bytes);
+    format!("{COOKIE_TS_EIDS_R_PREFIX}{}", hex::encode(bytes))
+}
+
+fn seal_r_batch(
+    keys: &IdentityKeys,
+    ec_id: &str,
+    batch: &RBatch,
+    random: &dyn RandomSource,
+) -> String {
+    let payload = serde_json::to_vec(batch).expect("should serialize a removal batch");
+    seal(&keys.cookie_r, ec_id, &payload, random)
+}
+
+/// Where a response's removal batch goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RPlan {
+    /// A new cookie of its own.
+    Cookie {
+        /// The cookie name.
+        name: String,
+        /// The sealed value.
+        value: String,
+    },
+    /// Written to KV before send (spec 6.2, overflow).
+    Overflow,
+}
+
+/// Plans a batch: one new cookie when it fits and fewer than four openable
+/// removal cookies are present, else an overflow write.
+#[must_use]
+pub(crate) fn plan_r_batch(
+    keys: &IdentityKeys,
+    ec_id: &str,
+    batch: &RBatch,
+    inbound_openable: usize,
+    random: &dyn RandomSource,
+) -> RPlan {
+    if inbound_openable >= R_COOKIE_SOFT_LIMIT {
+        return RPlan::Overflow;
+    }
+    let value = seal_r_batch(keys, ec_id, batch, random);
+    if value.len() > MAX_R_COOKIE_BYTES {
+        return RPlan::Overflow;
+    }
+    RPlan::Cookie {
+        name: new_r_cookie_name(random),
+        value,
+    }
+}
+
+/// Splits a batch across as many removal cookies as it needs, without
+/// coarsening it: every removal, opt-out and hash is kept exactly.
+#[must_use]
+pub(crate) fn split_r_batch(
+    keys: &IdentityKeys,
+    ec_id: &str,
+    batch: &RBatch,
+    random: &dyn RandomSource,
+) -> Vec<(String, String)> {
+    let mut items: Vec<RBatch> = Vec::with_capacity(batch.item_count());
+    items.extend(batch.rm.iter().map(|removal| RBatch {
+        rm: vec![removal.clone()],
+        ..RBatch::default()
+    }));
+    items.extend(batch.o.iter().map(|(provider, at)| RBatch {
+        o: [(provider.clone(), *at)].into_iter().collect(),
+        ..RBatch::default()
+    }));
+    for (provider, hashes) in &batch.iv {
+        items.extend(hashes.iter().map(|hash| {
+            RBatch {
+                iv: [(provider.clone(), vec![hash.clone()])]
+                    .into_iter()
+                    .collect(),
+                ..RBatch::default()
+            }
+        }));
+    }
+
+    let mut cookies = Vec::new();
+    let mut current = RBatch::default();
+    for item in items {
+        let mut candidate = current.clone();
+        candidate.rm.extend(item.rm.clone());
+        candidate.o.extend(item.o.clone());
+        for (provider, hashes) in &item.iv {
+            candidate
+                .iv
+                .entry(provider.clone())
+                .or_default()
+                .extend(hashes.iter().cloned());
+        }
+        if current.is_empty()
+            || seal_r_batch(keys, ec_id, &candidate, random).len() <= MAX_R_COOKIE_BYTES
+        {
+            current = candidate;
+            continue;
+        }
+        cookies.push(current);
+        current = item;
+    }
+    if !current.is_empty() {
+        cookies.push(current);
+    }
+
+    cookies
+        .into_iter()
+        .map(|batch| {
+            let value = seal_r_batch(keys, ec_id, &batch, random);
+            if value.len() > MAX_R_COOKIE_BYTES {
+                log::error!("A single removal does not fit a removal cookie; setting it anyway");
+            }
+            (new_r_cookie_name(random), value)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use http::{HeaderMap, HeaderValue, header};
@@ -1328,6 +1610,299 @@ mod s_cookie_tests {
         assert!(
             cookie.ids.iter().any(SEntry::is_browser_gap),
             "the browser gap entry is dropped last"
+        );
+    }
+}
+
+#[cfg(test)]
+mod r_cookie_tests {
+    use super::*;
+    use crate::ec::identity::input::SeededRandom;
+    use crate::ec::identity::mutation::PartnerIdChange;
+    use crate::ec::identity::test_support::test_keys;
+    use crate::ec::kv_types::{KvEntry, KvOptOut, KvPartnerId, KvProviderState};
+
+    const EC: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.ABC123";
+
+    fn removal(source: &str, writer: &str, sa: u64) -> RRemoval {
+        RRemoval {
+            s: source.to_owned(),
+            w: writer.to_owned(),
+            pv: None,
+            sa,
+        }
+    }
+
+    fn batch_of(count: usize) -> RBatch {
+        RBatch {
+            rm: (0..count)
+                .map(|index| removal(&format!("s{index}.example.com"), "provider", 1_760_000_000))
+                .collect(),
+            ..RBatch::default()
+        }
+    }
+
+    fn headers_for(cookies: &[(String, String)]) -> http::HeaderMap {
+        let joined = cookies
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::COOKIE,
+            http::HeaderValue::from_str(&joined).expect("should build header"),
+        );
+        headers
+    }
+
+    #[test]
+    fn a_typical_batch_fits_one_cookie_and_a_long_domain_fits_alone() {
+        let keys = test_keys();
+        let random = SeededRandom::new(1);
+        let RPlan::Cookie { name, value } = plan_r_batch(&keys, EC, &batch_of(4), 0, &random)
+        else {
+            panic!("four typical removals should fit one cookie");
+        };
+        assert!(
+            name.starts_with("__Host-ts-eids-r-"),
+            "should use the prefix"
+        );
+        assert_eq!(
+            name.len(),
+            "__Host-ts-eids-r-".len() + 8,
+            "should add 8 hex digits"
+        );
+        assert!(value.len() <= MAX_R_COOKIE_BYTES, "should fit 512 bytes");
+
+        let label = "a".repeat(63);
+        let long_domain = format!("{label}.{label}.{label}.{}.com", "b".repeat(57));
+        assert_eq!(long_domain.len(), 253, "should be a 253-byte domain");
+        let one = RBatch {
+            rm: vec![removal(&long_domain, "a-long-provider-id", 1_760_000_000)],
+            ..RBatch::default()
+        };
+        assert!(
+            matches!(
+                plan_r_batch(&keys, EC, &one, 0, &random),
+                RPlan::Cookie { .. }
+            ),
+            "one long removal fits"
+        );
+    }
+
+    #[test]
+    fn overflow_when_too_big_or_four_cookies_present() {
+        let keys = test_keys();
+        let random = SeededRandom::new(1);
+        assert!(
+            matches!(
+                plan_r_batch(&keys, EC, &batch_of(12), 0, &random),
+                RPlan::Overflow
+            ),
+            "too big"
+        );
+        assert!(
+            matches!(
+                plan_r_batch(&keys, EC, &batch_of(1), 4, &random),
+                RPlan::Overflow
+            ),
+            "four present"
+        );
+        assert!(
+            matches!(
+                plan_r_batch(&keys, EC, &batch_of(1), 3, &random),
+                RPlan::Cookie { .. }
+            ),
+            "control: three present still allows a cookie"
+        );
+    }
+
+    #[test]
+    fn split_keeps_every_entry_exactly() {
+        let keys = test_keys();
+        let random = SeededRandom::new(1);
+        let big = RBatch {
+            o: [("provider".to_owned(), 5)].into_iter().collect(),
+            iv: [("provider".to_owned(), vec!["0123456789abcdef".to_owned()])]
+                .into_iter()
+                .collect(),
+            ..batch_of(12)
+        };
+        let cookies = split_r_batch(&keys, EC, &big, &random);
+        assert!(cookies.len() > 1, "should need several cookies");
+        assert!(
+            cookies
+                .iter()
+                .all(|(_, value)| value.len() <= MAX_R_COOKIE_BYTES),
+            "each fits"
+        );
+        let opened = open_r_cookies(&keys, EC, &headers_for(&cookies));
+        assert!(opened.unopenable.is_empty(), "every cookie opens");
+        let mut rebuilt = RBatch::default();
+        for (_, batch) in &opened.cookies {
+            rebuilt.rm.extend(batch.rm.clone());
+            rebuilt.o.extend(batch.o.clone());
+            for (provider, hashes) in &batch.iv {
+                rebuilt
+                    .iv
+                    .entry(provider.clone())
+                    .or_default()
+                    .extend(hashes.clone());
+            }
+        }
+        rebuilt.rm.sort_by(|a, b| a.s.cmp(&b.s));
+        let mut expected = big.rm.clone();
+        expected.sort_by(|a, b| a.s.cmp(&b.s));
+        assert_eq!(rebuilt.rm, expected, "every removal survives unchanged");
+        assert_eq!(rebuilt.o, big.o, "the opt-out survives unchanged");
+        assert_eq!(rebuilt.iv, big.iv, "the iv hash survives unchanged");
+    }
+
+    #[test]
+    fn applied_rules() {
+        let keys = test_keys();
+        let mut entry = KvEntry::minimal("b.example.com", "x", 1);
+        entry.ids.insert(
+            "a.example.com".to_owned(),
+            KvPartnerId {
+                w: Some("p".to_owned()),
+                at: Some(10),
+                rv: Some("1111111111111111".to_owned()),
+                ..KvPartnerId::new("u")
+            },
+        );
+        let without_pv = |writer: &str, sa| RBatch {
+            rm: vec![removal("a.example.com", writer, sa)],
+            ..RBatch::default()
+        };
+        assert!(
+            !r_batch_applied(&without_pv("p", 10), &entry, &keys),
+            "pending"
+        );
+        assert!(
+            r_batch_applied(&without_pv("p", 9), &entry, &keys),
+            "re-acquired after sa"
+        );
+        assert!(
+            r_batch_applied(&without_pv("q", 10), &entry, &keys),
+            "other writer"
+        );
+        let with_pv = |pv: &str| RBatch {
+            rm: vec![RRemoval {
+                pv: Some(pv.to_owned()),
+                ..removal("a.example.com", "p", 10)
+            }],
+            ..RBatch::default()
+        };
+        assert!(
+            !r_batch_applied(&with_pv("1111111111111111"), &entry, &keys),
+            "same revision"
+        );
+        assert!(
+            r_batch_applied(&with_pv("2222222222222222"), &entry, &keys),
+            "other revision"
+        );
+
+        entry.ps.insert(
+            "p".to_owned(),
+            KvProviderState {
+                o: Some(KvOptOut {
+                    at: 5,
+                    fp: "0".repeat(16),
+                }),
+                ..KvProviderState::default()
+            },
+        );
+        let opt_out = |at| RBatch {
+            o: [("p".to_owned(), at)].into_iter().collect(),
+            ..RBatch::default()
+        };
+        assert!(
+            r_batch_applied(&opt_out(5), &entry, &keys),
+            "KV o.at at or after"
+        );
+        assert!(
+            !r_batch_applied(&opt_out(6), &entry, &keys),
+            "newer opt-out pending"
+        );
+        entry.ps.get_mut("p").expect("should hold p").oc = Some(6);
+        assert!(
+            !r_batch_applied(&opt_out(6), &entry, &keys),
+            "a same-second clear does not count"
+        );
+        entry.ps.get_mut("p").expect("should hold p").oc = Some(7);
+        assert!(
+            r_batch_applied(&opt_out(6), &entry, &keys),
+            "a later clear makes it stale"
+        );
+        let iv_only = RBatch {
+            iv: [("p".to_owned(), vec!["0".repeat(16)])]
+                .into_iter()
+                .collect(),
+            ..RBatch::default()
+        };
+        assert!(
+            r_batch_applied(&iv_only, &entry, &keys),
+            "iv never keeps a cookie alive"
+        );
+    }
+
+    #[test]
+    fn batches_become_changes_by_source_domain() {
+        let batch = RBatch {
+            rm: vec![
+                removal("a.example.com", "p", 10),
+                RRemoval {
+                    pv: Some("1111111111111111".to_owned()),
+                    ..removal("b.example.com", "p", 10)
+                },
+                removal("not a domain", "p", 10),
+            ],
+            o: [("p".to_owned(), 7)].into_iter().collect(),
+            iv: [("p".to_owned(), vec!["0".repeat(16)])]
+                .into_iter()
+                .collect(),
+        };
+        let (changes, states) = r_batch_to_changes(&batch);
+        assert_eq!(
+            changes.len(),
+            2,
+            "should drop the entry that does not parse"
+        );
+        assert!(
+            matches!(
+                &changes[0],
+                PartnerIdChange::WriterRemove {
+                    staged_at: Some(10),
+                    ..
+                }
+            ),
+            "a removal without pv is a WriterRemove"
+        );
+        assert!(
+            matches!(&changes[1], PartnerIdChange::OwnerRemove { .. }),
+            "a removal with pv is an OwnerRemove"
+        );
+        let state = &states[&"p".parse().expect("should parse id")];
+        assert_eq!(state.opt_out.as_ref().map(|o| o.at), Some(7), "opt-out at");
+        assert_eq!(state.iv_add.len(), 1, "iv hash");
+    }
+
+    #[test]
+    fn unopenable_cookies_are_listed_for_deletion() {
+        let keys = test_keys();
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::COOKIE,
+            http::HeaderValue::from_static("__Host-ts-eids-r-00000000=v1.bad.value"),
+        );
+        let opened = open_r_cookies(&keys, EC, &headers);
+        assert!(opened.cookies.is_empty(), "nothing opens");
+        assert_eq!(
+            opened.unopenable,
+            vec!["__Host-ts-eids-r-00000000".to_owned()],
+            "listed for deletion"
         );
     }
 }
