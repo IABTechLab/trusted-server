@@ -2211,10 +2211,12 @@ already carries four openable `ts-eids-r` cookies. This removal overflow
 write is the second page-load exception to G4 (section 5.1). It reads the
 row and applies only the batch's removals, opt-outs and `iv` hashes under
 the rules of section 5.4, with a CAS and the withdrawal path's five
-attempts. When it lands, or the read shows the batch already applied, no
-cookie is set. When it fails, the response sets the batch in new cookies of
-its own, split across as many 512-byte cookies as it needs, so the batch is
-never lost.
+attempts. Like that path, it re-reads and tries again only when the CAS
+generation no longer matches. Any other failure, Fastly's per-key limit
+included, ends the write at once. When it lands, or the read shows the batch
+already applied, no cookie is set. When it fails, the response sets the
+batch in new cookies of its own, split across as many 512-byte cookies as it
+needs, so the batch is never lost.
 
 Four is where TS stops relying on cookies, not a hard cap. Concurrent
 responses each count from their own inbound snapshot, so five responses
@@ -3980,6 +3982,8 @@ Decisions made while writing this spec, with the user:
 | GPP opt-outs                     | Sharing and targeted-advertising opt-outs are decoded, and the strict policy blocks them.                                                                               |
 | `x-ts-eids`                      | Kept as a full troubleshooting header. Its exposure of server-only IDs to page scripts is accepted.                                                                     |
 | Consent withdrawal               | Synchronous tombstone on any request, one of two G4 exceptions with the removal overflow write. Proposed in review; not yet confirmed.                                  |
+| Removal overflow                 | A synchronous, removal-only KV write before send, the second G4 exception. It retries only a CAS conflict and falls back to new cookies. Confirmed after round 10.      |
+| Equal-second ties                | A removal or opt-out wins a tie with an acquisition or clear. An ID re-acquired in that second is resolved again later. Confirmed after round 10.                       |
 
 Round 7 proposed these, and they are applied in revision 8 pending the
 user's review of the spec:
@@ -3998,15 +4002,14 @@ user's review of the spec:
 Round 10 proposed these, and they are applied in revision 11 pending the
 user's review of the spec:
 
-| Decision            | Choice                                                                                                          |
-| ------------------- | --------------------------------------------------------------------------------------------------------------- |
-| Removal overflow    | A synchronous, removal-only KV write before send, the second G4 exception. Batches are never merged or widened  |
-| Record revision     | A random `rv` per record write. Ties between a removal or opt-out and an acquisition or clear go to the removal |
-| Stateful results    | IDs, state and scheduling apply atomically. An invalid replacement state rejects the positive result            |
-| Refresh anchors     | An expired owned record is kept, unserved, while its owner holds state, until its `ru`                          |
-| Disclosure policy   | The writer's policy always, plus the owner's. Records of disabled writers are not served                        |
-| Browser candidates  | The owner's `ps.iv` and `ps.o` filter the browser's value for owned sources                                     |
-| `/identify` consent | The request's visitor consent. No persisted visitor authorization                                               |
+| Decision            | Choice                                                                                               |
+| ------------------- | ---------------------------------------------------------------------------------------------------- |
+| Record revision     | A random `rv` per record write                                                                       |
+| Stateful results    | IDs, state and scheduling apply atomically. An invalid replacement state rejects the positive result |
+| Refresh anchors     | An expired owned record is kept, unserved, while its owner holds state, until its `ru`               |
+| Disclosure policy   | The writer's policy always, plus the owner's. Records of disabled writers are not served             |
+| Browser candidates  | The owner's `ps.iv` and `ps.o` filter the browser's value for owned sources                          |
+| `/identify` consent | The request's visitor consent. No persisted visitor authorization                                    |
 
 ## 17. Review log
 
