@@ -181,15 +181,11 @@ mod tests {
         entry.consent.ok = true;
         entry.ids.insert(
             "zeta.example.com".to_owned(),
-            super::super::kv_types::KvPartnerId {
-                uid: "uid-z".to_owned(),
-            },
+            super::super::kv_types::KvPartnerId::new("uid-z".to_owned()),
         );
         entry.ids.insert(
             "alpha.example.com".to_owned(),
-            super::super::kv_types::KvPartnerId {
-                uid: "uid-a".to_owned(),
-            },
+            super::super::kv_types::KvPartnerId::new("uid-a".to_owned()),
         );
 
         let resolved = resolve_partner_ids(&registry, &entry);

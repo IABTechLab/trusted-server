@@ -157,9 +157,7 @@ fn apply_cookie_partner_id_updates(
 
         entry.ids.insert(
             partner_id.to_owned(),
-            super::kv_types::KvPartnerId {
-                uid: uid.to_owned(),
-            },
+            super::kv_types::KvPartnerId::new(uid.to_owned()),
         );
         changed = true;
     }
@@ -205,9 +203,7 @@ pub(crate) fn apply_partner_id_updates(entry: &mut KvEntry, updates: &[PartnerId
 
         entry.ids.insert(
             partner_id.to_owned(),
-            super::kv_types::KvPartnerId {
-                uid: uid.to_owned(),
-            },
+            super::kv_types::KvPartnerId::new(uid.to_owned()),
         );
         changed = true;
     }
@@ -920,9 +916,7 @@ impl KvIdentityGraph {
 
             entry.ids.insert(
                 partner_id.to_owned(),
-                super::kv_types::KvPartnerId {
-                    uid: uid.to_owned(),
-                },
+                super::kv_types::KvPartnerId::new(uid.to_owned()),
             );
 
             let (body, meta_str) = Self::serialize_entry(&entry, self.store_name())?;
@@ -992,9 +986,7 @@ impl KvIdentityGraph {
 
             entry.ids.insert(
                 partner_id.to_owned(),
-                super::kv_types::KvPartnerId {
-                    uid: uid.to_owned(),
-                },
+                super::kv_types::KvPartnerId::new(uid.to_owned()),
             );
 
             let (body, meta_str) = Self::serialize_entry(&entry, self.store_name())?;
@@ -1737,9 +1729,9 @@ mod tests {
         let mut entry = KvEntry::tombstone(1000);
         entry.ids.insert(
             "ssp_x".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "x".repeat(crate::ec::kv_types::MAX_UID_LENGTH + 1),
-            },
+            crate::ec::kv_types::KvPartnerId::new(
+                "x".repeat(crate::ec::kv_types::MAX_UID_LENGTH + 1),
+            ),
         );
         let body = serde_json::to_vec(&entry).expect("should serialize invalid entry payload");
 
@@ -1772,9 +1764,9 @@ mod tests {
         let mut entry = KvEntry::tombstone(1000);
         entry.ids.insert(
             "ssp_x".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "x".repeat(crate::ec::kv_types::MAX_UID_LENGTH + 1),
-            },
+            crate::ec::kv_types::KvPartnerId::new(
+                "x".repeat(crate::ec::kv_types::MAX_UID_LENGTH + 1),
+            ),
         );
 
         let err = KvIdentityGraph::serialize_entry(&entry, "test-store")
@@ -1796,9 +1788,7 @@ mod tests {
         let mut entry = live_entry();
         entry.ids.insert(
             "concurrent.example.com".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "concurrent-uid".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::new("concurrent-uid".to_owned()),
         );
         entry
     }
@@ -2131,9 +2121,7 @@ mod tests {
         let mut entry = live_entry();
         entry.ids.insert(
             "ssp_x".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "uid-1".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::new("uid-1".to_owned()),
         );
         let updates = vec![PartnerIdUpdate::new("ssp_x", "uid-1")];
 
@@ -2159,9 +2147,7 @@ mod tests {
         let mut entry = live_entry();
         entry.ids.insert(
             "ssp_x".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "old-uid".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::new("old-uid".to_owned()),
         );
         let updates = vec![PartnerIdUpdate::new("ssp_x", "new-uid")];
 
@@ -2191,9 +2177,7 @@ mod tests {
         let mut entry = live_entry();
         entry.ids.insert(
             "ssp_x".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "original".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::new("original".to_owned()),
         );
         let updates = vec![
             PartnerIdUpdate::new("ssp_x", "intermediate"),
@@ -2215,9 +2199,7 @@ mod tests {
         let mut concurrent = live_entry();
         concurrent.ids.insert(
             "ssp_x".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "desired-uid".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::new("desired-uid".to_owned()),
         );
         let lookups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2333,9 +2315,7 @@ mod tests {
         let mut entry = live_entry();
         entry.ids.insert(
             "ssp_x".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "latest-uid".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::new("latest-uid".to_owned()),
         );
         let updates = [
             PartnerIdUpdate::new("ssp_x", "older-uid"),
@@ -2354,9 +2334,7 @@ mod tests {
         let mut concurrent = live_entry();
         concurrent.ids.insert(
             "ssp_x".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "concurrent-uid".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::new("concurrent-uid".to_owned()),
         );
         let lookups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2439,9 +2417,7 @@ mod tests {
         let mut entry = live_entry();
         entry.ids.insert(
             "ssp_x".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "protected-uid".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::new("protected-uid".to_owned()),
         );
         graph.create(&ec_id, &entry).expect("should seed entry");
 
@@ -2466,9 +2442,7 @@ mod tests {
         let mut entry = live_entry();
         entry.ids.insert(
             "ssp_x".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "protected-uid".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::new("protected-uid".to_owned()),
         );
         graph.create(&ec_id, &entry).expect("should seed entry");
 

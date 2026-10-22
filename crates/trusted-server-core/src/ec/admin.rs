@@ -368,6 +368,19 @@ fn requested_ec_id(req: &Request<EdgeBody>) -> Result<String, Box<Response<EdgeB
     Ok(ec_id)
 }
 
+/// Replaces every `ps.<provider>.st` with a marker. Provider state is never
+/// returned by the admin lookup.
+fn redact_provider_state(entry_json: &mut JsonValue) {
+    let Some(states) = entry_json.get_mut("ps").and_then(JsonValue::as_object_mut) else {
+        return;
+    };
+    for state in states.values_mut() {
+        if let Some(st) = state.get_mut("st") {
+            *st = JsonValue::String("[redacted]".to_owned());
+        }
+    }
+}
+
 /// Builds the success payload from a raw KV lookup.
 ///
 /// Parse failures are reported in the payload rather than propagated, so
@@ -393,6 +406,7 @@ fn build_lookup_response(
 
     match serde_json::from_slice::<JsonValue>(&lookup.body) {
         Ok(mut entry_json) => {
+            redact_provider_state(&mut entry_json);
             add_iso_timestamp_companions(&mut entry_json);
             payload.entry = Some(entry_json);
 
@@ -778,15 +792,11 @@ mod tests {
         let mut entry = KvEntry::minimal("bidstream.example", "uid-live", 1_741_824_000);
         entry.ids.insert(
             "disabled.example".to_owned(),
-            KvPartnerId {
-                uid: "uid-disabled".to_owned(),
-            },
+            KvPartnerId::new("uid-disabled".to_owned()),
         );
         entry.ids.insert(
             "unknown.example".to_owned(),
-            KvPartnerId {
-                uid: "uid-unknown".to_owned(),
-            },
+            KvPartnerId::new("uid-unknown".to_owned()),
         );
         entry
     }
@@ -1305,6 +1315,44 @@ mod tests {
             handle_admin_ec_lookup(None, &test_registry(), &req).expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[test]
+    fn admin_lookup_redacts_provider_state() {
+        let mut entry = KvEntry::minimal("example.com", "example-uid", 1_760_000_000);
+        entry.ps.insert(
+            "id5".to_owned(),
+            crate::ec::kv_types::KvProviderState {
+                n: Some(5),
+                st: Some(serde_json::json!({ "signature": "secret-state" })),
+                ..crate::ec::kv_types::KvProviderState::default()
+            },
+        );
+        let lookup = EcKvLookup {
+            body: serde_json::to_vec(&entry).expect("should serialize entry"),
+            metadata: None,
+            generation: 1,
+        };
+        let registry = PartnerRegistry::from_config(&[]).expect("should build empty registry");
+
+        let payload = build_lookup_response(&registry, "ec-store", "ec".to_owned(), &lookup);
+        let body = payload.entry.expect("should include the entry");
+
+        assert_eq!(
+            body["ps"]["id5"]["st"],
+            serde_json::json!("[redacted]"),
+            "should redact the state"
+        );
+        assert_eq!(
+            body["ps"]["id5"]["n"],
+            serde_json::json!(5),
+            "should keep the rest of ps"
+        );
+        assert_eq!(
+            body["ids"]["example.com"]["uid"],
+            serde_json::json!("example-uid"),
+            "should keep the ids"
+        );
     }
 
     #[test]

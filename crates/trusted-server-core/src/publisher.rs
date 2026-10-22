@@ -7929,9 +7929,7 @@ mod tests {
         let mut entry = KvEntry::minimal("ids.example.com", "kv-stale", 1000);
         entry.ids.insert(
             "other.example.com".to_owned(),
-            KvPartnerId {
-                uid: "kv-other".to_owned(),
-            },
+            KvPartnerId::new("kv-other".to_owned()),
         );
         let snapshot = EcKvSnapshot::Present {
             ec_id: ec_id.clone(),

@@ -652,9 +652,7 @@ mod tests {
         if let EcKvSnapshot::Present { entry, .. } = &mut snapshot {
             entry.ids.insert(
                 "ssp.example.com".to_owned(),
-                crate::ec::kv_types::KvPartnerId {
-                    uid: "uid".to_owned(),
-                },
+                crate::ec::kv_types::KvPartnerId::new("uid".to_owned()),
             );
         }
         ec_context.set_kv_snapshot(snapshot);
@@ -702,9 +700,7 @@ mod tests {
 
         entry.ids.insert(
             "b.example.com".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "uid-b".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::new("uid-b".to_owned()),
         );
 
         assert!(
@@ -1213,9 +1209,7 @@ mod tests {
         entry.consent.ok = true;
         entry.ids.insert(
             "alpha.example.com".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "already-known".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::new("already-known".to_owned()),
         );
         graph
             .create(&ec_id, &entry)

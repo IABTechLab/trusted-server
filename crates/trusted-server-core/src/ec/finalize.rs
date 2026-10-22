@@ -2376,9 +2376,7 @@ mod tests {
         let mut entry = live_entry();
         entry.ids.insert(
             "ssp.example.com".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "partner-uid".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::new("partner-uid".to_owned()),
         );
         ec_context.set_kv_snapshot(EcKvSnapshot::Present {
             ec_id,
