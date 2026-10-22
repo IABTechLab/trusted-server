@@ -13,6 +13,7 @@ use serde::de::DeserializeOwned;
 use url::Url;
 
 use super::descriptor::{Access, Input, ProviderDescriptor, ResolveKind};
+use super::exchange::ProviderResponse;
 use super::ids::{IdentityProviderId, SourceDomain, UnixTime};
 use super::resolution::IdentityProviderError;
 use crate::consent::ConsentContext;
@@ -575,6 +576,89 @@ impl<'a> ResolveInput<'a> {
     }
 }
 
+/// The parts a [`CaptureInput`] is built from.
+pub(crate) struct CaptureParts<'a> {
+    pub(crate) descriptor: &'a ProviderDescriptor,
+    pub(crate) path: &'a str,
+    pub(crate) response: &'a ProviderResponse,
+    pub(crate) stored: &'a BTreeMap<SourceDomain, StoredId>,
+    pub(crate) consent: &'a ProviderConsent,
+    pub(crate) publisher_domain: &'a str,
+    pub(crate) now: UnixTime,
+}
+
+/// What a capture may read from one proxied response. It never exposes the
+/// proxied request's body or headers.
+pub struct CaptureInput<'a> {
+    parts: CaptureParts<'a>,
+}
+
+impl fmt::Debug for CaptureInput<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CaptureInput")
+            .field("provider", self.parts.descriptor.id())
+            .field("path", &self.parts.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'a> CaptureInput<'a> {
+    /// The input for one capture.
+    #[must_use]
+    pub(crate) fn new(parts: CaptureParts<'a>) -> Self {
+        Self { parts }
+    }
+
+    /// The proxied request path, without query string.
+    #[must_use]
+    pub fn path(&self) -> &str {
+        self.parts.path
+    }
+
+    /// The proxied response, decoded.
+    #[must_use]
+    pub fn response(&self) -> &ProviderResponse {
+        self.parts.response
+    }
+
+    /// The descriptor's primary source.
+    #[must_use]
+    pub fn primary_source(&self) -> &SourceDomain {
+        self.parts.descriptor.primary_source()
+    }
+
+    /// Finds a declared source by a vendor's spelling of it.
+    #[must_use]
+    pub fn source_named(&self, name: &str) -> Option<&SourceDomain> {
+        self.parts.descriptor.source_named(name)
+    }
+
+    /// The stored record for a source.
+    #[must_use]
+    pub fn stored(&self, source: &SourceDomain) -> Option<&StoredId> {
+        self.parts.stored.get(source)
+    }
+
+    /// The stricter of the cookie consent and the request-body consent.
+    #[must_use]
+    pub fn consent(&self) -> &ProviderConsent {
+        self.parts.consent
+    }
+
+    /// The publisher's domain.
+    #[must_use]
+    pub fn publisher_domain(&self) -> &str {
+        self.parts.publisher_domain
+    }
+
+    /// The request's time.
+    #[must_use]
+    pub fn now(&self) -> UnixTime {
+        self.parts.now
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -841,5 +925,56 @@ mod tests {
         let mut c = [0u8; 16];
         first.fill(&mut c);
         assert_ne!(a, c, "the stream advances");
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use std::collections::BTreeMap;
+
+    use http::{Method, StatusCode};
+
+    use super::*;
+    use crate::ec::identity::descriptor::Captures;
+
+    #[test]
+    fn capture_input_exposes_path_and_sources() {
+        let descriptor = ProviderDescriptor::builder("c".parse().expect("should parse id"))
+            .with_source("example.com".parse().expect("should parse source"))
+            .with_captures(Captures::new().with_path(Method::POST, "/integrations/c/api"))
+            .build()
+            .expect("should build");
+        let response = ProviderResponse::for_test(StatusCode::OK, b"{}");
+        let consent = ProviderConsent::default();
+        let stored = BTreeMap::new();
+        let input = CaptureInput::new(CaptureParts {
+            descriptor: &descriptor,
+            path: "/integrations/c/api",
+            response: &response,
+            stored: &stored,
+            consent: &consent,
+            publisher_domain: "www.example.com",
+            now: UnixTime::from_secs(1),
+        });
+        assert_eq!(
+            input.path(),
+            "/integrations/c/api",
+            "should expose the path"
+        );
+        assert_eq!(
+            input.primary_source().as_str(),
+            "example.com",
+            "should expose the source"
+        );
+        assert_eq!(
+            input.source_named("EXAMPLE.com").map(SourceDomain::as_str),
+            Some("example.com"),
+            "should normalize vendor spellings"
+        );
+        assert_eq!(
+            input.response().status(),
+            StatusCode::OK,
+            "should expose the response"
+        );
     }
 }
