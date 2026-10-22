@@ -15,6 +15,7 @@
 
 pub mod descriptor;
 pub mod ids;
+pub mod input;
 pub mod resolution;
 
 pub use descriptor::{
@@ -22,4 +23,5 @@ pub use descriptor::{
     ProviderDescriptorBuilder, ResolveKind, Resolves, UsOptOut,
 };
 pub use ids::{IdentityProviderId, SourceDomain, UnixTime};
+pub use input::{HashedEmail, ProviderConsent, Region, ResolveInput, StoredId};
 pub use resolution::IdentityProviderError;
