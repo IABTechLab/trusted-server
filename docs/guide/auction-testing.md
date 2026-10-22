@@ -75,8 +75,11 @@ Core tests cover split dispatch/collection and synchronous execution, pending
 provider attribution, preserved on-time bids, late collection after an origin
 wait, and exhausted-budget mediation. Axum loopback tests separately delay
 headers and trickle bodies, and verify outstanding task cancellation. Worker
-adapter tests use controlled futures and timers, with WASM compilation checking
-the actual timer and cancellation APIs. Fastly also has Viceroy network fixtures
+adapter tests use controlled futures and timers. CI also runs the actual worker
+HTTP clients under local workerd and Spin 4.1, covering eager dispatch, buffered
+bids after a slow origin, delayed headers, and trickling bodies. Run
+`scripts/test-worker-auction-deadlines.py --help` for the same local fixtures.
+Fastly also has Viceroy network fixtures
 for stalled headers, trickling bodies, bodyless responses, and competing bidders;
 run its local origin harness after building the adapter test binary:
 
@@ -89,4 +92,4 @@ python3 crates/trusted-server-adapter-fastly/tests/deadline_origin.py \
 
 Use the adapter test artifact printed by Cargo in place of `<hash>`. The harness
 binds a local ephemeral port and runs the four network tests excluded from the
-standard suite.
+standard suite; CI runs the harness automatically.

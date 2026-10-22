@@ -171,7 +171,8 @@ The workspace has multiple WASM runtimes with runtime-specific SDKs. Use target-
 Fastly and Axum support concurrent auction provider fan-out. Cloudflare and Spin
 currently accept at most one provider in an enabled auction. Every adapter runs
 target-aware fan-out and backend-name checks at startup. Auction collection uses
-an absolute cutoff across header waits and complete response bodies. Fastly
+an absolute cutoff for network waiting across headers and complete response bodies.
+A nonblocking snapshot retains complete results after a slow origin. Fastly
 abandons pending backend requests because its SDK cannot cancel them; other
 adapters cancel their owned operations at cutoff. See
 [Auction timeout behavior](/guide/auction-orchestration#timeout-behavior) for

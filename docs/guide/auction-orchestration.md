@@ -814,22 +814,32 @@ Until that callback lands, startup remains the mandatory target-aware gate.
 
 ### Timeout behavior
 
-Provider response collection uses one absolute deadline measured from auction
-dispatch. It includes waiting for headers and buffering the complete upstream
-body. When the deadline expires, outstanding providers are recorded as timeouts;
-completed bids collected before the cutoff remain available for local ranking.
-Collection after a slow origin response does not restart the clock, and late
-responses are not admitted. A mediator starts only with remaining budget and
-uses the earlier of the auction cutoff and its own logical timeout.
+Auction requests start at dispatch and progress while the publisher origin loads.
+Response collection waits for headers and complete upstream bodies only until the
+original absolute deadline. At expiry, one nonblocking snapshot preserves complete
+responses already available; unfinished providers become timeouts. A slow origin
+never restarts the budget or causes an already-buffered bid to be discarded.
+Fastly has no upstream arrival timestamp, so this is a bound on network waiting,
+not bid eligibility based on an exact server-side arrival time. A mediator starts
+only with remaining budget and uses the earlier of the auction cutoff and its own
+logical timeout.
 
-Fastly limits retained response payloads to 10 MiB across the collector. A provider
-whose next chunk would exceed that limit fails while its siblings remain eligible.
-Fastly abandons unfinished backend requests and closes acquired response bodies;
+Personalized auction and mediator requests explicitly bypass intermediary caches.
+Fastly uses the SDK's direct pending-request handles and body readiness handles in
+a timed wait; it neither polls headers every millisecond nor waits on an empty
+handle list. Retained partial payloads share a 10 MiB budget. Under memory pressure,
+the largest partial response is rejected with its own backend attribution so a
+large stalled provider cannot make a small healthy sibling take the failure.
+Completed payloads move directly into the platform body without a host-buffer
+round trip. This cap covers retained payloads, not every allocator or host buffer.
+
+On expiry Fastly closes acquired response bodies and abandons unfinished requests;
 the installed SDK has no pending-request cancellation API. Axum aborts outstanding
-request tasks. Cloudflare aborts its fetch through an AbortController, and Spin
-drops cancelable WASI operations. Cloudflare and Spin retain their single-provider
-restriction and defer outbound request execution until collection so the entire
-request can be bounded.
+request tasks. Cloudflare and Spin start owned background tasks at dispatch and
+retain abort handles until response collection completes. Cloudflare also aborts
+its fetch through an AbortController. Both workers retain their single-provider
+restriction. Dropping a pending handle cancels queued or running guest work;
+upstream side effects that already happened cannot be undone.
 
 Backend first-byte and between-byte timeouts remain transport safeguards rather
 than total deadlines. Timer granularity and runtime scheduling can add a small

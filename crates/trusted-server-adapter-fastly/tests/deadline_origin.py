@@ -1,9 +1,12 @@
 """Run ignored Fastly deadline tests against a local, deliberately slow origin.
 
-Usage: python3 tests/deadline_origin.py /path/to/viceroy /path/to/test-binary.wasm
+Usage: python3 tests/deadline_origin.py /path/to/viceroy [test-binary.wasm]
+
+Without an artifact argument, build and locate the current binary using Cargo JSON.
 """
 
 import http.server
+import json
 import os
 import pathlib
 import subprocess
@@ -47,6 +50,24 @@ class Origin(http.server.BaseHTTPRequestHandler):
 
 
 def main():
+    if len(sys.argv) == 2:
+        build = subprocess.run(
+            ["cargo", "test", "-p", "trusted-server-adapter-fastly",
+             "--target", "wasm32-wasip1", "--bin", "trusted-server-adapter-fastly", "--no-run",
+             "--message-format=json"],
+            text=True, stdout=subprocess.PIPE, check=True,
+        )
+        artifacts = [json.loads(line) for line in build.stdout.splitlines() if line.startswith("{")]
+        binaries = [item["executable"] for item in artifacts
+                    if item.get("reason") == "compiler-artifact"
+                    and item.get("profile", {}).get("test")
+                    and item.get("target", {}).get("name") == "trusted-server-adapter-fastly"
+                    and item.get("executable")]
+        if len(binaries) != 1:
+            raise RuntimeError(f"Expected one Fastly binary test artifact, found {binaries!r}")
+        binary = binaries[0]
+    else:
+        binary = sys.argv[2]
     with http.server.ThreadingHTTPServer(("127.0.0.1", 0), Origin) as server:
         server.daemon_threads = True
         threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -60,10 +81,11 @@ def main():
             if pathlib.Path("/etc/ssl/cert.pem").exists():
                 environment.setdefault("SSL_CERT_FILE", "/etc/ssl/cert.pem")
             result = subprocess.run(
-                [sys.argv[1], "run", "-C", str(config), sys.argv[2],
+                [sys.argv[1], "run", "-C", str(config), binary,
                  "platform::deadline::tests::network_", "--ignored", "--nocapture"],
                 env=environment,
                 check=False,
+                timeout=120,
             )
         server.shutdown()
     return result.returncode

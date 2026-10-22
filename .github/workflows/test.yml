@@ -20,12 +20,12 @@ jobs:
         id: viceroy-version
         # `.tool-versions` is the single source of truth so this workflow and
         # `.github/actions/setup-integration-test-env/action.yml` can't drift.
-        run: echo "viceroy-version=$(grep '^viceroy ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "viceroy-version=$(grep '^viceroy ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Retrieve Node.js version
         id: node-version
-        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Set up Rust toolchain
@@ -52,6 +52,9 @@ jobs:
 
       - name: Run tests
         run: cargo test-fastly
+
+      - name: Run Fastly absolute deadline slow-network tests
+        run: python3 crates/trusted-server-adapter-fastly/tests/deadline_origin.py "$(command -v viceroy)"
 
       - name: Run tests (reusable-sandbox feature)
         run: cargo test-fastly-reuse
@@ -268,7 +271,7 @@ jobs:
       - name: Retrieve Node.js version
         id: node-version
         working-directory: .
-        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Use Node.js

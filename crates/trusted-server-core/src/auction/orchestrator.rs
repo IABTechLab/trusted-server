@@ -29,9 +29,9 @@ use crate::request_signing::RequestSigner;
 ///
 /// Created by [`AuctionOrchestrator::dispatch_auction`] and consumed by
 /// [`AuctionOrchestrator::collect_dispatched_auction`]. Carrying this handle
-/// across `pending_origin.wait()` lets origin response and SSP HTTP requests
-/// race in Fastly's native layer, enabling TTFB ≈ origin latency rather than
-/// TTFB ≈ auction timeout.
+/// across the publisher origin wait lets provider operations progress while
+/// the page loads. Collection retains available responses and never restarts
+/// the original auction budget.
 pub struct DispatchedAuction {
     pending_requests: Vec<PlatformPendingRequest>,
     backend_to_provider: HashMap<String, ProviderLaunchState>,
@@ -550,13 +550,6 @@ impl AuctionOrchestratorHarness {
                         .to_string();
                     if let Some(state) = launches.remove(&backend_name) {
                         let elapsed_ms = state.started_at.elapsed().as_millis() as u64;
-                        if remaining_budget_ms(auction_start, context.timeout_ms) == 0 {
-                            responses.push(provider_timeout_response(
-                                state.provider.provider_name(),
-                                elapsed_ms,
-                            ));
-                            continue;
-                        }
                         match state
                             .provider
                             .parse_response_with_state(
@@ -1140,10 +1133,8 @@ impl AuctionOrchestrator {
             }));
         }
 
-        // Reject multi-provider fan-out before any request launches when the
-        // platform executes `send_async` eagerly (e.g. Cloudflare Workers):
-        // sequential execution would accrue the sum of provider latencies and
-        // blow the auction budget before a later `select` could reject it.
+        // Enforce each adapter's supported provider count before dispatch.
+        // Worker adapters retain their single-provider collection contract.
         if provider_names.len() > 1 && !context.services.http_client().supports_concurrent_fanout()
         {
             return Err(Report::new(TrustedServerError::Auction {
@@ -1383,13 +1374,6 @@ impl AuctionOrchestrator {
 
                     if let Some(state) = backend_to_provider.remove(&backend_name) {
                         let response_time_ms = state.started_at.elapsed().as_millis() as u64;
-                        if remaining_budget_ms(auction_start, context.timeout_ms) == 0 {
-                            responses.push(provider_timeout_response(
-                                &state.provider_name,
-                                response_time_ms,
-                            ));
-                            continue;
-                        }
                         let provider_context = AuctionContext {
                             settings: context.settings,
                             request: context.request,
@@ -1886,11 +1870,8 @@ impl AuctionOrchestrator {
             return DispatchAuctionOutcome::NotStarted;
         }
 
-        // Mirror run_providers_parallel: reject multi-provider fan-out before
-        // any request launches when the platform executes `send_async` eagerly
-        // (e.g. Cloudflare Workers, Spin). Sequential execution would accrue
-        // the sum of provider latencies before the origin fetch and then fail
-        // collection with empty bids.
+        // Mirror the adapter capability guard before dispatch. Worker adapters
+        // start requests eagerly but retain single-provider collection support.
         #[cfg(test)]
         if provider_names.len() > 1 && !context.services.http_client().supports_concurrent_fanout()
         {
@@ -2194,13 +2175,6 @@ impl AuctionOrchestrator {
                     let backend_name = platform_response.backend_name.clone().unwrap_or_default();
                     if let Some(state) = backend_to_provider.remove(&backend_name) {
                         let response_time_ms = state.started_at.elapsed().as_millis() as u64;
-                        if remaining_budget_ms(auction_start, timeout_ms) == 0 {
-                            responses.push(provider_timeout_response(
-                                &state.provider_name,
-                                response_time_ms,
-                            ));
-                            continue;
-                        }
                         let provider_context = AuctionContext {
                             settings: context.settings,
                             request: &provider_request_context,
@@ -2230,13 +2204,6 @@ impl AuctionOrchestrator {
                         }
                     } else if let Some(state) = planned_backend_to_provider.remove(&backend_name) {
                         let response_time_ms = state.started_at.elapsed().as_millis() as u64;
-                        if remaining_budget_ms(auction_start, timeout_ms) == 0 {
-                            responses.push(provider_timeout_response(
-                                state.provider.provider_name(),
-                                response_time_ms,
-                            ));
-                            continue;
-                        }
                         match state
                             .provider
                             .parse_response_with_state(
@@ -5564,7 +5531,7 @@ mod tests {
     fn rejects_multi_provider_fanout_before_launch_on_sequential_platform() {
         futures::executor::block_on(async {
             // Arrange: two configured providers on a platform whose HTTP
-            // client executes send_async eagerly (no concurrent fan-out).
+            // client is configured without multi-provider collection support.
             let stub = Arc::new(StubHttpClient::new());
             stub.set_concurrent_fanout(false);
             let stub_for_assertion = Arc::clone(&stub);
@@ -5627,7 +5594,7 @@ mod tests {
     fn dispatch_auction_skips_multi_provider_fanout_on_sequential_platform() {
         futures::executor::block_on(async {
             // Arrange: two configured providers on a platform whose HTTP
-            // client executes send_async eagerly (no concurrent fan-out).
+            // client is configured without multi-provider collection support.
             // The initial-page dispatch path must apply the same guard as
             // run_providers_parallel or the summed provider latency lands
             // before the origin fetch.
@@ -5890,6 +5857,12 @@ mod tests {
                     .await
                     .expect("should collect partial results")
             };
+            assert!(
+                http.recorded_cache_intents()
+                    .iter()
+                    .all(crate::platform::PlatformCacheIntent::is_bypass),
+                "should explicitly bypass intermediary caches for personalized auctions"
+            );
             assert_eq!(
                 result.provider_responses.len(),
                 2,
@@ -5920,9 +5893,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn planned_split_collection_drains_ready_bid_after_slow_origin_without_mediation() {
+        let http = Arc::new(StubHttpClient::new());
+        http.push_response(
+            200,
+            serde_json::to_vec(&serde_json::json!({
+                "seatbid": [{"seat": "example", "bid": [{
+                    "id": "on-time", "impid": "fictional-slot", "price": 2.0,
+                    "adm": "<div>fictional</div>", "w": 300, "h": 250
+                }]}]
+            }))
+            .expect("should serialize buffered bid"),
+        );
+        http.push_response(204, Vec::new());
+        http.push_select_delay(Duration::ZERO);
+        http.push_select_delay(Duration::from_millis(250));
+        let services = build_services_with_backend_and_http_client(
+            Arc::new(NamingBackend::new(BackendNamingPolicy::Axum)),
+            Arc::clone(&http) as Arc<_>,
+        );
+        let plan = AuctionPlan::compile(planned_config(
+            &[
+                ("provider-a", RoutingMode::AllEligible),
+                ("provider-b", RoutingMode::AllEligible),
+            ],
+            false,
+        ))
+        .expect("should compile providers");
+        let launches = Arc::new(AtomicUsize::new(0));
+        let mediator = Arc::new(DeadlineRecordingMediator {
+            launches: Arc::clone(&launches),
+            budgets: None,
+        });
+        let orchestrator = AuctionOrchestrator::from_plan(Arc::new(plan), Some(mediator));
+        let request = planned_request();
+        let settings = create_test_settings();
+        let inbound = http::Request::new(edgezero_core::body::Body::empty());
+        let context = AuctionContext {
+            settings: &settings,
+            request: &inbound,
+            timeout_ms: 10,
+            transport_timeout_ms: 10,
+            provider_responses: None,
+            services: &services,
+        };
+        let DispatchAuctionOutcome::Dispatched(dispatched) =
+            orchestrator.dispatch_auction(&request, &context).await
+        else {
+            panic!("should dispatch providers");
+        };
+        std::thread::sleep(Duration::from_millis(25));
+        let started = Instant::now();
+        let result = orchestrator
+            .collect_dispatched_auction(dispatched, &services, &context)
+            .await;
+        assert_eq!(
+            result.provider_responses.len(),
+            2,
+            "should retain one result for every provider"
+        );
+        assert_eq!(
+            result
+                .winning_bids
+                .get("fictional-slot")
+                .and_then(|bid| bid.bid_id.as_deref()),
+            Some("on-time"),
+            "should retain the available bid after the origin wait"
+        );
+        assert_eq!(
+            result.provider_responses[1].metadata["error_type"], ERROR_TYPE_TIMEOUT,
+            "should time out the unfinished sibling"
+        );
+        assert!(
+            result
+                .provider_responses
+                .iter()
+                .all(|response| response.response_time_ms >= 10),
+            "should report elapsed dispatch-to-collection time"
+        );
+        assert_eq!(
+            launches.load(Ordering::Relaxed),
+            0,
+            "should skip mediation after budget exhaustion"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "should never wait again for an unfinished response"
+        );
+    }
+
+    #[tokio::test]
     async fn planned_split_collection_uses_dispatch_deadline_after_slow_origin() {
         let http = Arc::new(StubHttpClient::new());
         http.push_response(204, Vec::new());
+        http.push_select_delay(Duration::from_millis(250));
         let services = build_services_with_backend_and_http_client(
             Arc::new(NamingBackend::new(BackendNamingPolicy::Axum)),
             http,
@@ -5995,8 +6059,8 @@ mod tests {
             false,
         ))
         .expect("should compile planned auction");
-        let orchestrator = AuctionOrchestratorHarness::new(
-            plan,
+        let orchestrator = AuctionOrchestrator::from_plan(
+            Arc::new(plan),
             Some(Arc::new(PendingDeadlineMediator(mediator_timeout_ms))),
         );
         let request = planned_request();

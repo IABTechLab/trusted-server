@@ -1708,7 +1708,7 @@ impl AuctionProvider for ApsAuctionProvider {
         let pending = context
             .services
             .http_client()
-            .send_async(PlatformHttpRequest::new(outbound_request, backend))
+            .send_async(PlatformHttpRequest::new(outbound_request, backend).with_cache_bypass())
             .await
             .change_context(TrustedServerError::Auction {
                 message: "Failed to send APS request".to_string(),

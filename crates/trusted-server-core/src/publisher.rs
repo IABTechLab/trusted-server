@@ -5146,8 +5146,8 @@ pub async fn handle_publisher_request(
         }
     }
 
-    // SSP requests are already racing through the platform HTTP client, so
-    // origin TTFB tracks origin latency rather than the auction timeout.
+    // Provider operations are already running while the origin loads. Collection
+    // retains buffered results, then waits only for the original remaining budget.
     let origin_result = if let Some(pending) = pending_origin {
         services.http_client().wait(pending).await
     } else {

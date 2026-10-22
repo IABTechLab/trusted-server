@@ -725,9 +725,6 @@ impl PlatformHttpClient for StubHttpClient {
         deadline: Instant,
     ) -> Result<Option<PlatformSelectResult>, Report<PlatformError>> {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Ok(None);
-        }
         let delay = self
             .select_delays
             .lock()
@@ -735,6 +732,12 @@ impl PlatformHttpClient for StubHttpClient {
             .front()
             .copied()
             .unwrap_or_default();
+        if delay.is_zero() {
+            return self.select(pending_requests).await.map(Some);
+        }
+        if remaining.is_zero() {
+            return Ok(None);
+        }
         if delay >= remaining {
             self.select_delays
                 .lock()

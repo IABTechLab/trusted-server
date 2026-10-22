@@ -381,7 +381,9 @@ impl GenericOpenRtbProvider {
         }
         let pending = services
             .http_client()
-            .send_async(PlatformHttpRequest::new(outbound, backend_name.clone()))
+            .send_async(
+                PlatformHttpRequest::new(outbound, backend_name.clone()).with_cache_bypass(),
+            )
             .await
             .change_context(TrustedServerError::Auction {
                 message: format!("Provider {} request launch failed", self.provider_name()),

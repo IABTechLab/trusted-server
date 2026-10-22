@@ -45,4 +45,10 @@ trusted-server-core = { workspace = true, features = ["test-utils"] }
 base64 = { workspace = true }
 edgezero-core = { workspace = true }
 toml = { workspace = true }
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+
+[[example]]
+name = "deadline-runtime"
+path = "tests/runtime/deadline.rs"
+crate-type = ["cdylib"]

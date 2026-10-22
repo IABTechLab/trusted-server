@@ -1,17 +1,17 @@
 //! Deadline-bounded collection of Fastly auction responses.
 
-use std::io::Read as _;
-use std::time::Duration;
-
 use error_stack::{Report, ResultExt as _};
-use fastly::handle::BodyHandle;
-use fastly::http::request::{PendingRequest, PollResult};
+use fastly::handle::{BodyHandle, PendingRequestHandle, PollHandleResult};
+use std::io::Read as _;
 use trusted_server_core::platform::{
     PlatformError, PlatformPendingRequest, PlatformResponse, PlatformSelectResult,
 };
 use web_time::Instant;
 
-use super::{MAX_PLATFORM_RESPONSE_BODY_BYTES, fastly_response_to_platform, response_carries_body};
+use super::{
+    CacheBypassPending, MAX_PLATFORM_RESPONSE_BODY_BYTES, buffered_response_to_platform,
+    fastly_response_to_platform, response_carries_body,
+};
 
 // Bound payload retained across all partial bodies, as well as each response.
 const MAX_TOTAL_BUFFERED_BODY_BYTES: usize = MAX_PLATFORM_RESPONSE_BODY_BYTES;
@@ -25,7 +25,8 @@ struct DeadlinePending {
 }
 
 enum PendingState {
-    Headers(Box<Option<PendingRequest>>),
+    Headers(Option<PendingRequestHandle>),
+    Ready(Result<PlatformResponse, Report<PlatformError>>),
     Body {
         response: Box<fastly::Response>,
         body: BodyHandle,
@@ -48,15 +49,19 @@ impl DeadlinePending {
             Err(pending) => pending,
         };
         let backend_name = pending.backend_name().unwrap_or("<unknown>").to_owned();
-        let pending = pending.downcast::<PendingRequest>().map_err(|_| {
-            Report::new(PlatformError::HttpClient).attach(format!(
-                "invalid Fastly deadline pending handle for backend '{backend_name}'"
+        // The marker is constructed only after set_pass(true), which selects
+        // HostCaching in fastly 0.13.1's Request::get_caching_mode. Its direct
+        // handle conversion therefore cannot encounter a guest caching state.
+        let pending = pending.downcast::<CacheBypassPending>().map_err(|_| {
+            Report::new(PlatformError::Unsupported).attach(format!(
+                "deadline collection requires a cache-bypass request for backend '{backend_name}'"
             ))
         })?;
+        let pending = PendingRequestHandle::from(pending.0);
         Ok(Self {
             backend_name,
             request_method,
-            state: Some(PendingState::Headers(Box::new(Some(pending)))),
+            state: Some(PendingState::Headers(Some(pending))),
         })
     }
 
@@ -88,37 +93,35 @@ impl DeadlinePending {
     fn buffered_bytes(&self) -> usize {
         match &self.state {
             Some(PendingState::Body { bytes, .. }) => bytes.len(),
+            Some(PendingState::Ready(Ok(response))) => {
+                response.response.body().as_bytes().map_or(0, <[u8]>::len)
+            }
             _ => 0,
         }
     }
 
-    fn poll(
-        &mut self,
-        deadline: Instant,
-        available_buffer_bytes: usize,
-    ) -> Result<Option<PlatformResponse>, Report<PlatformError>> {
+    fn poll(&mut self) -> Result<Option<PlatformResponse>, Report<PlatformError>> {
         let state = self
             .state
             .take()
             .expect("should retain pending collection state");
         let state = match state {
+            PendingState::Ready(result) => return result.map(Some),
             PendingState::Headers(mut slot) => {
                 match slot.take().expect("should retain a pending request").poll() {
-                    PollResult::Pending(pending) => {
-                        *slot = Some(pending);
+                    PollHandleResult::Pending(pending) => {
+                        slot = Some(pending);
                         self.state = Some(PendingState::Headers(slot));
                         return Ok(None);
                     }
-                    PollResult::Done(Err(error)) => {
-                        self.backend_name = error.backend_name().to_owned();
+                    PollHandleResult::Done(Err(error)) => {
                         return Err(
                             Report::new(PlatformError::HttpClient).attach(error.to_string())
                         );
                     }
-                    PollResult::Done(Ok(mut response)) => {
-                        if let Some(backend_name) = response.get_backend_name() {
-                            self.backend_name = backend_name.to_owned();
-                        }
+                    PollHandleResult::Done(Ok((response_handle, body_handle))) => {
+                        let mut response =
+                            fastly::Response::from_handles(response_handle, body_handle);
                         let request_is_head = self.request_is_head(&response)?;
                         if !response_carries_body(request_is_head, response.get_status()) {
                             return fastly_response_to_platform(
@@ -150,14 +153,14 @@ impl DeadlinePending {
             state => state,
         };
         let PendingState::Body {
-            mut response,
+            response,
             mut body,
             mut bytes,
         } = state
         else {
             unreachable!("headers are polled before buffering bodies");
         };
-        if Instant::now() >= deadline || !body_is_ready(&body)? || Instant::now() >= deadline {
+        if !body_is_ready(&body)? {
             self.state = Some(PendingState::Body {
                 response,
                 body,
@@ -170,17 +173,20 @@ impl DeadlinePending {
             .read(&mut chunk)
             .change_context(PlatformError::HttpClient)?;
         if read == 0 {
-            response.set_body(bytes);
-            return fastly_response_to_platform(*response, self.backend_name.clone(), false, false)
+            return buffered_response_to_platform(&response, self.backend_name.clone(), bytes)
                 .map(Some);
         }
         if bytes.len() + read > MAX_PLATFORM_RESPONSE_BODY_BYTES {
             return Err(Report::new(PlatformError::HttpClient)
                 .attach("origin response body exceeds response body limit"));
         }
-        if read > available_buffer_bytes {
-            return Err(Report::new(PlatformError::HttpClient)
-                .attach("origin response body exceeds aggregate auction buffer capacity"));
+        if bytes.len() + read > bytes.capacity() {
+            let capacity = bytes
+                .capacity()
+                .max(chunk.len())
+                .saturating_mul(2)
+                .min(MAX_PLATFORM_RESPONSE_BODY_BYTES);
+            bytes.reserve_exact(capacity - bytes.len());
         }
         bytes.extend_from_slice(&chunk[..read]);
         self.state = Some(PendingState::Body {
@@ -204,15 +210,16 @@ fn body_is_ready(body: &BodyHandle) -> Result<bool, Report<PlatformError>> {
     Ok(ready != 0)
 }
 
-/// Collect one fully buffered response before the absolute deadline.
+/// Collect one fully buffered response without waiting past the absolute deadline.
 ///
 /// Dropping response bodies closes their host handles. Fastly has no pending
 /// request cancellation ABI: unfinished header requests are abandoned and
-/// never waited on past the auction deadline.
+/// never waited on past the auction deadline. If collection starts after the
+/// deadline, one nonblocking snapshot preserves already available responses.
 ///
-/// Partial bodies share a 10 MiB payload budget. A provider whose next chunk
-/// would exceed that capacity fails with an attributed HTTP client error;
-/// its buffered bytes are released and its siblings remain collectible.
+/// Partial bodies share a 10 MiB payload budget. If a chunk exceeds that
+/// capacity, the largest partial response fails with an attributed HTTP client
+/// error; its buffered bytes are released and smaller siblings remain collectible.
 /// Completed response payload plus retained partial bodies fits the same budget.
 ///
 /// # Errors
@@ -223,9 +230,6 @@ pub(super) fn select_until(
     pending_requests: Vec<PlatformPendingRequest>,
     deadline: Instant,
 ) -> Result<Option<PlatformSelectResult>, Report<PlatformError>> {
-    if Instant::now() >= deadline {
-        return Ok(None);
-    }
     if pending_requests.is_empty() {
         return Err(Report::new(PlatformError::HttpClient)
             .attach("select_until called with an empty pending_requests list"));
@@ -239,25 +243,71 @@ pub(super) fn select_until(
         return Err(Report::new(PlatformError::HttpClient)
             .attach("resumed auction responses exceed aggregate buffer capacity"));
     }
+    let expired_at_entry = Instant::now() >= deadline;
+    if expired_at_entry {
+        // Take one nonblocking snapshot. Fully buffered results are cached;
+        // responses that would require a wait are abandoned, never retried.
+        for index in 0..pending.len() {
+            loop {
+                let previous = pending[index].buffered_bytes();
+                let result = pending[index].poll();
+                let progressed =
+                    matches!(result, Ok(None)) && pending[index].buffered_bytes() > previous;
+                match result {
+                    Ok(None) if progressed => {}
+                    Ok(None) => {
+                        pending[index].state = None;
+                    }
+                    result => {
+                        pending[index].state = Some(PendingState::Ready(match result {
+                            Ok(Some(response)) => Ok(response),
+                            Err(error) => Err(error),
+                            Ok(None) => unreachable!("pending results handled above"),
+                        }));
+                    }
+                }
+                buffered_bytes = buffered_bytes - previous + pending[index].buffered_bytes();
+                enforce_aggregate_budget(&mut pending, &mut buffered_bytes);
+                if !progressed || !matches!(pending[index].state, Some(PendingState::Body { .. })) {
+                    break;
+                }
+            }
+        }
+        pending.retain(|item| item.state.is_some());
+    }
     loop {
         for index in 0..pending.len() {
-            if Instant::now() >= deadline {
-                return Ok(None);
+            if !expired_at_entry && Instant::now() >= deadline {
+                // A timed host wait may wake with a ready event at the cutoff.
+                // Finish with the same nonblocking snapshot as expired entry.
+                return select_until(
+                    pending
+                        .into_iter()
+                        .map(DeadlinePending::into_platform)
+                        .collect(),
+                    deadline,
+                );
             }
             let previous_bytes = pending[index].buffered_bytes();
-            let result =
-                pending[index].poll(deadline, MAX_TOTAL_BUFFERED_BODY_BYTES - buffered_bytes);
-            buffered_bytes = buffered_bytes - previous_bytes + pending[index].buffered_bytes();
-            // A host event arriving at the deadline must not make a late bid eligible.
-            if Instant::now() >= deadline {
-                return Ok(None);
+            let result = pending[index].poll();
+            if let Ok(Some(response)) = result {
+                pending[index].state = Some(PendingState::Ready(Ok(response)));
+            } else if let Err(error) = result {
+                pending[index].state = Some(PendingState::Ready(Err(error)));
             }
-            let ready = match result {
-                Ok(None) => continue,
-                Ok(Some(response)) => Ok(response),
-                Err(error) => Err(error),
+            buffered_bytes = buffered_bytes - previous_bytes + pending[index].buffered_bytes();
+            enforce_aggregate_budget(&mut pending, &mut buffered_bytes);
+            // Capacity eviction may have failed an earlier large sibling.
+            let ready_index = pending
+                .iter()
+                .position(|item| matches!(item.state, Some(PendingState::Ready(_))));
+            let Some(ready_index) = ready_index else {
+                continue;
             };
-            let completed = pending.swap_remove(index);
+            let mut completed = pending.swap_remove(ready_index);
+            let Some(PendingState::Ready(ready)) = completed.state.take() else {
+                unreachable!("should select a ready result");
+            };
             let failed_backend_name = ready.as_ref().err().map(|_| completed.backend_name);
             return Ok(Some(PlatformSelectResult {
                 ready,
@@ -268,15 +318,44 @@ pub(super) fn select_until(
                 failed_backend_name,
             }));
         }
+        if expired_at_entry || pending.is_empty() {
+            return Ok(None);
+        }
         wait_for_progress(&pending, deadline)?;
     }
+}
+
+fn enforce_aggregate_budget(pending: &mut [DeadlinePending], buffered_bytes: &mut usize) {
+    if *buffered_bytes <= MAX_TOTAL_BUFFERED_BODY_BYTES {
+        return;
+    }
+    // The overflow is at most one read chunk. Evict the largest partial body
+    // first, preserving completed responses and healthy smaller siblings.
+    let largest = pending
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| matches!(item.state, Some(PendingState::Body { .. })))
+        .max_by_key(|(_, item)| item.buffered_bytes())
+        .or_else(|| {
+            pending
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, item)| item.buffered_bytes())
+        })
+        .map(|(index, _)| index)
+        .expect("should retain the response exceeding buffer capacity");
+    *buffered_bytes -= pending[largest].buffered_bytes();
+    pending[largest].state = Some(PendingState::Ready(Err(Report::new(
+        PlatformError::HttpClient,
+    )
+    .attach("largest partial response exceeds aggregate auction buffer capacity"))));
 }
 
 fn wait_for_progress(
     pending: &[DeadlinePending],
     deadline: Instant,
 ) -> Result<(), Report<PlatformError>> {
-    let Some(mut remaining) = deadline.checked_duration_since(Instant::now()) else {
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
         return Ok(());
     };
     if remaining.is_zero() {
@@ -285,17 +364,16 @@ fn wait_for_progress(
     let mut bodies = Vec::new();
     for pending in pending {
         match &pending.state {
-            Some(PendingState::Headers(_)) => {
-                // High-level PendingRequest keeps its host handle private. Poll
-                // at most 1ms apart without spinning while headers are pending.
-                remaining = remaining.min(Duration::from_millis(1));
-            }
+            Some(PendingState::Headers(Some(handle))) => bodies.push(handle.as_u32()),
             Some(PendingState::Body { body, .. }) => {
                 // SAFETY: these handles remain owned by pending throughout select.
                 bodies.push(unsafe { body.as_u32() });
             }
-            None => {}
+            _ => {}
         }
+    }
+    if bodies.is_empty() {
+        return Ok(());
     }
     let timeout_ms = u32::try_from(remaining.as_millis())
         .unwrap_or(u32::MAX)
@@ -332,13 +410,19 @@ mod tests {
     use web_time::Instant;
 
     #[test]
-    fn expired_deadline_does_not_accept_a_pending_result() {
+    fn expired_deadline_rejects_an_invalid_pending_handle() {
         let result = futures::executor::block_on(FastlyPlatformHttpClient.select_until(
             vec![PlatformPendingRequest::new(42_u32).with_backend_name("example")],
             Instant::now(),
         ))
-        .expect("should report expiration before inspecting handles");
-        assert!(result.is_none(), "should discard expired pending requests");
+        .expect_err("should reject invalid handles even in the nonblocking snapshot");
+        assert!(
+            matches!(
+                result.current_context(),
+                trusted_server_core::platform::PlatformError::Unsupported
+            ),
+            "should reject unsupported deadline handles without panicking"
+        );
     }
 
     #[test]
@@ -370,15 +454,15 @@ mod tests {
     }
 
     #[test]
-    fn expired_deadline_discards_an_already_ready_body() {
+    fn expired_deadline_preserves_an_already_ready_body() {
         let pending = buffered_pending(b"ready".to_vec(), "example");
         let result = futures::executor::block_on(
             FastlyPlatformHttpClient.select_until(vec![pending], Instant::now()),
         )
         .expect("should discard an expired ready response");
         assert!(
-            result.is_none(),
-            "should never accept a ready response after expiration"
+            result.is_some(),
+            "should preserve an already complete response without waiting"
         );
     }
 
@@ -433,6 +517,28 @@ mod tests {
     }
 
     #[test]
+    fn completed_body_moves_into_platform_without_a_payload_copy() {
+        let bytes = vec![b'x'; 32768];
+        let pointer = bytes.as_ptr();
+        let response = super::buffered_response_to_platform(
+            &fastly::Response::new(),
+            "example".to_owned(),
+            bytes,
+        )
+        .expect("should move a buffered response into the platform");
+        assert_eq!(
+            response
+                .response
+                .body()
+                .as_bytes()
+                .expect("should retain a buffered body")
+                .as_ptr(),
+            pointer,
+            "should retain the original allocation without a Fastly host-body roundtrip"
+        );
+    }
+
+    #[test]
     fn body_collection_is_fair_and_preserves_partial_siblings() {
         let large = vec![b'x'; 32768];
         let pending = vec![
@@ -475,6 +581,30 @@ mod tests {
     }
 
     #[test]
+    fn body_at_the_exact_limit_remains_eligible() {
+        let pending = buffered_pending(vec![b'x'; MAX_PLATFORM_RESPONSE_BODY_BYTES], "exact");
+        let result = futures::executor::block_on(
+            FastlyPlatformHttpClient
+                .select_until(vec![pending], Instant::now() + Duration::from_secs(10)),
+        )
+        .expect("should collect an exactly sized body")
+        .expect("should complete before the deadline");
+        let response = result
+            .ready
+            .expect("should accept the configured body-size boundary");
+        assert_eq!(
+            response
+                .response
+                .body()
+                .as_bytes()
+                .expect("should retain buffered bytes")
+                .len(),
+            MAX_PLATFORM_RESPONSE_BODY_BYTES,
+            "should accept the exact limit without evicting its EOF probe"
+        );
+    }
+
+    #[test]
     fn incremental_body_limit_reports_the_failed_backend() {
         let pending = buffered_pending(vec![b'x'; MAX_PLATFORM_RESPONSE_BODY_BYTES + 1], "large");
         let result = futures::executor::block_on(
@@ -495,58 +625,70 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_body_limit_rejects_growth_and_preserves_partial_siblings() {
-        let half_budget = MAX_PLATFORM_RESPONSE_BODY_BYTES / 2;
-        let partial = |unread: Vec<u8>, backend: &str| {
-            let mut pending = DeadlinePending::from_platform(buffered_pending(unread, backend))
-                .expect("should construct a partially buffered response");
-            if let Some(PendingState::Body { bytes, .. }) = &mut pending.state {
-                *bytes = vec![b'x'; half_budget];
-            }
-            pending.into_platform()
-        };
+    fn aggregate_body_pressure_evicts_largest_partial_provider() {
+        let mut large =
+            DeadlinePending::from_platform(buffered_pending(vec![b'x'; 16384], "large"))
+                .expect("should construct a large partial response");
+        if let Some(PendingState::Body { bytes, .. }) = &mut large.state {
+            *bytes = vec![b'x'; MAX_PLATFORM_RESPONSE_BODY_BYTES - 1];
+        }
         let pending = vec![
-            partial(vec![b'x'], "growing"),
-            partial(Vec::new(), "sibling"),
+            buffered_pending(b"healthy".to_vec(), "healthy"),
+            large.into_platform(),
         ];
         let deadline = Instant::now() + Duration::from_secs(10);
         let result =
             futures::executor::block_on(FastlyPlatformHttpClient.select_until(pending, deadline))
-                .expect("should return an attributed capacity failure")
-                .expect("should reject excess buffer growth before deadline");
+                .expect("should return a capacity result")
+                .expect("should reject excess growth");
         assert!(
             result.ready.is_err(),
-            "should reject growth beyond aggregate buffer capacity"
+            "should reject excess aggregate buffering"
         );
         assert_eq!(
             result.failed_backend_name.as_deref(),
-            Some("growing"),
-            "should attribute the capacity failure to the growing provider"
-        );
-        assert_eq!(
-            result.remaining.len(),
-            1,
-            "should preserve the partial sibling response"
+            Some("large"),
+            "should attribute capacity pressure to the largest partial response"
         );
         let result = futures::executor::block_on(
             FastlyPlatformHttpClient.select_until(result.remaining, deadline),
         )
-        .expect("should resume the preserved sibling")
-        .expect("should complete its already buffered body");
-        let response = result.ready.expect("should retain the successful sibling");
+        .expect("should retain the healthy provider")
+        .expect("should complete the healthy provider");
         assert_eq!(
-            response.backend_name.as_deref(),
-            Some("sibling"),
-            "should preserve backend correlation"
+            result
+                .ready
+                .expect("should preserve the healthy bid")
+                .backend_name
+                .as_deref(),
+            Some("healthy"),
+            "should avoid blaming the healthy provider for another provider's large body"
         );
-        let (_, body) = response.response.into_parts();
-        let bytes = body
-            .into_bytes()
-            .expect("should retain a buffered response body");
-        assert_eq!(
-            bytes.len(),
-            half_budget,
-            "should preserve all previously buffered sibling bytes"
+    }
+
+    #[test]
+    fn expired_snapshot_retains_only_ready_results_across_calls() {
+        let pending = vec![
+            buffered_pending(b"one".to_vec(), "one"),
+            buffered_pending(b"two".to_vec(), "two"),
+        ];
+        let deadline = Instant::now();
+        let result =
+            futures::executor::block_on(FastlyPlatformHttpClient.select_until(pending, deadline))
+                .expect("should snapshot ready results")
+                .expect("should return first ready result");
+        assert!(
+            result.ready.is_ok(),
+            "should preserve a complete ready response"
+        );
+        let result = futures::executor::block_on(
+            FastlyPlatformHttpClient.select_until(result.remaining, deadline),
+        )
+        .expect("should use cached ready results")
+        .expect("should return second ready result");
+        assert!(
+            result.ready.is_ok(),
+            "should preserve the second complete response"
         );
     }
 
@@ -562,6 +704,33 @@ mod tests {
             ),
         )
         .expect("should launch fixture request")
+    }
+
+    #[test]
+    #[ignore = "requires the local origin started by tests/deadline_origin.py"]
+    fn network_slow_origin_preserves_ready_bid_without_waiting_for_stalled_sibling() {
+        let fast = network_pending("fast", "GET");
+        let stalled = network_pending("stalled", "GET");
+        let deadline = Instant::now() + Duration::from_millis(40);
+        std::thread::sleep(Duration::from_millis(100));
+        let started = Instant::now();
+        let result = futures::executor::block_on(
+            FastlyPlatformHttpClient.select_until(vec![stalled, fast], deadline),
+        )
+        .expect("should snapshot already ready bids")
+        .expect("should retain the complete fast response");
+        assert!(
+            result.ready.is_ok(),
+            "should preserve a bid available after a slow publisher origin"
+        );
+        assert!(
+            result.remaining.is_empty(),
+            "should abandon the stalled sibling in the nonblocking snapshot"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "should never wait for the stalled sibling after expiration"
+        );
     }
 
     #[test]

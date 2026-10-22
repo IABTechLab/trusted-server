@@ -349,10 +349,11 @@ pub trait PlatformHttpClient: Send + Sync {
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>>;
 
-    /// Prepares an upstream request without waiting for its response.
+    /// Starts an upstream request without waiting for its response.
     ///
-    /// Fastly and Axum start network I/O at dispatch. Worker runtimes may
-    /// defer execution until collection so a deadline can bound all I/O.
+    /// Adapters retain ownership of the request operation so it can progress
+    /// while the publisher origin is fetched. Dropping its pending handle
+    /// cancels or abandons unfinished work according to the runtime contract.
     ///
     /// # Errors
     ///
@@ -415,19 +416,23 @@ pub trait PlatformHttpClient: Send + Sync {
         pending_requests: Vec<PlatformPendingRequest>,
     ) -> Result<PlatformSelectResult, Report<PlatformError>>;
 
-    /// Collects one complete buffered response before an absolute deadline.
+    /// Collects an available response, waiting only until an absolute deadline.
     ///
-    /// Returns `Ok(None)` on expiry, relinquishing every supplied pending
-    /// request. Implementations must bound both header waits and body reads,
-    /// reject completions observed after the cutoff, and cancel outstanding
-    /// work where the runtime supports cancellation. Fastly can abandon pending
-    /// backend requests but cannot cancel them with the installed SDK.
+    /// On expiry, implementations take one nonblocking snapshot of complete
+    /// available responses before relinquishing unfinished requests. This
+    /// preserves buffered bids when a publisher origin delays collection.
+    /// Subsequent calls may drain only the completed snapshot. The deadline
+    /// bounds network waiting, not eligibility by an upstream arrival timestamp.
+    /// Returns `Ok(None)` when no complete response remains. Both header waits
+    /// and body reads must be bounded; unfinished work is canceled or abandoned.
+    /// Fastly cannot cancel backend requests with the installed SDK.
     /// Stream-marked requests require the separate streaming wait contract.
     ///
     /// # Performance
     ///
     /// Complete response bodies are buffered within adapter-specific limits.
-    /// Deadline expiry drops retained partial responses and pending handles.
+    /// Deadline expiry drops incomplete bodies and pending handles after the
+    /// nonblocking snapshot; complete buffered responses remain collectible.
     ///
     /// # Examples
     ///
