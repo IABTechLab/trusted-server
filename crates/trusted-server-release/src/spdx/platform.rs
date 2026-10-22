@@ -100,6 +100,10 @@ fn coverage_gaps(platform: &PlatformEvidence) -> Vec<String> {
             gaps.insert("gnu-privileged-helper-content-unmeasured".to_owned());
         }
     }
+    if platform.fastly_tools().is_some() {
+        gaps.insert("fastly-tool-closure-unmeasured".to_owned());
+        gaps.insert("fastly-original-acquisition-unverified".to_owned());
+    }
     gaps.into_iter().collect()
 }
 
@@ -307,6 +311,32 @@ fn project(
                 &format!("gnu-selected-or-configured-{role}"),
                 sha256,
                 component_role,
+            )?);
+        }
+    }
+    if let Some(fastly) = platform.fastly_tools() {
+        if owner.target != ReleaseTarget::Wasm32Wasip1 {
+            return Err(spdx_error("Fastly measurements belong to another platform"));
+        }
+        fastly
+            .verify_binding(&owner.boundary, &owner.plan)
+            .map_err(|error| error.change_context(ReleaseError::Spdx))?;
+        for (role, sha256) in fastly.measured_files() {
+            if ![
+                "host_compiler",
+                "host_archiver",
+                "configured_host_assembler",
+                "wasm_rust_linker",
+            ]
+            .contains(&role)
+            {
+                return Err(spdx_error("Fastly file role has not been reviewed"));
+            }
+            components.push(measured_file(
+                owner.target,
+                &format!("fastly-selected-or-configured-{role}"),
+                sha256,
+                ComponentRole::BuildTool,
             )?);
         }
     }

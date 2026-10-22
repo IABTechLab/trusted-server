@@ -67,6 +67,7 @@ pub(super) enum CargoQueryOutput {
         tree: Vec<u8>,
         plan_digests: [String; 2],
         denial: DenialReceipt,
+        fastly_tools: Option<Box<super::fastly_tools::FastlyToolEvidence>>,
     },
     /// Pure completion tests never execute Cargo and cannot supply real observations.
     #[cfg(test)]
@@ -262,6 +263,28 @@ impl PreparedRecipe {
                 )
             })
             .transpose()?;
+        let fastly_sandbox = if self.request.asset.artifact().target == ReleaseTarget::Wasm32Wasip1
+            && cfg!(all(target_os = "linux", target_arch = "x86_64"))
+        {
+            Some(MeasurementSandbox::establish(
+                boundary,
+                &self.tools,
+                &self.request.target_dir,
+            )?)
+        } else {
+            None
+        };
+        let fastly_tools = fastly_sandbox
+            .as_ref()
+            .map(|sandbox| {
+                super::fastly_tools::FastlyToolEvidence::measure(
+                    &self.tools,
+                    &self.plan(boundary)?,
+                    &boundary.execution_fingerprint(),
+                    sandbox,
+                )
+            })
+            .transpose()?;
         let denial = proof.receipt_for(&boundary.execution_fingerprint())?;
         let run: Result<_, Report<ReleaseError>> = (|| {
             let query = |kind| {
@@ -286,6 +309,7 @@ impl PreparedRecipe {
                     tree,
                     plan_digests: [metadata_plan, tree_plan],
                     denial,
+                    fastly_tools: fastly_tools.map(Box::new),
                 },
                 result,
                 started_at_seconds,
@@ -304,8 +328,29 @@ impl PreparedRecipe {
                     )?;
                     before.verify_after(&after)?;
                 }
+                if let (
+                    Some(sandbox),
+                    Ok((
+                        CargoQueryOutput::Captured {
+                            fastly_tools: Some(before),
+                            ..
+                        },
+                        _,
+                        _,
+                    )),
+                ) = (&fastly_sandbox, &run)
+                {
+                    let after = super::fastly_tools::FastlyToolEvidence::measure(
+                        &self.tools,
+                        &self.plan(boundary)?,
+                        &boundary.execution_fingerprint(),
+                        sandbox,
+                    )?;
+                    before.verify_after(&after)?;
+                }
                 Ok(())
             });
+
         let (queries, result, started_at_seconds) = match (run, after) {
             (Ok(result), Ok(())) => result,
             (Ok(_), Err(changed)) => return Err(changed),
@@ -385,12 +430,13 @@ impl PreparedRecipe {
             },
             paths,
         )?;
-        let (mut cargo_observations, denial_receipt) = match run.queries {
+        let (mut cargo_observations, denial_receipt, fastly_tools) = match run.queries {
             CargoQueryOutput::Captured {
                 metadata,
                 tree,
                 plan_digests,
                 denial,
+                fastly_tools,
             } => {
                 if !denial.matches_fingerprint(&boundary_fingerprint) {
                     return Err(recipe_error(
@@ -406,10 +452,14 @@ impl PreparedRecipe {
                     CargoCapture::new(metadata, tree, &run.stdout, &layout, plan_digests)?;
                 let selected_package_id =
                     captured.require_binary(&manifest, artifact.bin, &located.execution)?;
-                (Some((captured, selected_package_id)), Some(denial))
+                (
+                    Some((captured, selected_package_id)),
+                    Some(denial),
+                    fastly_tools,
+                )
             }
             #[cfg(test)]
-            CargoQueryOutput::Fixture => (None, None),
+            CargoQueryOutput::Fixture => (None, None, None),
         };
         let copied = copy_artifact(
             &located.host,
@@ -480,6 +530,20 @@ impl PreparedRecipe {
                         })?;
                         gnu.verify_binding(&boundary_fingerprint, plan_digest.sha256())?;
                         platform.with_gnu(gnu)?
+                    } else {
+                        platform
+                    };
+                    if artifact.target == ReleaseTarget::Wasm32Wasip1
+                        && cfg!(all(target_os = "linux", target_arch = "x86_64"))
+                        && fastly_tools.is_none()
+                    {
+                        return Err(recipe_error(
+                            "Fastly completion lacks enforced host-tool measurements",
+                        ));
+                    }
+                    let platform = if let Some(evidence) = fastly_tools {
+                        evidence.verify_binding(&boundary_fingerprint, plan_digest.sha256())?;
+                        platform.with_fastly_tools(*evidence)?
                     } else {
                         platform
                     };

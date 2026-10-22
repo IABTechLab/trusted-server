@@ -159,8 +159,8 @@ fn measurement_probe(_tools: &SelectedRustTools) -> Result<ProbeProgram, Report<
 /// run in this one instance, so their receipts stay byte-identical, and the
 /// sandbox carries its own denial proof.
 pub(super) struct MeasurementSandbox {
-    boundary: Boundary,
-    proof: DenialProof,
+    pub(super) boundary: Boundary,
+    pub(super) proof: DenialProof,
 }
 
 impl MeasurementSandbox {
@@ -261,6 +261,9 @@ fn compiler_query(argument: &str, working: &Path) -> Result<String, Report<Relea
 /// compiler queries, unsupported sysroots and oversized installed inventories.
 /// This private helper supplies no selection or qualification capability.
 pub(crate) fn helper_measurement() -> Result<Vec<u8>, Report<ReleaseError>> {
+    if std::env::var_os("TRUSTED_SERVER_FASTLY_TOOL_MEASUREMENT").is_some() {
+        return super::fastly_tools::helper_measurement();
+    }
     if !cfg!(target_os = "linux") {
         return Err(recipe_error("GNU measurement helper requires Linux"));
     }
@@ -601,4 +604,9 @@ impl GnuEvidence {
         }
         Ok(())
     }
+}
+
+/// Hashes a resolved image regular file without following its final alias.
+pub(super) fn hash_image_file(path: &Path) -> Result<(String, u64), Report<ReleaseError>> {
+    image::image_file_hash(path)
 }

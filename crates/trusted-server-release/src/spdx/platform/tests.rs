@@ -583,3 +583,64 @@ fn coverage_gaps_retain_apple_exclusions_and_unmeasured_tool_closure() {
         "should not report unresolved host paths for explicit Apple files"
     );
 }
+
+#[test]
+fn fastly_selected_tools_project_with_owner_binding_and_conservative_gaps() {
+    let platform = projection_fixture(ReleaseTarget::Wasm32Wasip1)
+        .with_fastly_tools(crate::recipe::fastly_tools::FastlyToolEvidence::projection_fixture())
+        .expect("should attach fictional Fastly selections");
+    let mut owner = Owner::fixture(&platform);
+    let components = project(&platform, &owner).expect("should project fixed host files");
+    let files = components
+        .iter()
+        .filter(|component| matches!(component.origin, Some(Origin::PlatformMeasuredFile { .. })))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        files.len(),
+        4,
+        "should project four selected or configured files"
+    );
+    for component in files {
+        assert!(
+            component.roles == [ComponentRole::BuildTool],
+            "should retain installed tool scope"
+        );
+        assert!(
+            component.declared_license.is_none(),
+            "should not invent acquisition or license"
+        );
+        assert!(
+            !component.identity.contains("/boundary"),
+            "should exclude private paths from identity"
+        );
+    }
+    let gaps = coverage_gaps(&platform);
+    for gap in [
+        "native-tool-host-path-unresolved:assembler",
+        "native-tool-host-path-unresolved:build_tools",
+        "fastly-tool-closure-unmeasured",
+        "native-material-coverage-incomplete",
+    ] {
+        assert!(
+            gaps.contains(&gap.to_owned()),
+            "should retain honest gap {gap}"
+        );
+    }
+    for role in ["compiler", "archiver", "linker"] {
+        assert!(
+            !gaps.contains(&format!("native-tool-host-path-unresolved:{role}")),
+            "should resolve selected host role {role}"
+        );
+    }
+    owner.boundary = [2; 32];
+    assert!(
+        project(&platform, &owner).is_err(),
+        "should reject another boundary"
+    );
+    owner.boundary = [1; 32];
+    owner.plan = "f".repeat(64);
+    assert!(
+        project(&platform, &owner).is_err(),
+        "should reject another plan"
+    );
+}

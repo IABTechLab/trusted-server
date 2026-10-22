@@ -77,7 +77,7 @@ fn open_image_file(path: &Path) -> std::io::Result<fs::File> {
 /// Hashes one held no-follow regular file from the read-only image namespace.
 ///
 /// Unlike host document handling, image hardlinks are permitted. Only the
-/// confined GNU helper uses this policy to construct production measurements.
+/// confined GNU and Fastly helpers use this policy to measure candidate files.
 pub(super) fn image_file_hash(path: &Path) -> Result<(String, u64), Report<ReleaseError>> {
     let file = open_image_file(path).map_err(|error| {
         recipe_error(format!(

@@ -327,6 +327,26 @@ Implementation sequencing: review the local validation framework and candidate b
 
 ### Task 9: Implement fixed fresh Rust recipes and native inspection
 
+Fastly host-tool selection increment (2026-10-22): the Linux x86_64 candidate
+plan explicitly selects `/usr/bin/cc` as its host Rust linker driver and
+`HOST_CC`, `/usr/bin/ar` as `HOST_AR`, and the measured Rust tree's
+`lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld` as the Wasm linker.
+The host-triple Cargo linker setting applies to host artifacts during an
+explicit-target build; no unstable host configuration or compiler wrapper is
+introduced. Host C selectors do not establish target C compilation or prove
+that the selected drivers executed. Existing GNU and Apple selections stay
+separate.
+
+The existing staged measurement helper gains a fixed private Fastly mode,
+without a new command in `main.rs`. It runs before and after Cargo in the
+existing denied sibling sandbox, excluding the writable target root. It checks
+the actual Rust host, resolves and hashes selected files inside the image,
+and independently hashes the compiler's reported assembler candidate. The
+receipt binds the helper, exact plan and build/measurement boundary identities;
+changed before/after observations fail. This changes only the opaque
+`platform.native_tools` receipt payload, not the checked composition fields or
+candidate-index companion formats. Production selection remains closed.
+
 **Retain/modify:** `scripts/release/build.sh` and approved native bootstrap. **Create:** release tool `src/recipe.rs`, `inspect.rs`, private registered recipe/native/final-Fastly tests and public-command process fixtures.
 
 - [ ] Test unknown asset/variant, reused target output, source/material mutation, unselected native library, GLIBC symbol ceiling violations, runner-only paths and Mach-O deployment-target mismatch. Add role-specific variation fixtures: missing selected B variation, normalized values misreported as varied, unsupported user variation claimed as passed and incorrect observed concurrency/umask.
@@ -345,6 +365,40 @@ Progress (2026-10-16, no Task 9 exit yet): the closed recipe, checked A/B ambien
 
 ### Task 10: Record selected Cargo units and native materials
 
+Fastly selected-file evidence (2026-10-22, local implementation; hosted proof
+pending): the receipt retains selected and resolved paths, SHA-256 and size for
+the host C compiler driver, host archiver, configured host assembler candidate
+and selected Wasm Rust linker. The host Rust linker selects the same measured
+C driver. SPDX projects these four raw files only as build tools, with no
+invented acquisition, download, license or executed-helper claims. The bound
+Rust installed-tree measurement remains separate.
+
+After successful denied measurement, the compiler, archiver and linker
+host-path gaps can be removed for this explicitly selected Linux profile.
+The assembler is merely compiler-configured, so its role gap remains. Expected
+candidate SPDX gaps are exactly `fastly-original-acquisition-unverified`,
+`fastly-tool-closure-unmeasured`, `native-material-coverage-incomplete`,
+`native-tool-host-path-unresolved:assembler` and
+`native-tool-host-path-unresolved:build_tools`. Missing or inconsistent required
+measurements fail rather than manufacturing evidence. Other profiles retain
+their existing gaps. This does not complete Task 10, original acquisition,
+qualification or qualified SPDX generation. The next hosted Fastly candidate
+must confirm these gaps and the unchanged real producer-receipt check before
+this increment is described as integrated.
+
+Local verification passed 216 pure tests: 70 SPDX, 68 composition, seven Fastly
+tool tests, 18 GNU measurements, 14 recipe-plan, 13 tool-selection, four
+source-replacement, 20 completion and two unchanged candidate-index golden
+tests. The explicit-selection assertion failed against the previous bare
+driver selection and passed after restoring the implementation. Filesystem
+tests independently check raw SHA-256/size, changed bytes and escaping aliases;
+parser tests reject malformed compiler queries. Strict host-target
+all-target/all-feature Clippy, all-feature documentation and formatting passed.
+Independent specification and quality reviews found no remaining blockers.
+The minimal Fastly expectations in `recipe/tests/plan.rs` were explicitly
+authorized; their Linux branch and real boundary execution remain hosted checks.
+No process-spawning or ignored tests were run locally.
+
 Remaining dependency audit (2026-10-22, `41560cfd9`): the open capture exit
 below requires conservative native/tool coverage. The specification does not
 require an exact compiler DAG or mandatory execution tracing: an inventory of
@@ -353,15 +407,15 @@ also establish closure. The current recipes do not establish that containment.
 The next implementation must address these dependencies rather than treating
 another successful snapshot hash as closure:
 
-| Remaining evidence                      | Dependency and current limitation                                                                                                                                                                                                                                                                                            |
-| --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Fastly host tools and supporting inputs | Task 9 must select and constrain the compiler, assembler, archiver, linker and build tools; Task 10 must measure and join them. `composition/platform.rs` still records five unresolved roles. GNU CLI receipts do not cover Fastly automatically.                                                                           |
-| GNU tool/input closure                  | Task 9 must constrain or account for relevant inputs beyond the inventory roots; Task 10 must inventory and join that closure. `recipe/gnu/image.rs` explicitly leaves other files available. Configured helper paths are observations, not exhaustive dependency coverage.                                                  |
-| Apple tool/library closure              | Task 9 must constrain or account for relevant inputs outside measured directories; Task 10 must measure and join them. `recipe/apple.rs` permits broad developer-directory access. Measuring the selected toolchain's entire `usr/lib` does not resolve outside-directory or transitive dependency inputs.                   |
-| Unreadable GNU privileged helpers       | Tasks 9/10 must obtain measured content or establish reviewed, enforced noncontribution/exclusion treatment for the three helpers. Acquisition evidence alone cannot close their content gap. Retain metadata-only observations and the gap until proven; do not infer hashes or expand privileges.                          |
-| Original acquisition                    | Tasks 3/8 must bind authenticated Rust/tool/SDK/image distributions to the selected inputs. Installed-tree hashes do not authenticate original acquisition; pending pins in `scripts/release/release-tools.json` remain pending.                                                                                             |
-| Platform qualification                  | Task 8 must qualify the actual platform, boundary and recipes against the selected closure. Passing ordinary-CI candidates does not construct the closed qualified tool or sandbox types.                                                                                                                                    |
-| Complete owning composition             | Task 10 must resolve the first four material-coverage rows before supplying complete composition evidence. Acquisition and production qualification are independent additional requirements; complete measured coverage alone would not open `spdx::generate_from_completed`, which deliberately rejects current candidates. |
+| Remaining evidence                      | Dependency and current limitation                                                                                                                                                                                                                                                                                                                                    |
+| --------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Fastly host tools and supporting inputs | At audit head `41560cfd9`, five host-tool roles were unresolved. The increment above measures selected Linux host compiler/archiver/linkers while retaining assembler, build-tools and full-closure gaps. Other Fastly profiles keep all five role gaps. Supporting inputs still require Task 9/10 closure work; GNU CLI receipts do not cover Fastly automatically. |
+| GNU tool/input closure                  | Task 9 must constrain or account for relevant inputs beyond the inventory roots; Task 10 must inventory and join that closure. `recipe/gnu/image.rs` explicitly leaves other files available. Configured helper paths are observations, not exhaustive dependency coverage.                                                                                          |
+| Apple tool/library closure              | Task 9 must constrain or account for relevant inputs outside measured directories; Task 10 must measure and join them. `recipe/apple.rs` permits broad developer-directory access. Measuring the selected toolchain's entire `usr/lib` does not resolve outside-directory or transitive dependency inputs.                                                           |
+| Unreadable GNU privileged helpers       | Tasks 9/10 must obtain measured content or establish reviewed, enforced noncontribution/exclusion treatment for the three helpers. Acquisition evidence alone cannot close their content gap. Retain metadata-only observations and the gap until proven; do not infer hashes or expand privileges.                                                                  |
+| Original acquisition                    | Tasks 3/8 must bind authenticated Rust/tool/SDK/image distributions to the selected inputs. Installed-tree hashes do not authenticate original acquisition; pending pins in `scripts/release/release-tools.json` remain pending.                                                                                                                                     |
+| Platform qualification                  | Task 8 must qualify the actual platform, boundary and recipes against the selected closure. Passing ordinary-CI candidates does not construct the closed qualified tool or sandbox types.                                                                                                                                                                            |
+| Complete owning composition             | Task 10 must resolve the first four material-coverage rows before supplying complete composition evidence. Acquisition and production qualification are independent additional requirements; complete measured coverage alone would not open `spdx::generate_from_completed`, which deliberately rejects current candidates.                                         |
 
 Paths in the table are relative to `crates/trusted-server-release/src/` unless
 shown otherwise. Content measurement, dependency closure, authenticated original
