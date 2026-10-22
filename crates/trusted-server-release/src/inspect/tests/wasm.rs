@@ -31,6 +31,30 @@ fn valid_core_module_is_accepted_with_observed_imports() {
 }
 
 #[test]
+fn reviewed_fastly_async_io_imports_are_recorded() {
+    let bytes = wasm_module(&[
+        ("fastly_async_io", "is_ready"),
+        ("fastly_async_io", "select"),
+    ]);
+    let facts = inspect_wasm(&bytes).expect("should accept the reviewed asynchronous host module");
+    assert_eq!(
+        facts.import_modules(),
+        ["fastly_async_io"],
+        "should retain the exact observed import module"
+    );
+    assert_eq!(
+        facts.function_imports(),
+        2,
+        "should record both asynchronous host calls"
+    );
+    assert_eq!(
+        facts.sha256(),
+        sha256_hex(&bytes),
+        "should bind the exact inspected bytes"
+    );
+}
+
+#[test]
 fn import_free_module_is_accepted() {
     let facts = inspect_wasm(&wasm_module(&[])).expect("should accept an empty module");
 
@@ -47,6 +71,11 @@ fn unknown_import_module_is_rejected() {
         "spin:example/key-value",
         "env",
         "fastly_example",
+        "fastly_async_io_extra",
+        "FASTLY_ASYNC_IO",
+        "fastly_async_io/v1",
+        "fastly_backend",
+        "fastly_abi",
     ] {
         let bytes = wasm_module(&[("wasi_snapshot_preview1", "fd_write"), (module, "call")]);
 
@@ -60,16 +89,22 @@ fn unknown_import_module_is_rejected() {
 
 #[test]
 fn non_function_import_is_rejected() {
-    let mut bytes = b"\0asm\x01\0\0\0".to_vec();
-    let mut body = vec![1];
-    for name in ["fastly_log", "memory"] {
-        body.push(u8::try_from(name.len()).expect("should fit"));
-        body.extend_from_slice(name.as_bytes());
-    }
-    body.extend_from_slice(&[2, 0, 1]);
-    section(&mut bytes, 2, &body);
+    for module in ["fastly_log", "fastly_async_io"] {
+        let mut bytes = b"\0asm\x01\0\0\0".to_vec();
+        let mut body = vec![1];
+        for name in [module, "memory"] {
+            body.push(u8::try_from(name.len()).expect("should fit"));
+            body.extend_from_slice(name.as_bytes());
+        }
+        body.extend_from_slice(&[2, 0, 1]);
+        section(&mut bytes, 2, &body);
 
-    assert_eq!(violation(inspect_wasm(&bytes)), Violation::WasmImport);
+        assert_eq!(
+            violation(inspect_wasm(&bytes)),
+            Violation::WasmImport,
+            "should reject non-function imports from {module}"
+        );
+    }
 }
 
 #[test]

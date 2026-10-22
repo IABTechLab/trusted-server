@@ -13,10 +13,12 @@ use crate::error::ReleaseError;
 
 /// Reviewed import modules of the Fastly Compute host ABI.
 ///
-/// Observed in a local release build of `trusted-server-adapter-fastly`:
-/// WASI preview 1 plus these `fastly_*` hostcall modules. A new module is a
-/// host-ABI change and needs review before it is added.
+/// Observed in release builds of `trusted-server-adapter-fastly`: WASI
+/// preview 1 plus these `fastly_*` hostcall modules. The locked SDK 0.13.1
+/// also uses the reviewed asynchronous I/O module supported by Viceroy 0.21.0.
+/// Adding a module changes the host ABI policy and requires review.
 pub(crate) const FASTLY_IMPORT_MODULES: &[&str] = &[
+    "fastly_async_io",
     "fastly_cache",
     "fastly_compute_runtime",
     "fastly_config_store",

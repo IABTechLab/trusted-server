@@ -748,6 +748,43 @@ pass. Independent specification/security and code-quality reviews find no
 blockers. Actual candidate builds and their receipts still require hosted
 validation after this correction.
 
+Hosted native acceptance (2026-10-22): run `39729655151` at `5d194d00f`
+builds merge `a8c33bcc9990a4eb6520a8afd0f7dd2641c25111`. Linux CLI job
+`119661528635`, Apple ARM job `119667144194` and Apple Intel job `119667144562`
+all pass their actual producer fixtures, retaining composition receipts with
+native completeness and release qualification false. Linux/ARM record
+495 packages, 659 units and 61 build-script executions; Intel records
+496 packages, 660 units and 61 executions. The real-receipt assertions pass.
+
+Both Apple legs measure 6,205 selected toolchain library entries and
+2,601,020,072 regular bytes, with digest
+`da141ea11bf363ffcf61e620ccf28cf72224a7439d3e08e5cc945df01eb2333e`.
+Their fixtures complete in 1,277.15 and 2,279.81 seconds respectively. This
+accepts the inventory increment under the existing cohort budgets; no separate
+inventory timing is logged, so its isolated cost is not established. Both
+retain exactly `apple-coverage-excluded:toolchain_libraries`,
+`apple-tool-closure-unmeasured` and `native-material-coverage-incomplete`.
+Linux retains exactly `gnu-original-acquisition-unverified`,
+`gnu-privileged-helper-content-unmeasured`, `gnu-tool-closure-unmeasured` and
+`native-material-coverage-incomplete`. These results do not complete Tasks 10/11.
+
+The same run's only failing job is Fastly `119661528580`: canonical Wasm
+inspection rejects `fastly_async_io`. The Cargo bookkeeping barrier is passed;
+no Fastly runtime, reproduction, SPDX or four-asset index acceptance is inferred.
+Review of locked `fastly-sys` 0.13.1 and project async request call paths binds
+this module to `select`/`is_ready`; pinned Viceroy 0.21.0 registers it. Admit only
+that exact module. Other unreviewed SDK modules and component-style imports stay
+rejected, along with non-function imports, invalid Wasm, wrong entry ABI and
+missing debug information. A pure two-function regression first reproduces the
+failure and passes after the policy update. Actual Fastly acceptance remains
+a hosted check after the fix.
+
+The scoped ABI verification passes 223 pure tests, including all 68 artifact
+inspection tests, plus strict host-target clippy, documentation, read-only
+workspace formatting and plan Prettier. Independent specification/security and
+code-quality reviews find no blockers. No runtime gate, receipt field,
+qualification flag or companion golden changes.
+
 ### Task 11: Generate complete artifact-specific SPDX
 
 JavaScript declaration guard (2026-10-22): projected JavaScript facts contain no
