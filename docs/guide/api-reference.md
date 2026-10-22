@@ -325,6 +325,9 @@ optional and must be `json` when present. A request is admitted only when
 request carries `X-TSJS-Page-Bids`. Every `OPTIONS` request is denied so a
 cross-origin caller cannot acquire permission to send that non-simple header.
 
+`/_ts/page-bids` never writes KV. Browser EIDs in `ts-eids` reach KV at the
+visitor's next full page load.
+
 **Response schema:** `200 application/json` with `{ "slots": [...], "bids":
 {...} }`. The ad-stack kill switch, an auction kill switch, or denied consent
 returns empty collections. Unknown `format` returns `400`; a rejected GET or
@@ -368,6 +371,11 @@ below `[publisher].domain` receive reflected credentialed CORS for
 `200` for no origin or an allowed origin. There is no endpoint rate limiter.
 The endpoint is Fastly-only and requires the EC store and a statically
 configured `[[ec.partners]]` token.
+
+The endpoint never writes KV. It reports a stored `cluster_size`, or computes
+one without storing it. It returns only a UID the shared servability check
+allows for this request: an expired ID, or one whose writing provider's
+consent policy fails under the request's consent, is omitted.
 
 **Request:**
 

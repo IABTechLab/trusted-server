@@ -319,6 +319,35 @@ the publisher origin's `Cookie` header:
   consent-forwarding mode. A `Cookie` header that is not valid UTF-8 is
   dropped rather than forwarded.
 
+## Identity Cookies and the Single KV Write
+
+Only a full page load writes the EC identity row, once, after the page has
+been sent. That request is the **writer**: a real browser's top-level
+document navigation (`Sec-Fetch-Dest: document`, not a prefetch) to the
+publisher or an integration proxy. Every other request, including `/auction`,
+`/_ts/page-bids`, `/_ts/api/v1/identify`, iframes and prefetches, never writes
+KV. It saves what it learned in two server-owned cookies instead, and the next
+writer writes it:
+
+- **`__Host-ts-eids-s`** caches provider-collected IDs and holds entries other
+  requests staged, such as browser EIDs that `/auction` saw in its request
+  body and KV does not have yet. At most 2,048 bytes.
+- **`__Host-ts-eids-r-<id>`** holds one response's removals and opt-outs not
+  yet in KV. Each removal batch gets its own cookie, so a concurrent request
+  cannot lose it. At most 512 bytes each. A batch that does not fit, or meets
+  four such cookies, is written to KV before send instead.
+
+Both are sealed with AES-256-GCM, bound to the visitor's EC ID, host-only,
+`HttpOnly`, `Secure` and `SameSite=Lax`, and last a year. The TSJS shim never
+reads or writes them, and neither reaches the publisher origin or Prebid
+Server. A cookie copied from another visitor, or left after an EC rotation,
+does not open and is ignored. A consent withdrawal expires `__Host-ts-eids-s`.
+
+A new visitor's row is still created before the EC cookie is set, carrying the
+browser's EIDs, so a new visitor's page load is also one write. Two writes
+outside that rule remain: a consent withdrawal's tombstone, and an overflowing
+removal batch.
+
 ## Operational Notes
 
 - Rotate the secret periodically. Rotation produces a new 64-hex base
@@ -333,7 +362,7 @@ the publisher origin's `Cookie` header:
 - When consent is blocked but not explicitly withdrawn, Trusted Server strips EC response headers for that request but leaves any existing `ts-ec` cookie intact; cookie expiry and tombstones happen only on explicit withdrawal.
 - `/_ts/api/v1/identify` is read-oriented and returns identity enrichment for the authenticated partner. It computes `cluster_size` only when the EC entry does not already store one.
 - `/_ts/api/v1/batch-sync` validates every input, groups valid mappings by normalized EC ID, and applies the last valid UID for each group once. Group outcomes still account for every original input; infrastructure failures reject the failing and remaining groups. Mapping timestamps remain required for API compatibility but do not order writes. See the [API Reference](/guide/api-reference) for the complete contract.
-- Pull sync fills missing partner UIDs only. Existing partner UIDs are not periodically refreshed because EC entries no longer store per-partner sync timestamps.
+- Pull partners fill missing partner UIDs only, and run after a returning visitor's page load has been sent, from the visitor's second page load. A failing partner backs off per visitor: a few minutes after a transport failure, up to an hour, and an hour after a rejected request, up to a day.
 
 ## Next Steps
 
