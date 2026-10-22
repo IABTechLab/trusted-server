@@ -3060,7 +3060,11 @@ impl Settings {
     pub fn from_toml_and_env(toml_str: &str) -> Result<Self, Report<TrustedServerError>> {
         let overrides = std::env::vars_os()
             .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
-            .filter(|(key, _)| !BUILD_ENVIRONMENT_VARIABLES.contains(&key.as_str()))
+            .filter(|(key, _)| {
+                !BUILD_ENVIRONMENT_VARIABLES
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(key))
+            })
             .collect();
         let environment = Environment::default()
             .prefix(ENVIRONMENT_VARIABLE_PREFIX)
@@ -6320,11 +6324,18 @@ source_domain = "partner.example.com"
     fn legacy_env_loader_ignores_build_time_git_version() {
         let toml_str = crate_test_settings_str();
 
-        for value in ["v0.0.0-example", ""] {
-            temp_env::with_var("TRUSTED_SERVER__GIT_VERSION", Some(value), || {
-                Settings::from_toml_and_env(&toml_str)
-                    .expect("should ignore the build-time git version input");
-            });
+        for key in [
+            "TRUSTED_SERVER__GIT_VERSION",
+            "trusted_server__git_version",
+            "Trusted_Server__Git_Version",
+        ] {
+            for value in ["v0.0.0-example", ""] {
+                temp_env::with_var(key, Some(value), || {
+                    Settings::from_toml_and_env(&toml_str).expect(
+                        "should ignore the build-time git version input regardless of case",
+                    );
+                });
+            }
         }
     }
 
