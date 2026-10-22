@@ -236,7 +236,6 @@ fn dispatch_marked(
     );
     let facts = writer_facts(context, finalize);
     let request = EligibilityRequest {
-        identity: &finalize.identity,
         view: &view,
         facts: &facts,
         consent: context.consent(),

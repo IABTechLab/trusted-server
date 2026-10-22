@@ -187,7 +187,6 @@ pub(crate) fn candidates(
 ) -> Vec<Candidate> {
     let facts = writer_facts(context, finalize);
     let request = EligibilityRequest {
-        identity: &finalize.identity,
         view,
         facts: &facts,
         consent: context.consent(),

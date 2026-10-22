@@ -384,6 +384,10 @@ impl Resolves {
     }
 
     /// Inputs passed when available.
+    #[expect(
+        dead_code,
+        reason = "the providers change (passive capture, hold mode, the breaker) uses this"
+    )]
     #[must_use]
     pub(crate) fn wants(&self) -> &BTreeSet<Input> {
         &self.wants
@@ -452,6 +456,13 @@ impl Captures {
     }
 
     /// Whether a proxied request matches a rule.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the providers change (passive capture, hold mode, the breaker) uses this"
+        )
+    )]
     #[must_use]
     pub(crate) fn matches(&self, method: &Method, path: &str) -> bool {
         self.paths
@@ -464,18 +475,30 @@ impl Captures {
     }
 
     /// Exact path rules.
+    #[expect(
+        dead_code,
+        reason = "the providers change (passive capture, hold mode, the breaker) uses this"
+    )]
     #[must_use]
     pub(crate) fn paths(&self) -> &[(Method, String)] {
         &self.paths
     }
 
     /// Prefix rules.
+    #[expect(
+        dead_code,
+        reason = "the providers change (passive capture, hold mode, the breaker) uses this"
+    )]
     #[must_use]
     pub(crate) fn prefixes(&self) -> &[String] {
         &self.prefixes
     }
 
     /// Declared body consent pointers.
+    #[expect(
+        dead_code,
+        reason = "the providers change (passive capture, hold mode, the breaker) uses this"
+    )]
     #[must_use]
     pub(crate) fn consent_pointers(&self) -> &[&'static str] {
         &self.consent_pointers

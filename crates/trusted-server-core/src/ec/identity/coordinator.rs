@@ -76,6 +76,7 @@ pub(crate) struct EligibilityView {
 
 impl EligibilityView {
     /// A view with nothing stored.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn empty() -> Self {
         Self::default()
@@ -252,6 +253,13 @@ impl EligibilityView {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Phase {
     /// Before the auction.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the providers change (passive capture, hold mode, the breaker) uses this"
+        )
+    )]
     Hold,
     /// The phase-2 dry run of an after-send provider.
     AfterSendDryRun,
@@ -313,7 +321,6 @@ pub(crate) enum Eligibility {
 
 /// The request-wide inputs of an eligibility decision.
 pub(crate) struct EligibilityRequest<'a> {
-    pub(crate) identity: &'a IdentitySettings,
     pub(crate) view: &'a EligibilityView,
     pub(crate) facts: &'a RequestFacts,
     pub(crate) consent: &'a ConsentContext,
@@ -504,6 +511,13 @@ pub(crate) enum CallOutcome {
     /// A transport error, timeout, 429 or 5xx.
     TransportFailure,
     /// The circuit breaker was open.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the providers change (passive capture, hold mode, the breaker) uses this"
+        )
+    )]
     BreakerOpen,
     /// Not sent for a reason the stored row does not show, such as the
     /// per-visitor burst cap. Phase 4 backs a marked provider off by a minute.
@@ -860,7 +874,6 @@ mod tests {
                 settings,
                 phase,
                 &EligibilityRequest {
-                    identity: &self.identity,
                     view,
                     facts,
                     consent: &self.consent,

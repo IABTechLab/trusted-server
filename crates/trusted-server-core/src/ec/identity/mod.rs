@@ -6,13 +6,6 @@
 //! KV write-back, so every page load makes at most one browser-driven KV
 //! write.
 
-// Several crate-private helpers are only called once the coordinator is wired
-// into requests later in this series. Remove this allow when that lands.
-#![allow(
-    dead_code,
-    reason = "crate-private identity helpers are wired into requests by later commits"
-)]
-
 pub(crate) mod catalog;
 pub mod config;
 pub(crate) mod cookie;

@@ -199,6 +199,7 @@ impl IdentityMutation {
     }
 
     /// Whether it holds a removal, opt-out, clear or `iv` hash.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn has_removals(&self) -> bool {
         self.partner_ids.iter().any(PartnerIdChange::is_removal)

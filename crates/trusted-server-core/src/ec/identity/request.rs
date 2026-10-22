@@ -37,6 +37,7 @@ impl RawIdentityCookies {
     }
 
     /// Whether the request carried either cookie.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn has_any(&self) -> bool {
         self.s.is_some() || !self.r.is_empty()

@@ -207,38 +207,10 @@ impl<'p> ProviderHarness<'p> {
         }
     }
 
-    /// Sets the client IP.
-    #[must_use]
-    pub(crate) fn with_client_ip(mut self, ip: &str) -> Self {
-        self.client_ip = Some(ip.parse().expect("should parse the client IP"));
-        self
-    }
-
-    /// Sets the user agent.
-    #[must_use]
-    pub(crate) fn with_user_agent(mut self, user_agent: &str) -> Self {
-        self.user_agent = Some(user_agent.to_owned());
-        self
-    }
-
     /// Sets the EC ID, which only generic pull may read.
     #[must_use]
     pub(crate) fn with_ec_id(mut self, ec_id: &str) -> Self {
         self.ec_id = Some(ec_id.to_owned());
-        self
-    }
-
-    /// Stores a record for `source`, which makes its kind `Refresh`.
-    #[must_use]
-    pub(crate) fn with_stored(
-        mut self,
-        source: &str,
-        record: &crate::ec::kv_types::KvPartnerId,
-    ) -> Self {
-        self.stored.insert(
-            source.parse().expect("should parse source"),
-            crate::ec::identity::StoredId::from_record(record),
-        );
         self
     }
 

@@ -159,6 +159,7 @@ impl fmt::Debug for HashedEmail {
 
 impl HashedEmail {
     /// From digest bytes. No code in v1 constructs one outside tests.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
@@ -288,10 +289,10 @@ impl RandomSource for ThreadRandom {
 }
 
 /// Deterministic bytes for tests: xorshift64* from a seed.
-#[cfg(any(test, feature = "test-utils"))]
+#[cfg(test)]
 pub(crate) struct SeededRandom(std::sync::Mutex<u64>);
 
-#[cfg(any(test, feature = "test-utils"))]
+#[cfg(test)]
 impl SeededRandom {
     /// A generator seeded with `seed`. A zero seed is replaced by one,
     /// because xorshift never leaves zero.
@@ -300,7 +301,7 @@ impl SeededRandom {
     }
 }
 
-#[cfg(any(test, feature = "test-utils"))]
+#[cfg(test)]
 impl RandomSource for SeededRandom {
     fn fill(&self, bytes: &mut [u8]) {
         let mut state = self.0.lock().expect("should lock the seed");
@@ -632,6 +633,13 @@ impl fmt::Debug for CaptureInput<'_> {
 
 impl<'a> CaptureInput<'a> {
     /// The input for one capture.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the providers change (passive capture, hold mode, the breaker) uses this"
+        )
+    )]
     #[must_use]
     pub(crate) fn new(parts: CaptureParts<'a>) -> Self {
         Self { parts }

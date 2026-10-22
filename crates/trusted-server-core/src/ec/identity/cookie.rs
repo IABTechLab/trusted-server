@@ -316,6 +316,7 @@ impl SEntry {
     }
 
     /// A provider entry staged at `sa`, replacing revision `pv`.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn staged_provider(
         s: usize,
@@ -361,6 +362,7 @@ impl SEntry {
     }
 
     /// The UID, absent on a stub.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn uid(&self) -> Option<&str> {
         self.u.as_deref()
@@ -939,6 +941,7 @@ pub(crate) struct OpenedRemovals {
 }
 
 /// Opens every `__Host-ts-eids-r-*` cookie for this EC.
+#[cfg(test)]
 #[must_use]
 pub(crate) fn open_r_cookies(
     keys: &IdentityKeys,
