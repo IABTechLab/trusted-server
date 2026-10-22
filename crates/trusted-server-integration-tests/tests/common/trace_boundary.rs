@@ -267,7 +267,7 @@ fn with_trace_runtime(
                 .arg("--key-value")
                 .arg(format!("{CONFIG_BLOB_KEY}={envelope}"))
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stderr(Stdio::inherit())
                 .spawn()
                 .expect("should spawn isolated Spin runtime");
             let process = RuntimeProcess {
