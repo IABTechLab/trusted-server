@@ -319,7 +319,7 @@ Callers:
 
 ## Consent and privacy
 
-Click wrapping decides whether a creative click carries the visitor's EC ID to the landing page. `/first-party/click` (`proxy.rs:1627-1668`) appends the request's `ts-ec` value to the landing URL and logs the click (target, referer, user agent, EC ID) at `info`. `/first-party/proxy` appends it to proxied asset requests (`forward_ec_id: true`, `proxy.rs:1592`).
+Click wrapping decides whether a creative click carries the visitor's EC ID to the landing page. `/first-party/click` (`proxy.rs:1556-1597`) appends the request's `ts-ec` value to the landing URL and logs the click (target, referer, user agent, EC ID) at `info`. `/first-party/proxy` appends it to proxied asset requests (`forward_ec_id: true`, `proxy.rs:1521`).
 
 - `rewrite_clicks = false` stops landing-page forwarding on every path, including links in HTML fetched through `/first-party/proxy`.
 - `rewrite_clicks = true` with `rewrite_creatives = false` forwards it to landing pages while assets load direct.
