@@ -427,22 +427,19 @@ fn is_wasi_forbidden_outbound_header(name: &str) -> bool {
         || name.eq_ignore_ascii_case("proxy-connection")
 }
 
-/// Carries a completed response through `send_async` → `select`.
+/// Owns the outbound operation until selection completes or drops it.
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 struct SpinPendingResponse {
-    backend_name: String,
-    status: u16,
-    headers: HeaderPairs,
-    body: Vec<u8>,
+    response:
+        futures::future::LocalBoxFuture<'static, Result<PlatformResponse, Report<PlatformError>>>,
 }
 
 /// `spin_sdk::http::send`-backed HTTP client for the Spin runtime.
 ///
-/// `send_async` eagerly executes each request before returning, so
-/// [`PlatformHttpClient::supports_concurrent_fanout`] reports `false` and the
-/// auction orchestrator rejects multi-provider configurations before any
-/// request launches. `select` keeps a defense-in-depth rejection for more
-/// than one pending request, matching the Cloudflare adapter behavior.
+/// Selection supports one provider at a time, so
+/// [`PlatformHttpClient::supports_concurrent_fanout`] reports `false`.
+/// Deadline selection bounds the full send and response body collection.
+/// Dropping the pending operation cancels its WASI asynchronous operations.
 ///
 /// Spin's WASI HTTP API sends one request and returns the original response; it
 /// exposes no redirect-follow policy. Each trait call therefore reaches exactly
@@ -451,20 +448,14 @@ struct SpinPendingResponse {
 /// `StubHttpClient` driver records the one-send 3xx behavior while adapter tests
 /// cover request/response policy around that single boundary.
 ///
-/// # Known MVP limits
-///
-/// **No configurable outbound timeout.** `spin_sdk::http::send` does not
-/// expose per-request timeout control, and [`PlatformBackendSpec::first_byte_timeout`]
-/// is ignored by [`NoopBackend`]. A slow or hung origin will block the Spin
-/// invocation for whatever default the Spin runtime imposes. Operators requiring
-/// deterministic timeout behaviour should use the Fastly adapter.
+/// Backend phase timeouts remain unsupported. Callers requiring an absolute
+/// cutoff use [`PlatformHttpClient::select_until`].
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub struct SpinPlatformHttpClient;
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 impl SpinPlatformHttpClient {
     async fn execute(
-        &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
         reject_unsupported_request_contracts(&request)?;
@@ -554,9 +545,8 @@ impl SpinPlatformHttpClient {
 #[async_trait::async_trait(?Send)]
 impl PlatformHttpClient for SpinPlatformHttpClient {
     fn supports_concurrent_fanout(&self) -> bool {
-        // `send_async` executes each request eagerly, so multiple pending
-        // requests run sequentially. The auction orchestrator checks this
-        // before launching more than one provider request.
+        // Keep the existing single-provider restriction: selection polls one
+        // outbound request at a time.
         false
     }
 
@@ -564,7 +554,7 @@ impl PlatformHttpClient for SpinPlatformHttpClient {
         &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
-        self.execute(request).await
+        Self::execute(request).await
     }
 
     async fn send_async(
@@ -572,28 +562,8 @@ impl PlatformHttpClient for SpinPlatformHttpClient {
         request: PlatformHttpRequest,
     ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
         let backend_name = request.backend_name.clone();
-        let response = self.execute(request).await?;
-
-        let status = response.response.status().as_u16();
-        let headers: HeaderPairs = response
-            .response
-            .headers()
-            .iter()
-            .map(|(n, v)| (n.to_string(), v.as_bytes().to_vec()))
-            .collect();
-        let body_bytes = match response.response.into_body() {
-            edgezero_core::body::Body::Once(bytes) => bytes.to_vec(),
-            edgezero_core::body::Body::Stream(_) => {
-                return Err(Report::new(PlatformError::HttpClient)
-                    .attach("SpinPlatformHttpClient::execute returned a streaming body"));
-            }
-        };
-
         let pending = SpinPendingResponse {
-            backend_name: backend_name.clone(),
-            status,
-            headers,
-            body: body_bytes,
+            response: Box::pin(Self::execute(request)),
         };
         Ok(PlatformPendingRequest::new(pending).with_backend_name(backend_name))
     }
@@ -624,20 +594,56 @@ impl PlatformHttpClient for SpinPlatformHttpClient {
                     .attach("unexpected inner type in SpinPlatformHttpClient::select")
             })?;
 
-        let mut builder = edgezero_core::http::response_builder().status(pending.status);
-        for (name, value) in &pending.headers {
-            builder = builder.header(name.as_str(), value.as_slice());
-        }
-        let edge_resp = builder
-            .body(edgezero_core::body::Body::from(pending.body))
-            .change_context(PlatformError::HttpClient)?;
-
-        let ready = Ok(PlatformResponse::new(edge_resp).with_backend_name(pending.backend_name));
+        let ready = pending.response.await;
         Ok(PlatformSelectResult {
             ready,
             remaining: pending_requests,
             failed_backend_name: None,
         })
+    }
+
+    async fn select_until(
+        &self,
+        mut pending_requests: Vec<PlatformPendingRequest>,
+        deadline: web_time::Instant,
+    ) -> Result<Option<PlatformSelectResult>, Report<PlatformError>> {
+        if pending_requests.is_empty() {
+            return Err(Report::new(PlatformError::HttpClient)
+                .attach("select_until called with an empty pending_requests list"));
+        }
+        if pending_requests.len() > 1 {
+            return Err(Report::new(PlatformError::HttpClient)
+                .attach("multi-provider fan-out is not supported on this adapter"));
+        }
+        let remaining = deadline.saturating_duration_since(web_time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        let platform_pending = pending_requests.remove(0);
+        let backend_name = platform_pending.backend_name().map(str::to_owned);
+        let pending = platform_pending
+            .downcast::<SpinPendingResponse>()
+            .map_err(|_| {
+                Report::new(PlatformError::HttpClient)
+                    .attach("unexpected pending request type in deadline selection")
+            })?;
+        let result = complete_before_deadline(
+            pending.response,
+            async {
+                let remaining = deadline.saturating_duration_since(web_time::Instant::now());
+                if !remaining.is_zero() {
+                    spin_sdk::time::sleep(remaining).await;
+                }
+            },
+            deadline,
+            web_time::Instant::now,
+        )
+        .await;
+        Ok(result.map(|ready| PlatformSelectResult {
+            failed_backend_name: ready.as_ref().err().and(backend_name),
+            ready,
+            remaining: pending_requests,
+        }))
     }
 }
 
@@ -1396,5 +1402,130 @@ mod tests {
                 "{header} should be allowed in WASI HTTP outbound requests"
             );
         }
+    }
+}
+
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+async fn complete_before_deadline<F, T, N>(
+    operation: F,
+    timer: T,
+    deadline: web_time::Instant,
+    now: N,
+) -> Option<F::Output>
+where
+    F: std::future::Future,
+    T: std::future::Future<Output = ()>,
+    N: Fn() -> web_time::Instant,
+{
+    if now() >= deadline {
+        return None;
+    }
+    match futures::future::select(Box::pin(operation), Box::pin(timer)).await {
+        futures::future::Either::Left((response, _)) if now() < deadline => Some(response),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    use futures::executor::block_on;
+    use futures::future::{pending, ready};
+    use web_time::Instant;
+
+    use super::complete_before_deadline;
+
+    #[test]
+    fn expired_deadline_does_not_poll_request() {
+        let deadline = Instant::now();
+        let polled = Cell::new(false);
+        let operation = async {
+            polled.set(true);
+            pending::<()>().await
+        };
+        let result: Option<()> = block_on(complete_before_deadline(
+            operation,
+            pending(),
+            deadline,
+            || deadline,
+        ));
+        assert_eq!(result, None, "should reject before polling expired request");
+        assert!(!polled.get(), "should not poll an expired request");
+    }
+
+    #[test]
+    fn timer_cuts_off_pending_operation_and_drops_it() {
+        struct DropProbe(Rc<Cell<bool>>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        let dropped = Rc::new(Cell::new(false));
+        let probe = DropProbe(Rc::clone(&dropped));
+        let operation = async move {
+            let _probe = probe;
+            pending::<()>().await
+        };
+        let now = Instant::now();
+        let result = block_on(complete_before_deadline(
+            operation,
+            ready(()),
+            now + Duration::from_secs(1),
+            || now,
+        ));
+        assert_eq!(result, None, "should cut off a pending request");
+        assert!(dropped.get(), "should drop the pending operation at cutoff");
+    }
+
+    #[test]
+    fn accepts_complete_response_before_deadline() {
+        let now = Instant::now();
+        let result = block_on(complete_before_deadline(
+            ready(42),
+            pending(),
+            now + Duration::from_secs(1),
+            || now,
+        ));
+        assert_eq!(result, Some(42), "should accept response before cutoff");
+    }
+
+    #[test]
+    fn rejects_response_that_becomes_ready_at_deadline() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(1);
+        let clock = Cell::new(now);
+        let operation = async {
+            clock.set(deadline);
+            42
+        };
+        let result = block_on(complete_before_deadline(
+            operation,
+            pending(),
+            deadline,
+            || clock.get(),
+        ));
+        assert_eq!(result, None, "should reject a late ready response");
+    }
+
+    #[test]
+    fn timer_bounds_body_after_headers_complete() {
+        let now = Instant::now();
+        let headers_received = Cell::new(false);
+        let operation = async {
+            headers_received.set(true);
+            pending::<()>().await
+        };
+        let result = block_on(complete_before_deadline(
+            operation,
+            ready(()),
+            now + Duration::from_secs(1),
+            || now,
+        ));
+        assert!(headers_received.get(), "should reach response body read");
+        assert_eq!(result, None, "should cut off pending body collection");
     }
 }

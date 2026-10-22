@@ -68,3 +68,25 @@ are part of the contract rather than skipped coverage.
 
 See [Auction orchestration](/guide/auction-orchestration) for configuration and
 response details.
+
+## Absolute deadline regressions
+
+Core tests cover split dispatch/collection and synchronous execution, pending
+provider attribution, preserved on-time bids, late collection after an origin
+wait, and exhausted-budget mediation. Axum loopback tests separately delay
+headers and trickle bodies, and verify outstanding task cancellation. Worker
+adapter tests use controlled futures and timers, with WASM compilation checking
+the actual timer and cancellation APIs. Fastly also has Viceroy network fixtures
+for stalled headers, trickling bodies, bodyless responses, and competing bidders;
+run its local origin harness after building the adapter test binary:
+
+```bash
+cargo test -p trusted-server-adapter-fastly --target wasm32-wasip1 --no-run
+python3 crates/trusted-server-adapter-fastly/tests/deadline_origin.py \
+  "$(command -v viceroy)" \
+  target/wasm32-wasip1/debug/deps/trusted_server_adapter_fastly-<hash>.wasm
+```
+
+Use the adapter test artifact printed by Cargo in place of `<hash>`. The harness
+binds a local ephemeral port and runs the four network tests excluded from the
+standard suite.

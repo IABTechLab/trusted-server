@@ -814,15 +814,28 @@ Until that callback lands, startup remains the mandatory target-aware gate.
 
 ### Timeout behavior
 
-For each provider, Trusted Server uses the smaller of its resolved timeout and
-the remaining auction budget for launch decisions and OpenRTB `tmax`. The
-mediator is not launched after the logical auction budget is exhausted.
+Provider response collection uses one absolute deadline measured from auction
+dispatch. It includes waiting for headers and buffering the complete upstream
+body. When the deadline expires, outstanding providers are recorded as timeouts;
+completed bids collected before the cutoff remain available for local ranking.
+Collection after a slow origin response does not restart the clock, and late
+responses are not admitted. A mediator starts only with remaining budget and
+uses the earlier of the auction cutoff and its own logical timeout.
 
-No current adapter claims an abortable provider-wide total-request deadline.
-Already-launched work may complete after the logical budget, and a completed
-late response can remain eligible. Local decision and delivery also finish
-after network launch closes, so `timeout_ms` is not a hard wall-clock ceiling
-and an auction can exceed it.
+Fastly limits retained response payloads to 10 MiB across the collector. A provider
+whose next chunk would exceed that limit fails while its siblings remain eligible.
+Fastly abandons unfinished backend requests and closes acquired response bodies;
+the installed SDK has no pending-request cancellation API. Axum aborts outstanding
+request tasks. Cloudflare aborts its fetch through an AbortController, and Spin
+drops cancelable WASI operations. Cloudflare and Spin retain their single-provider
+restriction and defer outbound request execution until collection so the entire
+request can be bounded.
+
+Backend first-byte and between-byte timeouts remain transport safeguards rather
+than total deadlines. Timer granularity and runtime scheduling can add a small
+overshoot. Parsing, ranking, HTML processing, and delivery are local work outside
+network collection, so this cutoff is not a hard ceiling on the whole publisher
+response time.
 
 Browser Prebid `timeout_ms` and `debug` stay under `[integrations.prebid]` and
 are independent of all server provider values. Server endpoint, timeout,

@@ -29,6 +29,7 @@ edgezero-core = { workspace = true }
 error-stack = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }
+web-time = { workspace = true }
 serde_json = { workspace = true }
 trusted-server-core = { workspace = true }
 trusted-server-js = { workspace = true }

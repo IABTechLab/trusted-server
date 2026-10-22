@@ -294,6 +294,18 @@ pub mod nextjs_auction {
             Ok(PlatformPendingRequest::new(request).with_backend_name(backend))
         }
 
+        async fn select_until(
+            &self,
+            pending_requests: Vec<PlatformPendingRequest>,
+            deadline: web_time::Instant,
+        ) -> Result<Option<PlatformSelectResult>, Report<PlatformError>> {
+            if web_time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+            let response = self.select(pending_requests).await?;
+            Ok((web_time::Instant::now() < deadline).then_some(response))
+        }
+
         async fn select(
             &self,
             mut pending_requests: Vec<PlatformPendingRequest>,

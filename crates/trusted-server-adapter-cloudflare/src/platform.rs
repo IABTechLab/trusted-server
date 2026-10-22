@@ -162,33 +162,21 @@ impl KvStore for KvHandleAdapter {
 // CloudflareHttpClient — WASM target only
 // ---------------------------------------------------------------------------
 
-/// Carries a completed response through `send_async` → `select`.
-///
-/// Same pattern as `AxumPendingResponse`: stores raw parts because `Body::Stream`
-/// is `!Send`, which is incompatible with `Box<dyn Any + Send>` inside
-/// [`PlatformPendingRequest`].
+/// Owns the outbound operation until selection completes or drops it.
 #[cfg(target_arch = "wasm32")]
 struct CloudflarePendingResponse {
-    backend_name: String,
-    status: u16,
-    headers: Vec<(String, Vec<u8>)>,
-    body: Vec<u8>,
+    response:
+        futures::future::LocalBoxFuture<'static, Result<PlatformResponse, Report<PlatformError>>>,
 }
 
 /// [`worker::Fetch`]-backed HTTP client for the Cloudflare Workers runtime.
 ///
 /// # Multi-provider auction limitation
 ///
-/// `send_async` eagerly awaits each request before returning, so
-/// [`PlatformHttpClient::supports_concurrent_fanout`] reports `false` and the
-/// auction orchestrator rejects multi-provider configurations before any
-/// request launches. `select` keeps a defense-in-depth rejection for more
-/// than one pending request. Configure a single auction provider for
-/// Cloudflare Workers, or use the Fastly adapter for parallel DSP fan-out.
-///
-/// Per-provider timeouts baked into the backend name are not enforced at the
-/// fetch layer; the Workers runtime's global CPU budget (~30 s on paid plans)
-/// is the only implicit deadline.
+/// Selection supports one provider at a time, so
+/// [`PlatformHttpClient::supports_concurrent_fanout`] reports `false`.
+/// Deadline selection bounds fetch and body collection together and aborts
+/// the Workers fetch when its pending operation is dropped.
 #[cfg(target_arch = "wasm32")]
 pub struct CloudflareHttpClient;
 
@@ -284,9 +272,20 @@ fn outbound_request_init(method: worker::Method, headers: worker::Headers) -> wo
 }
 
 #[cfg(target_arch = "wasm32")]
+struct AbortOnDrop(Option<worker::AbortController>);
+
+#[cfg(target_arch = "wasm32")]
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(controller) = self.0.take() {
+            controller.abort();
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
 impl CloudflareHttpClient {
     async fn execute(
-        &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
         use worker::{CacheMode, Fetch, Headers, Method, Request};
@@ -366,8 +365,14 @@ impl CloudflareHttpClient {
         let worker_req =
             Request::new_with_init(&uri, &init).change_context(PlatformError::HttpClient)?;
 
+        let abort = AbortOnDrop(Some(worker::AbortController::default()));
+        let signal = abort
+            .0
+            .as_ref()
+            .expect("should retain abort controller")
+            .signal();
         let mut resp = Fetch::Request(worker_req)
-            .send()
+            .send_with_signal(&signal)
             .await
             .change_context(PlatformError::HttpClient)
             .attach_with(|| format!("outbound request to {uri} failed"))?;
@@ -449,13 +454,12 @@ impl PlatformHttpClient for CloudflareHttpClient {
         &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
-        self.execute(request).await
+        Self::execute(request).await
     }
 
     fn supports_concurrent_fanout(&self) -> bool {
-        // `send_async` executes each request eagerly, so multiple pending
-        // requests run sequentially. The auction orchestrator checks this
-        // before launching more than one provider request.
+        // Keep the existing single-provider restriction: selection polls one
+        // outbound request at a time.
         false
     }
 
@@ -464,33 +468,8 @@ impl PlatformHttpClient for CloudflareHttpClient {
         request: PlatformHttpRequest,
     ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
         let backend_name = request.backend_name.clone();
-        let response = self.execute(request).await?;
-
-        let status = response.response.status().as_u16();
-        let headers: Vec<(String, Vec<u8>)> = response
-            .response
-            .headers()
-            .iter()
-            .map(|(n, v)| (n.to_string(), v.as_bytes().to_vec()))
-            .collect();
-        let body_bytes = match response.response.into_body() {
-            edgezero_core::body::Body::Once(bytes) => bytes.to_vec(),
-            // execute() always buffers via resp.bytes().await → Body::Once.
-            // Return a typed error rather than panicking in the request path
-            // in case that edgezero implementation detail ever changes.
-            edgezero_core::body::Body::Stream(_) => {
-                return Err(Report::new(PlatformError::HttpClient).attach(
-                    "unexpected streaming body from CloudflareHttpClient::execute \
-                     — expected a buffered Body::Once",
-                ));
-            }
-        };
-
         let pending = CloudflarePendingResponse {
-            backend_name: backend_name.clone(),
-            status,
-            headers,
-            body: body_bytes,
+            response: Box::pin(Self::execute(request)),
         };
         Ok(PlatformPendingRequest::new(pending).with_backend_name(backend_name))
     }
@@ -514,20 +493,66 @@ impl PlatformHttpClient for CloudflareHttpClient {
                     .attach("unexpected inner type in CloudflareHttpClient::select")
             })?;
 
-        let mut builder = edgezero_core::http::response_builder().status(pending.status);
-        for (name, value) in &pending.headers {
-            builder = builder.header(name.as_str(), value.as_slice());
-        }
-        let edge_resp = builder
-            .body(edgezero_core::body::Body::from(pending.body))
-            .change_context(PlatformError::HttpClient)?;
-
-        let ready = Ok(PlatformResponse::new(edge_resp).with_backend_name(pending.backend_name));
+        let ready = pending.response.await;
         Ok(PlatformSelectResult {
             ready,
             remaining: pending_requests,
             failed_backend_name: None,
         })
+    }
+
+    async fn select_until(
+        &self,
+        mut pending_requests: Vec<PlatformPendingRequest>,
+        deadline: web_time::Instant,
+    ) -> Result<Option<PlatformSelectResult>, Report<PlatformError>> {
+        if pending_requests.is_empty() {
+            return Err(Report::new(PlatformError::HttpClient)
+                .attach("select_until called with an empty pending_requests list"));
+        }
+        if pending_requests.len() > 1 {
+            return Err(Report::new(PlatformError::HttpClient)
+                .attach("multi-provider fan-out is not supported on this adapter"));
+        }
+        let remaining = deadline.saturating_duration_since(web_time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        let platform_pending = pending_requests.remove(0);
+        let backend_name = platform_pending.backend_name().map(str::to_owned);
+        let pending = platform_pending
+            .downcast::<CloudflarePendingResponse>()
+            .map_err(|_| {
+                Report::new(PlatformError::HttpClient)
+                    .attach("unexpected pending request type in deadline selection")
+            })?;
+        let result = complete_before_deadline(
+            pending.response,
+            async {
+                // Workers timers use whole signed milliseconds. Recheck the
+                // absolute deadline after each bounded timer interval.
+                loop {
+                    let remaining = deadline.saturating_duration_since(web_time::Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    worker::Delay::from(
+                        remaining
+                            .max(Duration::from_millis(1))
+                            .min(Duration::from_millis(i32::MAX as u64)),
+                    )
+                    .await;
+                }
+            },
+            deadline,
+            web_time::Instant::now,
+        )
+        .await;
+        Ok(result.map(|ready| PlatformSelectResult {
+            failed_backend_name: ready.as_ref().err().and(backend_name),
+            ready,
+            remaining: pending_requests,
+        }))
     }
 }
 
@@ -946,5 +971,130 @@ mod tests {
             OutboundCacheMode::RuntimeDefault,
             "a default intent should keep the runtime default cache behavior"
         );
+    }
+}
+
+#[cfg(any(test, target_arch = "wasm32"))]
+async fn complete_before_deadline<F, T, N>(
+    operation: F,
+    timer: T,
+    deadline: web_time::Instant,
+    now: N,
+) -> Option<F::Output>
+where
+    F: std::future::Future,
+    T: std::future::Future<Output = ()>,
+    N: Fn() -> web_time::Instant,
+{
+    if now() >= deadline {
+        return None;
+    }
+    match futures::future::select(Box::pin(operation), Box::pin(timer)).await {
+        futures::future::Either::Left((response, _)) if now() < deadline => Some(response),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    use futures::executor::block_on;
+    use futures::future::{pending, ready};
+    use web_time::Instant;
+
+    use super::complete_before_deadline;
+
+    #[test]
+    fn expired_deadline_does_not_poll_request() {
+        let deadline = Instant::now();
+        let polled = Cell::new(false);
+        let operation = async {
+            polled.set(true);
+            pending::<()>().await
+        };
+        let result: Option<()> = block_on(complete_before_deadline(
+            operation,
+            pending(),
+            deadline,
+            || deadline,
+        ));
+        assert_eq!(result, None, "should reject before polling expired request");
+        assert!(!polled.get(), "should not poll an expired request");
+    }
+
+    #[test]
+    fn timer_cuts_off_pending_operation_and_drops_it() {
+        struct DropProbe(Rc<Cell<bool>>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        let dropped = Rc::new(Cell::new(false));
+        let probe = DropProbe(Rc::clone(&dropped));
+        let operation = async move {
+            let _probe = probe;
+            pending::<()>().await
+        };
+        let now = Instant::now();
+        let result = block_on(complete_before_deadline(
+            operation,
+            ready(()),
+            now + Duration::from_secs(1),
+            || now,
+        ));
+        assert_eq!(result, None, "should cut off a pending request");
+        assert!(dropped.get(), "should drop the pending operation at cutoff");
+    }
+
+    #[test]
+    fn accepts_complete_response_before_deadline() {
+        let now = Instant::now();
+        let result = block_on(complete_before_deadline(
+            ready(42),
+            pending(),
+            now + Duration::from_secs(1),
+            || now,
+        ));
+        assert_eq!(result, Some(42), "should accept response before cutoff");
+    }
+
+    #[test]
+    fn rejects_response_that_becomes_ready_at_deadline() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_secs(1);
+        let clock = Cell::new(now);
+        let operation = async {
+            clock.set(deadline);
+            42
+        };
+        let result = block_on(complete_before_deadline(
+            operation,
+            pending(),
+            deadline,
+            || clock.get(),
+        ));
+        assert_eq!(result, None, "should reject a late ready response");
+    }
+
+    #[test]
+    fn timer_bounds_body_after_headers_complete() {
+        let now = Instant::now();
+        let headers_received = Cell::new(false);
+        let operation = async {
+            headers_received.set(true);
+            pending::<()>().await
+        };
+        let result = block_on(complete_before_deadline(
+            operation,
+            ready(()),
+            now + Duration::from_secs(1),
+            || now,
+        ));
+        assert!(headers_received.get(), "should reach response body read");
+        assert_eq!(result, None, "should cut off pending body collection");
     }
 }

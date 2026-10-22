@@ -2239,13 +2239,14 @@ push as proof that a Cloudflare or Spin multi-provider plan can start.
 
 ### Deadline behavior
 
-Configured timeouts are logical budgets, not hard wall-clock guarantees. No
-current adapter claims an abortable provider-wide total-request deadline.
-Already-launched work may complete after the logical budget and a completed late
-response can remain eligible. Once the logical auction budget is exhausted,
-Trusted Server starts no additional provider or mediator network work, then
-finishes local decision and delivery. An auction can therefore exceed its
-configured wall-clock timeout.
+Auction response collection stops at an absolute deadline measured from dispatch,
+including header waits and complete response bodies. Outstanding providers become
+timeouts, previously collected bids remain eligible, and mediation cannot start
+with an exhausted budget. Backend timeout rounding does not extend that cutoff.
+Fastly abandons pending requests; Axum, Cloudflare, and Spin cancel outstanding
+operations where supported. Local processing and delivery can finish after the
+network cutoff. See [Timeout behavior](/guide/auction-orchestration#timeout-behavior)
+for runtime semantics and limitations.
 
 Creative sanitization is opt-in. `sanitize_creatives = true` strips executable
 markup before delivery. `rewrite_creatives = false` skips first-party URL

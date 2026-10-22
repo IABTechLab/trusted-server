@@ -31,6 +31,7 @@ flate2 = { workspace = true }
 futures = { workspace = true }
 http-body-util = { workspace = true }
 log = { workspace = true }
+web-time = { workspace = true }
 trusted-server-core = { workspace = true }
 trusted-server-js = { workspace = true }
 

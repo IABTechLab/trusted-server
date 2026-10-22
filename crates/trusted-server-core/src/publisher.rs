@@ -21146,6 +21146,21 @@ mod tests {
             self.inner.send_async(request).await
         }
 
+        async fn select_until(
+            &self,
+            pending: Vec<crate::platform::PlatformPendingRequest>,
+            deadline: web_time::Instant,
+        ) -> Result<
+            Option<crate::platform::PlatformSelectResult>,
+            Report<crate::platform::PlatformError>,
+        > {
+            if web_time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+            let result = self.select(pending).await?;
+            Ok((web_time::Instant::now() < deadline).then_some(result))
+        }
+
         async fn select(
             &self,
             pending: Vec<crate::platform::PlatformPendingRequest>,

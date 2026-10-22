@@ -1,6 +1,8 @@
 //! Fastly-backed implementations of the platform traits defined in
 //! `trusted-server-core::platform`.
 
+mod deadline;
+
 use bytes::Bytes;
 use error_stack::{Report, ResultExt};
 use fastly::geo::{Geo, geo_lookup};
@@ -620,6 +622,14 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
             remaining,
             failed_backend_name,
         })
+    }
+
+    async fn select_until(
+        &self,
+        pending_requests: Vec<PlatformPendingRequest>,
+        deadline: web_time::Instant,
+    ) -> Result<Option<PlatformSelectResult>, Report<PlatformError>> {
+        deadline::select_until(pending_requests, deadline)
     }
 
     async fn wait(

@@ -7,6 +7,7 @@ use base64::{Engine as _, engine::general_purpose};
 use ed25519_dalek::SigningKey;
 use error_stack::{Report, ResultExt as _};
 use rand::rngs::OsRng;
+use web_time::Instant;
 
 use super::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformCacheIntent,
@@ -245,10 +246,10 @@ pub(crate) struct StubHttpClient {
     // Test-only wall-clock delays applied before each select result is returned.
     select_delays: Mutex<VecDeque<Duration>>,
     // Reported by supports_concurrent_fanout(); set false to emulate
-    // platforms whose send_async executes eagerly (e.g. Cloudflare Workers).
+    // platforms whose collection contract permits only a single provider.
     concurrent_fanout: std::sync::atomic::AtomicBool,
     // Reported by has_enforceable_total_request_deadline(); set true to emulate
-    // a future adapter with a hard total request deadline.
+    // unbounded request transport with a hard total request deadline.
     enforceable_total_request_deadline: std::sync::atomic::AtomicBool,
     // Reported by supports_streaming_responses(); set true to emulate Fastly's
     // streaming response support.
@@ -716,6 +717,62 @@ impl PlatformHttpClient for StubHttpClient {
             Some(None) => pending,
             None => pending.with_backend_name(backend_name),
         })
+    }
+
+    async fn select_until(
+        &self,
+        pending_requests: Vec<PlatformPendingRequest>,
+        deadline: Instant,
+    ) -> Result<Option<PlatformSelectResult>, Report<PlatformError>> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        let delay = self
+            .select_delays
+            .lock()
+            .expect("should lock select delays")
+            .front()
+            .copied()
+            .unwrap_or_default();
+        if delay >= remaining {
+            self.select_delays
+                .lock()
+                .expect("should lock select delays")
+                .pop_front();
+            std::thread::sleep(remaining);
+            return Ok(None);
+        }
+        let response = self.select(pending_requests).await?;
+        Ok((Instant::now() < deadline).then_some(response))
+    }
+
+    async fn wait_until(
+        &self,
+        pending: PlatformPendingRequest,
+        deadline: Instant,
+    ) -> Result<PlatformResponse, Report<PlatformError>> {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let delay = self
+            .wait_delays
+            .lock()
+            .expect("should lock wait delays")
+            .front()
+            .copied()
+            .unwrap_or_default();
+        if remaining.is_zero() || delay >= remaining {
+            self.wait_delays
+                .lock()
+                .expect("should lock wait delays")
+                .pop_front();
+            std::thread::sleep(remaining);
+            return Err(Report::new(PlatformError::DeadlineExceeded));
+        }
+        let response = self.wait(pending).await?;
+        if Instant::now() >= deadline {
+            return Err(Report::new(PlatformError::DeadlineExceeded));
+        }
+        Ok(response)
     }
 
     /// Always marks the first pending request in the input as ready (FIFO order).
