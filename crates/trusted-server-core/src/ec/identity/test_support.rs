@@ -129,3 +129,10 @@ pub(crate) fn fixed_provider(
         false,
     )
 }
+
+/// Identity keys derived from the shared test settings.
+pub(crate) fn test_keys() -> crate::ec::identity::revision::IdentityKeys {
+    crate::ec::identity::revision::IdentityKeys::from_settings(
+        &crate::test_support::tests::create_test_settings(),
+    )
+}
