@@ -20,6 +20,7 @@ pub mod input;
 pub(crate) mod policy;
 pub mod provider;
 pub mod resolution;
+pub(crate) mod revision;
 #[cfg(test)]
 pub(crate) mod test_support;
 
