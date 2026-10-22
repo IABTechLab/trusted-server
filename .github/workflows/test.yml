@@ -350,20 +350,14 @@ jobs:
         with:
           fetch-depth: 2
 
-      - name: Retrieve Rust version
-        id: rust-version
-        run: echo "rust-version=$(grep '^rust ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
-        shell: bash
-
       - name: Set up Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@v1
+        uses: ./.github/actions/setup-rust
         with:
-          toolchain: ${{ steps.rust-version.outputs.rust-version }}
-          # Restore `test-cli`'s cache read-only. This job never runs on main,
-          # so a key of its own is only ever saved in PR scope, where no other
-          # PR can restore it.
-          cache-shared-key: cargo-cli-${{ runner.os }}
-          cache-save-if: false
+          # Restore `test-cli`'s cache read-only. The action only saves on
+          # main and this job only runs on PRs; `save-cache` keeps it
+          # restore-only if either changes.
+          cache-key: cargo-cli
+          save-cache: "false"
 
       # Building `ts` compiles trusted-server-core, whose trusted-server-js
       # build script runs the TSJS build with the `npm` on PATH, so pin Node
