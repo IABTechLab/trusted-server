@@ -345,6 +345,31 @@ Progress (2026-10-16, no Task 9 exit yet): the closed recipe, checked A/B ambien
 
 ### Task 10: Record selected Cargo units and native materials
 
+Remaining dependency audit (2026-10-22, `41560cfd9`): the open capture exit
+below requires conservative native/tool coverage. The specification does not
+require an exact compiler DAG or mandatory execution tracing: an inventory of
+all permitted relevant inputs, coupled with enforced access containment, can
+also establish closure. The current recipes do not establish that containment.
+The next implementation must address these dependencies rather than treating
+another successful snapshot hash as closure:
+
+| Remaining evidence                      | Dependency and current limitation                                                                                                                                                                                                                                                                                            |
+| --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Fastly host tools and supporting inputs | Task 9 must select and constrain the compiler, assembler, archiver, linker and build tools; Task 10 must measure and join them. `composition/platform.rs` still records five unresolved roles. GNU CLI receipts do not cover Fastly automatically.                                                                           |
+| GNU tool/input closure                  | Task 9 must constrain or account for relevant inputs beyond the inventory roots; Task 10 must inventory and join that closure. `recipe/gnu/image.rs` explicitly leaves other files available. Configured helper paths are observations, not exhaustive dependency coverage.                                                  |
+| Apple tool/library closure              | Task 9 must constrain or account for relevant inputs outside measured directories; Task 10 must measure and join them. `recipe/apple.rs` permits broad developer-directory access. Measuring the selected toolchain's entire `usr/lib` does not resolve outside-directory or transitive dependency inputs.                   |
+| Unreadable GNU privileged helpers       | Tasks 9/10 must obtain measured content or establish reviewed, enforced noncontribution/exclusion treatment for the three helpers. Acquisition evidence alone cannot close their content gap. Retain metadata-only observations and the gap until proven; do not infer hashes or expand privileges.                          |
+| Original acquisition                    | Tasks 3/8 must bind authenticated Rust/tool/SDK/image distributions to the selected inputs. Installed-tree hashes do not authenticate original acquisition; pending pins in `scripts/release/release-tools.json` remain pending.                                                                                             |
+| Platform qualification                  | Task 8 must qualify the actual platform, boundary and recipes against the selected closure. Passing ordinary-CI candidates does not construct the closed qualified tool or sandbox types.                                                                                                                                    |
+| Complete owning composition             | Task 10 must resolve the first four material-coverage rows before supplying complete composition evidence. Acquisition and production qualification are independent additional requirements; complete measured coverage alone would not open `spdx::generate_from_completed`, which deliberately rejects current candidates. |
+
+Paths in the table are relative to `crates/trusted-server-release/src/` unless
+shown otherwise. Content measurement, dependency closure, authenticated original
+acquisition and qualification are distinct proofs. Acquisition and qualification
+rows describe production dependencies, not prerequisites for measuring complete
+material coverage. None is substituted for another, and this audit changes no
+completeness or qualification state.
+
 **Create:** release tool `src/composition.rs`, private `composition::tests`, `crates/trusted-server-release/tests/fixtures/composition/`.
 
 - [x] Add fixtures for host/target dual-role packages with different unit features, ambiguous source IDs, dev-only graph entries, unknown native origin, system substitution and prepared-but-discarded CLI JS.
@@ -804,11 +829,41 @@ compiled locally but is run only in hosted CI under the process-test restriction
 
 **Create:** release tool `src/spdx.rs`, private `spdx::tests`, `crates/trusted-server-release/tests/fixtures/spdx/`.
 
-- [ ] Write cases for incorrect root digest, missing native coverage, ambiguous package identity, unknown license, duplicate SPDX IDs, dangling relationships, uncompiled dev dependencies, type-only/virtual JS and oversize predicates.
+- [x] Write cases for incorrect root digest, missing native coverage, ambiguous package identity, unknown license, duplicate SPDX IDs, dangling relationships, uncompiled dev dependencies, type-only/virtual JS and oversize predicates.
 - [x] Run the pure `spdx::` suite with the nonzero-selection guard. The scoped 2026-10-21 run selected and passed 66 tests; this validates renderer/candidate behavior, not the closed qualified generator.
 - [ ] Emit SPDX 2.3 JSON from Task 10 normalized evidence. Root checksum is final executable SHA-256; contributors/materials/tools/external requirements have distinct relationships. Unknown licenses use NOASSERTION; missing contributing origin/coverage fails. Validator uses a pinned authoritative SPDX schema.
 - [ ] Generate full real Fastly and all three CLI SBOMs; schema-valid toy fixtures are not sufficient. Validate size <=16 MiB and document equality semantics: reject duplicate keys, ignore object order, preserve array order.
 - [ ] Re-run fixtures plus actual coverage inspection. Commit `Generate validated per-artifact SPDX evidence`.
+
+Fixture exit audit (2026-10-22, `41560cfd9`): the first checkbox records existing
+written regression cases, not complete qualified generation. The cases span
+owner validation, projections, rendering and the JS collector:
+
+| Required case                                                       | Existing regression                                                                                                                                                                                                                                                                                                                                               |
+| ------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Incorrect root digest, duplicate SPDX IDs and dangling relationship | `spdx/tests.rs::rejects_root_digest_changes_duplicate_identities_missing_origins_and_dangling_edges` rejects each input mutation. `stable_ids_and_document_bytes_do_not_depend_on_input_component_order` checks unique emitted package SPDX IDs. Candidate merge tests additionally reject cross-part duplicates and dangling/cross-part edges.                   |
+| Missing measured native coverage                                    | `composition/native/tests.rs::native_spdx_requires_each_reviewed_consuming_context_and_unambiguous_features` clears measured contributors and requires projection rejection. `rejects_unknown_native_scripts_and_missing_native_execution` rejects missing captured build-script output. These tests do not establish complete platform coverage.                 |
+| Ambiguous package identity                                          | `composition/tests.rs::ambiguous_or_missing_package_and_target_joins_are_rejected` rejects duplicate metadata. `identical_names_and_versions_from_distinct_sources_remain_separate` and `spdx/cargo/tests.rs::original_identity_distinguishes_complete_registry_and_git_facts` preserve distinct source identities. Native tests reject original/context aliases. |
+| Unknown license                                                     | `spdx/tests.rs::unknown_licenses_use_noassertion_and_never_become_unsupported_expressions` verifies `NOASSERTION` for absent and unknown declarations. Native and JS origin tests reject manufactured declarations.                                                                                                                                               |
+| Uncompiled dev dependencies                                         | `composition/graph/tests.rs::catalog_dev_only_entries_never_create_contributors` excludes potential-only packages; `spdx/cargo/tests.rs::package_edges_require_both_observed_endpoints_and_skip_dev_kinds` excludes their projected dependency edges.                                                                                                             |
+| Type-only JS                                                        | `crates/trusted-server-js/lib/test/release-composition.test.mjs` checks that a type-only import and a zero-length rendered namespace are omitted. `javascript/contributions/tests.rs` rejects a zero rendered-length contribution.                                                                                                                                |
+| Virtual JS                                                          | The same JS collector file rejects an unknown virtual producer and checks recognized CommonJS helper ownership. `spdx/tests.rs::generated_js_requires_a_known_producer_and_retains_generated_bytes_identity` rejects a missing producer while preserving generated-byte identity.                                                                                 |
+| Oversize predicates                                                 | `spdx/tests.rs::rejects_an_spdx_document_exceeding_the_attestation_byte_limit` and `spdx/candidate/tests.rs::candidate_bounds_reject_documents_over_sixteen_mebibytes` enforce the output bound.                                                                                                                                                                  |
+
+Rust paths above are relative to `crates/trusted-server-release/src/`. Running
+only the SPDX and composition selections does not execute the JS collector
+cases. No new test API, duplicate fixture, schema change or candidate-index
+golden change is needed to close the written-cases checkbox. Complete native/tool
+coverage, qualified generator integration, the producer/consumer contract and
+full real four-asset SBOM exits remain open.
+
+Audit verification: fresh pure selections passed 69 SPDX and 67 composition
+tests, each with a nonzero selected count. Strict host-target all-target/all-feature
+Clippy, all-feature documentation, read-only workspace formatting and this plan's
+Prettier check passed. JS collector cases were inspected, not rerun locally.
+Independent specification and quality reviews supported the fixture checkbox;
+their corrections explicitly separate acquisition/qualification from material
+coverage and identify the emitted-ID uniqueness assertion.
 
 Progress (2026-10-19, partial renderer foundation): a private pure renderer validates executable root identity, component origins and roles, stable package/relationship identities, license declarations and bounded output against the existing pinned SPDX 2.3 schema. Structured-tree evidence stays in explanatory source information rather than raw-file checksums. Fictional fixtures exercise structural/semantic acceptance; schema validity supplies no signing or qualification authority. The closed (qualified) generator entry point still rejects every current candidate; a separate private candidate-only assembly (see the 2026-10-20 notes below) renders an unqualified document that cannot become the closed type. There is no functioning generation command, no caller-controlled completeness flag and no JSON constructor for complete inputs. Typed Cargo/JS contributor export, complete native/tool coverage, producer/consumer contract fixtures and full real Fastly/three-platform CLI SBOMs remain required; the renderer does not satisfy those exits.
 
