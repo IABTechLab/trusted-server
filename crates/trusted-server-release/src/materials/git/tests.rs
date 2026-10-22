@@ -255,8 +255,7 @@ fn missing_blob_in_unrelated_subtree_still_rejects() {
 fn unsafe_or_noncanonical_tree_entries_reject() {
     let oid = "d".repeat(40);
     for (mode, name) in [
-        (&b"120000"[..], &b"link"[..]),
-        (b"160000", b"submodule"),
+        (&b"160000"[..], &b"submodule"[..]),
         (b"100664", b"mode"),
         (b"100644", b".."),
         (b"100644", b".Git"),
@@ -289,6 +288,39 @@ fn unsafe_or_noncanonical_tree_entries_reject() {
             "should reject aliases, duplicate names and noncanonical ordering"
         );
     }
+}
+
+#[test]
+fn linked_blobs_are_retained_as_inert_verified_objects() {
+    let input = temporary();
+    let target = object(input.path(), "blob", b"example readme bytes\n");
+    let link = object(input.path(), "blob", b"../README.md");
+    let package = tree(input.path(), &[(b"120000", b"README.md", &link)]);
+    let root = tree(
+        input.path(),
+        &[
+            (b"100644", b"README.md", &target),
+            (b"40000", b"package", &package),
+        ],
+    );
+    let revision = commit(input.path(), &root);
+    let locked = locked(&revision);
+    let snapshot = collection(&locked)
+        .verify(SELECTOR, &revision, input.path())
+        .expect("should retain authenticated link blobs without creating links");
+    assert_eq!(
+        snapshot.object_count(),
+        5,
+        "should retain the complete commit closure"
+    );
+    assert!(
+        snapshot
+            .object_store()
+            .join(&link[..2])
+            .join(&link[2..])
+            .is_file(),
+        "should retain the link target as an inert object"
+    );
 }
 
 #[test]

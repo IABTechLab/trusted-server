@@ -582,7 +582,7 @@ fn vendor_git(
         (committed, None)
     };
     let mut writer = PackageWriter::create(vendor, &directory)?;
-    materialize(&store, &root, &mut writer)?;
+    materialize(&store, input.material.root_tree(), &root, &mut writer)?;
     writer.write("Cargo.toml", &manifest, false)?;
     if let Some(original) = &original {
         writer.write("Cargo.toml.orig", original, false)?;

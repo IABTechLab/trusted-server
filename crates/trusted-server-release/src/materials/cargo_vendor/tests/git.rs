@@ -109,6 +109,131 @@ fn locked_core() -> LockedMaterials {
     locked(&[], vec![git_package("example-core", "0.4.0")])
 }
 
+fn documentation_links(readme_target: &[u8]) -> Workspace {
+    let objects = Objects::new();
+    let manifest_blob = objects.blob(PLAIN.as_bytes());
+    let license = objects.blob(b"example license bytes\n");
+    let readme = objects.blob(b"example readme bytes\n");
+    let license_link = objects.blob(b"../LICENSE");
+    let readme_link = objects.blob(readme_target);
+    let indirect = objects.blob(b"README.md");
+    let directory = objects.tree(&[]);
+    let package = objects.tree(&[
+        ("100644", "Cargo.toml", &manifest_blob),
+        ("120000", "LICENSE", &license_link),
+        ("120000", "README.md", &readme_link),
+    ]);
+    let root_tree = objects.tree(&[
+        ("100644", "LICENSE", &license),
+        ("100755", "README.md", &readme),
+        ("120000", "alias", &indirect),
+        ("40000", "directory", &directory),
+        ("40000", "package", &package),
+    ]);
+    Workspace {
+        objects,
+        root_tree,
+        manifest_blob,
+    }
+}
+
+#[test]
+fn git_documentation_links_copy_verified_parent_files_as_regular_files() {
+    let built = documentation_links(b"../README.md");
+    let material = built.objects.material(SELECTOR, REVISION, &built.root_tree);
+    let result = run(&locked_core(), &material);
+    result
+        .outcome
+        .expect("should vendor direct documentation file links");
+    let package = result.root.join("vendor/example-core");
+    for (name, expected, mode) in [
+        ("LICENSE", &b"example license bytes\n"[..], 0o644),
+        ("README.md", &b"example readme bytes\n"[..], 0o755),
+    ] {
+        let path = package.join(name);
+        assert!(
+            fs::symlink_metadata(&path)
+                .expect("should inspect copied file")
+                .is_file(),
+            "should write a regular file"
+        );
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("should inspect copied permissions")
+                .permissions()
+                .mode()
+                & 0o7777,
+            mode,
+            "should preserve the target executable mode"
+        );
+        assert_eq!(
+            fs::read(path).expect("should read copied file"),
+            expected,
+            "should copy the authenticated target bytes"
+        );
+    }
+}
+
+#[test]
+fn git_documentation_links_reject_unsafe_or_indirect_targets() {
+    for target in [
+        &b"../../outside"[..],
+        b"/outside",
+        b"../missing",
+        b"../alias",
+        b"../directory",
+        b"../README.md\0",
+        b"..\\README.md",
+        b"../README.md\n",
+        b"../missing/../README.md",
+        b"../alias/README.md",
+        b"../README.md/.",
+        b"../directory/..",
+    ] {
+        let built = documentation_links(target);
+        let material = built.objects.material(SELECTOR, REVISION, &built.root_tree);
+        assert!(
+            run(&locked_core(), &material).outcome.is_err(),
+            "should reject an unsafe or indirect file link"
+        );
+    }
+}
+
+#[test]
+fn git_manifest_links_are_rejected_during_package_discovery() {
+    let objects = Objects::new();
+    let manifest = objects.blob(PLAIN.as_bytes());
+    let target = objects.blob(b"manifest.toml");
+    let root = objects.tree(&[
+        ("120000", "Cargo.toml", &target),
+        ("100644", "manifest.toml", &manifest),
+    ]);
+    let material = objects.material(SELECTOR, REVISION, &root);
+    assert!(
+        rejection(run(&locked_core(), &material)).contains("manifest aliases"),
+        "should reject an aliased manifest before using its bytes"
+    );
+}
+
+#[test]
+fn git_file_link_targets_are_rehashed_before_copying() {
+    let built = documentation_links(b"../README.md");
+    let target = built.objects.blob(b"example readme bytes\n");
+    let material = built.objects.material(SELECTOR, REVISION, &built.root_tree);
+    fs::write(
+        material
+            .object_store()
+            .join(&target[..2])
+            .join(&target[2..]),
+        b"changed object bytes",
+    )
+    .expect("should corrupt the target object");
+    assert!(
+        run(&locked_core(), &material).outcome.is_err(),
+        "should reject a target changed after object verification"
+    );
+}
+
 fn rejection(run: Run) -> String {
     run.outcome.expect_err("should reject the Git package")
 }

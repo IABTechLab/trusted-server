@@ -38,6 +38,7 @@ pub(super) struct TreeEntry {
     pub(super) name: String,
     pub(super) directory: bool,
     pub(super) executable: bool,
+    symlink: bool,
     pub(super) oid: String,
 }
 
@@ -55,7 +56,7 @@ fn lower_oid(text: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-/// Parses a tree body, rejecting symlinks, submodules and unsafe names.
+/// Parses inert tree entries, rejecting submodules and unsafe names.
 fn parse_tree(mut bytes: &[u8]) -> Result<Vec<TreeEntry>, Report<ReleaseError>> {
     let mut seen = BTreeSet::new();
     let mut entries = Vec::new();
@@ -64,13 +65,14 @@ fn parse_tree(mut bytes: &[u8]) -> Result<Vec<TreeEntry>, Report<ReleaseError>> 
             .iter()
             .position(|byte| *byte == b' ')
             .ok_or_else(|| material_error("malformed Git tree mode"))?;
-        let (directory, executable) = match &bytes[..space] {
-            b"40000" => (true, false),
-            b"100644" => (false, false),
-            b"100755" => (false, true),
+        let (directory, executable, symlink) = match &bytes[..space] {
+            b"40000" => (true, false, false),
+            b"100644" => (false, false, false),
+            b"100755" => (false, true, false),
+            b"120000" => (false, false, true),
             _ => {
                 return Err(material_error(
-                    "Git package symlinks, submodules and noncanonical modes are unreviewed",
+                    "Git package submodules and noncanonical modes are unreviewed",
                 ));
             }
         };
@@ -91,6 +93,11 @@ fn parse_tree(mut bytes: &[u8]) -> Result<Vec<TreeEntry>, Report<ReleaseError>> 
         if unsafe_name {
             return Err(material_error("unsafe Git package tree name"));
         }
+        if symlink && name == b"Cargo.toml" {
+            return Err(material_error(
+                "Git package manifest aliases are unreviewed",
+            ));
+        }
         if !seen.insert(name.to_ascii_lowercase()) {
             return Err(material_error("Git package tree aliases or repeats a name"));
         }
@@ -101,6 +108,7 @@ fn parse_tree(mut bytes: &[u8]) -> Result<Vec<TreeEntry>, Report<ReleaseError>> 
             name: String::from_utf8_lossy(name).into_owned(),
             directory,
             executable,
+            symlink,
             oid: hex::encode(oid),
         });
         bytes = &rest[nul + 21..];
@@ -192,6 +200,81 @@ impl<'a> Store<'a> {
         }
         self.entries.set(visited);
         Ok(entries)
+    }
+
+    /// Resolves only direct relative file links through authenticated tree objects.
+    fn file_link(
+        &self,
+        repository_tree: &str,
+        path: &str,
+        target: &[u8],
+    ) -> Result<(Vec<u8>, bool), Report<ReleaseError>> {
+        if target.is_empty()
+            || target.len() > 4096
+            || !target.is_ascii()
+            || target.starts_with(b"/")
+            || target
+                .iter()
+                .any(|byte| byte.is_ascii_control() || matches!(byte, b'\\' | b':'))
+        {
+            return Err(material_error("unsafe Git file link target"));
+        }
+        let parent = path.rsplit_once('/').map_or("", |(parent, _)| parent);
+        let mut parts: Vec<&str> = parent.split('/').filter(|part| !part.is_empty()).collect();
+        let target = std::str::from_utf8(target).map_err(material_error)?;
+        if matches!(target.rsplit('/').next(), Some("" | "." | "..")) {
+            return Err(material_error("Git file link must name a file"));
+        }
+        let mut descended = false;
+        for part in target.split('/') {
+            match part {
+                "" => return Err(material_error("empty Git file link target component")),
+                "." => {}
+                ".." => {
+                    if descended {
+                        return Err(material_error(
+                            "Git file link traverses a parent after descending",
+                        ));
+                    }
+                    if parts.pop().is_none() {
+                        return Err(material_error("Git file link escapes its repository"));
+                    }
+                }
+                _ => {
+                    descended = true;
+                    parts.push(part);
+                }
+            }
+        }
+        if parts.is_empty() || parts.len() > DEPTH_LIMIT || parts.join("/").len() > 4096 {
+            return Err(material_error("Git file link target exceeds path limits"));
+        }
+        let mut tree = repository_tree.to_owned();
+        for (index, part) in parts.iter().enumerate() {
+            let entry = self
+                .tree(&tree)?
+                .into_iter()
+                .find(|entry| entry.name == *part)
+                .ok_or_else(|| material_error("Git file link target is missing"))?;
+            if index + 1 == parts.len() {
+                if entry.directory || entry.symlink {
+                    return Err(material_error(
+                        "Git file link must target a direct regular file",
+                    ));
+                }
+                return Ok((
+                    self.read("blob", &entry.oid, OBJECT_LIMIT)?,
+                    entry.executable,
+                ));
+            }
+            if !entry.directory {
+                return Err(material_error(
+                    "Git file link parent is not a direct directory",
+                ));
+            }
+            tree = entry.oid;
+        }
+        Err(material_error("Git file link target is missing"))
     }
 }
 
@@ -333,6 +416,7 @@ pub(super) fn ancestor_manifests(
 /// Returns [`ReleaseError::Material`] for an unreadable object or write.
 pub(super) fn materialize(
     store: &Store<'_>,
+    repository_tree: &str,
     root: &PackageRoot,
     writer: &mut PackageWriter,
 ) -> Result<(), Report<ReleaseError>> {
@@ -352,8 +436,21 @@ pub(super) fn materialize(
                     pending.push((child, format!("{relative}/"), depth + 1));
                 }
             } else if relative != "Cargo.toml" {
-                let bytes = store.read("blob", &entry.oid, OBJECT_LIMIT)?;
-                writer.write(&relative, &bytes, entry.executable)?;
+                let (bytes, executable) = if entry.symlink {
+                    let target = store.read("blob", &entry.oid, 4096)?;
+                    let path = if root.path.is_empty() {
+                        relative.clone()
+                    } else {
+                        format!("{}/{relative}", root.path)
+                    };
+                    store.file_link(repository_tree, &path, &target)?
+                } else {
+                    (
+                        store.read("blob", &entry.oid, OBJECT_LIMIT)?,
+                        entry.executable,
+                    )
+                };
+                writer.write(&relative, &bytes, executable)?;
             }
         }
     }

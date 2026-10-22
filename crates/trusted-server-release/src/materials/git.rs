@@ -469,10 +469,11 @@ fn parse_tree(mut bytes: &[u8]) -> Result<Vec<Entry>, Report<ReleaseError>> {
         let mode = &bytes[..space];
         let tree = match mode {
             b"40000" => true,
-            b"100644" | b"100755" => false,
+            // Link targets remain authenticated blob data; no filesystem link is created.
+            b"100644" | b"100755" | b"120000" => false,
             _ => {
                 return Err(material_error(
-                    "Git dependency symlinks, submodules and noncanonical modes are unreviewed",
+                    "Git dependency submodules and noncanonical modes are unreviewed",
                 ));
             }
         };

@@ -678,6 +678,36 @@ Prettier, JavaScript syntax and diff checks pass. Independent specification/secu
 and code-quality reviews found no blocking findings. Hosted validation remains
 pending for the actual npm lifecycle, four candidate builds and their receipts.
 
+Git dependency compatibility (2026-10-22): run `39720199554` at `0bf452370`
+passes ordinary/native suites and the Linux JS handoff, but candidate jobs
+`119631656292`, `119631656310` and `119635856319` reject the Git-sourced `esi`
+dependency introduced by main. Its locked commit contains package-local LICENSE
+and README.md links to regular files in the repository parent. Both the original
+Git closure parser and the package vendorer previously rejected mode `120000`.
+
+Retain canonical link blobs as inert authenticated objects in the complete
+locked commit closure. During package vendoring, resolve only direct relative
+file links through the same repository tree, rehashing every traversed object
+and the target under existing budgets. Copy target bytes and executable mode
+into regular files through the existing checksum writer; never create or follow
+filesystem links. Reject absolute/escaping targets, malformed or oversize text,
+missing targets, directory or chained aliases, aliased manifests and submodules.
+Reject parent traversal after descending into a target component rather than
+collapsing paths with potentially different link semantics. This changes no
+receipt fields, origin identities, acquisition authority or qualification claims.
+
+The positive pure vendoring regression first fails at the original unsupported
+mode check, then passes with authenticated parent-file bytes. Pure regressions
+also cover unsafe targets, manifest aliases, target executable mode and object
+tampering. Full original-object collection and actual four-candidate builds
+remain hosted checks; local process-spawning tests are not run.
+
+Local verification selects and passes 186 pure tests: 42 vendoring, 67
+composition, 68 SPDX, two candidate-index goldens, four authentication and three
+entropy-reader tests. Strict host-target clippy, documentation, read-only
+workspace formatting and changed-document Prettier pass. Independent
+specification/security and code-quality reviews report no blocking findings.
+
 ### Task 11: Generate complete artifact-specific SPDX
 
 **Create:** release tool `src/spdx.rs`, private `spdx::tests`, `crates/trusted-server-release/tests/fixtures/spdx/`.
