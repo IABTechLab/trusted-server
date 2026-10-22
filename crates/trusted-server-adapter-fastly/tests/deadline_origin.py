@@ -38,6 +38,8 @@ class Origin(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"fast")
         except (BrokenPipeError, ConnectionResetError):
+            # Deadline expiry deliberately closes the response before this slow
+            # origin finishes writing, so a disconnected client is expected.
             pass
 
     def log_message(self, *_args):

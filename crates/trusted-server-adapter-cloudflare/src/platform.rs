@@ -755,9 +755,8 @@ fn extract_client_ip(ctx: &edgezero_core::context::RequestContext) -> Option<IpA
 
 /// Reject multi-provider auction fan-out at the Cloudflare adapter level.
 ///
-/// Cloudflare Workers executes `send_async` eagerly (no true concurrency), so
-/// N simultaneous DSP requests run sequentially and accrue `sum(latencies)`
-/// instead of `max(latencies)`.
+/// Pending worker requests execute during collection. This adapter collects
+/// one response future at a time and retains its single-provider contract.
 ///
 /// The primary guard lives in the auction orchestrator, which checks
 /// `supports_concurrent_fanout()` and rejects multi-provider configurations
