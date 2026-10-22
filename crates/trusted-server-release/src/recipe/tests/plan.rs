@@ -198,6 +198,16 @@ fn expected_remap(target: ReleaseTarget) -> Vec<String> {
             "target.\"x86_64-unknown-linux-gnu\".linker=\"/usr/bin/gcc\"".to_owned(),
         ]);
     }
+    if target == ReleaseTarget::Wasm32Wasip1
+        && cfg!(all(target_os = "linux", target_arch = "x86_64"))
+    {
+        arguments.extend([
+            "--config".to_owned(),
+            "target.\"x86_64-unknown-linux-gnu\".linker=\"/usr/bin/cc\"".to_owned(),
+            "--config".to_owned(),
+            "target.\"wasm32-wasip1\".linker=\"/boundary/tool/0/lib/rustlib/x86_64-unknown-linux-gnu/bin/rust-lld\"".to_owned(),
+        ]);
+    }
     arguments
 }
 
@@ -334,6 +344,12 @@ fn assert_environment(actual: &BTreeMap<String, String>, fixture: &Fixture, targ
         ] {
             expected.insert(name.to_owned(), value.to_owned());
         }
+    }
+    if target == ReleaseTarget::Wasm32Wasip1
+        && cfg!(all(target_os = "linux", target_arch = "x86_64"))
+    {
+        expected.insert("HOST_CC".to_owned(), "/usr/bin/cc".to_owned());
+        expected.insert("HOST_AR".to_owned(), "/usr/bin/ar".to_owned());
     }
     if target.is_darwin() {
         let bin = "/boundary/system/0/Toolchains/XcodeDefault.xctoolchain/usr/bin";

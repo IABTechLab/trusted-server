@@ -298,6 +298,11 @@ pub(super) fn plan_for(inputs: &PlanInputs<'_>) -> Result<CargoPlan, Report<Rele
     if target == crate::policy::ReleaseTarget::X86_64UnknownLinuxGnu {
         configs.extend(super::gnu::linker_arguments());
     }
+    if target == crate::policy::ReleaseTarget::Wasm32Wasip1
+        && cfg!(all(target_os = "linux", target_arch = "x86_64"))
+    {
+        configs.extend(super::fastly_tools::linker_arguments(&tool_root));
+    }
     let developer = darwin.as_ref().map(|darwin| darwin.developer.as_str());
     let c_prefix_map = c_prefix_map_environment_with(target, &sources, developer)?;
     if let Some((name, mut value)) = c_prefix_map {
@@ -326,6 +331,11 @@ pub(super) fn plan_for(inputs: &PlanInputs<'_>) -> Result<CargoPlan, Report<Rele
     }
     if target == crate::policy::ReleaseTarget::X86_64UnknownLinuxGnu {
         environment.extend(super::gnu::environment());
+    }
+    if target == crate::policy::ReleaseTarget::Wasm32Wasip1
+        && cfg!(all(target_os = "linux", target_arch = "x86_64"))
+    {
+        environment.extend(super::fastly_tools::environment());
     }
     let apple_identity_sha256 = match darwin {
         Some(darwin) => {

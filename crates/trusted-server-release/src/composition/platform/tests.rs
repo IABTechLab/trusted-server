@@ -366,3 +366,32 @@ fn platform_binding_rejects_an_artifact_built_for_another_apple_sdk() {
         "should reject a recorded SDK differing from selected Apple tools"
     );
 }
+
+#[test]
+fn fastly_tool_attachment_preserves_target_and_receipt_incompleteness() {
+    let platform = projection_fixture(ReleaseTarget::Wasm32Wasip1)
+        .with_fastly_tools(crate::recipe::fastly_tools::FastlyToolEvidence::projection_fixture())
+        .expect("should attach selected Fastly host files");
+    assert_eq!(
+        platform.unresolved_native_tool_roles(),
+        ["assembler", "build_tools"],
+        "should retain unmeasured closure roles"
+    );
+    assert!(
+        !platform.material_native_coverage_complete(),
+        "should retain incomplete native material coverage"
+    );
+    let receipt = serde_json::to_value(&platform).expect("should serialize receipt");
+    assert_eq!(
+        receipt["native_tools"]["evidence"]["full_closure_measured"], false,
+        "should preserve bounded measurement scope"
+    );
+    assert!(
+        projection_fixture(ReleaseTarget::X86_64UnknownLinuxGnu)
+            .with_fastly_tools(
+                crate::recipe::fastly_tools::FastlyToolEvidence::projection_fixture()
+            )
+            .is_err(),
+        "should reject another target"
+    );
+}

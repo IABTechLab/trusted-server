@@ -25,6 +25,9 @@ pub(crate) struct PlatformEvidence {
 #[derive(Debug, Serialize)]
 #[serde(tag = "scope", rename_all = "snake_case")]
 enum NativeToolCoverage {
+    ExplicitFastlyHostFiles {
+        evidence: Box<crate::recipe::fastly_tools::FastlyToolEvidence>,
+    },
     HostPathUnresolved {
         roles: [&'static str; 5],
     },
@@ -60,6 +63,32 @@ impl PlatformEvidence {
             _ => None,
         }
     }
+    /// Borrows bounded selected Fastly host files when measured by execution.
+    pub(crate) fn fastly_tools(&self) -> Option<&crate::recipe::fastly_tools::FastlyToolEvidence> {
+        match &self.native_tools {
+            NativeToolCoverage::ExplicitFastlyHostFiles { evidence } => Some(evidence),
+            _ => None,
+        }
+    }
+    /// Attaches measured selected Linux host files to the Fastly target.
+    ///
+    /// # Errors
+    ///
+    /// Rejects attachment to another target.
+    pub(crate) fn with_fastly_tools(
+        mut self,
+        evidence: crate::recipe::fastly_tools::FastlyToolEvidence,
+    ) -> Result<Self, Report<ReleaseError>> {
+        if self.target != ReleaseTarget::Wasm32Wasip1.triple() {
+            return Err(composition_error(
+                "Fastly host tools belong to another target",
+            ));
+        }
+        self.native_tools = NativeToolCoverage::ExplicitFastlyHostFiles {
+            evidence: Box::new(evidence),
+        };
+        Ok(self)
+    }
     /// Borrows the accepted executable's logical runtime requirements.
     pub(crate) fn external_requirements(&self) -> &ExternalRequirements {
         &self.external_requirements
@@ -68,6 +97,7 @@ impl PlatformEvidence {
     pub(crate) fn unresolved_native_tool_roles(&self) -> &[&'static str] {
         match &self.native_tools {
             NativeToolCoverage::HostPathUnresolved { roles } => roles,
+            NativeToolCoverage::ExplicitFastlyHostFiles { .. } => &["assembler", "build_tools"],
             NativeToolCoverage::ExplicitAppleFiles { .. }
             | NativeToolCoverage::ExplicitGnuImage { .. } => &[],
         }

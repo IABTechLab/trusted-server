@@ -46,6 +46,7 @@ mod cargo_output;
 mod compare;
 mod completed;
 mod execute;
+pub(crate) mod fastly_tools;
 mod final_paths;
 mod fresh;
 pub(crate) mod gnu;
