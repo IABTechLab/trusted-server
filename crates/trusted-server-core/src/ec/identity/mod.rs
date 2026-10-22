@@ -26,6 +26,7 @@ pub mod input;
 pub(crate) mod mutation;
 pub(crate) mod policy;
 pub mod provider;
+pub(crate) mod request;
 pub mod resolution;
 pub(crate) mod revision;
 pub(crate) mod servable;

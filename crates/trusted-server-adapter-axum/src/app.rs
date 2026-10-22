@@ -233,6 +233,7 @@ async fn dispatch_fallback(
                 ec_context: &mut ec_context,
                 services,
                 req,
+                is_real_browser: false,
             })
             .await
             .unwrap_or_else(|| {

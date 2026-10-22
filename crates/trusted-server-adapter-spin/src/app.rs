@@ -826,6 +826,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                         ec_context: &mut ec_context,
                         services: &services,
                         req,
+                        is_real_browser: false,
                     })
                     .await
                     .unwrap_or_else(|| {

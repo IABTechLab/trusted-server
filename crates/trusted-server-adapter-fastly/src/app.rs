@@ -820,6 +820,7 @@ async fn dispatch_fallback(
                 ec_context: &mut ec.ec_context,
                 services,
                 req,
+                is_real_browser: ec.is_real_browser,
             })
             .await
             .unwrap_or_else(|| {
@@ -847,6 +848,7 @@ async fn dispatch_fallback(
         if is_navigation {
             ec.ec_context.set_eid_sync_source(EidSyncSource::Navigation);
         }
+        ec.ec_context.decide_writer(&req, true, ec.is_real_browser);
         let is_publisher_navigation = ec.is_real_browser && is_navigation;
         if is_publisher_navigation
             && let Err(err) = ec

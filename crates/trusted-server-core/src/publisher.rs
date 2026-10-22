@@ -72,7 +72,9 @@ use crate::ec::registry::PartnerRegistry;
 use crate::ec::{EcContext, EidSyncSource};
 use crate::error::TrustedServerError;
 use crate::html_processor::BodyCloseInjection;
-use crate::http_util::{RequestInfo, is_navigation_request, serve_static_with_etag};
+use crate::http_util::{
+    RequestInfo, is_navigation_request, is_prefetch_request, serve_static_with_etag,
+};
 use crate::integrations::IntegrationRegistry;
 use crate::platform::{
     GeoInfo, PlatformBackendSpec, PlatformHttpRequest, RuntimeServices,
@@ -3203,18 +3205,6 @@ pub(crate) fn is_bot_user_agent(req: &Request<EdgeBody>) -> bool {
     BOT_USER_AGENT_FRAGMENTS
         .iter()
         .any(|frag| ua.contains(frag))
-}
-
-/// Returns true when the request advertises itself as a prefetch via either
-/// the standard `Sec-Purpose` or the legacy `Purpose` header.
-pub(crate) fn is_prefetch_request(req: &Request<EdgeBody>) -> bool {
-    let header = |name: &str| {
-        req.headers()
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.contains("prefetch"))
-    };
-    header("sec-purpose") || header("purpose")
 }
 
 /// Returns whether request-scoped signals permit an ad-eligible navigation.

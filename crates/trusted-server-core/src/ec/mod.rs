@@ -284,6 +284,10 @@ pub struct EcContext {
     pull_sync_marker: PullSyncMarkerState,
     /// Allowed returning-user EID persistence source, assigned only after request filters pass.
     eid_sync_source: Option<EidSyncSource>,
+    /// Request-scoped identity provider state: the writer decision, phase-1
+    /// signals, the identity cookies, the single mutation and the cookies
+    /// this response sets.
+    identity: identity::request::RequestIdentity,
 }
 
 impl EcContext {
@@ -366,6 +370,7 @@ impl EcContext {
             client_eids: None,
             pull_sync_marker: PullSyncMarkerState::from_cookie(parsed.pull_sync_marker),
             eid_sync_source: None,
+            identity: identity::request::RequestIdentity::capture(req.headers()),
         })
     }
 
@@ -649,6 +654,48 @@ impl EcContext {
         self.ec_value.as_deref().map(generation::ec_hash)
     }
 
+    /// Request-scoped identity provider state.
+    #[allow(
+        dead_code,
+        reason = "identity finalize, which reads this, lands in a following commit"
+    )]
+    #[must_use]
+    pub(crate) fn identity(&self) -> &identity::request::RequestIdentity {
+        &self.identity
+    }
+
+    /// Request-scoped identity provider state, to change it.
+    #[allow(
+        dead_code,
+        reason = "identity finalize, which writes this, lands in a following commit"
+    )]
+    pub(crate) fn identity_mut(&mut self) -> &mut identity::request::RequestIdentity {
+        &mut self.identity
+    }
+
+    /// Decides whether this request is the page load's identity writer.
+    ///
+    /// Call once pre-route filters have allowed dispatch, where routing
+    /// decides EC generation. The writer is an organic route (the publisher
+    /// fallback or an integration proxy), a `Sec-Fetch-Dest: document`
+    /// navigation that is not a prefetch, from a real browser. It also records
+    /// the page URL for providers.
+    pub fn decide_writer(
+        &mut self,
+        req: &Request<EdgeBody>,
+        organic_route: bool,
+        is_real_browser: bool,
+    ) {
+        let writer = organic_route
+            && is_real_browser
+            && crate::http_util::is_document_navigation(req)
+            && !crate::http_util::is_prefetch_request(req);
+        self.identity.set_writer(writer);
+        if writer && let Ok(url) = url::Url::parse(&req.uri().to_string()) {
+            self.identity.set_page_url(url);
+        }
+    }
+
     /// Creates a test-only `EcContext` with explicit field values.
     #[cfg(test)]
     #[must_use]
@@ -667,6 +714,7 @@ impl EcContext {
             client_eids: None,
             pull_sync_marker: PullSyncMarkerState::Absent,
             eid_sync_source: None,
+            identity: identity::request::RequestIdentity::default(),
         }
     }
 
@@ -692,6 +740,7 @@ impl EcContext {
             client_eids: None,
             pull_sync_marker: PullSyncMarkerState::Absent,
             eid_sync_source: None,
+            identity: identity::request::RequestIdentity::default(),
         }
     }
 
@@ -720,6 +769,7 @@ impl EcContext {
             client_eids: None,
             pull_sync_marker: PullSyncMarkerState::Absent,
             eid_sync_source: None,
+            identity: identity::request::RequestIdentity::default(),
         }
     }
 }
@@ -774,6 +824,75 @@ mod tests {
     };
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::create_test_settings;
+
+    fn navigation_request() -> Request<EdgeBody> {
+        Request::builder()
+            .uri("https://www.example.com/a?b=c#d")
+            .header("sec-fetch-dest", "document")
+            .header(http::header::USER_AGENT, "ExampleBrowser/1.0")
+            .header("dnt", "1")
+            .header(
+                http::header::COOKIE,
+                "__Host-ts-eids-s=v1.a.b; __Host-ts-eids-r-0a1b2c3d=v1.c.d",
+            )
+            .body(EdgeBody::empty())
+            .expect("should build request")
+    }
+
+    #[test]
+    fn decide_writer_needs_every_condition() {
+        let mut context = EcContext::default();
+        context.decide_writer(&navigation_request(), true, true);
+        assert!(
+            context.identity().writer(),
+            "organic real-browser document navigation"
+        );
+        assert_eq!(
+            context.identity().page_url().map(url::Url::as_str),
+            Some("https://www.example.com/a"),
+            "the page URL has no query or fragment"
+        );
+
+        let prefetch = Request::builder()
+            .header("sec-fetch-dest", "document")
+            .header("sec-purpose", "prefetch")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        let accept_only = Request::builder()
+            .header(http::header::ACCEPT, "text/html")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        for (name, organic, browser, request) in [
+            ("named route", false, true, navigation_request()),
+            ("bot", true, false, navigation_request()),
+            ("prefetch", true, true, prefetch),
+            ("no Sec-Fetch-Dest", true, true, accept_only),
+        ] {
+            let mut context = EcContext::default();
+            context.decide_writer(&request, organic, browser);
+            assert!(!context.identity().writer(), "not a writer: {name}");
+        }
+    }
+
+    #[test]
+    fn read_from_request_captures_identity_signals() {
+        let settings = create_test_settings();
+        let context =
+            EcContext::read_from_request(&settings, &navigation_request(), &noop_services())
+                .expect("should read the request");
+        let identity = context.identity();
+        assert_eq!(
+            identity.user_agent(),
+            Some("ExampleBrowser/1.0"),
+            "captures the user agent"
+        );
+        assert!(identity.dnt(), "captures DNT");
+        assert!(
+            identity.raw_cookies().has_any(),
+            "captures the raw identity cookies"
+        );
+        assert!(!identity.writer(), "reading alone never makes a writer");
+    }
 
     /// [`EcKvStore`] wrapper whose first `collisions` `Add` writes report a
     /// precondition failure, forcing generation to retry with a fresh suffix.

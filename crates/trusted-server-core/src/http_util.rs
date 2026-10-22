@@ -117,6 +117,34 @@ pub fn is_navigation_request(req: &Request<EdgeBody>) -> bool {
         })
 }
 
+/// Returns whether this is a top-level document navigation by
+/// `Sec-Fetch-Dest: document` alone.
+///
+/// Unlike [`is_navigation_request`], the `Accept: text/html` fallback does not
+/// count, because a page script's `fetch()` can send it. Only such a request
+/// can be a page load's identity writer.
+#[must_use]
+pub fn is_document_navigation(req: &Request<EdgeBody>) -> bool {
+    req.headers()
+        .get("sec-fetch-dest")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|dest| dest.trim().eq_ignore_ascii_case("document"))
+}
+
+/// Returns true when the request advertises itself as a prefetch or
+/// prerender via either the standard `Sec-Purpose` or the legacy `Purpose`
+/// header.
+#[must_use]
+pub fn is_prefetch_request(req: &Request<EdgeBody>) -> bool {
+    let header = |name: &str| {
+        req.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains("prefetch"))
+    };
+    header("sec-purpose") || header("purpose")
+}
+
 /// Extracted request information for host rewriting.
 ///
 /// This struct captures the effective host and scheme from an incoming request.
@@ -487,6 +515,48 @@ pub fn enforce_max_body_size(
 mod tests {
     use super::*;
     use crate::platform::ClientInfo;
+
+    #[test]
+    fn document_navigation_requires_sec_fetch_dest_document() {
+        let with_dest = Request::builder()
+            .header("sec-fetch-dest", "document")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        let accept_only = Request::builder()
+            .header(header::ACCEPT, "text/html")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        let iframe = Request::builder()
+            .header("sec-fetch-dest", "iframe")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        assert!(is_document_navigation(&with_dest), "document counts");
+        assert!(
+            !is_document_navigation(&accept_only),
+            "the Accept fallback does not"
+        );
+        assert!(
+            is_navigation_request(&accept_only),
+            "control: the broad check still accepts it"
+        );
+        assert!(!is_document_navigation(&iframe), "iframes do not");
+    }
+
+    #[test]
+    fn prefetch_is_detected_from_either_header() {
+        for header_name in ["sec-purpose", "purpose"] {
+            let request = Request::builder()
+                .header(header_name, "prefetch;prerender")
+                .body(EdgeBody::empty())
+                .expect("should build request");
+            assert!(is_prefetch_request(&request), "{header_name} prefetch");
+        }
+        let plain = Request::builder()
+            .body(EdgeBody::empty())
+            .expect("should build request");
+        assert!(!is_prefetch_request(&plain), "control: no header");
+    }
+
     use crate::redacted::Redacted;
     use crate::settings::TrustedClientIpConfig;
     use http::{HeaderName, HeaderValue, Method};
