@@ -21,6 +21,7 @@ pub mod descriptor;
 pub(crate) mod dispatch;
 pub mod exchange;
 pub(crate) mod finalize;
+pub mod flush;
 pub(crate) mod generic_pull;
 pub mod ids;
 pub mod input;

@@ -16,21 +16,32 @@ use super::cookie::{
     delete_cookie_header, encode_s_cookie, merge_with_kv, plan_r_batch, r_batch_applied,
     r_batch_to_changes, set_cookie_header, split_r_batch,
 };
-use super::coordinator::{EligibilityView, claimed_sources};
+use super::coordinator::{
+    Eligibility, EligibilityRequest, EligibilityView, Phase, RequestFacts, claimed_sources,
+    eligibility,
+};
+use super::descriptor::{Input, ResolveKind};
+use super::ids::UnixTime;
 use super::ids::{IdentityProviderId, SourceDomain};
+use super::input::{ProviderConsent, Region, ResolveInput, ResolveSignals, StoredId};
 use super::input::{RandomSource, ThreadRandom};
 use super::mutation::{ApplyContext, IdentityMutation, PartnerIdChange, ProviderStateChange};
 use super::policy::{PolicySignals, policy_allows};
+use super::provider::IdentityProvider;
+use super::resolution::IdentityProviderError;
 use super::revision::{IdentityKeys, Revision, invalidated_uid_hash};
 use crate::consent::allows_eid_persistence;
 use crate::constants::COOKIE_TS_EIDS_S;
 use crate::ec::EidSyncSource;
+use crate::ec::consent::ec_consent_granted;
 use crate::ec::kv::{KvIdentityGraph, PartnerIdUpdate, RemovalWriteOutcome};
 use crate::ec::kv_types::{KvEntry, KvPartnerId};
 use crate::ec::prebid_eids::collect_eid_updates;
 use crate::ec::registry::PartnerRegistry;
 use crate::ec::{EcContext, EcKvSnapshot};
 use crate::settings::Settings;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 /// What identity finalize needs besides the request: keys, the provider
 /// catalog, the `[ec.identity]` settings, the time and a random source.
@@ -95,6 +106,129 @@ pub(crate) fn open_identity_cookies(context: &mut EcContext, finalize: &Identity
         .open_cookies(&finalize.keys, &finalize.catalog, &ec_id);
 }
 
+/// The inputs this request can supply to providers.
+fn available_inputs(context: &EcContext) -> std::collections::BTreeSet<Input> {
+    let identity = context.identity();
+    let mut inputs = std::collections::BTreeSet::new();
+    if context.client_ip().is_some() {
+        inputs.insert(Input::ClientIp);
+    }
+    if identity.user_agent().is_some() {
+        inputs.insert(Input::UserAgent);
+    }
+    if identity.page_url().is_some() {
+        inputs.insert(Input::PageUrl);
+    }
+    if region_of(context).is_some() {
+        inputs.insert(Input::Region);
+    }
+    inputs
+}
+
+fn region_of(context: &EcContext) -> Option<Region> {
+    let geo = context.geo_info()?;
+    Region::from_geo(&geo.country, geo.region.as_deref())
+}
+
+/// The facts of the writer request, for after-send eligibility.
+#[must_use]
+pub(crate) fn writer_facts(context: &EcContext, finalize: &IdentityFinalize) -> RequestFacts {
+    RequestFacts {
+        is_real_browser: context.identity().writer(),
+        ec_persistence_allowed: ec_consent_granted(context.consent())
+            && allows_eid_persistence(context.consent()),
+        policy_signals: PolicySignals {
+            dnt: context.identity().dnt(),
+        },
+        writer: context.identity().writer(),
+        new_visitor: context.ec_generated(),
+        runs_auction: false,
+        now: UnixTime::from_secs(finalize.now),
+        available_inputs: available_inputs(context),
+    }
+}
+
+/// An after-send provider eligible in `phase`, with the sources to resolve.
+pub(crate) struct Candidate {
+    pub(crate) provider: Arc<dyn IdentityProvider>,
+    pub(crate) kinds: BTreeMap<SourceDomain, ResolveKind>,
+}
+
+impl Candidate {
+    fn stateful(&self) -> bool {
+        self.provider
+            .descriptor()
+            .resolves()
+            .is_some_and(super::descriptor::Resolves::has_private_state)
+    }
+
+    fn generic_pull(&self) -> bool {
+        self.provider
+            .descriptor()
+            .resolves()
+            .is_some_and(super::descriptor::Resolves::gets_ec_id)
+    }
+
+    fn has_unowned_source(&self, catalog: &ProviderCatalog) -> bool {
+        let id = self.provider.descriptor().id();
+        self.kinds
+            .keys()
+            .any(|source| catalog.owner_of(source) != Some(id))
+    }
+}
+
+/// Every provider eligible in `phase` on `view`. A valid pull-complete
+/// marker leaves generic pull providers out, as it always has.
+pub(crate) fn candidates(
+    context: &EcContext,
+    finalize: &IdentityFinalize,
+    view: &EligibilityView,
+    phase: Phase,
+) -> Vec<Candidate> {
+    let facts = writer_facts(context, finalize);
+    let request = EligibilityRequest {
+        identity: &finalize.identity,
+        view,
+        facts: &facts,
+        consent: context.consent(),
+        catalog: &finalize.catalog,
+        keys: &finalize.keys,
+    };
+    let pull_complete = context.pull_sync_marker().is_valid();
+    finalize
+        .catalog
+        .providers()
+        .filter_map(|provider| {
+            let settings = finalize
+                .catalog
+                .provider_settings(&finalize.identity, provider.descriptor().id());
+            match eligibility(provider.as_ref(), &settings, phase, &request) {
+                Eligibility::Eligible { kinds } => Some(Candidate {
+                    provider: Arc::clone(provider),
+                    kinds,
+                }),
+                Eligibility::Skip(_) => None,
+            }
+        })
+        .filter(|candidate| !(pull_complete && candidate.generic_pull()))
+        .collect()
+}
+
+fn opened_batches(context: &EcContext) -> Vec<RBatch> {
+    context
+        .identity()
+        .opened()
+        .map(|opened| {
+            opened
+                .removals
+                .cookies
+                .iter()
+                .map(|(_, batch)| batch.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Whether the writer must read KV before send (spec 6.3, step 2): the
 /// cookie is missing, unreadable, from another config, stale, marked
 /// missing, holds staged entries or markers, or removal cookies are present.
@@ -106,15 +240,74 @@ pub(crate) fn phase1_read_needed(context: &EcContext, finalize: &IdentityFinaliz
     if !opened.removals.cookies.is_empty() || !opened.removals.unopenable.is_empty() {
         return true;
     }
-    match &opened.s {
-        SOpen::Missing | SOpen::Failed | SOpen::ConfigChanged(_) => true,
-        SOpen::Valid(cookie) => {
-            cookie.m
-                || finalize.now.saturating_sub(cookie.kc) > finalize.identity.kv_revalidate_sec
-                || cookie.ids.iter().any(|entry| !entry.k && !entry.d)
-                || cookie.ps.values().any(|state| state.p.is_some())
-        }
+    let cookie = match &opened.s {
+        SOpen::Missing | SOpen::Failed | SOpen::ConfigChanged(_) => return true,
+        SOpen::Valid(cookie) => cookie,
+    };
+    if cookie.m
+        || finalize.now.saturating_sub(cookie.kc) > finalize.identity.kv_revalidate_sec
+        || cookie.ids.iter().any(|entry| !entry.k && !entry.d)
+        || cookie.ps.values().any(|state| state.p.is_some())
+    {
+        return true;
     }
+    // An after-send provider with an unowned candidate source needs KV for
+    // its dry run, because the cookie caches no unowned values.
+    let view = EligibilityView::merge(
+        None,
+        Some(cookie),
+        &opened_batches(context),
+        &finalize.catalog,
+        &finalize.keys,
+    );
+    candidates(context, finalize, &view, Phase::AfterSendDryRun)
+        .iter()
+        .any(|candidate| !candidate.stateful() && candidate.has_unowned_source(&finalize.catalog))
+}
+
+/// Records, in the cookie only, that a read showed every unowned candidate
+/// source of a provider present: `ps.n = now + refresh_after_sec`, with the
+/// KV `n` it saw. Stops the unowned read trigger firing on every navigation.
+fn apply_cookie_only_backoff(
+    cookie: &mut SCookie,
+    entry: &KvEntry,
+    finalize: &IdentityFinalize,
+) -> bool {
+    let mut changed = false;
+    for provider in finalize.catalog.providers() {
+        let descriptor = provider.descriptor();
+        let Some(resolves) = descriptor.resolves() else {
+            continue;
+        };
+        if resolves.has_private_state() {
+            continue;
+        }
+        let id = descriptor.id();
+        let settings = finalize.catalog.provider_settings(&finalize.identity, id);
+        let unowned: Vec<&SourceDomain> = claimed_sources(descriptor, &settings)
+            .into_iter()
+            .filter(|source| finalize.catalog.owner_of(source) != Some(id))
+            .collect();
+        let all_present = !unowned.is_empty()
+            && unowned.iter().all(|source| {
+                entry
+                    .ids
+                    .get(source.as_str())
+                    .is_some_and(|record| record.exp.is_none_or(|exp| finalize.now < exp))
+            });
+        if !all_present {
+            continue;
+        }
+        let kv_n = entry.ps.get(id.as_str()).and_then(|state| state.n);
+        let state = cookie.ps.entry(id.to_string()).or_default();
+        if state.n.is_some_and(|n| n > finalize.now) && state.kn == kv_n {
+            continue;
+        }
+        state.n = Some(finalize.now + settings.refresh_after_sec);
+        state.kn = kv_n;
+        changed = true;
+    }
+    changed
 }
 
 /// A KV read answers a marker when every unowned candidate source of the
@@ -179,8 +372,15 @@ pub(crate) fn reconcile_with_snapshot(context: &mut EcContext, finalize: &Identi
             .collect();
         return;
     }
-    if outcome.changed || !matches!(opened.s, SOpen::Valid(_)) {
-        staged.s_cookie = Some(outcome.cookie);
+    let mut cookie = outcome.cookie;
+    let backed_off = match &snapshot {
+        EcKvSnapshot::Present { entry, .. } => {
+            apply_cookie_only_backoff(&mut cookie, entry, finalize)
+        }
+        _ => false,
+    };
+    if outcome.changed || backed_off || !matches!(opened.s, SOpen::Valid(_)) {
+        staged.s_cookie = Some(cookie);
     }
     if writer && let EcKvSnapshot::Present { entry, .. } = &snapshot {
         for (name, batch) in &opened.removals.cookies {
@@ -429,6 +629,148 @@ pub(crate) fn queue_writer_changes(
     for (provider, state) in states {
         mutation.merge_state(provider, state);
     }
+}
+
+/// The signals a provider call may use, from the request context.
+pub(crate) fn request_signals<'a>(
+    context: &'a EcContext,
+    finalize: &'a IdentityFinalize,
+    publisher_domain: &'a str,
+    client_ip: Option<std::net::IpAddr>,
+) -> ResolveSignals<'a> {
+    ResolveSignals {
+        client_ip,
+        user_agent: context.identity().user_agent(),
+        page_url: context.identity().page_url().cloned(),
+        region: region_of(context),
+        hashed_email: None,
+        consent: ProviderConsent::from_context(context.consent()),
+        publisher_domain,
+        now: UnixTime::from_secs(finalize.now),
+        random: finalize.random(),
+        ec_id: context.ec_value().map(str::to_owned),
+        stored: BTreeMap::new(),
+        state_json: None,
+        dry_run: false,
+    }
+}
+
+/// A provider's stored records and private state in a row or view.
+pub(crate) fn provider_records(
+    provider: &dyn IdentityProvider,
+    view: &EligibilityView,
+) -> (BTreeMap<SourceDomain, StoredId>, Option<String>) {
+    let stored = provider
+        .descriptor()
+        .sources()
+        .iter()
+        .filter_map(|source| {
+            view.record(source)
+                .map(|record| (source.clone(), StoredId::from_record(record)))
+        })
+        .collect();
+    let state = view
+        .state(provider.descriptor().id().as_str())
+        .and_then(|state| state.st.as_ref())
+        .and_then(|st| serde_json::to_string(st).ok());
+    (stored, state)
+}
+
+/// Phase 3 on the writer (spec 5.2): dry-runs each eligible after-send
+/// provider and marks the ones that would call, so phase 4 knows to re-read
+/// the row. A provider with private state gets no dry run and is marked when
+/// due. An unowned dry run needs a KV read that showed the source missing.
+pub(crate) fn mark_after_send(
+    context: &mut EcContext,
+    finalize: &IdentityFinalize,
+    publisher_domain: &str,
+    status: http::StatusCode,
+) {
+    let returning = context.ec_was_present() && !context.ec_generated();
+    if !context.identity().writer()
+        || !returning
+        || !(status.is_success() || status == http::StatusCode::NOT_MODIFIED)
+    {
+        return;
+    }
+    let kv_read = context
+        .ec_value()
+        .and_then(|ec_id| context.kv_snapshot().entry_for(ec_id))
+        .is_some();
+    let cookie = context.identity().staged().s_cookie.clone().or_else(|| {
+        context
+            .identity()
+            .opened()
+            .and_then(|opened| opened.s.cookie().cloned())
+    });
+    let view = EligibilityView::merge(
+        context
+            .ec_value()
+            .and_then(|ec_id| context.kv_snapshot().entry_for(ec_id)),
+        cookie.as_ref(),
+        &opened_batches(context),
+        &finalize.catalog,
+        &finalize.keys,
+    );
+
+    let mut marked = Vec::new();
+    let mut skipped = Vec::new();
+    for candidate in candidates(context, finalize, &view, Phase::AfterSendDryRun) {
+        let id = candidate.provider.descriptor().id().clone();
+        if candidate.stateful() {
+            marked.push(id);
+            continue;
+        }
+        if candidate.has_unowned_source(&finalize.catalog) && !kv_read {
+            continue;
+        }
+        let (stored, state) = provider_records(candidate.provider.as_ref(), &view);
+        let base = request_signals(context, finalize, publisher_domain, None);
+        let client_ip = context
+            .client_ip()
+            .and_then(|ip| ip.parse::<std::net::IpAddr>().ok());
+        let signals = ResolveSignals {
+            client_ip,
+            ..base.for_provider(stored, state, true)
+        };
+        let input = ResolveInput::new(candidate.provider.descriptor(), candidate.kinds, &signals);
+        match candidate.provider.request(&input) {
+            Ok(Some(_)) => marked.push(id),
+            Ok(None) => skipped.push(id),
+            Err(error)
+                if matches!(
+                    error.current_context(),
+                    IdentityProviderError::InputUnavailable { .. }
+                ) =>
+            {
+                skipped.push(id);
+            }
+            Err(error) => log::warn!(
+                "Identity provider {id} dry run failed: {}",
+                error.current_context()
+            ),
+        }
+    }
+
+    for id in skipped {
+        let settings = finalize.catalog.provider_settings(&finalize.identity, &id);
+        context.identity_mut().mutation_mut().merge_state(
+            id,
+            ProviderStateChange {
+                n: Some(finalize.now + settings.refresh_after_sec),
+                ..ProviderStateChange::default()
+            },
+        );
+    }
+    if marked.is_empty() {
+        return;
+    }
+    let mut cookie = cookie.unwrap_or_else(|| SCookie::new(&finalize.catalog, finalize.now));
+    for id in marked {
+        cookie.ps.entry(id.to_string()).or_default().p = Some(finalize.now);
+        context.identity_mut().mark(id);
+    }
+    context.identity_mut().staged_mut().s_cookie = Some(cookie);
 }
 
 /// The removals, opt-outs, clears and `iv` hashes of every removal cookie,
@@ -1098,6 +1440,135 @@ mod tests {
 
         assert_eq!(counter.writes().total() - before.total(), 0, "no write");
         assert_eq!(removal_cookie_count(&response), 1, "one removal cookie");
+    }
+
+    fn pull_registry() -> PartnerRegistry {
+        let mut pull = partner("ssp.example.com");
+        pull.pull_sync_enabled = true;
+        pull.pull_sync_url = Some("https://sync.ssp.example.com/pull".to_owned());
+        pull.pull_sync_allowed_domains = vec!["sync.ssp.example.com".to_owned()];
+        pull.ts_pull_token = Some(crate::redacted::Redacted::new(
+            "example-token-value-0123456789abcdef".to_owned(),
+        ));
+        PartnerRegistry::from_config(&[pull]).expect("should build registry")
+    }
+
+    fn pull_finalize() -> IdentityFinalize {
+        IdentityFinalize::for_test(
+            ProviderCatalog::from_partners(&pull_registry()).expect("should build catalog"),
+            current_timestamp(),
+        )
+    }
+
+    #[test]
+    fn unowned_pull_partner_is_marked_only_after_a_read_shows_it_missing() {
+        let finalize = pull_finalize();
+        let graph = KvIdentityGraph::in_memory("ec-store");
+        graph
+            .create(&ec_id(), &KvEntry::minimal("z.example.com", "x", 1))
+            .expect("should seed");
+
+        let mut unread = context_with("x=1", true, Jurisdiction::NonRegulated);
+        open_identity_cookies(&mut unread, &finalize);
+        mark_after_send(
+            &mut unread,
+            &finalize,
+            "www.example.com",
+            http::StatusCode::OK,
+        );
+        assert!(
+            unread.identity().marked().is_empty(),
+            "without a read the cookie cannot know the source is missing"
+        );
+
+        let mut read = context_with("x=1", true, Jurisdiction::NonRegulated);
+        read.set_kv_snapshot(graph.load_snapshot(&ec_id()));
+        open_identity_cookies(&mut read, &finalize);
+        mark_after_send(
+            &mut read,
+            &finalize,
+            "www.example.com",
+            http::StatusCode::OK,
+        );
+        assert_eq!(
+            read.identity()
+                .marked()
+                .iter()
+                .map(IdentityProviderId::as_str)
+                .collect::<Vec<_>>(),
+            vec!["pull-ssp-example-com"],
+            "a read showing the source missing marks the pull partner"
+        );
+        assert!(
+            read.identity()
+                .staged()
+                .s_cookie
+                .as_ref()
+                .is_some_and(|cookie| cookie.ps["pull-ssp-example-com"].p.is_some()),
+            "the marker goes into ts-eids-s"
+        );
+
+        let mut redirect = context_with("x=1", true, Jurisdiction::NonRegulated);
+        redirect.set_kv_snapshot(graph.load_snapshot(&ec_id()));
+        open_identity_cookies(&mut redirect, &finalize);
+        mark_after_send(
+            &mut redirect,
+            &finalize,
+            "www.example.com",
+            http::StatusCode::FOUND,
+        );
+        assert!(
+            redirect.identity().marked().is_empty(),
+            "a 302 marks nothing"
+        );
+    }
+
+    #[test]
+    fn present_unowned_source_backs_off_the_read_trigger_in_the_cookie() {
+        let finalize = pull_finalize();
+        let mut entry = KvEntry::minimal("ssp.example.com", "held", 1);
+        entry
+            .ids
+            .get_mut("ssp.example.com")
+            .expect("should hold it")
+            .at = Some(1);
+        let mut context = context_with("x=1", true, Jurisdiction::NonRegulated);
+        context.set_kv_snapshot(EcKvSnapshot::Present {
+            ec_id: ec_id(),
+            entry: Box::new(entry),
+            generation: Some(1),
+        });
+        open_identity_cookies(&mut context, &finalize);
+        assert!(
+            phase1_read_needed(&context, &finalize),
+            "control: with no cookie the writer reads"
+        );
+
+        reconcile_with_snapshot(&mut context, &finalize);
+        let cookie = context
+            .identity()
+            .staged()
+            .s_cookie
+            .clone()
+            .expect("should stage the cookie");
+        assert!(
+            cookie.ps["pull-ssp-example-com"]
+                .n
+                .is_some_and(|next| next > finalize.now),
+            "the cookie records when the partner is next due"
+        );
+
+        let sealed = sealed_s(&cookie);
+        let mut next = context_with(
+            &format!("__Host-ts-eids-s={sealed}"),
+            true,
+            Jurisdiction::NonRegulated,
+        );
+        open_identity_cookies(&mut next, &finalize);
+        assert!(
+            !phase1_read_needed(&next, &finalize),
+            "the next navigation skips the read"
+        );
     }
 
     #[test]

@@ -13,12 +13,11 @@ use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
 use trusted_server_core::cache_policy::{EdgeCacheHeader, cache_control_headers_have_directive};
 use trusted_server_core::constants::HEADER_X_TS_VERSION;
+use trusted_server_core::ec::EcContext;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
+use trusted_server_core::ec::identity::flush::{AfterSendInput, after_send_needed, run_after_send};
 use trusted_server_core::ec::kv::KvIdentityGraph;
-use trusted_server_core::ec::pull_sync::{
-    PullSyncContext, build_pull_sync_context, dispatch_pull_sync,
-};
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::error::TrustedServerError;
 use trusted_server_core::integrations::RequestFilterEffects;
@@ -509,12 +508,13 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
         if let Some(settings) = settings_snapshot.as_deref() {
             match apply_edgezero_ec_finalize(settings, &mut ec_state, &mut response) {
                 Ok(partner_registry) => {
+                    let status = response.status();
                     send_edgezero_response(
                         response,
                         request_filter_effects.as_ref(),
                         counters.as_ref(),
                     );
-                    run_edgezero_pull_sync_after_send(settings, &partner_registry, &ec_state);
+                    run_identity_after_send(settings, &partner_registry, &ec_state, status);
                     return;
                 }
                 Err(e) => {
@@ -528,15 +528,17 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
                 Ok(settings) => {
                     match apply_edgezero_ec_finalize(&settings, &mut ec_state, &mut response) {
                         Ok(partner_registry) => {
+                            let status = response.status();
                             send_edgezero_response(
                                 response,
                                 request_filter_effects.as_ref(),
                                 counters.as_ref(),
                             );
-                            run_edgezero_pull_sync_after_send(
+                            run_identity_after_send(
                                 &settings,
                                 &partner_registry,
                                 &ec_state,
+                                status,
                             );
                             return;
                         }
@@ -615,49 +617,50 @@ fn apply_edgezero_ec_finalize(
     Ok(partner_registry)
 }
 
-fn run_edgezero_pull_sync_after_send(
+/// Phase 4: the writer request's single identity flush, after the response
+/// is sent. The KV graph is built only when there is something to flush.
+fn run_identity_after_send(
     settings: &Settings,
     partner_registry: &PartnerRegistry,
     ec_state: &EcFinalizeState,
+    status: edgezero_core::http::StatusCode,
 ) {
-    if !ec_state.is_real_browser {
-        return;
-    }
-
-    let prepared_context = build_pull_sync_context(&ec_state.ec_context, partner_registry);
-    let Some((context, kv)) =
-        prepare_pull_sync_after_send(prepared_context, || require_identity_graph(settings))
-    else {
+    let Some(kv) = prepare_identity_after_send(&ec_state.ec_context, status, || {
+        require_identity_graph(settings)
+    }) else {
         return;
     };
-
     let limiter = FastlyRateLimiter::new(RATE_COUNTER_NAME);
-    dispatch_pull_sync(
+    let outcome = run_after_send(&AfterSendInput {
         settings,
-        &kv,
-        partner_registry,
-        &limiter,
-        &context,
-        &ec_state.services,
-    );
+        registry: partner_registry,
+        services: &ec_state.services,
+        graph: &kv,
+        context: &ec_state.ec_context,
+        status,
+        rate_limiter: Some(&limiter),
+    });
+    log::debug!("Identity flush outcome: {outcome}");
 }
 
-fn prepare_pull_sync_after_send<F>(
-    context: Option<PullSyncContext>,
+fn prepare_identity_after_send<F>(
+    context: &EcContext,
+    status: edgezero_core::http::StatusCode,
     graph_factory: F,
-) -> Option<(PullSyncContext, KvIdentityGraph)>
+) -> Option<KvIdentityGraph>
 where
     F: FnOnce() -> Result<KvIdentityGraph, Report<TrustedServerError>>,
 {
-    let context = context?;
-    let kv = match graph_factory() {
-        Ok(kv) => kv,
+    if !after_send_needed(context, status) {
+        return None;
+    }
+    match graph_factory() {
+        Ok(kv) => Some(kv),
         Err(err) => {
-            log::debug!("Pull sync: identity graph unavailable, skipping: {err:?}");
-            return None;
+            log::debug!("Identity flush: identity graph unavailable, skipping: {err:?}");
+            None
         }
-    };
-    Some((context, kv))
+    }
 }
 
 /// Sends a finalized `EdgeZero` response to the client.
@@ -878,19 +881,18 @@ mod tests {
     }
 
     #[test]
-    fn pull_sync_noop_states_skip_post_send_graph_factory() {
+    fn identity_noop_states_skip_post_send_graph_factory() {
         let calls = std::cell::Cell::new(0);
-        let result = prepare_pull_sync_after_send(None, || {
-            calls.set(calls.get() + 1);
-            Err(Report::new(TrustedServerError::KvStore {
-                store_name: "unexpected".to_owned(),
-                message: "graph factory should not run".to_owned(),
-            }))
-        });
-        assert!(
-            result.is_none(),
-            "a skipped pull-sync plan should return none"
-        );
+        let context = EcContext::default();
+        let result =
+            prepare_identity_after_send(&context, edgezero_core::http::StatusCode::OK, || {
+                calls.set(calls.get() + 1);
+                Err(Report::new(TrustedServerError::KvStore {
+                    store_name: "unexpected".to_owned(),
+                    message: "graph factory should not run".to_owned(),
+                }))
+            });
+        assert!(result.is_none(), "nothing to flush returns none");
         assert_eq!(calls.get(), 0, "should not invoke the graph factory");
     }
 

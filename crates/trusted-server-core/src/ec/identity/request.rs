@@ -122,6 +122,7 @@ pub(crate) struct RequestIdentity {
     staged: StagedCookies,
     seed: Vec<PartnerIdUpdate>,
     client_eids_from_body: bool,
+    marked: Vec<super::ids::IdentityProviderId>,
 }
 
 impl RequestIdentity {
@@ -243,6 +244,18 @@ impl RequestIdentity {
 
     pub(crate) fn set_client_eids_from_body(&mut self, from_body: bool) {
         self.client_eids_from_body = from_body;
+    }
+
+    /// After-send providers this request marked pending in phase 3.
+    #[must_use]
+    pub(crate) fn marked(&self) -> &[super::ids::IdentityProviderId] {
+        &self.marked
+    }
+
+    pub(crate) fn mark(&mut self, provider: super::ids::IdentityProviderId) {
+        if !self.marked.contains(&provider) {
+            self.marked.push(provider);
+        }
     }
 
     /// Browser ingest a new visitor's create carries.

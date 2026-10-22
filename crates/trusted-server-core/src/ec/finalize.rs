@@ -17,9 +17,9 @@ use super::EcContext;
 use super::cookies::{expire_ec_cookie, set_ec_cookie};
 use super::generation::{generate_ec_id, is_valid_ec_id};
 use super::identity::finalize::{
-    IdentityFinalize, after_rotation, emit_identity_cookies, open_identity_cookies,
-    phase1_read_needed, queue_writer_changes, reconcile_with_snapshot, rotation_removals,
-    stage_consent_loss, stage_kv_gap, stage_new_ec_cookie,
+    IdentityFinalize, after_rotation, emit_identity_cookies, mark_after_send,
+    open_identity_cookies, phase1_read_needed, queue_writer_changes, reconcile_with_snapshot,
+    rotation_removals, stage_consent_loss, stage_kv_gap, stage_new_ec_cookie,
 };
 use super::identity::mutation::{ApplyContext, apply as apply_mutation};
 use super::kv::{
@@ -141,6 +141,12 @@ pub fn ec_finalize_response(
                 reconcile_with_snapshot(ec_context, identity);
                 if writer {
                     queue_writer_changes(ec_context, identity, &updates);
+                    mark_after_send(
+                        ec_context,
+                        identity,
+                        &settings.publisher.domain,
+                        response.status(),
+                    );
                 } else {
                     stage_kv_gap(ec_context, identity, registry);
                 }
