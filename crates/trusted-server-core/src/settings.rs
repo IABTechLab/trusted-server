@@ -731,6 +731,10 @@ impl Rewrite {
     /// Empty and bare `*` entries in `exclude_domains` are dropped with a
     /// warning: neither can match a host, so dropping them changes no behavior.
     fn normalize(&mut self) {
+        // An `exclude_domains` entry that can never equal a URL host keeps its
+        // host proxied and receiving `ts-ec`. Rejecting it would stop existing
+        // blobs from loading, so warn once per entry and keep it.
+        let inert_warnings = Self::inert_exclude_domain_warnings(&self.exclude_domains);
         let before = self.exclude_domains.len();
         self.exclude_domains = self
             .exclude_domains
@@ -748,16 +752,34 @@ impl Rewrite {
             .iter()
             .map(|pattern| pattern.trim().to_ascii_lowercase())
             .collect();
-        // An `exclude_domains` entry that can never equal a URL host keeps its
-        // host proxied and receiving `ts-ec`. Rejecting it would stop existing
-        // blobs from loading, so warn once per entry and keep it.
-        for pattern in &self.exclude_domains {
-            if let Err(reason) = Self::check_exclude_domain(pattern) {
-                log::warn!(
-                    "rewrite.exclude_domains: entry `{pattern}` never matches a URL host ({reason})"
-                );
-            }
+        for warning in &inert_warnings {
+            log::warn!("{warning}");
         }
+    }
+
+    /// Returns one warning per `exclude_domains` entry that never matches a URL
+    /// host.
+    ///
+    /// Each warning names the entry by its index in `patterns` and gives a
+    /// static reason. It never includes the raw value, which may be a pasted URL
+    /// carrying credentials or control characters. Empty and bare `*` entries
+    /// are skipped because [`Self::normalize`] drops them with its own warning.
+    fn inert_exclude_domain_warnings(patterns: &[String]) -> Vec<String> {
+        patterns
+            .iter()
+            .enumerate()
+            .filter_map(|(index, pattern)| {
+                let pattern = pattern.trim().to_ascii_lowercase();
+                if pattern.is_empty() || pattern == "*" {
+                    return None;
+                }
+                Self::check_exclude_domain(&pattern).err().map(|reason| {
+                    format!(
+                        "rewrite.exclude_domains[{index}] never matches a URL host ({reason}); the entry is kept"
+                    )
+                })
+            })
+            .collect()
     }
 
     /// Checks one normalized `exclude_domains` entry, returning why no fetched
@@ -7137,6 +7159,46 @@ source_domain = "partner.example.com"
                 "[2001:0db8::1]".to_owned(),
             ],
             "should keep inert exclude_domains entries unchanged"
+        );
+    }
+
+    #[test]
+    fn rewrite_exclude_domains_warnings_omit_raw_values() {
+        let sentinel = "example-secret-sentinel";
+        let malformed = format!("https://example-user:{sentinel}@ads.example.com/path\u{7}");
+        let toml_str = crate_test_settings_str()
+            + r#"
+            [rewrite]
+            exclude_domains = ["", "cdn.example.com", "https://example-user:example-secret-sentinel@ads.example.com/path\u0007"]
+            "#;
+        let configured: Vec<String> = vec![
+            String::new(),
+            "cdn.example.com".to_owned(),
+            malformed.clone(),
+        ];
+
+        let warnings = Rewrite::inert_exclude_domain_warnings(&configured);
+        let settings = Settings::from_toml(&toml_str)
+            .expect("should load a malformed exclude_domains entry with a warning");
+
+        assert_eq!(
+            warnings,
+            vec![
+                "rewrite.exclude_domains[2] never matches a URL host (not a valid URL host); the entry is kept"
+                    .to_owned()
+            ],
+            "should name the malformed entry by its configured index and a static reason"
+        );
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| !warning.contains(sentinel) && !warning.contains("ads.example.com")),
+            "should omit the credential sentinel and raw value from warnings"
+        );
+        assert_eq!(
+            settings.rewrite.exclude_domains,
+            vec!["cdn.example.com".to_owned(), malformed.to_ascii_lowercase()],
+            "should keep the malformed entry as an inert pattern"
         );
     }
 
