@@ -16,6 +16,10 @@ use crate::ec::EcContext;
 use crate::ec::EcKvSnapshot;
 use crate::ec::client_eids::parse_client_eids;
 use crate::ec::eids::{resolve_partner_ids, to_eids};
+use crate::ec::identity::UnixTime;
+use crate::ec::identity::catalog::ProviderCatalog;
+use crate::ec::identity::policy::PolicySignals;
+use crate::ec::identity::servable::{ServeContext, kv_opted_out};
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::partner::normalize_partner_source_domain;
 use crate::ec::prebid_eids::parse_prebid_eids_cookie;
@@ -462,7 +466,22 @@ pub(crate) fn resolve_auction_eids(
         return Some(Vec::new());
     }
 
-    let resolved = resolve_partner_ids(registry, entry);
+    // Without a trustworthy clock every expiry check would pass, so no KV ID
+    // is served.
+    let Some(now) = crate::ec::checked_current_timestamp() else {
+        log::warn!("Skipping KV EIDs because the clock is unavailable");
+        return Some(Vec::new());
+    };
+    let catalog = ProviderCatalog::empty();
+    let opted_out = kv_opted_out(entry);
+    let serve = ServeContext {
+        now: UnixTime::from_secs(now),
+        consent: ec_context.consent(),
+        signals: PolicySignals::default(),
+        catalog: &catalog,
+        opted_out: &opted_out,
+    };
+    let resolved = resolve_partner_ids(registry, entry, &serve);
     Some(to_eids(&resolved))
 }
 

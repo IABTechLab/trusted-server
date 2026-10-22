@@ -26,6 +26,7 @@ use serde_json::Value as JsonValue;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt as _};
 
+use crate::consent::ConsentContext;
 use crate::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
 use crate::cookies::extract_cookie_value;
 use crate::error::TrustedServerError;
@@ -33,6 +34,10 @@ use crate::openrtb::Eid;
 
 use super::eids::{resolve_partner_ids, to_eids};
 use super::generation::is_valid_ec_id;
+use super::identity::UnixTime;
+use super::identity::catalog::ProviderCatalog;
+use super::identity::policy::PolicySignals;
+use super::identity::servable::{ServeContext, kv_opted_out};
 use super::kv::KvIdentityGraph;
 use super::kv_backend::EcKvLookup;
 use super::kv_types::{KvEntry, KvMetadata};
@@ -495,8 +500,21 @@ fn iso_timestamp(unix_seconds: u64) -> Option<String> {
 
 /// Derives the auction EID view for a valid entry, mirroring the filters in
 /// [`resolve_partner_ids`] and reporting why each stored ID was skipped.
+///
+/// The admin request carries no visitor consent, so the view applies expiry,
+/// writer presence and opt-outs with a default consent context.
 fn build_auction_view(registry: &PartnerRegistry, entry: &KvEntry) -> AuctionEidsView {
-    let resolved = resolve_partner_ids(registry, entry);
+    let consent = ConsentContext::default();
+    let catalog = ProviderCatalog::empty();
+    let opted_out = kv_opted_out(entry);
+    let serve = ServeContext {
+        now: UnixTime::from_secs(super::current_timestamp()),
+        consent: &consent,
+        signals: PolicySignals::default(),
+        catalog: &catalog,
+        opted_out: &opted_out,
+    };
+    let resolved = resolve_partner_ids(registry, entry, &serve);
     let eids = to_eids(&resolved);
 
     let mut skipped = Vec::new();

@@ -81,3 +81,51 @@ pub(crate) fn consent_with(signals: &TestSignals) -> ConsentContext {
 pub(crate) fn allowing_consent() -> ConsentContext {
     consent_with(&TestSignals::default())
 }
+
+/// A descriptor-only provider for tests.
+pub(crate) struct FixedProvider(pub(crate) crate::ec::identity::ProviderDescriptor);
+
+impl crate::ec::identity::IdentityProvider for FixedProvider {
+    fn descriptor(&self) -> &crate::ec::identity::ProviderDescriptor {
+        &self.0
+    }
+}
+
+/// A resolving provider over `sources` with the given policy.
+pub(crate) fn provider_with_policy(
+    id: &str,
+    sources: &[&str],
+    policy: crate::ec::identity::ConsentPolicy,
+    expiring: bool,
+) -> std::sync::Arc<dyn crate::ec::identity::IdentityProvider> {
+    let mut builder = crate::ec::identity::ProviderDescriptor::builder(
+        id.parse().expect("should parse provider id"),
+    );
+    for source in sources {
+        builder = builder.with_source(source.parse().expect("should parse source"));
+    }
+    builder = builder
+        .with_resolves(
+            crate::ec::identity::Resolves::new().with_endpoint("https://api.example.com/v1"),
+        )
+        .with_consent_policy(policy);
+    if expiring {
+        builder = builder.with_expiring_ids();
+    }
+    std::sync::Arc::new(FixedProvider(
+        builder.build().expect("should build provider"),
+    ))
+}
+
+/// A resolving provider with generic pull's permissive policy.
+pub(crate) fn fixed_provider(
+    id: &str,
+    sources: &[&str],
+) -> std::sync::Arc<dyn crate::ec::identity::IdentityProvider> {
+    provider_with_policy(
+        id,
+        sources,
+        crate::ec::identity::ConsentPolicy::eid_persistence_only(),
+        false,
+    )
+}

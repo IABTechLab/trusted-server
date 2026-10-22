@@ -13,6 +13,7 @@
     reason = "crate-private identity helpers are wired into requests by later commits"
 )]
 
+pub(crate) mod catalog;
 pub mod descriptor;
 pub mod exchange;
 pub mod ids;
@@ -21,6 +22,7 @@ pub(crate) mod policy;
 pub mod provider;
 pub mod resolution;
 pub(crate) mod revision;
+pub(crate) mod servable;
 #[cfg(test)]
 pub(crate) mod test_support;
 
