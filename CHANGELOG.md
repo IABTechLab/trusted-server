@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add Phase 1 attested Fastly wasm and Linux/macOS CLI releases through a reusable signer workflow, with conservative SPDX 2.3 inventories, published provenance/SBOM bundles, immutable release verification and a manual verified-byte Fastly route. Platform qualification, reproducibility and the custom verifier remain later work; publication requires maintainer settings and an authorized sandbox rehearsal.
+
 ### Changed
 
 - **Breaking:** `x-ts-version` now reports the deployed git version — the release tag, else the branch, else the first 6 characters of the commit — compiled in from the build-time `TRUSTED_SERVER__GIT_VERSION` (set by the deploy pipeline) or local git, and is sent by every adapter, including on the Fastly `GET /health` probe. The Fastly service version it previously carried is now `x-ts-fastly-version`; update dashboards, monitors, and scripts that read `x-ts-version` as the Fastly version number. Builds with neither the override nor git omit the header.
