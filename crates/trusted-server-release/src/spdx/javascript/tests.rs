@@ -105,6 +105,33 @@ fn javascript_originals_accept_only_their_single_supported_roles() {
 }
 
 #[test]
+fn javascript_originals_reject_unmeasured_declared_licenses() {
+    for (original, roles) in role_originals().into_iter().zip([
+        [
+            ComponentRole::RetainedJavascript,
+            ComponentRole::BuildMaterial,
+        ],
+        [
+            ComponentRole::ConservativeJavascript,
+            ComponentRole::BuildMaterial,
+        ],
+        [ComponentRole::BuildTool, ComponentRole::BuildMaterial],
+    ]) {
+        for role in roles {
+            let mut inputs = role_inputs(original.clone(), role);
+            inputs.components[0].declared_license = Some("MIT".to_owned());
+
+            let error = super::super::render(&inputs)
+                .expect_err("should reject unmeasured JavaScript declared licenses");
+            assert!(
+                format!("{error:?}").contains("JavaScript declared license exceeds measured facts"),
+                "should reject the unmeasured license at the JavaScript origin boundary"
+            );
+        }
+    }
+}
+
+#[test]
 fn valid_javascript_role_document_bytes_remain_unchanged() {
     let original = role_originals()[0].clone();
     let inputs = role_inputs(original, ComponentRole::RetainedJavascript);

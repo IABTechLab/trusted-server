@@ -211,7 +211,7 @@ fn changed_blob_bytes_fail_the_selected_object_identity() {
 fn unsafe_entry_outside_cargo_package_root_still_rejects() {
     let input = temporary();
     let blob = object(input.path(), "blob", b"fictional dependency");
-    let unrelated = tree(input.path(), &[(b"120000", b"unreviewed-link", &blob)]);
+    let unrelated = tree(input.path(), &[(b"160000", b"unreviewed-submodule", &blob)]);
     let root = tree(
         input.path(),
         &[

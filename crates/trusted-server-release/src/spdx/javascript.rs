@@ -279,6 +279,11 @@ pub(super) fn origin_fields(
     if commit != inputs.source_commit || !lower_hex(commit, 40) {
         return Err(spdx_error("JavaScript source differs from selected source"));
     }
+    if component.declared_license.is_some() {
+        return Err(spdx_error(
+            "JavaScript declared license exceeds measured facts",
+        ));
+    }
     if !matches!(
         (original, component.roles.as_slice()),
         (

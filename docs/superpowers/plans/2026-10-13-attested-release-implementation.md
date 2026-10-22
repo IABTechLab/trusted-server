@@ -708,7 +708,35 @@ entropy-reader tests. Strict host-target clippy, documentation, read-only
 workspace formatting and changed-document Prettier pass. Independent
 specification/security and code-quality reviews report no blocking findings.
 
+Hosted follow-up: run `39724280588` at `0c67be66e` exposes an outdated
+whole-tree rejection fixture in macOS job `119644526058`: it still labels mode
+`120000` as unsupported. Keep its unrelated-subtree rejection assertion and
+replace that entry with a still-forbidden `160000` submodule. The separate new
+collection fixture requires retention of authenticated inert link blobs. This
+process-spawning collection regression remains a hosted check.
+
+Security verification: CodeQL run `39723446088` scans merge `eca28ba934`,
+containing entropy correction `d4408d2e0`. All analyses pass and alerts 224–230
+are fixed, with no relocated entropy warning or open release-tool finding.
+Existing core/adapter/JS baseline findings are separate. This is security
+acceptance of the entropy correction, not candidate-build qualification.
+
 ### Task 11: Generate complete artifact-specific SPDX
+
+JavaScript declaration guard (2026-10-22): projected JavaScript facts contain no
+measured declared-license evidence. Reject any supplied declaration at the
+JavaScript origin boundary, matching the existing native-origin restriction,
+instead of allowing a renderer input to manufacture a declaration. A pure
+red/green regression injects MIT into all six supported original/role pairs;
+the existing valid-document byte digest remains unchanged. Unknown JS licenses
+continue to render as `NOASSERTION`; no new license measurement, receipt field,
+companion format or completeness claim is introduced.
+
+Scoped verification passes 187 pure tests, including all 69 SPDX tests and
+unchanged candidate-index goldens, plus strict host-target clippy, documentation,
+read-only workspace formatting and plan Prettier. Independent specification and
+code-quality reviews find no blockers. The corrected Git collection fixture is
+compiled locally but is run only in hosted CI under the process-test restriction.
 
 **Create:** release tool `src/spdx.rs`, private `spdx::tests`, `crates/trusted-server-release/tests/fixtures/spdx/`.
 
