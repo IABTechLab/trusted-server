@@ -93,7 +93,7 @@ pub fn handle_identify(
     let mut cluster_size: Option<u32> = None;
 
     match kv.get(ec_id) {
-        Ok(Some((entry, generation))) => {
+        Ok(Some((entry, _generation))) => {
             if !entry.consent.ok {
                 // Tombstone entries preserve the withdrawal signal for 24 hours.
                 // Do not extract IDs or evaluate cluster size because that would
@@ -105,9 +105,9 @@ pub fn handle_identify(
                 // and never the row's stored consent snapshot.
                 uid = servable_partner_uid(&entry, &partner.source_domain, ec_context);
 
-                // Evaluate cluster size lazily for identify responses. Existing
-                // stored cluster_size values are reused without a prefix-list call.
-                match kv.evaluate_cluster(ec_id, &entry, generation) {
+                // Use a stored cluster size, or compute one without writing it.
+                // The writer navigation stores it in its single mutation.
+                match kv.cluster_size(ec_id, &entry) {
                     Ok(size) => {
                         cluster_size = size;
                     }
@@ -692,6 +692,46 @@ mod tests {
         body.get("uid")
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned)
+    }
+
+    #[test]
+    fn handle_identify_computes_cluster_size_without_writing() {
+        let settings = create_test_settings();
+        let (kv, counter) = KvIdentityGraph::write_counting("identify_store");
+        let partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        kv.create(
+            &ec_id,
+            &crate::ec::kv_types::KvEntry::minimal("ssp.example.com", "u", 1),
+        )
+        .expect("should seed the row");
+        let writes_before = counter.writes().total();
+        let req = Request::builder()
+            .method("GET")
+            .uri("https://edge.test-publisher.com/identify")
+            .header("authorization", format!("Bearer {VALID_API_TOKEN}"))
+            .body(EdgeBody::empty())
+            .expect("should build test request");
+        let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+
+        let response = handle_identify(&settings, &kv, &registry, &req, &ec_context)
+            .expect("should answer identify");
+        let body = serde_json::from_slice::<serde_json::Value>(
+            &response.into_body().into_bytes().unwrap_or_default(),
+        )
+        .expect("should decode identify response JSON");
+
+        assert_eq!(
+            body["cluster_size"],
+            serde_json::json!(1),
+            "should report a size"
+        );
+        assert_eq!(
+            counter.writes().total(),
+            writes_before,
+            "should not write the computed size"
+        );
     }
 
     #[test]

@@ -21,7 +21,7 @@ use crate::error::TrustedServerError;
 
 use super::generation::ec_hash;
 use super::kv_backend::{EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome};
-use super::kv_types::{KvEntry, KvMetadata, KvNetwork, KvPartnerId};
+use super::kv_types::{KvEntry, KvMetadata, KvPartnerId};
 use super::{EcKvSnapshot, checked_current_timestamp, current_timestamp, log_id};
 
 /// Maximum number of CAS retry attempts before giving up.
@@ -1468,27 +1468,25 @@ impl KvIdentityGraph {
             .count_keys_with_prefix(hash_prefix, CLUSTER_LIST_LIMIT)
     }
 
-    /// Evaluates the cluster size for an EC entry.
+    /// Returns the cluster size for an entry, without writing it.
     ///
-    /// Returns the stored `cluster_size` when it has already been evaluated
-    /// for a live entry. Tombstone entries return `None` without store I/O so
-    /// their 24-hour withdrawal TTL is not extended. Otherwise, counts the
-    /// number of keys sharing the same hash prefix via
-    /// [`count_hash_prefix_keys`](Self::count_hash_prefix_keys) and writes the
-    /// result back to the entry. The CAS write is best-effort — on conflict
-    /// or write failure, the computed value is still returned.
+    /// Uses the stored `cluster_size` when the entry has one. Tombstone
+    /// entries return `None` without store I/O. Otherwise counts the keys
+    /// that share the EC's hash prefix with
+    /// [`count_hash_prefix_keys`](Self::count_hash_prefix_keys). The writer
+    /// request stores a computed size in its single mutation; `/identify`
+    /// never writes.
     ///
     /// # Errors
     ///
-    /// Returns [`TrustedServerError::KvStore`] on store or list failure.
-    pub fn evaluate_cluster(
+    /// Returns [`TrustedServerError::KvStore`] on list failure.
+    pub fn cluster_size(
         &self,
         ec_id: &str,
         entry: &KvEntry,
-        generation: u64,
     ) -> Result<Option<u32>, Report<TrustedServerError>> {
         if !entry.consent.ok {
-            log::trace!("evaluate_cluster: skipping tombstone entry");
+            log::trace!("cluster_size: skipping tombstone entry");
             return Ok(None);
         }
 
@@ -1497,54 +1495,15 @@ impl KvIdentityGraph {
             .as_ref()
             .and_then(|network| network.cluster_size)
         {
-            log::trace!("evaluate_cluster: using stored cluster_size");
+            log::trace!("cluster_size: using stored cluster_size");
             return Ok(Some(cluster_size));
         }
 
-        // Compute cluster size via prefix list.
-        let hash_prefix = ec_hash(ec_id);
-        let cluster_size = self.count_hash_prefix_keys(hash_prefix)?;
-
+        let cluster_size = self.count_hash_prefix_keys(ec_hash(ec_id))?;
         log::debug!(
-            "evaluate_cluster: computed cluster_size={cluster_size} for '{}'",
+            "cluster_size: computed cluster_size={cluster_size} for '{}'",
             log_id(ec_id)
         );
-
-        // Best-effort CAS write-back — update only the cluster size so any
-        // future `network` fields are preserved across this lazy write.
-        let mut updated_entry = entry.clone();
-        let mut network = updated_entry
-            .network
-            .unwrap_or(KvNetwork { cluster_size: None });
-        network.cluster_size = Some(cluster_size);
-        updated_entry.network = Some(network);
-
-        let (body, meta_str) = Self::serialize_entry(&updated_entry, self.store_name())?;
-
-        match self.write_entry(
-            ec_id,
-            &body,
-            &meta_str,
-            ENTRY_TTL,
-            EcKvWriteMode::IfGenerationMatch(generation),
-        ) {
-            Ok(EcKvWriteOutcome::Written) => {}
-            Ok(EcKvWriteOutcome::PreconditionFailed) => {
-                log::debug!(
-                    "evaluate_cluster: CAS conflict writing cluster_size for '{}', \
-                     returning computed value anyway",
-                    log_id(ec_id),
-                );
-            }
-            Err(report) => {
-                // Log but don't fail — the computed value is still valid.
-                log::warn!(
-                    "evaluate_cluster: failed to write cluster_size for '{}': {report}",
-                    log_id(ec_id)
-                );
-            }
-        }
-
         Ok(Some(cluster_size))
     }
 
@@ -2556,16 +2515,16 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_cluster_returns_stored_value_without_store_io() {
+    fn cluster_size_returns_stored_value_without_store_io() {
         let kv = KvIdentityGraph::failing("nonexistent_store_for_cluster_cache_test");
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let mut entry = live_entry();
-        entry.network = Some(KvNetwork {
+        entry.network = Some(crate::ec::kv_types::KvNetwork {
             cluster_size: Some(5),
         });
 
         let cluster_size = kv
-            .evaluate_cluster(&ec_id, &entry, 0)
+            .cluster_size(&ec_id, &entry)
             .expect("should not touch store when cluster_size is already known");
 
         assert_eq!(
@@ -2576,13 +2535,13 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_cluster_skips_tombstone_without_store_io() {
+    fn cluster_size_skips_tombstone_without_store_io() {
         let kv = KvIdentityGraph::failing("nonexistent_store_for_tombstone_cluster_test");
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let entry = KvEntry::tombstone(1000);
 
         let cluster_size = kv
-            .evaluate_cluster(&ec_id, &entry, 0)
+            .cluster_size(&ec_id, &entry)
             .expect("should not touch store for tombstone entries");
 
         assert_eq!(
