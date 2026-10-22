@@ -5146,8 +5146,8 @@ pub async fn handle_publisher_request(
         }
     }
 
-    // SSP requests are already racing through the platform HTTP client, so
-    // origin TTFB tracks origin latency rather than the auction timeout.
+    // Provider operations are already running while the origin loads. Collection
+    // retains buffered results, then waits only for the original remaining budget.
     let origin_result = if let Some(pending) = pending_origin {
         services.http_client().wait(pending).await
     } else {
@@ -21122,6 +21122,8 @@ mod tests {
         );
     }
 
+    // Manually polled fixture for publisher injection order, not timer scheduling.
+    // Adapter runtime tests cover autonomous deadline wakeups and cancellation.
     struct GatedAuctionHttpClient {
         inner: StubHttpClient,
         released: std::sync::atomic::AtomicBool,
@@ -21144,6 +21146,33 @@ mod tests {
         ) -> Result<crate::platform::PlatformPendingRequest, Report<crate::platform::PlatformError>>
         {
             self.inner.send_async(request).await
+        }
+
+        async fn select_until(
+            &self,
+            pending: Vec<crate::platform::PlatformPendingRequest>,
+            deadline: web_time::Instant,
+        ) -> Result<
+            Option<crate::platform::PlatformSelectResult>,
+            Report<crate::platform::PlatformError>,
+        > {
+            self.collections.fetch_add(1, Ordering::SeqCst);
+            let ready = futures::future::poll_fn(|_| {
+                // The gate models completion, so probe it before checking expiry.
+                if self.released.load(Ordering::SeqCst) {
+                    std::task::Poll::Ready(true)
+                } else if web_time::Instant::now() >= deadline {
+                    std::task::Poll::Ready(false)
+                } else {
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+            if ready {
+                self.inner.select_until(pending, deadline).await
+            } else {
+                Ok(None)
+            }
         }
 
         async fn select(

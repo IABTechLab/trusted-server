@@ -26,9 +26,9 @@ use trusted_server_core::platform::{
     PlatformPendingRequest, PlatformResponse, PlatformSelectResult,
 };
 
-// 8 MiB ceiling: conservative for ad-server responses while leaving headroom in
-// the Spin WASM component heap. Larger responses from misbehaving origins are
-// rejected with a typed error rather than OOMing the component.
+// Limit both streamed bytes and decompressed bytes to 8 MiB to preserve
+// headroom in the Spin WASM component heap. The streaming limit rejects an
+// oversized frame before retaining it in the collected response body.
 #[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
 const MAX_DECOMPRESSED_SIZE: usize = 8 * 1024 * 1024;
 
@@ -427,22 +427,44 @@ fn is_wasi_forbidden_outbound_header(name: &str) -> bool {
         || name.eq_ignore_ascii_case("proxy-connection")
 }
 
-/// Carries a completed response through `send_async` → `select`.
-#[cfg(all(feature = "spin", target_arch = "wasm32"))]
-struct SpinPendingResponse {
-    backend_name: String,
-    status: u16,
-    headers: HeaderPairs,
-    body: Vec<u8>,
+/// Receives a dispatched operation and cancels it when its owner is dropped.
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+struct SpinPendingResponse<T> {
+    response: futures::channel::oneshot::Receiver<T>,
+    abort: futures::future::AbortHandle,
+}
+
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+impl<T: 'static> SpinPendingResponse<T> {
+    fn start(
+        operation: impl std::future::Future<Output = T> + 'static,
+        spawn: impl FnOnce(futures::future::LocalBoxFuture<'static, ()>),
+    ) -> Self {
+        let (sender, response) = futures::channel::oneshot::channel();
+        let (abort, registration) = futures::future::AbortHandle::new_pair();
+        spawn(Box::pin(async move {
+            if let Ok(result) = futures::future::Abortable::new(operation, registration).await {
+                let _ = sender.send(result);
+            }
+        }));
+        Self { response, abort }
+    }
+}
+
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+impl<T> Drop for SpinPendingResponse<T> {
+    fn drop(&mut self) {
+        self.abort.abort();
+    }
 }
 
 /// `spin_sdk::http::send`-backed HTTP client for the Spin runtime.
 ///
-/// `send_async` eagerly executes each request before returning, so
-/// [`PlatformHttpClient::supports_concurrent_fanout`] reports `false` and the
-/// auction orchestrator rejects multi-provider configurations before any
-/// request launches. `select` keeps a defense-in-depth rejection for more
-/// than one pending request, matching the Cloudflare adapter behavior.
+/// Auction configuration supports one provider at a time, so
+/// [`PlatformHttpClient::supports_concurrent_fanout`] reports `false`.
+/// Requests start in a runtime task at dispatch, overlapping publisher-origin work.
+/// Deadline selection bounds waiting for the full send and response body collection.
+/// Dropping the pending operation cancels its WASI asynchronous operations.
 ///
 /// Spin's WASI HTTP API sends one request and returns the original response; it
 /// exposes no redirect-follow policy. Each trait call therefore reaches exactly
@@ -451,20 +473,14 @@ struct SpinPendingResponse {
 /// `StubHttpClient` driver records the one-send 3xx behavior while adapter tests
 /// cover request/response policy around that single boundary.
 ///
-/// # Known MVP limits
-///
-/// **No configurable outbound timeout.** `spin_sdk::http::send` does not
-/// expose per-request timeout control, and [`PlatformBackendSpec::first_byte_timeout`]
-/// is ignored by [`NoopBackend`]. A slow or hung origin will block the Spin
-/// invocation for whatever default the Spin runtime imposes. Operators requiring
-/// deterministic timeout behaviour should use the Fastly adapter.
+/// Backend phase timeouts remain unsupported. Callers requiring an absolute
+/// cutoff use [`PlatformHttpClient::select_until`].
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 pub struct SpinPlatformHttpClient;
 
 #[cfg(all(feature = "spin", target_arch = "wasm32"))]
 impl SpinPlatformHttpClient {
     async fn execute(
-        &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
         reject_unsupported_request_contracts(&request)?;
@@ -525,8 +541,7 @@ impl SpinPlatformHttpClient {
             .iter()
             .map(|(name, value)| (name.to_string(), value.as_bytes().to_vec()))
             .collect();
-        let body = spin_response
-            .into_body()
+        let body = http_body_util::Limited::new(spin_response.into_body(), MAX_DECOMPRESSED_SIZE)
             .collect()
             .await
             .map_err(|error| {
@@ -554,9 +569,8 @@ impl SpinPlatformHttpClient {
 #[async_trait::async_trait(?Send)]
 impl PlatformHttpClient for SpinPlatformHttpClient {
     fn supports_concurrent_fanout(&self) -> bool {
-        // `send_async` executes each request eagerly, so multiple pending
-        // requests run sequentially. The auction orchestrator checks this
-        // before launching more than one provider request.
+        // Retain the existing auction capability restriction independently of
+        // runtime task scheduling.
         false
     }
 
@@ -564,7 +578,7 @@ impl PlatformHttpClient for SpinPlatformHttpClient {
         &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
-        self.execute(request).await
+        Self::execute(request).await
     }
 
     async fn send_async(
@@ -572,29 +586,7 @@ impl PlatformHttpClient for SpinPlatformHttpClient {
         request: PlatformHttpRequest,
     ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
         let backend_name = request.backend_name.clone();
-        let response = self.execute(request).await?;
-
-        let status = response.response.status().as_u16();
-        let headers: HeaderPairs = response
-            .response
-            .headers()
-            .iter()
-            .map(|(n, v)| (n.to_string(), v.as_bytes().to_vec()))
-            .collect();
-        let body_bytes = match response.response.into_body() {
-            edgezero_core::body::Body::Once(bytes) => bytes.to_vec(),
-            edgezero_core::body::Body::Stream(_) => {
-                return Err(Report::new(PlatformError::HttpClient)
-                    .attach("SpinPlatformHttpClient::execute returned a streaming body"));
-            }
-        };
-
-        let pending = SpinPendingResponse {
-            backend_name: backend_name.clone(),
-            status,
-            headers,
-            body: body_bytes,
-        };
+        let pending = SpinPendingResponse::start(Self::execute(request), spin_sdk::wasip3::spawn);
         Ok(PlatformPendingRequest::new(pending).with_backend_name(backend_name))
     }
 
@@ -617,27 +609,68 @@ impl PlatformHttpClient for SpinPlatformHttpClient {
         }
 
         let ready_platform = pending_requests.remove(0);
-        let pending = ready_platform
-            .downcast::<SpinPendingResponse>()
+        let mut pending = ready_platform
+            .downcast::<SpinPendingResponse<Result<PlatformResponse, Report<PlatformError>>>>()
             .map_err(|_| {
                 Report::new(PlatformError::HttpClient)
                     .attach("unexpected inner type in SpinPlatformHttpClient::select")
             })?;
 
-        let mut builder = edgezero_core::http::response_builder().status(pending.status);
-        for (name, value) in &pending.headers {
-            builder = builder.header(name.as_str(), value.as_slice());
-        }
-        let edge_resp = builder
-            .body(edgezero_core::body::Body::from(pending.body))
-            .change_context(PlatformError::HttpClient)?;
-
-        let ready = Ok(PlatformResponse::new(edge_resp).with_backend_name(pending.backend_name));
+        let ready = (&mut pending.response).await.unwrap_or_else(|error| {
+            Err(Report::new(PlatformError::HttpClient)
+                .attach(format!("dispatched response task stopped: {error}")))
+        });
         Ok(PlatformSelectResult {
             ready,
             remaining: pending_requests,
             failed_backend_name: None,
         })
+    }
+
+    async fn select_until(
+        &self,
+        mut pending_requests: Vec<PlatformPendingRequest>,
+        deadline: web_time::Instant,
+    ) -> Result<Option<PlatformSelectResult>, Report<PlatformError>> {
+        if pending_requests.is_empty() {
+            return Err(Report::new(PlatformError::HttpClient)
+                .attach("select_until called with an empty pending_requests list"));
+        }
+        if pending_requests.len() > 1 {
+            return Err(Report::new(PlatformError::HttpClient)
+                .attach("multi-provider fan-out is not supported on this adapter"));
+        }
+        let platform_pending = pending_requests.remove(0);
+        let backend_name = platform_pending.backend_name().map(str::to_owned);
+        let mut pending = platform_pending
+            .downcast::<SpinPendingResponse<Result<PlatformResponse, Report<PlatformError>>>>()
+            .map_err(|_| {
+                Report::new(PlatformError::HttpClient)
+                    .attach("unexpected pending request type in deadline selection")
+            })?;
+        let result = complete_before_deadline(
+            &mut pending.response,
+            async {
+                let remaining = deadline.saturating_duration_since(web_time::Instant::now());
+                if !remaining.is_zero() {
+                    spin_sdk::time::sleep(remaining).await;
+                }
+            },
+            deadline,
+            web_time::Instant::now,
+        )
+        .await;
+        Ok(result.map(|result| {
+            let ready = result.unwrap_or_else(|error| {
+                Err(Report::new(PlatformError::HttpClient)
+                    .attach(format!("dispatched response task stopped: {error}")))
+            });
+            PlatformSelectResult {
+                failed_backend_name: ready.as_ref().err().and(backend_name),
+                ready,
+                remaining: pending_requests,
+            }
+        }))
     }
 }
 
@@ -790,10 +823,6 @@ mod tests {
     fn auction_http_capabilities_are_explicit() {
         let capabilities = AuctionTargetId::Spin.descriptor().capabilities();
         assert!(!capabilities.supports_concurrent_provider_fanout());
-        assert!(
-            !capabilities.has_enforceable_total_request_deadline(),
-            "Spin outbound HTTP does not expose an enforceable hard total request deadline"
-        );
     }
     use edgezero_core::context::RequestContext;
     use edgezero_core::http::request_builder;
@@ -1396,5 +1425,263 @@ mod tests {
                 "{header} should be allowed in WASI HTTP outbound requests"
             );
         }
+    }
+}
+
+#[cfg(any(test, all(feature = "spin", target_arch = "wasm32")))]
+async fn complete_before_deadline<R, T, N>(
+    response: &mut futures::channel::oneshot::Receiver<R>,
+    timer: T,
+    deadline: web_time::Instant,
+    now: N,
+) -> Option<Result<R, futures::channel::oneshot::Canceled>>
+where
+    T: std::future::Future<Output = ()>,
+    N: Fn() -> web_time::Instant,
+{
+    // Inspect only the task's buffered result, including when collection starts
+    // after publisher-origin work has exhausted the auction budget.
+    match response.try_recv() {
+        Ok(Some(ready)) => return Some(Ok(ready)),
+        Err(error) => return Some(Err(error)),
+        Ok(None) => {}
+    }
+    if now() >= deadline {
+        return None;
+    }
+    match futures::future::select(response, Box::pin(timer)).await {
+        futures::future::Either::Left((ready, _)) => Some(ready),
+        // The timer and task can become ready in the same executor turn. A final
+        // channel probe retains buffered results without polling transport I/O.
+        futures::future::Either::Right(((), response)) => response.try_recv().transpose(),
+    }
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    use futures::executor::{LocalPool, block_on};
+    use futures::future::{pending, ready};
+    use futures::task::LocalSpawnExt as _;
+    use web_time::Instant;
+
+    use super::{SpinPendingResponse, complete_before_deadline};
+
+    #[test]
+    fn dispatched_task_starts_before_collection_and_buffers_complete_body() {
+        let mut executor = LocalPool::new();
+        let spawner = executor.spawner();
+        let started = Rc::new(Cell::new(false));
+        let started_operation = Rc::clone(&started);
+        let (finish_body, body) = futures::channel::oneshot::channel();
+        let mut pending = SpinPendingResponse::start(
+            async move {
+                started_operation.set(true);
+                body.await.expect("should receive complete response body")
+            },
+            |task| {
+                spawner
+                    .spawn_local(task)
+                    .expect("should spawn outbound task")
+            },
+        );
+
+        executor.run_until_stalled();
+        assert!(started.get(), "should start outbound work before selection");
+        assert_eq!(
+            pending.response.try_recv().expect("should poll result"),
+            None,
+            "should not expose headers before response body completes"
+        );
+        finish_body.send(42).expect("should finish response body");
+        executor.run_until_stalled();
+        assert_eq!(
+            pending
+                .response
+                .try_recv()
+                .expect("should poll buffered result"),
+            Some(42),
+            "should preserve a complete buffered response without polling transport"
+        );
+    }
+
+    #[test]
+    fn dropping_dispatched_pending_cancels_started_body_operation() {
+        struct DropProbe(Rc<Cell<bool>>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        let mut executor = LocalPool::new();
+        let spawner = executor.spawner();
+        let dropped = Rc::new(Cell::new(false));
+        let probe = DropProbe(Rc::clone(&dropped));
+        let pending = SpinPendingResponse::start(
+            async move {
+                let _probe = probe;
+                futures::future::pending::<()>().await;
+            },
+            |task| {
+                spawner
+                    .spawn_local(task)
+                    .expect("should spawn outbound task")
+            },
+        );
+        executor.run_until_stalled();
+        assert!(!dropped.get(), "should retain an active body operation");
+        drop(pending);
+        executor.run_until_stalled();
+        assert!(
+            dropped.get(),
+            "should drop spawned operation after cancellation"
+        );
+    }
+
+    #[test]
+    fn dropping_queued_dispatch_prevents_transport_poll() {
+        let mut executor = LocalPool::new();
+        let spawner = executor.spawner();
+        let started = Rc::new(Cell::new(false));
+        let operation_started = Rc::clone(&started);
+        let pending = SpinPendingResponse::start(
+            async move {
+                operation_started.set(true);
+            },
+            |task| {
+                spawner
+                    .spawn_local(task)
+                    .expect("should spawn outbound task")
+            },
+        );
+        drop(pending);
+        executor.run_until_stalled();
+        assert!(
+            !started.get(),
+            "should cancel queued work before transport starts"
+        );
+    }
+
+    #[test]
+    fn spin_body_collection_rejects_oversized_stream() {
+        let body = http_body_util::Full::new(bytes::Bytes::from(vec![
+            0;
+            super::MAX_DECOMPRESSED_SIZE
+                + 1
+        ]));
+        let result = block_on(http_body_util::BodyExt::collect(
+            http_body_util::Limited::new(body, super::MAX_DECOMPRESSED_SIZE),
+        ));
+        assert!(
+            result.is_err(),
+            "should reject a response exceeding the streamed body cap"
+        );
+    }
+
+    #[test]
+    fn spin_body_collection_accepts_body_at_limit() {
+        let body =
+            http_body_util::Full::new(bytes::Bytes::from(vec![0; super::MAX_DECOMPRESSED_SIZE]));
+        let result = block_on(http_body_util::BodyExt::collect(
+            http_body_util::Limited::new(body, super::MAX_DECOMPRESSED_SIZE),
+        ))
+        .expect("should collect a body at the limit");
+        assert_eq!(
+            result.to_bytes().len(),
+            super::MAX_DECOMPRESSED_SIZE,
+            "should retain the complete permitted body"
+        );
+    }
+
+    #[test]
+    fn expired_deadline_preserves_buffered_response() {
+        let (sender, mut response) = futures::channel::oneshot::channel();
+        sender.send(42).expect("should buffer response");
+        let deadline = Instant::now();
+        let result = block_on(complete_before_deadline(
+            &mut response,
+            pending(),
+            deadline,
+            || deadline,
+        ));
+        assert_eq!(
+            result,
+            Some(Ok(42)),
+            "should retain a buffered response after cutoff"
+        );
+    }
+
+    #[test]
+    fn expired_deadline_returns_without_waiting_for_response() {
+        let (_sender, mut response) = futures::channel::oneshot::channel::<()>();
+        let deadline = Instant::now();
+        let result = block_on(complete_before_deadline(
+            &mut response,
+            pending(),
+            deadline,
+            || deadline,
+        ));
+        assert_eq!(result, None, "should stop waiting at an expired deadline");
+    }
+
+    #[test]
+    fn timer_cuts_off_pending_response() {
+        let (_sender, mut response) = futures::channel::oneshot::channel::<()>();
+        let now = Instant::now();
+        let result = block_on(complete_before_deadline(
+            &mut response,
+            ready(()),
+            now + Duration::from_secs(1),
+            || now,
+        ));
+        assert_eq!(result, None, "should cut off an unbuffered response");
+    }
+
+    #[test]
+    fn closed_response_channel_reports_failure() {
+        let (sender, mut response) = futures::channel::oneshot::channel::<()>();
+        drop(sender);
+        let now = Instant::now();
+        let result = block_on(complete_before_deadline(
+            &mut response,
+            pending(),
+            now + Duration::from_secs(1),
+            || now,
+        ));
+        assert!(
+            matches!(result, Some(Err(_))),
+            "should preserve a dispatched task failure"
+        );
+    }
+
+    #[test]
+    fn timer_rechecks_result_published_during_cutoff() {
+        let (sender, mut response) = futures::channel::oneshot::channel();
+        let now = Instant::now();
+        let clock = Cell::new(now);
+        let deadline = now + Duration::from_secs(1);
+        let timer = async {
+            clock.set(deadline);
+            sender.send(42).expect("should publish at cutoff");
+        };
+        let result = block_on(complete_before_deadline(
+            &mut response,
+            timer,
+            deadline,
+            || clock.get(),
+        ));
+        assert_eq!(
+            result,
+            Some(Ok(42)),
+            "should retain result buffered when timer wins"
+        );
+        assert_eq!(
+            clock.get(),
+            deadline,
+            "should exercise the deadline boundary"
+        );
     }
 }

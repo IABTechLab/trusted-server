@@ -3480,7 +3480,7 @@ impl AuctionProvider for PrebidAuctionProvider {
         let pending = context
             .services
             .http_client()
-            .send_async(PlatformHttpRequest::new(pbs_req, backend_name))
+            .send_async(PlatformHttpRequest::new(pbs_req, backend_name).with_cache_bypass())
             .await
             .change_context(TrustedServerError::Prebid {
                 message: "Failed to send async request to Prebid Server".to_string(),
