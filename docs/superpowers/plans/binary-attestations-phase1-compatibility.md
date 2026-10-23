@@ -11,7 +11,7 @@ Frozen source references below mean:
 - [Cohort](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/scripts/release/release-cohort.json), [tools](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/scripts/release/release-tools.json), [consumer policy](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/crates/trusted-server-cli/release-policy.json).
 - [Index v1 schema](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/docs/superpowers/specs/schemas/release-index-v1.schema.json), [distribution names](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/crates/trusted-server-release/src/distribution.rs#L55), [consumer companion rules](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/crates/trusted-server-cli/src/release/documents.rs#L236), [SPDX joins](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/crates/trusted-server-cli/src/release/evidence/joins.rs#L188).
 
-### Phase 1 review notes — corrective batch for rehearsal .9
+### Phase 1 review notes — rehearsal .9 passed
 
 Phase 1 is **part of #1235**, pending D7 maintainer settings. These notes supersede
 historical phase applicability, not the retained destination requirements.
@@ -25,7 +25,7 @@ below describe #1262, not current Phase 1 implementation status.
 
 Current tool pins: Rust 1.98.1, Node 24.20.0, Fastly CLI 16.0.0, Viceroy 0.21.0;
 verification uses GitHub CLI 2.102.0. The reusable release-build.yml is the signer. Rehearsals use GitHub CLI 2.102.0, Fastly CLI 16.0.0 and Viceroy 0.21.0; the carried destination spec/plan still mention GitHub CLI 2.97.0 and Fastly CLI 15.1.0. Those carried versions are unchanged.
-[Rehearsal `.8`](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6362236955) passed at exact implementation SHA `7a05940e2f7b10c459bdd2d3949f265b755ce42c`. That rehearsal applies to its exact historical implementation; the current corrective batch requires fresh rehearsal `.9`. Rehearsal `.6` at `39a769c3e` failed after immutable publication despite successful independent verification; `.7` at `7a05940e2` was cancelled before signing/publication because GitHub could not assign a macOS ARM runner. The compatibility audit retains those failed outcomes.
+[Rehearsal `.9`](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6364827112) passed at exact implementation SHA `149754d357901ec874eab6140e92bce3d8613085`. Subsequent review-head updates are **docs-only since rehearsed `149754d35`**. Rehearsal `.8` remains historical evidence for its own implementation. Rehearsal `.6` at `39a769c3e` failed after immutable publication despite successful independent verification; `.7` at `7a05940e2` was cancelled before signing/publication because GitHub could not assign a macOS ARM runner. The compatibility audit retains those failed outcomes.
 
 Slice 2.3 immutable build facts are reused from introducing commit
 `bfb697404551a28217af8906024506095bcd9559` and revision
@@ -58,8 +58,8 @@ unchanged; the phasing sections describe this slice and its rehearsal outcome. T
 Phase 1 audit baseline is `4dd217125c6e38055e4bcb2cba32c0b95e739914`; the
 following corrections are implemented in this slice, with verification and
 rehearsal tracked in the PR description at its current commit. Signing and
-immutable publication rehearsal `.8` passed at `7a05940e2f7b10c459bdd2d3949f265b755ce42c`; see the
-[full verification transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6362236955).
+immutable publication rehearsal `.9` passed at `149754d357901ec874eab6140e92bce3d8613085`; see the
+[full verification transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6364827112).
 
 The current correction aligns the local input-free `release-build.yml` signer
 with the `release.yml` caller/publisher, real SPDX 2.3 documents, fourteen
@@ -160,8 +160,8 @@ qualified evidence.
 This implementation extends the frozen cohort from four
 to **seven binaries / 29 release files**, retaining all four original names.
 Rehearsal `.4` at `922c2211c` proves only the original four-binary/17-file
-implementation. Rehearsal `.8` passed for the seven-binary implementation at
-`7a05940e2f7b10c459bdd2d3949f265b755ce42c`; the `.4` evidence is not reused for the expanded cohort.
+implementation. Rehearsal `.9` passed for the seven-binary implementation at
+`149754d357901ec874eab6140e92bce3d8613085`; the `.4` evidence is not reused for the expanded cohort.
 
 The exact cohort diff is three appended records, all default features, empty
 extra features, `variant: default`, `assurance_profile: provenance-sbom`,
@@ -269,10 +269,12 @@ valid.
 
 - `v0.0.0-rehearsal.8` at `7a05940e2f7b10c459bdd2d3949f265b755ce42c`: all seven builds/signing jobs, immutable prerelease publication and complete independent online/offline/runtime verification passed. All 29 assets, 28 checksum entries, both predicates and signer forms, online store lookup without bundles, SPDX equality and the pinned Fastly pack/validate/inspect/cmp route passed. [Full transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6362236955).
 
-The latest rehearsed implementation is `7a05940e2f7b10c459bdd2d3949f265b755ce42c` from `.8`.
-The current corrective batch changes publication checks and Axum binding; `.8` is historical evidence and does not qualify these changes.
+- `v0.0.0-rehearsal.9` at `149754d357901ec874eab6140e92bce3d8613085`: all seven builds/signing jobs, immutable prerelease publication and complete independent verification passed. The publisher found the release attestation available on its first check (no live availability wait), then re-downloaded and byte-compared all 29 assets. All bundle/online-store/offline predicates and signer pins, SPDX comparisons, checksums, macOS floor and CLI source checks passed. Axum smokes proved 0.0.0.0:8080 from outside each container and rejected primary/legacy port zero. Pinned Fastly pack/validate/inspect/cmp and Viceroy runtime checks passed, with visible no-Build-facts check/result. [Full transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6364827112).
 
-The immutable `.2`, `.3`, `.4`, `.5`, `.6` and `.8` releases remain intact; no drafts remain. The `.7` tag has no release. No upstream tags, releases or repository settings were changed.
+The latest rehearsed implementation is `149754d357901ec874eab6140e92bce3d8613085` from `.9`.
+This review-head update is docs-only since rehearsed `149754d35`; workflows, scripts, tests and runtime code retain the rehearsed implementation.
+
+The immutable `.2`, `.3`, `.4`, `.5`, `.6`, `.8` and `.9` releases remain intact; no drafts remain. The `.7` tag has no release. No upstream tags, releases or repository settings were changed.
 
 ### Phase 1 review boundary notes
 
