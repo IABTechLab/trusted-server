@@ -12,6 +12,8 @@ pub mod collector;
 pub mod generate;
 pub mod page;
 
+use std::io::IsTerminal as _;
+
 use clap::{Args, Subcommand};
 
 use crate::app_config::AppConfigArgs;
@@ -208,6 +210,13 @@ pub(crate) struct AuditAdTemplatesGenerateArgs {
     /// Preview the updated config on stdout instead of writing it.
     #[arg(long)]
     pub dry_run: bool,
+    /// Apply changes to the config without asking for confirmation.
+    ///
+    /// Without it, a run that would change the config shows the target path
+    /// and the managed-field diff, then waits for an explicit `yes`. Required
+    /// when stdin or stderr is not a terminal, so automation must opt in.
+    #[arg(long, conflicts_with = "dry_run")]
+    pub yes: bool,
     /// Perform a deterministic scroll pass after each page initially settles.
     #[arg(long)]
     pub scroll: bool,
@@ -356,6 +365,13 @@ pub(crate) fn run_audit(args: &AuditArgs) -> Result<RunOutcome, String> {
             let mut out = stdout.lock();
             let stderr = std::io::stderr();
             let mut err = stderr.lock();
+            let stdin = std::io::stdin();
+            // The prompt is written to stderr and answered on stdin, so both
+            // must reach a person for an answer to mean anything.
+            let interactive = stdin.is_terminal() && stderr.is_terminal();
+            // Locks stdin per read rather than for the whole crawl; only the
+            // confirmation prompt reads it.
+            let mut input = std::io::BufReader::new(stdin);
             generate::run_update_slots(
                 &generate::UpdateSlotsRequest {
                     url: gen_args.url.as_str(),
@@ -365,12 +381,15 @@ pub(crate) fn run_audit(args: &AuditArgs) -> Result<RunOutcome, String> {
                     replace: gen_args.replace,
                     cookies: &gen_args.cookies,
                     dry_run: gen_args.dry_run,
+                    yes: gen_args.yes,
+                    interactive,
                     scroll: gen_args.scroll,
                     budget: gen_args.budget(),
                 },
                 &selected,
                 &mut out,
                 &mut err,
+                &mut input,
             )
             .map(|()| RunOutcome::Success)
         }
