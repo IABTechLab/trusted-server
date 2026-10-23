@@ -1,3 +1,6 @@
+// `ts dev audit` has no OS-specific dependencies and is available on every host
+// target.
+pub mod audit;
 // `ts dev proxy` supports macOS and Linux; its dependencies are scoped to
 // those targets in `Cargo.toml`, so the module and the `Proxy` subcommand only
 // exist there. `ts dev lint` and `ts dev install-hooks` are pure-Rust
@@ -19,6 +22,9 @@ use crate::error::CliError;
 /// The `ts dev …` command group.
 #[derive(Debug, clap::Subcommand)]
 pub enum DevCommand {
+    /// Audit origin responses (e.g. cache headers per content type).
+    #[command(subcommand)]
+    Audit(audit::DevAuditCommand),
     /// Run the local production-hostname dev proxy (macOS and Linux).
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     Proxy(proxy::ProxyArgs),
@@ -52,6 +58,7 @@ pub struct InstallHooksArgs {
 /// `Err(String)` returned here comes from `proxy` or `sandbox-probe`.
 pub fn run(command: DevCommand) -> Result<(), String> {
     match command {
+        DevCommand::Audit(command) => audit::run(&command),
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         DevCommand::Proxy(args) => proxy::run(&args).map_err(|report| format!("{report:?}")),
         #[cfg(not(target_family = "wasm"))]
