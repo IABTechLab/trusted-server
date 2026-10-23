@@ -85,6 +85,17 @@ hyper = { workspace = true, features = ["http1", "client"] }
 hyper-util = { workspace = true, features = ["tokio"] }
 tokio = { workspace = true, features = ["net", "rt-multi-thread"] }
 
+# Consumer release verification (`src/release`), compiled only where the
+# module is: Unix hosts. `sha2`/`hex` hash exact distributed bytes, `libc`
+# provides process-group termination and `openat` snapshot reads, and
+# `jsonschema` evaluates the governing release-index schema offline. The
+# `jsonschema` exact pin and empty default features match `trusted-server-release`.
+[target.'cfg(all(unix, not(target_arch = "wasm32")))'.dependencies]
+hex = { workspace = true }
+jsonschema = { version = "=0.58.6", default-features = false }
+libc = { workspace = true }
+sha2 = { workspace = true }
+
 # The shared proxy engine supports macOS and Linux only.
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 base64 = { workspace = true }

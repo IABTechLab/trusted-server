@@ -1,0 +1,18 @@
+# Ordinary CI denial fixture: every member but `control` tries one loopback
+# connection while Cargo builds it and fails the build reporting the errno.
+[workspace]
+resolver = "3"
+members = [
+    "crates/build-direct",
+    "crates/build-grandchild",
+    "crates/control",
+    "crates/macro-attempt",
+]
+
+[workspace.package]
+edition = "2024"
+publish = false
+version = "0.1.0"
+
+[profile.release]
+debug = 1

@@ -11,6 +11,7 @@ use error_stack::Report;
 use fastly::http::Method as FastlyMethod;
 use fastly::{Request as FastlyRequest, Response as FastlyResponse};
 
+use trusted_server_core::build_info::{BuildInfo, BuildVariant};
 use trusted_server_core::cache_policy::{EdgeCacheHeader, cache_control_headers_have_directive};
 use trusted_server_core::constants::HEADER_X_TS_VERSION;
 use trusted_server_core::ec::device::DeviceSignals;
@@ -56,6 +57,17 @@ use crate::sandbox::{RetainedApp, Sandbox, SandboxCounters, ServeMode, StartupDi
 #[cfg(feature = "reusable-sandbox")]
 use crate::sandbox::RetirementCounters;
 
+/// Immutable facts compiled into the owning Fastly product.
+pub const BUILD_INFO: BuildInfo = BuildInfo::new(
+    env!("CARGO_PKG_VERSION"),
+    env!("TRUSTED_SERVER__BUILD_TARGET"),
+    if cfg!(feature = "reusable-sandbox") {
+        BuildVariant::ReusableSandbox
+    } else {
+        BuildVariant::Default
+    },
+);
+
 /// Opens the Fastly Config Store used by the `EdgeZero` dispatcher.
 ///
 /// # Errors
@@ -97,10 +109,7 @@ fn main() {
 
     // Held outside the sandbox: `serve_custom` owns the `Sandbox` and exposes
     // no slot for application state that is not the retained payload.
-    let mut startup = StartupDiagnostics::default();
-    for message in diagnostics {
-        startup.push(message);
-    }
+    let mut startup = startup_diagnostics(diagnostics);
 
     match mode {
         ServeMode::Single => {
@@ -114,6 +123,21 @@ fn main() {
         }
         ServeMode::Reuse(limits) => serve_loop(limits, startup),
     }
+}
+
+fn startup_diagnostics(diagnostics: Vec<String>) -> StartupDiagnostics {
+    let mut startup = StartupDiagnostics::default();
+    startup.push(format!(
+        "Build facts: package={} source={} target={} variant={}",
+        BUILD_INFO.package_version(),
+        BUILD_INFO.source().unwrap_or("unknown"),
+        BUILD_INFO.target(),
+        BUILD_INFO.variant()
+    ));
+    for message in diagnostics {
+        startup.push(message);
+    }
+    startup
 }
 
 /// Serves requests from one sandbox under explicit bounds.
@@ -909,6 +933,51 @@ mod tests {
             response.take_body_str(),
             "ok",
             "should return the health body"
+        );
+    }
+
+    #[test]
+    fn fastly_build_info_uses_actual_owning_package_target_source_and_feature() {
+        assert_eq!(
+            BUILD_INFO.package_version(),
+            env!("CARGO_PKG_VERSION"),
+            "should own Fastly package version"
+        );
+        assert_eq!(
+            BUILD_INFO.target(),
+            "wasm32-wasip1",
+            "should own Fastly Cargo target"
+        );
+        assert_eq!(
+            BUILD_INFO.source(),
+            trusted_server_core::constants::TS_GIT_VERSION,
+            "should read source from core"
+        );
+        let expected = if cfg!(feature = "reusable-sandbox") {
+            BuildVariant::ReusableSandbox
+        } else {
+            BuildVariant::Default
+        };
+        assert_eq!(
+            BUILD_INFO.variant(),
+            expected,
+            "should derive actual Fastly feature variant"
+        );
+    }
+
+    #[test]
+    fn startup_queues_one_build_fact_message_for_existing_log_flush() {
+        let startup = startup_diagnostics(Vec::new());
+        assert_eq!(
+            startup.pending(),
+            1,
+            "should queue exactly one build fact message"
+        );
+        let startup = startup_diagnostics(vec!["example diagnostic".to_owned()]);
+        assert_eq!(
+            startup.pending(),
+            2,
+            "should preserve existing startup diagnostics"
         );
     }
 

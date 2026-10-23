@@ -1,0 +1,428 @@
+# Callable quality validation only. No release trigger or publication authority.
+# Governance approval is not configured: the terminal result remains closed.
+name: Release validation
+
+on:
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Exact lowercase source commit; must equal the caller revision.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  admission:
+    name: Release validation admission
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0 (Node 24)
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Read pinned Node version
+        id: node
+        shell: bash
+        run: echo "version=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0 (Node 24)
+        with:
+          node-version: ${{ steps.node.outputs.version }}
+      - name: Check same-commit invocation and remote lightweight tag
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          node .github/workflows/release-validation.mjs admit
+
+  fastly:
+    name: Release validation Fastly
+    needs: admission
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0 (Node 24)
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Read pinned Node version
+        id: node
+        shell: bash
+        run: echo "version=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0 (Node 24)
+        with:
+          node-version: ${{ steps.node.outputs.version }}
+      # Shell installation follows the existing native release-tool gate and
+      # avoids inheriting floating composite-action dependencies or shared caches.
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUST_VERSION="$(awk '$1 == "rust" { print $2 }' .tool-versions)"
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy,rustfmt --target wasm32-wasip1
+          rustup override set "$RUST_VERSION"
+          HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+          test -n "$HOST_TARGET"
+          echo "HOST_TARGET=$HOST_TARGET" >> "$GITHUB_ENV"
+      - name: Install JavaScript build dependencies
+        shell: bash
+        run: |
+          npm ci --prefix crates/trusted-server-js/lib
+      - name: Install pinned Viceroy
+        shell: bash
+        run: |
+          VICEROY_VERSION="$(awk '$1 == "viceroy" { print $2 }' .tool-versions)"
+          cargo install viceroy --version "$VICEROY_VERSION" --locked --force
+      - name: Run Fastly gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test-fastly
+          cargo test-fastly-reuse
+          cargo clippy-fastly
+          BID_DELAY=3 ./scripts/template-cache-local-test.sh esi
+          BID_DELAY=3 ./scripts/template-cache-local-test.sh inline
+          BID_DELAY=3 ./scripts/template-cache-local-test.sh purge
+
+  native:
+    name: Release validation native and parity
+    needs: admission
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0 (Node 24)
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Read pinned Node version
+        id: node
+        shell: bash
+        run: echo "version=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0 (Node 24)
+        with:
+          node-version: ${{ steps.node.outputs.version }}
+      # Shell installation follows the existing native release-tool gate and
+      # avoids inheriting floating composite-action dependencies or shared caches.
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUST_VERSION="$(awk '$1 == "rust" { print $2 }' .tool-versions)"
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy,rustfmt --target wasm32-wasip1
+          rustup override set "$RUST_VERSION"
+          HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+          test -n "$HOST_TARGET"
+          echo "HOST_TARGET=$HOST_TARGET" >> "$GITHUB_ENV"
+      - name: Install JavaScript build dependencies
+        shell: bash
+        run: |
+          npm ci --prefix crates/trusted-server-js/lib
+      - name: Install native trust test tools
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libnss3-tools openssl
+      - name: Run native and parity gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo build -p trusted-server-adapter-axum
+          cargo test-axum
+          cargo clippy-axum
+          cargo test -p trusted-server-core --test template_build_digest
+          cargo clippy -p trusted-server-core --test template_build_digest -- -D warnings
+          cargo bench -p trusted-server-core --bench html_processor_bench -- --test
+          ./scripts/test-cli.sh
+          cargo clippy-cli
+          cargo test -p trusted-server-openrtb-codegen --target "$HOST_TARGET"
+          cargo clippy-codegen
+          cargo fmt --manifest-path crates/trusted-server-integration-tests/Cargo.toml -- --check
+          cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --test parity
+          cargo clippy --manifest-path crates/trusted-server-integration-tests/Cargo.toml --all-targets -- -D warnings
+          cargo build --package trusted-server-adapter-fastly --release --target wasm32-wasip1
+      - name: Guard and run real NSS trust fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          TEST_LIST="$(mktemp)"
+          trap 'rm -f "$TEST_LIST"' EXIT
+          cargo test --package trusted-server-cli --target "$HOST_TARGET" --test proxy_trust_linux -- --ignored --list > "$TEST_LIST"
+          awk '/: test$/ { count++ } END { if (count == 0) exit 1 }' "$TEST_LIST"
+          cargo test --package trusted-server-cli --target "$HOST_TARGET" --test proxy_trust_linux -- --ignored
+
+  runtimes:
+    name: Release validation Cloudflare and Spin
+    needs: admission
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0 (Node 24)
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Read pinned Node version
+        id: node
+        shell: bash
+        run: echo "version=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0 (Node 24)
+        with:
+          node-version: ${{ steps.node.outputs.version }}
+      # Shell installation follows the existing native release-tool gate and
+      # avoids inheriting floating composite-action dependencies or shared caches.
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUST_VERSION="$(awk '$1 == "rust" { print $2 }' .tool-versions)"
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy,rustfmt --target wasm32-wasip1,wasm32-unknown-unknown
+          rustup override set "$RUST_VERSION"
+          HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+          test -n "$HOST_TARGET"
+          echo "HOST_TARGET=$HOST_TARGET" >> "$GITHUB_ENV"
+      - name: Install JavaScript build dependencies
+        shell: bash
+        run: |
+          npm ci --prefix crates/trusted-server-js/lib
+      - name: Run Cloudflare and Spin gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check -p trusted-server-adapter-cloudflare
+          cargo check-cloudflare
+          cargo test-cloudflare
+          cargo clippy-cloudflare
+          cargo clippy-cloudflare-wasm
+          scripts/lint-wasm-clock.sh
+          cargo check -p trusted-server-adapter-spin
+          cargo check-spin
+          cargo test-spin
+          cargo clippy-spin-native
+          cargo clippy-spin-wasm
+      - name: Build Spin release artifact
+        env:
+          TRUSTED_SERVER__PUBLISHER__ORIGIN_URL: http://127.0.0.1:8080
+          TRUSTED_SERVER__PUBLISHER__PROXY_SECRET: example-integration-secret
+          TRUSTED_SERVER__EC__PASSPHRASE: example-ec-passphrase-padded-to-32
+          TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK: 'false'
+        shell: bash
+        run: |
+          cargo build --package trusted-server-adapter-spin --target wasm32-wasip1 --features spin --release
+
+  release-tool-linux:
+    name: Release validation release tool Linux
+    needs: admission
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0 (Node 24)
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Read pinned Node version
+        id: node
+        shell: bash
+        run: echo "version=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0 (Node 24)
+        with:
+          node-version: ${{ steps.node.outputs.version }}
+      # Shell installation follows the existing native release-tool gate and
+      # avoids inheriting floating composite-action dependencies or shared caches.
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUST_VERSION="$(awk '$1 == "rust" { print $2 }' .tool-versions)"
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy,rustfmt
+          rustup override set "$RUST_VERSION"
+          HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+          test -n "$HOST_TARGET"
+          echo "HOST_TARGET=$HOST_TARGET" >> "$GITHUB_ENV"
+      - name: Install JavaScript build dependencies
+        shell: bash
+        run: |
+          npm ci --prefix crates/trusted-server-js/lib
+      - name: Check the reviewed workflow contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run --package trusted-server-release --target "$HOST_TARGET" --locked -- check-workflow-contract --workflow .github/workflows/release-validation.yml
+      - name: Guard and run host release-tool and prebuilt gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          TEST_LIST="$(mktemp)"
+          trap 'rm -f "$TEST_LIST"' EXIT
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --all-features --locked -- --list > "$TEST_LIST"
+          awk '/: test$/ { count++ } END { if (count == 0) exit 1 }' "$TEST_LIST"
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --all-features --locked
+          cargo clippy -p trusted-server-release --target "$HOST_TARGET" --all-targets --all-features --locked -- -D warnings
+          cargo doc -p trusted-server-release --target "$HOST_TARGET" --no-deps --all-features --locked
+          cargo test -p trusted-server-js --target "$HOST_TARGET" --test release_prebuilt --locked -- --list > "$TEST_LIST"
+          awk '/: test$/ { count++ } END { if (count == 0) exit 1 }' "$TEST_LIST"
+          cargo test -p trusted-server-js --target "$HOST_TARGET" --test release_prebuilt --locked
+          cargo clippy -p trusted-server-js --target "$HOST_TARGET" --all-targets --all-features --locked -- -D warnings
+
+  release-tool-macos:
+    name: Release validation release tool macOS
+    needs: admission
+    runs-on: macos-15
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0 (Node 24)
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Read pinned Node version
+        id: node
+        shell: bash
+        run: echo "version=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0 (Node 24)
+        with:
+          node-version: ${{ steps.node.outputs.version }}
+      # Shell installation follows the existing native release-tool gate and
+      # avoids inheriting floating composite-action dependencies or shared caches.
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUST_VERSION="$(awk '$1 == "rust" { print $2 }' .tool-versions)"
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy,rustfmt
+          rustup override set "$RUST_VERSION"
+          HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+          test -n "$HOST_TARGET"
+          echo "HOST_TARGET=$HOST_TARGET" >> "$GITHUB_ENV"
+      - name: Install JavaScript build dependencies
+        shell: bash
+        run: |
+          npm ci --prefix crates/trusted-server-js/lib
+      - name: Check the reviewed workflow contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run --package trusted-server-release --target "$HOST_TARGET" --locked -- check-workflow-contract --workflow .github/workflows/release-validation.yml
+      - name: Guard and run host release-tool and prebuilt gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          TEST_LIST="$(mktemp)"
+          trap 'rm -f "$TEST_LIST"' EXIT
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --all-features --locked -- --list > "$TEST_LIST"
+          awk '/: test$/ { count++ } END { if (count == 0) exit 1 }' "$TEST_LIST"
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --all-features --locked
+          cargo clippy -p trusted-server-release --target "$HOST_TARGET" --all-targets --all-features --locked -- -D warnings
+          cargo doc -p trusted-server-release --target "$HOST_TARGET" --no-deps --all-features --locked
+          cargo test -p trusted-server-js --target "$HOST_TARGET" --test release_prebuilt --locked -- --list > "$TEST_LIST"
+          awk '/: test$/ { count++ } END { if (count == 0) exit 1 }' "$TEST_LIST"
+          cargo test -p trusted-server-js --target "$HOST_TARGET" --test release_prebuilt --locked
+          cargo clippy -p trusted-server-js --target "$HOST_TARGET" --all-targets --all-features --locked -- -D warnings
+
+  javascript:
+    name: Release validation JavaScript
+    needs: admission
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0 (Node 24)
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Read pinned Node version
+        id: node
+        shell: bash
+        run: echo "version=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0 (Node 24)
+        with:
+          node-version: ${{ steps.node.outputs.version }}
+      - name: Run JavaScript gates
+        env:
+          TRUSTED_SERVER__RELEASE_JS_TESTS: '1'
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --prefix crates/trusted-server-js/lib
+          npm run build --prefix crates/trusted-server-js/lib
+          npm test --prefix crates/trusted-server-js/lib -- --run
+          npm run lint --prefix crates/trusted-server-js/lib
+          npm run format --prefix crates/trusted-server-js/lib
+          node --test .github/workflows/release-validation.test.mjs
+
+  docs:
+    name: Release validation docs
+    needs: admission
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0 (Node 24)
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Read pinned Node version
+        id: node
+        shell: bash
+        run: echo "version=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0 (Node 24)
+        with:
+          node-version: ${{ steps.node.outputs.version }}
+      - name: Run documentation and proposal gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --prefix docs
+          npm run lint --prefix docs
+          npm run format --prefix docs
+          docs/node_modules/.bin/prettier --config docs/.prettierrc --check "*.md" ".claude/**/*.md" ".github/**/*.md" "crates/**/*.md" "scripts/**/*.md" "scripts/**/*.mjs" "tinybird/**/*.md"
+          npm run build --prefix docs
+          shellcheck scripts/docs-proposal/*.sh
+          node --test scripts/docs-proposal/hunks.test.mjs
+          scripts/docs-proposal/test.sh
+      - name: Verify instruction symlink and shared Rust setup policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git ls-tree HEAD CLAUDE.md | awk '{print $1}')" = 120000
+          test "$(git cat-file blob HEAD:CLAUDE.md)" = AGENTS.md
+          test -f AGENTS.md
+          if grep -rnE "uses:[[:space:]]*[\"']?(actions-rust-lang/setup-rust-toolchain|Swatinem/rust-cache)@" .github | grep -v '^\.github/actions/setup-rust/action\.yml:'; then
+            echo 'Use the shared Rust setup action rather than direct external Rust setup actions.' >&2
+            exit 1
+          fi
+
+  terminal-results:
+    name: Release validation terminal results
+    permissions:
+      contents: read
+      actions: read
+    needs: admission
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0 (Node 24)
+        with:
+          ref: ${{ inputs.source_sha }}
+          persist-credentials: false
+      - name: Read pinned Node version
+        id: node
+        shell: bash
+        run: echo "version=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0 (Node 24)
+        with:
+          node-version: ${{ steps.node.outputs.version }}
+      - name: Wait for this invocation and retain the governance block
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          node .github/workflows/release-validation.mjs wait

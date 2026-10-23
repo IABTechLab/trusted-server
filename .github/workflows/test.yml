@@ -1,4 +1,4 @@
-name: "Run Tests"
+name: 'Run Tests'
 
 permissions:
   contents: read
@@ -7,6 +7,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The scheduled and dispatched runs measure the native CLI reproduction
+  # builds that push and pull request runs defer (TS_RELEASE_NATIVE_REPRODUCTION).
+  schedule:
+    - cron: '23 4 * * *'
+  workflow_dispatch:
 
 jobs:
   test-rust:
@@ -20,12 +25,12 @@ jobs:
         id: viceroy-version
         # `.tool-versions` is the single source of truth so this workflow and
         # `.github/actions/setup-integration-test-env/action.yml` can't drift.
-        run: echo "viceroy-version=$(grep '^viceroy ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "viceroy-version=$(grep '^viceroy ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Retrieve Node.js version
         id: node-version
-        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Set up Rust toolchain
@@ -153,15 +158,13 @@ jobs:
         run: cargo check-spin
 
       - name: Build Spin adapter release WASM
-        # Mirror the Fastly release-build overrides so the artifact embeds usable
-        # settings instead of the trusted-server.toml placeholders, which startup
-        # rejects (falling back to the generic 503 router). This proves the
-        # documented Spin artifact can boot, not just compile.
+        # Compile the documented Spin artifact. Application settings and secrets
+        # are supplied separately at runtime; compilation does not prove startup.
         env:
           TRUSTED_SERVER__PUBLISHER__ORIGIN_URL: http://127.0.0.1:8080
           TRUSTED_SERVER__PUBLISHER__PROXY_SECRET: integration-test-proxy-secret
           TRUSTED_SERVER__EC__PASSPHRASE: integration-test-ec-secret-padded-32
-          TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK: "false"
+          TRUSTED_SERVER__PROXY__CERTIFICATE_CHECK: 'false'
         run: cargo build --package trusted-server-adapter-spin --target wasm32-wasip1 --features spin --release
 
       - name: Run Spin adapter tests (native host)
@@ -201,7 +204,7 @@ jobs:
       - name: Set up Rust toolchain
         uses: ./.github/actions/setup-rust
         with:
-          components: "clippy, rustfmt"
+          components: 'clippy, rustfmt'
           cache-key: cargo-cli
 
       - name: Read pinned Node.js version for CLI fixtures
@@ -256,6 +259,1060 @@ jobs:
           cargo test --manifest-path crates/trusted-server-cli/Cargo.toml --target "$TARGET" \
             --test proxy_trust_linux -- --ignored
 
+  # Ordinary source-built behavior checks; this matrix is not release qualification.
+  test-release-native:
+    name: cargo test (release tooling and JS prebuilt, native)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0 (Node 24)
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Read pinned tool versions
+        id: tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "rust=$(awk '$1 == "rust" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+          echo "node=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+
+      - name: Use pinned Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0 (Node 24)
+        with:
+          node-version: ${{ steps.tools.outputs.node }}
+          cache: npm
+          cache-dependency-path: crates/trusted-server-js/lib/package-lock.json
+
+      - name: Install JS dependencies
+        working-directory: crates/trusted-server-js/lib
+        run: npm ci
+
+      # The runner's installed rustup bootstraps ordinary CI, not the release producer.
+      - name: Install pinned native Rust toolchain
+        env:
+          RUST_VERSION: ${{ steps.tools.outputs.rust }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy
+          rustup override set "$RUST_VERSION"
+          HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+          test -n "$HOST_TARGET"
+          echo "HOST_TARGET=$HOST_TARGET" >> "$GITHUB_ENV"
+
+      - name: Guard and run all native release-tool tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          TEST_LIST="$(mktemp)"
+          trap 'rm -f "$TEST_LIST"' EXIT
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --all-features -- --list > "$TEST_LIST"
+          awk '/: test$/ { count++ } END { if (count == 0) { print "No native release-tool tests selected"; exit 1 } print "Selected " count " native release-tool tests" }' "$TEST_LIST"
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --all-features
+          cargo clippy -p trusted-server-release --target "$HOST_TARGET" --all-targets --all-features -- -D warnings
+          cargo doc -p trusted-server-release --target "$HOST_TARGET" --no-deps --all-features
+
+      - name: Prepare original-only full JS fixture (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p trusted-server-release --target "$HOST_TARGET" --locked
+          FIXTURE_ROOT="$RUNNER_TEMP/release-js-original-fixture"
+          node scripts/release/tests/prepare-js-fixture.mjs "$FIXTURE_ROOT" "target/$HOST_TARGET/debug/trusted-server-release"
+          echo "TS_RELEASE_JS_FIXTURE_ROOT=$FIXTURE_ROOT" >> "$GITHUB_ENV"
+
+      - name: Prove two fresh offline JS builds (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          # Optimize repeated whole-input hashes with test safety checks retained.
+          CARGO_PROFILE_TEST_OPT_LEVEL: '2'
+          CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: 'true'
+          CARGO_PROFILE_TEST_OVERFLOW_CHECKS: 'true'
+        run: |
+          set -euo pipefail
+          TEST_NAME=preparation::tests::full::real_two_fresh_js_builds
+          TEST_LIST="$(mktemp)"
+          trap 'rm -f "$TEST_LIST"' EXIT
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --list > "$TEST_LIST"
+          awk '/: test$/ { count++ } END { if (count != 1) { print "Expected exactly one full JS execution fixture"; exit 1 } }' "$TEST_LIST"
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --nocapture
+          cat "$TS_RELEASE_JS_FIXTURE_ROOT/js-execution-measurement.json"
+
+      - name: Guard and run native JS prebuilt tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          TEST_LIST="$(mktemp)"
+          trap 'rm -f "$TEST_LIST"' EXIT
+          cargo test -p trusted-server-js --target "$HOST_TARGET" --test release_prebuilt -- --list > "$TEST_LIST"
+          awk '/: test$/ { count++ } END { if (count == 0) { print "No native JS prebuilt tests selected"; exit 1 } print "Selected " count " native JS prebuilt tests" }' "$TEST_LIST"
+          cargo test -p trusted-server-js --target "$HOST_TARGET" --test release_prebuilt
+          cargo clippy -p trusted-server-js --target "$HOST_TARGET" --all-targets --all-features -- -D warnings
+
+  # Ordinary CI candidate evidence of the confined Cargo recipe; this job is
+  # not release qualification (every measurement reports it as such).
+  test-release-cargo-candidate:
+    name: cargo test (confined release Cargo candidate, Linux)
+    runs-on: ubuntu-24.04
+    # Fixture preparation, two fresh JS builds (~12 min), then two confined
+    # Fastly builds each with its own vendoring (~3-4 min each) and the
+    # final-byte comparison: 45 minutes left too little headroom. The
+    # uncached Viceroy install (~5-8 min) and three gate runs add to that.
+    timeout-minutes: 75
+    outputs:
+      # CI-internal descriptor of the uploaded candidate entry, for the
+      # candidate index collector; not a release schema.
+      candidate-entry: ${{ steps.describe-entry.outputs.candidate-entry }}
+    env:
+      # Optimize repeated whole-input hashes with test safety checks retained.
+      CARGO_PROFILE_TEST_OPT_LEVEL: '2'
+      CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: 'true'
+      CARGO_PROFILE_TEST_OVERFLOW_CHECKS: 'true'
+      TS_RELEASE_CANDIDATE_ENTRY_UPLOAD: candidate-entry-trusted-server-fastly.wasm-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0 (Node 24)
+        with:
+          persist-credentials: false
+          # Full history: the fixtures clone this checkout, and source
+          # authentication rejects a shallow repository (`.git/shallow`).
+          fetch-depth: 0
+
+      - name: Read pinned tool versions
+        id: tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "rust=$(awk '$1 == "rust" { print $2 }' .tool-versions)"
+            echo "node=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)"
+            echo "viceroy=$(awk '$1 == "viceroy" { print $2 }' .tool-versions)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Use pinned Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0 (Node 24)
+        with:
+          node-version: ${{ steps.tools.outputs.node }}
+          cache: npm
+          cache-dependency-path: crates/trusted-server-js/lib/package-lock.json
+
+      # The runner's installed rustup bootstraps ordinary CI, not the release producer.
+      - name: Install pinned native Rust toolchain with the Wasm target
+        env:
+          RUST_VERSION: ${{ steps.tools.outputs.rust }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup target add --toolchain "$RUST_VERSION" wasm32-wasip1
+          rustup override set "$RUST_VERSION"
+          HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+          test -n "$HOST_TARGET"
+          echo "HOST_TARGET=$HOST_TARGET" >> "$GITHUB_ENV"
+
+      # Restores the host release-tool build (third-party rlibs; Cargo still
+      # rebuilds trusted-server-release from the checkout). This calls
+      # actions/cache directly, not ./.github/actions/setup-rust, which the
+      # format.yml guard requires for Rust caching elsewhere: these jobs
+      # install the pinned toolchain with rustup on purpose, and setup-rust
+      # would export RUSTFLAGS and other environment into the release tool.
+      # The guard only rejects setup-rust-toolchain and rust-cache steps.
+      # Only main saves (below), so a pull request restores only main's
+      # entry, never another pull request's. ~/.cargo/registry is never
+      # cached. A restored build stays ordinary CI evidence only: every
+      # measurement records `release_qualification: false` and the key.
+      - name: Restore the release-tool host build cache
+        id: release-tool-cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0 (Node 24)
+        with:
+          path: target
+          key: release-tool-${{ runner.os }}-${{ env.HOST_TARGET }}-rust-${{ steps.tools.outputs.rust }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.tool-versions', 'crates/trusted-server-release/Cargo.toml') }}-test-o${{ env.CARGO_PROFILE_TEST_OPT_LEVEL }}-da${{ env.CARGO_PROFILE_TEST_DEBUG_ASSERTIONS }}-oc${{ env.CARGO_PROFILE_TEST_OVERFLOW_CHECKS }}
+
+      # Same pinned source install as the other Viceroy jobs, but uncached and
+      # into a private root: the runtime gate selects this exact absolute path,
+      # checks its reported version and records its digest.
+      - name: Install pinned Viceroy for the final-byte runtime gate
+        env:
+          VICEROY_VERSION: ${{ steps.tools.outputs.viceroy }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$VICEROY_VERSION"
+          VICEROY_ROOT="$RUNNER_TEMP/release-viceroy"
+          cargo install viceroy --version "$VICEROY_VERSION" --locked --root "$VICEROY_ROOT"
+          test "$("$VICEROY_ROOT/bin/viceroy" --version)" = "viceroy $VICEROY_VERSION"
+          echo "TS_RELEASE_VICEROY=$VICEROY_ROOT/bin/viceroy" >> "$GITHUB_ENV"
+
+      - name: Prepare ordinary CI JS and Cargo fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p trusted-server-release --target "$HOST_TARGET" --locked
+          # Build the test binary now so the cache below holds its dependencies.
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --locked --no-run
+          PRODUCER="target/$HOST_TARGET/debug/trusted-server-release"
+          JS_FIXTURE_ROOT="$RUNNER_TEMP/release-js-original-fixture"
+          CARGO_FIXTURE_ROOT="$RUNNER_TEMP/release-cargo-fixture"
+          node scripts/release/tests/prepare-js-fixture.mjs "$JS_FIXTURE_ROOT" "$PRODUCER"
+          node scripts/release/tests/prepare-cargo-fixture.mjs "$CARGO_FIXTURE_ROOT" "$PRODUCER"
+          echo "TS_RELEASE_JS_FIXTURE_ROOT=$JS_FIXTURE_ROOT" >> "$GITHUB_ENV"
+          echo "TS_RELEASE_CARGO_FIXTURE_ROOT=$CARGO_FIXTURE_ROOT" >> "$GITHUB_ENV"
+          df -h "$RUNNER_TEMP"
+
+      # Saved before any ignored fixture test runs, so no fixture output can
+      # enter the cache. The Linux CLI and JS handoff jobs restore this same
+      # key without saving it.
+      - name: Drop incremental state before saving the host build cache
+        if: github.ref == 'refs/heads/main' && steps.release-tool-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: rm -rf target/debug/incremental target/*/debug/incremental
+
+      - name: Save the release-tool host build cache (main only)
+        if: github.ref == 'refs/heads/main' && steps.release-tool-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0 (Node 24)
+        with:
+          path: target
+          key: ${{ steps.release-tool-cache.outputs.cache-primary-key }}
+
+      - name: Prove Cargo build scripts and proc macros inherit denial (Linux)
+        env:
+          TS_RELEASE_CI_BUILD_CACHE: ${{ steps.release-tool-cache.outputs.cache-matched-key || 'miss' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TEST_NAME=recipe::tests::full::cargo_children_inherit_denial
+          TEST_LIST="$(mktemp)"
+          trap 'rm -f "$TEST_LIST"' EXIT
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --list > "$TEST_LIST"
+          awk '/: test$/ { count++ } END { if (count != 1) { print "Expected exactly one Cargo denial fixture"; exit 1 } }' "$TEST_LIST"
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --nocapture
+          cat "$TS_RELEASE_CARGO_FIXTURE_ROOT/cargo-denial-measurement.json"
+
+      # Before each build, the producer-normalized Git manifests are compared
+      # with cargo vendor's for dependency resolution (evidence only). The
+      # canonical and reproduction builds use the same JS handoff in
+      # separate fresh roots and boundaries; the final Fastly files must be
+      # byte-identical. Both outputs then pass the final-byte Viceroy runtime
+      # gate, and a closed-origin run must be rejected despite a healthy probe.
+      - name: Build canonical and reproduction Fastly from one JS handoff, compare final bytes and run the Viceroy gate (Linux)
+        env:
+          TS_RELEASE_CI_BUILD_CACHE: ${{ steps.release-tool-cache.outputs.cache-matched-key || 'miss' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TEST_NAME=recipe::tests::full::fastly_canonical_and_reproduction_builds_are_byte_identical
+          TEST_LIST="$(mktemp)"
+          trap 'rm -f "$TEST_LIST"' EXIT
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --list > "$TEST_LIST"
+          awk '/: test$/ { count++ } END { if (count != 1) { print "Expected exactly one Fastly canonical/reproduction equality fixture"; exit 1 } }' "$TEST_LIST"
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --nocapture
+          cat "$TS_RELEASE_CARGO_FIXTURE_ROOT/normalized-manifest-differential-measurement.json"
+          cat "$TS_RELEASE_CARGO_FIXTURE_ROOT/cargo-canonical-reproduction-equality-measurement.json"
+          cat "$TS_RELEASE_CARGO_FIXTURE_ROOT/fastly-runtime-gate-measurement.json"
+
+      # The rechecked canonical entry and its final executable, as six flat
+      # files, for the candidate index collector. Unauthenticated ordinary CI
+      # evidence; fork pull requests skip it like the transfer fixture.
+      - name: Upload the unqualified Fastly candidate entry for the index collector
+        id: upload-entry
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0 (Node 24)
+        with:
+          name: ${{ env.TS_RELEASE_CANDIDATE_ENTRY_UPLOAD }}
+          path: ${{ env.TS_RELEASE_CARGO_FIXTURE_ROOT }}/candidate-entry
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Describe the uploaded Fastly candidate entry
+        id: describe-entry
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+        shell: bash
+        env:
+          TRANSFER_FILE: ${{ env.TS_RELEASE_CARGO_FIXTURE_ROOT }}/candidate-entry-transfer.json
+          ARTIFACT_ID: ${{ steps.upload-entry.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload-entry.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          DESCRIPTOR="$(jq -c --argjson id "$ARTIFACT_ID" --arg name "$TS_RELEASE_CANDIDATE_ENTRY_UPLOAD" --arg digest "$ARTIFACT_DIGEST" --argjson attempt "$GITHUB_RUN_ATTEMPT" '. + {artifact_id: $id, artifact_name: $name, archive_sha256: $digest, run_attempt: $attempt}' "$TRANSFER_FILE")"
+          echo "$DESCRIPTOR"
+          echo "candidate-entry=$DESCRIPTOR" >> "$GITHUB_OUTPUT"
+
+  test-release-cli-candidate:
+    name: cargo test (Linux ts CLI release candidate)
+    runs-on: ubuntu-24.04
+    # Fixture preparation (~6 min, including the UBI 9 builder image and the
+    # three startup image pulls), two fresh JS builds (~12 min), then the
+    # canonical and, when measured, the reproduction confined CLI builds
+    # (~10-15 min each, about twice the Fastly dependency closure plus C
+    # code) and three clean-container startups.
+    timeout-minutes: 75
+    outputs:
+      # CI-internal descriptor of the uploaded candidate entry, for the
+      # candidate index collector; not a release schema.
+      candidate-entry: ${{ steps.describe-entry.outputs.candidate-entry }}
+    env:
+      # Optimize repeated whole-input hashes with test safety checks retained.
+      CARGO_PROFILE_TEST_OPT_LEVEL: '2'
+      CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: 'true'
+      CARGO_PROFILE_TEST_OVERFLOW_CHECKS: 'true'
+      TS_RELEASE_CANDIDATE_ENTRY_UPLOAD: candidate-entry-ts-x86_64-unknown-linux-gnu-${{ github.run_id }}-${{ github.run_attempt }}
+      # The reproduction build is a measurement, never a gate. Scheduled and
+      # dispatched runs (and pull requests labelled before the push) measure
+      # it; every other run records it as deferred. The test rejects a
+      # missing value and `defer` on a scheduled or dispatched run.
+      TS_RELEASE_NATIVE_REPRODUCTION: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'release-native-reproduction')) && 'measure' || 'defer' }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0 (Node 24)
+        with:
+          persist-credentials: false
+          # Full history: the fixtures clone this checkout, and source
+          # authentication rejects a shallow repository (`.git/shallow`).
+          fetch-depth: 0
+
+      - name: Read pinned tool versions
+        id: tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "rust=$(awk '$1 == "rust" { print $2 }' .tool-versions)"
+            echo "node=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Use pinned Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0 (Node 24)
+        with:
+          node-version: ${{ steps.tools.outputs.node }}
+          cache: npm
+          cache-dependency-path: crates/trusted-server-js/lib/package-lock.json
+
+      # The runner's installed rustup bootstraps ordinary CI, not the release
+      # producer. The copied toolchain keeps its host x86_64-unknown-linux-gnu
+      # standard library, which the CLI targets; the Cargo fixture also
+      # requires the Wasm one.
+      - name: Install pinned native Rust toolchain with the Wasm target
+        env:
+          RUST_VERSION: ${{ steps.tools.outputs.rust }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup target add --toolchain "$RUST_VERSION" wasm32-wasip1
+          rustup override set "$RUST_VERSION"
+          HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+          test "$HOST_TARGET" = x86_64-unknown-linux-gnu
+          echo "HOST_TARGET=$HOST_TARGET" >> "$GITHUB_ENV"
+
+      # Restore only: the Cargo candidate job saves this key (see its comment
+      # for why this is actions/cache and what the cache may and may not
+      # hold). The fixture probes here come from the uncached in-container
+      # bootstrap below; only the host test binary uses the restored build.
+      - name: Restore the release-tool host build cache
+        id: release-tool-cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0 (Node 24)
+        with:
+          path: target
+          key: release-tool-${{ runner.os }}-${{ env.HOST_TARGET }}-rust-${{ steps.tools.outputs.rust }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.tool-versions', 'crates/trusted-server-release/Cargo.toml') }}-test-o${{ env.CARGO_PROFILE_TEST_OPT_LEVEL }}-da${{ env.CARGO_PROFILE_TEST_DEBUG_ASSERTIONS }}-oc${{ env.CARGO_PROFILE_TEST_OVERFLOW_CHECKS }}
+
+      - name: Prepare ordinary CI JS, Cargo and CLI fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p trusted-server-release --target "$HOST_TARGET" --locked
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --locked --no-run
+          PRODUCER="target/$HOST_TARGET/debug/trusted-server-release"
+          JS_FIXTURE_ROOT="$RUNNER_TEMP/release-js-original-fixture"
+          CARGO_FIXTURE_ROOT="$RUNNER_TEMP/release-cargo-fixture"
+          CLI_FIXTURE_ROOT="$RUNNER_TEMP/release-cli-fixture"
+          node scripts/release/tests/prepare-cli-fixture.mjs "$CLI_FIXTURE_ROOT"
+          # Rebuild the same producer inside the GNU baseline. The Ubuntu
+          # host binary requires a newer libc and cannot serve as its probe.
+          # These cached downloads remain unauthenticated candidate inputs.
+          BOOTSTRAP_ROOT="$(mktemp -d "$RUNNER_TEMP/cli-producer.XXXXXX")"
+          BOOTSTRAP_NAME="ts-cli-producer-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          BOOTSTRAP_ID=
+          BOOTSTRAP_CREATE_STARTED=false
+          mkdir "$BOOTSTRAP_ROOT/cargo-home" "$BOOTSTRAP_ROOT/target" "$BOOTSTRAP_ROOT/docker-config"
+          cleanup_cli_bootstrap() {
+            local build_status=$?
+            trap - EXIT
+            local reference="$BOOTSTRAP_NAME" filter="name=^/$BOOTSTRAP_NAME$"
+            if [[ -n "$BOOTSTRAP_ID" ]]; then
+              reference="$BOOTSTRAP_ID"
+              filter="id=$BOOTSTRAP_ID"
+            elif [[ "$BOOTSTRAP_CREATE_STARTED" == true ]]; then
+              printf '%s\n' 'Bootstrap creation was not acknowledged; no start was issued.' >&2
+              [[ "$build_status" -ne 0 ]] || build_status=1
+            fi
+            timeout --kill-after=5s 30s docker --config "$BOOTSTRAP_ROOT/docker-config" --host unix:///var/run/docker.sock stop --time 2 "$reference" >/dev/null 2>&1 || true
+            timeout --kill-after=5s 30s docker --config "$BOOTSTRAP_ROOT/docker-config" --host unix:///var/run/docker.sock rm --force "$reference" >/dev/null 2>&1 || true
+            local survivors
+            survivors="$(timeout --kill-after=5s 30s docker --config "$BOOTSTRAP_ROOT/docker-config" --host unix:///var/run/docker.sock ps --all --quiet --filter "$filter")" || exit 1
+            [[ -z "$survivors" ]] || exit 1
+            exit "$build_status"
+          }
+          trap cleanup_cli_bootstrap EXIT
+          cp -R "$HOME/.cargo/registry" "$BOOTSTRAP_ROOT/cargo-home/registry"
+          if [[ -d "$HOME/.cargo/git" ]]; then
+            cp -R "$HOME/.cargo/git" "$BOOTSTRAP_ROOT/cargo-home/git"
+          fi
+          BUILDER_IMAGE="$(node -p 'JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).builder_image_id' "$CLI_FIXTURE_ROOT/cli-fixture.json")"
+          TOOLCHAIN_ROOT="$(rustc --print sysroot)"
+          BOOTSTRAP_CREATE_STARTED=true
+          BOOTSTRAP_CREATED="$(timeout --kill-after=5s 60s docker --config "$BOOTSTRAP_ROOT/docker-config" --host unix:///var/run/docker.sock create \
+            --init --name "$BOOTSTRAP_NAME" --pull=never --network=none --read-only \
+            --user "$(id -u):$(id -g)" --cap-drop=ALL --security-opt=no-new-privileges \
+            --pids-limit=256 --memory=4g --cpus=2 --tmpfs /tmp:rw,nosuid,nodev,size=256m \
+            --mount "type=bind,src=$GITHUB_WORKSPACE,dst=/source,readonly" \
+            --mount "type=bind,src=$TOOLCHAIN_ROOT,dst=/tools,readonly" \
+            --mount "type=bind,src=$BOOTSTRAP_ROOT/cargo-home,dst=/cargo-home" \
+            --mount "type=bind,src=$BOOTSTRAP_ROOT/target,dst=/target" \
+            --workdir /source --env PATH=/tools/bin:/usr/bin:/bin --env HOME=/tmp \
+            --env CARGO_HOME=/cargo-home --env CARGO_TARGET_DIR=/target --env RUSTC=/tools/bin/rustc \
+            --env GIT_CONFIG_NOSYSTEM=1 --env GIT_CONFIG_GLOBAL=/dev/null \
+            --entrypoint /tools/bin/cargo "$BUILDER_IMAGE" \
+            build -p trusted-server-release --target "$HOST_TARGET" --locked --offline)"
+          [[ "$BOOTSTRAP_CREATED" =~ ^[a-f0-9]{64}$ ]]
+          BOOTSTRAP_ID="$BOOTSTRAP_CREATED"
+          timeout --kill-after=10s 15m docker --config "$BOOTSTRAP_ROOT/docker-config" --host unix:///var/run/docker.sock start --attach "$BOOTSTRAP_ID"
+          PRODUCER="$BOOTSTRAP_ROOT/target/$HOST_TARGET/debug/trusted-server-release"
+          node scripts/release/tests/prepare-js-fixture.mjs "$JS_FIXTURE_ROOT" "$PRODUCER"
+          node scripts/release/tests/prepare-cargo-fixture.mjs "$CARGO_FIXTURE_ROOT" "$PRODUCER"
+          {
+            echo "TS_RELEASE_JS_FIXTURE_ROOT=$JS_FIXTURE_ROOT"
+            echo "TS_RELEASE_CARGO_FIXTURE_ROOT=$CARGO_FIXTURE_ROOT"
+            echo "TS_RELEASE_CLI_FIXTURE_ROOT=$CLI_FIXTURE_ROOT"
+          } >> "$GITHUB_ENV"
+          cat "$CLI_FIXTURE_ROOT/cli-fixture.json"
+          df -h "$RUNNER_TEMP"
+
+      - name: Verify startup timeout removes its owned container
+        shell: bash
+        run: |
+          set -euo pipefail
+          TEST_NAME=recipe::startup::tests::startup_timeout_removes_only_its_owned_container
+          TEST_LIST="$(mktemp)"
+          trap 'rm -f "$TEST_LIST"' EXIT
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --list > "$TEST_LIST"
+          awk '/: test$/ { count++ } END { if (count != 1) { print "Expected exactly one startup cleanup fixture"; exit 1 } }' "$TEST_LIST"
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --nocapture
+
+      # The canonical build is gated: glibc 2.34 ELF policy with retained
+      # debug info, the remap scan, planted operator values absent and
+      # `ts --version` in clean UBI 9, Ubuntu 22.04 and Debian 12 containers.
+      # The reproduction build is recorded, never a gate, and only built when
+      # TS_RELEASE_NATIVE_REPRODUCTION is `measure`.
+      - name: Build, inspect and start the Linux ts candidate; reproduction per TS_RELEASE_NATIVE_REPRODUCTION (Linux)
+        env:
+          TS_RELEASE_CI_BUILD_CACHE: ${{ steps.release-tool-cache.outputs.cache-matched-key || 'miss' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Native reproduction: $TS_RELEASE_NATIVE_REPRODUCTION (event ${GITHUB_EVENT_NAME})"
+          TEST_NAME=recipe::tests::cli::linux_cli_candidate_builds_inspects_and_starts_cleanly
+          TEST_LIST="$(mktemp)"
+          trap 'rm -f "$TEST_LIST"' EXIT
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --list > "$TEST_LIST"
+          awk '/: test$/ { count++ } END { if (count != 1) { print "Expected exactly one Linux CLI candidate fixture"; exit 1 } }' "$TEST_LIST"
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --nocapture
+          cat "$TS_RELEASE_CLI_FIXTURE_ROOT/linux-cli-candidate-measurement.json"
+          df -h "$RUNNER_TEMP"
+
+      # The rechecked canonical entry and its final executable, as six flat
+      # files, for the candidate index collector. Unauthenticated ordinary CI
+      # evidence; fork pull requests skip it like the transfer fixture.
+      - name: Upload the unqualified Linux CLI candidate entry for the index collector
+        id: upload-entry
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0 (Node 24)
+        with:
+          name: ${{ env.TS_RELEASE_CANDIDATE_ENTRY_UPLOAD }}
+          path: ${{ env.TS_RELEASE_CLI_FIXTURE_ROOT }}/candidate-entry
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Describe the uploaded Linux CLI candidate entry
+        id: describe-entry
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+        shell: bash
+        env:
+          TRANSFER_FILE: ${{ env.TS_RELEASE_CLI_FIXTURE_ROOT }}/candidate-entry-transfer.json
+          ARTIFACT_ID: ${{ steps.upload-entry.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload-entry.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          DESCRIPTOR="$(jq -c --argjson id "$ARTIFACT_ID" --arg name "$TS_RELEASE_CANDIDATE_ENTRY_UPLOAD" --arg digest "$ARTIFACT_DIGEST" --argjson attempt "$GITHUB_RUN_ATTEMPT" '. + {artifact_id: $id, artifact_name: $name, archive_sha256: $digest, run_attempt: $attempt}' "$TRANSFER_FILE")"
+          echo "$DESCRIPTOR"
+          echo "candidate-entry=$DESCRIPTOR" >> "$GITHUB_OUTPUT"
+
+      - name: Preserve available CLI candidate measurements in the job log
+        if: always()
+        shell: bash
+        run: |
+          if [[ -n "${TS_RELEASE_CLI_FIXTURE_ROOT:-}" ]]; then
+            for report in builder-filesystem-controls.json linux-cli-candidate-measurement.json; do
+              if [[ -f "$TS_RELEASE_CLI_FIXTURE_ROOT/$report" ]]; then
+                cat "$TS_RELEASE_CLI_FIXTURE_ROOT/$report"
+              fi
+            done
+          fi
+
+      # Measured runs keep the reproduction measurement as an artifact so
+      # reports can cite it, not only the job log.
+      - name: Upload the measured Linux CLI candidate measurement
+        if: ${{ !cancelled() && env.TS_RELEASE_NATIVE_REPRODUCTION == 'measure' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0 (Node 24)
+        with:
+          name: linux-cli-candidate-measurement
+          path: ${{ env.TS_RELEASE_CLI_FIXTURE_ROOT }}/linux-cli-candidate-measurement.json
+          if-no-files-found: warn
+          retention-days: 90
+          # A re-run of this job replaces its own earlier upload.
+          overwrite: true
+
+  # Decides whether the macOS candidate jobs and their Linux JS handoff run.
+  # It fails open: any error, a new branch or an unknown event selects them.
+  # Skipped jobs report success. The candidate index collector needs all four
+  # candidate jobs to succeed, so a deselected range also skips it; the step
+  # summary records that reason. The collector is not a required check.
+  changes:
+    name: Detect release candidate changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      release: ${{ steps.filter.outputs.release }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0 (Node 24)
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Match changed paths against the release candidate inputs
+        id: filter
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PULL_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PULL_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          PUSH_AFTER_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          node --test scripts/release/tests/candidate-changes.test.mjs
+          select_release() {
+            echo "release=$1" >> "$GITHUB_OUTPUT"
+            echo "Release candidate jobs selected: $1 ($2)"
+            if [[ "$1" != true ]]; then
+              echo "Candidate index collector not selected: the macOS candidates are deselected ($2), and the four-asset candidate index is assembled only when all four candidate jobs succeed." >> "$GITHUB_STEP_SUMMARY"
+            fi
+            exit 0
+          }
+          case "$EVENT_NAME" in
+            pull_request) RANGE="$PULL_BASE_SHA...$PULL_HEAD_SHA" ;;
+            push) RANGE="$PUSH_BEFORE_SHA..$PUSH_AFTER_SHA" ;;
+            *) select_release true "event $EVENT_NAME" ;;
+          esac
+          if [[ "$RANGE" == *0000000000000000000000000000000000000000* || "$RANGE" == ...* || "$RANGE" == *... || "$RANGE" == ..* ]]; then
+            select_release true "no comparable base"
+          fi
+          if ! SELECTED="$(bash scripts/release/tests/candidate-changes.sh "$RANGE")"; then
+            select_release true "cannot classify $RANGE"
+          fi
+          case "$SELECTED" in
+            true|false) select_release "$SELECTED" "comparison $RANGE" ;;
+            *) select_release true "unexpected classifier result" ;;
+          esac
+
+  # Exports the Linux two-fresh JS handoff for the macOS candidate jobs,
+  # which cannot run the Linux-only JS build. The artifact is unauthenticated
+  # ordinary CI evidence; the adopting job labels it so.
+  test-release-js-handoff:
+    name: cargo test (export Linux JS handoff for macOS candidates)
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.release == 'true') }}
+    runs-on: ubuntu-24.04
+    # Fixture preparation (~3 min, including the JS fixture image) and the
+    # two fresh JS builds (~12 min).
+    timeout-minutes: 30
+    env:
+      # Optimize repeated whole-input hashes with test safety checks retained.
+      CARGO_PROFILE_TEST_OPT_LEVEL: '2'
+      CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: 'true'
+      CARGO_PROFILE_TEST_OVERFLOW_CHECKS: 'true'
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0 (Node 24)
+        with:
+          persist-credentials: false
+          # Full history: the fixture clones this checkout, and source
+          # authentication rejects a shallow repository (`.git/shallow`).
+          fetch-depth: 0
+
+      - name: Read pinned tool versions
+        id: tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "rust=$(awk '$1 == "rust" { print $2 }' .tool-versions)"
+            echo "node=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Use pinned Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0 (Node 24)
+        with:
+          node-version: ${{ steps.tools.outputs.node }}
+          cache: npm
+          cache-dependency-path: crates/trusted-server-js/lib/package-lock.json
+
+      # The runner's installed rustup bootstraps ordinary CI, not the release producer.
+      - name: Install pinned native Rust toolchain
+        env:
+          RUST_VERSION: ${{ steps.tools.outputs.rust }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup override set "$RUST_VERSION"
+          HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+          test "$HOST_TARGET" = x86_64-unknown-linux-gnu
+          echo "HOST_TARGET=$HOST_TARGET" >> "$GITHUB_ENV"
+
+      # Restore only: the Cargo candidate job saves this key (see its comment
+      # for why this is actions/cache and what the cache may and may not
+      # hold). The Wasm target it also installs does not change host output.
+      - name: Restore the release-tool host build cache
+        id: release-tool-cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0 (Node 24)
+        with:
+          path: target
+          key: release-tool-${{ runner.os }}-${{ env.HOST_TARGET }}-rust-${{ steps.tools.outputs.rust }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.tool-versions', 'crates/trusted-server-release/Cargo.toml') }}-test-o${{ env.CARGO_PROFILE_TEST_OPT_LEVEL }}-da${{ env.CARGO_PROFILE_TEST_DEBUG_ASSERTIONS }}-oc${{ env.CARGO_PROFILE_TEST_OVERFLOW_CHECKS }}
+
+      - name: Prepare original-only full JS fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p trusted-server-release --target "$HOST_TARGET" --locked
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --locked --no-run
+          FIXTURE_ROOT="$RUNNER_TEMP/release-js-original-fixture"
+          EXPORT_ROOT="$RUNNER_TEMP/release-js-handoff"
+          test ! -e "$EXPORT_ROOT"
+          node scripts/release/tests/prepare-js-fixture.mjs "$FIXTURE_ROOT" "target/$HOST_TARGET/debug/trusted-server-release"
+          {
+            echo "TS_RELEASE_JS_FIXTURE_ROOT=$FIXTURE_ROOT"
+            echo "TS_RELEASE_JS_HANDOFF_EXPORT=$EXPORT_ROOT"
+          } >> "$GITHUB_ENV"
+
+      - name: Run two fresh offline JS builds and export the retained handoff
+        shell: bash
+        run: |
+          set -euo pipefail
+          TEST_NAME=preparation::tests::full::export_js_handoff_for_candidates
+          TEST_LIST="$(mktemp)"
+          trap 'rm -f "$TEST_LIST"' EXIT
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --list > "$TEST_LIST"
+          awk '/: test$/ { count++ } END { if (count != 1) { print "Expected exactly one JS handoff export fixture"; exit 1 } }' "$TEST_LIST"
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --nocapture
+          find "$TS_RELEASE_JS_HANDOFF_EXPORT" -type f | sort
+
+      - name: Upload the unauthenticated JS handoff for the macOS candidates
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0 (Node 24)
+        with:
+          name: release-js-handoff
+          path: ${{ env.TS_RELEASE_JS_HANDOFF_EXPORT }}
+          if-no-files-found: error
+          retention-days: 1
+          # A re-run of this job replaces its own earlier upload.
+          overwrite: true
+
+  # Ordinary CI candidate evidence of the Darwin ts on native arm64 and Intel
+  # macOS 15; not release qualification (every measurement reports it). The
+  # unqualified sandbox only reaps descendants after each run, the Xcode is
+  # the runner's, and the JS handoff is the Linux job's unauthenticated
+  # artifact.
+  test-release-macos-cli-candidate:
+    name: cargo test (macOS ts CLI release candidate, ${{ matrix.os }})
+    needs: test-release-js-handoff
+    if: ${{ !cancelled() && needs.test-release-js-handoff.result == 'success' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    # Setup, fixtures and the producer build (~16 min), four denial builds
+    # (~10 min), then the canonical and, when measured, the reproduction
+    # confined CLI builds and one native startup. On macos-15-intel the
+    # canonical build alone measured 24 min and the two-job reproduction is
+    # slower, so a 90-minute limit cancelled run 39529002302
+    # mid-reproduction.
+    timeout-minutes: 150
+    outputs:
+      # Per-leg keys: each leg sets only its own, so the two descriptors of
+      # the CI-internal candidate-entry upload stay apart in matrix outputs.
+      macos-15-candidate-entry: ${{ steps.describe-entry.outputs.macos-15-candidate-entry }}
+      macos-15-intel-candidate-entry: ${{ steps.describe-entry.outputs.macos-15-intel-candidate-entry }}
+    env:
+      # Optimize repeated whole-input hashes with test safety checks retained.
+      CARGO_PROFILE_TEST_OPT_LEVEL: '2'
+      CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: 'true'
+      CARGO_PROFILE_TEST_OVERFLOW_CHECKS: 'true'
+      TS_RELEASE_CANDIDATE_ENTRY_UPLOAD: candidate-entry-${{ matrix.os == 'macos-15' && 'ts-aarch64-apple-darwin' || 'ts-x86_64-apple-darwin' }}-${{ github.run_id }}-${{ github.run_attempt }}
+      # The reproduction build is a measurement, never a gate. Scheduled and
+      # dispatched runs (and pull requests labelled before the push) measure
+      # it; every other run records it as deferred. The test rejects a
+      # missing value and `defer` on a scheduled or dispatched run.
+      TS_RELEASE_NATIVE_REPRODUCTION: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || contains(github.event.pull_request.labels.*.name, 'release-native-reproduction')) && 'measure' || 'defer' }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0 (Node 24)
+        with:
+          persist-credentials: false
+          # Full history: the fixture clones this checkout, and source
+          # authentication rejects a shallow repository (`.git/shallow`).
+          fetch-depth: 0
+
+      - name: Read pinned tool versions
+        id: tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "rust=$(awk '$1 == "rust" { print $2 }' .tool-versions)"
+            echo "node=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Use pinned Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0 (Node 24)
+        with:
+          node-version: ${{ steps.tools.outputs.node }}
+
+      # The runner's installed rustup bootstraps ordinary CI, not the release
+      # producer. The copied toolchain keeps only its host Darwin standard
+      # library, which both the CLI and the denial fixture target.
+      - name: Install pinned native Rust toolchain and check the native host
+        env:
+          RUST_VERSION: ${{ steps.tools.outputs.rust }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup override set "$RUST_VERSION"
+          HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+          case "$(uname -m)" in
+            arm64) EXPECTED_TARGET=aarch64-apple-darwin ;;
+            x86_64) EXPECTED_TARGET=x86_64-apple-darwin ;;
+            *) echo "Unsupported macOS machine $(uname -m)" >&2; exit 1 ;;
+          esac
+          test "$HOST_TARGET" = "$EXPECTED_TARGET"
+          # Absent on Intel hardware; 1 would mean a Rosetta-translated shell.
+          TRANSLATED="$(sysctl -n sysctl.proc_translated 2>/dev/null || echo absent)"
+          echo "sysctl.proc_translated=$TRANSLATED"
+          test "$TRANSLATED" != 1
+          echo "Selected Xcode developer directory: $(xcode-select -p)"
+          echo "HOST_TARGET=$HOST_TARGET" >> "$GITHUB_ENV"
+
+      # Each matrix entry restores and (on main) saves its own host target's
+      # key. See the Cargo candidate job for why this is actions/cache and
+      # what the cache may and may not hold.
+      - name: Restore the release-tool host build cache
+        id: release-tool-cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0 (Node 24)
+        with:
+          path: target
+          key: release-tool-${{ runner.os }}-${{ env.HOST_TARGET }}-rust-${{ steps.tools.outputs.rust }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.tool-versions', 'crates/trusted-server-release/Cargo.toml') }}-test-o${{ env.CARGO_PROFILE_TEST_OPT_LEVEL }}-da${{ env.CARGO_PROFILE_TEST_DEBUG_ASSERTIONS }}-oc${{ env.CARGO_PROFILE_TEST_OVERFLOW_CHECKS }}
+
+      - name: Prepare ordinary CI Darwin Cargo fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p trusted-server-release --target "$HOST_TARGET" --locked
+          # Build the test binary now so the cache below holds its dependencies.
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --locked --no-run
+          CARGO_FIXTURE_ROOT="$RUNNER_TEMP/release-cargo-fixture"
+          JS_HANDOFF_ROOT="$RUNNER_TEMP/release-js-handoff"
+          test ! -e "$JS_HANDOFF_ROOT"
+          node scripts/release/tests/prepare-cargo-fixture.mjs "$CARGO_FIXTURE_ROOT" "target/$HOST_TARGET/debug/trusted-server-release"
+          {
+            echo "TS_RELEASE_CARGO_FIXTURE_ROOT=$CARGO_FIXTURE_ROOT"
+            echo "TS_RELEASE_JS_HANDOFF_ROOT=$JS_HANDOFF_ROOT"
+          } >> "$GITHUB_ENV"
+          df -h "$RUNNER_TEMP"
+
+      # Saved before any ignored fixture test runs, so no fixture output can
+      # enter the cache.
+      - name: Drop incremental state before saving the host build cache
+        if: github.ref == 'refs/heads/main' && steps.release-tool-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: rm -rf target/debug/incremental target/*/debug/incremental
+
+      - name: Save the release-tool host build cache (main only)
+        if: github.ref == 'refs/heads/main' && steps.release-tool-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0 (Node 24)
+        with:
+          path: target
+          key: ${{ steps.release-tool-cache.outputs.cache-primary-key }}
+
+      - name: Download the Linux JS handoff into a fresh directory
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0 (Node 24)
+        with:
+          name: release-js-handoff
+          path: ${{ env.TS_RELEASE_JS_HANDOFF_ROOT }}
+
+      - name: Prove Cargo build scripts and proc macros inherit denial (macOS)
+        env:
+          TS_RELEASE_CI_BUILD_CACHE: ${{ steps.release-tool-cache.outputs.cache-matched-key || 'miss' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TEST_NAME=recipe::tests::full_macos::cargo_children_inherit_denial_macos
+          TEST_LIST="$(mktemp)"
+          trap 'rm -f "$TEST_LIST"' EXIT
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --list > "$TEST_LIST"
+          awk '/: test$/ { count++ } END { if (count != 1) { print "Expected exactly one macOS Cargo denial fixture"; exit 1 } }' "$TEST_LIST"
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --nocapture
+          cat "$TS_RELEASE_CARGO_FIXTURE_ROOT/cargo-denial-measurement.json"
+
+      # The canonical build is gated: Mach-O acceptance with the measured SDK
+      # and a relative debug map, the remap and final-path scans, planted
+      # operator values absent and a native `ts --version` on the reviewed
+      # host. The reproduction build is recorded, never a gate, and only built
+      # when TS_RELEASE_NATIVE_REPRODUCTION is `measure`.
+      - name: Build, inspect and start the macOS ts candidate; reproduction per TS_RELEASE_NATIVE_REPRODUCTION (macOS)
+        env:
+          TS_RELEASE_CI_BUILD_CACHE: ${{ steps.release-tool-cache.outputs.cache-matched-key || 'miss' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Native reproduction: $TS_RELEASE_NATIVE_REPRODUCTION (event ${GITHUB_EVENT_NAME})"
+          TEST_NAME=recipe::tests::macos_cli::macos_cli_candidate_builds_inspects_and_starts_cleanly
+          TEST_LIST="$(mktemp)"
+          trap 'rm -f "$TEST_LIST"' EXIT
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --list > "$TEST_LIST"
+          awk '/: test$/ { count++ } END { if (count != 1) { print "Expected exactly one macOS CLI candidate fixture"; exit 1 } }' "$TEST_LIST"
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --nocapture
+          cat "$TS_RELEASE_CARGO_FIXTURE_ROOT/macos-cli-candidate-measurement.json"
+          df -h "$RUNNER_TEMP"
+
+      # The rechecked canonical entry and its final executable, as six flat
+      # files, for the candidate index collector. Unauthenticated ordinary CI
+      # evidence; fork pull requests skip it like the transfer fixture.
+      - name: Upload the unqualified macOS CLI candidate entry for the index collector
+        id: upload-entry
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0 (Node 24)
+        with:
+          name: ${{ env.TS_RELEASE_CANDIDATE_ENTRY_UPLOAD }}
+          path: ${{ env.TS_RELEASE_CARGO_FIXTURE_ROOT }}/candidate-entry
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Describe the uploaded macOS CLI candidate entry
+        id: describe-entry
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+        shell: bash
+        env:
+          TRANSFER_FILE: ${{ env.TS_RELEASE_CARGO_FIXTURE_ROOT }}/candidate-entry-transfer.json
+          ARTIFACT_ID: ${{ steps.upload-entry.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload-entry.outputs.artifact-digest }}
+          MATRIX_OS: ${{ matrix.os }}
+        run: |
+          set -euo pipefail
+          DESCRIPTOR="$(jq -c --argjson id "$ARTIFACT_ID" --arg name "$TS_RELEASE_CANDIDATE_ENTRY_UPLOAD" --arg digest "$ARTIFACT_DIGEST" --argjson attempt "$GITHUB_RUN_ATTEMPT" '. + {artifact_id: $id, artifact_name: $name, archive_sha256: $digest, run_attempt: $attempt}' "$TRANSFER_FILE")"
+          echo "$DESCRIPTOR"
+          echo "${MATRIX_OS}-candidate-entry=$DESCRIPTOR" >> "$GITHUB_OUTPUT"
+
+      - name: Preserve available macOS candidate measurements in the job log
+        if: always()
+        shell: bash
+        run: |
+          if [[ -n "${TS_RELEASE_CARGO_FIXTURE_ROOT:-}" ]]; then
+            for report in cargo-denial-measurement.json macos-cli-candidate-measurement.json; do
+              if [[ -f "$TS_RELEASE_CARGO_FIXTURE_ROOT/$report" ]]; then
+                cat "$TS_RELEASE_CARGO_FIXTURE_ROOT/$report"
+              fi
+            done
+          fi
+
+      # Measured runs keep the reproduction measurement as an artifact so
+      # reports can cite it, not only the job log.
+      - name: Upload the measured macOS CLI candidate measurement
+        if: ${{ !cancelled() && env.TS_RELEASE_NATIVE_REPRODUCTION == 'measure' }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0 (Node 24)
+        with:
+          name: macos-cli-candidate-measurement-${{ matrix.os }}
+          path: ${{ env.TS_RELEASE_CARGO_FIXTURE_ROOT }}/macos-cli-candidate-measurement.json
+          if-no-files-found: warn
+          retention-days: 90
+          # A re-run of this job replaces its own earlier upload.
+          overwrite: true
+
+      # Bounded: two minutes of wall time and the last 400 lines at most.
+      - name: Show recent sandbox denials on failure
+        if: failure()
+        shell: bash
+        run: |
+          perl -e 'alarm 120; exec @ARGV or die "cannot run log: $!"' \
+            /usr/bin/log show --last 15m --style compact --predicate 'sender=="Sandbox"' \
+            | tail -n 400 || true
+
+  # Joins the four real candidate entries into one unqualified candidate
+  # index. It downloads each candidate job's exact upload through the bounded
+  # release-tool backend, rebuilds every entry from its bytes, derives the
+  # policy from a source-checked clean clone, and runs the CLI consumer's
+  # unsigned joins. Ordinary CI evidence only: no signing, publication,
+  # trusted workflow binding or qualification. It runs only when all four
+  # candidate jobs succeeded (the macOS matrix result covers both legs), so it
+  # never assembles from fewer than four entries. It is not a required check.
+  test-release-candidate-index:
+    name: Assemble the unqualified four-asset candidate index
+    needs:
+      - test-release-cargo-candidate
+      - test-release-cli-candidate
+      - test-release-macos-cli-candidate
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && needs.test-release-cargo-candidate.result == 'success' && needs.test-release-cli-candidate.result == 'success' && needs.test-release-macos-cli-candidate.result == 'success' }}
+    runs-on: ubuntu-24.04
+    # Release-tool test build (1-3 min with a warm cache), the CLI library
+    # test build (3-5 min; its dependencies are outside the release-tool
+    # cache, and the embedded JS needs npm), then four downloads, the largest
+    # being the ~285 MB Linux CLI with debug info.
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+    env:
+      # Same profile as the candidate jobs, so the restored cache key matches.
+      CARGO_PROFILE_TEST_OPT_LEVEL: '2'
+      CARGO_PROFILE_TEST_DEBUG_ASSERTIONS: 'true'
+      CARGO_PROFILE_TEST_OVERFLOW_CHECKS: 'true'
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0 (Node 24)
+        with:
+          persist-credentials: false
+          # Full history: the retained clone below must not be shallow.
+          fetch-depth: 0
+
+      - name: Read pinned tool versions
+        id: tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "rust=$(awk '$1 == "rust" { print $2 }' .tool-versions)"
+            echo "node=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Use pinned Node.js
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0 (Node 24)
+        with:
+          node-version: ${{ steps.tools.outputs.node }}
+          cache: npm
+          cache-dependency-path: crates/trusted-server-js/lib/package-lock.json
+
+      - name: Install pinned native Rust toolchain
+        env:
+          RUST_VERSION: ${{ steps.tools.outputs.rust }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          rustup override set "$RUST_VERSION"
+          HOST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+          test "$HOST_TARGET" = x86_64-unknown-linux-gnu
+          echo "HOST_TARGET=$HOST_TARGET" >> "$GITHUB_ENV"
+
+      # Restore only: the Cargo candidate job saves this key (see its comment
+      # for why this is actions/cache and what the cache may and may not hold).
+      - name: Restore the release-tool host build cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0 (Node 24)
+        with:
+          path: target
+          key: release-tool-${{ runner.os }}-${{ env.HOST_TARGET }}-rust-${{ steps.tools.outputs.rust }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.tool-versions', 'crates/trusted-server-release/Cargo.toml') }}-test-o${{ env.CARGO_PROFILE_TEST_OPT_LEVEL }}-da${{ env.CARGO_PROFILE_TEST_DEBUG_ASSERTIONS }}-oc${{ env.CARGO_PROFILE_TEST_OVERFLOW_CHECKS }}
+
+      # Source authentication rejects untracked paths such as this checkout's
+      # target/ and node_modules/, so the policy is read from a fresh clone of
+      # the checked-out commit with the minimal Git configuration the
+      # fixtures use.
+      - name: Retain a clean clone of the candidate commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          SOURCE_ROOT="$RUNNER_TEMP/release-candidate-source"
+          INDEX_ROOT="$RUNNER_TEMP/release-candidate-index"
+          test ! -e "$SOURCE_ROOT"
+          test ! -e "$INDEX_ROOT"
+          git clone --no-hardlinks --no-checkout -- "$GITHUB_WORKSPACE" "$SOURCE_ROOT"
+          git -C "$SOURCE_ROOT" checkout --detach --force HEAD
+          printf '[core]\nrepositoryformatversion = 0\nbare = false\nfilemode = true\n' > "$SOURCE_ROOT/.git/config"
+          test "$(git -C "$SOURCE_ROOT" rev-parse HEAD)" = "$GITHUB_SHA"
+          {
+            echo "TS_RELEASE_CANDIDATE_SOURCE_ROOT=$SOURCE_ROOT"
+            echo "TS_RELEASE_CANDIDATE_INDEX_ROOT=$INDEX_ROOT"
+          } >> "$GITHUB_ENV"
+
+      - name: Compile and require exactly one collector and one consumer fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          TEST_LIST="$(mktemp)"
+          trap 'rm -f "$TEST_LIST"' EXIT
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --locked distribution::ordinary::real_four_job_candidate_index -- --ignored --exact --list > "$TEST_LIST"
+          awk '/: test$/ { count++ } END { if (count != 1) { print "Expected exactly one candidate index collector"; exit 1 } }' "$TEST_LIST"
+          cargo test -p trusted-server-cli --target "$HOST_TARGET" --locked --lib release::evidence::candidate_fixture_tests::ordinary_ci_assembled_candidate_passes_unsigned_consumer_joins -- --ignored --exact --list > "$TEST_LIST"
+          awk '/: test$/ { count++ } END { if (count != 1) { print "Expected exactly one candidate index consumer check"; exit 1 } }' "$TEST_LIST"
+
+      - name: Download, rebuild and assemble the four real candidate entries
+        shell: bash
+        env:
+          # The read-only token (contents/actions read) is visible to this
+          # same-repository test binary, which needs it to download; build
+          # scripts already ran without it in the listing step above, and fork
+          # PRs never reach this job.
+          GH_TOKEN: ${{ github.token }}
+          TS_RELEASE_TRANSFER_RUN_ID: ${{ github.run_id }}
+          # REST identifies the PR head; the checkout and every candidate
+          # build use its synthetic merge, which is the candidate source.
+          # Neither identity grants approved-source or release authority here.
+          TS_RELEASE_TRANSFER_RUN_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          TS_RELEASE_CANDIDATE_SOURCE_COMMIT: ${{ github.sha }}
+          TS_RELEASE_CANDIDATE_ENTRY_FASTLY: ${{ needs.test-release-cargo-candidate.outputs.candidate-entry }}
+          TS_RELEASE_CANDIDATE_ENTRY_LINUX: ${{ needs.test-release-cli-candidate.outputs.candidate-entry }}
+          TS_RELEASE_CANDIDATE_ENTRY_MACOS_ARM: ${{ needs.test-release-macos-cli-candidate.outputs.macos-15-candidate-entry }}
+          TS_RELEASE_CANDIDATE_ENTRY_MACOS_INTEL: ${{ needs.test-release-macos-cli-candidate.outputs.macos-15-intel-candidate-entry }}
+        run: |
+          set -euo pipefail
+          cargo test -p trusted-server-release --target "$HOST_TARGET" --locked distribution::ordinary::real_four_job_candidate_index -- --ignored --exact --nocapture
+
+      - name: Run the consumer's unsigned joins over the assembled index
+        shell: bash
+        env:
+          TS_RELEASE_CANDIDATE_SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          cargo test -p trusted-server-cli --target "$HOST_TARGET" --locked --lib release::evidence::candidate_fixture_tests::ordinary_ci_assembled_candidate_passes_unsigned_consumer_joins -- --ignored --exact --nocapture
+
+      - name: Print the unqualified candidate index and its SHA-256
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat "$TS_RELEASE_CANDIDATE_INDEX_ROOT/candidate-release-index.json"
+          echo
+          (cd "$TS_RELEASE_CANDIDATE_INDEX_ROOT" && sha256sum -- *)
+
+      # Short-retention citable evidence of an unqualified, unsigned candidate;
+      # never a release asset.
+      - name: Upload the assembled unqualified candidate index evidence
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0 (Node 24)
+        with:
+          name: unqualified-candidate-release-index-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.TS_RELEASE_CANDIDATE_INDEX_ROOT }}
+          if-no-files-found: error
+          retention-days: 7
+
   test-typescript:
     name: vitest
     runs-on: ubuntu-latest
@@ -263,19 +1320,21 @@ jobs:
       run:
         working-directory: crates/trusted-server-js/lib
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0 (Node 24)
+        with:
+          persist-credentials: false
 
       - name: Retrieve Node.js version
         id: node-version
         working-directory: .
-        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> $GITHUB_OUTPUT
+        run: echo "node-version=$(grep '^nodejs ' .tool-versions | awk '{print $2}')" >> "$GITHUB_OUTPUT"
         shell: bash
 
       - name: Use Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0 (Node 24)
         with:
           node-version: ${{ steps.node-version.outputs.node-version }}
-          cache: "npm"
+          cache: 'npm'
           cache-dependency-path: crates/trusted-server-js/lib/package.json
 
       - name: Install dependencies
@@ -285,4 +1344,120 @@ jobs:
         run: npm run build
 
       - name: Run unit tests
+        env:
+          TRUSTED_SERVER__RELEASE_JS_TESTS: '1'
         run: npm test -- --run
+
+  # Four inert files exercise actual upload/REST/original-ZIP interoperability.
+  # This is ordinary CI diagnostics and supplies no release qualification.
+  test-release-transfer-upload:
+    name: Upload fictional release transfer fixture
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+      artifact-digest: ${{ steps.upload.outputs.artifact-digest }}
+      artifact-name: ${{ steps.fixture.outputs.name }}
+    steps:
+      - name: Create four fixed fictional members
+        id: fixture
+        shell: bash
+        env:
+          FIXTURE_NAME: release-transfer-interop-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          FIXTURE_DIRECTORY="$RUNNER_TEMP/release-transfer-fixture"
+          mkdir "$FIXTURE_DIRECTORY"
+          printf '%s\n' 'fictional transfer executable bytes' > "$FIXTURE_DIRECTORY/artifact"
+          printf '%s\n' '{"kind":"fictional-build-record","release_qualification":false}' > "$FIXTURE_DIRECTORY/build-record.json"
+          printf '%s\n' '{"kind":"fictional-composition","complete":false}' > "$FIXTURE_DIRECTORY/composition.json"
+          printf '%s\n' '{"kind":"fictional-javascript-inventory","modules":[]}' > "$FIXTURE_DIRECTORY/tsjs-inventory.json"
+          echo "name=$FIXTURE_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the fictional archive with the selected action
+        id: upload
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0 (Node 24)
+        with:
+          name: ${{ steps.fixture.outputs.name }}
+          path: ${{ runner.temp }}/release-transfer-fixture
+          if-no-files-found: error
+          retention-days: 1
+
+  test-release-transfer-receive:
+    name: Retrieve exact ordinary-CI upload through bounded HTTP
+    needs: test-release-transfer-upload
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0 (Node 24)
+        with:
+          persist-credentials: false
+
+      - name: Install the source-pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          RUST_VERSION="$(awk '$1 == "rust" { print $2 }' .tool-versions)"
+          test -n "$RUST_VERSION"
+          rustup toolchain install "$RUST_VERSION" --profile minimal
+          HOST_TARGET="$(rustup run "$RUST_VERSION" rustc -vV | sed -n 's/^host: //p')"
+          test -n "$HOST_TARGET"
+          {
+            echo "RUST_VERSION=$RUST_VERSION"
+            echo "HOST_TARGET=$HOST_TARGET"
+          } >> "$GITHUB_ENV"
+
+      - name: Compile and require exactly one ignored interoperability fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          TEST_NAME=collection::transfer::ordinary::real_uploaded_archive
+          TEST_LIST="$(mktemp)"
+          trap 'rm -f "$TEST_LIST"' EXIT
+          cargo +"$RUST_VERSION" test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --list > "$TEST_LIST"
+          awk '/: test$/ { count++ } END { if (count != 1) { print "Expected exactly one ordinary transfer fixture"; exit 1 } }' "$TEST_LIST"
+
+      - name: Download and check the exact selected original archive twice
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TS_RELEASE_TRANSFER_RUN_ID: ${{ github.run_id }}
+          # REST identifies the PR head; checkout may hold its synthetic merge.
+          # Neither identity grants approved-source or release authority here.
+          TS_RELEASE_TRANSFER_RUN_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          TS_RELEASE_TRANSFER_ARTIFACT_ID: ${{ needs.test-release-transfer-upload.outputs.artifact-id }}
+          TS_RELEASE_TRANSFER_ARTIFACT_NAME: ${{ needs.test-release-transfer-upload.outputs.artifact-name }}
+          TS_RELEASE_TRANSFER_ARCHIVE_SHA256: ${{ needs.test-release-transfer-upload.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          TEST_NAME=collection::transfer::ordinary::real_uploaded_archive
+          cargo +"$RUST_VERSION" test -p trusted-server-release --target "$HOST_TARGET" --locked "$TEST_NAME" -- --ignored --exact --nocapture
+
+  test-release-workflow-contract:
+    name: Release validation helper contracts (pure)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0 (Node 24)
+        with:
+          persist-credentials: false
+
+      - name: Read pinned Node version
+        id: node
+        shell: bash
+        run: |
+          echo "version=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0 (Node 24)
+        with:
+          node-version: ${{ steps.node.outputs.version }}
+
+      - name: Check invocation and waiter contracts without network or child processes
+        run: node --test .github/workflows/release-validation.test.mjs

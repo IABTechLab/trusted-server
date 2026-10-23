@@ -1,10 +1,12 @@
 use std::process;
+use std::sync::LazyLock;
 
 use clap::{Parser, Subcommand};
 use edgezero_cli::args::{
     ActiveVersionArgs, AuthArgs, BuildArgs, ConfigDiffArgs, ConfigGcArgs, ConfigPushArgs,
     ConfigValidateArgs, DeployArgs, HealthcheckArgs, ProvisionArgs, RollbackArgs, ServeArgs,
 };
+use trusted_server_core::build_info::{BuildInfo, BuildVariant};
 use trusted_server_core::config::TrustedServerAppConfig;
 
 use crate::commands::audit::{AuditArgs, run_audit};
@@ -13,8 +15,25 @@ use crate::commands::config::init::{ConfigInitArgs, run_config_init};
 use crate::commands::pbs::{self, PbsArgs};
 use crate::prebid_bundle::{NpmPrebidBundleGenerator, PrebidBundleArgs, run_bundle};
 
+/// Immutable facts compiled into the owning CLI product.
+pub const BUILD_INFO: BuildInfo = BuildInfo::new(
+    env!("CARGO_PKG_VERSION"),
+    env!("TRUSTED_SERVER__BUILD_TARGET"),
+    BuildVariant::Default,
+);
+
+static VERSION_TEXT: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "package={} source={} target={} variant={}",
+        BUILD_INFO.package_version(),
+        BUILD_INFO.source().unwrap_or("unknown"),
+        BUILD_INFO.target(),
+        BUILD_INFO.variant()
+    )
+});
+
 #[derive(Debug, Parser)]
-#[command(name = "ts", version, about = "Trusted Server CLI")]
+#[command(name = "ts", version = VERSION_TEXT.as_str(), about = "Trusted Server CLI")]
 struct Args {
     #[command(subcommand)]
     command: Command,
@@ -22,6 +41,10 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Verify official release assets without deployment.
+    #[cfg(unix)]
+    #[command(subcommand)]
+    Release(crate::commands::release::ReleaseCommand),
     /// Print the currently active deployment version for a target adapter.
     ActiveVersion(ActiveVersionArgs),
     /// Browser-backed page and ad-template audits.
@@ -119,6 +142,10 @@ pub fn run_from_env() -> Result<RunOutcome, String> {
 
 fn dispatch(args: Args) -> Result<RunOutcome, String> {
     match args.command {
+        #[cfg(unix)]
+        Command::Release(command) => {
+            crate::commands::release::run(command).map(|()| RunOutcome::Success)
+        }
         Command::ActiveVersion(args) => {
             edgezero_cli::run_active_version(&args).map(|()| RunOutcome::Success)
         }
@@ -203,6 +230,16 @@ mod tests {
             err.kind(),
             clap::error::ErrorKind::DisplayVersion,
             "should print the version rather than fail to parse"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "ts package={} source={} target={} variant=default\n",
+                env!("CARGO_PKG_VERSION"),
+                trusted_server_core::constants::TS_GIT_VERSION.unwrap_or("unknown"),
+                env!("TRUSTED_SERVER__BUILD_TARGET")
+            ),
+            "should print all four labeled owning build facts"
         );
     }
 

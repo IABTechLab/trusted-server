@@ -1,0 +1,174 @@
+{
+  "provenance": [
+    {
+      "verificationResult": {
+        "mediaType": "application/vnd.dev.sigstore.verificationresult+json;version=0.1",
+        "signature": {
+          "certificate": {
+            "certificateIssuer": "CN=example-intermediate,O=example.com",
+            "subjectAlternativeName": "https://example.com/example/project/.github/workflows/release-archives.yml@refs/tags/v1.2.0",
+            "issuer": "https://example.com/issuer",
+            "githubWorkflowTrigger": "push",
+            "githubWorkflowSHA": "0123456789abcdef0123456789abcdef01234567",
+            "githubWorkflowName": "Release archives",
+            "githubWorkflowRepository": "example/project",
+            "githubWorkflowRef": "refs/tags/v1.2.0",
+            "buildSignerURI": "https://example.com/example/project/.github/workflows/release-archives.yml@refs/tags/v1.2.0",
+            "buildSignerDigest": "0123456789abcdef0123456789abcdef01234567",
+            "runnerEnvironment": "github-hosted",
+            "sourceRepositoryURI": "https://example.com/example/project",
+            "sourceRepositoryDigest": "0123456789abcdef0123456789abcdef01234567",
+            "sourceRepositoryRef": "refs/tags/v1.2.0",
+            "sourceRepositoryIdentifier": "123456",
+            "sourceRepositoryOwnerURI": "https://example.com/example",
+            "sourceRepositoryOwnerIdentifier": "654321",
+            "buildConfigURI": "https://example.com/example/project/.github/workflows/release-archives.yml@refs/tags/v1.2.0",
+            "buildConfigDigest": "0123456789abcdef0123456789abcdef01234567",
+            "buildTrigger": "push",
+            "runInvocationURI": "https://example.com/example/project/actions/runs/1234567890/attempts/1",
+            "sourceRepositoryVisibilityAtSigning": "public"
+          }
+        },
+        "verifiedTimestamps": [
+          {
+            "type": "Tlog",
+            "uri": "https://example.com/transparency-log",
+            "timestamp": "2026-01-01T00:00:00Z"
+          }
+        ],
+        "verifiedIdentity": {
+          "subjectAlternativeName": {
+            "subjectAlternativeName": "https://example.com/example/project/.github/workflows/release-archives.yml@refs/tags/v1.2.0"
+          },
+          "issuer": {
+            "issuer": "",
+            "regexp": ".*"
+          },
+          "runnerEnvironment": "github-hosted"
+        },
+        "statement": {
+          "_type": "https://in-toto.io/Statement/v1",
+          "subject": [
+            {
+              "name": "example-asset",
+              "digest": {
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+              }
+            }
+          ],
+          "predicateType": "https://slsa.dev/provenance/v1",
+          "predicate": {
+            "buildDefinition": {
+              "buildType": "https://actions.github.io/buildtypes/workflow/v1",
+              "externalParameters": {
+                "workflow": {
+                  "path": ".github/workflows/release-archives.yml",
+                  "ref": "refs/tags/v1.2.0",
+                  "repository": "https://example.com/example/project"
+                }
+              },
+              "internalParameters": {
+                "github": {
+                  "event_name": "push",
+                  "repository_id": "123456",
+                  "repository_owner_id": "654321",
+                  "runner_environment": "github-hosted"
+                }
+              },
+              "resolvedDependencies": [
+                {
+                  "digest": {
+                    "gitCommit": "0123456789abcdef0123456789abcdef01234567"
+                  },
+                  "uri": "git+https://example.com/example/project@refs/tags/v1.2.0"
+                }
+              ]
+            },
+            "runDetails": {
+              "builder": {
+                "id": "https://example.com/example/project/.github/workflows/release-archives.yml@refs/tags/v1.2.0"
+              },
+              "metadata": {
+                "invocationId": "https://example.com/example/project/actions/runs/1234567890/attempts/1"
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "spdx": [
+    {
+      "verificationResult": {
+        "mediaType": "application/vnd.dev.sigstore.verificationresult+json;version=0.1",
+        "signature": {
+          "certificate": {
+            "certificateIssuer": "CN=example-intermediate,O=example.com",
+            "subjectAlternativeName": "https://example.com/example/project/.github/workflows/release-archives.yml@refs/tags/v1.2.0",
+            "issuer": "https://example.com/issuer",
+            "githubWorkflowTrigger": "push",
+            "githubWorkflowSHA": "0123456789abcdef0123456789abcdef01234567",
+            "githubWorkflowName": "Release archives",
+            "githubWorkflowRepository": "example/project",
+            "githubWorkflowRef": "refs/tags/v1.2.0",
+            "buildSignerURI": "https://example.com/example/project/.github/workflows/release-archives.yml@refs/tags/v1.2.0",
+            "buildSignerDigest": "0123456789abcdef0123456789abcdef01234567",
+            "runnerEnvironment": "github-hosted",
+            "sourceRepositoryURI": "https://example.com/example/project",
+            "sourceRepositoryDigest": "0123456789abcdef0123456789abcdef01234567",
+            "sourceRepositoryRef": "refs/tags/v1.2.0",
+            "sourceRepositoryIdentifier": "123456",
+            "sourceRepositoryOwnerURI": "https://example.com/example",
+            "sourceRepositoryOwnerIdentifier": "654321",
+            "buildConfigURI": "https://example.com/example/project/.github/workflows/release-archives.yml@refs/tags/v1.2.0",
+            "buildConfigDigest": "0123456789abcdef0123456789abcdef01234567",
+            "buildTrigger": "push",
+            "runInvocationURI": "https://example.com/example/project/actions/runs/1234567890/attempts/1",
+            "sourceRepositoryVisibilityAtSigning": "public"
+          }
+        },
+        "verifiedTimestamps": [
+          {
+            "type": "Tlog",
+            "uri": "https://example.com/transparency-log",
+            "timestamp": "2026-01-01T00:00:00Z"
+          }
+        ],
+        "verifiedIdentity": {
+          "subjectAlternativeName": {
+            "subjectAlternativeName": "https://example.com/example/project/.github/workflows/release-archives.yml@refs/tags/v1.2.0"
+          },
+          "issuer": {
+            "issuer": "",
+            "regexp": ".*"
+          },
+          "runnerEnvironment": "github-hosted"
+        },
+        "statement": {
+          "_type": "https://in-toto.io/Statement/v1",
+          "subject": [
+            {
+              "name": "example-asset",
+              "digest": {
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+              }
+            }
+          ],
+          "predicateType": "https://spdx.dev/Document/v2.3",
+          "predicate": {
+            "spdxVersion": "SPDX-2.3",
+            "dataLicense": "CC0-1.0",
+            "SPDXID": "SPDXRef-DOCUMENT",
+            "name": "example-document",
+            "documentNamespace": "https://example.com/spdx/example",
+            "creationInfo": {
+              "created": "2026-01-01T00:00:00Z",
+              "creators": ["Tool: example-generator"]
+            },
+            "packages": []
+          }
+        }
+      }
+    }
+  ]
+}

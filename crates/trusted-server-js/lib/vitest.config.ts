@@ -2,7 +2,33 @@ import path from 'node:path';
 
 import { defineConfig } from 'vitest/config';
 
+import { releaseBuild } from './release-composition.mjs';
+
+if (
+  Object.hasOwn(process.env, 'TRUSTED_SERVER__RELEASE_JS_TESTS') &&
+  process.env.TRUSTED_SERVER__RELEASE_JS_TESTS !== '1'
+) {
+  throw new Error('TRUSTED_SERVER__RELEASE_JS_TESTS must be exactly 1 when present');
+}
+
 export default defineConfig({
+  ...(releaseBuild()
+    ? {
+        envDir: false,
+        mode: 'production',
+        server: { host: '127.0.0.1' },
+        // Preserve native imports that Vite otherwise replaces with browser stubs in production.
+        plugins: [
+          {
+            name: 'release-test-node-builtins',
+            enforce: 'pre' as const,
+            resolveId(id: string) {
+              if (id.startsWith('node:')) return { id, external: true };
+            },
+          },
+        ],
+      }
+    : {}),
   resolve: {
     alias: {
       // prebid.js doesn't expose src/adapterManager.js via its package

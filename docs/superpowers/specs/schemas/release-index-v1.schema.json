@@ -1,0 +1,581 @@
+{
+  "$comment": "Evaluate explicitly with JSON Schema Draft 2020-12 as required by R-INDEX. This dialect declaration is part of the normative specification.",
+  "title": "Trusted Server release-index version 1",
+  "description": "Normative structural contract. The specification adds exact cohort membership, unique asset/companion names, companion naming, byte digest checks, source approval and evidence-policy checks.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "repository",
+    "tag",
+    "source_commit",
+    "recipe_source_commit",
+    "cohort_source_commit",
+    "cohort",
+    "policy_version",
+    "policy_sha256",
+    "tsjs_inventory",
+    "artifacts"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "repository": {
+      "const": "IABTechLab/trusted-server"
+    },
+    "tag": {
+      "type": "string",
+      "maxLength": 128,
+      "pattern": "^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$",
+      "not": {
+        "pattern": "[\\r\\n]"
+      }
+    },
+    "source_commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "not": {
+        "pattern": "[\\r\\n]"
+      }
+    },
+    "recipe_source_commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "not": {
+        "pattern": "[\\r\\n]"
+      }
+    },
+    "cohort_source_commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "not": {
+        "pattern": "[\\r\\n]"
+      }
+    },
+    "cohort": {
+      "const": "phase1-fastly-cli"
+    },
+    "policy_version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Producer policy at source_commit. Must match an independently trusted accepted historical producer policy; does not select consumer policy."
+    },
+    "policy_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "SHA-256 of producer policy bytes at source_commit; consumer acceptance is defined by the specification.",
+      "not": {
+        "pattern": "[\\r\\n]"
+      }
+    },
+    "tsjs_inventory": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/file"
+        },
+        {
+          "properties": {
+            "name": {
+              "const": "tsjs-inventory.json"
+            },
+            "size": {
+              "maximum": 1048576
+            }
+          }
+        }
+      ]
+    },
+    "artifacts": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/artifact"
+      },
+      "allOf": [
+        {
+          "contains": {
+            "properties": {
+              "name": {
+                "const": "trusted-server-fastly.wasm"
+              }
+            },
+            "required": ["name"]
+          },
+          "minContains": 1,
+          "maxContains": 1
+        },
+        {
+          "contains": {
+            "properties": {
+              "name": {
+                "const": "ts-x86_64-unknown-linux-gnu"
+              }
+            },
+            "required": ["name"]
+          },
+          "minContains": 1,
+          "maxContains": 1
+        },
+        {
+          "contains": {
+            "properties": {
+              "name": {
+                "const": "ts-aarch64-apple-darwin"
+              }
+            },
+            "required": ["name"]
+          },
+          "minContains": 1,
+          "maxContains": 1
+        },
+        {
+          "contains": {
+            "properties": {
+              "name": {
+                "const": "ts-x86_64-apple-darwin"
+              }
+            },
+            "required": ["name"]
+          },
+          "minContains": 1,
+          "maxContains": 1
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "size", "sha256"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "maxLength": 160,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]*(?:\\.[A-Za-z0-9_-]+)*$",
+          "not": {
+            "pattern": "[\\r\\n]"
+          }
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 536870912
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "not": {
+            "pattern": "[\\r\\n]"
+          }
+        }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "size",
+        "sha256",
+        "role",
+        "kind",
+        "package",
+        "target",
+        "variant",
+        "assurance_profile",
+        "capabilities",
+        "compatibility",
+        "js_inventory_sha256",
+        "companions"
+      ],
+      "properties": {
+        "name": {
+          "enum": [
+            "trusted-server-fastly.wasm",
+            "ts-x86_64-unknown-linux-gnu",
+            "ts-aarch64-apple-darwin",
+            "ts-x86_64-apple-darwin"
+          ]
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 536870912
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "not": {
+            "pattern": "[\\r\\n]"
+          }
+        },
+        "role": {
+          "enum": ["server", "operator-cli"]
+        },
+        "kind": {
+          "enum": ["wasm-core", "native-executable"]
+        },
+        "package": {
+          "enum": ["trusted-server-adapter-fastly", "trusted-server-cli"]
+        },
+        "target": {
+          "enum": [
+            "wasm32-wasip1",
+            "x86_64-unknown-linux-gnu",
+            "aarch64-apple-darwin",
+            "x86_64-apple-darwin"
+          ]
+        },
+        "variant": {
+          "const": "default"
+        },
+        "assurance_profile": {
+          "enum": ["provenance-sbom-repeatable", "provenance-sbom"]
+        },
+        "capabilities": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": {
+            "enum": ["fastly-production", "fastly-staging", "cli-execute"]
+          }
+        },
+        "compatibility": {
+          "$ref": "#/$defs/compatibility"
+        },
+        "js_inventory_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "not": {
+            "pattern": "[\\r\\n]"
+          }
+        },
+        "companions": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "sbom",
+            "provenance",
+            "sbom_attestation",
+            "build_evidence",
+            "build_recipe",
+            "rebuild_check"
+          ],
+          "properties": {
+            "sbom": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/file"
+                },
+                {
+                  "properties": {
+                    "size": {
+                      "maximum": 16777216
+                    }
+                  }
+                }
+              ]
+            },
+            "provenance": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/file"
+                },
+                {
+                  "properties": {
+                    "size": {
+                      "maximum": 33554432
+                    }
+                  }
+                }
+              ]
+            },
+            "sbom_attestation": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/file"
+                },
+                {
+                  "properties": {
+                    "size": {
+                      "maximum": 33554432
+                    }
+                  }
+                }
+              ]
+            },
+            "build_evidence": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/file"
+                },
+                {
+                  "properties": {
+                    "size": {
+                      "maximum": 33554432
+                    }
+                  }
+                }
+              ]
+            },
+            "build_recipe": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/file"
+                },
+                {
+                  "properties": {
+                    "size": {
+                      "maximum": 33554432
+                    }
+                  }
+                }
+              ]
+            },
+            "rebuild_check": {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/file"
+                },
+                {
+                  "properties": {
+                    "size": {
+                      "maximum": 33554432
+                    }
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "name": {
+              "const": "trusted-server-fastly.wasm"
+            },
+            "role": {
+              "const": "server"
+            },
+            "kind": {
+              "const": "wasm-core"
+            },
+            "package": {
+              "const": "trusted-server-adapter-fastly"
+            },
+            "target": {
+              "const": "wasm32-wasip1"
+            },
+            "variant": {
+              "const": "default"
+            },
+            "assurance_profile": {
+              "const": "provenance-sbom-repeatable"
+            },
+            "capabilities": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 2,
+              "uniqueItems": true,
+              "items": {
+                "enum": ["fastly-production", "fastly-staging"]
+              },
+              "contains": {
+                "const": "fastly-production"
+              }
+            },
+            "compatibility": {
+              "properties": {
+                "runtime": {
+                  "const": "fastly-compute"
+                },
+                "architecture": {
+                  "const": "wasm32"
+                }
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "name": {
+              "const": "ts-x86_64-unknown-linux-gnu"
+            },
+            "role": {
+              "const": "operator-cli"
+            },
+            "kind": {
+              "const": "native-executable"
+            },
+            "package": {
+              "const": "trusted-server-cli"
+            },
+            "target": {
+              "const": "x86_64-unknown-linux-gnu"
+            },
+            "variant": {
+              "const": "default"
+            },
+            "assurance_profile": {
+              "const": "provenance-sbom"
+            },
+            "capabilities": {
+              "const": ["cli-execute"]
+            },
+            "compatibility": {
+              "properties": {
+                "runtime": {
+                  "const": "linux-gnu"
+                },
+                "architecture": {
+                  "const": "x86_64"
+                }
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "name": {
+              "const": "ts-aarch64-apple-darwin"
+            },
+            "role": {
+              "const": "operator-cli"
+            },
+            "kind": {
+              "const": "native-executable"
+            },
+            "package": {
+              "const": "trusted-server-cli"
+            },
+            "target": {
+              "const": "aarch64-apple-darwin"
+            },
+            "variant": {
+              "const": "default"
+            },
+            "assurance_profile": {
+              "const": "provenance-sbom"
+            },
+            "capabilities": {
+              "const": ["cli-execute"]
+            },
+            "compatibility": {
+              "properties": {
+                "runtime": {
+                  "const": "macos"
+                },
+                "architecture": {
+                  "const": "aarch64"
+                }
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "name": {
+              "const": "ts-x86_64-apple-darwin"
+            },
+            "role": {
+              "const": "operator-cli"
+            },
+            "kind": {
+              "const": "native-executable"
+            },
+            "package": {
+              "const": "trusted-server-cli"
+            },
+            "target": {
+              "const": "x86_64-apple-darwin"
+            },
+            "variant": {
+              "const": "default"
+            },
+            "assurance_profile": {
+              "const": "provenance-sbom"
+            },
+            "capabilities": {
+              "const": ["cli-execute"]
+            },
+            "compatibility": {
+              "properties": {
+                "runtime": {
+                  "const": "macos"
+                },
+                "architecture": {
+                  "const": "x86_64"
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "compatibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runtime", "minimum_version", "architecture"],
+      "properties": {
+        "runtime": {
+          "enum": ["fastly-compute", "linux-gnu", "macos"]
+        },
+        "minimum_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "architecture": {
+          "enum": ["wasm32", "x86_64", "aarch64"]
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "runtime": {
+              "const": "fastly-compute"
+            },
+            "minimum_version": {
+              "const": "wasip1"
+            },
+            "architecture": {
+              "const": "wasm32"
+            }
+          }
+        },
+        {
+          "properties": {
+            "runtime": {
+              "const": "linux-gnu"
+            },
+            "minimum_version": {
+              "const": "glibc-2.34"
+            },
+            "architecture": {
+              "const": "x86_64"
+            }
+          }
+        },
+        {
+          "properties": {
+            "runtime": {
+              "const": "macos"
+            },
+            "minimum_version": {
+              "const": "13.0"
+            },
+            "architecture": {
+              "enum": ["x86_64", "aarch64"]
+            }
+          }
+        }
+      ]
+    }
+  }
+}

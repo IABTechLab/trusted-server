@@ -6,6 +6,17 @@ mod app_config;
 mod error;
 #[cfg(not(target_arch = "wasm32"))]
 mod prebid_bundle;
+// Consumer-side release attestation verification. Unix-only because the gh
+// runner terminates whole process groups. The public command is read-only.
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "private offline and future action-consumption helpers have no public command surface"
+    )
+)]
+mod release;
 #[cfg(not(target_arch = "wasm32"))]
 mod run;
 #[cfg(not(target_arch = "wasm32"))]
@@ -14,7 +25,7 @@ mod tls;
 mod url_guard;
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use run::{RunOutcome, run_from_env};
+pub use run::{BUILD_INFO, RunOutcome, run_from_env};
 
 // Every `ts` subcommand's implementation lives under `commands/<name>`. The
 // `ts dev` group is available on every host target; `ts dev lint` and
