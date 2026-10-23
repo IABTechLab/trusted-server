@@ -95,7 +95,7 @@ jobs:
           retention-days: 7
 
   sign:
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && vars.RELEASE_PUBLICATION_ENABLED == 'true'
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 15

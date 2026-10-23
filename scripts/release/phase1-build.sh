@@ -12,8 +12,8 @@ case "$build_package/$build_target/$release_asset" in
 esac
 : "${RUNNER_TEMP:?}"
 : "${SOURCE_COMMIT:?}"
-[[ "$SOURCE_COMMIT" =~ ^[a-f0-9]{40}$ ]]
-[[ "$(git rev-parse HEAD)" == "$SOURCE_COMMIT" ]]
+[[ "$SOURCE_COMMIT" =~ ^[a-f0-9]{40}$ ]] || { echo 'Invalid source commit' >&2; exit 1; }
+[[ "$(git rev-parse HEAD)" == "$SOURCE_COMMIT" ]] || { echo 'Source commit mismatch' >&2; exit 1; }
 for variable in TSJS_SKIP_BUILD TSJS_PREBUILT_DIR TSJS_TEST; do
   if printenv "$variable" >/dev/null; then
     echo "Refusing $variable in the release build" >&2

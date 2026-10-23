@@ -373,10 +373,9 @@ Every PR must pass:
 9. Native core build-digest test and lint (`cargo test -p trusted-server-core --test template_build_digest` and `cargo clippy -p trusted-server-core --test template_build_digest -- -D warnings`)
 10. Wasm clock lint: `scripts/lint-wasm-clock.sh` (crates built into the Cloudflare Worker must use `web_time`, not the `std::time::{Instant,SystemTime}` `now`/`elapsed` methods, which panic there)
 11. Documentation proposal scripts: `shellcheck scripts/docs-proposal/*.sh && node --test scripts/docs-proposal/hunks.test.mjs && scripts/docs-proposal/test.sh`
+12. Release producer checks: `node --test scripts/release/phase1.test.mjs && shellcheck scripts/release/phase1-build.sh`
 
 ---
-
-12. Release producer checks: `node --test scripts/release/phase1.test.mjs && shellcheck scripts/release/phase1-build.sh`
 
 ## Standard Workflow
 

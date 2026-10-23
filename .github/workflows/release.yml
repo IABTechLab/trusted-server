@@ -114,6 +114,7 @@ jobs:
           const fs = require('node:fs');
           const { createHash } = require('node:crypto');
           const { execFileSync } = require('node:child_process');
+          const { isDeepStrictEqual } = require('node:util');
           const { GH_REPO: repo, RELEASE_TAG: tag, GH_TOKEN: token, SOURCE_COMMIT: source } = process.env;
           if (!/^[\w-]+\/[\w.-]+$/.test(repo) || !/^v[\w.+-]+$/.test(tag)) throw Error('Invalid repository or tag');
           if (process.env.RELEASE_PUBLICATION_ENABLED !== 'true') throw Error('Release publication is not enabled by maintainers');
@@ -139,8 +140,8 @@ jobs:
           files.push('SHA256SUMS');
           // Close API connections before synchronous gh checks can leave pooled sockets idle.
           const api = async (path, method = 'GET', body) => {
-            const response = await fetch(`https://api.github.com/repos/${repo}/${path}`, {method, headers:{Connection:'close', Authorization:`Bearer ${token}`, Accept:'application/vnd.github+json', 'Content-Type':'application/json'}, ...(method === 'GET' && path.startsWith('releases/') ? {signal:AbortSignal.timeout(10000)} : {}), ...(body ? {body:JSON.stringify(body)} : {})}); // allow-domain: api.github.com
-            if (!response.ok) throw Object.assign(Error(`GitHub API failed: ${method} ${path} ${response.status}`), {status:response.status, retryAfter:response.headers.get('retry-after')});
+            const response = await fetch(`https://api.github.com/repos/${repo}/${path}`, {method, headers:{Connection:'close', Authorization:`Bearer ${token}`, Accept:'application/vnd.github+json', 'Content-Type':'application/json'}, ...(method === 'GET' && (path.startsWith('releases/') || path.startsWith('attestations/')) ? {signal:AbortSignal.timeout(10000)} : {}), ...(body ? {body:JSON.stringify(body)} : {})}); // allow-domain: api.github.com
+            if (!response.ok || path.startsWith('attestations/') && response.status !== 200) throw Object.assign(Error(`GitHub API failed: ${method} ${path} ${response.status}`), {status:response.status, retryAfter:response.headers.get('retry-after')});
             return response.json();
           };
           // List releases, including drafts. Never resume, overwrite or delete a matching tag.
@@ -204,7 +205,51 @@ jobs:
             if ((await retryRead(() => api(`releases/tags/${encodeURIComponent(tag)}`))).id !== id) throw Error('Published tag identity mismatch');
           };
           await verifyIdentity();
-          console.log('Verified release:', (await retryRead(() => execFileSync('gh', ['release','verify',tag,'--repo',repo], {timeout:10000}))).toString());
+          // The release attestation can be created after the immutable release becomes visible.
+          const verifyBundle = record => {
+            if (Date.now() >= retryDeadline) throw Error('Post-publish verification window exhausted');
+            const proof = JSON.parse(execFileSync('gh', ['release','verify','--repo',repo,'--format','json','--',record.statement.predicate.tag], {timeout:10000, stdio:'pipe'}));
+            if (!isDeepStrictEqual(proof.attestation?.bundle, record.bundle)) throw Error('Verified release attestation bundle mismatch');
+          };
+          for (let attempt = 1; ; attempt++) {
+            if (Date.now() >= retryDeadline) throw Error('Post-publish verification window exhausted');
+            // No transport/status retry here: only a valid HTTP 200 empty result may wait.
+            const page = await api(`attestations/sha1:${source}?per_page=100&predicate_type=release`);
+            if (!Array.isArray(page.attestations) || page.attestations.length >= 100) throw Error('Invalid or truncated release attestation response');
+            const records = [];
+            for (const record of page.attestations) {
+              if (!record || typeof record.initiator !== 'string') throw Error('Malformed release attestation record');
+              if (record.initiator !== 'github') continue;
+              const envelope = record.bundle?.dsseEnvelope;
+              if (envelope?.payloadType !== 'application/vnd.in-toto+json' || typeof envelope.payload !== 'string' || !envelope.payload || !Array.isArray(envelope.signatures) || !envelope.signatures.length) throw Error('Malformed release attestation bundle');
+              const bytes = Buffer.from(envelope.payload, 'base64');
+              if (bytes.toString('base64') !== envelope.payload) throw Error('Malformed release attestation payload');
+              const statement = JSON.parse(bytes.toString());
+              const predicate = statement.predicate;
+              if (statement._type !== 'https://in-toto.io/Statement/v1' || statement.predicateType !== 'https://in-toto.io/attestation/release/v0.2' || predicate?.repository !== repo || typeof predicate.tag !== 'string' || !predicate.tag || !/^[1-9][0-9]*$/.test(predicate.databaseId) || !Array.isArray(statement.subject)) throw Error('Malformed release attestation statement');
+              const sources = statement.subject.filter(subject => subject.uri === `pkg:github/${repo}@${predicate.tag}`);
+              const subjects = statement.subject.filter(subject => !sources.includes(subject));
+              if (sources.length !== 1 || sources[0].digest?.sha1 !== source || Object.keys(sources[0].digest).length !== 1 || !subjects.length || subjects.some(subject => typeof subject.name !== 'string' || !subject.name || !/^[a-f0-9]{64}$/.test(subject.digest?.sha256) || Object.keys(subject.digest).length !== 1) || new Set(subjects.map(subject => subject.name)).size !== subjects.length) throw Error('Invalid release attestation subjects');
+              records.push({...record, statement, subjects});
+            }
+            const current = records.filter(record => record.statement.predicate.tag === tag);
+            if (current.length > 1) throw Error('Multiple release attestations for current tag');
+            if (current.length && (current[0].statement.predicate.databaseId !== String(id) || current[0].subjects.length !== files.length || current[0].subjects.some(subject => !files.includes(subject.name) || subject.digest.sha256 !== hash(regular(`release-assets/${subject.name}`))))) throw Error('Current release attestation identity or assets mismatch');
+            for (const record of records.filter(record => record.statement.predicate.tag !== tag)) {
+              verifyBundle(record);
+              console.log('Ignored verified release attestation for other tag:', JSON.stringify(record.statement.predicate.tag));
+            }
+            if (current.length) {
+              verifyBundle(current[0]);
+              console.log('Verified release:', tag, 'signature and exact attestation bundle match');
+              break;
+            }
+            if (attempt === 3) throw Error('Release already published and immutable; release attestation unavailable after three checks');
+            const delay = [2000, 5000][attempt - 1];
+            if (Date.now() + delay >= retryDeadline) throw Error('Post-publish verification window exhausted');
+            console.warn(`Release attestation availability: attempt ${attempt + 1}/3, no current-tag record, wait ${delay}ms`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+          }
           for (const file of files) console.log('Verified asset:', file, (await retryRead(() => execFileSync('gh', ['release','verify-asset',tag,`release-assets/${file}`,'--repo',repo], {timeout:10000}))).toString());
           await verifyIdentity();
           // END PUBLICATION

@@ -14,6 +14,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import * as fs from 'node:fs'
 import vm from 'node:vm'
+import { isDeepStrictEqual } from 'node:util'
 import { checkBinary, checkSource, mergeSboms, sentinels } from './phase1.mjs'
 test('rejects every planted operator value, including inside binary data', () => {
   for (const marker of sentinels) {
@@ -164,10 +165,36 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
     'upload-error',
     'mutable',
     'wrong-id',
+    'attestation-after-one-wait',
+    'attestation-after-two-waits',
+    'attestation-never',
+    'attestation-non-200',
+    'attestation-201',
+    'attestation-auth-error',
+    'attestation-malformed',
+    'attestation-wrong-tag-shape',
+    'attestation-wrong-id',
+    'attestation-wrong-repository',
+    'attestation-wrong-source',
+    'attestation-wrong-assets',
+    'attestation-missing-asset',
+    'attestation-extra-asset',
+    'attestation-duplicate',
+    'attestation-other-tag',
+    'attestation-other-tag-before-current',
+    'attestation-other-malformed',
+    'attestation-other-unverifiable',
+    'attestation-substituted-bundle',
+    'attestation-verification-failure',
   ]) {
     const root = mkdtempSync(join(tmpdir(), 'phase1-publish-'))
     const calls = []
     const uploaded = []
+    const stable = ['stable', 'attestation-other-tag'].includes(mode)
+    const waits = [],
+      ignored = []
+    let polls = 0,
+      observed = []
     try {
       for (const asset of assets) {
         const build = join(root, 'build', asset)
@@ -203,12 +230,58 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         )
       const release = (draft) => ({
         id: 42,
-        tag_name: mode === 'stable' ? 'v1.0.0' : 'v0.0.0-example',
-        prerelease: mode !== 'stable' && mode !== 'prerelease-mismatch',
+        tag_name: stable ? 'v1.0.0' : 'v0.0.0-example',
+        prerelease: !stable && mode !== 'prerelease-mismatch',
         draft,
         immutable: mode !== 'mutable',
         assets: uploaded,
       })
+      const attestation = (tag = release(false).tag_name) => {
+        const statement = {
+          _type: 'https://in-toto.io/Statement/v1',
+          predicateType: 'https://in-toto.io/attestation/release/v0.2',
+          predicate: { databaseId: '42', repository: 'example/project', tag },
+          subject: [
+            {
+              uri: `pkg:github/example/project@${tag}`,
+              digest: { sha1: 'a'.repeat(40) },
+            },
+            ...uploaded.map((a) => ({
+              name: a.name,
+              digest: { sha256: a.digest.slice(7) },
+            })),
+          ],
+        }
+        if (mode === 'attestation-wrong-id')
+          statement.predicate.databaseId = '43'
+        if (mode === 'attestation-wrong-repository')
+          statement.predicate.repository = 'example/other'
+        if (mode === 'attestation-wrong-source')
+          statement.subject[0].digest.sha1 = 'b'.repeat(40)
+        if (mode === 'attestation-wrong-assets')
+          statement.subject[1].digest.sha256 = '0'.repeat(64)
+        if (mode === 'attestation-missing-asset') statement.subject.pop()
+        if (mode === 'attestation-extra-asset')
+          statement.subject.push({
+            name: 'unexpected',
+            digest: { sha256: '0'.repeat(64) },
+          })
+        if (mode === 'attestation-wrong-tag-shape') statement.predicate.tag = 42
+        return {
+          initiator: 'github',
+          bundle: {
+            mediaType: 'application/vnd.dev.sigstore.bundle.v0.3+json',
+            verificationMaterial: {},
+            dsseEnvelope: {
+              payloadType: 'application/vnd.in-toto+json',
+              payload: Buffer.from(JSON.stringify(statement)).toString(
+                'base64'
+              ),
+              signatures: [{ sig: 'fixture' }],
+            },
+          },
+        }
+      }
       const fetch = async (url, options = {}) => {
         const u = new URL(url)
         const method = options.method ?? 'GET'
@@ -226,17 +299,42 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
               : JSON.stringify(body),
             { status }
           )
+        if (u.pathname.includes('/attestations/')) {
+          polls++
+          assert.equal(method, 'GET')
+          assert.equal(u.searchParams.get('predicate_type'), 'release')
+          if (mode === 'attestation-non-200') return response({}, 503)
+          if (mode === 'attestation-201') return response({}, 201)
+          if (mode === 'attestation-auth-error') return response({}, 403)
+          if (mode === 'attestation-malformed')
+            return response({ attestations: null })
+          const other = attestation('v1.0.0-rc.1')
+          if (mode === 'attestation-other-malformed')
+            other.bundle.dsseEnvelope.payload = '!invalid!'
+          const delay =
+            mode === 'attestation-after-one-wait'
+              ? 1
+              : [
+                    'attestation-after-two-waits',
+                    'attestation-other-tag-before-current',
+                  ].includes(mode)
+                ? 2
+                : mode === 'attestation-never'
+                  ? 3
+                  : 0
+          observed = polls <= delay ? [] : [attestation()]
+          if (mode === 'attestation-duplicate') observed.push(attestation())
+          if (mode.startsWith('attestation-other-')) observed.unshift(other)
+          return response({ attestations: observed })
+        }
         if (u.pathname.endsWith('/releases') && method === 'GET')
           return mode === 'api-error'
             ? response('denied', 503)
             : response(mode === 'draft' ? [release(true)] : [])
         if (u.pathname.endsWith('/releases') && method === 'POST') {
           const creation = JSON.parse(options.body)
-          assert.equal(creation.prerelease, mode !== 'stable')
-          assert.equal(
-            creation.make_latest,
-            mode === 'stable' ? 'true' : 'false'
-          )
+          assert.equal(creation.prerelease, !stable)
+          assert.equal(creation.make_latest, stable ? 'true' : 'false')
           const body = creation.body
           assert.match(body, /--signer-workflow.*release-build\.yml/)
           assert.match(body, /--cert-identity.*release-build\.yml@refs\/tags/)
@@ -273,14 +371,27 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
       }
       const context = {
         Buffer,
+        JSON,
         AbortSignal,
         URL,
-        console,
+        console: {
+          log: (...args) => {
+            if (
+              args[0] === 'Ignored verified release attestation for other tag:'
+            )
+              ignored.push(args[1])
+          },
+          warn: () => {},
+        },
+        setTimeout: (resolve, delay) => {
+          waits.push(delay)
+          resolve()
+        },
         fetch,
         process: {
           env: {
             GH_REPO: 'example/project',
-            RELEASE_TAG: mode === 'stable' ? 'v1.0.0' : 'v0.0.0-example',
+            RELEASE_TAG: stable ? 'v1.0.0' : 'v0.0.0-example',
             RELEASE_PUBLICATION_ENABLED:
               mode === 'publication-disabled' ? 'false' : 'true',
             SOURCE_COMMIT: 'a'.repeat(40),
@@ -303,14 +414,51 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
                 fs.copyFileSync(join(root, a), join(root, b)),
             }
           if (name === 'node:crypto') return { createHash }
+          if (name === 'node:util') return { isDeepStrictEqual }
           if (name === 'node:child_process')
-            return { execFileSync: (...args) => calls.push(['gh', args]) }
+            return {
+              execFileSync: (...args) => {
+                calls.push(['gh', args])
+                if (args[1][1] !== 'verify')
+                  return Buffer.from('verified asset')
+                const tag = args[1].at(-1)
+                if (
+                  mode === 'attestation-verification-failure' ||
+                  (mode === 'attestation-other-unverifiable' &&
+                    tag === 'v1.0.0-rc.1')
+                )
+                  throw Error('Signature verification failed')
+                assert.ok(
+                  polls > 0,
+                  'should read release-attestation availability before verification'
+                )
+                const record = observed.find(
+                  (r) =>
+                    JSON.parse(
+                      Buffer.from(r.bundle.dsseEnvelope.payload, 'base64')
+                    ).predicate.tag === tag
+                )
+                const bundle = structuredClone(record.bundle)
+                if (mode === 'attestation-substituted-bundle')
+                  bundle.dsseEnvelope.signatures[0].sig = 'different'
+                return Buffer.from(JSON.stringify({ attestation: { bundle } }))
+              },
+            }
           throw Error(name)
         },
       }
       const execute = () =>
         vm.runInNewContext(`(async()=>{${script}\n})()`, context)
-      if (['success', 'idle-socket', 'stable'].includes(mode)) await execute()
+      const successful = [
+        'success',
+        'idle-socket',
+        'stable',
+        'attestation-after-one-wait',
+        'attestation-after-two-waits',
+        'attestation-other-tag',
+        'attestation-other-tag-before-current',
+      ].includes(mode)
+      if (successful) await execute()
       else await assert.rejects(execute, undefined, mode)
       if (
         [
@@ -328,9 +476,58 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         assert.equal(calls.length, mode === 'api-error' ? 1 : 3)
       if (['upload-error'].includes(mode))
         assert.ok(!calls.some(([method]) => method === 'PATCH'), mode)
-      if (['success', 'idle-socket', 'stable'].includes(mode)) {
+      if (successful) {
         assert.equal(uploaded.length, 29)
-        assert.equal(calls.filter(([method]) => method === 'gh').length, 30)
+        assert.equal(
+          calls.filter(([method]) => method === 'gh').length,
+          mode === 'attestation-other-tag'
+            ? 31
+            : mode === 'attestation-other-tag-before-current'
+              ? 33
+              : 30
+        )
+      }
+      if (mode.startsWith('attestation-')) {
+        const expectedWaits =
+          mode === 'attestation-after-one-wait'
+            ? [2000]
+            : [
+                  'attestation-after-two-waits',
+                  'attestation-never',
+                  'attestation-other-tag-before-current',
+                ].includes(mode)
+              ? [2000, 5000]
+              : []
+        assert.deepEqual(waits, expectedWaits, mode)
+        assert.equal(polls, expectedWaits.length + 1, mode)
+        assert.equal(
+          calls.filter(
+            ([method, path]) => method === 'POST' && path.endsWith('/releases')
+          ).length,
+          1,
+          mode
+        )
+        assert.equal(
+          calls.filter(
+            ([method, path]) => method === 'POST' && path.endsWith('/assets')
+          ).length,
+          29,
+          mode
+        )
+        assert.equal(
+          calls.filter(([method]) => method === 'PATCH').length,
+          1,
+          mode
+        )
+        assert.deepEqual(
+          ignored,
+          mode === 'attestation-other-tag'
+            ? ['"v1.0.0-rc.1"']
+            : mode === 'attestation-other-tag-before-current'
+              ? Array(3).fill('"v1.0.0-rc.1"')
+              : [],
+          mode
+        )
       }
     } finally {
       rmSync(root, { recursive: true, force: true })
@@ -602,52 +799,84 @@ test('workflows select exactly the descriptive cohort and restrict actual build 
   const actualBuild = build.split('\n  build:')[1].split('\n  sign:')[0]
   assert.doesNotMatch(actualBuild, /id-token|attestations:/)
   assert.match(release, /vars\.RELEASE_PUBLICATION_ENABLED == 'true'/)
+  assert.match(
+    build.split('\n  sign:')[1],
+    /vars\.RELEASE_PUBLICATION_ENABLED == 'true'/
+  )
 })
-test('release preflight rejects inherited JS controls and mismatched source before tools run', () => {
-  const script = readFileSync('scripts/release/phase1-build.sh', 'utf8')
+test('release preflight rejects inherited controls in an isolated script fixture', () => {
   const root = mkdtempSync(join(tmpdir(), 'phase1-preflight-'))
-  const packageArgs = [
+  const script = join(root, 'scripts/release/phase1-build.sh')
+  const bin = join(root, 'bin'),
+    marker = join(root, 'tools-ran')
+  const source = 'a'.repeat(40)
+  const args = [
     'trusted-server-cli',
     'x86_64-unknown-linux-gnu',
     'ts-x86_64-unknown-linux-gnu',
   ]
-  const actual = execFileSync('git', ['rev-parse', 'HEAD'], {
-    encoding: 'utf8',
-  }).trim()
   try {
+    mkdirSync(join(root, 'scripts/release'), { recursive: true })
+    mkdirSync(bin)
+    fs.copyFileSync('scripts/release/phase1-build.sh', script)
+    const stub = (name, body) =>
+      writeFileSync(join(bin, name), '#!/bin/sh\n' + body + '\n', {
+        mode: 0o755,
+      })
+    stub(
+      'git',
+      `test "$*" = "rev-parse HEAD" || exit 96; printf '%s\\n' "$PREFLIGHT_FIXTURE_COMMIT"`
+    )
+    stub('printenv', 'exec /usr/bin/printenv "$@"')
+    for (const tool of [
+      'node',
+      'npm',
+      'docker',
+      'cargo',
+      'rustup',
+      'curl',
+      'sudo',
+    ])
+      stub(tool, `printf '%s\\n' "$0" >> "$PREFLIGHT_TOOL_LOG"; exit 97`)
+    const execute = (extra) => {
+      try {
+        execFileSync('/bin/bash', [script, ...args], {
+          cwd: root,
+          stdio: 'pipe',
+          env: {
+            PATH: bin,
+            RUNNER_TEMP: root,
+            SOURCE_COMMIT: source,
+            PREFLIGHT_FIXTURE_COMMIT: source,
+            PREFLIGHT_TOOL_LOG: marker,
+            ...extra,
+          },
+        })
+        assert.fail('should stop before any real tool executes')
+      } catch (error) {
+        return error
+      }
+    }
     for (const variable of [
       'TSJS_SKIP_BUILD',
       'TSJS_PREBUILT_DIR',
       'TSJS_TEST',
     ]) {
-      assert.throws(
-        () =>
-          execFileSync('bash', ['-c', script, 'phase1', ...packageArgs], {
-            env: {
-              PATH: process.env.PATH,
-              HOME: process.env.HOME,
-              RUNNER_TEMP: root,
-              SOURCE_COMMIT: actual,
-              [variable]: '',
-            },
-            stdio: 'pipe',
-          }),
-        (error) => error.stderr.toString().includes('Refusing ' + variable)
-      )
+      const error = execute({ [variable]: '' })
+      assert.equal(error.status, 1)
+      assert.match(error.stderr.toString(), new RegExp('Refusing ' + variable))
+      assert.equal(fs.existsSync(marker), false)
     }
-    assert.throws(
-      () =>
-        execFileSync('bash', ['-c', script, 'phase1', ...packageArgs], {
-          env: {
-            PATH: process.env.PATH,
-            HOME: process.env.HOME,
-            RUNNER_TEMP: root,
-            SOURCE_COMMIT: '0'.repeat(40),
-          },
-          stdio: 'pipe',
-        }),
-      (error) => error.status !== 0
+    for (const invalid of ['0'.repeat(40), 'A'.repeat(40), 'invalid'])
+      assert.equal(execute({ SOURCE_COMMIT: invalid }).status, 1)
+    assert.equal(fs.existsSync(marker), false)
+    assert.equal(
+      execute({}).status,
+      97,
+      'should reach the safe node stub when preflight passes'
     )
+    assert.equal(readFileSync(marker, 'utf8').trim(), join(bin, 'node'))
+    assert.equal(fs.existsSync(join(root, 'trusted-server.toml')), false)
   } finally {
     rmSync(root, { recursive: true, force: true })
   }
