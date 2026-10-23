@@ -1,6 +1,6 @@
 # Server-side identity providers
 
-Status: Draft, revision 11. Revised after review rounds 1 to 10. Section 17
+Status: Draft, revision 12. Revised after review rounds 1 to 11. Section 17
 maps each finding to its fix.
 
 Issue: none filed yet. Related: [#1245](https://github.com/IABTechLab/trusted-server/issues/1245)
@@ -19,7 +19,11 @@ with `adapter-fastly/src/`. Prebid.js references are to version 10.26.0, read
 from `crates/trusted-server-js/lib/node_modules/prebid.js/modules/`. This spec
 depends on the EID fidelity branch for `merge_auction_eids`, the shared
 client EID parser and the `ts-eids` cookie carrying the same set the shim
-sends.
+sends. It assumes that work forwards configured ORTB2 EIDs together with
+User ID module EIDs, deduplicated, with EID-level provenance preserved
+(EID fidelity spec D2, D3, §4.2, §4.4). Lockr writes its ID5 EID only into
+`pbjs.getConfig('ortb2').user.ext.eids`, which a collector that reads only
+`getUserIdsAsEids()` misses (#1246).
 
 This spec does not depend on PR #1260. Its `IdentityCapture` trait,
 `identity_owner` field and `ts-eids-s` cookie are not on `main`. Where this
@@ -155,8 +159,9 @@ can be written, and each extra write is another CAS race between tabs.
   mode.
 - **G4.** At most one browser-driven KV write per page load, and a write
   that fails is not retried. This is strict. The only page-load exceptions
-  are a consent withdrawal's tombstone (section 5.1) and a removal batch that
-  the removal cookies cannot hold (section 6.2). Writers outside page loads
+  are a consent withdrawal's tombstone (section 5.1), which also covers a
+  capture provider's global revoke (section 8), and a removal batch from a
+  real browser that the removal cookies cannot hold (section 6.2). Writers outside page loads
   keep their own writes: batch sync, the admin endpoints and the deferred
   deletion framework (sections 2.2, 5.5).
 - **G5.** Provider-collected IDs are stored in both a first-party cookie
@@ -183,9 +188,10 @@ can be written, and each extra write is another CAS race between tabs.
   methods (section 4.2).
 - **G12.** Removals win. An ID removed from KV (opt-out, invalidation,
   withdrawal, deletion) stops reaching bidders within a bounded time, even
-  from the cookie. A removal staged by a stager stops that browser's
-  bidstream at once and reaches KV at the next writer navigation; a client
-  that never makes one keeps it in `ts-eids-r` until it does.
+  from the cookie. A removal staged by a stager stops that client's
+  bidstream at once and reaches KV at the client's next writer navigation; a
+  client that never makes one, such as a script that fails the real-browser
+  check (section 4.7), keeps it in `ts-eids-r` until it does.
 
 ### 2.2 Non-goals
 
@@ -1407,8 +1413,19 @@ counters are kept per POP, so the breaker is too.
 **Passive capture.** `IntegrationRegistry::handle_proxy`
 (`integrations/registry.rs:1031-1060`) holds the `EcContext`.
 `IntegrationProxy::handle` itself has no EC context
-(`integrations/registry.rs:319-324`). For each provider with a capture
-rule (`with_path` or `with_path_prefix`) matching the request:
+(`integrations/registry.rs:319-324`).
+
+Capture is off by default. `capture_enabled` (section 10.1) defaults to
+`false` for every provider that declares `captures`. While it is false, the
+coordinator still runs `capture`, discards the result's positive IDs and
+logs at debug what it discarded, by provider ID and source only. The
+result's removals and opt-outs still apply as below, because removals win
+(G12): an ID captured while capture was on must stay removable after it is
+turned off. An operator turns capture on per provider after the rollout
+checklist (section 14).
+
+For each provider with a capture rule (`with_path` or `with_path_prefix`)
+matching the request:
 
 - **Before `handle`.** When the descriptor's `Captures` declares `with_request_consent` and the
   request has a body, `handle_proxy` buffers it with the existing
@@ -1426,13 +1443,22 @@ rule (`with_path` or `with_path_prefix`) matching the request:
 - **After `handle`,** on 2xx responses only, the coordinator decodes
   `Content-Encoding` under the byte caps, builds a `CaptureInput` and calls
   `capture`.
-- **It applies the result.** Removals and opt-outs always apply, whatever the
+- **It applies the result.** Removals and opt-outs apply whatever the
   consent, because a revocation arrives after consent is denied. Positive
-  IDs apply only when eligibility steps 1 to 3 pass under the stricter
-  consent, and the provider has no sticky `ps.o`, unless this result clears
-  it: a capture-only provider without a GVL ID that returns IDs under
-  consenting cookie and body consent stages a clear, `ps.oc = now`, beside
-  its IDs in `ts-eids-s` (section 8).
+  IDs apply only when `capture_enabled` is true, eligibility steps 1 to 3
+  pass under the stricter consent, and the provider has no sticky `ps.o`,
+  unless this result clears it: a capture-only provider without a GVL ID
+  that returns IDs under consenting cookie and body consent stages a clear,
+  `ps.oc = now`, beside its IDs in `ts-eids-s` (section 8).
+- **The real-browser gate.** Eligibility step 1 already keeps positive IDs
+  from a client that fails `looks_like_browser()`. Such a client's removals
+  and opt-outs go only into its own response's `ts-eids-r` cookie. They never
+  trigger the removal overflow write (section 6.2), and a global revoke
+  (section 8) is staged as a provider opt-out instead. The batch reaches KV
+  only if that client later makes a writer navigation, which needs a real
+  browser (section 5.1). So a script replaying a copied `ts-ec` cookie
+  through the proxy can neither enrich the row nor strip or tombstone it.
+  Consent withdrawal keeps its own exception (section 5.1).
 
 The result is staged on `EcContext`. `ec_finalize_response`, which already
 runs for proxy responses (`adapter-fastly/src/app.rs:909`,
@@ -1516,9 +1542,12 @@ browsers (`adapter-fastly/src/app.rs:446-452`). Revocation cannot wait for a
 navigation that may never come. The exception covers the whole of today's
 withdrawal path: a CAS tombstone with up to five attempts, then its
 completion-marker write, for each withdrawn EC ID (one or two;
-`ec/kv.rs:1349-1430`, `:1115-1124`; `finalize.rs:509-525`). It and the
-removal overflow write (section 6.2) are the only page-load exceptions to
-G4. The tombstone is not part of any `IdentityMutation`. A
+`ec/kv.rs:1349-1430`, `:1115-1124`; `finalize.rs:509-525`). The same
+exception covers a captured opt-out from a provider with
+`revoke_scope = "global"` (section 8), from a real browser only: it runs this
+path on the request that carries it. It and the removal overflow write
+(section 6.2) are the only page-load exceptions to G4. The tombstone is not
+part of any `IdentityMutation`. A
 writer whose phase 4 re-read finds the tombstone drops its mutation (section
 5.4, step 1).
 
@@ -1597,8 +1626,8 @@ writer whose phase 4 re-read finds the tombstone drops its mutation (section
     returned `Some`, only when the response status is 2xx or 304 (finalize
     already holds the response)
   - when the phase 1 read changed the cookie under the section 6.3 merge
-  - when the cookie was missing, failed to open or was past its
-    revalidation age
+  - when the cookie was missing, failed to open, opened under a previous
+    key (section 6.2) or was past its revalidation age
 
 **Phase 4, after send. Returning ECs only. The only write.**
 
@@ -1901,7 +1930,11 @@ that seems to allow otherwise:
   re-gate, the writer-still-owns check and `staged_max_age_sec` in the flush
   checks (section 5.3), and keep only the EC binding and, when they carry
   one, the revision check. Withdrawing consent, disabling a provider or a
-  week in an SPA can delay a positive ID, never a removal.
+  week in an SPA can delay a positive ID, never a removal. The one gate a
+  removal does face is the real-browser gate on capture (section 4.7): a
+  capture removal from a client that fails `looks_like_browser()` stays in
+  that client's own `ts-eids-r` and reaches KV only through that client's
+  own writer navigation, never through the removal overflow write.
 - **A config change keeps removals.** When the `cf` of `ts-eids-s` does not
   match, its positive entries are discarded and it is rebuilt from KV.
   Pending markers are kept. `ts-eids-r` carries no `cf`, so its removals
@@ -1937,8 +1970,10 @@ that seems to allow otherwise:
   cannot bring IDs back. It may still set removals in a new `ts-eids-r`
   cookie.
 - **The cookie is rewritten only when it changes.** A request that read KV
-  re-emits `ts-eids-s` only when its entries, markers or `ps` changed, or
-  when the inbound `kc` is older than half of `kv_revalidate_sec`. Phase 3
+  re-emits `ts-eids-s` only when its entries, markers or `ps` changed, when
+  the inbound `kc` is older than half of `kv_revalidate_sec`, or when it
+  opened under a previous key (section 6.2), so it moves to the current key.
+  Phase 3
   stamps `kc` only when this request read KV. This keeps `Set-Cookie` off
   most responses and narrows the window for concurrent overwrites.
 - **Cluster size rides on a write.** `/_ts/api/v1/identify` is a
@@ -2058,7 +2093,9 @@ Two server-owned cookies:
   Each response that produces a removal or opt-out sets a new one, with a
   fresh random 8-hex-digit `<id>`, holding only its own batch. No response
   rewrites another's cookie, so neither a concurrent `/auction` rewriting
-  `ts-eids-s` nor another removal in flight can lose a batch. Stagers never
+  `ts-eids-s` nor another removal in flight can lose a batch. The one
+  rewrite is the writer's re-seal after a key rotation (below), which keeps
+  the same name and the same batch. Stagers never
   delete one. They are deleted, by name, in three cases only: by the writer
   navigation, after its phase 1 read shows a cookie's entries all applied
   or the cookie fails to open; by any request whose KV read confirms a
@@ -2083,12 +2120,16 @@ every request from the browser, through any intermediary that logs headers.
 A signed cookie would show server-only IDs, such as UID2 tokens and LiveRamp
 envelopes, in plain text there, and to the origin if the strip ever
 regressed. So each value is sealed with AES-256-GCM:
-`v1.<nonce>.<ciphertext and tag>`, base64url without padding. The key is
-derived from `ec.passphrase` with a namespaced label per cookie
-(`trusted-server/ts-eids-s/key/v1`, `trusted-server/ts-eids-r/key/v1`),
-following the pull-complete marker's pattern. The nonce is 12 random bytes
-from the platform generator. The full EC ID is the associated data, so it is
-authenticated but not stored:
+`v1.<kid>.<nonce>.<ciphertext and tag>`, with the nonce and ciphertext in
+base64url without padding. `<kid>` names the sealing key: 1 to 8
+characters of `[a-z0-9]`, in plain text, because it is not secret. The keys
+are dedicated secrets from the secret store, listed in
+`[ec.identity.cookie_keys]` (section 10.1) and in `secret_fields()` (section
+10.2). They are not derived from `ec.passphrase`. Each cookie's AES key is
+derived from a keyring secret with a namespaced label
+(`trusted-server/ts-eids-s/key/v1`, `trusted-server/ts-eids-r/key/v1`). The
+nonce is 12 random bytes from the platform generator. The full EC ID is the
+associated data, so it is authenticated but not stored:
 
 - A cookie copied from another visitor, or left over after an EC rotation,
   fails to open and is ignored.
@@ -2105,6 +2146,47 @@ A cookie that fails to open or decode is ignored and rebuilt by the next
 request that reads KV. The failure is logged without the value. Sealing
 needs an AES-GCM implementation, a new dependency (section 14), which the
 UID2 provider needs anyway (section 12.3).
+
+**Key rotation.** TS seals every new cookie with the `current` key and
+opens a cookie with any key in the keyring: the current key and the
+previous keys still configured. A cookie whose `<kid>` is not in the
+keyring fails to open, as any other cookie that fails to open. Rotation must
+never drop an unapplied removal batch, so:
+
+- A writer whose phase 1 read finds a `ts-eids-r` cookie opened under a
+  previous key and not yet all applied re-seals it under the current key, in
+  place: same name, same batch, a fresh nonce and a new `Max-Age`. A partly
+  applied cookie is re-sealed whole. Every writer navigation reads KV when a
+  `ts-eids-r` cookie is present (section 6.3), so it re-seals or deletes
+  every one it carries. Stagers never re-seal.
+- A `ts-eids-s` opened under a previous key is re-emitted under the current
+  key by the next request that reads KV and sets it (section 5.6).
+- A rotation is two deploys: add the new key to the keyring, wait until
+  every POP serves that config, then make it `current`. A POP that does not
+  yet know a key ID would otherwise fail to open the new cookies, and its
+  writer would delete their batches.
+
+How long a previous key must stay configured:
+
+- **`ts-eids-s`:** at least `staged_max_age_sec` (default 7 days). By then
+  every staged entry sealed under it is too old to flush anyway, and a
+  cookie that fails to open is rebuilt from KV. A client that keeps
+  navigating moves to the current key within `kv_revalidate_sec`.
+- **`ts-eids-r`:** one year, the cookies' `Max-Age`, after the key stops
+  being current. A client's batch moves to the current key at its first
+  writer navigation after the rotation, so a shorter retention covers every
+  client that navigates within it. Only the full year guarantees that no
+  browser can still hold a batch sealed under the removed key.
+
+Residual risk: a client that holds an unapplied batch and makes no writer
+navigation before its key is removed loses that batch when it returns. Its
+writer deletes the cookie as failing to open, and the removed ID can reach
+that browser's bidstream again until the provider removes it again. A
+client that never returns holds a batch nobody applies, rotation or not. An
+emergency rotation that removes a compromised key at once accepts this loss
+for every batch sealed under it.
+
+The hashes of section 9.3 keep their `ec.passphrase`-derived keys.
 
 **Why it is sealed.** Staged entries become KV writes, and sealing proves TS
 wrote them. Without it, a visitor could plant an arbitrary ID in KV, where it
@@ -2189,14 +2271,16 @@ when the live row shows:
 `iv` entries never keep a cookie alive: they are applied with the cookie's
 other entries and then dropped with it. The writer's phase 1 read deletes
 each cookie whose entries are all applied, and any `__Host-ts-eids-r-`
-cookie that fails to open, for example one sealed under an old key. A
-cookie that is only partly applied is kept whole, and its applied entries
-are skipped when re-applied.
+cookie that fails to open, for example one sealed under a key no longer in
+the keyring. A cookie that is only partly applied is kept whole, and its
+applied entries are skipped when re-applied. One opened under a previous
+key is re-sealed (above).
 
 **Size.** Each cookie's sealed value is at most 512 bytes. The `v1.`
-prefix, the base64url nonce and its separator take 20 bytes, base64url
-turns every 3 bytes into 4, and the tag takes 16, so a cookie holds at most
-353 bytes of payload JSON. A removal costs 56 bytes plus its source domain
+prefix, a key ID of at most 8 characters, the base64url nonce and their
+separators take at most 29 bytes, base64url turns every 3 bytes into 4, and
+the tag takes 16, so a cookie holds at most 346 bytes of payload JSON. A
+removal costs 56 bytes plus its source domain
 and provider ID: about four fit with typical names (a 15-byte source and an
 8-byte provider), and one with a 253-byte source domain. An `iv` hash costs
 19 bytes, and an opt-out about 15 bytes plus the provider ID.
@@ -2205,9 +2289,12 @@ A batch is never coarsened to fit. It is not merged into another
 response's cookie, its removals are not widened, its `iv` hashes are not
 dropped, and an invalidation never becomes an opt-out.
 
-**Overflow.** A response writes its batch to KV before send, instead of
-setting a cookie, when the batch does not fit one cookie or the request
-already carries four openable `ts-eids-r` cookies. This removal overflow
+**Overflow.** A response to a real browser writes its batch to KV before
+send, instead of setting a cookie, when the batch does not fit one cookie
+or the request already carries four openable `ts-eids-r` cookies. A
+response to a client that fails `looks_like_browser()` never makes this
+write (section 4.7): it sets the batch in new cookies of its own, split as
+needed, as when the write fails. This removal overflow
 write is the second page-load exception to G4 (section 5.1). It reads the
 row and applies only the batch's removals, opt-outs and `iv` hashes under
 the rules of section 5.4, with a CAS and the withdrawal path's five
@@ -2271,9 +2358,11 @@ source.
   responses are already private.
 - **`ts-eids-r`:** any response that produces a removal or opt-out, on any
   route, including the unusable-consent path (section 5.3), adds a new
-  cookie for its batch, unless its overflow write landed (above); and the
-  writer navigation's HTML response deletes
-  the cookies its phase 1 read showed applied.
+  cookie for its batch, unless its overflow write landed (above; a client
+  that fails the real-browser check never makes one); and the writer
+  navigation's HTML response deletes the cookies its phase 1 read showed
+  applied and re-seals, in place, those opened under a previous key that
+  are not yet all applied.
 - **A consent withdrawal, or any KV read that finds a tombstone,** sets
   `Max-Age=0` on `ts-eids-s`. Once the tombstone is confirmed (written by
   this request, or read), the `ts-eids-r` cookies are pointless and are
@@ -2385,7 +2474,9 @@ hold-mode provider):
      caches them with their `ra` and `exp`, so the cookie view already knows
      when they are due.
    - On the writer only, each `ts-eids-r` cookie whose entries the row shows
-     all applied is deleted. Stagers leave the `ts-eids-r` cookies alone.
+     all applied is deleted, and each one opened under a previous key that
+     is not yet all applied is re-sealed under the current key (section
+     6.2). Stagers leave the `ts-eids-r` cookies alone.
 
    The writer's HTML response carries the result only under phase 3's rules,
    which include "the phase 1 read changed the cookie".
@@ -2531,6 +2622,8 @@ cookies: positive changes into `ts-eids-s`, removals and opt-outs into
 | `Rejected` with 429 or 5xx, `Transport`, timeout                               | unchanged                                                             | `f += 1`, `n = now + min(5 min × 2^(f-1), 1 h)`; breaker `record`                     | info  |
 | Breaker open                                                                   | not dispatched                                                        | unchanged                                                                             | debug |
 | Capture: any result or error                                                   | IDs and removals as above                                             | only `o`; never `n`, `f` or the breaker                                               | debug |
+| Capture with `capture_enabled = false`                                         | positive IDs discarded; removals as above                             | only `o`                                                                              | debug |
+| Captured `opted_out`, `revoke_scope = "global"`, real browser                  | the withdrawal tombstone removes the row (section 5.1)                | removed with the row                                                                  | info  |
 
 **Sticky opt-outs.** `ps.o = {at, fp}` records a provider-reported opt-out
 and the consent fingerprint at that time. Server-side calls do not carry the
@@ -2559,6 +2652,18 @@ provider relaxes never clears it. A clear is written to KV, and the
 browser's mirrored copy yields to it (section 4.7). A consent withdrawal's
 tombstone removes everything, provider opt-outs included: after it, the
 visitor starts again with a new EC.
+
+**Revoke scope.** A provider that declares `captures` has a `revoke_scope`
+(section 10.1), default `"provider"`. With `"provider"`, a captured
+`opted_out` is the provider opt-out above. With `"global"`, a captured
+`opted_out` from a real browser runs today's consent-withdrawal tombstone
+path on that request instead (section 5.1): the row is tombstoned, the EC
+cookie is cleared, and everything is removed, provider opt-outs included.
+It uses the withdrawal's existing exception, so G4 keeps exactly two
+page-load exceptions. From a client that fails `looks_like_browser()`, a
+global revoke is staged as a provider opt-out in that client's own
+`ts-eids-r` (section 4.7), so a replayed `ts-ec` cannot tombstone another
+browser's row. An opt-out from `resolves` is always provider-scoped.
 
 The **consent fingerprint** is the first 16 hex digits of an HMAC, keyed from
 `ec.passphrase`, over the consent signals the provider's policy reads:
@@ -2608,7 +2713,11 @@ Rules:
     auction (`auction/routing.rs:336`).
 - **Fail closed.** `strict()` blocks when a raw TC, GPP or US Privacy string
   is present but has no decoded form, for example in proxy mode or after a
-  decode failure (`consent/mod.rs:104-127`, `:197-210`).
+  decode failure (`consent/mod.rs:104-127`, `:197-210`). A GPP string that
+  decodes but has no applicable section, such as the header-only `DBAA` a
+  CMP sends when no section applies, has a decoded form and carries no
+  opt-out, so it does not block `strict()` by itself. Where TCF applies, the
+  policy still needs TCF consent from a TC string or a GPP TCF section.
 - **Before disclosure:** the live-row read and eligibility recomputation
   described in section 4.7.
 - **At write:** the CAS on that read's generation.
@@ -2621,7 +2730,8 @@ Rules:
   request's visitor consent (section 7.1). Owner denials also filter the
   browser's candidates.
 - **On withdrawal:** the tombstone is written synchronously on whichever
-  request carries it, and the response expires `ts-eids-s` (section 5.1).
+  request carries it, and the response expires `ts-eids-s` (section 5.1). A
+  global revoke from a real browser takes the same path (section 8).
 
 ### 9.2 Outbound requests
 
@@ -2658,7 +2768,16 @@ Rules:
   (`integrations/lockr.rs:202-204`).
 - Hashes of identifiers (the rate-limit visitor key, `pv`, `ps.iv`, the
   consent fingerprint) are HMACs with keys derived from `ec.passphrase`, so
-  they cannot be linked to an EC ID without the key.
+  they cannot be linked to an EC ID without the key. They do not move to the
+  rotating cookie keys (section 6.2). `ps.iv`, the consent fingerprint and
+  the legacy revision hash a `pv` can hold are stored and compared on later
+  requests, so each rotation would break them: a rejected UID could be
+  re-seeded, an opt-out's fingerprint would never match again, and a staged
+  removal with a legacy `pv` would look applied and be skipped. The visitor
+  rate-limit key would survive a rotation, because its windows last 60
+  seconds, but it stays with the others.
+- Cookie sealing keys come from the secret store and are never logged. A
+  key ID may be logged.
 - `CaptureInput` never exposes request bodies or request headers. Proxied
   requests can contain an email or HEM. TS forwards them, and reads from a
   body only the consent pointers a descriptor declares (section 4.7). It
@@ -2723,6 +2842,28 @@ breaker_failures_per_minute = 50
 # Lower is dropped first when ts-eids-s exceeds its cap. Default 0.
 cookie_priority = 10
 
+[ec.identity.providers.lockr]
+# Only for providers that declare `captures`. Default false: captured
+# positive IDs are discarded and logged at debug; removals still apply.
+capture_enabled = true
+# Only for providers that declare `captures`. "provider" or "global".
+# Default "provider": a captured opt-out removes this provider's records.
+# "global" runs the consent-withdrawal tombstone instead (section 8).
+revoke_scope = "provider"
+
+# Keys that seal ts-eids-s and ts-eids-r (section 6.2). No default:
+# required when `ec.ec_store` is set.
+[ec.identity.cookie_keys]
+# The key ID that seals new cookies. It must be one of `keys`.
+current = "k2"
+# The current key and every previous key still accepted for opening. Each
+# `secret` is a secret-store key name at rest, resolved at startup to 32
+# bytes in base64.
+keys = [
+  { id = "k2", secret = "ts-identity-cookie-key-k2" },
+  { id = "k1", secret = "ts-identity-cookie-key-k1" },
+]
+
 # Source policy: the existing table, with one new field.
 [[ec.partners]]
 name = "ID5"
@@ -2738,8 +2879,10 @@ enabled = true
 partner_id = 1234
 ```
 
-`[ec.identity]` and each `[ec.identity.providers.<id>]` table are optional.
-A provider with no table uses the defaults.
+`[ec.identity]` and each `[ec.identity.providers.<id>]` table are optional,
+except `[ec.identity.cookie_keys]`, which is required when `ec.ec_store` is
+set, because the cookies cannot be sealed without it. A provider with no
+table uses the defaults.
 
 ### 10.2 Validation
 
@@ -2779,6 +2922,15 @@ Each of these is an error:
 - `timeout_ms` is greater than `hold_budget_ms` for a hold-mode provider.
 - `hold_budget_ms` is over 1,000, `max_concurrency` is 0,
   `refresh_after_sec` is 0, or `kv_revalidate_sec` is not below 86,400.
+- `capture_enabled` or `revoke_scope` is set for a provider whose
+  descriptor declares no `captures`, or `revoke_scope` is not `provider` or
+  `global`.
+- `ec.ec_store` is set and `[ec.identity.cookie_keys]` is missing.
+- `current` is not one of `keys`, two keys share an `id`, or an `id` is not
+  1 to 8 characters of `[a-z0-9]`.
+- At startup, after secret resolution, a key's secret does not decode from
+  base64 to exactly 32 bytes. Deploy validation sees only key names, so this
+  check runs in `validate_settings_for_runtime`.
 
 Validation never calls a provider. Live approvals, such as a LiveRamp
 placement or an approved origin, stay on the rollout checklist of each vendor
@@ -2789,7 +2941,9 @@ secret, are `Redacted<String>` config fields. At rest the config holds their
 secret-store key names, and they are resolved in memory before runtime
 settings are built (`secret_resolution.rs`). Each identity integration adds
 its secret paths to `TrustedServerAppConfig::secret_fields()`
-(`config.rs:136-175`). `build_descriptor` must never read a secret field,
+(`config.rs:136-175`). The cookie keys' secrets are listed there too, at
+`ec.identity.cookie_keys.keys[].secret`, as an optional path like the
+partner tokens. `build_descriptor` must never read a secret field,
 because deploy validation runs before resolution and would see key names.
 The harness's `check_descriptor_ignores_secrets` builds the descriptor from
 a config whose secrets are placeholder key names and from one with resolved
@@ -3194,8 +3348,17 @@ What this shows:
 - **Revocation outlives consent.** `revoke-consent` arrives after the visitor
   has denied consent, so the request's consent gate would block it. A
   capture's removals must apply whatever the consent (section 12.5). It is
-  provider-scoped here: it removes Lockr-written records only, never the EC.
-  Lockr's plan settles the real scope.
+  provider-scoped by default (`revoke_scope = "provider"`): it removes
+  Lockr-written records only, never the EC. An operator who sets
+  `revoke_scope = "global"` makes it a full withdrawal that tombstones the
+  row, from real browsers only (section 8). Lockr's plan settles which
+  scope Lockr's revocation means.
+- **Capture sees a token once.** Lockr returns a token only when it first
+  issues one. On a reload its SDK sends the saved ID with `noGenerate`, and
+  the response carries no new token (#1246). So capture sees an ID only at
+  its first issue, and the browser path carries it on later page views:
+  Lockr writes the ID into Prebid's `ortb2` config, which the EID fidelity
+  work forwards in the `/auction` body and `ts-eids`.
 - **Consent in the request body.** Lockr's SDK sends its own consent strings
   in the body. The descriptor names them, the coordinator extracts and
   decodes only those fields, and capture is gated by the stricter of the
@@ -3703,6 +3866,18 @@ refresh and opt-out.
   rule matching the request, decodes gzip and brotli bodies under the caps,
   reads only the declared consent pointers from a request body, and never
   touches `n`, `f` or the breaker.
+- With `capture_enabled = false`, a capture's positive IDs reach neither
+  cookie nor KV and are logged at debug without values, while its removals
+  and opt-outs still apply.
+- A capture from a client that fails `looks_like_browser()` stores no
+  positive ID, puts its removals and opt-outs only in its own `ts-eids-r`,
+  never makes the removal overflow write, and turns a global revoke into a
+  provider opt-out. A later writer navigation from that client applies the
+  batch. A replayed `ts-ec` on the proxy changes no KV row.
+- With `revoke_scope = "global"`, a captured opt-out from a real browser
+  tombstones the row and clears the EC cookie on that request, as a consent
+  withdrawal does. With `"provider"`, it removes only that provider's
+  records.
 - A Lockr `revoke-consent` captured on the proxy removes every Lockr-written
   record, owned or unowned, including sources the cookie holds only as
   stubs, and survives a concurrent `/auction` rewriting `ts-eids-s`.
@@ -3729,6 +3904,8 @@ refresh and opt-out.
   US National GPC and known-child fields decode from each section that
   defines them. Each one blocks a strict policy.
 - A raw consent string that does not decode blocks a strict policy.
+- A decodable GPP string with no applicable section, the header-only
+  `DBAA` shape, does not block a strict policy where TCF does not apply.
 - A targeted-advertising opt-out without a sale opt-out produces no
   server-side IDs in `user.eids`, no flush of that provider's entries, and no
   IDs written into the cookie.
@@ -3738,23 +3915,25 @@ refresh and opt-out.
 so adapter tests can use it. `KvIdentityGraph::counting` counts reads only
 (`ec/kv.rs:1596-1605`, `ec/kv_backend.rs:205-221`).
 
-| Scenario                                                           | KV writes                                            |
-| ------------------------------------------------------------------ | ---------------------------------------------------- |
-| New visitor, navigation                                            | 1 (create, before send)                              |
-| New visitor whose first ID collides                                | 1 (create with a re-minted ID)                       |
-| Returning visitor, changes pending                                 | 1                                                    |
-| Returning visitor, nothing changed                                 | 0                                                    |
-| 304 revalidation with changes pending                              | 1                                                    |
-| Returning EC, navigation answered with 3xx, 4xx or 5xx             | 0                                                    |
-| New visitor, prefetch or prerender navigation                      | 1 (create, before send)                              |
-| Returning visitor, prefetch or prerender navigation                | 0                                                    |
-| New visitor, client without `Sec-Fetch-Dest`                       | 1 (create, before send)                              |
-| Returning visitor, iframe HTML or no `Sec-Fetch-Dest`              | 0                                                    |
-| Integration-proxy navigation that mints an EC                      | 1 (create)                                           |
-| `/auction`, `/_ts/page-bids`, `/identify`, Lockr API proxy, assets | 0                                                    |
-| Consent withdrawal, on any request                                 | CAS tombstone (up to 5 attempts) plus marker, per ID |
-| Removal batch that overflows the removal cookies, on any request   | CAS removal write before send (up to 5 attempts)     |
-| CAS conflict or per-key limit on the flush                         | 1 attempt, not retried                               |
+| Scenario                                                             | KV writes                                            |
+| -------------------------------------------------------------------- | ---------------------------------------------------- |
+| New visitor, navigation                                              | 1 (create, before send)                              |
+| New visitor whose first ID collides                                  | 1 (create with a re-minted ID)                       |
+| Returning visitor, changes pending                                   | 1                                                    |
+| Returning visitor, nothing changed                                   | 0                                                    |
+| 304 revalidation with changes pending                                | 1                                                    |
+| Returning EC, navigation answered with 3xx, 4xx or 5xx               | 0                                                    |
+| New visitor, prefetch or prerender navigation                        | 1 (create, before send)                              |
+| Returning visitor, prefetch or prerender navigation                  | 0                                                    |
+| New visitor, client without `Sec-Fetch-Dest`                         | 1 (create, before send)                              |
+| Returning visitor, iframe HTML or no `Sec-Fetch-Dest`                | 0                                                    |
+| Integration-proxy navigation that mints an EC                        | 1 (create)                                           |
+| `/auction`, `/_ts/page-bids`, `/identify`, Lockr API proxy, assets   | 0                                                    |
+| Consent withdrawal, on any request                                   | CAS tombstone (up to 5 attempts) plus marker, per ID |
+| Global revoke captured from a real browser                           | as a consent withdrawal                              |
+| Removal batch from a real browser that overflows the removal cookies | CAS removal write before send (up to 5 attempts)     |
+| Capture removal, opt-out or global revoke from a non-browser client  | 0                                                    |
+| CAS conflict or per-key limit on the flush                           | 1 attempt, not retried                               |
 
 **Withdrawal and removal.**
 
@@ -3782,6 +3961,8 @@ existing one read and no more.
 - A gap too large for the cookie is saved again by the next `/auction` and
   eventually written.
 - Every source today's `/auction` ingest would write reaches KV.
+- An EID present only in Prebid's `ortb2` config, as Lockr writes its ID5,
+  reaches `ts-eids` and KV.
 
 **Orphans and collisions (section 5.5).**
 
@@ -3840,8 +4021,20 @@ existing one read and no more.
     and removes one acquired in the same second as `sa`
   - it is honoured on the unusable-consent path, where `ts-eids-s` is
     expired, until the next writer applies it
-  - the 512-byte sealed cap per cookie, the one-year `Max-Age`, and that
-    stagers never delete one
+  - the 512-byte sealed cap per cookie with an 8-character key ID, the
+    one-year `Max-Age`, and that stagers never delete one
+- Cookie keys:
+  - a cookie sealed under a previous key opens; one whose key ID is not in
+    the keyring fails to open
+  - a writer re-seals an unapplied `ts-eids-r` cookie opened under a
+    previous key, in place, with the same batch, and deletes an applied one;
+    a stager never re-seals
+  - a `ts-eids-s` opened under a previous key is re-emitted under the
+    current key by the next request that reads KV
+  - across a rotation, with the new key added before it becomes current,
+    no unapplied removal batch is lost
+  - `ps.iv`, the consent fingerprint and a legacy `pv` hash still match
+    after a cookie key rotation
 - The admin lookup redacts `ps.st`.
 
 **Outbound requests.** Requests to Prebid Server, in every
@@ -3878,8 +4071,15 @@ nothing is left.
 test.
 
 **Config.** Each validation error in section 10.2, `build_descriptor`
-running in `ts config validate` without secrets, and acceptance of a config
-with no `[ec.identity]` at all.
+running in `ts config validate` without secrets, acceptance of a config
+with no `[ec.identity]` at all when `ec.ec_store` is unset, and acceptance
+of one with only `[ec.identity.cookie_keys]` when it is set. The
+strips-only release accepts `[ec.identity.cookie_keys]` (section 14).
+
+**First-auction metric.** The shim reports the race flag of section 14 on
+the first `/auction` of a page load only, and only where the Lockr
+integration is active. The log line carries the flag and no identifier
+value.
 
 **Adapters.** Phase 4 runs after send on Fastly. Axum, Cloudflare and Spin
 behave as before apart from the Prebid Server and origin cookie strips. The parity test crate
@@ -3896,18 +4096,32 @@ Three steps, each shippable on its own:
    list. Stripping `ts-eids` from origin requests is a behaviour change for
    any origin that read it. A rollback after step 1 then lands on code that
    still keeps the new one-year cookies away from the origin and its header
-   limit. This release is the rollback floor.
+   limit. This release is the rollback floor. It also parses and validates
+   `[ec.identity.cookie_keys]` and lists its secrets in `secret_fields()`,
+   without using them. `Ec` denies unknown fields (`settings.rs:541-542`),
+   so without this a config holding the keys would fail to load after a
+   rollback to it. Operators provision the keys in the secret store and add
+   the table during this release, so step 1 finds them.
 1. **One write, no new vendors.** This step includes:
    - the writer-request rule and the `IdentityMutation` single flush, with
      no retry; the new visitor's create stays before routing, as today
    - `/identify` and `/_ts/page-bids` stopping their writes
    - `ts-eids-s`: the host-only cookie sealed with AES-256-GCM (a new
-     `aes-gcm` dependency, which the UID2 provider later reuses), `kc`
-     revalidation, KV-gap staging on `/auction`, pending and `m` markers,
-     the size cap
-   - the `ts-eids-r` removal cookies
+     `aes-gcm` dependency, which the UID2 provider later reuses) under the
+     rotating cookie keys, `kc` revalidation, KV-gap staging on `/auction`,
+     pending and `m` markers, the size cap
+   - the `ts-eids-r` removal cookies, and their re-seal after a key
+     rotation (section 6.2)
    - a metric for the inbound `Cookie` header size, and for the number and
      total size of `ts-eids-r` cookies (section 6.2)
+   - a first-auction race metric for the open question in section 15. The
+     shim adds one boolean to the first `/auction` body of each page load,
+     only where the Lockr integration is active: whether the browser's
+     resource timing already shows a completed response from the Lockr
+     proxy's `page-view` path. TS counts first auctions with and without it.
+     It is counted once per page load and logs no identifier value. Capture
+     comes in step 2, but the race does not depend on it, so step 1 measures
+     it before step 2 relies on the cookie
    - metadata-preserving `KvPartnerId` and `ps`, with `Default` and
      constructors
    - `GenericPullProvider` replacing pull sync, which brings the trait, the
@@ -3921,10 +4135,31 @@ Three steps, each shippable on its own:
 
 2. **Providers.** `.with_identity_provider` and
    `.try_with_identity_provider` for vendors, ownership and its
-   validation, hold mode, passive capture, provider state, the rate-limiter
-   `record` and `count` methods and the circuit breaker, and the consent
-   decoder extensions of section 9.1. Vendor modules follow in their own
-   specs.
+   validation, hold mode, passive capture with `capture_enabled` off by
+   default and `revoke_scope` defaulting to `"provider"`, the real-browser
+   gate on capture effects, provider state, the rate-limiter `record` and
+   `count` methods and the circuit breaker, and the consent decoder
+   extensions of section 9.1. Vendor modules follow in their own specs.
+   Capture stays off for a provider until the checklist below has passed
+   once on a live service.
+
+**Capture provider checklist.** Before setting `capture_enabled = true`:
+
+- Each captured source has an `[[ec.partners]]` entry with
+  `bidstream_enabled = true` and the right `openrtb_atype`. Lockr's ID5 uses
+  `1` (#1246).
+- A source moving to an owner is moved off pull sync first. A
+  `pull_sync_enabled` entry registers a generic pull provider that claims
+  the source, and two providers cannot claim an owned source (section 10.2).
+- Live acceptance: after an eligible request, `/_ts/admin/eids` lists the
+  source as matched (`ingest.matched`, `ec/admin.rs:532-536`), and then
+  `/_ts/admin/ec` shows the stored UID (`ec/admin.rs:276`).
+
+**Rotating the cookie keys.** Add the new key to `keys` and deploy. Once
+every POP serves that config, make it `current` and deploy again. Keep the
+previous key for the retention section 6.2 gives: `staged_max_age_sec` for
+`ts-eids-s`, one year for `ts-eids-r`. Removing it sooner can drop an
+unapplied removal batch of a client that has not navigated since.
 
 After providers write metadata, do not roll back past step 1. Step 1's reader
 preserves the new fields. A rollback past it strips them:
@@ -3955,35 +4190,47 @@ sending what it staged.
    on Fastly's per-key limit when another write to the same key landed
    within about a second, on a read failure, or on a KV error. Should a
    failed tombstone be retried after send, with a delay?
+3. **How often the first auction misses Lockr's ID.** On the affected route,
+   Lockr's `page-view` call and the first `/auction` start close together.
+   How often does the first `/auction` leave before the proxied Lockr
+   response sets `ts-eids-s`? Then that auction lacks the captured ID, and a
+   first visit's first auction gets it only from the browser path. Step 1's
+   race metric (section 14) measures it before capture is turned on (#1260
+   review).
+4. **Global revoke and a granting CMP.** A global revoke clears the EC
+   cookie, as a withdrawal does, but the CMP's consent may still grant. The
+   next navigation then mints a new EC. Should a global revoke also stop
+   minting until consent changes?
 
 ## 16. Decisions log
 
 Decisions made while writing this spec, with the user:
 
-| Decision                         | Choice                                                                                                                                                                  |
-| -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Scope                            | Framework and trait. Vendors get their own specs.                                                                                                                       |
-| HEM input                        | Typed slot, always empty in v1. Intake is a later spec.                                                                                                                 |
-| Browser vs server precedence     | Configured per source through `owner`. The owner's valid value wins.                                                                                                    |
-| Cookie for server IDs            | Separate `ts-eids-s`, server-owned and HttpOnly, sealed with AES-256-GCM so the origin and its logs never see server-only IDs.                                          |
-| Structure                        | Trait plus coordinator, with an optional passive-capture capability.                                                                                                    |
-| Trait shape                      | One required method, `descriptor`. Capabilities are default methods. Synchronous. Additive by construction.                                                             |
-| Inputs                           | Declared in the descriptor and enforced: a provider can read only what it declared.                                                                                     |
-| Page load for the one-write rule | A navigation plus every request it causes. Only the navigation writes. Strict.                                                                                          |
-| New-visitor write                | One create before routing, as today, carrying browser EIDs. No provider runs on the first navigation. Changed in rounds 3 and 4.                                        |
-| New-visitor recovery             | Today's rotation. The cookie-proof recreation of revision 3 is removed with the deferred create.                                                                        |
-| Failed write                     | Not retried. Changed from one merge-retry once Fastly's per-key limit was confirmed.                                                                                    |
-| Browser EIDs beyond the cookie   | `/auction` saves the KV gap in `ts-eids-s`. The next navigation writes it.                                                                                              |
-| Delay on body-less routes        | Accepted: a browser ID first seen in an `/auction` body reaches KV one page view later.                                                                                 |
-| SPA views (`/_ts/page-bids`)     | Stagers. They never write KV.                                                                                                                                           |
-| Hold budget                      | `hold_budget_ms` defaults to 100 ms, reduced from 300 ms (section 4.7 gives the reasons).                                                                               |
-| Outbound cookies                 | TS's identity cookies are stripped from Prebid Server requests. The origin keeps `ts-ec` but loses `ts-eids`, `ts-eids-s` and `ts-eids-r`, to stay under header limits. |
-| Deletion                         | A tombstone with the 24-hour `TOMBSTONE_TTL` replaces the hard delete. No extra writes.                                                                                 |
-| GPP opt-outs                     | Sharing and targeted-advertising opt-outs are decoded, and the strict policy blocks them.                                                                               |
-| `x-ts-eids`                      | Kept as a full troubleshooting header. Its exposure of server-only IDs to page scripts is accepted.                                                                     |
-| Consent withdrawal               | Synchronous tombstone on any request, one of two G4 exceptions with the removal overflow write. Proposed in review; not yet confirmed.                                  |
-| Removal overflow                 | A synchronous, removal-only KV write before send, the second G4 exception. It retries only a CAS conflict and falls back to new cookies. Confirmed after round 10.      |
-| Equal-second ties                | A removal or opt-out wins a tie with an acquisition or clear. An ID re-acquired in that second is resolved again later. Confirmed after round 10.                       |
+| Decision                         | Choice                                                                                                                                                                                                                                                                    |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Scope                            | Framework and trait. Vendors get their own specs.                                                                                                                                                                                                                         |
+| HEM input                        | Typed slot, always empty in v1. Intake is a later spec.                                                                                                                                                                                                                   |
+| Browser vs server precedence     | Configured per source through `owner`. The owner's valid value wins.                                                                                                                                                                                                      |
+| Cookie for server IDs            | Separate `ts-eids-s`, server-owned and HttpOnly, sealed with AES-256-GCM so the origin and its logs never see server-only IDs.                                                                                                                                            |
+| Structure                        | Trait plus coordinator, with an optional passive-capture capability.                                                                                                                                                                                                      |
+| Trait shape                      | One required method, `descriptor`. Capabilities are default methods. Synchronous. Additive by construction.                                                                                                                                                               |
+| Inputs                           | Declared in the descriptor and enforced: a provider can read only what it declared.                                                                                                                                                                                       |
+| Page load for the one-write rule | A navigation plus every request it causes. Only the navigation writes. Strict.                                                                                                                                                                                            |
+| New-visitor write                | One create before routing, as today, carrying browser EIDs. No provider runs on the first navigation. Changed in rounds 3 and 4.                                                                                                                                          |
+| New-visitor recovery             | Today's rotation. The cookie-proof recreation of revision 3 is removed with the deferred create.                                                                                                                                                                          |
+| Failed write                     | Not retried. Changed from one merge-retry once Fastly's per-key limit was confirmed.                                                                                                                                                                                      |
+| Browser EIDs beyond the cookie   | `/auction` saves the KV gap in `ts-eids-s`. The next navigation writes it.                                                                                                                                                                                                |
+| Delay on body-less routes        | Accepted: a browser ID first seen in an `/auction` body reaches KV one page view later.                                                                                                                                                                                   |
+| SPA views (`/_ts/page-bids`)     | Stagers. They never write KV.                                                                                                                                                                                                                                             |
+| Hold budget                      | `hold_budget_ms` defaults to 100 ms, reduced from 300 ms (section 4.7 gives the reasons).                                                                                                                                                                                 |
+| Outbound cookies                 | TS's identity cookies are stripped from Prebid Server requests. The origin keeps `ts-ec` but loses `ts-eids`, `ts-eids-s` and `ts-eids-r`, to stay under header limits.                                                                                                   |
+| Deletion                         | A tombstone with the 24-hour `TOMBSTONE_TTL` replaces the hard delete. No extra writes.                                                                                                                                                                                   |
+| GPP opt-outs                     | Sharing and targeted-advertising opt-outs are decoded, and the strict policy blocks them.                                                                                                                                                                                 |
+| `x-ts-eids`                      | Kept as a full troubleshooting header. Its exposure of server-only IDs to page scripts is accepted.                                                                                                                                                                       |
+| Consent withdrawal               | Synchronous tombstone on any request, one of two G4 exceptions with the removal overflow write. Proposed in review; not yet confirmed.                                                                                                                                    |
+| Removal overflow                 | A synchronous, removal-only KV write before send, the second G4 exception. It retries only a CAS conflict and falls back to new cookies. Confirmed after round 10.                                                                                                        |
+| Equal-second ties                | A removal or opt-out wins a tie with an acquisition or clear. An ID re-acquired in that second is resolved again later. Confirmed after round 10.                                                                                                                         |
+| Server cookie lifetime           | #1260's handoff cookie lived five minutes, only filled absent sources and was never authoritative. `ts-eids-s` lives a year, revalidates against KV every `kv_revalidate_sec` and can carry owner writes, so staged entries survive failed flushes and long SPA sessions. |
 
 Round 7 proposed these, and they are applied in revision 8 pending the
 user's review of the spec:
@@ -4010,6 +4257,15 @@ user's review of the spec:
 | Disclosure policy   | The writer's policy always, plus the owner's. Records of disabled writers are not served             |
 | Browser candidates  | The owner's `ps.iv` and `ps.o` filter the browser's value for owned sources                          |
 | `/identify` consent | The request's visitor consent. No persisted visitor authorization                                    |
+
+Round 11 proposed these, and they are applied in revision 12 pending the
+user's review of the spec:
+
+| Decision          | Choice                                                                                                                                |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| Real-browser gate | A non-browser capture stores no positive ID, stages removals only in its own `ts-eids-r`, and never makes the overflow write          |
+| Global revoke     | `revoke_scope`, default `"provider"`. `"global"` runs the withdrawal tombstone, from real browsers only, under the existing exception |
+| Cookie keys       | Dedicated rotating keys from the secret store, `v1.<kid>.<nonce>.<ciphertext>`. Writers re-seal unapplied removal batches             |
 
 ## 17. Review log
 
@@ -4267,3 +4523,27 @@ the declared capabilities rather than every provider shape, HEM intake and
 multi-step exchanges stay out of v1 (section 2.2), and the vendor examples
 are illustrations, to be checked against protocol fixtures in their own
 specs.
+
+**Round 11** (2026-10-23) folded in findings from
+[#1246](https://github.com/IABTechLab/trusted-server/issues/1246) (Lockr IDs to
+KV) and the review of
+[#1260](https://github.com/IABTechLab/trusted-server/pull/1260) (server-side
+identity foundation and Lockr capture). The Lockr ID5 EID lives in Prebid's
+`ortb2` config, and capture sees it only at first issue. The first auction
+can race the Lockr response. An empty GPP string must not block. Capture
+should stay off until live acceptance. A replayed `ts-ec` could change a
+row through the proxy, a revoke's scope needs an operator choice, and the
+cookie keys should rotate apart from `ec.passphrase`. Revision 12 resolves
+them:
+
+| Finding                                                                     | Source       | Resolution                                                                             |
+| --------------------------------------------------------------------------- | ------------ | -------------------------------------------------------------------------------------- |
+| Lockr's ID5 EID is only in `ortb2`, which `getUserIdsAsEids()` misses       | #1246        | Dependency on the EID fidelity collector stated; capture-once note, 12.2; G10 test, 13 |
+| The first `/auction` can leave before the Lockr response sets `ts-eids-s`   | #1260 review | Open question 3, 15; race metric in rollout step 1, 14                                 |
+| A header-only GPP string (`DBAA`) blocked capture                           | #1260 review | Stated in 9.1; consent test, 13                                                        |
+| Capture defaulted to on                                                     | #1260 review | `capture_enabled`, default `false`, 4.7, 8, 10.1, 10.2, 14                             |
+| Owner, partner entry and pull sync prerequisites were implicit              | #1260 review | Capture provider checklist, 14                                                         |
+| The handoff cookie's lifetime differed from `ts-eids-s`                     | #1260        | Decisions log row, 16                                                                  |
+| A replayed `ts-ec` could enrich, strip or tombstone a row through the proxy | #1260 review | Real-browser gate on capture effects, G12, 4.7, 5.6, 6.2, 8, 13                        |
+| Global revoke had no operator gate                                          | #1260        | `revoke_scope`, default `"provider"`, 5.1, 8, 10.1, 10.2, 12.2, 13                     |
+| Cookie keys came from `ec.passphrase` and could not rotate                  | #1260        | Dedicated rotating keys, re-seal, retention, 6.2, 9.3, 10.1, 10.2, 13, 14              |
