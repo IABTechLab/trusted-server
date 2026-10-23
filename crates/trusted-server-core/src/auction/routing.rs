@@ -574,6 +574,7 @@ mod tests {
 
     fn provider(profile: &str, routing: RoutingMode) -> ProviderConfig {
         ProviderConfig {
+            allow_insecure_http: false,
             protocol: "openrtb-2.6".to_string(),
             profile: profile.to_string(),
             endpoint: format!("https://{profile}.example.test/openrtb"),
