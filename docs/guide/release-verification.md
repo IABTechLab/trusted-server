@@ -333,14 +333,13 @@ tags and approve tag-push authority and required checks. Immutability remains a
 human precondition. Set repository variable `RELEASE_PUBLICATION_ENABLED=true` only after confirming those settings with the read-only commands below. Without it, both signing and publication are skipped; an early tag push creates no public attestations. There is no repository-administration token or prepublication settings API call, following the reviewed decision to check the published release instead. A
 violation can expose a mutable release before the workflow reports failure.
 
-Tags containing `-` publish as prereleases with Latest disabled; stable tags publish as normal releases. Whether to authorize tags from rc branches is a maintainer decision; the Phase 2 ancestry/ruleset validator is not implemented here.
+Tags containing `-` publish as prereleases and never become Latest. Stable tags publish as normal releases with `make_latest: legacy`; GitHub chooses Latest by version/date rather than forcing a backport release to Latest. Whether to authorize tags from rc branches is a maintainer decision; the Phase 2 ancestry/ruleset validator is not implemented here.
 
 Publication lists releases, including drafts, and refuses every existing
 matching tag. It creates one draft, retains its release ID, and binds uploads
 and the final publish mutation to that ID. It checks the exact signing-approved asset
 set, validates each upload response's size and SHA-256 digest before publication,
-and checks immutable membership after publication. Re-downloading uploaded bytes
-and the reviewed publication owner remain additive later work. There are no
+and checks immutable membership after publication. Published assets are then re-downloaded and byte-compared against the signed `SHA256SUMS` and validated handoff. The reviewed publication owner remains additive later work. There are no
 automatic mutation retries or draft-resume claims.
 
 Only post-publish reads may retry: release/asset metadata GETs and the GitHub
