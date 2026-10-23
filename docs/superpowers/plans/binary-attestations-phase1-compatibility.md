@@ -1,6 +1,6 @@
 # Phase 1 compatibility audit and approved alignment
 
-**Audit baseline:** reviewed #1262 at `122b78664b1235c717e9208fd200f9a9b0c335df` versus #1435 at `4dd217125c6e38055e4bcb2cba32c0b95e739914`. The table records the audit of those commits. The approved status below supersedes earlier implementation suggestions in the audit; work in progress is not a claim of completed release qualification. The published SBOM format is **SPDX 2.3**. Rehearsal `.4` passed at `922c2211c`; the rehearsal history below records earlier outcomes.
+**Audit baseline:** reviewed #1262 at `122b78664b1235c717e9208fd200f9a9b0c335df` versus #1435 at `4dd217125c6e38055e4bcb2cba32c0b95e739914`. The table records the audit of those commits. The approved status below supersedes earlier implementation suggestions in the audit; work in progress is not a claim of completed release qualification. The published SBOM format is **SPDX 2.3**. Rehearsal `.5` passed at `937214a632f9387601dba94f996de78b2e6ee424`; the rehearsal history below records earlier outcomes.
 
 **Conclusion:** the original Phase 1 signer path and CycloneDX public format would have required a later breaking policy replacement. Fix those now. Phase 1 is the first implementation slice of the existing contract: retain its public names, signer/caller distinction, SPDX semantics and original policy files. Introduce no competing release-index schema or weakened consumer policy.
 
@@ -18,13 +18,14 @@ unchanged; the phasing sections describe this slice and its rehearsal outcome. T
 Phase 1 audit baseline is `4dd217125c6e38055e4bcb2cba32c0b95e739914`; the
 following corrections are implemented in this slice, with verification and
 rehearsal tracked in the PR description at its current commit. Signing and
-immutable publication rehearsal `.4` passed at `922c2211c`; see the
-[full verification transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6346483024).
+immutable publication rehearsal `.5` passed at `937214a632f9387601dba94f996de78b2e6ee424`; see the
+[full verification transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6357357438).
 
 The current correction aligns the local input-free `release-build.yml` signer
-with the `release.yml` caller/publisher, real SPDX 2.3 documents, all eight
-named bundles, the existing four binary names and `SHA256SUMS`: 17 assets.
-Provenance covers each real binary and SPDX document; no missing evidence
+with the `release.yml` caller/publisher, real SPDX 2.3 documents, fourteen
+named bundles, seven binary names and `SHA256SUMS`: 29 assets. Each binary has
+provenance and an SPDX predicate attestation; each signed SPDX predicate matches
+its published companion. No missing evidence
 subjects, index, inventory, recipe or rebuild results are fabricated. Exact
 artifact selection and signing-approved digest checks replace wildcard merging.
 The publisher lists all releases including drafts, refuses a matching tag,
@@ -36,7 +37,7 @@ three descriptive Axum entries below; all three policies still have **no Phase 1
 readers**. Checked cohort selection, a supplemental tool policy, environment
 normalization/remapping, stricter tag/source validation, uploaded-byte re-download,
 macOS 13 targeting, full platform qualification and CLI immutable build facts
-are additive later work. The next batch adds UBI GNU glibc 2.34 checks and
+are additive later work. This slice includes UBI GNU glibc 2.34 checks and
 startup smokes, while retaining the macOS 15.0 deployment target; copying a
 destination policy alone never establishes its qualification requirements. Native reproduction is a later measurement, not a
 Phase 1 release gate. Full Task 16 resume/reconciliation remains deferred.
@@ -117,11 +118,11 @@ qualified evidence.
 
 ### Approved seven-binary Axum extension
 
-The next implementation batch deliberately extends the frozen cohort from four
+This implementation extends the frozen cohort from four
 to **seven binaries / 29 release files**, retaining all four original names.
 Rehearsal `.4` at `922c2211c` proves only the original four-binary/17-file
-implementation. The seven-binary batch requires fresh rehearsal `.5`; it is not
-claimed rehearsed by the `.4` evidence.
+implementation. Rehearsal `.5` passed for the seven-binary implementation at
+`937214a632f9387601dba94f996de78b2e6ee424`; the `.4` evidence is not reused for the expanded cohort.
 
 The exact cohort diff is three appended records, all default features, empty
 extra features, `variant: default`, `assurance_profile: provenance-sbom`,
@@ -214,9 +215,21 @@ valid.
   and [offline/local runtime proof](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6346428668).
   Bounded read-only retries were present, but no transient retry was observed.
 
+- `v0.0.0-rehearsal.5` at `937214a632f9387601dba94f996de78b2e6ee424`:
+  all seven builds/signing jobs, immutable publication and post-publish checks
+  passed. Independent GitHub CLI 2.102.0 verification passed all 29 asset checks,
+  28 checksum entries, both predicates and signer checks for all seven binaries,
+  and seven SPDX predicate comparisons. Offline verification passed under
+  OS-enforced network denial; Viceroy 0.21.0 served a configured page from the
+  verified wasm with the exact source header. GNU runtime image checks, native
+  ARM startup and static-musl Alpine/scratch-like checks passed with explicit
+  runtime CA data. See the [online transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6357357438),
+  [offline proof](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6357351810) and
+  [build/local runtime proof](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6357352104).
+
 The exact rehearsed implementation SHA above is retained even when later
 commits change documentation only. This documentation update does not change
 workflows, scripts, tests or release bytes.
 
-The immutable `.2`, `.3` and `.4` releases remain intact; no drafts remain from
+The immutable `.2`, `.3`, `.4` and `.5` releases remain intact; no drafts remain from
 these rehearsals. No upstream tags, releases or repository settings were changed.

@@ -80,8 +80,9 @@ The cohort records this explicit extension, but tools/policy and the frozen v1
 index schema remain unchanged. Phase 1 emits no index. The later index/consumer
 slices need a reviewed seven-artifact amendment, including new target/capability
 forms; see the [compatibility audit](../plans/binary-attestations-phase1-compatibility.md)
-and slice-map annotations. Rehearsal `.4` covers the original four assets only;
-the expanded implementation requires rehearsal `.5`.
+and slice-map annotations. Rehearsal `.5` passed for the seven-binary implementation at
+`937214a632f9387601dba94f996de78b2e6ee424`; the compatibility audit records the complete evidence.
+Rehearsal `.4` remains historical evidence for the original four assets only.
 
 The phase labels on requirement headings below apply only to the reduced Phase 1 subset described above; all additional clauses and requirements marked Phase 2+ remain deferred. The original assurance profiles, custom verifier, retained evidence graph and reproduction gates do not block the first Phase 1 release. The [implementation plan](../plans/2026-10-13-attested-release-implementation.md#phasing--2026-10-22) contains the acceptance mapping and exhaustive slice inventory.
 

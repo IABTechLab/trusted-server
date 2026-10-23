@@ -17,17 +17,20 @@ The cohort records this explicit extension, but tools/policy and the frozen v1
 index schema remain unchanged. Phase 1 emits no index. The later index/consumer
 slices need a reviewed seven-artifact amendment, including new target/capability
 forms; see the [compatibility audit](binary-attestations-phase1-compatibility.md)
-and slice-map annotations. Rehearsal `.4` covers the original four assets only;
-the expanded implementation requires rehearsal `.5`.
+and slice-map annotations. Rehearsal `.5` passed for the seven-binary implementation at
+`937214a632f9387601dba94f996de78b2e6ee424`; the compatibility audit records the complete evidence.
+Rehearsal `.4` remains historical evidence for the original four assets only.
 
 The phase labels on requirement headings below apply only to the reduced Phase 1 subset described above; all additional clauses and requirements marked Phase 2+ remain deferred. The original assurance profiles, custom verifier, retained evidence graph and reproduction gates do not block the first Phase 1 release. The [implementation plan](../plans/2026-10-13-attested-release-implementation.md#phasing--2026-10-22) contains the acceptance mapping and exhaustive slice inventory.
 
-Rehearsal `.4` passed at exact implementation SHA
-`922c2211c0cc7941bfc8ffa9f775ef8ac0971232`; see the
-[full online transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6346483024)
-and [offline/local runtime proof](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6346428668).
-Rehearsal `.4` covers that four-binary implementation only; the seven-binary
-changes require new CI and rehearsal evidence.
+Rehearsal `.5` passed at exact implementation SHA
+`937214a632f9387601dba94f996de78b2e6ee424`; see the
+[full online transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6357357438),
+[offline proof](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6357351810)
+and [local runtime proof](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6357352104).
+All seven builds/signing jobs, 29 immutable release assets, 28 checksum entries,
+both predicates/signer checks, seven SPDX comparisons and startup smokes passed.
+Later documentation-only heads retain this exact rehearsed implementation SHA.
 
 ### Phase 1 implementation checklist
 
@@ -41,8 +44,8 @@ changes require new CI and rehearsal evidence.
 | #1235 acceptance item                                 | Phase 1 evidence                                                                 |
 | ----------------------------------------------------- | -------------------------------------------------------------------------------- |
 | Reviewed spec and compile-time input list             | Retained R-CONFIG/R-INPUTS, this phasing section; #1262 review history           |
-| Tag publishes immutable binaries, SBOMs and checksums | release.yml caller/publisher and release-build.yml signer; rehearsal `.4` passed |
-| Provenance, SBOM predicate and asset verification     | release-verification.md; rehearsal `.4` verification passed                      |
+| Tag publishes immutable binaries, SBOMs and checksums | release.yml caller/publisher and release-build.yml signer; rehearsal `.5` passed |
+| Provenance, SBOM predicate and asset verification     | release-verification.md; rehearsal `.5` verification passed                      |
 | Fresh JS; fail missing npm/install/skip               | Existing main build.rs plus clean npm ci and release preflight                   |
 | Deploy exact bytes                                    | Manual verified Fastly package route; no reproducibility claim                   |
 | Immutable setting and protected tags                  | Maintainer gate; no setting changes by this PR                                   |

@@ -40,8 +40,8 @@ request initialization. Every Axum smoke mounts the runner's system CA
 bundle read-only at `/ca.pem` with `SSL_CERT_FILE=/ca.pem`; production operators
 must supply their own runtime trust store. This is runtime data, not an embedded
 configuration or dynamically linked library.
-The expanded seven-binary batch awaits hosted CI and rehearsal `.5`; `.4`
-proves only the original four binaries. Native
+The seven-binary implementation passed hosted CI and [rehearsal `.5`](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6357357438)
+at `937214a632f9387601dba94f996de78b2e6ee424`; `.4` proves only the original four binaries. Native
 libraries and provider tools needed by individual `ts` commands retain their
 existing prerequisites. Cloudflare, Spin, Windows and Linux ARM64 CLI releases follow separately.
 
@@ -312,9 +312,9 @@ EdgeZero prepared-payload deployment and operation recovery are later phases.
 
 ### Local runtime evidence
 
-The [rehearsal runtime transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6346428668)
+The [rehearsal runtime transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6357352104)
 records local execution of the verified Fastly wasm at
-`922c2211c0cc7941bfc8ffa9f775ef8ac0971232` using pinned Viceroy 0.21.0.
+`937214a632f9387601dba94f996de78b2e6ee424` using pinned Viceroy 0.21.0.
 It uses the example configuration with loopback publisher/origin values,
 public development secrets and a local Node origin fixture. A real page request
 returned HTTP 200, the fixture marker, injected JS and the full source SHA in
