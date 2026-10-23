@@ -1011,6 +1011,9 @@ type TrustedServerRequest = {
 
 type PrebidUserIdEid = {
   source?: unknown;
+  inserter?: unknown;
+  matcher?: unknown;
+  mm?: unknown;
   uids?: Array<{ id?: unknown; atype?: unknown; ext?: unknown }>;
 };
 
@@ -1907,7 +1910,18 @@ function collectAuctionEids(): AuctionEid[] | undefined {
       continue;
     }
 
-    eids.push({ source: eid.source, uids });
+    const sanitized: AuctionEid = { source: eid.source, uids };
+    if (typeof eid.inserter === 'string') sanitized.inserter = eid.inserter;
+    if (typeof eid.matcher === 'string') sanitized.matcher = eid.matcher;
+    if (
+      typeof eid.mm === 'number' &&
+      Number.isInteger(eid.mm) &&
+      eid.mm >= -2147483648 &&
+      eid.mm <= 2147483647
+    ) {
+      sanitized.mm = eid.mm;
+    }
+    eids.push(sanitized);
   }
 
   return eids.length > 0 ? eids : undefined;

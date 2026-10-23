@@ -14,7 +14,8 @@
 
 # --- Build stage ---
 ARG NODE_VERSION
-FROM node:${NODE_VERSION}-alpine AS builder
+ARG DOCKER_LIBRARY=docker.io/library
+FROM ${DOCKER_LIBRARY}/node:${NODE_VERSION}-alpine AS builder
 
 WORKDIR /app
 
@@ -27,7 +28,7 @@ COPY app/ ./app/
 RUN npm run build
 
 # --- Runtime stage ---
-FROM node:${NODE_VERSION}-alpine AS runner
+FROM ${DOCKER_LIBRARY}/node:${NODE_VERSION}-alpine AS runner
 
 WORKDIR /app
 

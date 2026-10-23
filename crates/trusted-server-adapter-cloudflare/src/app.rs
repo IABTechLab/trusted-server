@@ -643,8 +643,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             .get("/_ts/admin/ec/{id}", |_ctx: RequestContext| async {
                 Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
             })
-            // Admin EIDs echo: pure request inspection (no KV), so this
-            // adapter serves the real handler.
+            // Keep the authenticated diagnostic local; do not route it to publisher fallback.
             .get(
                 "/_ts/admin/eids",
                 make_handler(Arc::clone(&state), |s, _services, req| async move {

@@ -15,6 +15,7 @@ use trusted_server_core::cache_policy::{EdgeCacheHeader, cache_control_headers_h
 use trusted_server_core::constants::HEADER_X_TS_VERSION;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::ec_finalize_response;
+use trusted_server_core::ec::identity::{IdentityEffects, send_then_apply_identity};
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::pull_sync::{
     PullSyncContext, build_pull_sync_context, dispatch_pull_sync,
@@ -509,12 +510,14 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
         if let Some(settings) = settings_snapshot.as_deref() {
             match apply_edgezero_ec_finalize(settings, &mut ec_state, &mut response) {
                 Ok(partner_registry) => {
-                    send_edgezero_response(
+                    send_identity_response(
                         response,
                         request_filter_effects.as_ref(),
                         counters.as_ref(),
+                        settings,
+                        &partner_registry,
+                        &mut ec_state,
                     );
-                    run_edgezero_pull_sync_after_send(settings, &partner_registry, &ec_state);
                     return;
                 }
                 Err(e) => {
@@ -528,15 +531,13 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
                 Ok(settings) => {
                     match apply_edgezero_ec_finalize(&settings, &mut ec_state, &mut response) {
                         Ok(partner_registry) => {
-                            send_edgezero_response(
+                            send_identity_response(
                                 response,
                                 request_filter_effects.as_ref(),
                                 counters.as_ref(),
-                            );
-                            run_edgezero_pull_sync_after_send(
                                 &settings,
                                 &partner_registry,
-                                &ec_state,
+                                &mut ec_state,
                             );
                             return;
                         }
@@ -608,11 +609,31 @@ fn apply_edgezero_ec_finalize(
         &mut ec_state.ec_context,
         finalize_kv_graph.as_ref(),
         &partner_registry,
-        ec_state.eids_cookie.as_deref(),
         ec_state.sharedid_cookie.as_deref(),
         response,
     );
     Ok(partner_registry)
+}
+
+/// Keeps capture effects through cookie finalization, then consumes them after send.
+fn send_identity_response(
+    mut response: HttpResponse,
+    filters: Option<&RequestFilterEffects>,
+    counters: Option<&SandboxCounters>,
+    settings: &Settings,
+    partners: &PartnerRegistry,
+    state: &mut EcFinalizeState,
+) {
+    let effects = response.extensions_mut().remove::<IdentityEffects>();
+    if send_then_apply_identity(
+        effects,
+        &mut state.ec_context,
+        partners,
+        || send_edgezero_response(response, filters, counters),
+        || require_identity_graph(settings).ok(),
+    ) {
+        run_edgezero_pull_sync_after_send(settings, partners, state);
+    }
 }
 
 fn run_edgezero_pull_sync_after_send(

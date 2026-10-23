@@ -93,6 +93,9 @@ pub(crate) fn canonical_parity_auction_request() -> AuctionRequest {
                 ..Default::default()
             }),
             eids: Some(vec![Eid {
+                inserter: None,
+                matcher: None,
+                mm: None,
                 source: "identity.example".to_string(),
                 uids: vec![Uid {
                     id: "fictional-uid".to_string(),

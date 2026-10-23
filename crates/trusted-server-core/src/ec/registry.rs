@@ -28,6 +28,8 @@ pub struct PartnerConfig {
     pub openrtb_atype: i32,
     /// Whether this partner's UIDs appear in auction `user.eids`.
     pub bidstream_enabled: bool,
+    /// Selected authoritative integration, when managed acquisition owns this source.
+    pub identity_owner: Option<String>,
     /// SHA-256 hex of the partner's API token, when inbound API access is enabled.
     pub api_key_hash: Option<String>,
     /// Max batch sync API requests per partner per minute.
@@ -239,7 +241,7 @@ impl PartnerRegistry {
     pub fn pull_enabled_partners(&self) -> Vec<&PartnerConfig> {
         self.by_source_domain
             .values()
-            .filter(|p| p.pull_sync_enabled)
+            .filter(|p| p.pull_sync_enabled && p.identity_owner.is_none())
             .collect()
     }
 
@@ -304,6 +306,7 @@ fn build_partner_config(
         pull_sync_allowed_domains: partner.pull_sync_allowed_domains.clone(),
         pull_sync_ttl_sec: partner.pull_sync_ttl_sec,
         pull_sync_rate_limit: partner.pull_sync_rate_limit,
+        identity_owner: partner.identity_owner.clone(),
         ts_pull_token: partner.ts_pull_token.clone(),
     }
 }
@@ -431,6 +434,7 @@ mod tests {
             pull_sync_allowed_domains: vec![],
             pull_sync_ttl_sec: EcPartner::default_pull_sync_ttl_sec(),
             pull_sync_rate_limit: EcPartner::default_pull_sync_rate_limit(),
+            identity_owner: None,
             ts_pull_token: None,
         }
     }

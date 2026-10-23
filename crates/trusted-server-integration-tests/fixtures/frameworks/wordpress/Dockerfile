@@ -9,7 +9,8 @@
 # Run manually:
 #   docker run -p 8080:80 test-wordpress:latest
 
-FROM php:8.3-cli-alpine
+ARG DOCKER_LIBRARY=docker.io/library
+FROM ${DOCKER_LIBRARY}/php:8.3-cli-alpine
 
 WORKDIR /var/www/html
 

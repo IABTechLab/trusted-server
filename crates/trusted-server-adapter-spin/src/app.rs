@@ -645,8 +645,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             Ok::<Response, EdgeError>(admin_ec_lookup_not_supported())
         };
 
-        // Admin EIDs echo: pure request inspection (no KV), so this adapter
-        // serves the real handler.
+        // Keep the authenticated diagnostic local; do not route it to publisher fallback.
         let s = Arc::clone(&state);
         let admin_eids_handler = move |ctx: RequestContext| {
             let s = Arc::clone(&s);
@@ -654,7 +653,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 let req = ctx.into_request();
                 let result = PartnerRegistry::from_config(&s.settings.ec.partners)
                     .and_then(|registry| handle_admin_eids_lookup(&registry, &req));
-                Ok::<Response, EdgeError>(result.unwrap_or_else(|e| http_error(&e)))
+                Ok::<Response, EdgeError>(result.unwrap_or_else(|error| http_error(&error)))
             }
         };
 
