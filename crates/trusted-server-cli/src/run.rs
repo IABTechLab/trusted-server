@@ -1,10 +1,12 @@
 use std::process;
+use std::sync::LazyLock;
 
 use clap::{Parser, Subcommand};
 use edgezero_cli::args::{
     ActiveVersionArgs, AuthArgs, BuildArgs, ConfigDiffArgs, ConfigGcArgs, ConfigPushArgs,
     ConfigValidateArgs, DeployArgs, HealthcheckArgs, ProvisionArgs, RollbackArgs, ServeArgs,
 };
+use trusted_server_core::build_info::{BuildInfo, BuildVariant};
 use trusted_server_core::config::TrustedServerAppConfig;
 
 use crate::commands::audit::{AuditArgs, run_audit};
@@ -13,8 +15,25 @@ use crate::commands::config::init::{ConfigInitArgs, run_config_init};
 use crate::commands::pbs::{self, PbsArgs};
 use crate::prebid_bundle::{NpmPrebidBundleGenerator, PrebidBundleArgs, run_bundle};
 
+/// Immutable facts compiled into the owning CLI product.
+pub const BUILD_INFO: BuildInfo = BuildInfo::new(
+    env!("CARGO_PKG_VERSION"),
+    env!("TRUSTED_SERVER__BUILD_TARGET"),
+    BuildVariant::Default,
+);
+
+static VERSION_TEXT: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "package={} source={} target={} variant={}",
+        BUILD_INFO.package_version(),
+        BUILD_INFO.source().unwrap_or("unknown"),
+        BUILD_INFO.target(),
+        BUILD_INFO.variant()
+    )
+});
+
 #[derive(Debug, Parser)]
-#[command(name = "ts", version, about = "Trusted Server CLI")]
+#[command(name = "ts", version = VERSION_TEXT.as_str(), about = "Trusted Server CLI")]
 struct Args {
     #[command(subcommand)]
     command: Command,

@@ -1,0 +1,166 @@
+name: Release build and signing
+on:
+  workflow_call:
+permissions:
+  contents: read
+jobs:
+  checks:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - run: node --test scripts/release/phase1.test.mjs
+  build:
+    needs: checks
+    name: Build ${{ matrix.asset }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            package: trusted-server-adapter-fastly
+            target: wasm32-wasip1
+            asset: trusted-server-fastly.wasm
+          - os: ubuntu-24.04
+            package: trusted-server-cli
+            target: x86_64-unknown-linux-gnu
+            asset: ts-x86_64-unknown-linux-gnu
+          - os: macos-15
+            package: trusted-server-cli
+            target: aarch64-apple-darwin
+            asset: ts-aarch64-apple-darwin
+          - os: macos-15-intel
+            package: trusted-server-cli
+            target: x86_64-apple-darwin
+            asset: ts-x86_64-apple-darwin
+          - os: ubuntu-24.04
+            package: trusted-server-adapter-axum
+            target: x86_64-unknown-linux-gnu
+            asset: trusted-server-axum-x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04
+            package: trusted-server-adapter-axum
+            target: x86_64-unknown-linux-musl
+            asset: trusted-server-axum-x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            package: trusted-server-adapter-axum
+            target: aarch64-unknown-linux-gnu
+            asset: trusted-server-axum-aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: Read pinned toolchains
+        id: tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "node=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+          echo "rust=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: ${{ steps.tools.outputs.node }}
+      - name: Install the pinned Rust toolchain without build caches
+        env:
+          RUST_VERSION: ${{ steps.tools.outputs.rust }}
+          BUILD_TARGET: ${{ matrix.target }}
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal --target "$BUILD_TARGET"
+      - name: Build and generate the build inventory in a clean environment
+        shell: bash
+        env:
+          BUILD_PACKAGE: ${{ matrix.package }}
+          BUILD_TARGET: ${{ matrix.target }}
+          RELEASE_ASSET: ${{ matrix.asset }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          env -i PATH="$PATH" HOME="$HOME" \
+            CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
+            RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
+            TMPDIR="${TMPDIR:-/tmp}" RUNNER_TEMP="$RUNNER_TEMP" \
+            SOURCE_COMMIT="$SOURCE_COMMIT" RELEASE_VERSION="$RELEASE_VERSION" \
+            bash scripts/release/phase1-build.sh "$BUILD_PACKAGE" "$BUILD_TARGET" "$RELEASE_ASSET"
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: release-${{ matrix.asset }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+
+  sign:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && vars.RELEASE_PUBLICATION_ENABLED == 'true'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        asset:
+          [
+            trusted-server-axum-x86_64-unknown-linux-gnu,
+            trusted-server-axum-x86_64-unknown-linux-musl,
+            trusted-server-axum-aarch64-unknown-linux-gnu,
+            trusted-server-fastly.wasm,
+            ts-aarch64-apple-darwin,
+            ts-x86_64-apple-darwin,
+            ts-x86_64-unknown-linux-gnu,
+          ]
+    steps:
+      # Only fixed inline checks execute here; never checkout or execute build inputs.
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: release-${{ matrix.asset }}
+          path: release-assets
+      - name: Validate signing inputs and retain their digests
+        env:
+          ASSET: ${{ matrix.asset }}
+        run: |
+          set -euo pipefail
+          cd release-assets
+          test "$(find . -mindepth 1 -maxdepth 1 | wc -l)" -eq 2
+          for file in "$ASSET" "$ASSET.spdx.json"; do test -f "$file" && test ! -L "$file" && test -s "$file"; done
+          sha256sum "$ASSET" "$ASSET.spdx.json" > ../inputs.sha256
+      - name: Attest SLSA build provenance
+        id: provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: |
+            release-assets/${{ matrix.asset }}
+            release-assets/${{ matrix.asset }}.spdx.json
+      - name: Attest the binary's SPDX SBOM
+        id: sbom
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: release-assets/${{ matrix.asset }}
+          sbom-path: release-assets/${{ matrix.asset }}.spdx.json
+      - name: Retain only this run's real bundles and signed-input digests
+        env:
+          ASSET: ${{ matrix.asset }}
+          PROVENANCE: ${{ steps.provenance.outputs.bundle-path }}
+          SBOM: ${{ steps.sbom.outputs.bundle-path }}
+        run: |
+          set -euo pipefail
+          (cd release-assets && sha256sum --check ../inputs.sha256)
+          test -s "$PROVENANCE" && test -s "$SBOM"
+          mkdir signed-assets
+          cp "$PROVENANCE" "signed-assets/$ASSET.provenance.sigstore.json"
+          cp "$SBOM" "signed-assets/$ASSET.sbom.sigstore.json"
+          cp inputs.sha256 signed-assets/SHA256SUMS
+          (cd signed-assets && sha256sum "$ASSET.provenance.sigstore.json" "$ASSET.sbom.sigstore.json" >> SHA256SUMS)
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: signed-${{ matrix.asset }}
+          path: signed-assets/*
+          if-no-files-found: error
+          retention-days: 7

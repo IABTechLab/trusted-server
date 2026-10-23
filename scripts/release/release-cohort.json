@@ -1,0 +1,133 @@
+{
+  "artifacts": [
+    {
+      "assurance_profile": "provenance-sbom-repeatable",
+      "bin": "trusted-server-adapter-fastly",
+      "capabilities": ["fastly-production"],
+      "compatibility": {
+        "architecture": "wasm32",
+        "minimum_version": "wasip1",
+        "runtime": "fastly-compute"
+      },
+      "default_features": true,
+      "features": [],
+      "kind": "wasm-core",
+      "name": "trusted-server-fastly.wasm",
+      "package": "trusted-server-adapter-fastly",
+      "role": "server",
+      "target": "wasm32-wasip1",
+      "variant": "default"
+    },
+    {
+      "assurance_profile": "provenance-sbom",
+      "bin": "ts",
+      "capabilities": ["cli-execute"],
+      "compatibility": {
+        "architecture": "aarch64",
+        "minimum_version": "13.0",
+        "runtime": "macos"
+      },
+      "default_features": true,
+      "features": [],
+      "kind": "native-executable",
+      "name": "ts-aarch64-apple-darwin",
+      "package": "trusted-server-cli",
+      "role": "operator-cli",
+      "target": "aarch64-apple-darwin",
+      "variant": "default"
+    },
+    {
+      "assurance_profile": "provenance-sbom",
+      "bin": "ts",
+      "capabilities": ["cli-execute"],
+      "compatibility": {
+        "architecture": "x86_64",
+        "minimum_version": "13.0",
+        "runtime": "macos"
+      },
+      "default_features": true,
+      "features": [],
+      "kind": "native-executable",
+      "name": "ts-x86_64-apple-darwin",
+      "package": "trusted-server-cli",
+      "role": "operator-cli",
+      "target": "x86_64-apple-darwin",
+      "variant": "default"
+    },
+    {
+      "assurance_profile": "provenance-sbom",
+      "bin": "ts",
+      "capabilities": ["cli-execute"],
+      "compatibility": {
+        "architecture": "x86_64",
+        "minimum_version": "glibc-2.34",
+        "runtime": "linux-gnu"
+      },
+      "default_features": true,
+      "features": [],
+      "kind": "native-executable",
+      "name": "ts-x86_64-unknown-linux-gnu",
+      "package": "trusted-server-cli",
+      "role": "operator-cli",
+      "target": "x86_64-unknown-linux-gnu",
+      "variant": "default"
+    },
+    {
+      "assurance_profile": "provenance-sbom",
+      "bin": "trusted-server-axum",
+      "capabilities": ["axum-production"],
+      "compatibility": {
+        "architecture": "x86_64",
+        "minimum_version": "glibc-2.34",
+        "runtime": "linux-gnu"
+      },
+      "default_features": true,
+      "features": [],
+      "kind": "native-executable",
+      "name": "trusted-server-axum-x86_64-unknown-linux-gnu",
+      "package": "trusted-server-adapter-axum",
+      "role": "server",
+      "target": "x86_64-unknown-linux-gnu",
+      "variant": "default"
+    },
+    {
+      "assurance_profile": "provenance-sbom",
+      "bin": "trusted-server-axum",
+      "capabilities": ["axum-production"],
+      "compatibility": {
+        "architecture": "x86_64",
+        "minimum_version": "static",
+        "runtime": "linux-musl"
+      },
+      "default_features": true,
+      "features": [],
+      "kind": "native-executable",
+      "name": "trusted-server-axum-x86_64-unknown-linux-musl",
+      "package": "trusted-server-adapter-axum",
+      "role": "server",
+      "target": "x86_64-unknown-linux-musl",
+      "variant": "default"
+    },
+    {
+      "assurance_profile": "provenance-sbom",
+      "bin": "trusted-server-axum",
+      "capabilities": ["axum-production"],
+      "compatibility": {
+        "architecture": "aarch64",
+        "minimum_version": "glibc-2.34",
+        "runtime": "linux-gnu"
+      },
+      "default_features": true,
+      "features": [],
+      "kind": "native-executable",
+      "name": "trusted-server-axum-aarch64-unknown-linux-gnu",
+      "package": "trusted-server-adapter-axum",
+      "role": "server",
+      "target": "aarch64-unknown-linux-gnu",
+      "variant": "default"
+    }
+  ],
+  "cohort": "phase1-fastly-cli",
+  "eligible_branches": ["main"],
+  "schema_version": 1
+}
