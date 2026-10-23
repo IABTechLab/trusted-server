@@ -1722,6 +1722,13 @@ Each `[[integrations.js_asset_proxy.assets]]` entry:
 | `rewrite_sdk_host`  | Boolean or null | `null`                                              | Deprecated compatibility input       |
 | `origin_override`   | URL or null     | `null`                                              | Optional upstream `Origin` override  |
 
+The dedicated trust-server SDK routes API requests through `/integrations/lockr/api`.
+A browser guard resolves root-relative Lockr XHR API URLs against the page origin,
+independently of any `<base href>`. It leaves other request URLs unchanged.
+Trusted Server no longer rewrites the SDK API host. Custom `sdk_url` builds must
+route their own API requests through the first-party proxy; builds that depended
+on the removed SDK-host shim need migration.
+
 See [lockr](/guide/integrations/lockr).
 
 ### Prebid Integration
