@@ -17,8 +17,11 @@ import type {
   TsjsApi,
 } from '../../core/types';
 import {
+  APS_RENDER_FAILED_MESSAGE,
   APS_UNIVERSAL_CREATIVE_RENDERER,
   APS_UNIVERSAL_CREATIVE_RENDERER_VERSION,
+  RENDERER_READY_TIMEOUT_MS,
+  apsRenderFailureReason,
   apsRendererUrl,
   dispatchApsRendering,
   consumeApsPrebidRenderer,
@@ -1901,11 +1904,23 @@ function safelyRecordCreativeFailure(
   }
 }
 
+/**
+ * A consumed APS ad ID, retained as a security tombstone.
+ *
+ * `adUnitCode` is kept so a failure relayed later by the creative frame can be
+ * source-checked against the ad unit the capability was served to, rather than
+ * trusted because it names a live ad ID.
+ */
+interface ApsConsumedTombstone {
+  expiresAt: number;
+  adUnitCode: string;
+}
+
 /** Maximum number of consumed APS Prebid IDs retained as security tombstones. */
 const MAX_CONSUMED_PREBID_APS_IDS = 256;
 
 function pruneConsumedPrebidApsIds(
-  consumedIds: Map<string, { expiresAt: number }>,
+  consumedIds: Map<string, ApsConsumedTombstone>,
   now: number
 ): void {
   for (const [adId, consumed] of consumedIds) {
@@ -1914,7 +1929,7 @@ function pruneConsumedPrebidApsIds(
 }
 
 function hasConsumedPrebidApsIdCapacity(
-  consumedIds: Map<string, { expiresAt: number }>,
+  consumedIds: Map<string, ApsConsumedTombstone>,
   adId: string
 ): boolean {
   if (consumedIds.has(adId) || consumedIds.size < MAX_CONSUMED_PREBID_APS_IDS) return true;
@@ -1924,11 +1939,20 @@ function hasConsumedPrebidApsIdCapacity(
 }
 
 function recordConsumedPrebidApsId(
-  consumedIds: Map<string, { expiresAt: number }>,
+  consumedIds: Map<string, ApsConsumedTombstone>,
   adId: string,
-  expiresAt: number
+  expiresAt: number,
+  adUnitCode: string
 ): void {
-  consumedIds.set(adId, { expiresAt });
+  // A capability consumed with little TTL left would otherwise lose its
+  // tombstone before the renderer frame's timeout relay arrives, dropping the
+  // reason. The frame starts its timer only after the capability round trip, so
+  // the relay lands later than one timeout after consumption: hold the
+  // tombstone for twice that window rather than exactly it. Bounded by the
+  // frame's own timeout so the two cannot drift apart. This also keeps the ad ID
+  // blocked longer, which is the safer direction for a security tombstone.
+  const minimum = Date.now() + 2 * RENDERER_READY_TIMEOUT_MS;
+  consumedIds.set(adId, { expiresAt: Math.max(expiresAt, minimum), adUnitCode });
 }
 
 /**
@@ -1962,7 +1986,7 @@ export function installTsRenderBridge(): void {
   // is scoped to the slot, not the bare adId: hb_adid is not unique per bid, so
   // keying on it alone would let one slot block a distinct slot's render.
   const renderingKeys = new Set<string>();
-  const consumedPrebidApsIds = new Map<string, { expiresAt: number }>();
+  const consumedPrebidApsIds = new Map<string, ApsConsumedTombstone>();
   // One consumed APS ad ID per slot is sufficient: a newer bid replaces the
   // slot's old ad ID in `window.tsjs.bids`, so the ownership guard rejects it.
   const consumedServerApsBySlot = new Map<string, string>();
@@ -1975,6 +1999,47 @@ export function installTsRenderBridge(): void {
           ? (e.data as Record<string, unknown>)
           : (JSON.parse(e.data as string) as Record<string, unknown>);
     } catch {
+      return;
+    }
+
+    // Diagnostics relayed by the APS Universal Creative frame. The creative is
+    // cross-origin, so every field is untrusted: the reason resolves through the
+    // allowlist, and the sender must be a frame inside the ad unit the
+    // capability was served to. Recording only; it never answers the sender.
+    if (data['message'] === APS_RENDER_FAILED_MESSAGE) {
+      const failedAdId = data['adId'];
+      const reason = apsRenderFailureReason(data['reason']);
+      if (typeof failedAdId === 'string' && reason !== undefined) {
+        pruneConsumedPrebidApsIds(consumedPrebidApsIds, Date.now());
+        const tombstone = consumedPrebidApsIds.get(failedAdId);
+        let failedSlotId: string | undefined;
+        if (tombstone) {
+          // The Prebid path tombstones the publisher's ad unit code, which can
+          // be a configured prefix rather than a DOM id. The store keys
+          // associations by Trusted Server slot id, so resolve the slot through
+          // the authenticated frame rather than treating the code as a map key:
+          // that resolver handles exact ids, prefixes, and ambiguity, and
+          // `divToSlotId` holds only resolved ids. The capability's own source
+          // check still gates it, so a sender outside the served ad unit is
+          // rejected before the slot is resolved.
+          if (sourceFrameForAdUnit(e.source, tombstone.adUnitCode)) {
+            failedSlotId = slotFrameForMessageSource(e.source)?.slotId;
+          }
+        } else {
+          // Server-side APS winners are served the same renderer and emit the
+          // same relay, but are tracked per slot. `hb_adid` is not unique per
+          // slot, so require the sender to sit in the slot that consumed it.
+          for (const [slotId, consumedAdId] of consumedServerApsBySlot) {
+            if (consumedAdId === failedAdId && sourceFrameForSlotId(e.source, slotId)) {
+              failedSlotId = slotId;
+              break;
+            }
+          }
+        }
+        if (failedSlotId !== undefined) {
+          safelyRecordCreativeFailure(safelyRecordCreativeRequest(failedSlotId), reason);
+        }
+      }
       return;
     }
 
@@ -2008,7 +2073,12 @@ export function installTsRenderBridge(): void {
       const renderer = validateApsRenderer(prebidRendererEntry.renderer);
       if (!renderer || !hasConsumedPrebidApsIdCapacity(consumedPrebidApsIds, adId)) return;
       if (!consumeApsPrebidRenderer(adId, prebidRendererEntry)) return;
-      recordConsumedPrebidApsId(consumedPrebidApsIds, adId, prebidRendererEntry.expiresAt);
+      recordConsumedPrebidApsId(
+        consumedPrebidApsIds,
+        adId,
+        prebidRendererEntry.expiresAt,
+        prebidRendererEntry.adUnitCode
+      );
 
       const markUsed = (): void => {
         try {
