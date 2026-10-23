@@ -4,11 +4,16 @@
 //! selected by configuration, with no default, and [`build_module`] is the
 //! composition root that builds the selected one. A built-in module is
 //! constructed from its `[ec.<name>]` block, and a vendor module is taken
-//! from the adapter that injected it. Construction reads no request data,
-//! so a selection this deployment cannot satisfy fails at startup rather than
-//! leaving it running without an identity. Fastly, Cloudflare and Spin resolve
-//! the module once per application state and thread the result. Axum and
-//! embedders resolve per request.
+//! from the adapter that injected it. A built-in module that also needs a
+//! host service, as the host-signal module needs the [`HostSignals`]
+//! service, is built only on a host that supplies that service. Construction
+//! reads configuration and long-lived services, so a selection this deployment
+//! cannot satisfy fails at startup rather than leaving it running without an
+//! identity. Fastly, Cloudflare and Spin resolve the module once per
+//! application state and thread the result. Axum and embedders resolve per
+//! request. The host-signal module is the exception, being built per request
+//! from that request's TLS and HTTP/2 signals (see
+//! [`is_request_scoped`](EdgeCookieModule::is_request_scoped)).
 //!
 //! Request evidence reaches a module at call time rather than at
 //! construction. [`EdgeCookieModule::generate`] borrows a [`RequestInfo`],
@@ -28,7 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::consent::ConsentContext;
 use crate::error::TrustedServerError;
-use crate::evidence::RequestInfo;
+use crate::evidence::{HostSignals, RequestInfo};
 use crate::redacted::Redacted;
 use crate::settings::{Ec, EcModuleBlock};
 
@@ -113,6 +118,15 @@ impl From<EcModuleSelection> for String {
 /// [`HMAC_MODULE_CODE`].
 pub const HMAC_MODULE_KEY: &str = "hmac";
 
+/// The implementation id of the host-signal module still built into core.
+///
+/// An ordinary id in the same open-ended namespace as [`HMAC_MODULE_KEY`],
+/// spelled exactly the way a vendor crate spells its own, and nothing branches
+/// on it outside the resolution in [`build_module`]. It is also
+/// [`HostSignalModule::id`]'s return value, and it goes with that resolution
+/// arm when the host-signal module becomes a module of its own.
+pub const HOST_SIGNALS_MODULE_KEY: &str = "host_signals";
+
 /// The type folder of every Edge Cookie crate, which a name written in
 /// `[ec] module` or an `implementation` line may leave off.
 pub const MODULE_TYPE: &str = "edgecookie";
@@ -122,7 +136,7 @@ pub const MODULE_TYPE: &str = "edgecookie";
 ///
 /// [`build_module`] refuses an injected module under one of these ids
 /// rather than picking one of the two.
-const BUILTIN_MODULE_KEYS: &[&str] = &[HMAC_MODULE_KEY];
+const BUILTIN_MODULE_KEYS: &[&str] = &[HMAC_MODULE_KEY, HOST_SIGNALS_MODULE_KEY];
 
 /// The registry code of the built-in HMAC module.
 ///
@@ -566,6 +580,23 @@ pub trait EdgeCookieModule: Send + Sync + core::fmt::Debug {
     /// sees its own value part.
     fn code(&self) -> ModuleCode;
 
+    /// Whether this module was built from evidence about one request.
+    ///
+    /// Almost every module is built from configuration and services that are
+    /// the same for every request, so one instance can be resolved once and
+    /// handed to all of them. [`HostSignalModule`] is the exception, because
+    /// it is built from the TLS and HTTP/2 signals of a single request and
+    /// answers `true` here. A composition root reads this through
+    /// [`build_reusable_module`] to decide whether keeping the instance is
+    /// safe, and keeping a request-scoped one would serve every later request
+    /// from the first request's evidence.
+    ///
+    /// The default is `false`, which is right for a module whose constructor
+    /// takes only configuration and long-lived services.
+    fn is_request_scoped(&self) -> bool {
+        false
+    }
+
     /// Derives an Edge Cookie identifier from the request evidence in
     /// `request_info` and the gating context in `input`.
     ///
@@ -677,6 +708,70 @@ impl EdgeCookieModule for HmacModule {
     }
 }
 
+/// The built-in host-signal Edge Cookie module.
+///
+/// Derives the identifier from the host signals (TLS JA4 and HTTP/2, read
+/// from the injected [`HostSignals`]) plus the client IP (from [`RequestInfo`]),
+/// keyed by the configured passphrase. It is host-agnostic: it depends on the
+/// `HostSignals` capability, so any host that supplies one can use it. A host
+/// that supplies no `HostSignals` cannot build it, and the request stops.
+#[derive(Debug, Clone)]
+pub struct HostSignalModule {
+    passphrase: Redacted<String>,
+    host_signals: Arc<dyn HostSignals>,
+}
+
+impl HostSignalModule {
+    /// Creates the module with the passphrase and its injected host signals.
+    #[must_use]
+    pub fn new(passphrase: Redacted<String>, host_signals: Arc<dyn HostSignals>) -> Self {
+        Self {
+            passphrase,
+            host_signals,
+        }
+    }
+}
+
+impl EdgeCookieModule for HostSignalModule {
+    fn id(&self) -> &'static str {
+        HOST_SIGNALS_MODULE_KEY
+    }
+
+    // Built from the signals of one request, so it is only ever valid for
+    // that request and must never be kept and reused.
+    fn is_request_scoped(&self) -> bool {
+        true
+    }
+
+    fn code(&self) -> ModuleCode {
+        crate::module_code!("hs00")
+    }
+
+    fn generate(
+        &self,
+        request_info: &dyn RequestInfo,
+        _input: &IdentityInput<'_>,
+    ) -> Result<GeneratedEdgeCookie, Report<TrustedServerError>> {
+        let ja4 = self.host_signals.ja4().unwrap_or_default();
+        let h2 = self.host_signals.h2().unwrap_or_default();
+        // With no signal at all, creating an identifier would silently degrade
+        // to an IP-only identifier under the `host_signals` name. Defer
+        // instead, meaning no identity this request, and the request proceeds.
+        if ja4.is_empty() && h2.is_empty() {
+            log::warn!("The host_signals EC module found no TLS/HTTP-2 signals and is deferring");
+            return Ok(GeneratedEdgeCookie::default());
+        }
+        let id = generation::generate_hmac_ec_id(
+            self.passphrase.expose(),
+            &[ja4, h2, request_info.client_ip()],
+        )?;
+        Ok(GeneratedEdgeCookie {
+            id: Some(id),
+            response_headers: Vec::new(),
+        })
+    }
+}
+
 /// Refuses an injected module that claims an implementation core supplies
 /// itself.
 ///
@@ -716,23 +811,24 @@ fn ensure_no_name_collision(
 
 /// Builds the Edge Cookie module named by the `[ec] module` selector.
 ///
-/// This is the composition root for the Edge Cookie module. It reads the
-/// `[ec]` configuration and takes the adapter's optional injected module,
-/// resolving the selector to the built-in module or the injected one. The
-/// per-request [`RequestInfo`] is passed borrowed to
-/// [`generate`](EdgeCookieModule::generate) at call time rather than stored,
-/// so no request snapshot is cloned here. Returns `Ok(None)` when no module
-/// is selected, so the caller stays stateless.
+/// This is the composition root for the built-in modules: the adapter supplies
+/// the [`HostSignals`] when the host can produce them, and this constructs the
+/// selected module. The per-request [`RequestInfo`] is passed borrowed to
+/// [`generate`](EdgeCookieModule::generate) at call time rather than stored, so
+/// no request snapshot is cloned here. Returns `Ok(None)` when no module is
+/// selected, so the caller stays stateless.
 ///
 /// # Errors
 ///
 /// Returns [`TrustedServerError::EdgeCookie`] when the named module cannot be
 /// built, which is a built-in implementation whose configuration block is
-/// missing, or an implementation this deployment's adapter does not inject.
-/// Both fail loudly rather than leaving the deployment running stateless under
-/// a selector that says otherwise.
+/// missing, a built-in implementation whose host capability this host does not
+/// supply, or an implementation this deployment's adapter does not inject. All
+/// fail loudly rather than leaving the deployment running stateless under a
+/// selector that says otherwise.
 pub fn build_module(
     ec: &Ec,
+    host_signals: Option<Arc<dyn HostSignals>>,
     injected: Option<Arc<dyn EdgeCookieModule>>,
 ) -> Result<Option<Box<dyn EdgeCookieModule>>, Report<TrustedServerError>> {
     ensure_no_name_collision(injected.as_deref())?;
@@ -742,7 +838,9 @@ pub fn build_module(
     let module: Option<Box<dyn EdgeCookieModule>> = match selection {
         // Explicit statelessness: the same meaning as omitting the selector.
         EcModuleSelection::None => None,
-        EcModuleSelection::Named(name) => Some(resolve_named_module(name, ec, injected)?),
+        EcModuleSelection::Named(name) => {
+            Some(resolve_named_module(name, ec, host_signals, injected)?)
+        }
     };
     Ok(module)
 }
@@ -764,10 +862,12 @@ pub fn build_module(
 ///
 /// Returns [`TrustedServerError::EdgeCookie`] when the implementation matches
 /// no module this deployment can build, naming the implementations it has,
-/// or when a built-in implementation has no configuration block.
+/// when a built-in implementation has no configuration block, or when a
+/// built-in implementation needs a host capability this host does not supply.
 fn resolve_named_module(
     name: &str,
     ec: &Ec,
+    host_signals: Option<Arc<dyn HostSignals>>,
     injected: Option<Arc<dyn EdgeCookieModule>>,
 ) -> Result<Box<dyn EdgeCookieModule>, Report<TrustedServerError>> {
     let implementation = ec.module_blocks.implementation(name);
@@ -791,6 +891,35 @@ fn resolve_named_module(
                 })
             })?;
         return Ok(Box::new(HmacModule::new(config.passphrase.clone())));
+    }
+
+    // The host-signal module needs signals only some hosts supply, and
+    // that check cannot be made in settings validation at all, so it is made
+    // here rather than creating a degraded identifier under this name.
+    if implementation == HOST_SIGNALS_MODULE_KEY {
+        let config = ec
+            .module_blocks
+            .get(name)
+            .and_then(EcModuleBlock::host_signals_settings)
+            .ok_or_else(|| {
+                Report::new(TrustedServerError::EdgeCookie {
+                    message: format!(
+                        "Edge Cookie module `{name}` uses the `host_signals` implementation \
+                         but has no `[ec.{name}]` configuration"
+                    ),
+                })
+            })?;
+        let signals = host_signals.ok_or_else(|| {
+            Report::new(TrustedServerError::EdgeCookie {
+                message: "The host_signals Edge Cookie module requires a host that supplies \
+                          TLS/HTTP-2 signals, which this host does not"
+                    .to_owned(),
+            })
+        })?;
+        return Ok(Box::new(HostSignalModule::new(
+            config.passphrase.clone(),
+            signals,
+        )));
     }
 
     let known = known_implementations(injected.as_deref());
@@ -829,12 +958,18 @@ fn known_implementations(injected: Option<&dyn EdgeCookieModule>) -> String {
 /// by the `[ec] module` selector.
 ///
 /// The composition root calls this while it builds application state, passing
-/// the same injected module it will put into
+/// the same services it will put into
 /// [`RuntimeServices`](crate::platform::RuntimeServices) on every request.
 /// [`build_module`] reads no request data, so the answer is the same for
 /// every request and a selection the adapter can never supply fails at startup
 /// rather than on the first request. A stateless deployment (no selector, or
 /// `"none"`) passes.
+///
+/// `host_signals` answers whether this adapter supplies a [`HostSignals`]
+/// service at all, which is fixed per deployment, rather than what any one
+/// request's signals are. An adapter that injects host signals on every
+/// request passes an instance here even though its values are empty at
+/// startup, and an adapter that never injects them passes `None`.
 ///
 /// # Errors
 ///
@@ -842,31 +977,76 @@ fn known_implementations(injected: Option<&dyn EdgeCookieModule>) -> String {
 /// be built from the services this deployment injects.
 pub fn ensure_module_available(
     ec: &Ec,
+    host_signals: Option<Arc<dyn HostSignals>>,
     injected: Option<Arc<dyn EdgeCookieModule>>,
 ) -> Result<(), Report<TrustedServerError>> {
-    build_shared_module(ec, injected)?;
+    build_shared_module(ec, host_signals, injected)?;
     Ok(())
 }
 
-/// Resolves the selected module into a shared handle the composition root can
-/// keep and the request path can reuse.
+/// Resolves the selected module into a shared handle.
 ///
 /// The same resolution as [`build_module`], returned as an `Arc` rather than
-/// a `Box` so one instance can be threaded into
+/// a `Box` so one instance can be held in
 /// [`RuntimeServices`](crate::platform::RuntimeServices) and read by every
-/// request without being built again. An adapter that calls this while it
-/// builds application state gets the startup check
-/// [`ensure_module_available`] performs and the module itself for one piece
-/// of work rather than two.
+/// request. Use [`build_reusable_module`] at a composition root, which adds
+/// the one check that decides whether keeping the instance is safe.
 ///
 /// # Errors
 ///
 /// The same errors as [`build_module`].
 pub fn build_shared_module(
     ec: &Ec,
+    host_signals: Option<Arc<dyn HostSignals>>,
     injected: Option<Arc<dyn EdgeCookieModule>>,
 ) -> Result<Option<Arc<dyn EdgeCookieModule>>, Report<TrustedServerError>> {
-    Ok(build_module(ec, injected)?.map(Arc::from))
+    Ok(build_module(ec, host_signals, injected)?.map(Arc::from))
+}
+
+/// The module a composition root may keep and hand to every request, when
+/// the selection is one that can be kept at all.
+///
+/// Resolving is also the startup check, so a selection this deployment cannot
+/// satisfy fails here rather than on the first request, exactly as
+/// [`ensure_module_available`] makes it fail. What this adds is the answer to
+/// a second question, which is whether the module that came back is the same
+/// for every request. Most are, because they are built from configuration
+/// alone, and keeping one saves resolving the same settings again on every
+/// request.
+///
+/// [`HostSignalModule`] is not, because it is built from the signals of
+/// one request and reports
+/// [`is_request_scoped`](EdgeCookieModule::is_request_scoped). Keeping that
+/// one would freeze the signals captured while application state was built,
+/// which on every adapter here are empty, so every later request would find no
+/// signals and defer. `Ok(None)` comes back for it, the adapter threads
+/// nothing, and the request path resolves it per request against that request's
+/// own signals.
+///
+/// `Ok(None)` therefore means "nothing to keep", which covers both a stateless
+/// deployment and a module that must be resolved per request. Both leave the
+/// request path resolving for itself, which is what it did before anything was
+/// kept.
+///
+/// # Errors
+///
+/// The same errors as [`build_module`].
+pub fn build_reusable_module(
+    ec: &Ec,
+    host_signals: Option<Arc<dyn HostSignals>>,
+    injected: Option<Arc<dyn EdgeCookieModule>>,
+) -> Result<Option<Arc<dyn EdgeCookieModule>>, Report<TrustedServerError>> {
+    let Some(module) = build_shared_module(ec, host_signals, injected)? else {
+        return Ok(None);
+    };
+    if module.is_request_scoped() {
+        log::debug!(
+            "Edge Cookie module `{}` is built from request evidence, so it is resolved per              request rather than kept",
+            module.id(),
+        );
+        return Ok(None);
+    }
+    Ok(Some(module))
 }
 
 /// The Edge Cookie module to use for this request.
@@ -882,8 +1062,8 @@ pub fn build_shared_module(
 ///
 /// # Errors
 ///
-/// The same errors as [`build_module`], and only when the adapter threaded
-/// nothing, because a threaded module has already been resolved successfully.
+/// The same errors as [`build_module`], and only when nothing was threaded,
+/// because a threaded module has already been resolved successfully.
 pub fn request_module(
     ec: &Ec,
     services: &crate::platform::RuntimeServices,
@@ -891,7 +1071,7 @@ pub fn request_module(
     if let Some(resolved) = services.resolved_ec_module() {
         return Ok(Some(resolved));
     }
-    build_shared_module(ec, None)
+    build_shared_module(ec, services.host_signals(), None)
 }
 
 /// Adapts an injected, shared [`EdgeCookieModule`] to the owned `Box` that
@@ -911,6 +1091,10 @@ impl EdgeCookieModule for SharedModule {
 
     fn id(&self) -> &'static str {
         self.0.id()
+    }
+
+    fn is_request_scoped(&self) -> bool {
+        self.0.is_request_scoped()
     }
 
     fn generate(
@@ -933,13 +1117,23 @@ impl EdgeCookieModule for SharedModule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::tests::select_hmac_module;
+    use crate::evidence::OwnedRequestInfo;
+    use crate::test_support::tests::{select_hmac_module, select_host_signals_module};
+    use http::HeaderMap;
 
     /// Settings selecting the built-in HMAC module under `name`, which is a
     /// label whenever it is not the implementation's own name.
     fn selected_hmac(name: &str) -> Ec {
         let mut ec = Ec::default();
         select_hmac_module(&mut ec, name, test_passphrase().expose());
+        ec
+    }
+
+    /// Settings selecting the built-in host-signal module under its own
+    /// name, with `passphrase` in its block.
+    fn selected_host_signals(passphrase: &str) -> Ec {
+        let mut ec = Ec::default();
+        select_host_signals_module(&mut ec, passphrase);
         ec
     }
 
@@ -1245,7 +1439,7 @@ mod tests {
             ..Ec::default()
         };
         assert!(
-            build_module(&none, None)
+            build_module(&none, None, None)
                 .expect("explicit statelessness should build")
                 .is_none(),
             "`none` should select no module"
@@ -1253,7 +1447,7 @@ mod tests {
 
         // `hmac` with its block builds the built-in module.
         let hmac = selected_hmac(HMAC_MODULE_KEY);
-        let built = build_module(&hmac, None)
+        let built = build_module(&hmac, None, None)
             .expect("the hmac selection should build")
             .expect("the hmac selection should yield a module");
         assert_eq!(
@@ -1273,7 +1467,7 @@ mod tests {
             module: Some(EcModuleSelection::Named("acme".to_owned())),
             ..Ec::default()
         };
-        let built = build_module(&vendor, Some(Arc::new(VendorModule)))
+        let built = build_module(&vendor, None, Some(Arc::new(VendorModule)))
             .expect("the vendor selection should build")
             .expect("the vendor selection should yield a module");
         assert_eq!(
@@ -1289,7 +1483,7 @@ mod tests {
         // so everything that resolves the selection has to read the
         // implementation rather than the label the operator chose.
         let labeled_hmac = selected_hmac("primary");
-        let built = build_module(&labeled_hmac, None)
+        let built = build_module(&labeled_hmac, None, None)
             .expect("a labeled hmac block should build")
             .expect("a labeled hmac block should yield a module");
         assert_eq!(
@@ -1309,7 +1503,7 @@ mod tests {
             "module = \"main\"\n\n[main]\nimplementation = \"acme\"\nendpoint = \"https://ec.acme.example.com\"\n",
         )
         .expect("should parse a labeled vendor block");
-        let built = build_module(&labeled_vendor, Some(Arc::new(VendorModule)))
+        let built = build_module(&labeled_vendor, None, Some(Arc::new(VendorModule)))
             .expect("a labeled vendor block should build")
             .expect("a labeled vendor block should yield a module");
         assert_eq!(
@@ -1342,6 +1536,26 @@ mod tests {
 
     fn test_passphrase() -> Redacted<String> {
         Redacted::from("a-test-passphrase-32-bytes-minimum".to_owned())
+    }
+
+    fn test_request_info() -> OwnedRequestInfo {
+        OwnedRequestInfo::new("203.0.113.1".to_owned(), HeaderMap::new())
+    }
+
+    /// Test host signals with fixed JA4/H2 values.
+    #[derive(Debug)]
+    struct TestHostSignals {
+        ja4: Option<String>,
+        h2: Option<String>,
+    }
+
+    impl HostSignals for TestHostSignals {
+        fn ja4(&self) -> Option<&str> {
+            self.ja4.as_deref()
+        }
+        fn h2(&self) -> Option<&str> {
+            self.h2.as_deref()
+        }
     }
 
     #[test]
@@ -1525,7 +1739,7 @@ mod tests {
         // guards.
         let hmac = selected_hmac(HMAC_MODULE_KEY);
 
-        let err = build_module(&hmac, Some(Arc::new(VendorNamedHmacModule)))
+        let err = build_module(&hmac, None, Some(Arc::new(VendorNamedHmacModule)))
             .expect_err("two modules claiming `hmac` should be refused");
         let message = err.to_string();
         assert!(
@@ -1544,9 +1758,12 @@ mod tests {
             module: Some(EcModuleSelection::None),
             ..Ec::default()
         };
-        let err =
-            ensure_module_available(&selected_elsewhere, Some(Arc::new(VendorNamedHmacModule)))
-                .expect_err("the clash should be refused whatever the selector says");
+        let err = ensure_module_available(
+            &selected_elsewhere,
+            None,
+            Some(Arc::new(VendorNamedHmacModule)),
+        )
+        .expect_err("the clash should be refused whatever the selector says");
         assert!(
             err.to_string().contains(HMAC_MODULE_KEY),
             "the startup check should name the contested name too, got: {err}"
@@ -1557,8 +1774,42 @@ mod tests {
             module: Some(EcModuleSelection::Named("acme".to_owned())),
             ..Ec::default()
         };
-        build_module(&vendor, Some(Arc::new(VendorModule)))
+        build_module(&vendor, None, Some(Arc::new(VendorModule)))
             .expect("a vendor module under its own name should still build");
+    }
+
+    #[test]
+    fn host_signal_module_creates_from_signals() {
+        let signals = Arc::new(TestHostSignals {
+            ja4: Some("t13d1516h2_8daaf6152771_e5627efa2ab1".to_owned()),
+            h2: Some("1:65536;4:6291456".to_owned()),
+        });
+        let module = HostSignalModule::new(test_passphrase(), signals);
+        let request_info = test_request_info();
+        let generated = module
+            .generate(&request_info, &IdentityInput::default())
+            .expect("should generate");
+        assert!(
+            generated.id.is_some(),
+            "the host-signal module should create an identifier from the signals"
+        );
+    }
+
+    #[test]
+    fn host_signal_module_defers_without_signals() {
+        let signals = Arc::new(TestHostSignals {
+            ja4: None,
+            h2: None,
+        });
+        let module = HostSignalModule::new(test_passphrase(), signals);
+        let request_info = test_request_info();
+        let generated = module
+            .generate(&request_info, &IdentityInput::default())
+            .expect("should generate");
+        assert!(
+            generated.id.is_none(),
+            "with no host signals the module should defer rather than create an IP-only identifier"
+        );
     }
 
     #[test]
@@ -1570,7 +1821,7 @@ mod tests {
             toml::from_str("module = \"primary\"\n\n[primary]\nimplementation = \"hmca\"\n")
                 .expect("should parse a labeled module block");
 
-        let err = build_module(&ec, None)
+        let err = build_module(&ec, None, None)
             .expect_err("an implementation this deployment lacks should be refused");
         let message = err.to_string();
         assert!(
@@ -1582,7 +1833,7 @@ mod tests {
             "the error should name the built-in implementation, got: {message}"
         );
 
-        let err = build_module(&ec, Some(Arc::new(VendorModule)))
+        let err = build_module(&ec, None, Some(Arc::new(VendorModule)))
             .expect_err("an injected module of another implementation should not stand in");
         let message = err.to_string();
         assert!(
@@ -1602,11 +1853,65 @@ mod tests {
             ..Ec::default()
         };
 
-        let err = build_module(&ec, None)
+        let err = build_module(&ec, None, None)
             .expect_err("selecting hmac with no [ec.hmac] block should error");
         assert!(
             err.to_string().contains("[ec.hmac]"),
             "the error should name the missing block, got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_module_built_from_request_evidence_is_never_kept_and_reused() {
+        // The host-signal module captures the signals of the request it
+        // was built for. A composition root builds application state with an
+        // empty host-signal service, because there is no request yet, so
+        // keeping that instance would serve every later request from empty
+        // signals and the module would defer forever. It must come back
+        // as nothing to keep, leaving the request path to resolve it against
+        // the signals each request actually carried.
+        let host_signals_selected = selected_host_signals(test_passphrase().expose());
+        let startup_signals: Arc<dyn HostSignals> = Arc::new(TestHostSignals {
+            ja4: None,
+            h2: None,
+        });
+
+        // It resolves, so the startup check still passes on a host that
+        // supplies the service.
+        let resolved = build_shared_module(
+            &host_signals_selected,
+            Some(Arc::clone(&startup_signals)),
+            None,
+        )
+        .expect("the host-signal selection should resolve on a host that supplies signals")
+        .expect("the selection should yield a module");
+        assert!(
+            resolved.is_request_scoped(),
+            "the host-signal module should declare itself built from request evidence"
+        );
+
+        // It is not offered for reuse.
+        assert!(
+            build_reusable_module(
+                &host_signals_selected,
+                Some(Arc::clone(&startup_signals)),
+                None
+            )
+            .expect("the host-signal selection should still pass the startup check")
+            .is_none(),
+            "a module built from request evidence must never be kept for later requests"
+        );
+
+        // A module built from configuration alone is still kept, so the
+        // saving stands for every selection that can take it.
+        let hmac_selected = selected_hmac(HMAC_MODULE_KEY);
+        let kept = build_reusable_module(&hmac_selected, None, None)
+            .expect("the hmac selection should resolve")
+            .expect("a module built from configuration alone should be kept");
+        assert_eq!(
+            kept.id(),
+            HMAC_MODULE_KEY,
+            "the kept module should be the selected one"
         );
     }
 
@@ -1622,7 +1927,7 @@ mod tests {
             module: Some(EcModuleSelection::Named("acme".to_owned())),
             ..Ec::default()
         };
-        let resolved = build_shared_module(&ec, Some(Arc::new(VendorModule)))
+        let resolved = build_reusable_module(&ec, None, Some(Arc::new(VendorModule)))
             .expect("the composition root should resolve the selection")
             .expect("the selection should yield a module");
 
@@ -1661,10 +1966,13 @@ mod tests {
             ..Ec::default()
         };
         for (case, outcome) in [
-            ("build_module", build_module(&selected, None).map(|_| ())),
+            (
+                "build_module",
+                build_module(&selected, None, None).map(|_| ()),
+            ),
             (
                 "the startup check",
-                ensure_module_available(&selected, None),
+                ensure_module_available(&selected, None, None),
             ),
         ] {
             let Err(err) = outcome else {
@@ -1678,13 +1986,37 @@ mod tests {
 
         // Statelessness is a supported deployment, spelled either way, and must
         // never be turned into a startup error.
-        ensure_module_available(&Ec::default(), None)
+        ensure_module_available(&Ec::default(), None, None)
             .expect("should allow a deployment that selects no module");
         let explicit_none = Ec {
             module: Some(EcModuleSelection::None),
             ..Ec::default()
         };
-        ensure_module_available(&explicit_none, None)
+        ensure_module_available(&explicit_none, None, None)
             .expect("should allow the explicit `none` selection");
+    }
+
+    #[test]
+    fn the_startup_check_rejects_host_signals_on_a_host_that_supplies_none() {
+        // Whether the adapter injects a host-signal service is fixed per
+        // deployment, so selecting the host-signal module on an adapter that
+        // injects none is knowable without a request.
+        let selected = selected_host_signals(test_passphrase().expose());
+
+        let err = ensure_module_available(&selected, None, None).expect_err(
+            "the host-signal module should fail the startup check with no host signals",
+        );
+        assert!(
+            err.to_string().contains("TLS/HTTP-2 signals"),
+            "the error should say the host supplies no signals, got: {err}"
+        );
+
+        let signals: Arc<dyn HostSignals> = Arc::new(TestHostSignals {
+            ja4: None,
+            h2: None,
+        });
+        ensure_module_available(&selected, Some(signals), None).expect(
+            "should pass on a host that injects host signals, whatever this request's signals are",
+        );
     }
 }

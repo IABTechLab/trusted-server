@@ -80,6 +80,7 @@ use edgezero_core::body::Body as EdgeBody;
 use error_stack::Report;
 use http::Request;
 
+use crate::consent::jurisdiction::Jurisdiction;
 use crate::consent::{self as consent_mod, ConsentContext, ConsentPipelineInput};
 use crate::constants::{COOKIE_TS_EC, COOKIE_TS_EC_PULL_COMPLETE};
 use crate::cookies::handle_request_cookies;
@@ -344,9 +345,10 @@ impl EcContext {
         // Take the selected module once. It is used here to decide whether
         // the incoming cookie value is a usable identifier, and again by
         // generation, which reuses this one rather than asking for another.
-        // Resolving needs no request data, so an adapter that resolved the
-        // selection while it built application state hands the same instance
-        // back here and nothing is built a second time on this request.
+        // `request_module` hands back the instance the composition root
+        // resolved when there is one, and otherwise resolves the selection from
+        // this request's own services, the host signals among them, so a
+        // module built from request evidence reads this request's evidence.
         let selected_module: Option<Arc<dyn crate::ec::module::EdgeCookieModule>> =
             module::request_module(&settings.ec, services)?;
 
@@ -479,9 +481,18 @@ impl EcContext {
         };
 
         if !self.ec_allowed {
+            // The jurisdiction class is logged rather than the value. The
+            // value carries a configured US state code, and the full
+            // jurisdiction is already logged once when the EC context is
+            // built, so naming the class here loses nothing.
+            let jurisdiction = match &self.consent.jurisdiction {
+                Jurisdiction::Gdpr => "gdpr",
+                Jurisdiction::UsState(_) => "us-state",
+                Jurisdiction::NonRegulated => "non-regulated",
+                Jurisdiction::Unknown => "unknown",
+            };
             log::info!(
-                "EC generation skipped: EC creation not permitted (jurisdiction={})",
-                self.consent.jurisdiction,
+                "EC generation skipped: EC creation not permitted (jurisdiction={jurisdiction})"
             );
             return Ok(());
         }
@@ -1358,10 +1369,13 @@ pub(crate) mod tests {
         settings.ec.module = Some(EcModuleSelection::from("opaque"));
 
         let ec_config = settings.ec.clone();
-        let resolved =
-            crate::ec::module::build_shared_module(&ec_config, Some(Arc::new(OpaqueModule)))
-                .expect("the composition root should resolve the selection")
-                .expect("the selection should yield a module");
+        let resolved = crate::ec::module::build_reusable_module(
+            &ec_config,
+            None,
+            Some(Arc::new(OpaqueModule)),
+        )
+        .expect("the composition root should resolve the selection")
+        .expect("the selection should yield a module");
 
         let services =
             crate::platform::test_support::noop_services_with_ec_module(Arc::clone(&resolved));

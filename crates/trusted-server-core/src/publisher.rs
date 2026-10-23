@@ -57,7 +57,9 @@ use crate::cache_policy::{
     CachePolicy, EdgeCacheHeader, cache_control_headers_are_private_or_no_store,
 };
 use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
-use crate::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS, HEADER_X_COMPRESS_HINT};
+use crate::constants::{
+    COOKIE_SHAREDID, COOKIE_TS_EIDS, HEADER_X_COMPRESS_HINT, HOST_SIGNAL_HEADERS,
+};
 use crate::cookies::handle_request_cookies;
 use crate::cookies::template_cache_policy::{TemplateCookieDecision, evaluate_cookie_policy};
 use crate::creative_opportunities::{
@@ -3119,8 +3121,9 @@ fn should_preload_ec_snapshot(input: &EcSnapshotPreloadInput) -> bool {
 /// Rewrites a downstream request into an outbound publisher-origin request.
 ///
 /// Restricts advertised encodings to those the rewrite pipeline can handle,
-/// strips the internal `fastly-ssl` scheme signal so it never leaks to the
-/// backend, and retargets the URI and `Host` header at the origin.
+/// strips the internal `fastly-ssl` scheme signal and the host signal headers
+/// so they never leak to the backend, and retargets the URI and `Host` header
+/// at the origin.
 fn rewrite_origin_request(
     req: &mut Request<EdgeBody>,
     target_uri: Uri,
@@ -3136,6 +3139,11 @@ fn rewrite_origin_request(
     // separate change. Until then we strip it here so the edge signal never
     // reaches publisher backends.
     req.headers_mut().remove("fastly-ssl");
+    // The origin request carries the reader's other headers onward, so the
+    // host's TLS and HTTP/2 client signals are removed by name.
+    for name in HOST_SIGNAL_HEADERS {
+        req.headers_mut().remove(*name);
+    }
     *req.uri_mut() = target_uri;
     req.headers_mut().insert(
         header::HOST,
@@ -18183,6 +18191,58 @@ mod tests {
             vec![true],
             "publisher origin fetch should request streams when the platform supports them"
         );
+    }
+
+    #[tokio::test]
+    async fn publisher_origin_fetch_drops_host_signal_headers() {
+        // The origin request carries the reader's other headers onward, so the
+        // host's TLS and HTTP/2 client signals must be removed whether or not
+        // the origin response is streamed.
+        for streaming in [false, true] {
+            let settings = create_test_settings();
+            let stub = Arc::new(StubHttpClient::new());
+            stub.set_streaming_responses_supported(streaming);
+            stub.push_response_with_headers(
+                200,
+                b"<html><body>origin</body></html>".to_vec(),
+                vec![("content-type", "text/html; charset=utf-8")],
+            );
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let req = HttpRequest::builder()
+                .method(Method::GET)
+                .uri("https://publisher.example/page")
+                .header(header::HOST, "publisher.example")
+                .header("x-ts-tls-ja4", "t13d1516h2_8daaf6152771_02713d6af862")
+                .header(
+                    "x-ts-h2-fingerprint",
+                    "1:65536;4:6291456|15663105|0|m,a,s,p",
+                )
+                .header("x-publisher-trace", "kept")
+                .body(EdgeBody::empty())
+                .expect("should build request");
+
+            let _ = run_publisher_proxy(&settings, &services, req).await;
+
+            let headers = stub
+                .recorded_request_headers()
+                .into_iter()
+                .next()
+                .expect("should record one origin request");
+            for name in ["x-ts-tls-ja4", "x-ts-h2-fingerprint"] {
+                assert!(
+                    headers.iter().all(|(header_name, _)| header_name != name),
+                    "origin fetch (streaming {streaming}) should not forward `{name}`"
+                );
+            }
+            assert!(
+                headers
+                    .iter()
+                    .any(|(name, value)| name == "x-publisher-trace" && value == "kept"),
+                "origin fetch (streaming {streaming}) should keep the reader's other headers"
+            );
+        }
     }
 
     #[tokio::test]

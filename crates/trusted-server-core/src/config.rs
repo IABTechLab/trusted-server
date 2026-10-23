@@ -13,7 +13,7 @@ use error_stack::Report;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use validator::{Validate, ValidationError, ValidationErrors, ValidationErrorsKind};
 
-use crate::ec::module::HMAC_MODULE_KEY;
+use crate::ec::module::{HMAC_MODULE_KEY, HOST_SIGNALS_MODULE_KEY};
 use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
 use crate::integrations::{
@@ -153,11 +153,18 @@ fn remove_labeled_module_secret_errors(errors: &mut ValidationErrors, ec: &Ec) {
     let Some(ValidationErrorsKind::Struct(ec_errors)) = errors.errors_mut().get_mut("ec") else {
         return;
     };
-    for (name, _) in ec
+    let labeled = ec
         .module_blocks
         .hmac_blocks()
-        .filter(|(name, _)| *name != HMAC_MODULE_KEY)
-    {
+        .map(|(name, _)| name)
+        .filter(|name| *name != HMAC_MODULE_KEY)
+        .chain(
+            ec.module_blocks
+                .host_signals_blocks()
+                .map(|(name, _)| name)
+                .filter(|name| *name != HOST_SIGNALS_MODULE_KEY),
+        );
+    for name in labeled {
         let Some(ValidationErrorsKind::Struct(block_errors)) = ec_errors.errors_mut().get_mut(name)
         else {
             continue;
@@ -176,17 +183,17 @@ fn remove_labeled_module_secret_errors(errors: &mut ValidationErrors, ec: &Ec) {
 }
 
 impl crate::secret_resolution::ConfiguredSecretFields for TrustedServerAppConfig {
-    /// The passphrase of every Edge Cookie module block that configures the
-    /// built-in HMAC module under a label.
+    /// The passphrase of every Edge Cookie module block that configures a
+    /// module built into core under a label.
     ///
     /// [`secret_fields`](edgezero_core::app_config::AppConfigMeta::secret_fields)
-    /// lists the passphrase of the `[ec.hmac]` block, the one path this
-    /// module's block has when its name is its implementation. The same
-    /// module under a label of the operator's choosing holds that secret at
-    /// `ec.<label>.passphrase`, which is only knowable from the configuration
-    /// itself.
+    /// lists the passphrases of the `[ec.hmac]` and `[ec.host_signals]`
+    /// blocks, the one path each of those modules' blocks has when its name
+    /// is its implementation. The same module under a label of the
+    /// operator's choosing holds that secret at `ec.<label>.passphrase`, which
+    /// is only knowable from the configuration itself.
     fn configured_secret_fields(data: &serde_json::Value) -> Vec<SecretField> {
-        labeled_hmac_block_names(data)
+        labeled_module_block_names(data)
             .map(|name| SecretField {
                 kind: SecretKind::KeyInDefault,
                 optional: true,
@@ -201,22 +208,26 @@ impl crate::secret_resolution::ConfiguredSecretFields for TrustedServerAppConfig
 }
 
 /// The names of the `[ec.<name>]` blocks in a serialized configuration that
-/// configure the built-in HMAC module under a label.
+/// configure a module built into core under a label.
 ///
-/// A block named `hmac` is the fixed path `secret_fields` already lists, and a
-/// block naming any other implementation holds that implementation's settings,
-/// which core does not read.
-fn labeled_hmac_block_names(data: &serde_json::Value) -> impl Iterator<Item = String> + '_ {
+/// A block named after either built-in implementation is a fixed path
+/// `secret_fields` already lists, whichever of the two it configures, so it is
+/// left out rather than listed twice. A block naming any other implementation
+/// holds that implementation's settings, which core does not read.
+fn labeled_module_block_names(data: &serde_json::Value) -> impl Iterator<Item = String> + '_ {
     data.get("ec")
         .and_then(serde_json::Value::as_object)
         .into_iter()
         .flatten()
         .filter(|(name, block)| {
-            name.as_str() != HMAC_MODULE_KEY
-                && block
-                    .get(MODULE_IMPLEMENTATION_KEY)
-                    .and_then(serde_json::Value::as_str)
-                    == Some(HMAC_MODULE_KEY)
+            let Some(implementation) = block
+                .get(MODULE_IMPLEMENTATION_KEY)
+                .and_then(serde_json::Value::as_str)
+            else {
+                return false;
+            };
+            let built_in = |key: &str| key == HMAC_MODULE_KEY || key == HOST_SIGNALS_MODULE_KEY;
+            built_in(implementation) && !built_in(name.as_str())
         })
         .map(|(name, _)| name.clone())
 }
@@ -235,13 +246,22 @@ impl edgezero_core::app_config::AppConfigMeta for TrustedServerAppConfig {
         vec![
             field(vec![object("publisher"), object("proxy_secret")], false),
             field(vec![object("ec"), object("passphrase")], true),
-            // The `[ec.hmac]` block, the built-in HMAC module configured
-            // under its own name, is the one module block with a fixed path.
-            // The same module under a label of the operator's choosing is
-            // reached by `ConfiguredSecretFields`, which reads the names out of
-            // the configuration.
+            // The `[ec.hmac]` and `[ec.host_signals]` blocks, the modules
+            // built into core configured under their own names, are the
+            // module blocks with fixed paths. The same modules under a
+            // label of the operator's choosing are reached by
+            // `ConfiguredSecretFields`, which reads the names out of the
+            // configuration.
             field(
                 vec![object("ec"), optional_object("hmac"), object("passphrase")],
+                true,
+            ),
+            field(
+                vec![
+                    object("ec"),
+                    optional_object("host_signals"),
+                    object("passphrase"),
+                ],
                 true,
             ),
             field(
@@ -494,6 +514,12 @@ fn validate_secret_key_references(settings: &Settings) -> Result<(), Report<Trus
     }
     for (name, hmac) in settings.ec.module_blocks.hmac_blocks() {
         validate_secret_key_reference(&format!("ec.{name}.passphrase"), hmac.passphrase.expose())?;
+    }
+    for (name, host_signals) in settings.ec.module_blocks.host_signals_blocks() {
+        validate_secret_key_reference(
+            &format!("ec.{name}.passphrase"),
+            host_signals.passphrase.expose(),
+        )?;
     }
 
     for (index, partner) in settings.ec.partners.iter().enumerate() {
@@ -1103,6 +1129,31 @@ formats = [{ width = 300, height = 250 }]
     }
 
     #[test]
+    fn push_validation_accepts_a_host_signals_passphrase_key_name() {
+        // The block is named `host_signals` in the configuration and in the
+        // registered secret path, so push validation has to skip the passphrase
+        // check under that name.
+        let mut settings = valid_settings();
+        settings.ec.module = Some(crate::ec::module::EcModuleSelection::from(
+            HOST_SIGNALS_MODULE_KEY,
+        ));
+        settings.ec.module_blocks.clear();
+        settings.ec.module_blocks.insert(
+            HOST_SIGNALS_MODULE_KEY.to_owned(),
+            crate::settings::EcModuleBlock::from(crate::settings::HostSignalsModuleConfig {
+                passphrase: Redacted::new("host_signals_key".to_owned()),
+            }),
+        );
+
+        let app_config = TrustedServerAppConfig::new(settings)
+            .expect("should validate the host_signals passphrase as a key name");
+
+        let serialized =
+            serde_json::to_string(&app_config).expect("should serialize key-name-only app config");
+        assert!(serialized.contains("host_signals_key"));
+    }
+
+    #[test]
     fn secret_metadata_lists_all_secret_paths_and_optionality() {
         let fields = TrustedServerAppConfig::secret_fields();
         let paths = fields
@@ -1116,6 +1167,7 @@ formats = [{ width = 300, height = 250 }]
                 ("publisher.proxy_secret".to_owned(), false),
                 ("ec.passphrase".to_owned(), true),
                 ("ec.hmac.passphrase".to_owned(), true),
+                ("ec.host_signals.passphrase".to_owned(), true),
                 ("ec.partners[*].api_token".to_owned(), true),
                 ("ec.partners[*].ts_pull_token".to_owned(), true),
                 ("handlers[*].password".to_owned(), false),
