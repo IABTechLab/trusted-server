@@ -34,7 +34,7 @@ container are required smoke images, while distroless-static is another deployme
 without a separate Phase 1 runtime test. All acquired smoke images are digest-pinned; build logs record their image IDs. These required startup checks do not establish complete platform/tool qualification.
 Axum defaults to `127.0.0.1:8787`. Set runtime `EDGEZERO__ADAPTER__HOST=0.0.0.0`
 and `EDGEZERO__ADAPTER__PORT=8080` for containers and publish that port. `PORT`
-is a compatible alias. When both are set, they must agree; both values are
+is a legacy alias. Ports must be 1–65535; zero is rejected. When both are set, they must agree; both values are
 validated and any invalid explicit value fails startup. This runtime setting is never compiled into the executable.
 The smoke reaches a bridge-networked container through a host-published port;
 loopback-only binding cannot pass it. TLS termination, graceful shutdown and
@@ -45,12 +45,7 @@ request initialization. Every Axum smoke mounts the runner's system CA
 bundle read-only at `/ca.pem` with `SSL_CERT_FILE=/ca.pem`; production operators
 must supply their own runtime trust store. This is runtime data, not an embedded
 configuration or dynamically linked library.
-The seven-binary implementation passed hosted CI and [rehearsal `.8`](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6362236955)
-at `7a05940e2f7b10c459bdd2d3949f265b755ce42c`; `.4` and `.5` remain historical evidence. Native
-libraries and provider tools needed by individual `ts` commands retain their
-existing prerequisites. Cloudflare, Spin, Windows and Linux ARM64 CLI releases follow separately.
-
-[Rehearsal `.8`](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6362236955) passed at exact implementation SHA `7a05940e2f7b10c459bdd2d3949f265b755ce42c`. Subsequent review-head updates are **docs-only since rehearsed `7a05940e2`**. Rehearsal `.6` at `39a769c3e` failed after immutable publication despite successful independent verification; `.7` at `7a05940e2` was cancelled before signing/publication because GitHub could not assign a macOS ARM runner. The compatibility audit retains those failed outcomes.
+Native libraries and provider tools needed by individual `ts` commands retain their existing prerequisites. Cloudflare, Spin, Windows and Linux ARM64 CLI releases follow separately.
 
 Each `<binary>.spdx.json` is a **conservative build dependency inventory** of
 the selected Cargo target and the installed npm build tree used for that build.
@@ -83,84 +78,42 @@ Run this in a new private directory, using Bash. Replace the fictional tag and
 commit. For rehearsal, change `REPO` to the approved public sandbox and use the
 individually approved, never-reused rehearsal tag.
 
+<!-- release-verification:start -->
+
 ```bash
 set -euo pipefail
 REPO=IABTechLab/trusted-server
 TAG=v1.2.3
 COMMIT=0123456789abcdef0123456789abcdef01234567
-ASSETS=(trusted-server-fastly.wasm ts-x86_64-unknown-linux-gnu \
-  ts-aarch64-apple-darwin ts-x86_64-apple-darwin \
-  trusted-server-axum-x86_64-unknown-linux-gnu \
-  trusted-server-axum-x86_64-unknown-linux-musl \
-  trusted-server-axum-aarch64-unknown-linux-gnu)
-
+ASSETS=(trusted-server-axum-x86_64-unknown-linux-gnu trusted-server-axum-x86_64-unknown-linux-musl trusted-server-axum-aarch64-unknown-linux-gnu trusted-server-fastly.wasm ts-aarch64-apple-darwin ts-x86_64-apple-darwin ts-x86_64-unknown-linux-gnu)
 gh release download "$TAG" --repo "$REPO" --dir .
-test "$(gh api "repos/$REPO/releases/tags/$TAG" --jq '.immutable')" = true
-gh api "repos/$REPO/attestations/sha1:$COMMIT?per_page=100&predicate_type=release" \
-  --jq '[.attestations[] | {initiator}]'
+test "$(gh api "repos/$REPO/releases/tags/$TAG" --jq .immutable)" = true
 gh release verify "$TAG" --repo "$REPO"
 for asset in "${ASSETS[@]}"; do
-  for suffix in '' .spdx.json .provenance.sigstore.json .sbom.sigstore.json; do
-    gh release verify-asset "$TAG" "$asset$suffix" --repo "$REPO"
+  for suffix in "" .spdx.json .provenance.sigstore.json .sbom.sigstore.json; do gh release verify-asset "$TAG" "$asset$suffix" --repo "$REPO"; done
+  for kind in provenance sbom; do
+    predicate=https://slsa.dev/provenance/v1; if [[ "$kind" == sbom ]]; then predicate=https://spdx.dev/Document/v2.3; fi
+    checks=(--repo "$REPO" --bundle "$asset.$kind.sigstore.json" --source-ref "refs/tags/$TAG" --source-digest "$COMMIT" --signer-digest "$COMMIT" --deny-self-hosted-runners --predicate-type "$predicate")
+    gh attestation verify "$asset" "${checks[@]}" --signer-workflow "$REPO/.github/workflows/release-build.yml" --format json > "$asset.$kind.verified.json"
+    if [[ "$kind" == sbom ]]; then jq -e --slurpfile sbom "$asset.spdx.json" '[.[].verificationResult.statement.predicate] | length == 1 and .[0] == $sbom[0]' "$asset.$kind.verified.json"; fi
+    gh attestation verify "$asset" "${checks[@]}" --cert-identity "https://github.com/$REPO/.github/workflows/release-build.yml@refs/tags/$TAG"
   done
 done
 gh release verify-asset "$TAG" SHA256SUMS --repo "$REPO"
 shasum -a 256 --check SHA256SUMS
 ```
 
-The checksums cover the other 28 assets, never `SHA256SUMS` itself. Immutable
-release verification establishes membership; provenance verification establishes
-the reviewed signer and source. Both are required.
+<!-- release-verification:end -->
 
-First verify both published bundles for each binary using the reusable signer
-workflow. Provenance binds the binary and its SPDX document; the SBOM
-attestation's subject is the **binary**, and its predicate is the SPDX document.
-Do not pass the JSON asset as the SBOM attestation's subject.
+Both predicates use the binary as their subject. The verified SBOM predicate must equal the shipped SPDX document. `--signer-workflow` matches a prefix; the separate `--cert-identity` check pins the exact reusable workflow at the tag. GitHub CLI makes those two identity options mutually exclusive.
+
+The checksums cover the other 28 assets, never `SHA256SUMS` itself. Immutable release verification establishes membership; provenance establishes the reviewed signer and source. Both are required.
+
+WORKFLOW and IDENTITY below refer to the same reusable signer:
 
 ```bash
 WORKFLOW="$REPO/.github/workflows/release-build.yml"
-for asset in "${ASSETS[@]}"; do
-  gh attestation verify "$asset" --repo "$REPO" \
-    --bundle "$asset.provenance.sigstore.json" \
-    --signer-workflow "$WORKFLOW" \
-    --source-ref "refs/tags/$TAG" --source-digest "$COMMIT" \
-    --signer-digest "$COMMIT" --deny-self-hosted-runners \
-    --predicate-type https://slsa.dev/provenance/v1
-  gh attestation verify "$asset" --repo "$REPO" \
-    --bundle "$asset.sbom.sigstore.json" \
-    --signer-workflow "$WORKFLOW" \
-    --source-ref "refs/tags/$TAG" --source-digest "$COMMIT" \
-    --signer-digest "$COMMIT" --deny-self-hosted-runners \
-    --predicate-type https://spdx.dev/Document/v2.3
-done
-```
-
-`--signer-workflow` matches a prefix. Enforce the exact certificate identity,
-including the tag ref, in separate checks: GitHub CLI makes `--signer-workflow`
-and `--cert-identity` mutually exclusive. These checks use the same bundles
-and independently approved source commit. Compare the verified SBOM predicate
-to the published SPDX document as well.
-
-```bash
 IDENTITY="https://github.com/$WORKFLOW@refs/tags/$TAG"
-for asset in "${ASSETS[@]}"; do
-  gh attestation verify "$asset" --repo "$REPO" \
-    --bundle "$asset.provenance.sigstore.json" \
-    --cert-identity "$IDENTITY" \
-    --source-ref "refs/tags/$TAG" --source-digest "$COMMIT" \
-    --signer-digest "$COMMIT" --deny-self-hosted-runners \
-    --predicate-type https://slsa.dev/provenance/v1
-  gh attestation verify "$asset" --repo "$REPO" \
-    --bundle "$asset.sbom.sigstore.json" \
-    --cert-identity "$IDENTITY" \
-    --source-ref "refs/tags/$TAG" --source-digest "$COMMIT" \
-    --signer-digest "$COMMIT" --deny-self-hosted-runners \
-    --predicate-type https://spdx.dev/Document/v2.3 \
-    --format json > "$asset.sbom-verification.json"
-  jq -e --slurpfile document "$asset.spdx.json" \
-    'length == 1 and .[0].verificationResult.statement.predicate == $document[0]' \
-    "$asset.sbom-verification.json"
-done
 ```
 
 Stop if any check fails. Keep the outputs, reviewed source identity, bundles
@@ -331,15 +284,7 @@ EdgeZero prepared-payload deployment and operation recovery are later phases.
 
 ### Local runtime evidence
 
-The [rehearsal runtime transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6362236955)
-records local execution of the verified Fastly wasm at
-`7a05940e2f7b10c459bdd2d3949f265b755ce42c` using pinned Viceroy 0.21.0.
-It uses the example configuration with loopback publisher/origin values,
-public development secrets and a local Node origin fixture. A real page request
-returned HTTP 200, the fixture marker, injected JS and the full source SHA in
-`x-ts-version`. Both the wasm and the CLI used to seed local config were verified
-before execution. No Fastly service was deployed. This proves the local prebuilt
-execution route; default single mode also emitted no Build facts log. Provider submission and production operation remain separate.
+Run verified Fastly bytes with pinned Viceroy and external example configuration for local testing. A page request can check the origin response, injected JavaScript and source SHA in `x-ts-version`. Default single mode emits no Build facts log. Local execution does not establish provider submission or production operation.
 
 ## Build inputs, policy and release administration
 
@@ -403,7 +348,7 @@ CLI asset verification calls. Each check has at most three attempts,
 with 2s then 5s backoff. A supplied `Retry-After` can increase a delay, capped
 at 10s (at most 20s waiting per check). A shared three-minute window bounds
 retry scheduling across the job, and individual read requests/commands time out
-after 10s. `Connection: close` remains enabled for API calls.
+after 10s, except bulk asset downloads, which have up to 60s capped by the remaining shared deadline. `Connection: close` remains enabled for API calls.
 
 Retries require a recognized transport error, timeout, HTTP 5xx or 429.
 GitHub CLI errors are classified conservatively: an otherwise empty-output
@@ -413,7 +358,9 @@ membership or digests, and definitive verification failures stop immediately.
 Release listing before creation and every create/upload/publish mutation remain
 single-shot.
 
-Before cryptographic release verification, a separate availability check makes at most three release-attestation GETs, with 2s then 5s backoff: at most 7s total waiting, inside the same three-minute scheduling window. Only HTTP 200 with no current-tag GitHub release attestation may wait. Any other status, malformed record, duplicate current-tag record, identity/source/asset mismatch or cryptographic verification failure stops immediately. Well-formed other-tag records on the same commit are ignored only after their exact bundles verify; logs name only the ignored tags. They never satisfy the current-tag check. Each GET/verification command has a 10s timeout; no mutation is retried.
+Before cryptographic release verification, the availability check makes at most five release-attestation GETs, with 2s/5s/10s/20s backoff (37s total waiting). Only this endpoint treats HTTP 404 as no record yet; a valid HTTP 200 with no current-tag record may also wait. Each GET times out after at most 4s, and a separate 60s deadline bounds availability checking, including other-tag verification, within the shared three-minute scheduling window. Every other non-200 status fails immediately. Malformed records, duplicate current-tag records, identity/source/asset mismatches and definitive cryptographic failures stop immediately. Other-tag records are ignored only after their exact bundles verify; those read-only verification calls may retry recognized transient failures within the same bounds. Current-tag cryptographic verification is single-shot. Logs show every wait or availability on the first check. No mutation is retried.
+
+The publisher re-downloads all 29 assets into a fresh temporary directory, checks the exact file set and byte-compares them with the validated signed handoff, including identical SHA256SUMS. Only transport download failures may retry; any missing, extra or different file fails immediately. Temporary downloads are removed after each attempt.
 
 If the availability check exhausts its bound, the release is already published and immutable (verified before availability polling). Keep the tag and release unchanged and use the read-only recovery commands below.
 

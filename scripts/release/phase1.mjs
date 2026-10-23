@@ -536,6 +536,36 @@ async function smokeRelease(file, target) {
         )
         continue
       }
+      for (const setting of ['EDGEZERO__ADAPTER__PORT', 'PORT']) {
+        let rejected = false
+        try {
+          docker([
+            'run',
+            '--rm',
+            '--network=none',
+            ...restrictions,
+            '--env',
+            setting + '=0',
+            image,
+          ])
+        } catch (error) {
+          if (
+            error.status !== 1 ||
+            !(String(error.stdout ?? '') + String(error.stderr ?? '')).includes(
+              '1–65535'
+            )
+          )
+            throw error
+          rejected = true
+        }
+        if (!rejected) throw Error('Axum accepted port zero: ' + setting)
+        console.log(
+          'SUCCESS: Axum rejects ' +
+            setting +
+            '=0; exit 1, ports must be 1–65535:',
+          image
+        )
+      }
       const reservation = createServer().listen(0, '127.0.0.1')
       await once(reservation, 'listening')
       const port = reservation.address().port
@@ -564,7 +594,7 @@ async function smokeRelease(file, target) {
         version: 1,
       }
       const environment = [
-        'PORT=8787',
+        'EDGEZERO__ADAPTER__PORT=8080',
         'EDGEZERO__ADAPTER__HOST=0.0.0.0',
         `TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG=${JSON.stringify(envelope)}`,
         'TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_EC_PASSPHRASE=smoke-edge-cookie-passphrase-32-bytes',
@@ -577,7 +607,7 @@ async function smokeRelease(file, target) {
         container,
         '-d',
         '--publish',
-        `127.0.0.1:${port}:8787`,
+        `127.0.0.1:${port}:8080`,
         ...restrictions,
         ...environment.flatMap((value) => ['--env', value]),
         image,
@@ -612,7 +642,7 @@ async function smokeRelease(file, target) {
       }
       if (!healthy) throw Error('Axum startup deadline exhausted')
       console.log(
-        'SUCCESS: Axum bound to 0.0.0.0; host reached published container port, HTTP 200 ok:',
+        'SUCCESS: Axum bound to 0.0.0.0:8080; host reached published container port, HTTP 200 ok:',
         reference,
         image
       )

@@ -11,7 +11,7 @@ Frozen source references below mean:
 - [Cohort](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/scripts/release/release-cohort.json), [tools](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/scripts/release/release-tools.json), [consumer policy](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/crates/trusted-server-cli/release-policy.json).
 - [Index v1 schema](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/docs/superpowers/specs/schemas/release-index-v1.schema.json), [distribution names](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/crates/trusted-server-release/src/distribution.rs#L55), [consumer companion rules](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/crates/trusted-server-cli/src/release/documents.rs#L236), [SPDX joins](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/crates/trusted-server-cli/src/release/evidence/joins.rs#L188).
 
-### Phase 1 review notes — rehearsal .8 passed
+### Phase 1 review notes — corrective batch for rehearsal .9
 
 Phase 1 is **part of #1235**, pending D7 maintainer settings. These notes supersede
 historical phase applicability, not the retained destination requirements.
@@ -24,8 +24,8 @@ retained Rust-producer constraint, replaced by slices 2.5 (recipes/inspection),
 below describe #1262, not current Phase 1 implementation status.
 
 Current tool pins: Rust 1.98.1, Node 24.20.0, Fastly CLI 16.0.0, Viceroy 0.21.0;
-verification uses GitHub CLI 2.102.0. The reusable release-build.yml is the signer.
-[Rehearsal `.8`](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6362236955) passed at exact implementation SHA `7a05940e2f7b10c459bdd2d3949f265b755ce42c`. Subsequent review-head updates are **docs-only since rehearsed `7a05940e2`**. Rehearsal `.6` at `39a769c3e` failed after immutable publication despite successful independent verification; `.7` at `7a05940e2` was cancelled before signing/publication because GitHub could not assign a macOS ARM runner. The compatibility audit retains those failed outcomes.
+verification uses GitHub CLI 2.102.0. The reusable release-build.yml is the signer. Rehearsals use GitHub CLI 2.102.0, Fastly CLI 16.0.0 and Viceroy 0.21.0; the carried destination spec/plan still mention GitHub CLI 2.97.0 and Fastly CLI 15.1.0. Those carried versions are unchanged.
+[Rehearsal `.8`](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6362236955) passed at exact implementation SHA `7a05940e2f7b10c459bdd2d3949f265b755ce42c`. That rehearsal applies to its exact historical implementation; the current corrective batch requires fresh rehearsal `.9`. Rehearsal `.6` at `39a769c3e` failed after immutable publication despite successful independent verification; `.7` at `7a05940e2` was cancelled before signing/publication because GitHub could not assign a macOS ARM runner. The compatibility audit retains those failed outcomes.
 
 Slice 2.3 immutable build facts are reused from introducing commit
 `bfb697404551a28217af8906024506095bcd9559` and revision
@@ -47,7 +47,7 @@ Publication requires `RELEASE_PUBLICATION_ENABLED=true` only after maintainers
 confirm immutable releases and the v\* tag ruleset. There is no settings token or
 prepublication settings API call, following the reviewed signing boundary;
 postpublication immutable=true readback fails loudly. Hyphenated tags are
-prereleases and never Latest. Stable tags are normal releases. Eligibility of
+prereleases and never Latest. Stable tags are normal releases with `make_latest: legacy`; GitHub selects Latest by version/date, so backports do not force Latest. Eligibility of
 rc-branch tags is an unresolved maintainer decision; Phase 1 does not implement
 the destination branch-ancestry/ruleset validator or authorize rc tags.
 
@@ -176,7 +176,7 @@ extra features, `variant: default`, `assurance_profile: provenance-sbom`,
 
 This adds production Axum distributions by explicit scope decision. `static`
 means no dynamic libc/loader requirement, not qualification of every Linux
-kernel. The historical cohort identifier `phase1-fastly-cli` is a destination-only label for the original contract; it is not the current file count or a qualification claim. The Fastly `provenance-sbom-repeatable` profile is destination-only: Phase 1 makes no repeatability claim. Its original four entries remain unchanged. **No Phase 1 reader** enforces these records or
+kernel. The cohort’s `eligible_branches: ["main"]` is a destination value, not enforced by Phase 1; rc-branch eligibility remains a maintainer decision. Phase 1 ships seven artifacts. The historical cohort identifier `phase1-fastly-cli` is a destination-only label for the original contract; it is not the current file count or a qualification claim. The Fastly `provenance-sbom-repeatable` profile is destination-only: Phase 1 makes no repeatability claim. Its original four entries remain unchanged. **No Phase 1 reader** enforces these records or
 their destination assurance profiles/capability labels. `release-tools.json` and
 consumer `release-policy.json` remain byte-for-byte unchanged. The workflow's
 explicit seven selections own the Phase 1 builds; no supplemental tool file or
@@ -270,8 +270,7 @@ valid.
 - `v0.0.0-rehearsal.8` at `7a05940e2f7b10c459bdd2d3949f265b755ce42c`: all seven builds/signing jobs, immutable prerelease publication and complete independent online/offline/runtime verification passed. All 29 assets, 28 checksum entries, both predicates and signer forms, online store lookup without bundles, SPDX equality and the pinned Fastly pack/validate/inspect/cmp route passed. [Full transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6362236955).
 
 The latest rehearsed implementation is `7a05940e2f7b10c459bdd2d3949f265b755ce42c` from `.8`.
-This review-head update is docs-only since rehearsed `7a05940e2`; workflows,
-scripts, tests and release bytes retain the rehearsed implementation.
+The current corrective batch changes publication checks and Axum binding; `.8` is historical evidence and does not qualify these changes.
 
 The immutable `.2`, `.3`, `.4`, `.5`, `.6` and `.8` releases remain intact; no drafts remain. The `.7` tag has no release. No upstream tags, releases or repository settings were changed.
 
@@ -294,4 +293,8 @@ clean inherited environments provide additional checks, not hermeticity.
 
 Rehearsal `.6` at `39a769c3e3d6476395fa7a215bd0a5e74a760f3e` failed after immutable publication at the release-attestation lookup. [Independent verification](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6360012578) passed for all seven binaries / 29 assets, online and offline checks, SPDX equality and the manual Fastly pack/validate/inspect/cmp route; this does not turn the failed workflow green. Fresh `.8` subsequently passed at `7a05940e2f7b10c459bdd2d3949f265b755ce42c`; see the [full transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6362236955).
 
-The failed publisher check ran at 07:19:53.744 UTC; the independently verified release attestation has a trusted timestamp of 07:19:58 UTC. The pinned CLI hides underlying lookup errors, so the original HTTP status is unknown. The immutable prerelease and its 29 assets remain unchanged. The new availability check waits only for an HTTP 200 result without a current-tag GitHub release attestation: three checks, 2s then 5s, at most 7s total waiting within the existing scheduling window. Other-tag records on the same commit must be well-formed and their exact bundles cryptographically verified before ignoring them; their tag names alone are logged. Current-tag duplicates or identity/source/asset mismatches and every verification failure stop immediately.
+The failed publisher check ran at 07:19:53.744 UTC; the independently verified release attestation has a trusted timestamp of 07:19:58 UTC. The pinned CLI hides underlying lookup errors, so the original HTTP status is unknown. The immutable prerelease and its 29 assets remain unchanged. Before cryptographic release verification, the availability check makes at most five release-attestation GETs, with 2s/5s/10s/20s backoff (37s total waiting). Only this endpoint treats HTTP 404 as no record yet; a valid HTTP 200 with no current-tag record may also wait. Each GET times out after at most 4s, and a separate 60s deadline bounds availability checking, including other-tag verification, within the shared three-minute scheduling window. Every other non-200 status fails immediately. Malformed records, duplicate current-tag records, identity/source/asset mismatches and definitive cryptographic failures stop immediately. Other-tag records are ignored only after their exact bundles verify; those read-only verification calls may retry recognized transient failures within the same bounds. Current-tag cryptographic verification is single-shot. Logs show every wait or availability on the first check. No mutation is retried.
+
+### Corrective batch publication checks
+
+Post-publish downloads use fresh temporary directories and bounded transient read retries. The complete 29-file inventory and every byte, including SHA256SUMS, must match the cryptographically verified release/handoff. Missing, extra or changed files fail immediately. The release-body verification commands are tested against the operator guide’s canonical block. Axum uses the pinned EdgeZero resolver with every warning fatal; ports must be 1–65535, and primary EDGEZERO**ADAPTER**PORT and legacy PORT must agree. Container smokes use 0.0.0.0:8080 with host-side reachability.

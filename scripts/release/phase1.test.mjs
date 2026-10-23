@@ -153,6 +153,12 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
     'success',
     'idle-socket',
     'stable',
+    'download-corrupt',
+    'download-missing',
+    'download-extra',
+    'download-manifest',
+    'download-transient',
+    'download-never',
     'publication-disabled',
     'prerelease-mismatch',
     'post-read-error',
@@ -165,9 +171,9 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
     'upload-error',
     'mutable',
     'wrong-id',
-    'attestation-after-one-wait',
+    'attestation-404-then-present',
     'attestation-after-two-waits',
-    'attestation-never',
+    'attestation-404-never',
     'attestation-non-200',
     'attestation-201',
     'attestation-auth-error',
@@ -184,6 +190,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
     'attestation-other-tag-before-current',
     'attestation-other-malformed',
     'attestation-other-unverifiable',
+    'attestation-other-transient',
     'attestation-substituted-bundle',
     'attestation-verification-failure',
   ]) {
@@ -193,6 +200,9 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
     const stable = ['stable', 'attestation-other-tag'].includes(mode)
     const waits = [],
       ignored = []
+    let downloads = 0,
+      otherReads = 0,
+      now = 0
     let polls = 0,
       observed = []
     try {
@@ -312,16 +322,18 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           if (mode === 'attestation-other-malformed')
             other.bundle.dsseEnvelope.payload = '!invalid!'
           const delay =
-            mode === 'attestation-after-one-wait'
+            mode === 'attestation-404-then-present'
               ? 1
               : [
                     'attestation-after-two-waits',
                     'attestation-other-tag-before-current',
                   ].includes(mode)
                 ? 2
-                : mode === 'attestation-never'
-                  ? 3
+                : mode === 'attestation-404-never'
+                  ? 5
                   : 0
+          if (polls <= delay && mode !== 'attestation-other-tag-before-current')
+            return response({ message: 'Not Found' }, 404)
           observed = polls <= delay ? [] : [attestation()]
           if (mode === 'attestation-duplicate') observed.push(attestation())
           if (mode.startsWith('attestation-other-')) observed.unshift(other)
@@ -334,12 +346,26 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         if (u.pathname.endsWith('/releases') && method === 'POST') {
           const creation = JSON.parse(options.body)
           assert.equal(creation.prerelease, !stable)
-          assert.equal(creation.make_latest, stable ? 'true' : 'false')
+          assert.equal(creation.make_latest, stable ? 'legacy' : 'false')
           const body = creation.body
           assert.match(body, /--signer-workflow.*release-build\.yml/)
           assert.match(body, /--cert-identity.*release-build\.yml@refs\/tags/)
           assert.ok(body.includes('COMMIT=' + 'a'.repeat(40)))
           for (const asset of assets) assert.ok(body.includes(asset))
+          const normalize = (code) =>
+            code.replace(/^(REPO|TAG|COMMIT|ASSETS)=.*$/gm, '$1=<pin>').trim()
+          const guide = readFileSync(
+            'docs/guide/release-verification.md',
+            'utf8'
+          ).match(
+            /<!-- release-verification:start -->\n\n```bash\n([\s\S]*?)\n```\n\n<!-- release-verification:end -->/
+          )
+          assert.ok(guide, 'should mark the canonical verification block')
+          assert.equal(
+            normalize(body.match(/```bash\n([\s\S]*?)\n```/)[1]),
+            normalize(guide[1]),
+            'release commands should match the guide'
+          )
           execFileSync('bash', ['-n'], {
             input: body.match(/```bash\n([\s\S]*?)\n```/)[1],
           })
@@ -371,6 +397,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
       }
       const context = {
         Buffer,
+        Date: { now: () => now, parse: Date.parse },
         JSON,
         AbortSignal,
         URL,
@@ -385,6 +412,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         },
         setTimeout: (resolve, delay) => {
           waits.push(delay)
+          now += delay
           resolve()
         },
         fetch,
@@ -401,6 +429,9 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
           if (name === 'node:fs')
             return {
               ...fs,
+              mkdtempSync: (prefix) =>
+                fs.mkdtempSync(join(root, prefix)).slice(root.length + 1),
+              rmSync: (path, options) => fs.rmSync(join(root, path), options),
               readdirSync: (path, ...rest) =>
                 fs.readdirSync(join(root, path), ...rest),
               lstatSync: (path) => fs.lstatSync(join(root, path)),
@@ -419,9 +450,39 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
             return {
               execFileSync: (...args) => {
                 calls.push(['gh', args])
+                if (args[1][1] === 'download') {
+                  downloads++
+                  assert.ok(
+                    args[2].timeout > 10000 && args[2].timeout <= 60000,
+                    'should allow bulk transfers within the shared deadline'
+                  )
+                  const dir = args[1][args[1].indexOf('--dir') + 1]
+                  if (
+                    mode === 'download-never' ||
+                    (mode === 'download-transient' && downloads === 1)
+                  )
+                    throw Object.assign(Error('timeout'), { code: 'ETIMEDOUT' })
+                  for (const item of uploaded)
+                    fs.writeFileSync(join(root, dir, item.name), item.bytes)
+                  if (mode === 'download-corrupt')
+                    fs.writeFileSync(join(root, dir, assets[0]), 'corrupt')
+                  if (mode === 'download-manifest')
+                    fs.writeFileSync(join(root, dir, 'SHA256SUMS'), 'corrupt')
+                  if (mode === 'download-missing')
+                    fs.unlinkSync(join(root, dir, assets[0]))
+                  if (mode === 'download-extra')
+                    fs.writeFileSync(join(root, dir, 'extra'), 'extra')
+                  return Buffer.from('downloaded')
+                }
                 if (args[1][1] !== 'verify')
                   return Buffer.from('verified asset')
                 const tag = args[1].at(-1)
+                if (
+                  mode === 'attestation-other-transient' &&
+                  tag === 'v1.0.0-rc.1' &&
+                  ++otherReads === 1
+                )
+                  throw Object.assign(Error('timeout'), { code: 'ETIMEDOUT' })
                 if (
                   mode === 'attestation-verification-failure' ||
                   (mode === 'attestation-other-unverifiable' &&
@@ -453,13 +514,24 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         'success',
         'idle-socket',
         'stable',
-        'attestation-after-one-wait',
+        'download-transient',
+        'attestation-other-transient',
+        'attestation-404-then-present',
         'attestation-after-two-waits',
         'attestation-other-tag',
         'attestation-other-tag-before-current',
       ].includes(mode)
       if (successful) await execute()
-      else await assert.rejects(execute, undefined, mode)
+      else
+        await assert.rejects(
+          execute,
+          mode === 'attestation-404-never'
+            ? /unavailable after five checks/
+            : mode.startsWith('download-') && mode !== 'download-never'
+              ? /mismatch|Unexpected artifact contents|ENOENT/
+              : undefined,
+          mode
+        )
       if (
         [
           'draft',
@@ -479,27 +551,60 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
       if (successful) {
         assert.equal(uploaded.length, 29)
         assert.equal(
-          calls.filter(([method]) => method === 'gh').length,
-          mode === 'attestation-other-tag'
-            ? 31
-            : mode === 'attestation-other-tag-before-current'
-              ? 33
-              : 30
+          calls.filter(
+            ([method, args]) => method === 'gh' && args[1][1] !== 'download'
+          ).length,
+          mode === 'attestation-other-transient'
+            ? 32
+            : mode === 'attestation-other-tag'
+              ? 31
+              : mode === 'attestation-other-tag-before-current'
+                ? 33
+                : 30
+        )
+      }
+      assert.equal(
+        fs
+          .readdirSync(root)
+          .some((name) => name.startsWith('published-download-')),
+        false,
+        'should clean every download attempt'
+      )
+      if (mode.startsWith('download-')) {
+        assert.equal(
+          downloads,
+          mode === 'download-transient' ? 2 : mode === 'download-never' ? 3 : 1
+        )
+        assert.deepEqual(
+          waits,
+          mode === 'download-transient'
+            ? [2000]
+            : mode === 'download-never'
+              ? [2000, 5000]
+              : []
         )
       }
       if (mode.startsWith('attestation-')) {
         const expectedWaits =
-          mode === 'attestation-after-one-wait'
-            ? [2000]
+          mode === 'attestation-404-never'
+            ? [2000, 5000, 10000, 20000]
             : [
-                  'attestation-after-two-waits',
-                  'attestation-never',
-                  'attestation-other-tag-before-current',
+                  'attestation-404-then-present',
+                  'attestation-other-transient',
                 ].includes(mode)
-              ? [2000, 5000]
-              : []
+              ? [2000]
+              : [
+                    'attestation-after-two-waits',
+                    'attestation-other-tag-before-current',
+                  ].includes(mode)
+                ? [2000, 5000]
+                : []
         assert.deepEqual(waits, expectedWaits, mode)
-        assert.equal(polls, expectedWaits.length + 1, mode)
+        assert.equal(
+          polls,
+          mode === 'attestation-other-transient' ? 1 : expectedWaits.length + 1,
+          mode
+        )
         assert.equal(
           calls.filter(
             ([method, path]) => method === 'POST' && path.endsWith('/releases')
@@ -521,7 +626,9 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         )
         assert.deepEqual(
           ignored,
-          mode === 'attestation-other-tag'
+          ['attestation-other-tag', 'attestation-other-transient'].includes(
+            mode
+          )
             ? ['"v1.0.0-rc.1"']
             : mode === 'attestation-other-tag-before-current'
               ? Array(3).fill('"v1.0.0-rc.1"')
@@ -928,5 +1035,26 @@ test('audit handles ordinary char literals and generated include prefixes', () =
       'src/lib.rs',
       'include_str!(concat!(env!("OUT_DIR"), "/generated.rs"))'
     )
+  )
+})
+
+test('post-publish reads cannot succeed after the shared deadline', async () => {
+  const code = publicationScript()
+    .split('// BEGIN READ RETRIES')[1]
+    .split('// END READ RETRIES')[0]
+  let now = 0
+  const retry = vm.runInNewContext(`${code}; retryRead`, {
+    Date: { now: () => now, parse: Date.parse },
+    console: {
+      warn: () => assert.fail('should not retry deadline exhaustion'),
+    },
+  })
+  await assert.rejects(
+    () =>
+      retry(() => {
+        now = 180000
+        return 'late success'
+      }),
+    /window exhausted/
   )
 })
