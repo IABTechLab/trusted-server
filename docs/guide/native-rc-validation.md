@@ -1,5 +1,20 @@
 # EdgeZero RC431 validation record
 
+## Geo follow-up, 2026-10-23
+
+The operator guide now targets EdgeZero RC
+`9896233cb4274ec14a3ed33babac1846ab3d3715`, including the explicit production
+options runner and admitted-error finalizer. Partial TS geography preserves
+populated field names and omits unavailable detail. Native Geo remains
+explicitly selected through the protected CloudFront profile.
+
+The 2026-10-20 results below are historical evidence for their recorded pins,
+not acceptance of this newer source, image or CloudFront deployment. New
+integration results and remaining cloud qualification must be recorded against
+the final source and image digests before deployment.
+
+## Initial RC431 record
+
 Validation date: 2026-10-20. This records local checks, not a deployment or a
 production certification. See [the operator guide](./native-rc-demo.md) for inputs
 and launch commands.

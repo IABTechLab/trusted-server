@@ -1,11 +1,11 @@
 # syntax=docker/dockerfile:1
-# Adapted from EdgeZero 61bfe3b's hardened native recipe. Build at workspace root.
+# Adapted from the pinned EdgeZero RC's hardened native recipe. Build at workspace root.
 FROM node:24.12.0-bookworm-slim@sha256:7326fb2dbdce998edd72140946851be64ef4a643e8715e138ca467e8e9d92c99 AS node
 FROM rust:1.98.1-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e AS builder
 COPY --from=node /usr/local/ /usr/local/
 WORKDIR /src
 COPY . .
-# AWS providers are default-off. Direct Cargo builds must forward them explicitly.
+# AWS providers and CloudFront Geo are default-off. Forward them explicitly.
 ARG NATIVE_FEATURES=""
 # Optional existing build metadata input; .git never enters the build context.
 ARG TRUSTED_SERVER__GIT_VERSION=""
@@ -15,10 +15,16 @@ test "$(rustc --version | awk '{print $2}')" = 1.98.1
 test "$(node --version)" = v24.12.0
 test "$(awk '$1 == "rust" {print $2}' .tool-versions)" = 1.98.1
 grep -Eq '^channel = "1.98.1"$' rust-toolchain.toml
-case "$NATIVE_FEATURES" in
-  ""|aws-appconfig-agent|aws-secrets-manager|aws-appconfig-agent,aws-secrets-manager|aws-secrets-manager,aws-appconfig-agent) ;;
-  *) echo 'Only the two declared native AWS provider features are supported' >&2; exit 1 ;;
-esac
+feature_ifs=$IFS
+IFS=,
+for feature in $NATIVE_FEATURES; do
+  case "$feature" in
+    aws-appconfig-agent|aws-secrets-manager|geo-cloudfront) ;;
+    *) echo 'Only the declared native AWS store and CloudFront Geo features are supported' >&2; exit 1 ;;
+  esac
+done
+IFS=$feature_ifs
+unset feature feature_ifs
 apt-get update
 apt-get install -y --no-install-recommends cmake
 rm -rf /var/lib/apt/lists/*

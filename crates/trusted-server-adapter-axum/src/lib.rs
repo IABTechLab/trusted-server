@@ -1,12 +1,15 @@
 //! Native Axum adapter with strict prepared-store startup.
 //!
 //! Runtime settings and immutable store snapshots are validated before the RC
-//! listener becomes ready. Reader geography remains unavailable on native.
+//! listener becomes ready. Optional reader geography comes only from the
+//! managed native host's protected, immutable request outcome.
 
 /// Application routing and handler registration for the Axum dev server.
 pub mod app;
 /// Request middleware (auth, response finalisation).
 pub mod middleware;
+/// Explicit native Geo boot profile and provider composition.
+pub mod native_geo;
 /// Managed outbound HTTP compatibility bridge.
 pub mod outbound;
 /// Native platform services and request-scoped transport/ingress bridges.

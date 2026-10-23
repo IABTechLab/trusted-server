@@ -3,7 +3,7 @@
 This is a compatibility/demo candidate, not production certification or an AWS
 deployment. It starts from Trusted Server main
 `6ef07ae52bec3e695ec57fe090243b1a281c314f` and pins EdgeZero to
-`61bfe3b931fd97f5300287e4a91e33f32aa0fbee`. PRs #1410, #1411 and #1412,
+`9896233cb4274ec14a3ed33babac1846ab3d3715`. PRs #1410, #1411 and #1412,
 including their #777 module/configuration/permission stack, are excluded.
 
 The [validation record](./native-rc-validation.md) lists executed checks,
@@ -36,7 +36,8 @@ Shared identities resolve to bytes `1.12.1`, Fastly/log-fastly `0.13.1`, Spin SD
 `7.0.0`, validator `0.21.0` and Worker `0.8.5`. ESI `0.7.2` uses the dependency-only
 Fastly SDK patch at `75bfbb396d4cb7792610f1287cbec61675f13f38`; remove it when
 upstream releases the SDK range change. TS cryptographic algorithms, crate
-majors and serialized byte contracts are unchanged. AWS SDK dependencies are
+majors are unchanged. Existing populated Geo wire fields keep their names; partial
+results omit unavailable detail. AWS SDK dependencies are
 absent from the default native and all three WASM adapter graphs.
 
 ## Prepare the existing configuration envelope
@@ -110,6 +111,49 @@ The file must contain only trusted shell assignments and be readable by UID 1000
 secrets remain visible to Docker administrators. Remote Secrets Manager bindings
 avoid this local file-to-environment bridge.
 
+## Optional protected native Geo
+
+The `geo-cloudfront` feature is default-off. Compile it explicitly, then select
+it through a separately delivered TS boot profile. EdgeZero does not read a
+Geo setting from store bindings, publisher AppConfig or an `EDGEZERO__GEO__*`
+environment variable.
+
+```toml
+version = 1
+
+[geo]
+provider = "cloudfront"
+alb_peer_cidrs = ["10.42.1.0/24", "10.42.2.0/24"]
+origin_credential_header_name = "x-origin-example-removal"
+```
+
+Set `TS_NATIVE_GEO_PROFILE_FILE` to that file. With no profile, local hosting
+remains Off. A selected invalid/unreadable profile or compiled-out provider
+fails before readiness. The protected policy accepts actual ALB peer ranges and
+only the credential removal name, never its expected value. Keep real header
+names and values out of logs and public configuration. The deployment wrapper
+can atomically render `TS_NATIVE_GEO_PROFILE_TOML` into its private runtime
+volume, unset those content bytes, and export the file pointer.
+
+The required front door is CloudFront with generated country/subdivision
+headers, HTTPS to an exact-credential-gated ALB, CloudFront-only ALB ingress,
+and an ALB-only private application port. Disable shared caching, including
+cacheable errors. Ordinary forwarding trust and protected Geo source admission
+are separate. See the [native deployment draft](../../deploy/native-demo/README.md)
+for staged origin/DNS cutover and cleanup ownership.
+
+TS reads only the immutable `RequestContext::geo()` result. Country-only data
+has no invented city or coordinates. Missing, invalid or untrusted results stay
+unavailable; US country without a recognized subdivision stays Unknown for
+consent policy. Real geographic estimates do not grant consent. The existing
+TCF/GPC/identity rules and unavailable identity KV remain unchanged.
+
+The production options runner preserves SIGINT/SIGTERM and bounded drain. The
+admitted error-response finalizer preserves Geo/TS headers on framework-rendered
+errors without replacing EdgeZero's status, required headers or failure
+classification. Pre-admission failures without a managed outcome remain outside
+that finalizer.
+
 ## Build and run the image
 
 Build from the workspace root. Rust `1.98.1`, Node `24.12.0` and the runtime base
@@ -121,14 +165,16 @@ its private Cargo `OUT_DIR` and embeds them in the actual TS binary.
 ```sh
 docker build --build-arg TRUSTED_SERVER__GIT_VERSION="$(git rev-parse HEAD)" \
   -t ts-edgezero431-local:local .
-# Optional, explicit server provider forwarding, default is local providers only:
+# Optional, explicit store/Geo forwarding, default is local providers only:
 docker build --build-arg TRUSTED_SERVER__GIT_VERSION="$(git rev-parse HEAD)" \
   --build-arg NATIVE_FEATURES=aws-appconfig-agent,aws-secrets-manager \
   -t ts-edgezero431-local:providers .
 ```
 
-Only `aws-appconfig-agent` and `aws-secrets-manager` are accepted by this recipe.
-CLI features do not compile server providers. There is no DynamoDB feature or EC
+Only `aws-appconfig-agent`, `aws-secrets-manager` and `geo-cloudfront` are accepted
+by this recipe. Add `geo-cloudfront` to the build argument for the protected
+profile; compiling it alone does not select Geo. CLI features do not compile
+server providers. There is no DynamoDB feature or EC
 graph claim here. Build outputs include `/usr/local/share/ts-build-inputs.sha256`
 for comparing the exact copied build inputs with later working-tree changes.
 Digest-pinned bases do not make subsequent Debian security updates bit-reproducible.
@@ -216,9 +262,11 @@ Native client IP and public URL metadata come from checked RC
 `NativeIngressMetadata`. RequestInfo, URI and Host are normalized together from
 those checked facts, including absolute-form request targets. Raw Forwarded-family
 headers do not grant trust. Only
-explicitly configured trusted proxies may supply forwarding metadata. Reader geo
-is unavailable on native. An AWS region is not reader geography, and consent
-remains fail-closed. This does not reproduce Fastly geo behavior.
+explicitly configured trusted proxies may supply forwarding metadata. Optional
+native Geo comes from the independently protected CloudFront assertion path,
+not the deployment region or raw reader/forwarding headers. No GeoIP database or
+remote lookup ships with this provider. Country/subdivision results do not
+reproduce Fastly city/coordinate precision, and consent remains fail-closed.
 
 Keep `RUST_LOG` at `info` or quieter for ordinary runs. AWS SDK dependencies can
 expose credential-source metadata, ARNs or bodies at DEBUG/TRACE, and AppConfig

@@ -384,10 +384,19 @@ fn build_common_request(
             geo: device.geo.as_ref().map(|geo| Geo {
                 country: Some(geo.country.clone()),
                 region: geo.region.clone(),
-                city: Some(geo.city.clone()),
-                lat: matches!(policy, ProfilePolicy::Prebid(_)).then_some(geo.latitude),
-                lon: matches!(policy, ProfilePolicy::Prebid(_)).then_some(geo.longitude),
-                metro: (geo.metro_code > 0).then(|| geo.metro_code.to_string()),
+                city: geo.city.clone(),
+                lat: geo
+                    .coordinates
+                    .filter(|_| matches!(policy, ProfilePolicy::Prebid(_)))
+                    .map(|coordinates| coordinates.latitude),
+                lon: geo
+                    .coordinates
+                    .filter(|_| matches!(policy, ProfilePolicy::Prebid(_)))
+                    .map(|coordinates| coordinates.longitude),
+                metro: geo
+                    .metro_code
+                    .filter(|code| *code > 0)
+                    .map(|code| code.to_string()),
                 r#type: Some(2),
                 ..Default::default()
             }),

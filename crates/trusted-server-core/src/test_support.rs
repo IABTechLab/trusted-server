@@ -319,11 +319,13 @@ pub mod nextjs_auction {
         ) -> Result<Option<GeoInfo>, Report<PlatformError>> {
             Ok(Some(GeoInfo {
                 country: "AU".to_owned(),
-                city: "Example City".to_owned(),
-                continent: "Oceania".to_owned(),
-                latitude: 0.0,
-                longitude: 0.0,
-                metro_code: 0,
+                city: Some("Example City".to_owned()),
+                continent: Some("Oceania".to_owned()),
+                coordinates: Some(crate::platform::GeoCoordinates {
+                    latitude: 0.0,
+                    longitude: 0.0,
+                }),
+                metro_code: Some(0),
                 region: None,
                 asn: None,
             }))

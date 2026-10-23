@@ -172,6 +172,70 @@ fn deterministic_signer() -> RequestSigner {
 }
 
 #[test]
+fn geo_exports_omit_unavailable_partial_fields_across_profiles() {
+    for (profile, config) in [
+        ("prebid-server", json!({})),
+        ("standard", json!({})),
+        ("aps", json!({"account_id": "example-account"})),
+    ] {
+        for region in [None, Some("CA".to_owned())] {
+            let mut request = canonical_parity_auction_request();
+            request.device.as_mut().expect("should have device").geo = Some(
+                crate::platform::GeoInfo::country_region("US", region.clone()),
+            );
+            let serialized =
+                serde_json::to_value(build_with_request(profile, config.clone(), request, None))
+                    .expect("should serialize partial geography");
+            let mut expected = json!({"country": "US", "type": 2});
+            if let Some(region) = region {
+                expected["region"] = json!(region);
+            }
+            assert_eq!(serialized["device"]["geo"], expected, "{profile}");
+        }
+    }
+}
+
+#[test]
+fn geo_exports_preserve_populated_fields_and_real_zero_coordinates() {
+    for (profile, config) in [
+        ("prebid-server", json!({})),
+        ("standard", json!({})),
+        ("aps", json!({"account_id": "example-account"})),
+    ] {
+        for coordinates in [
+            crate::platform::GeoCoordinates {
+                latitude: 12.34,
+                longitude: 56.78,
+            },
+            crate::platform::GeoCoordinates {
+                latitude: 0.0,
+                longitude: 0.0,
+            },
+        ] {
+            let mut request = canonical_parity_auction_request();
+            request
+                .device
+                .as_mut()
+                .expect("should have device")
+                .geo
+                .as_mut()
+                .expect("should have geo")
+                .coordinates = Some(coordinates);
+            let serialized =
+                serde_json::to_value(build_with_request(profile, config.clone(), request, None))
+                    .expect("should serialize populated geography");
+            let mut expected = json!({"country": "US", "region": "CA", "city": "Example City",
+                "metro": "501", "type": 2});
+            if profile == "prebid-server" {
+                expected["lat"] = json!(coordinates.latitude);
+                expected["lon"] = json!(coordinates.longitude);
+            }
+            assert_eq!(serialized["device"]["geo"], expected, "{profile}");
+        }
+    }
+}
+
+#[test]
 fn consent_matrix_preserves_pbs_standard_and_aps_policies() {
     let cases = [
         ("empty", ConsentContext::default()),
