@@ -333,6 +333,12 @@ async function smokeRelease(file, target) {
       '--mount',
       `type=bind,src=${resolve(file)},dst=/release,readonly`,
     ]
+    if (!cli)
+      restrictions.push(
+        '--mount',
+        'type=bind,src=/etc/ssl/certs/ca-certificates.crt,dst=/ca.pem,readonly',
+        '--env=SSL_CERT_FILE=/ca.pem'
+      )
     const container = 'phase1-smoke-' + randomUUID()
     let failed
     try {
@@ -414,8 +420,11 @@ async function smokeRelease(file, target) {
           await new Promise((resolve) => setTimeout(resolve, 100))
           continue
         }
-        if (response.status !== 200 || (await response.text()) !== 'ok')
-          throw Error('Axum configuration or health mismatch')
+        const body = await response.text()
+        if (response.status !== 200 || body !== 'ok')
+          throw Error(
+            `Axum health mismatch: HTTP ${response.status}: ${body.slice(0, 500)}`
+          )
         healthy = true
         break
       }

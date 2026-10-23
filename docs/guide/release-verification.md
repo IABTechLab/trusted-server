@@ -21,7 +21,7 @@ and signing jobs do not check out, compile or execute the downloaded binaries.
 | `ts-aarch64-apple-darwin`                       | macOS 15 Apple Silicon runner, deployment target 15.0; runtime compatibility qualification remains pending         |
 | `ts-x86_64-apple-darwin`                        | macOS 15 Intel runner, deployment target 15.0; runtime compatibility qualification remains pending                 |
 | `trusted-server-axum-x86_64-unknown-linux-gnu`  | GNU x86-64; UBI 9 build; maximum glibc 2.34; Debian 12, Ubuntu 22.04 and UBI 9 startup smokes                      |
-| `trusted-server-axum-x86_64-unknown-linux-musl` | Fully static x86-64; musl 1.2.4 build; pinned Alpine and empty-rootfs startup smokes                               |
+| `trusted-server-axum-x86_64-unknown-linux-musl` | Fully static x86-64; musl-tools 1.2.4-2; pinned Alpine and scratch-like startup smokes with runtime CA data        |
 | `trusted-server-axum-aarch64-unknown-linux-gnu` | ARM64 GNU; native ARM UBI 9 build; maximum glibc 2.34; Debian 12 startup smoke                                     |
 
 The retained destination design calls for a macOS 13.0 deployment target;
@@ -31,10 +31,15 @@ The executables are not notarized. GNU builds require no GLIBC symbol newer than
 the selected baseline. This includes
 Debian 12/bookworm-slim, Ubuntu 22.04+ and RHEL/UBI 9+. Distroless
 cc-debian12 has a compatible libc floor but is not a Phase 1 smoke image.
-The musl asset needs no dynamic loader or libraries; Alpine and an empty-rootfs
+The musl asset needs no dynamic loader or libraries; Alpine and a scratch-like
 container are required smoke images, while distroless-static is another deployment option
 without a separate Phase 1 runtime test. Build logs record acquired runtime image
 IDs. These required startup checks do not establish complete platform/tool qualification.
+Axum's TLS client requires a runtime CA certificate bundle, including for health
+request initialization. Every Axum smoke mounts the runner's system CA
+bundle read-only at `/ca.pem` with `SSL_CERT_FILE=/ca.pem`; production operators
+must supply their own runtime trust store. This is runtime data, not an embedded
+configuration or dynamically linked library.
 The expanded seven-binary batch awaits hosted CI and rehearsal `.5`; `.4`
 proves only the original four binaries. Native
 libraries and provider tools needed by individual `ts` commands retain their

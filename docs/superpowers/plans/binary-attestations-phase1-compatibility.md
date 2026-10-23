@@ -165,7 +165,12 @@ unchanged. Before upload they check wasm magic/version, each CLI's existing
 `ts 0.1.0` package-version output, GNU symbol ceilings and static-musl loader
 requirements. GNU x86 binaries start on Debian 12-slim, Ubuntu 22.04 and UBI 9.6
 minimal; ARM Axum starts on Debian 12-slim on the ARM runner; musl starts on
-pinned Alpine and an empty root filesystem. Acquired builder/runtime image IDs
+pinned Alpine and a scratch-like root filesystem with a read-only runtime CA
+bundle. The locked adapter initializes a TLS client before dispatching requests,
+so an entirely empty trust store fails even a health request. Every Axum smoke mounts
+the runner's system certificates at `/ca.pem` and sets `SSL_CERT_FILE`; operators
+must supply runtime trust data independently. No dynamic libraries are added.
+Acquired builder/runtime image IDs
 are logged. Axum has no help/version mode; its isolated, read-only, nonroot
 container receives only a fictional runtime envelope/secrets and must return
 `200 ok` from its configured health router. This does not establish publisher
