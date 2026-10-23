@@ -376,6 +376,8 @@ Every PR must pass:
 
 ---
 
+12. Release producer checks: `node --test scripts/release/phase1.test.mjs && shellcheck scripts/release/phase1-build.sh`
+
 ## Standard Workflow
 
 1. **Read & plan** — understand the request, explore relevant code.

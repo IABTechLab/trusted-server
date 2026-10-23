@@ -23,12 +23,13 @@ done
 node scripts/release/phase1.mjs audit
 # No operator values enter through inherited environment; these fictional canaries
 # additionally catch known config embedding regressions in the final executable.
+export TRUSTED_SERVER__RELEASE_BUILD=1
 export TRUSTED_SERVER__GIT_VERSION="$SOURCE_COMMIT"
 export TRUSTED_SERVER__PUBLISHER__ORIGIN_URL=https://phase1-origin-canary.example.com
 export TRUSTED_SERVER__PUBLISHER__PROXY_SECRET=phase1-secret-canary-32-characters
 export EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME=phase1-physical-store-canary
 export FASTLY_SERVICE_ID=phase1-service-account-canary
-export MACOSX_DEPLOYMENT_TARGET=15.0
+export MACOSX_DEPLOYMENT_TARGET=13.0
 [[ ! -e trusted-server.toml ]]
 cat > trusted-server.toml <<'CONFIG'
 # Fictional config must never become a build input.
@@ -62,7 +63,7 @@ DOCKERFILE
     --mount "type=bind,src=$CARGO_TARGET_DIR,dst=/target" \
     --mount "type=bind,src=$(dirname "$(dirname "$(node -p process.execPath)")"),dst=/opt/node,readonly" \
     --mount "type=bind,src=$(readlink -f "$(command -v rustup)"),dst=/usr/local/bin/rustup,readonly" \
-    --env TRUSTED_SERVER__GIT_VERSION --env TRUSTED_SERVER__PUBLISHER__ORIGIN_URL \
+    --env TRUSTED_SERVER__RELEASE_BUILD --env TRUSTED_SERVER__GIT_VERSION --env TRUSTED_SERVER__PUBLISHER__ORIGIN_URL \
     --env TRUSTED_SERVER__PUBLISHER__PROXY_SECRET --env EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME \
     --env FASTLY_SERVICE_ID --env CARGO_TARGET_DIR=/target \
     "$builder" bash -euc '
@@ -86,6 +87,7 @@ else
   cargo build --package "$build_package" --release --target "$build_target" --locked
 fi
 cp "$CARGO_TARGET_DIR/$build_target/release/$executable" "release-assets/$release_asset"
+shasum -a 256 "release-assets/$release_asset" > "$RUNNER_TEMP/binary.sha256"
 node scripts/release/phase1.mjs check "release-assets/$release_asset"
 node scripts/release/phase1.mjs smoke "release-assets/$release_asset" "$build_target"
 # Pin and checksum the generator source before extraction or execution. Cargo's
@@ -137,4 +139,5 @@ chmod +x "$tool_root/converter"
 node scripts/release/phase1.mjs validate-spdx \
   "release-assets/$release_asset.spdx.json" "release-assets/$release_asset" \
   "$tool_root/combined.cdx.json"
+shasum -a 256 --check "$RUNNER_TEMP/binary.sha256"
 git diff --exit-code -- Cargo.lock crates/trusted-server-js/lib/package-lock.json edgezero.toml

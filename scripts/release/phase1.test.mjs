@@ -151,6 +151,9 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
   for (const mode of [
     'success',
     'idle-socket',
+    'stable',
+    'publication-disabled',
+    'prerelease-mismatch',
     'post-read-error',
     'draft',
     'api-error',
@@ -200,7 +203,8 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         )
       const release = (draft) => ({
         id: 42,
-        tag_name: 'v0.0.0-example',
+        tag_name: mode === 'stable' ? 'v1.0.0' : 'v0.0.0-example',
+        prerelease: mode !== 'stable' && mode !== 'prerelease-mismatch',
         draft,
         immutable: mode !== 'mutable',
         assets: uploaded,
@@ -227,7 +231,13 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
             ? response('denied', 503)
             : response(mode === 'draft' ? [release(true)] : [])
         if (u.pathname.endsWith('/releases') && method === 'POST') {
-          const body = JSON.parse(options.body).body
+          const creation = JSON.parse(options.body)
+          assert.equal(creation.prerelease, mode !== 'stable')
+          assert.equal(
+            creation.make_latest,
+            mode === 'stable' ? 'true' : 'false'
+          )
+          const body = creation.body
           assert.match(body, /--signer-workflow.*release-build\.yml/)
           assert.match(body, /--cert-identity.*release-build\.yml@refs\/tags/)
           assert.ok(body.includes('COMMIT=' + 'a'.repeat(40)))
@@ -270,7 +280,9 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         process: {
           env: {
             GH_REPO: 'example/project',
-            RELEASE_TAG: 'v0.0.0-example',
+            RELEASE_TAG: mode === 'stable' ? 'v1.0.0' : 'v0.0.0-example',
+            RELEASE_PUBLICATION_ENABLED:
+              mode === 'publication-disabled' ? 'false' : 'true',
             SOURCE_COMMIT: 'a'.repeat(40),
           },
         },
@@ -298,11 +310,12 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
       }
       const execute = () =>
         vm.runInNewContext(`(async()=>{${script}\n})()`, context)
-      if (['success', 'idle-socket'].includes(mode)) await execute()
+      if (['success', 'idle-socket', 'stable'].includes(mode)) await execute()
       else await assert.rejects(execute, undefined, mode)
       if (
         [
           'draft',
+          'publication-disabled',
           'api-error',
           'missing',
           'extra',
@@ -315,7 +328,7 @@ test('publication binds exact signing handoffs and refuses drafts, corruption an
         assert.equal(calls.length, mode === 'api-error' ? 1 : 3)
       if (['upload-error'].includes(mode))
         assert.ok(!calls.some(([method]) => method === 'PATCH'), mode)
-      if (['success', 'idle-socket'].includes(mode)) {
+      if (['success', 'idle-socket', 'stable'].includes(mode)) {
         assert.equal(uploaded.length, 29)
         assert.equal(calls.filter(([method]) => method === 'gh').length, 30)
       }
@@ -505,4 +518,186 @@ test('rejects invalid wasm, GNU symbols above 2.34 and dynamic musl', () => {
   for (const dynamic of ['INTERP', '(NEEDED) libgcc_s.so.1'])
     assert.throws(() => checkReleaseFormat(elf, musl, dynamic), /static/)
   assert.throws(() => checkReleaseFormat(wasm, gnu, 'GLIBC_2.34'), /ELF/)
+})
+test('audit resolves raw and nested concatenated deployment inputs', () => {
+  for (const source of [
+    'include_str!(concat!("trusted-", "server.toml"))',
+    'include_bytes!(concat!(".en", r#"v.production"#))',
+    'env!(r#"TRUSTED_SERVER__EC__PASSPHRASE"#)',
+    'option_env!(concat!("EDGEZERO__", concat!("STORE", "S")))',
+  ])
+    assert.throws(() => checkSource('src/lib.rs', source), /compile-time/)
+  for (const source of [
+    'std::env::var("TRUSTED_SERVER__EC__PASSPHRASE")',
+    'std::env::var_os(concat!("EDGEZERO__", "STORE"))',
+    'const SECRET: &str = r#"TRUSTED_SERVER__SECRET"#; env::var(SECRET)',
+  ])
+    assert.throws(() => checkSource('build.rs', source), /compile-time/)
+  for (const source of [
+    'include_str!(concat!(env!("OUT_DIR"), "/generated.rs"))',
+    'include_str!("trusted-server.example.toml")',
+    '// env!("EDGEZERO__SECRET")\nlet product = "literal";',
+    '/* include_str!("trusted-server.toml") */',
+  ])
+    assert.doesNotThrow(() => checkSource('src/lib.rs', source))
+  assert.doesNotThrow(() =>
+    checkSource('build.rs', 'env::var("TRUSTED_SERVER__GIT_VERSION")')
+  )
+  assert.doesNotThrow(() =>
+    checkSource('src/lib.rs', 'std::env::var("EDGEZERO__ADAPTER__HOST")')
+  )
+})
+test('rejects non-Mach-O, wrong CPU and newer or absent macOS floor', () => {
+  const macho = (cpu = 0x0100000c, minimum = 0x000d0000) => {
+    const b = Buffer.alloc(56)
+    b.writeUInt32LE(0xfeedfacf, 0)
+    b.writeUInt32LE(cpu, 4)
+    b.writeUInt32LE(1, 16)
+    b.writeUInt32LE(24, 20)
+    b.writeUInt32LE(0x32, 32)
+    b.writeUInt32LE(24, 36)
+    b.writeUInt32LE(1, 40)
+    b.writeUInt32LE(minimum, 44)
+    return b
+  }
+  assert.doesNotThrow(() => checkReleaseFormat(macho(), 'aarch64-apple-darwin'))
+  assert.doesNotThrow(() =>
+    checkReleaseFormat(macho(0x01000007), 'x86_64-apple-darwin')
+  )
+  for (const b of [
+    Buffer.alloc(8),
+    macho(0x01000007),
+    macho(0x0100000c, 0x000e0000),
+    macho().subarray(0, 40),
+  ])
+    assert.throws(
+      () => checkReleaseFormat(b, 'aarch64-apple-darwin'),
+      /Mach-O|macOS/
+    )
+})
+test('workflows select exactly the descriptive cohort and restrict actual build jobs', () => {
+  const cohort = JSON.parse(readFileSync('scripts/release/release-cohort.json'))
+  const names = cohort.artifacts.map((a) => a.name).sort()
+  const build = readFileSync('.github/workflows/release-build.yml', 'utf8')
+  const release = readFileSync('.github/workflows/release.yml', 'utf8')
+  assert.deepEqual(
+    [...build.matchAll(/^            asset: (\S+)/gm)].map((m) => m[1]).sort(),
+    names
+  )
+  const sign = build.split('\n  sign:')[1]
+  for (const name of names) assert.equal(sign.split(name).length - 1, 1)
+  const published = publicationScript().match(/const names = (\[[^;]+\]);/)[1]
+  assert.deepEqual(Array.from(vm.runInNewContext(published)).sort(), names)
+  for (const prefix of ['release-', 'signed-'])
+    assert.deepEqual(
+      [
+        ...release.matchAll(
+          new RegExp('          name: ' + prefix + '(\\S+)', 'g')
+        ),
+      ]
+        .map((m) => m[1])
+        .sort(),
+      names
+    )
+  const actualBuild = build.split('\n  build:')[1].split('\n  sign:')[0]
+  assert.doesNotMatch(actualBuild, /id-token|attestations:/)
+  assert.match(release, /vars\.RELEASE_PUBLICATION_ENABLED == 'true'/)
+})
+test('release preflight rejects inherited JS controls and mismatched source before tools run', () => {
+  const script = readFileSync('scripts/release/phase1-build.sh', 'utf8')
+  const root = mkdtempSync(join(tmpdir(), 'phase1-preflight-'))
+  const packageArgs = [
+    'trusted-server-cli',
+    'x86_64-unknown-linux-gnu',
+    'ts-x86_64-unknown-linux-gnu',
+  ]
+  const actual = execFileSync('git', ['rev-parse', 'HEAD'], {
+    encoding: 'utf8',
+  }).trim()
+  try {
+    for (const variable of [
+      'TSJS_SKIP_BUILD',
+      'TSJS_PREBUILT_DIR',
+      'TSJS_TEST',
+    ]) {
+      assert.throws(
+        () =>
+          execFileSync('bash', ['-c', script, 'phase1', ...packageArgs], {
+            env: {
+              PATH: process.env.PATH,
+              HOME: process.env.HOME,
+              RUNNER_TEMP: root,
+              SOURCE_COMMIT: actual,
+              [variable]: '',
+            },
+            stdio: 'pipe',
+          }),
+        (error) => error.stderr.toString().includes('Refusing ' + variable)
+      )
+    }
+    assert.throws(
+      () =>
+        execFileSync('bash', ['-c', script, 'phase1', ...packageArgs], {
+          env: {
+            PATH: process.env.PATH,
+            HOME: process.env.HOME,
+            RUNNER_TEMP: root,
+            SOURCE_COMMIT: '0'.repeat(40),
+          },
+          stdio: 'pipe',
+        }),
+      (error) => error.status !== 0
+    )
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+test('SPDX identifies all producing tools and normalizes license spacing', () => {
+  const { document, original } = spdxFixture()
+  document.documentDescribes = []
+  document.relationships = []
+  document.packages = document.packages.filter(
+    (p) => p.SPDXID !== 'SPDXRef-Root'
+  )
+  document.packages[0].licenseDeclared = 'Apache-2.0  OR  MIT'
+  original.metadata.component.version = 'v1.2.3-example'
+  const output = completeSpdx(document, binary, original)
+  assert.equal(
+    output.packages.find((p) => p.SPDXID === 'SPDXRef-Artifact').versionInfo,
+    'v1.2.3-example'
+  )
+  assert.equal(output.packages[0].licenseDeclared, 'Apache-2.0 OR MIT')
+  assert.ok(output.creationInfo.creators.includes('Tool: cyclonedx-cli-0.33.1'))
+  assert.ok(
+    output.creationInfo.creators.includes('Tool: trusted-server-phase1')
+  )
+})
+test('audit handles Rust escapes and every macro delimiter', () => {
+  for (const source of [
+    String.raw`env!("\x54RUSTED_SERVER__SECRET")`,
+    String.raw`env!("\u{54}RUSTED_SERVER__SECRET")`,
+    String.raw`include_str!("\x2eenv.production")`,
+    'env![concat!["TRUSTED_SERVER__", "SECRET"]]',
+    'env!{concat!{"TRUSTED_SERVER__", "SECRET"}}',
+  ])
+    assert.throws(() => checkSource('src/lib.rs', source), /compile-time/)
+})
+test('audit handles ordinary char literals and generated include prefixes', () => {
+  assert.doesNotThrow(() =>
+    checkSource('src/lib.rs', `const QUOTE: char = '"';`)
+  )
+  assert.throws(
+    () =>
+      checkSource(
+        'src/lib.rs',
+        'include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/trusted-server.toml"))'
+      ),
+    /compile-time/
+  )
+  assert.doesNotThrow(() =>
+    checkSource(
+      'src/lib.rs',
+      'include_str!(concat!(env!("OUT_DIR"), "/generated.rs"))'
+    )
+  )
 })

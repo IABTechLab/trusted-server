@@ -78,13 +78,14 @@ jobs:
           BUILD_TARGET: ${{ matrix.target }}
           RELEASE_ASSET: ${{ matrix.asset }}
           SOURCE_COMMIT: ${{ github.sha }}
+          RELEASE_VERSION: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           env -i PATH="$PATH" HOME="$HOME" \
             CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
             RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
             TMPDIR="${TMPDIR:-/tmp}" RUNNER_TEMP="$RUNNER_TEMP" \
-            SOURCE_COMMIT="$SOURCE_COMMIT" \
+            SOURCE_COMMIT="$SOURCE_COMMIT" RELEASE_VERSION="$RELEASE_VERSION" \
             bash scripts/release/phase1-build.sh "$BUILD_PACKAGE" "$BUILD_TARGET" "$RELEASE_ASSET"
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:

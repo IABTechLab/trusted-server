@@ -6,13 +6,17 @@ on:
     paths:
       - '.github/workflows/release*.yml'
       - 'scripts/release/phase1*'
+      - 'scripts/release/release-cohort.json'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
       - '.tool-versions'
       - '.cargo/**'
       - 'edgezero.toml'
-      - 'crates/trusted-server-core/**'
+      - 'crates/trusted-server-core/src/**'
+      - 'crates/trusted-server-core/build_support/**'
+      - 'crates/trusted-server-core/build.rs'
+      - 'crates/trusted-server-core/Cargo.toml'
       - 'crates/trusted-server-cli/**'
       - 'crates/trusted-server-js/**'
       - 'crates/trusted-server-adapter-fastly/**'
@@ -31,7 +35,7 @@ jobs:
       id-token: write
       attestations: write
   release:
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && vars.RELEASE_PUBLICATION_ENABLED == 'true'
     needs: build
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -100,6 +104,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
           SOURCE_COMMIT: ${{ github.sha }}
+          RELEASE_PUBLICATION_ENABLED: ${{ vars.RELEASE_PUBLICATION_ENABLED }}
         run: |
           set -euo pipefail
           gh --version
@@ -111,6 +116,8 @@ jobs:
           const { execFileSync } = require('node:child_process');
           const { GH_REPO: repo, RELEASE_TAG: tag, GH_TOKEN: token, SOURCE_COMMIT: source } = process.env;
           if (!/^[\w-]+\/[\w.-]+$/.test(repo) || !/^v[\w.+-]+$/.test(tag)) throw Error('Invalid repository or tag');
+          if (process.env.RELEASE_PUBLICATION_ENABLED !== 'true') throw Error('Release publication is not enabled by maintainers');
+          const prerelease = tag.includes('-'), make_latest = prerelease ? 'false' : 'true';
           const names = ['trusted-server-axum-x86_64-unknown-linux-gnu', 'trusted-server-axum-x86_64-unknown-linux-musl', 'trusted-server-axum-aarch64-unknown-linux-gnu', 'trusted-server-fastly.wasm', 'ts-aarch64-apple-darwin', 'ts-x86_64-apple-darwin', 'ts-x86_64-unknown-linux-gnu'];
           const hash = bytes => createHash('sha256').update(bytes).digest('hex');
           const regular = path => { const stat = fs.lstatSync(path); if (!stat.isFile() || stat.size === 0) throw Error(`Invalid file: ${path}`); return fs.readFileSync(path); };
@@ -147,18 +154,19 @@ jobs:
           const body = [
             `[Verification guide](https://github.com/${repo}/blob/${tag}/docs/guide/release-verification.md)`, '', '```bash', 'set -euo pipefail',
             `REPO=${repo}`, `TAG=${tag}`, `COMMIT=${source}`, `ASSETS=(${names.join(' ')})`,
-            'gh release download "$TAG" --repo "$REPO"', 'gh release verify "$TAG" --repo "$REPO"',
+            'gh release download "$TAG" --repo "$REPO"', 'test "$(gh api "repos/$REPO/releases/tags/$TAG" --jq .immutable)" = true', 'gh release verify "$TAG" --repo "$REPO"',
             'for asset in "${ASSETS[@]}"; do',
             '  for suffix in "" .spdx.json .provenance.sigstore.json .sbom.sigstore.json; do gh release verify-asset "$TAG" "$asset$suffix" --repo "$REPO"; done',
             '  for kind in provenance sbom; do',
             '    predicate=https://slsa.dev/provenance/v1; if [[ "$kind" == sbom ]]; then predicate=https://spdx.dev/Document/v2.3; fi',
             '    checks=(--repo "$REPO" --bundle "$asset.$kind.sigstore.json" --source-ref "refs/tags/$TAG" --source-digest "$COMMIT" --signer-digest "$COMMIT" --deny-self-hosted-runners --predicate-type "$predicate")',
-            '    gh attestation verify "$asset" "${checks[@]}" --signer-workflow "$REPO/.github/workflows/release-build.yml"',
+            '    gh attestation verify "$asset" "${checks[@]}" --signer-workflow "$REPO/.github/workflows/release-build.yml" --format json > "$asset.$kind.verified.json"',
+            `    if [[ "$kind" == sbom ]]; then jq -e --slurpfile sbom "$asset.spdx.json" '[.[].verificationResult.statement.predicate] | length == 1 and .[0] == $sbom[0]' "$asset.$kind.verified.json"; fi`,
             '    gh attestation verify "$asset" "${checks[@]}" --cert-identity "https://github.com/$REPO/.github/workflows/release-build.yml@refs/tags/$TAG"',
             '  done', 'done', 'gh release verify-asset "$TAG" SHA256SUMS --repo "$REPO"', 'shasum -a 256 --check SHA256SUMS', '```',
           ].join('\n');
-          const created = await api('releases', 'POST', {tag_name:tag, target_commitish:source, name:tag, draft:true, body});
-          if (!Number.isSafeInteger(created.id) || created.id <= 0 || created.tag_name !== tag || created.draft !== true) throw Error('Invalid created release identity');
+          const created = await api('releases', 'POST', {tag_name:tag, target_commitish:source, name:tag, draft:true, prerelease, make_latest, body});
+          if (!Number.isSafeInteger(created.id) || created.id <= 0 || created.tag_name !== tag || created.draft !== true || created.prerelease !== prerelease) throw Error('Invalid created release identity');
           const id = created.id;
           console.log(`Created release ID: ${id}`);
           for (const file of files) {
@@ -168,7 +176,7 @@ jobs:
             const asset = await response.json();
             if (asset.name !== file || asset.state !== 'uploaded' || asset.size !== bytes.length || asset.digest !== `sha256:${hash(bytes)}`) throw Error(`Upload mismatch: ${file}`);
           }
-          const published = await api(`releases/${id}`, 'PATCH', {draft:false});
+          const published = await api(`releases/${id}`, 'PATCH', {draft:false, prerelease, make_latest});
           // BEGIN READ RETRIES
           const retryDeadline = Date.now() + 180000;
           const retryRead = async operation => {
@@ -186,7 +194,7 @@ jobs:
           // END READ RETRIES
           const verifyIdentity = async () => {
             const release = await retryRead(() => api(`releases/${id}`));
-            if (published.id !== id || release.id !== id || release.tag_name !== tag || release.draft !== false || release.immutable !== true) throw Error('Published release identity or immutability mismatch');
+            if (published.id !== id || release.id !== id || release.tag_name !== tag || release.draft !== false || release.immutable !== true || release.prerelease !== prerelease) throw Error('Published release identity or immutability mismatch');
             if (!Array.isArray(release.assets) || release.assets.length !== files.length || new Set(release.assets.map(asset => asset.name)).size !== files.length) throw Error('Published asset set mismatch');
             for (const asset of release.assets) {
               if (!files.includes(asset.name)) throw Error('Unexpected published asset');

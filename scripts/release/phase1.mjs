@@ -29,6 +29,40 @@ export function checkReleaseFormat(bytes, target, elf = '') {
         )
           throw Error('GLIBC requirement exceeds 2.34')
     }
+  } else if (target.endsWith('-apple-darwin')) {
+    if (
+      bytes.length < 32 ||
+      bytes.readUInt32LE(0) !== 0xfeedfacf ||
+      bytes.readUInt32LE(4) !==
+        (target.startsWith('aarch64-') ? 0x0100000c : 0x01000007)
+    )
+      throw Error('Expected target-matched 64-bit Mach-O')
+    const end = 32 + bytes.readUInt32LE(20),
+      count = bytes.readUInt32LE(16)
+    if (end > bytes.length || count > Math.floor((end - 32) / 8))
+      throw Error('Truncated Mach-O commands')
+    let offset = 32,
+      minimum
+    for (let i = 0; i < count; i++) {
+      if (offset + 8 > end) throw Error('Truncated Mach-O command')
+      const command = bytes.readUInt32LE(offset),
+        size = bytes.readUInt32LE(offset + 4)
+      if (size < 8 || offset + size > end)
+        throw Error('Invalid Mach-O command size')
+      if (command === 0x32 || command === 0x24) {
+        if (
+          minimum !== undefined ||
+          size < (command === 0x32 ? 24 : 16) ||
+          (command === 0x32 && bytes.readUInt32LE(offset + 8) !== 1)
+        )
+          throw Error('Invalid macOS deployment command')
+        minimum = bytes.readUInt32LE(offset + (command === 0x32 ? 12 : 8))
+      }
+      offset += size
+    }
+    if (offset !== end || minimum === undefined || minimum !== 0x000d0000)
+      throw Error('Expected macOS minimum OS 13.0')
+    console.log('SUCCESS: Mach-O target and macOS minimum OS 13.0:', target)
   }
 }
 
@@ -40,6 +74,19 @@ export function completeSpdx(document, binary, original) {
     document.packages.some((entry) => entry.SPDXID === 'SPDXRef-Artifact')
   )
     throw new Error('Unexpected converter root or relationships')
+  document.creationInfo ??= {}
+  document.creationInfo.creators = [
+    ...new Set([
+      ...(document.creationInfo.creators ?? []),
+      'Tool: cargo-cyclonedx-0.5.9',
+      'Tool: cyclonedx-cli-0.33.1',
+      'Tool: trusted-server-phase1',
+    ]),
+  ]
+  for (const item of document.packages)
+    for (const key of ['licenseDeclared', 'licenseConcluded'])
+      if (typeof item[key] === 'string')
+        item[key] = item[key].replace(/\s+/g, ' ').trim()
   const root = original.metadata.component
   document.packages.push({
     SPDXID: 'SPDXRef-Artifact',
@@ -156,24 +203,153 @@ export function checkBinary(bytes) {
   }
 }
 
-export function checkSource(file, source) {
-  const macros = source.matchAll(/\b(?:option_env|env)!\s*\(\s*"([^"]+)"/g)
-  for (const [, variable] of macros) {
-    if (
-      /^(?:TRUSTED_SERVER__|EDGEZERO__)/.test(variable) &&
-      variable !== 'TRUSTED_SERVER__GIT_VERSION'
-    ) {
-      throw new Error(`${file}: deployment compile-time environment input`)
+// Resolve literal macro arguments, including nested concat!, without Rust dataflow claims.
+function rustTokens(source) {
+  const tokens = []
+  for (let i = 0; i < source.length; ) {
+    if (/\s/.test(source[i])) {
+      i++
+      continue
     }
+    if (source.startsWith('//', i)) {
+      i = source.indexOf('\n', i)
+      if (i < 0) break
+      continue
+    }
+    if (source.startsWith('/*', i)) {
+      let depth = 1
+      i += 2
+      while (i < source.length && depth) {
+        if (source.startsWith('/*', i)) {
+          depth++
+          i += 2
+        } else if (source.startsWith('*/', i)) {
+          depth--
+          i += 2
+        } else i++
+      }
+      continue
+    }
+    const raw = source.slice(i).match(/^r(#{0,255})"/)
+    if (raw) {
+      const start = i + raw[0].length,
+        end = source.indexOf('"' + raw[1], start)
+      if (end < 0) throw Error('Unterminated Rust raw string')
+      tokens.push({ string: source.slice(start, end) })
+      i = end + 1 + raw[1].length
+      continue
+    }
+    const character = source
+      .slice(i)
+      .match(/^'(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|.)|[^'\\\r\n])'/)
+    if (character) {
+      i += character[0].length
+      continue
+    }
+    if (source[i] === '"') {
+      let end = i + 1
+      while (end < source.length && source[end] !== '"') {
+        if (source[end] === '\\') end++
+        end++
+      }
+      if (end === source.length) throw Error('Unterminated Rust string')
+      const value = source
+        .slice(i + 1, end)
+        .replace(
+          /\\(?:x([0-9a-fA-F]{2})|u\{([0-9a-fA-F_]+)\}|(\r?\n)\s*|([nrt0\\"']))/g,
+          (_, hex, unicode, newline, simple) => {
+            if (hex) return String.fromCodePoint(parseInt(hex, 16))
+            if (unicode)
+              return String.fromCodePoint(
+                parseInt(unicode.replaceAll('_', ''), 16)
+              )
+            if (newline) return ''
+            return { n: '\n', r: '\r', t: '\t', 0: '\0' }[simple] ?? simple
+          }
+        )
+      tokens.push({ string: value })
+      i = end + 1
+      continue
+    }
+    const word = source.slice(i).match(/^[A-Za-z_][A-Za-z_0-9]*/)
+    if (word) {
+      tokens.push(word[0])
+      i += word[0].length
+    } else tokens.push(source[i++])
   }
-  if (
-    /\binclude_(?:str|bytes)!\s*\([^)]*"[^"\n]*(?:trusted-server\.toml|\.env(?:[."]))/s.test(
-      source
-    ) ||
-    (file.endsWith('build.rs') &&
-      /["'][^"'\n]*trusted-server\.toml["']/.test(source))
-  ) {
-    throw new Error(`${file}: operator compile-time file input`)
+  return tokens
+}
+
+export function checkSource(file, source) {
+  const tokens = rustTokens(source)
+  const deployment = (value) => /^(?:TRUSTED_SERVER__|EDGEZERO__)/.test(value)
+  // Only release control and Cargo-owned target facts are additional build-time inputs.
+  const allowedBuild = new Set([
+    'TRUSTED_SERVER__GIT_VERSION',
+    'TRUSTED_SERVER__RELEASE_BUILD',
+    'TRUSTED_SERVER__BUILD_TARGET',
+  ])
+  const expression = (start) => {
+    if (
+      ['env', 'option_env'].includes(tokens[start]) &&
+      tokens[start + 1] === '!' &&
+      ['(', '[', '{'].includes(tokens[start + 2])
+    ) {
+      const close = { '(': ')', '[': ']', '{': '}' }[tokens[start + 2]]
+      const argument = expression(start + 3)
+      if (argument && tokens[argument.end] === close)
+        return { value: '__BUILD_ENV__', end: argument.end + 1 }
+      return null
+    }
+    if (tokens[start]?.string !== undefined)
+      return { value: tokens[start].string, end: start + 1 }
+    if (
+      tokens[start] !== 'concat' ||
+      tokens[start + 1] !== '!' ||
+      !['(', '[', '{'].includes(tokens[start + 2])
+    )
+      return null
+    const close = { '(': ')', '[': ']', '{': '}' }[tokens[start + 2]]
+    let cursor = start + 3,
+      value = ''
+    while (tokens[cursor] !== close) {
+      const part = expression(cursor)
+      if (!part) return null
+      value += part.value
+      cursor = part.end
+      if (tokens[cursor] === ',') cursor++
+      else if (tokens[cursor] !== close) return null
+    }
+    return { value, end: cursor + 1 }
+  }
+  const operatorPath = (value) =>
+    /(?:^|[/\\])(?:trusted-server\.toml|\.env(?:[./\\]|$))/.test(value)
+  for (let i = 0; i < tokens.length; i++) {
+    if (
+      ['env', 'option_env', 'include_str', 'include_bytes'].includes(
+        tokens[i]
+      ) &&
+      tokens[i + 1] === '!'
+    ) {
+      const argument = expression(i + 3)
+      if (!argument) continue
+      const value = argument.value
+      if (
+        (['env', 'option_env'].includes(tokens[i]) &&
+          deployment(value) &&
+          !allowedBuild.has(value)) ||
+        (tokens[i].startsWith('include_') && operatorPath(value))
+      )
+        throw Error(`${file}: deployment compile-time input`)
+    }
+    if (file.endsWith('build.rs')) {
+      const value = expression(i)?.value
+      if (
+        value !== undefined &&
+        ((deployment(value) && !allowedBuild.has(value)) || operatorPath(value))
+      )
+        throw Error(`${file}: operator compile-time build input`)
+    }
   }
 }
 
@@ -199,7 +375,7 @@ function namespace(bom, prefix) {
   return rename(bom)
 }
 
-export function mergeSboms(cargo, npm, binary, name) {
+export function mergeSboms(cargo, npm, binary, name, version) {
   checkBinary(binary)
   const rust = namespace(cargo, 'cargo')
   const javascript = namespace(npm, 'npm')
@@ -221,6 +397,7 @@ export function mergeSboms(cargo, npm, binary, name) {
       component: {
         ...root,
         name,
+        version: version ?? root.version,
         hashes: [
           {
             alg: 'SHA-256',
@@ -274,10 +451,11 @@ async function smokeRelease(file, target) {
   if (target === 'wasm32-wasip1') return
   const cli = file.split('/').at(-1).startsWith('ts-')
   const expected =
-    'ts ' +
+    'ts package=' +
     readFileSync('Cargo.toml', 'utf8').match(
       /\[workspace\.package\][\s\S]*?^version = "([^"]+)"/m
-    )[1]
+    )[1] +
+    ` source=${process.env.SOURCE_COMMIT} target=${target} variant=default`
   const version = (output) => {
     if (output.trim() !== expected) throw Error('Unexpected CLI version')
     console.log('SUCCESS:', output.trim())
@@ -303,11 +481,13 @@ async function smokeRelease(file, target) {
         'scratch',
       ]
     : target.startsWith('aarch64-')
-      ? ['debian:12-slim']
+      ? [
+          'debian:12-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8',
+        ]
       : [
-          'debian:12-slim',
-          'ubuntu:22.04',
-          'registry.access.redhat.com/ubi9/ubi-minimal:9.6',
+          'debian:12-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8',
+          'ubuntu:22.04@sha256:0a9887931b0e38af2e3487ed39e29436b0535c4f3f52e57745baaf79d1898956',
+          'registry.access.redhat.com/ubi9/ubi-minimal:9.6@sha256:34880b64c07f28f64d95737f82f891516de9a3b43583f39970f7bf8e4cfa48b7',
         ]
   for (const reference of images) {
     let image
@@ -384,7 +564,8 @@ async function smokeRelease(file, target) {
         version: 1,
       }
       const environment = [
-        `PORT=${port}`,
+        'PORT=8787',
+        'EDGEZERO__ADAPTER__HOST=0.0.0.0',
         `TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG_TRUSTED_SERVER_CONFIG=${JSON.stringify(envelope)}`,
         'TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_EC_PASSPHRASE=smoke-edge-cookie-passphrase-32-bytes',
         'TRUSTED_SERVER_SECRET_TRUSTED_SERVER_SECRETS_HANDLER_PASSWORD=smoke-admin-password-32-bytes-ok',
@@ -395,7 +576,8 @@ async function smokeRelease(file, target) {
         '--name',
         container,
         '-d',
-        '--network=host',
+        '--publish',
+        `127.0.0.1:${port}:8787`,
         ...restrictions,
         ...environment.flatMap((value) => ['--env', value]),
         image,
@@ -430,7 +612,7 @@ async function smokeRelease(file, target) {
       }
       if (!healthy) throw Error('Axum startup deadline exhausted')
       console.log(
-        'SUCCESS: configured Axum health returned 200 ok:',
+        'SUCCESS: Axum bound to 0.0.0.0; host reached published container port, HTTP 200 ok:',
         reference,
         image
       )
@@ -479,7 +661,8 @@ if (
           JSON.parse(readFileSync(cargo)),
           JSON.parse(readFileSync(npm)),
           readFileSync(binary),
-          binary.split('/').at(-1)
+          binary.split('/').at(-1),
+          process.env.RELEASE_VERSION
         ),
         null,
         2
@@ -490,6 +673,9 @@ if (
     const document = JSON.parse(readFileSync(file))
     const inventory = JSON.parse(readFileSync(original))
     completeSpdx(document, readFileSync(binary), inventory)
+    document.creationInfo.creators.push(
+      `Tool: npm-${execFileSync('npm', ['--version'], { encoding: 'utf8' }).trim()}`
+    )
     const coverage = inventory.metadata.properties?.find(
       (entry) => entry.name === 'trusted-server:coverage'
     )?.value
