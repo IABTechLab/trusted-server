@@ -10,6 +10,7 @@ use http::Response;
 
 use super::consent::{ec_consent_granted, ec_consent_withdrawn};
 use crate::consent::{ConsentContext, allows_eid_persistence};
+use crate::openrtb::Eid;
 use crate::settings::Settings;
 
 use super::EcContext;
@@ -43,7 +44,8 @@ const EC_RESPONSE_HEADERS: &[&str] = &[
 /// revocation marker. There is no separate consent KV store to clean up.
 ///
 /// `eids_cookie` should be the raw value of the `ts-eids` cookie extracted
-/// from the request *before* routing consumes it.
+/// from the request *before* routing consumes it. `/auction` responses ignore
+/// it in favor of the request's own client set.
 pub fn ec_finalize_response(
     settings: &Settings,
     ec_context: &mut EcContext,
@@ -81,12 +83,8 @@ pub fn ec_finalize_response(
             let source = ec_context.eid_sync_source();
             let collected = source
                 .map(|_| {
-                    collect_eid_updates(
-                        eids_cookie,
-                        sharedid_cookie,
-                        ec_context.client_eids(),
-                        registry,
-                    )
+                    let (cookie_input, client_input) = browser_eid_input(ec_context, eids_cookie);
+                    collect_eid_updates(cookie_input, sharedid_cookie, client_input, registry)
                 })
                 .unwrap_or_default();
             let had_eid_updates = !collected.is_empty();
@@ -138,13 +136,9 @@ pub fn ec_finalize_response(
             return;
         };
 
+        let (cookie_input, client_input) = browser_eid_input(ec_context, eids_cookie);
         let updates = gate_eid_updates_by_consent(
-            collect_eid_updates(
-                eids_cookie,
-                sharedid_cookie,
-                ec_context.client_eids(),
-                registry,
-            ),
+            collect_eid_updates(cookie_input, sharedid_cookie, client_input, registry),
             ec_context.consent(),
         );
         sync_eid_cookie_updates(graph, ec_context, &ec_id, &updates, EidSyncSource::NewEc);
@@ -156,6 +150,23 @@ pub fn ec_finalize_response(
     }
 
     reconcile_pull_sync_marker(settings, registry, ec_context, response);
+}
+
+/// Chooses the browser EID input KV ingestion reads for this request.
+///
+/// `/auction` ingests only the client set the auction itself used (its body,
+/// else its `ts-eids` cookie, as `handle_auction` resolved it). A cookie from
+/// an earlier page is then never ingested next to a scoped body, and an
+/// `/auction` that resolved no client set ingests nothing from the cookie.
+/// Every other route, and requests with no sync source, read the cookie.
+fn browser_eid_input<'a>(
+    ec_context: &'a EcContext,
+    eids_cookie: Option<&'a str>,
+) -> (Option<&'a str>, Option<&'a [Eid]>) {
+    match ec_context.eid_sync_source() {
+        Some(EidSyncSource::Auction) => (None, ec_context.client_eids()),
+        _ => (eids_cookie, None),
+    }
 }
 
 fn sync_eid_cookie_updates(
@@ -1115,17 +1126,15 @@ mod tests {
         );
         ec_context.set_recovery_eligible(true);
         ec_context.set_eid_sync_source(EidSyncSource::Navigation);
-        ec_context.set_client_eids(vec![Eid {
-            source: "id5-sync.com".to_owned(),
-            uids: vec![Uid {
-                id: "ID5_should_not_persist".to_owned(),
-                atype: Some(1),
-                ext: None,
-            }],
-        }]);
         let partners = vec![make_partner("id5-sync.com")];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let graph = KvIdentityGraph::in_memory("test_store");
+        let eids_cookie = base64::engine::general_purpose::STANDARD.encode(
+            serde_json::to_vec(&serde_json::json!([
+                { "source": "id5-sync.com", "uids": [{ "id": "ID5_should_not_persist", "atype": 1 }] }
+            ]))
+            .expect("should serialize test cookie payload"),
+        );
         let mut response = empty_response();
 
         ec_finalize_response(
@@ -1133,7 +1142,7 @@ mod tests {
             &mut ec_context,
             Some(&graph),
             &registry,
-            None,
+            Some(&eids_cookie),
             None,
             &mut response,
         );
@@ -1291,6 +1300,58 @@ mod tests {
                 "{source} should persist the returning-user EID cookie"
             );
         }
+    }
+
+    #[test]
+    fn finalize_generated_ec_without_sync_source_ingests_the_ts_eids_cookie() {
+        let settings = create_test_settings();
+        let ec_id = sample_ec_id("genck1");
+        let graph = KvIdentityGraph::in_memory("test_store");
+        let live = KvEntry::new(
+            &granting_consent(),
+            None,
+            current_timestamp(),
+            &settings.publisher.domain,
+        );
+        graph
+            .create(&ec_id, &live)
+            .expect("should seed generated row");
+        let mut ec_context =
+            make_context(Some(&ec_id), None, false, true, Jurisdiction::NonRegulated);
+        ec_context.set_kv_snapshot(graph.load_snapshot(&ec_id));
+        let registry = PartnerRegistry::from_config(&[make_partner("ids.example.com")])
+            .expect("should build registry");
+        let eids_cookie = base64::engine::general_purpose::STANDARD.encode(
+            serde_json::to_vec(&serde_json::json!([
+                { "source": "ids.example.com", "uids": [{ "id": "cookie-uid" }] }
+            ]))
+            .expect("should serialize test cookie payload"),
+        );
+        let mut response = empty_response();
+
+        ec_finalize_response(
+            &settings,
+            &mut ec_context,
+            Some(&graph),
+            &registry,
+            Some(&eids_cookie),
+            None,
+            &mut response,
+        );
+
+        let (stored, _) = graph
+            .get(&ec_id)
+            .expect("should read store")
+            .expect("row should remain");
+        assert_eq!(
+            stored
+                .ids
+                .iter()
+                .map(|(source, id)| (source.as_str(), id.uid.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("ids.example.com", "cookie-uid")],
+            "a new EC with no sync source should ingest the cookie"
+        );
     }
 
     #[test]
@@ -1517,22 +1578,22 @@ mod tests {
             .expect("should serialize test cookie payload"),
         );
         ec_context.set_client_eids(vec![
-            Eid {
-                source: "id5-sync.com".to_owned(),
-                uids: vec![Uid {
+            Eid::new(
+                "id5-sync.com".to_owned(),
+                vec![Uid {
                     id: "ID5_from_body".to_owned(),
                     atype: Some(1),
                     ext: None,
                 }],
-            },
-            Eid {
-                source: "liveramp.com".to_owned(),
-                uids: vec![Uid {
+            ),
+            Eid::new(
+                "liveramp.com".to_owned(),
+                vec![Uid {
                     id: "LR_from_body".to_owned(),
                     atype: Some(3),
                     ext: None,
                 }],
-            },
+            ),
         ]);
         let partners = vec![make_partner("id5-sync.com"), make_partner("liveramp.com")];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
@@ -1595,14 +1656,14 @@ mod tests {
             ec_id: ec_id.clone(),
         });
         ec_context.set_eid_sync_source(EidSyncSource::Auction);
-        ec_context.set_client_eids(vec![Eid {
-            source: "id5-sync.com".to_owned(),
-            uids: vec![Uid {
+        ec_context.set_client_eids(vec![Eid::new(
+            "id5-sync.com".to_owned(),
+            vec![Uid {
                 id: "ID5_should_not_persist".to_owned(),
                 atype: Some(1),
                 ext: None,
             }],
-        }]);
+        )]);
         let partners = vec![make_partner("id5-sync.com")];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let mut response = empty_response();

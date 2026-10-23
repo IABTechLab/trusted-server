@@ -88,27 +88,37 @@ User data is stored securely in Lockr's privacy vault:
 
 ### Extended ID (EID) Support
 
-Lockr identities are injected into OpenRTB bid requests as Extended Identifiers:
+The Lockr SDK writes its ID5 EID into Prebid's first-party data with
+`pbjs.setConfig({ ortb2: { user: { ext: { eids } } } })`. Prebid includes it in
+the `trustedServer` bidder request, and the adapter forwards it to `/auction`
+with its EID-level fields, for example:
 
 ```json
 {
-  "user": {
-    "ext": {
-      "eids": [
-        {
-          "source": "lockr.io",
-          "uids": [
-            {
-              "id": "lockr-user-id-123",
-              "atype": 1
-            }
-          ]
-        }
-      ]
-    }
-  }
+  "source": "id5-sync.com",
+  "inserter": "inserter.example.com",
+  "mm": 2,
+  "uids": [{ "id": "fictional-id5-id", "atype": 1 }]
 }
 ```
+
+The SDK writes the EID after its own network call, so the first auction on a
+page may run before it is available. Later auctions include it, and requests
+without an EID body get it from the `ts-eids` cookie and KV.
+
+To store the ID in the EC identity graph, register the source:
+
+```toml
+[[ec.partners]]
+name = "ID5 via Lockr"
+source_domain = "id5-sync.com"
+bidstream_enabled = true
+```
+
+Where GDPR applies and Prebid's TCF enforcement is active, Prebid sends the
+`trustedServer` adapter no EIDs unless the publisher grants the exception
+described in
+[TCF and the `trustedServer` adapter](./prebid.md#tcf-and-the-trustedserver-adapter).
 
 ## Use Cases
 
@@ -224,9 +234,11 @@ curl https://edge.example.com/
 
 **Solutions**:
 
-- Verify OpenRTB request builder includes `user.ext.eids`
-- Check integration is registered in IntegrationRegistry
-- Ensure `contribute_eids()` method is implemented
+- Confirm `pbjs.getEvents()` shows a `bidRequested` event for `trustedServer`
+  whose `ortb2.user.ext.eids` contains the `id5-sync.com` entry
+- Under GDPR, confirm the publisher's Prebid config grants `trustedServer` the
+  full TCF exception
+- Decode the `/auction` response's `x-ts-eids` header to see what was forwarded
 
 ## Performance
 

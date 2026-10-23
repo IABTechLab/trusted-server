@@ -1,4 +1,8 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import { describe, it, expect, vi, beforeAll, beforeEach, afterAll, afterEach } from 'vitest';
 
 function apsRenderer() {
   const bid = envelope.seatbid[0].bid[0];
@@ -236,6 +240,8 @@ interface TestAdapterSpec {
 // the external bundle in production), so tests install the mock there instead
 // of mocking module imports.
 const {
+  CANARY_EID,
+  auctionBodyLog,
   mockSetConfig,
   mockMergeConfig,
   mockProcessQueue,
@@ -254,11 +260,39 @@ const {
   const mockMergeConfig = vi.fn((config: unknown) => mockSetConfig(config));
   const mockProcessQueue = vi.fn();
   const mockRequestBids = vi.fn();
-  const mockRegisterBidAdapter = vi.fn();
+  const mockRegisterBidAdapter = vi.fn(
+    (
+      _bidder: unknown,
+      code: string,
+      spec: { buildRequests?: (...args: unknown[]) => { data?: unknown } }
+    ) => {
+      if (code !== 'trustedServer' || typeof spec?.buildRequests !== 'function') return;
+      const buildRequests = spec.buildRequests;
+      spec.buildRequests = function (this: unknown, ...args: unknown[]) {
+        const request = buildRequests.apply(this, args);
+        auctionBodyLog.bodies.push(String(request?.data));
+        auctionBodyLog.total += 1;
+        return request;
+      };
+    }
+  );
   const mockMarkWinningBidAsUsed = vi.fn();
   const mockOnEvent = vi.fn();
+  // D1 canary (spec 7.1 rule 3): an ID only pbjs.getUserIdsAsEids() knows. It
+  // must never reach an /auction body or ts-eids.
+  const CANARY_EID = {
+    source: 'canary.example.com',
+    uids: [{ id: 'canary-uid', atype: 1 }],
+  };
+  // Every /auction body the trustedServer adapter builds, recorded at the
+  // adapter so no test can bypass the canary check.
+  const auctionBodyLog = { bodies: [] as string[], total: 0 };
   const mockGetUserIdsAsEids = vi.fn(
-    () => [] as Array<{ source: string; uids?: Array<{ id: string; atype?: number }> }>
+    () =>
+      [CANARY_EID] as Array<{
+        source: string;
+        uids?: Array<{ id: string; atype?: number }>;
+      }>
   );
   const mockGetConfig = vi.fn();
 
@@ -326,6 +360,8 @@ const {
   };
 
   return {
+    CANARY_EID,
+    auctionBodyLog,
     mockSetConfig,
     mockMergeConfig,
     mockProcessQueue,
@@ -364,6 +400,7 @@ import type { TsjsApi } from '../../../src/core/types';
 import { GptDiagnosticsObserver } from '../../../src/integrations/gpt_diagnostics/observer';
 import { GptDiagnosticsStore } from '../../../src/integrations/gpt_diagnostics/store';
 import envelope from '../../fixtures/aps-renderer-v1.json';
+import { FIXTURE_EIDS } from '../../fixtures/eid-fixture-input';
 
 // installPrebidNpm is a per-page no-op once the sentinel is set (the module
 // self-init above already set it), so every test starts from a clean page.
@@ -374,6 +411,109 @@ beforeEach(() => {
   mockPbjs.processQueue = mockProcessQueue;
   delete mockPbjs['__tsManagedUserIdsSetConfigInstalled'];
 });
+
+function readTsEidsCookie(): string | undefined {
+  return document.cookie.match(/(?:^|; )ts-eids=([^;]*)/)?.[1] || undefined;
+}
+
+function decodeBase64Utf8(value: string): string {
+  return new TextDecoder().decode(Uint8Array.from(atob(value), (char) => char.charCodeAt(0)));
+}
+
+function decodedTsEidsCookie(): unknown {
+  const value = readTsEidsCookie();
+  return value === undefined ? undefined : JSON.parse(decodeBase64Utf8(value));
+}
+
+function presetTsEidsCookie(value: string): void {
+  document.cookie = `ts-eids=${value}; Path=/; Secure; SameSite=Lax; Max-Age=60`;
+  expect(readTsEidsCookie(), 'the preset ts-eids cookie should read back').toBe(value);
+}
+
+beforeAll(() => {
+  // jsdom silently drops a Secure cookie on a non-HTTPS URL other than
+  // localhost (spec 7.1 rule 5). Prove the shim's attributes survive here.
+  document.cookie = 'ts-eids-probe=1; Path=/; Secure; SameSite=Lax; Max-Age=60';
+  expect(document.cookie, 'shim cookie attributes should be readable here').toContain(
+    'ts-eids-probe=1'
+  );
+  document.cookie = 'ts-eids-probe=; Path=/; Max-Age=0';
+});
+
+afterEach(() => {
+  // Drain first so one leaking test cannot cascade into the next.
+  const bodies = auctionBodyLog.bodies.splice(0);
+  expect(mockGetUserIdsAsEids(), 'a test switched the getUserIdsAsEids canary off').toEqual([
+    CANARY_EID,
+  ]);
+  for (const body of bodies) {
+    expect(body, 'the getUserIdsAsEids canary leaked into an /auction body').not.toContain(
+      CANARY_EID.source
+    );
+  }
+  const cookie = readTsEidsCookie();
+  if (cookie !== undefined) {
+    let readable = cookie;
+    try {
+      readable = decodeBase64Utf8(cookie);
+    } catch {
+      // A preset non-base64 test value; check it as written.
+    }
+    expect(readable, 'the getUserIdsAsEids canary leaked into ts-eids').not.toContain(
+      CANARY_EID.source
+    );
+  }
+});
+
+afterAll(() => {
+  expect(
+    auctionBodyLog.total,
+    'the canary should have inspected at least one /auction body'
+  ).toBeGreaterThan(0);
+});
+
+function deepFreeze<T>(value: T, seen = new WeakSet<object>()): T {
+  if (value !== null && typeof value === 'object' && !seen.has(value)) {
+    seen.add(value);
+    for (const child of Object.values(value)) {
+      deepFreeze(child, seen);
+    }
+    Object.freeze(value);
+  }
+  return value;
+}
+
+/**
+ * A bidder request shaped as Prebid passes it to buildRequests: a frozen
+ * `ortb2` and `auctionId: null`, as Prebid's proxy hides it by default.
+ */
+function prebidBidderRequest(user: Record<string, unknown>): Record<string, unknown> {
+  return deepFreeze({
+    bidderCode: 'trustedServer',
+    auctionId: null,
+    ortb2: { user },
+  });
+}
+
+function trustedServerBidRequests(): Array<Record<string, unknown>> {
+  return [
+    {
+      adUnitCode: 'div-gpt-1',
+      bidder: 'trustedServer',
+      mediaTypes: { banner: { sizes: [[300, 250]] } },
+      params: {},
+    },
+  ];
+}
+
+function readFixture(name: string): string {
+  return fs
+    .readFileSync(
+      path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../fixtures', name),
+      'utf8'
+    )
+    .trimEnd();
+}
 
 describe('prebid/collectBidders', () => {
   it('returns empty array for empty ad units', () => {
@@ -578,7 +718,7 @@ describe('prebid/installPrebidNpm', () => {
     mockPbjs.que = [];
     mockPbjs.getConfig = mockGetConfig;
     mockGetUserIdsAsEids.mockReset();
-    mockGetUserIdsAsEids.mockReturnValue([]);
+    mockGetUserIdsAsEids.mockReturnValue([CANARY_EID]);
     mockGetConfig.mockReset();
     document.cookie = 'ts-eids=; Path=/; Max-Age=0';
     testWindow.__tsjs_prebid_bundle = DEFAULT_BUNDLE_MANIFEST;
@@ -1320,7 +1460,14 @@ describe('prebid/installPrebidNpm', () => {
     'preserves publisher userSync and autoRefresh=%s when seeding late IDs',
     (autoRefresh) => {
       testWindow.__tsjs_prebid = { managedUserIds: [MANAGED_USER_ID] };
-      const userSync = { userIds: [], auctionDelay: 300, syncEnabled: false, autoRefresh };
+      const userSync = {
+        userIds: [],
+        auctionDelay: 300,
+        syncDelay: 50,
+        filterSettings: { image: { bidders: '*', filter: 'include' } },
+        syncEnabled: false,
+        autoRefresh,
+      };
       mockGetConfig.mockImplementation((key?: string) => {
         if (key === 'userSync.userIds') return [];
         if (key === 'userSync') return userSync;
@@ -2416,203 +2563,367 @@ describe('prebid/installPrebidNpm', () => {
       expect(payload.eids).toBeUndefined();
     });
 
-    it('buildRequests includes current Prebid EIDs in the /auction payload', () => {
+    it('forwards an opaque LiveRamp envelope from the bidder request unchanged', () => {
       const spec = getAdapterSpec();
-      mockGetUserIdsAsEids.mockReturnValue([
-        {
+      const liveramp = {
+        source: 'liveramp.com',
+        uids: [{ id: 'opaque-test-envelope', atype: 3 }],
+      };
+
+      const request = spec.buildRequests(
+        trustedServerBidRequests(),
+        prebidBidderRequest({ ext: { eids: [liveramp] } })
+      );
+
+      expect(JSON.parse(String(request.data)).eids).toEqual([liveramp]);
+    });
+
+    it('forwards bidderRequest.ortb2 EIDs with EID-level fields, user.ext.eids first', () => {
+      const spec = getAdapterSpec();
+      const extEid = {
+        source: 'adserver.org',
+        inserter: 'adserver.org',
+        matcher: 'adserver.org',
+        mm: 4,
+        uids: [{ id: 'fictional-tdid', atype: 1, ext: { rtiPartner: 'TDID' } }],
+      };
+      const userEid = {
+        source: '51d.es',
+        mm: 1,
+        uids: [{ id: 'fictional-device', atype: 1 }],
+      };
+
+      const result = spec.buildRequests(
+        trustedServerBidRequests(),
+        prebidBidderRequest({ ext: { eids: [extEid] }, eids: [userEid] })
+      );
+
+      expect(JSON.parse(String(result.data)).eids, 'should forward both paths as sent').toEqual([
+        extEid,
+        userEid,
+      ]);
+      expect(mockGetUserIdsAsEids, 'should never read getUserIdsAsEids').not.toHaveBeenCalled();
+      expect(
+        mockGetConfig.mock.calls.some(([key]) => key === 'ortb2'),
+        'should never read the global ortb2 config'
+      ).toBe(false);
+    });
+
+    it('sends exactly the auction-body fixture for the fixture input', () => {
+      const spec = getAdapterSpec();
+
+      const result = spec.buildRequests(
+        trustedServerBidRequests(),
+        prebidBidderRequest({ ext: { eids: FIXTURE_EIDS } })
+      );
+
+      expect(String(result.data), 'TSJS should produce the Rust fixture byte for byte').toBe(
+        readFixture('auction-body-eids.txt')
+      );
+    });
+
+    it('writes exactly the ts-eids fixture for the fixture input', () => {
+      const spec = getAdapterSpec();
+
+      spec.buildRequests(
+        trustedServerBidRequests(),
+        prebidBidderRequest({ ext: { eids: FIXTURE_EIDS } })
+      );
+
+      expect(readTsEidsCookie()).toBe(readFixture('ts-eids-cookie.txt'));
+    });
+
+    it('writes ts-eids from the body set without EID-level ext', () => {
+      const spec = getAdapterSpec();
+      const withExt = {
+        source: 'liveintent.example.com',
+        ext: { segments: ['s1'] },
+        uids: [{ id: 'li-uid', atype: 3 }],
+      };
+      const plain = {
+        source: 'ids.example.com',
+        uids: [{ id: 'ids-uid', atype: 1 }],
+      };
+
+      const result = spec.buildRequests(
+        trustedServerBidRequests(),
+        prebidBidderRequest({ ext: { eids: [withExt, plain] } })
+      );
+
+      expect(JSON.parse(String(result.data)).eids, 'the body keeps EID-level ext').toEqual([
+        withExt,
+        plain,
+      ]);
+      expect(decodedTsEidsCookie(), 'the cookie copies the body set without EID-level ext').toEqual(
+        [{ source: 'liveintent.example.com', uids: [{ id: 'li-uid', atype: 3 }] }, plain]
+      );
+    });
+
+    it('clears ts-eids before the request when the bidder request holds no EIDs', () => {
+      const spec = getAdapterSpec();
+      presetTsEidsCookie('preset-value');
+
+      const result = spec.buildRequests(trustedServerBidRequests(), prebidBidderRequest({}));
+
+      const payload = JSON.parse(String(result.data));
+      expect(payload.adUnits[0].code, 'the request should still be built').toBe('div-gpt-1');
+      expect(payload.eids, 'the body should carry no eids').toBeUndefined();
+      expect(readTsEidsCookie(), 'the cookie should be cleared').toBeUndefined();
+    });
+
+    describe('storage consent', () => {
+      const storedEid = { source: 'ids.example.com', uids: [{ id: 'ids-uid', atype: 1 }] };
+
+      function consentedBidderRequest(gdprConsent: unknown): Record<string, unknown> {
+        return deepFreeze({
+          bidderCode: 'trustedServer',
+          auctionId: null,
+          ortb2: { user: { ext: { eids: [storedEid] } } },
+          gdprConsent,
+        });
+      }
+
+      function gdprConsentWithPurposes(
+        purposeOne: boolean,
+        purposeFour: boolean
+      ): Record<string, unknown> {
+        return {
+          gdprApplies: true,
+          consentString: 'CPexampleTCStringForTests',
+          vendorData: {
+            purpose: {
+              consents: { 1: purposeOne, 2: true, 4: purposeFour },
+              legitimateInterests: {},
+            },
+          },
+        };
+      }
+
+      it.each([
+        ['Purpose 1 is denied', gdprConsentWithPurposes(false, true)],
+        ['Purpose 4 is denied', gdprConsentWithPurposes(true, false)],
+        ['GDPR applies without a TCF purpose record', { gdprApplies: true, consentString: '' }],
+      ])('forwards EIDs but clears ts-eids when %s', (_case, gdprConsent) => {
+        const spec = getAdapterSpec();
+        presetTsEidsCookie('preset-value');
+
+        const result = spec.buildRequests(
+          trustedServerBidRequests(),
+          consentedBidderRequest(gdprConsent)
+        );
+
+        expect(JSON.parse(String(result.data)).eids, 'should still forward the EIDs').toEqual([
+          storedEid,
+        ]);
+        expect(
+          readTsEidsCookie(),
+          'should clear ts-eids without persistence consent'
+        ).toBeUndefined();
+      });
+
+      it.each([
+        ['Purposes 1 and 4 are granted', gdprConsentWithPurposes(true, true)],
+        ['GDPR does not apply', { gdprApplies: false }],
+      ])('writes ts-eids when %s', (_case, gdprConsent) => {
+        const spec = getAdapterSpec();
+
+        spec.buildRequests(trustedServerBidRequests(), consentedBidderRequest(gdprConsent));
+
+        expect(decodedTsEidsCookie(), 'should write ts-eids with persistence consent').toEqual([
+          storedEid,
+        ]);
+      });
+    });
+
+    it('clears ts-eids when no EID fits the cookie budget but still sends the body', () => {
+      const debugSpy = vi.spyOn(log, 'debug').mockImplementation(() => {});
+      const spec = getAdapterSpec();
+      presetTsEidsCookie('preset-value');
+      const entry = { source: 'huge.example.com', uids: [{ id: 'h'.repeat(5000) }] };
+
+      const result = spec.buildRequests(
+        trustedServerBidRequests(),
+        prebidBidderRequest({ ext: { eids: [entry] } })
+      );
+
+      expect(JSON.parse(String(result.data)).eids, 'the body keeps the entry').toEqual([entry]);
+      expect(readTsEidsCookie(), 'the cookie should be cleared').toBeUndefined();
+      expect(debugSpy).toHaveBeenCalledWith('[tsjs-prebid] forwarding bidder EIDs', {
+        forwarded: 1,
+        unserializable: 0,
+        overBudget: 0,
+        cookie: 'cleared',
+      });
+    });
+
+    describe('when document.cookie writes throw', () => {
+      function withBlockedCookieWrites(run: () => void): void {
+        const descriptor = Object.getOwnPropertyDescriptor(Document.prototype, 'cookie')!;
+        Object.defineProperty(document, 'cookie', {
+          configurable: true,
+          get: () => descriptor.get!.call(document),
+          set: () => {
+            throw new Error('cookies blocked');
+          },
+        });
+        try {
+          run();
+        } finally {
+          delete (document as unknown as Record<string, unknown>).cookie;
+        }
+      }
+
+      it('still builds the request with the entry when the cookie write fails', () => {
+        vi.spyOn(log, 'warn').mockImplementation(() => {});
+        const spec = getAdapterSpec();
+        const entry = { source: 'liveramp.com', uids: [{ id: 'lr-uid', atype: 3 }] };
+
+        withBlockedCookieWrites(() => {
+          const result = spec.buildRequests(
+            trustedServerBidRequests(),
+            prebidBidderRequest({ ext: { eids: [entry] } })
+          );
+
+          const payload = JSON.parse(String(result.data));
+          expect(payload.adUnits[0].code, 'the request should still be built').toBe('div-gpt-1');
+          expect(payload.eids, 'the body should carry the entry').toEqual([entry]);
+        });
+      });
+
+      it('still builds the request without eids when the cookie clear fails', () => {
+        vi.spyOn(log, 'warn').mockImplementation(() => {});
+        const spec = getAdapterSpec();
+
+        withBlockedCookieWrites(() => {
+          const result = spec.buildRequests(trustedServerBidRequests(), prebidBidderRequest({}));
+
+          const payload = JSON.parse(String(result.data));
+          expect(payload.adUnits[0].code, 'the request should still be built').toBe('div-gpt-1');
+          expect(payload.eids, 'the body should carry no eids').toBeUndefined();
+        });
+      });
+    });
+
+    it('sends no eids and leaves ts-eids alone without a bidder request object', () => {
+      const debugSpy = vi.spyOn(log, 'debug').mockImplementation(() => {});
+      const spec = getAdapterSpec();
+      presetTsEidsCookie('preset-value');
+
+      const result = spec.buildRequests(trustedServerBidRequests());
+
+      expect(JSON.parse(String(result.data)).adUnits[0].code).toBe('div-gpt-1');
+      expect(JSON.parse(String(result.data)).eids).toBeUndefined();
+      expect(readTsEidsCookie(), 'the cookie should be unchanged').toBe('preset-value');
+      expect(
+        debugSpy.mock.calls.some(
+          ([message]) => typeof message === 'string' && message.includes('no bidder request')
+        ),
+        'should explain at debug level'
+      ).toBe(true);
+    });
+
+    it('lets the later of two overlapping requests own ts-eids', () => {
+      const spec = getAdapterSpec();
+      const first = { source: 'first.example.com', uids: [{ id: 'first-uid' }] };
+      const second = { source: 'second.example.com', uids: [{ id: 'second-uid' }] };
+
+      spec.buildRequests(
+        trustedServerBidRequests(),
+        prebidBidderRequest({ ext: { eids: [first] } })
+      );
+      spec.buildRequests(
+        trustedServerBidRequests(),
+        prebidBidderRequest({ ext: { eids: [second] } })
+      );
+
+      expect(decodedTsEidsCookie()).toEqual([second]);
+    });
+
+    it('forwards ortb2 EIDs and writes ts-eids without the User ID module', () => {
+      const spec = getAdapterSpec();
+      const original = mockPbjs.getUserIdsAsEids;
+      mockPbjs.getUserIdsAsEids = undefined as unknown as typeof mockGetUserIdsAsEids;
+      try {
+        const lockrId5 = {
           source: 'id5-sync.com',
-          uids: [{ id: 'ID5_abc', atype: 1 }],
-        },
-        {
-          source: 'sharedid.org',
-          uids: [{ id: 'shared_123' }, { id: 'shared_456', atype: 3 }],
-        },
-        {
-          source: 'google.com',
-          uids: [{ id: 'pair_123', atype: 571187 }],
-        },
-      ]);
+          inserter: 'inserter.example.com',
+          mm: 2,
+          uids: [{ id: 'fictional-id5', atype: 1 }],
+        };
 
-      const result = spec.buildRequests([
-        {
-          adUnitCode: 'div-gpt-1',
-          bidder: 'trustedServer',
-          mediaTypes: { banner: { sizes: [[300, 250]] } },
-          params: {},
-        },
-      ]);
+        const result = spec.buildRequests(
+          trustedServerBidRequests(),
+          prebidBidderRequest({ ext: { eids: [lockrId5] } })
+        );
 
-      const payload = JSON.parse(result.data);
-      expect(payload.eids).toEqual([
-        {
-          source: 'id5-sync.com',
-          uids: [{ id: 'ID5_abc', atype: 1 }],
-        },
-        {
-          source: 'sharedid.org',
-          uids: [{ id: 'shared_123' }, { id: 'shared_456', atype: 3 }],
-        },
-        {
-          source: 'google.com',
-          uids: [{ id: 'pair_123', atype: 571187 }],
-        },
-      ]);
+        expect(JSON.parse(String(result.data)).eids).toEqual([lockrId5]);
+        expect(decodedTsEidsCookie()).toEqual([lockrId5]);
+      } finally {
+        mockPbjs.getUserIdsAsEids = original;
+      }
     });
 
-    it('forwards the opaque LiveRamp envelope as a liveramp.com EID', () => {
-      const spec = getAdapterSpec();
-      mockGetUserIdsAsEids.mockReturnValue([
-        {
-          source: 'liveramp.com',
-          uids: [{ id: 'opaque-test-envelope', atype: 3 }],
-        },
-      ]);
-
-      const request = spec.buildRequests([
-        {
-          adUnitCode: 'div-gpt-1',
-          bidId: 'bid-1',
-          bidder: 'trustedServer',
-          mediaTypes: { banner: { sizes: [[300, 250]] } },
-          params: {},
-        },
-      ]);
-
-      expect(JSON.parse(request.data).eids).toEqual([
-        {
-          source: 'liveramp.com',
-          uids: [{ id: 'opaque-test-envelope', atype: 3 }],
-        },
-      ]);
-    });
-
-    it('drops empty and malformed LiveRamp envelope values', () => {
-      const spec = getAdapterSpec();
-      mockGetUserIdsAsEids.mockReturnValue([
-        {
-          source: 'liveramp.com',
-          uids: [
-            { id: '' },
-            { id: undefined as unknown as string },
-            { id: 'opaque-valid-envelope', atype: 3 },
-          ],
-        },
-        { source: '', uids: [{ id: 'opaque-invalid-source' }] },
-      ]);
-
-      const request = spec.buildRequests([
-        {
-          adUnitCode: 'div-gpt-1',
-          bidder: 'trustedServer',
-          mediaTypes: { banner: { sizes: [[300, 250]] } },
-          params: {},
-        },
-      ]);
-
-      expect(JSON.parse(request.data).eids).toEqual([
-        {
-          source: 'liveramp.com',
-          uids: [{ id: 'opaque-valid-envelope', atype: 3 }],
-        },
-      ]);
-    });
-
-    it('never writes an opaque LiveRamp envelope to logs', () => {
-      const sentinel = 'opaque-envelope-must-not-be-logged';
+    it('logs EID counts and the cookie decision at debug level, never values', () => {
+      log.setLevel('debug');
       const spies = [
         vi.spyOn(log, 'debug').mockImplementation(() => {}),
         vi.spyOn(log, 'info').mockImplementation(() => {}),
         vi.spyOn(log, 'warn').mockImplementation(() => {}),
         vi.spyOn(log, 'error').mockImplementation(() => {}),
       ];
-      const spec = getAdapterSpec();
-      mockGetUserIdsAsEids.mockReturnValue([
-        { source: 'liveramp.com', uids: [{ id: sentinel, atype: 3 }] },
-      ]);
+      try {
+        const spec = getAdapterSpec();
 
-      spec.buildRequests([
-        {
-          adUnitCode: 'div-gpt-1',
-          bidder: 'trustedServer',
-          mediaTypes: { banner: { sizes: [[300, 250]] } },
-          params: {},
-        },
-      ]);
+        spec.buildRequests(
+          trustedServerBidRequests(),
+          prebidBidderRequest({
+            ext: {
+              eids: [{ source: 'ids.example.com', uids: [{ id: 'secret-uid-value' }] }],
+            },
+          })
+        );
 
-      const logged = spies.flatMap((spy) => spy.mock.calls).flat();
-      expect(logged.some((value) => JSON.stringify(value).includes(sentinel))).toBe(false);
+        expect(spies[0]).toHaveBeenCalledWith('[tsjs-prebid] forwarding bidder EIDs', {
+          forwarded: 1,
+          unserializable: 0,
+          overBudget: 0,
+          cookie: 'written',
+        });
+        const logged = spies.flatMap((spy) => spy.mock.calls).flat();
+        expect(
+          logged.some((value) => String(JSON.stringify(value)).includes('secret-uid-value')),
+          'no log argument may contain a UID value'
+        ).toBe(false);
+      } finally {
+        log.setLevel('warn');
+      }
     });
 
-    it('buildRequests clears stale ts-eids cookie when current Prebid EIDs are absent', () => {
+    it('keeps the trim log when the cookie had to drop sources', () => {
+      const debugSpy = vi.spyOn(log, 'debug').mockImplementation(() => {});
       const spec = getAdapterSpec();
-      document.cookie = 'ts-eids=stale-value';
-      mockGetUserIdsAsEids.mockReturnValue([]);
+      const long = 'x'.repeat(400);
+      const entries = [0, 1, 2, 3, 4, 5, 6].map((index) => ({
+        source: `s${index}.example.com`,
+        uids: [{ id: long, atype: 1 }],
+      }));
 
-      spec.buildRequests([
-        {
-          adUnitCode: 'div-gpt-1',
-          bidder: 'trustedServer',
-          mediaTypes: { banner: { sizes: [[300, 250]] } },
-          params: {},
-        },
-      ]);
+      const result = spec.buildRequests(
+        trustedServerBidRequests(),
+        prebidBidderRequest({ ext: { eids: entries } })
+      );
 
-      expect(document.cookie).toBe('');
-    });
-
-    it('buildRequests preserves uid ext and sanitizes invalid atype values', () => {
-      const spec = getAdapterSpec();
-      mockGetUserIdsAsEids.mockReturnValue([
-        {
-          source: 'adserver.org',
-          uids: [
-            {
-              id: 'uid-with-ext',
-              atype: 1,
-              ext: { provider: 'liveintent.com', rtiPartner: 'TDID' },
-            },
-            {
-              id: 'uid-bad-atype',
-              atype: 2_147_483_648,
-              ext: { keep: true },
-            },
-            {
-              id: 'uid-float-atype',
-              atype: 1.5,
-            },
-          ],
-        },
-      ]);
-
-      const result = spec.buildRequests([
-        {
-          adUnitCode: 'div-gpt-1',
-          bidder: 'trustedServer',
-          mediaTypes: { banner: { sizes: [[300, 250]] } },
-          params: {},
-        },
-      ]);
-
-      const payload = JSON.parse(result.data);
-      expect(payload.eids).toEqual([
-        {
-          source: 'adserver.org',
-          uids: [
-            {
-              id: 'uid-with-ext',
-              atype: 1,
-              ext: { provider: 'liveintent.com', rtiPartner: 'TDID' },
-            },
-            {
-              id: 'uid-bad-atype',
-              ext: { keep: true },
-            },
-            {
-              id: 'uid-float-atype',
-            },
-          ],
-        },
-      ]);
+      expect(JSON.parse(String(result.data)).eids, 'the body keeps every entry').toEqual(entries);
+      expect(decodedTsEidsCookie(), 'the cookie keeps what fits').toEqual(entries.slice(0, 5));
+      expect(debugSpy).toHaveBeenCalledWith(
+        '[tsjs-prebid] ts-eids cookie exceeded 3072 bytes; dropped sources: s6.example.com, s5.example.com'
+      );
+      expect(debugSpy).toHaveBeenCalledWith('[tsjs-prebid] forwarding bidder EIDs', {
+        forwarded: 7,
+        unserializable: 0,
+        overBudget: 0,
+        cookie: 'trimmed',
+      });
     });
 
     it('buildRequests uses custom endpoint when configured', () => {
@@ -2737,6 +3048,66 @@ describe('prebid/installPrebidNpm', () => {
       expect(bidsA[0].requestId).toBe('bid-a');
       expect(bidsB[0].requestId).toBe('bid-b');
     });
+  });
+
+  it('exposes the getUserIdsAsEids canary on the pbjs the shim uses', () => {
+    const pbjs = installPrebidNpm() as unknown as {
+      getUserIdsAsEids?: () => unknown;
+    };
+
+    expect(pbjs.getUserIdsAsEids).toBe(mockGetUserIdsAsEids);
+    expect(pbjs.getUserIdsAsEids?.()).toEqual([CANARY_EID]);
+  });
+
+  function tcfEnforcementHandler(): (event: unknown) => void {
+    installPrebidNpm();
+    const registration = mockOnEvent.mock.calls.find(([event]) => event === 'tcf2Enforcement');
+    expect(registration, 'the shim should listen for tcf2Enforcement').toBeDefined();
+    return registration![1] as (event: unknown) => void;
+  }
+
+  it.each([
+    ['biddersBlocked', { biddersBlocked: ['trustedServer'], eidsBlocked: [] }],
+    ['eidsBlocked', { biddersBlocked: [], eidsBlocked: ['trustedServer'] }],
+  ])('clears ts-eids when tcf2Enforcement lists trustedServer in %s', (_list, blocked) => {
+    const handler = tcfEnforcementHandler();
+    presetTsEidsCookie('preset-value');
+
+    handler({
+      storageBlocked: [],
+      analyticsBlocked: [],
+      ufpdBlocked: [],
+      geoBlocked: [],
+      ...blocked,
+    });
+
+    expect(readTsEidsCookie()).toBeUndefined();
+  });
+
+  it('leaves ts-eids alone when tcf2Enforcement lists only other bidders', () => {
+    const handler = tcfEnforcementHandler();
+    presetTsEidsCookie('preset-value');
+
+    handler({ biddersBlocked: ['appnexus'], eidsBlocked: ['appnexus'] });
+
+    expect(readTsEidsCookie()).toBe('preset-value');
+  });
+
+  it('leaves ts-eids alone when an auction builds no trustedServer request', () => {
+    mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
+      opts?.bidsBackHandler?.();
+    });
+    presetTsEidsCookie('preset-value');
+    const pbjs = installPrebidNpm();
+
+    pbjs.requestBids({
+      adUnits: [{ bids: [{ bidder: 'appnexus', params: {} }] }],
+    } as unknown as RequestBidsArg);
+
+    expect(mockRequestBids, 'the auction should have run').toHaveBeenCalled();
+    expect(readTsEidsCookie(), 'only buildRequests may write or clear the cookie').toBe(
+      'preset-value'
+    );
   });
 
   describe('requestBids shim', () => {
@@ -3156,202 +3527,6 @@ describe('prebid/installPrebidNpm', () => {
       );
       expect(hasTsBidder).toBe(true);
     });
-
-    it('syncs a structured ts-eids cookie after bidsBackHandler', () => {
-      mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
-        opts?.bidsBackHandler?.();
-      });
-      mockGetUserIdsAsEids.mockReturnValue([
-        {
-          source: 'sharedid.org',
-          uids: [
-            { id: 'shared_123', atype: 3 },
-            { id: 'shared_456', ext: { provider: 'example' } },
-          ],
-        },
-      ]);
-
-      const pbjs = installPrebidNpm();
-      pbjs.requestBids({
-        adUnits: [{ bids: [{ bidder: 'appnexus', params: {} }] }],
-      } as unknown as RequestBidsArg);
-
-      const cookieValue = document.cookie.match(/(?:^|; )ts-eids=([^;]+)/)?.[1];
-      expect(cookieValue).toBeDefined();
-      expect(JSON.parse(atob(cookieValue!))).toEqual([
-        {
-          source: 'sharedid.org',
-          uids: [
-            { id: 'shared_123', atype: 3 },
-            { id: 'shared_456', ext: { provider: 'example' } },
-          ],
-        },
-      ]);
-    });
-
-    it('preserves an opaque LiveRamp envelope in the ts-eids cookie', () => {
-      mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
-        opts?.bidsBackHandler?.();
-      });
-      mockGetUserIdsAsEids.mockReturnValue([
-        {
-          source: 'liveramp.com',
-          uids: [{ id: 'opaque-test-envelope', atype: 3 }],
-        },
-      ]);
-
-      const pbjs = installPrebidNpm();
-      pbjs.requestBids({
-        adUnits: [{ bids: [{ bidder: 'appnexus', params: {} }] }],
-      } as unknown as RequestBidsArg);
-
-      const cookieValue = document.cookie.match(/(?:^|; )ts-eids=([^;]+)/)?.[1];
-      expect(cookieValue).toBeDefined();
-      expect(JSON.parse(atob(cookieValue!))).toEqual([
-        {
-          source: 'liveramp.com',
-          uids: [{ id: 'opaque-test-envelope', atype: 3 }],
-        },
-      ]);
-    });
-
-    it('trims an oversized ts-eids cookie deterministically and logs which sources were dropped', () => {
-      const debugSpy = vi.spyOn(log, 'debug').mockImplementation(() => {});
-      const warnSpy = vi.spyOn(log, 'warn').mockImplementation(() => {});
-      mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
-        opts?.bidsBackHandler?.();
-      });
-      // A long uid value per source makes the encoded payload exceed
-      // MAX_EID_COOKIE_BYTES (3072) once several sources are present, the
-      // same way a real page with many ID modules would.
-      const longUid = 'x'.repeat(400);
-      mockGetUserIdsAsEids.mockReturnValue([
-        { source: 'id5-sync.com', uids: [{ id: longUid, atype: 1 }] },
-        { source: 'liveramp.com', uids: [{ id: longUid, atype: 3 }] },
-        { source: 'criteo.com', uids: [{ id: longUid, atype: 1 }] },
-        { source: 'uidapi.com', uids: [{ id: longUid, atype: 3 }] },
-        { source: 'pubcid.org', uids: [{ id: longUid, atype: 1 }] },
-        { source: 'sharedid.org', uids: [{ id: longUid, atype: 1 }] },
-        { source: 'dropped.example', uids: [{ id: longUid, atype: 1 }] },
-      ]);
-
-      const pbjs = installPrebidNpm();
-      pbjs.requestBids({
-        adUnits: [{ bids: [{ bidder: 'appnexus', params: {} }] }],
-      } as unknown as RequestBidsArg);
-
-      const cookieValue = document.cookie.match(/(?:^|; )ts-eids=([^;]+)/)?.[1];
-      expect(cookieValue).toBeDefined();
-      expect(cookieValue!.length).toBeLessThanOrEqual(3072);
-
-      const persistedSources = (JSON.parse(atob(cookieValue!)) as Array<{ source: string }>).map(
-        (eid) => eid.source
-      );
-      expect(persistedSources).not.toContain('dropped.example');
-      expect(persistedSources).toContain('id5-sync.com');
-
-      const loggedMessage = debugSpy.mock.calls
-        .map((call) => call.at(-1))
-        .find(
-          (arg): arg is string => typeof arg === 'string' && arg.includes('ts-eids cookie exceeded')
-        );
-      expect(loggedMessage).toBeDefined();
-      expect(loggedMessage).toContain('dropped.example');
-      expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining('ts-eids cookie exceeded'));
-    });
-
-    it('logs a source whose UIDs were partially trimmed but retained', () => {
-      const debugSpy = vi.spyOn(log, 'debug').mockImplementation(() => {});
-      mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
-        opts?.bidsBackHandler?.();
-      });
-      // A single source with many UIDs is trimmed down to fit rather than
-      // dropped outright — it stays in the payload, but with fewer UIDs.
-      const longUid = 'x'.repeat(400);
-      mockGetUserIdsAsEids.mockReturnValue([
-        {
-          source: 'id5-sync.com',
-          uids: Array.from({ length: 10 }, (_, i) => ({ id: `${longUid}${i}`, atype: 1 })),
-        },
-      ]);
-
-      const pbjs = installPrebidNpm();
-      pbjs.requestBids({
-        adUnits: [{ bids: [{ bidder: 'appnexus', params: {} }] }],
-      } as unknown as RequestBidsArg);
-
-      const cookieValue = document.cookie.match(/(?:^|; )ts-eids=([^;]+)/)?.[1];
-      expect(cookieValue).toBeDefined();
-
-      const persisted = JSON.parse(atob(cookieValue!)) as Array<{
-        source: string;
-        uids: unknown[];
-      }>;
-      expect(persisted.map((eid) => eid.source)).toContain('id5-sync.com');
-      const persistedSource = persisted.find((eid) => eid.source === 'id5-sync.com');
-      expect(persistedSource!.uids.length).toBeLessThan(10);
-
-      const loggedMessage = debugSpy.mock.calls
-        .map((call) => call.at(-1))
-        .find(
-          (arg): arg is string => typeof arg === 'string' && arg.includes('ts-eids cookie exceeded')
-        );
-      expect(loggedMessage).toBeDefined();
-      expect(loggedMessage).toContain('trimmed uids from sources: id5-sync.com');
-    });
-
-    it('reports a source trimmed and then dropped only as dropped', () => {
-      const debugSpy = vi.spyOn(log, 'debug').mockImplementation(() => {});
-      mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
-        opts?.bidsBackHandler?.();
-      });
-      // The tail source has several UIDs that are each too large to fit: the
-      // trimmer first removes UIDs from it, then drops it entirely.
-      const hugeUid = 'y'.repeat(2500);
-      mockGetUserIdsAsEids.mockReturnValue([
-        { source: 'id5-sync.com', uids: [{ id: 'kept', atype: 1 }] },
-        {
-          source: 'dropped.example',
-          uids: Array.from({ length: 3 }, (_, i) => ({ id: `${hugeUid}${i}`, atype: 1 })),
-        },
-      ]);
-
-      const pbjs = installPrebidNpm();
-      pbjs.requestBids({
-        adUnits: [{ bids: [{ bidder: 'appnexus', params: {} }] }],
-      } as unknown as RequestBidsArg);
-
-      const cookieValue = document.cookie.match(/(?:^|; )ts-eids=([^;]+)/)?.[1];
-      expect(cookieValue).toBeDefined();
-      const persistedSources = (JSON.parse(atob(cookieValue!)) as Array<{ source: string }>).map(
-        (eid) => eid.source
-      );
-      expect(persistedSources).toEqual(['id5-sync.com']);
-
-      const loggedMessage = debugSpy.mock.calls
-        .map((call) => call.at(-1))
-        .find(
-          (arg): arg is string => typeof arg === 'string' && arg.includes('ts-eids cookie exceeded')
-        );
-      expect(loggedMessage).toBeDefined();
-      expect(loggedMessage).toContain('dropped sources: dropped.example');
-      expect(loggedMessage).not.toContain('trimmed uids from sources');
-    });
-
-    it('clears ts-eids cookie after bidsBackHandler when no current EIDs remain', () => {
-      document.cookie = `ts-eids=${btoa(JSON.stringify([{ source: 'sharedid.org', uids: [{ id: 'stale' }] }]))}`;
-      mockRequestBids.mockImplementation((opts?: { bidsBackHandler?: () => void }) => {
-        opts?.bidsBackHandler?.();
-      });
-      mockGetUserIdsAsEids.mockReturnValue([]);
-
-      const pbjs = installPrebidNpm();
-      pbjs.requestBids({
-        adUnits: [{ bids: [{ bidder: 'appnexus', params: {} }] }],
-      } as unknown as RequestBidsArg);
-
-      expect(document.cookie).toBe('');
-    });
   });
 });
 
@@ -3361,7 +3536,7 @@ describe('prebid/installPrebidNpm with server-injected config', () => {
     mockPbjs.requestBids = mockRequestBids;
     mockPbjs.adUnits = [];
     mockGetUserIdsAsEids.mockReset();
-    mockGetUserIdsAsEids.mockReturnValue([]);
+    mockGetUserIdsAsEids.mockReturnValue([CANARY_EID]);
     document.cookie = 'ts-eids=; Path=/; Max-Age=0';
     delete testWindow.__tsjs_prebid;
   });
@@ -4463,7 +4638,7 @@ describe('prebid publisher snapshots and delivery refreshes', () => {
     delete (mockPbjs as unknown as Record<string, unknown>).__tsRemoveAdUnitWrapped;
     mockPbjs.adUnits = [];
     mockGetUserIdsAsEids.mockReset();
-    mockGetUserIdsAsEids.mockReturnValue([]);
+    mockGetUserIdsAsEids.mockReturnValue([CANARY_EID]);
     // By default the manifest declares all adapters compiled in.
     (window as unknown as { __tsjs_prebid_bundle?: unknown }).__tsjs_prebid_bundle =
       DEFAULT_BUNDLE_MANIFEST;
@@ -7550,7 +7725,7 @@ describe('prebid/client-side bidders', () => {
     mockPbjs.requestBids = mockRequestBids;
     mockPbjs.adUnits = [];
     mockGetUserIdsAsEids.mockReset();
-    mockGetUserIdsAsEids.mockReturnValue([]);
+    mockGetUserIdsAsEids.mockReturnValue([CANARY_EID]);
     // By default the manifest declares all adapters compiled in.
     testWindow.__tsjs_prebid_bundle = DEFAULT_BUNDLE_MANIFEST;
     delete testWindow.__tsjs_prebid;
@@ -8046,10 +8221,11 @@ describe('prebid/self-init without the external bundle', () => {
   });
 });
 
-describe('prebid self-init user ID module timing', () => {
-  const userSyncCallCount = () =>
-    mockSetConfig.mock.calls.filter(([arg]) => arg && typeof arg === 'object' && 'userSync' in arg)
-      .length;
+describe('prebid self-init writes no Prebid userSync settings', () => {
+  const userSyncCalls = () =>
+    mockSetConfig.mock.calls.filter(
+      ([arg]) => arg !== null && typeof arg === 'object' && 'userSync' in arg
+    );
 
   const setReadyState = (value: DocumentReadyState) => {
     Object.defineProperty(document, 'readyState', { value, configurable: true });
@@ -8064,28 +8240,26 @@ describe('prebid self-init user ID module timing', () => {
     setReadyState('complete');
   });
 
-  it('installs user ID modules immediately when the bundle loads after window load', async () => {
-    // The GPT slim loader appends this bundle from a window.load handler, so
-    // the document is already complete — a load listener would never fire.
+  it('writes no userSync when the bundle loads after window load', async () => {
     setReadyState('complete');
 
     await import('../../../src/integrations/prebid/index');
 
-    expect(userSyncCallCount()).toBeGreaterThan(0);
+    expect(mockSetConfig, 'the shim should still apply its own config').toHaveBeenCalledWith({
+      debug: false,
+    });
+    expect(userSyncCalls(), 'TS should leave userSync to the publisher and Prebid').toEqual([]);
   });
 
-  it('defers user ID modules to window load when the document is still loading', async () => {
+  it('writes no userSync when window load fires after install', async () => {
     setReadyState('loading');
 
     await import('../../../src/integrations/prebid/index');
-
-    expect(userSyncCallCount()).toBe(0);
-
     window.dispatchEvent(new Event('load'));
-    expect(userSyncCallCount()).toBe(1);
 
-    // { once: true } — a second load event must not reinstall.
-    window.dispatchEvent(new Event('load'));
-    expect(userSyncCallCount()).toBe(1);
+    expect(mockSetConfig, 'the shim should still apply its own config').toHaveBeenCalledWith({
+      debug: false,
+    });
+    expect(userSyncCalls(), 'TS should leave userSync to the publisher and Prebid').toEqual([]);
   });
 });
