@@ -420,7 +420,13 @@ impl NextJsRscStreamProcessor {
     /// in `current`. A queued payload whose placeholder had not yet been emitted
     /// would fail substitution rather than degrade to unchanged bytes.
     fn release_bypass(&mut self, current: &[u8]) -> io::Result<Vec<u8>> {
-        if !self.group.is_empty() || self.next_captured().is_some() {
+        // The rewriter and resolve_group warn when they enter fallback themselves.
+        let entering = !self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .bypass_rsc;
+        if entering && (!self.group.is_empty() || self.next_captured().is_some()) {
             log::warn!(
                 "Next.js RSC fallback: capture or output limit, {} held payloads",
                 self.group.len()

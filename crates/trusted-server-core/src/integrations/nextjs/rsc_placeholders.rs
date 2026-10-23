@@ -803,10 +803,15 @@ mod tests {
         })
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
     mod fallback_logging {
         use super::*;
+        use crate::html_processor::{HtmlProcessorConfig, create_html_processor};
+        use crate::integrations::IntegrationRegistry;
+        use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
+        use crate::test_support::nextjs_auction;
+        use serde_json::json;
         use std::cell::RefCell;
+        use std::io::Cursor;
 
         struct FallbackLogger;
 
@@ -822,8 +827,11 @@ mod tests {
 
             fn log(&self, record: &log::Record<'_>) {
                 if self.enabled(record.metadata())
-                    && record.target()
-                        == "trusted_server_core::integrations::nextjs::rsc_placeholders"
+                    && matches!(
+                        record.target(),
+                        "trusted_server_core::integrations::nextjs::rsc_placeholders"
+                            | "trusted_server_core::integrations::nextjs::rsc_stream"
+                    )
                 {
                     MESSAGES.with(|messages| {
                         if let Some(messages) = messages.borrow_mut().as_mut() {
@@ -858,12 +866,101 @@ mod tests {
             let messages = MESSAGES
                 .with(|messages| messages.borrow_mut().take())
                 .expect("should capture this thread's fallback warning");
-            log::set_max_level(previous_level);
             assert_eq!(
                 messages,
                 ["Next.js RSC fallback: uncaptured data head; remaining Flight payloads stay raw"],
                 "should log only the first transition and its fixed reason, never source text"
             );
+
+            let complete = "1:T3,abc";
+            let article = json!({"articleBody": "self.__next_f.push([1, publisher-secret"});
+            for (first, between, last, warning) in [
+                (
+                    complete,
+                    format!("<script type=\"application/ld+json\">{article}</script>"),
+                    complete,
+                    "Next.js RSC fallback: uncaptured data head; remaining Flight payloads stay raw",
+                ),
+                (
+                    complete,
+                    format!(
+                        "<script>self.__next_f.push({})</script>",
+                        json!([3, "AAECAw=="])
+                    ),
+                    complete,
+                    "Next.js RSC fallback: unsupported qualified push; remaining Flight payloads stay raw",
+                ),
+                (
+                    "1:Tffff,abc",
+                    format!("<p>{}</p>", "x".repeat(1024)),
+                    complete,
+                    "Next.js RSC fallback: capture or output limit, 1 held payloads",
+                ),
+                (
+                    "1:T1,é",
+                    String::new(),
+                    complete,
+                    "Next.js RSC fallback: invalid group, 1 payloads",
+                ),
+            ] {
+                for chunk_size in [16, 8192] {
+                    MESSAGES.with(|messages| *messages.borrow_mut() = Some(Vec::new()));
+                    let mut settings = nextjs_auction::script_composition_settings();
+                    settings
+                        .integrations
+                        .insert_config(
+                            "nextjs",
+                            &json!({"enabled": true, "max_combined_payload_bytes": 512}),
+                        )
+                        .expect("should configure the fallback limit");
+                    let registry = IntegrationRegistry::with_plan(
+                        &settings,
+                        Arc::new(
+                            crate::auction::compile_auction_plan(&settings)
+                                .expect("should compile the fallback fixture plan"),
+                        ),
+                    )
+                    .expect("should build the fallback fixture registry");
+                    let config = HtmlProcessorConfig::from_settings(
+                        &settings,
+                        &registry,
+                        nextjs_auction::ORIGIN_HOST,
+                        nextjs_auction::PUBLISHER_HOST,
+                        "https",
+                    );
+                    let html = format!(
+                        "<script>self.__next_f.push({})</script>{between}<script>self.__next_f.push({})</script>",
+                        json!([1, first]),
+                        json!([1, last]),
+                    );
+                    let mut pipeline = StreamingPipeline::new(
+                        PipelineConfig {
+                            input_compression: Compression::None,
+                            output_compression: Compression::None,
+                            chunk_size,
+                        },
+                        create_html_processor(config),
+                    );
+                    let mut output = Vec::new();
+                    pipeline
+                        .process(Cursor::new(html.as_bytes()), &mut output)
+                        .expect("should restore the complete fallback response");
+                    assert_eq!(
+                        output,
+                        html.as_bytes(),
+                        "should preserve original payloads and interstitial bytes at chunk {chunk_size}"
+                    );
+                    let messages = MESSAGES
+                        .with(|messages| messages.borrow_mut().take())
+                        .expect("should capture both fallback stages on this thread");
+                    assert_eq!(
+                        messages,
+                        [warning],
+                        "should warn once with the actual fallback reason at chunk {chunk_size}"
+                    );
+                }
+            }
+            log::set_max_level(previous_level);
         }
     }
 
