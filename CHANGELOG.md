@@ -13,8 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Attested release binaries report `x-ts-version` as the full 40-character source commit, rather than the release tag.
-
+- Attested release binaries report `x-ts-version` as the full 40-character source commit, rather than the release tag. CLI output labels package/source/target/variant, and Axum supports runtime `EDGEZERO__ADAPTER__HOST` binding with a loopback default.
 - **Breaking:** `x-ts-version` now reports the deployed git version — the release tag, else the branch, else the first 6 characters of the commit — compiled in from the build-time `TRUSTED_SERVER__GIT_VERSION` (set by the deploy pipeline) or local git, and is sent by every adapter, including on the Fastly `GET /health` probe. The Fastly service version it previously carried is now `x-ts-fastly-version`; update dashboards, monitors, and scripts that read `x-ts-version` as the Fastly version number. Builds with neither the override nor git omit the header.
 - **Breaking:** `ts prebid bundle` is now `ts prebid client`, alongside the new `ts prebid server` namespace. Update scripts and runbooks to use `ts prebid client` with the same arguments. The old `bundle` spelling is no longer accepted and has no compatibility alias.
 - The S2S `/_ts/api/v1/batch-sync` endpoint now validates the full batch and calls the CAS-protected update path once per distinct normalized EC ID. The last valid UID wins within a group, and infrastructure failures reject the failing and each unprocessed group, so accepted and `kv_unavailable` input indexes may interleave.

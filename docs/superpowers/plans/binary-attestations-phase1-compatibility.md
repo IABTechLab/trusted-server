@@ -11,6 +11,46 @@ Frozen source references below mean:
 - [Cohort](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/scripts/release/release-cohort.json), [tools](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/scripts/release/release-tools.json), [consumer policy](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/crates/trusted-server-cli/release-policy.json).
 - [Index v1 schema](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/docs/superpowers/specs/schemas/release-index-v1.schema.json), [distribution names](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/crates/trusted-server-release/src/distribution.rs#L55), [consumer companion rules](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/crates/trusted-server-cli/src/release/documents.rs#L236), [SPDX joins](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/crates/trusted-server-cli/src/release/evidence/joins.rs#L188).
 
+### Phase 1 review notes — rehearsal .6 pending
+
+Phase 1 is **part of #1235**, pending D7 maintainer settings. These notes supersede
+historical phase applicability, not the retained destination requirements.
+Goals, Non-goals, R-COHORT and R-BOUNDS refer to the original four-artifact design;
+this slice explicitly includes seven binaries / 29 files, including Axum and
+Linux ARM64. Its original four public names stay unchanged; no v1 index is emitted.
+The Node producer helpers and inline publisher are interim exceptions to the
+retained Rust-producer constraint, replaced by slices 2.5 (recipes/inspection),
+2.6 (composition/SPDX) and 2.8 (publication). The frozen Status and tool versions
+below describe #1262, not current Phase 1 implementation status.
+
+Current tool pins: Rust 1.98.1, Node 24.20.0, Fastly CLI 16.0.0, Viceroy 0.21.0;
+verification uses GitHub CLI 2.102.0. The reusable release-build.yml is the signer.
+Rehearsal .5 is historical evidence only; this corrective batch needs .6.
+
+Slice 2.3 immutable build facts are reused from introducing commit
+`bfb697404551a28217af8906024506095bcd9559` and revision
+`6d0efda7210983021ab3c9efe8a0a3190e9eb81b`, as retained at the frozen source.
+Core's resolver and new CLI/Fastly owner build scripts validate
+`TRUSTED_SERVER__RELEASE_BUILD=1` and the full lowercase source SHA.
+Cargo supplies the owning target/package; features supply the variant. Tags and
+run IDs stay external. CLI now labels package/source/target/variant; Fastly queues
+the same immutable facts through existing startup diagnostics. The source audit
+permits exactly this release control, GIT_VERSION and Cargo-owned BUILD_TARGET,
+not deployment values. CLI source-resource cleanup remains deferred.
+
+Axum binding is runtime-only: `EDGEZERO__ADAPTER__HOST` defaults to loopback;
+containers can set `0.0.0.0`, with the existing `PORT` override. The smoke uses
+bridge networking and reaches the process through a published host port.
+TLS termination, graceful shutdown and request/resource limits remain follow-up.
+
+Publication requires `RELEASE_PUBLICATION_ENABLED=true` only after maintainers
+confirm immutable releases and the v\* tag ruleset. There is no settings token or
+prepublication settings API call, following the reviewed signing boundary;
+postpublication immutable=true readback fails loudly. Hyphenated tags are
+prereleases and never Latest. Stable tags are normal releases. Eligibility of
+rc-branch tags is an unresolved maintainer decision; Phase 1 does not implement
+the destination branch-ancestry/ruleset validator or authorize rc tags.
+
 ## Approved scope after audit
 
 This document records the alignment decisions. Carried requirements remain
@@ -36,9 +76,8 @@ The tools and consumer policy files remain unchanged. The cohort adds the
 three descriptive Axum entries below; all three policies still have **no Phase 1
 readers**. Checked cohort selection, a supplemental tool policy, environment
 normalization/remapping, stricter tag/source validation, uploaded-byte re-download,
-macOS 13 targeting, full platform qualification and CLI immutable build facts
-are additive later work. This slice includes UBI GNU glibc 2.34 checks and
-startup smokes, while retaining the macOS 15.0 deployment target; copying a
+full platform qualification remains additive later work. This corrective batch adds immutable build facts and a verified macOS 13.0 deployment target; UBI GNU glibc 2.34 checks and
+startup smokes remain. Copying a
 destination policy alone never establishes its qualification requirements. Native reproduction is a later measurement, not a
 Phase 1 release gate. Full Task 16 resume/reconciliation remains deferred.
 
@@ -62,10 +101,10 @@ qualified evidence.
 | Run/source binding                | Same approved source, caller/signer revision and repository run/attempt (R-EVIDENCE)                                                                     | Same run, no custom evidence joins                                               | Preserve invocation shape now; full graph joins deferred, not substituted by metadata claims.                                                                                   |
 | Exact four raw executable assets  | `trusted-server-fastly.wasm`, `ts-aarch64-apple-darwin`, `ts-x86_64-apple-darwin`, `ts-x86_64-unknown-linux-gnu`                                         | Same                                                                             | Preserve exact names and unarchived executable subjects.                                                                                                                        |
 | Cohort identity / selection       | `phase1-fastly-cli`, schema 1, exact package/bin/target/default-feature/variant/role/capability combinations                                             | Names/packages/targets duplicated in YAML/shell; no cohort metadata              | Carry original cohort unchanged with no reader. Checked declaration-based selection is additive later work, never an arbitrary command interface.                               |
-| SPDX document / predicate         | SPDX 2.3; `https://spdx.dev/Document/v2.3`                                                                                                               | CycloneDX 1.5 / `https://cyclonedx.org/bom`                                      | User selected SPDX: generate real SPDX 2.3 and restore the source predicate before publication.                                                                                 |
+| SPDX document / predicate         | SPDX 2.3; `https://spdx.dev/Document/v2.3`                                                                                                               | CycloneDX 1.5 / `https://cyclonedx.org/bom`                                      | User selected SPDX: generate real SPDX 2.3 and restore the source predicate before publication. <!-- allow-domain: cyclonedx.org -->                                            |
 | SBOM companion name               | `<asset>.spdx.json` (distribution/consumer hardwired suffix)                                                                                             | `<asset>.cdx.json`                                                               | Align now; never rename CycloneDX bytes to SPDX.                                                                                                                                |
 | SBOM root/binary join             | `SPDXRef-DOCUMENT`; exactly one described root package and one `SHA256` checksum equal to executable bytes                                               | CycloneDX metadata hash                                                          | Validate real converted SPDX against the existing root/hash contract. Root ID spelling itself is not hardwired.                                                                 |
-| SBOM predicate/document equality  | Executable subject; predicate structurally equals distributed parsed SPDX; file bytes independently hashed                                               | Executable subject is correct; no signed-predicate/file comparison               | Preserve subject semantics, reject malformed/duplicate JSON before signing, and verify the shipped SPDX against the attested predicate.                                         |
+| SBOM predicate/document equality  | Executable subject; predicate structurally equals distributed parsed SPDX; file bytes independently hashed                                               | Executable subject is correct; no signed-predicate/file comparison               | Preserve subject semantics, reject malformed JSON before signing (duplicate-key rejection is not claimed), and verify the shipped SPDX against the attested predicate.          |
 | Provenance bundle name            | `<asset>.provenance.sigstore.json`                                                                                                                       | Not shipped                                                                      | Save action bundle and ship under the existing name now.                                                                                                                        |
 | SBOM bundle name                  | `<asset>.sbom.sigstore.json`                                                                                                                             | Not shipped                                                                      | Save and ship now; do not introduce a competing suffix.                                                                                                                         |
 | Provenance subject set            | Executable, SPDX, build-evidence, build-recipe, rebuild-check (Task 15/R-EVIDENCE)                                                                       | Executable only                                                                  | Sign executable + real SPDX in this slice. Add only the real evidence/recipe/rebuild subjects when their owning slices land; do not fabricate companions.                       |
@@ -82,24 +121,24 @@ qualified evidence.
 
 ### Build/policy contracts and explicit scope limits
 
-| Contract point                  | Frozen #1262 value                                                                                                                               | #1435 value at audit                                                         | Alignment / adoption                                                                                                                                                                                                                                                       |
-| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Policy file paths               | `scripts/release/release-cohort.json`, `scripts/release/release-tools.json`, `crates/trusted-server-cli/release-policy.json` (`policy.rs:23–27`) | All absent                                                                   | Carry all three unchanged with no Phase 1 readers. Later checked adoption must not execute source-supplied commands.                                                                                                                                                       |
-| Policy qualification            | Tools, environments and recipes remain `pending`, acquisition/digest fields null                                                                 | Ordinary hosted build                                                        | Preserve all pending/null state. A Phase 1 checksum is not a claim of authenticated Phase 2 qualification.                                                                                                                                                                 |
-| Existing tool versions          | Rust 1.98.1, Node 24.20.0, npm 11.19.0, gh 2.97.0; attest 4.2.2 at `1e69f48acb82d1966a394da916b4c1698aa569d6`                                    | Rust/Node match; npm unchecked; ambient gh; attest matches                   | Preserve current tracked Rust/Node/action pins. Additional policy readers and exact gh/npm enforcement remain additive later work; original tool policy is unchanged.                                                                                                      |
-| New SBOM tool acquisition       | No cargo-cyclonedx/converter entries; strict producer rejects unknown tool names                                                                 | Cargo generator version/hash hardcoded                                       | Supplemental tool-policy adoption is deferred. Keep existing Phase 1 acquisition checks and carry the original strict tools records unchanged.                                                                                                                             |
-| Package/bin/target/features     | Exact cohort entries, default features, no extras                                                                                                | Package/target agree; bin implicit                                           | Preserve current fixed selections. A checked cohort reader and explicit-bin reconciliation are additive later work.                                                                                                                                                        |
-| Profile and Cargo flags         | Release, debug 1, strip none; `--frozen`, structured messages, fixed jobs (`recipe/plan.rs:175–197`)                                             | Release/debug agree; `--locked`, online build, implicit bin/jobs             | Keep online locked acquisition/build as the current Phase 1 boundary. Structured output/jobs, explicit bin and source normalization are additive later work; frozen confined execution follows its reviewed owner.                                                         |
-| Normalized environment          | C locale, UTC, source-commit epoch, immutable source facts, controlled AWS-LC/SQLite selection (`preflight/child.rs:82–115`)                     | Full SHA source fact only                                                    | Environment normalization and checked commit epoch are additive later work; no Phase 1 reproducibility claim.                                                                                                                                                              |
-| Rust/C path remapping           | Stable `/trusted-server`, `/cargo-vendor`, `/cargo-home`, `/rust-tools`, `/cargo-target` roots (`recipe/remap.rs`)                               | None                                                                         | All additional remapping follows later owned inputs; it does not change names or verification identities.                                                                                                                                                                  |
-| Fresh/private inputs            | Private prepared state and target; denied network; authenticated paths                                                                           | Fresh target; hosted HOME/CARGO_HOME/PATH and network                        | Keep fresh target and scrubbed environment; prepared/offline/sandbox/tool closure remains the reviewed later slice.                                                                                                                                                        |
-| JS preparation                  | Checked prebuilt inventory, shared twice-built modules, no Vite env/config loading                                                               | Fresh npm per artifact; private Cargo output; no shared comparison           | Keep fresh npm/private Cargo outputs. Additional environment controls, authenticated inventory, two builds and shared contribution evidence remain later work; never invent equality claims.                                                                               |
-| macOS baseline                  | Deployment target **13.0**, hosted `macos-15` / `macos-15-intel`                                                                                 | Same runners, deployment target **15.0**                                     | Keep current 15.0 setting. Lowering to the destination 13.0 floor and older-host runtime qualification are additive later work.                                                                                                                                            |
-| Linux baseline                  | GNU builder maximum **glibc 2.34**, UBI9/Debian12/Ubuntu22 compatibility evidence                                                                | Ordinary Ubuntu24 build; 2.39 environment, older compatibility unestablished | Explicit temporary limitation if source GNU builder/sysroot cannot be adopted without deferred platform machinery. Do not claim 2.34 merely by copying policy. Lowering the future requirement to 2.34 broadens support without renaming assets or breaking Phase 1 users. |
-| Runtime/startup/file inspection | Owning runtime/startup acceptance and exact target classification                                                                                | Build-only + config canaries                                                 | Additional binary type/architecture checks and full runtime qualification remain additive later work with the source inspection owner.                                                                                                                                     |
-| CLI immutable build facts       | Source-controlled release/source/target/variant facts in CLI output (Task 4)                                                                     | Existing package-version CLI output                                          | Mark as additive later CLI metadata, preserving existing commands; do not substitute a different source-identity schema.                                                                                                                                                   |
-| SBOM precision                  | Complete Cargo/native/JS composition and retained-byte joins                                                                                     | Conservative Cargo target/npm build-tree inventory; native/std/runtime gaps  | Keep gaps explicit in SPDX and docs. Enrich the same SPDX companion later; do not label the smaller inventory complete.                                                                                                                                                    |
-| Assurance profiles              | Fastly `provenance-sbom-repeatable`; native `provenance-sbom` with full evidence                                                                 | No repeatability/full evidence                                               | Preserve destination profiles in cohort; do not emit an index/profile claim until its gates hold. Native reproduction remains a measurement; Fastly reproducibility is a later gate.                                                                                       |
+| Contract point                  | Frozen #1262 value                                                                                                                               | #1435 value at audit                                                         | Alignment / adoption                                                                                                                                                                                               |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Policy file paths               | `scripts/release/release-cohort.json`, `scripts/release/release-tools.json`, `crates/trusted-server-cli/release-policy.json` (`policy.rs:23–27`) | All absent                                                                   | Carry all three unchanged with no Phase 1 readers. Later checked adoption must not execute source-supplied commands.                                                                                               |
+| Policy qualification            | Tools, environments and recipes remain `pending`, acquisition/digest fields null                                                                 | Ordinary hosted build                                                        | Preserve all pending/null state. A Phase 1 checksum is not a claim of authenticated Phase 2 qualification.                                                                                                         |
+| Existing tool versions          | Rust 1.98.1, Node 24.20.0, npm 11.19.0, gh 2.97.0; attest 4.2.2 at `1e69f48acb82d1966a394da916b4c1698aa569d6`                                    | Rust/Node match; npm unchecked; ambient gh; attest matches                   | Preserve current tracked Rust/Node/action pins. Additional policy readers and exact gh/npm enforcement remain additive later work; original tool policy is unchanged.                                              |
+| New SBOM tool acquisition       | No cargo-cyclonedx/converter entries; strict producer rejects unknown tool names                                                                 | Cargo generator version/hash hardcoded                                       | Supplemental tool-policy adoption is deferred. Keep existing Phase 1 acquisition checks and carry the original strict tools records unchanged.                                                                     |
+| Package/bin/target/features     | Exact cohort entries, default features, no extras                                                                                                | Package/target agree; bin implicit                                           | Preserve current fixed selections. A checked cohort reader and explicit-bin reconciliation are additive later work.                                                                                                |
+| Profile and Cargo flags         | Release, debug 1, strip none; `--frozen`, structured messages, fixed jobs (`recipe/plan.rs:175–197`)                                             | Release/debug agree; `--locked`, online build, implicit bin/jobs             | Keep online locked acquisition/build as the current Phase 1 boundary. Structured output/jobs, explicit bin and source normalization are additive later work; frozen confined execution follows its reviewed owner. |
+| Normalized environment          | C locale, UTC, source-commit epoch, immutable source facts, controlled AWS-LC/SQLite selection (`preflight/child.rs:82–115`)                     | Full SHA source fact only                                                    | Environment normalization and checked commit epoch are additive later work; no Phase 1 reproducibility claim.                                                                                                      |
+| Rust/C path remapping           | Stable `/trusted-server`, `/cargo-vendor`, `/cargo-home`, `/rust-tools`, `/cargo-target` roots (`recipe/remap.rs`)                               | None                                                                         | All additional remapping follows later owned inputs; it does not change names or verification identities.                                                                                                          |
+| Fresh/private inputs            | Private prepared state and target; denied network; authenticated paths                                                                           | Fresh target; hosted HOME/CARGO_HOME/PATH and network                        | Keep fresh target and scrubbed environment; prepared/offline/sandbox/tool closure remains the reviewed later slice.                                                                                                |
+| JS preparation                  | Checked prebuilt inventory, shared twice-built modules, no Vite env/config loading                                                               | Fresh npm per artifact; private Cargo output; no shared comparison           | Keep fresh npm/private Cargo outputs. Additional environment controls, authenticated inventory, two builds and shared contribution evidence remain later work; never invent equality claims.                       |
+| macOS baseline                  | Deployment target **13.0**, hosted `macos-15` / `macos-15-intel`                                                                                 | Same runners, deployment target **15.0**                                     | This corrective batch targets 13.0 and checks Mach-O CPU/load-command minimum OS. Actual older-host runtime qualification remains later work.                                                                      |
+| Linux baseline                  | GNU builder maximum **glibc 2.34**, UBI9/Debian12/Ubuntu22 compatibility evidence                                                                | Ordinary Ubuntu24 build; 2.39 environment, older compatibility unestablished | Implemented: UBI 9.6 GNU builds, final-byte GLIBC ceiling 2.34, and digest-pinned Debian 12/Ubuntu 22.04/UBI 9 startup checks. Full compiler/native composition qualification remains deferred.                    |
+| Runtime/startup/file inspection | Owning runtime/startup acceptance and exact target classification                                                                                | Build-only + config canaries                                                 | Additional binary type/architecture checks and full runtime qualification remain additive later work with the source inspection owner.                                                                             |
+| CLI immutable build facts       | Source-controlled release/source/target/variant facts in CLI output (Task 4)                                                                     | Existing package-version CLI output                                          | Port the reviewed slice 2.3 immutable facts now, preserving the labelled source-identity schema.                                                                                                                   |
+| SBOM precision                  | Complete Cargo/native/JS composition and retained-byte joins                                                                                     | Conservative Cargo target/npm build-tree inventory; native/std/runtime gaps  | Keep gaps explicit in SPDX and docs. Enrich the same SPDX companion later; do not label the smaller inventory complete.                                                                                            |
+| Assurance profiles              | Fastly `provenance-sbom-repeatable`; native `provenance-sbom` with full evidence                                                                 | No repeatability/full evidence                                               | Preserve destination profiles in cohort; do not emit an index/profile claim until its gates hold. Native reproduction remains a measurement; Fastly reproducibility is a later gate.                               |
 
 ### Publication contract and nonbreaking recovery plan
 
@@ -137,8 +176,7 @@ extra features, `variant: default`, `assurance_profile: provenance-sbom`,
 
 This adds production Axum distributions by explicit scope decision. `static`
 means no dynamic libc/loader requirement, not qualification of every Linux
-kernel. The historical cohort identifier `phase1-fastly-cli` and its original
-four entries remain unchanged. **No Phase 1 reader** enforces these records or
+kernel. The historical cohort identifier `phase1-fastly-cli` is a destination-only label for the original contract; it is not the current file count or a qualification claim. The Fastly `provenance-sbom-repeatable` profile is destination-only: Phase 1 makes no repeatability claim. Its original four entries remain unchanged. **No Phase 1 reader** enforces these records or
 their destination assurance profiles/capability labels. `release-tools.json` and
 consumer `release-policy.json` remain byte-for-byte unchanged. The workflow's
 explicit seven selections own the Phase 1 builds; no supplemental tool file or
@@ -158,12 +196,10 @@ The builder's system packages are acquired through DNF and are not a fully
 qualified or pinned native tool closure. Musl uses Ubuntu's exact `1.2.4-2`
 `musl`, `musl-dev` and `musl-tools` packages, the explicit `musl-gcc` linker and
 GCC 13 driver, whose actual version is logged. Target-specific C/linker/static
-flags leave host SBOM-tool builds unchanged. No allocator or Rust source changes
-are included; consider mimalloc/jemalloc for musl under load later.
+flags leave host SBOM-tool builds unchanged. No allocator changes are included; allocator/load qualification remains later work.
 
 Builds scan the final bytes for config canaries and check locked inputs are
-unchanged. Before upload they check wasm magic/version, each CLI's existing
-`ts 0.1.0` package-version output, GNU symbol ceilings and static-musl loader
+unchanged. Before upload they check wasm magic/version, each CLI's labelled package/source/target/variant output, GNU symbol ceilings and static-musl loader
 requirements. GNU x86 binaries start on Debian 12-slim, Ubuntu 22.04 and UBI 9.6
 minimal; ARM Axum starts on Debian 12-slim on the ARM runner; musl starts on
 pinned Alpine and a scratch-like root filesystem with a read-only runtime CA
@@ -172,7 +208,7 @@ so an entirely empty trust store fails even a health request. Every Axum smoke m
 the runner's system certificates at `/ca.pem` and sets `SSL_CERT_FILE`; operators
 must supply runtime trust data independently. No dynamic libraries are added.
 Acquired builder/runtime image IDs
-are logged. Axum has no help/version mode; its isolated, read-only, nonroot
+are logged. Axum has no help/version mode; its bridge-networked, read-only, nonroot
 container receives only a fictional runtime envelope/secrets and must return
 `200 ok` from its configured health router. This does not establish publisher
 proxy/load qualification or complete native composition.
@@ -233,3 +269,17 @@ workflows, scripts, tests or release bytes.
 
 The immutable `.2`, `.3`, `.4` and `.5` releases remain intact; no drafts remain from
 these rehearsals. No upstream tags, releases or repository settings were changed.
+
+### Phase 1 review boundary notes
+
+The reusable caller declares the maximum signing permissions required by its
+called workflow. GitHub does not allow a read-only caller to invoke a nested
+workflow that declares greater permissions, even for conditionally skipped jobs.
+Actual build/check jobs narrow permissions to contents-read; signing remains
+tag-only. Splitting a new build-only workflow is deferred to preserve this slice.
+
+The configuration scanner covers literal/raw/concatenated macros and literal
+build-script deployment prefixes. It is a best-effort source regression audit,
+not Rust expansion or dataflow analysis: computed names, procedural macros and
+third-party build scripts are not completely analyzed. Planted canary scans and
+clean inherited environments provide additional checks, not hermeticity.

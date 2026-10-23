@@ -123,8 +123,6 @@ pub const REFERENCE_HOSTS: &[&str] = &[
     "slsa.dev",
     // SPDX: canonical document predicate in the retained reviewed contract.
     "spdx.dev",
-    // CycloneDX: canonical format reference for the build inventory generator.
-    "cyclonedx.org",
     // Specs (other)
     "webassembly.org",
     // Fastly docs
@@ -331,8 +329,8 @@ mod allow_check_tests {
             "should allow the canonical spdx.dev reference"
         );
         assert!(
-            is_allowed("cyclonedx.org", &nothing_suppressed()),
-            "should allow the canonical cyclonedx.org reference"
+            !is_allowed("cyclonedx.org", &nothing_suppressed()),
+            "should require per-line suppression for the inventory format reference"
         );
         assert!(
             is_allowed("cli.github.com", &nothing_suppressed()),

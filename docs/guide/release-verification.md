@@ -18,23 +18,27 @@ and signing jobs do not check out, compile or execute the downloaded binaries.
 | ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
 | `trusted-server-fastly.wasm`                    | Fastly Compute, `wasm32-wasip1`, default features; reproducibility and hosted runtime qualification remain pending |
 | `ts-x86_64-unknown-linux-gnu`                   | GNU x86-64; UBI 9 builder; maximum required glibc 2.34; Debian 12, Ubuntu 22.04 and UBI 9 startup smokes           |
-| `ts-aarch64-apple-darwin`                       | macOS 15 Apple Silicon runner, deployment target 15.0; runtime compatibility qualification remains pending         |
-| `ts-x86_64-apple-darwin`                        | macOS 15 Intel runner, deployment target 15.0; runtime compatibility qualification remains pending                 |
+| `ts-aarch64-apple-darwin`                       | macOS 15 Apple Silicon runner, deployment target 13.0; runtime compatibility qualification remains pending         |
+| `ts-x86_64-apple-darwin`                        | macOS 15 Intel runner, deployment target 13.0; runtime compatibility qualification remains pending                 |
 | `trusted-server-axum-x86_64-unknown-linux-gnu`  | GNU x86-64; UBI 9 build; maximum glibc 2.34; Debian 12, Ubuntu 22.04 and UBI 9 startup smokes                      |
 | `trusted-server-axum-x86_64-unknown-linux-musl` | Fully static x86-64; musl-tools 1.2.4-2; pinned Alpine and scratch-like startup smokes with runtime CA data        |
 | `trusted-server-axum-aarch64-unknown-linux-gnu` | ARM64 GNU; native ARM UBI 9 build; maximum glibc 2.34; Debian 12 startup smoke                                     |
 
-The retained destination design calls for a macOS 13.0 deployment target;
-Phase 1 still builds with 15.0. Lowering that floor and proving older-runtime
-compatibility are additive later work.
+The build checks 64-bit Mach-O magic, target CPU and minimum macOS 13.0 load commands. Actual execution on macOS 13 remains later qualification.
 The executables are not notarized. GNU builds require no GLIBC symbol newer than 2.34; glibc 2.34 and newer are
 the selected baseline. This includes
 Debian 12/bookworm-slim, Ubuntu 22.04+ and RHEL/UBI 9+. Distroless
 cc-debian12 has a compatible libc floor but is not a Phase 1 smoke image.
 The musl asset needs no dynamic loader or libraries; Alpine and a scratch-like
 container are required smoke images, while distroless-static is another deployment option
-without a separate Phase 1 runtime test. Build logs record acquired runtime image
-IDs. These required startup checks do not establish complete platform/tool qualification.
+without a separate Phase 1 runtime test. All acquired smoke images are digest-pinned; build logs record their image IDs. These required startup checks do not establish complete platform/tool qualification.
+Axum defaults to `127.0.0.1:8787`. Set runtime `EDGEZERO__ADAPTER__HOST=0.0.0.0`
+and `PORT=8080` for containers and publish that port. Invalid explicit values
+fail startup. This runtime setting is never compiled into the executable.
+The smoke reaches a bridge-networked container through a host-published port;
+loopback-only binding cannot pass it. TLS termination, graceful shutdown and
+request/resource limits remain follow-up production hardening.
+
 Axum's TLS client requires a runtime CA certificate bundle, including for health
 request initialization. Every Axum smoke mounts the runner's system CA
 bundle read-only at `/ca.pem` with `SSL_CERT_FILE=/ca.pem`; production operators
@@ -178,7 +182,13 @@ pins and trusted roots to the offline machine. Reuse `REPO`, `TAG`, `COMMIT`,
 `ASSETS`, `WORKFLOW` and `IDENTITY` from above. Supplying both the bundle and
 custom roots avoids network acquisition; there is no `--offline` flag.
 
+Before disconnecting, obtain an independent trusted SHA-256 pin for each binary
+(for example from a separately authenticated release verification record).
+Do not treat SHA256SUMS delivered with the same untrusted download as that pin.
+Transfer that approved pin file as `APPROVED_BINARY_SHA256SUMS`.
+
 ```bash
+shasum -a 256 --check APPROVED_BINARY_SHA256SUMS
 for asset in "${ASSETS[@]}"; do
   for kind in provenance sbom; do
     predicate=https://slsa.dev/provenance/v1
@@ -266,7 +276,7 @@ establish equality with this release, and Phase 1 adds no `ts deploy --release`
 command. Use a prebuilt package route for the verified bytes.
 
 For a manual deployment to an **existing** Fastly service, use the Fastly CLI
-version pinned in the release tag's `.tool-versions`. Prepare a fresh private
+16.0.0 pinned in the release tag's `.tool-versions`. Prepare a fresh private
 packaging directory containing only the verified wasm and a minimal manifest:
 
 ```toml
@@ -285,9 +295,12 @@ From the private directory:
 
 ```bash
 fastly compute pack --wasm-binary ./trusted-server-fastly.wasm
+fastly compute validate --package ./pkg/example-app.tar.gz
 tar -tzf ./pkg/example-app.tar.gz
 tar -xOzf ./pkg/example-app.tar.gz example-app/bin/main.wasm > packaged.wasm
 cmp trusted-server-fastly.wasm packaged.wasm
+tar -xOzf ./pkg/example-app.tar.gz example-app/fastly.toml > packaged.toml
+cmp fastly.toml packaged.toml
 ```
 
 Inspect the archive inventory: it must contain only the expected named package,
@@ -332,8 +345,7 @@ scaffold, not an operator config.
 
 Release Fastly responses report `x-ts-version` as the full 40-character source
 commit supplied by the release build. Development display fallbacks are not the
-release identity. `ts --version` reports the command name `ts` and Cargo package version, not a
-source-commit field. Source identity comes from the attestation pins above.
+release identity. `ts --version` labels `package=<version> source=<commit> target=<triple> variant=default`. Release mode requires the full 40-character lowercase source commit; the package version is not the release tag. Attestation pins authenticate these inputs externally.
 The executable's SHA-256 is checked externally against the retained release
 bytes; exposing that digest as a runtime build fact belongs to #161.
 
@@ -367,8 +379,10 @@ inputs.
 
 Before publication, a maintainer must enable immutable releases, protect `v*`
 tags and approve tag-push authority and required checks. Immutability remains a
-human precondition; the publisher has no repository-administration token. A
+human precondition. Set repository variable `RELEASE_PUBLICATION_ENABLED=true` only after confirming those settings with the read-only commands below. Without it, publication is skipped. There is no repository-administration token or prepublication settings API call, following the reviewed decision to check the published release instead. A
 violation can expose a mutable release before the workflow reports failure.
+
+Tags containing `-` publish as prereleases with Latest disabled; stable tags publish as normal releases. Whether to authorize tags from rc branches is a maintainer decision; the Phase 2 ancestry/ruleset validator is not implemented here.
 
 Publication lists releases, including drafts, and refuses every existing
 matching tag. It creates one draft, retains its release ID, and binds uploads
@@ -471,3 +485,17 @@ bypass actors only to callers with sufficient repository access; an omitted fiel
 is not proof of an empty bypass list. Also review inherited rulesets. These are
 maintainer gates, not evidence that Phase 1's publication token can administer
 repository settings.
+
+### Phase 1 review boundary notes
+
+The reusable caller declares the maximum signing permissions required by its
+called workflow. GitHub does not allow a read-only caller to invoke a nested
+workflow that declares greater permissions, even for conditionally skipped jobs.
+Actual build/check jobs narrow permissions to contents-read; signing remains
+tag-only. Splitting a new build-only workflow is deferred to preserve this slice.
+
+The configuration scanner covers literal/raw/concatenated macros and literal
+build-script deployment prefixes. It is a best-effort source regression audit,
+not Rust expansion or dataflow analysis: computed names, procedural macros and
+third-party build scripts are not completely analyzed. Planted canary scans and
+clean inherited environments provide additional checks, not hermeticity.

@@ -5,7 +5,8 @@
   "notes": [
     "File ownership is a planning map, not safe cherry-pick boundaries: main.rs, Cargo manifests/lock, shared fixtures and workflow YAML require staged hunks.",
     "Phase 1 linked evidence closure includes source-modified legacy spec, migration addendum, two integration plans, 13 dated evidence reports and JS composition narrative; baseline axum-dev.md need not port.",
-    "Commit citations identify introducing or major shaping commits, not complete exact-replay commit sets."
+    "Commit citations identify introducing or major shaping commits, not complete exact-replay commit sets.",
+    "Phase 1 interim producers scripts/release/phase1-build.sh and phase1.mjs are replaced by slices 2.5 (recipes/inspection) and 2.6 (composition/SPDX); release.yml inline publisher is replaced by slice 2.8. Slice 2.3 immutable build facts are partly adopted now; CLI source-resource cleanup remains deferred."
   ],
   "groups": {
     "phase-1-contract-and-linked-evidence": {
@@ -664,6 +665,17 @@
       "crates/trusted-server-release/tests/fixtures/index/candidate/ts-x86_64-unknown-linux-gnu.rebuild-check.json": "Update for Axum: Candidate companions and digest joins expand alongside the seven-artifact candidate index.",
       "crates/trusted-server-release/tests/fixtures/index/candidate/ts-x86_64-unknown-linux-gnu.spdx.json": "Update for Axum: Candidate companions and digest joins expand alongside the seven-artifact candidate index.",
       "crates/trusted-server-release/tests/fixtures/index/candidate/tsjs-inventory.json": "Update for Axum: Candidate companions and digest joins expand alongside the seven-artifact candidate index."
+    }
+  },
+  "phase1_interim_producers": {
+    "scripts/release/phase1-build.sh": {
+      "replaced_by": ["2.5"]
+    },
+    "scripts/release/phase1.mjs": {
+      "replaced_by": ["2.5", "2.6"]
+    },
+    ".github/workflows/release.yml inline publisher": {
+      "replaced_by": ["2.8"]
     }
   }
 }

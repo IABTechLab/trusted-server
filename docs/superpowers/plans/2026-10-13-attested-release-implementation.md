@@ -4,7 +4,7 @@
 
 This is the phased rework of [#1262](https://github.com/IABTechLab/trusted-server/pull/1262), frozen at `122b78664b1235c717e9208fd200f9a9b0c335df`. The reviewed contract below is retained as the destination design. This section controls phase applicability; historical statements about first-release gates and PR ownership below refer to the original combined proposal. No new spec approval cycle is introduced by reducing scope.
 
-**Phase 1 closes #1235:** tag-triggered builds of Fastly wasm, three native CLI binaries and three production Axum binaries; SLSA provenance and a shipped, attested SBOM for each binary; draft/upload/publish of an immutable release with `SHA256SUMS`; GitHub CLI verification pinned to the release workflow and predicate; and CI enforcement of configuration independence. Operators deploy the verified release bytes. Reproducibility is not a Phase 1 claim or gate. The source-version and fresh JS mechanisms already on main are reused.
+**Phase 1 contributes to #1235 (D7 settings pending):** tag-triggered builds of Fastly wasm, three native CLI binaries and three production Axum binaries; SLSA provenance and a shipped, attested SBOM for each binary; draft/upload/publish of an immutable release with `SHA256SUMS`; GitHub CLI verification pinned to the release workflow and predicate; and CI enforcement of configuration independence. Operators deploy the verified release bytes. Reproducibility is not a Phase 1 claim or gate. The source-version and fresh JS mechanisms already on main are reused.
 
 Phase 1 publishes SPDX 2.3 for a conservative selected-Cargo-target and installed-npm-build-tree inventory, with the final binary hash. CycloneDX is only an intermediate generator format. Complete composition qualification below remains Phase 2+; Phase 1 does not claim exact retained-code or native-source closure.
 
@@ -20,6 +20,46 @@ forms; see the [compatibility audit](binary-attestations-phase1-compatibility.md
 and slice-map annotations. Rehearsal `.5` passed for the seven-binary implementation at
 `937214a632f9387601dba94f996de78b2e6ee424`; the compatibility audit records the complete evidence.
 Rehearsal `.4` remains historical evidence for the original four assets only.
+
+### Phase 1 review notes — rehearsal .6 pending
+
+Phase 1 is **part of #1235**, pending D7 maintainer settings. These notes supersede
+historical phase applicability, not the retained destination requirements.
+Goals, Non-goals, R-COHORT and R-BOUNDS refer to the original four-artifact design;
+this slice explicitly includes seven binaries / 29 files, including Axum and
+Linux ARM64. Its original four public names stay unchanged; no v1 index is emitted.
+The Node producer helpers and inline publisher are interim exceptions to the
+retained Rust-producer constraint, replaced by slices 2.5 (recipes/inspection),
+2.6 (composition/SPDX) and 2.8 (publication). The frozen Status and tool versions
+below describe #1262, not current Phase 1 implementation status.
+
+Current tool pins: Rust 1.98.1, Node 24.20.0, Fastly CLI 16.0.0, Viceroy 0.21.0;
+verification uses GitHub CLI 2.102.0. The reusable release-build.yml is the signer.
+Rehearsal .5 is historical evidence only; this corrective batch needs .6.
+
+Slice 2.3 immutable build facts are reused from introducing commit
+`bfb697404551a28217af8906024506095bcd9559` and revision
+`6d0efda7210983021ab3c9efe8a0a3190e9eb81b`, as retained at the frozen source.
+Core's resolver and new CLI/Fastly owner build scripts validate
+`TRUSTED_SERVER__RELEASE_BUILD=1` and the full lowercase source SHA.
+Cargo supplies the owning target/package; features supply the variant. Tags and
+run IDs stay external. CLI now labels package/source/target/variant; Fastly queues
+the same immutable facts through existing startup diagnostics. The source audit
+permits exactly this release control, GIT_VERSION and Cargo-owned BUILD_TARGET,
+not deployment values. CLI source-resource cleanup remains deferred.
+
+Axum binding is runtime-only: `EDGEZERO__ADAPTER__HOST` defaults to loopback;
+containers can set `0.0.0.0`, with the existing `PORT` override. The smoke uses
+bridge networking and reaches the process through a published host port.
+TLS termination, graceful shutdown and request/resource limits remain follow-up.
+
+Publication requires `RELEASE_PUBLICATION_ENABLED=true` only after maintainers
+confirm immutable releases and the v\* tag ruleset. There is no settings token or
+prepublication settings API call, following the reviewed signing boundary;
+postpublication immutable=true readback fails loudly. Hyphenated tags are
+prereleases and never Latest. Stable tags are normal releases. Eligibility of
+rc-branch tags is an unresolved maintainer decision; Phase 1 does not implement
+the destination branch-ancestry/ruleset validator or authorize rc tags.
 
 The phase labels on requirement headings below apply only to the reduced Phase 1 subset described above; all additional clauses and requirements marked Phase 2+ remain deferred. The original assurance profiles, custom verifier, retained evidence graph and reproduction gates do not block the first Phase 1 release. The [implementation plan](../plans/2026-10-13-attested-release-implementation.md#phasing--2026-10-22) contains the acceptance mapping and exhaustive slice inventory.
 
@@ -69,7 +109,7 @@ The [machine-readable inventory](binary-attestations-slice-map.json) assigns eve
 | 2.10              | consumer cli                                  |
 | 2.11              | docs and format misc                          |
 
-All PR titles begin `Binary attestations: phase 2.N –`; all branches begin `feature/binary-attestations-phase2-N-`. Stack slices in order except the consumer CLI, which may branch directly from Phase 1. Keep every later slice closed: no signing triggers, production selector or qualification bypass. The source PR remains frozen and open until the user decides it is superseded. Cloudflare, Spin and Axum distribution/qualification follow these slices. Task 14 remains Phase 2.9. Human gates are immutable releases/tag protection and explicit authorization of the first real tag; signing/publication rehearsal `.3` passed at `ca902b6fe`.
+All PR titles begin `Binary attestations: phase 2.N –`; all branches begin `feature/binary-attestations-phase2-N-`. Stack slices in order except the consumer CLI, which may branch directly from Phase 1. Keep every later slice closed: no signing triggers, production selector or qualification bypass. The source PR remains frozen and open until the user decides it is superseded. Cloudflare and Spin distribution, plus full Axum consumer/platform qualification, follow these slices; Phase 1 already distributes the seven binaries described above. Task 14 remains Phase 2.9. Human gates are immutable releases/tag protection and explicit authorization of the first real tag; historical signing/publication evidence is recorded above; the corrective batch needs rehearsal `.6`.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

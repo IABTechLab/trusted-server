@@ -4,7 +4,7 @@
 
 This is the phased rework of [#1262](https://github.com/IABTechLab/trusted-server/pull/1262), frozen at `122b78664b1235c717e9208fd200f9a9b0c335df`. The reviewed contract below is retained as the destination design. This section controls phase applicability; historical statements about first-release gates and PR ownership below refer to the original combined proposal. No new spec approval cycle is introduced by reducing scope.
 
-**Phase 1 closes #1235:** tag-triggered builds of Fastly wasm, three native CLI binaries and three production Axum binaries; SLSA provenance and a shipped, attested SBOM for each binary; draft/upload/publish of an immutable release with `SHA256SUMS`; GitHub CLI verification pinned to the reusable `release-build.yml` signer and predicate; and CI enforcement of configuration independence. Operators deploy the verified release bytes. Reproducibility is not a Phase 1 claim or gate. The source-version and fresh JS mechanisms already on main are reused.
+**Phase 1 contributes to #1235 (D7 settings pending):** tag-triggered builds of Fastly wasm, three native CLI binaries and three production Axum binaries; SLSA provenance and a shipped, attested SBOM for each binary; draft/upload/publish of an immutable release with `SHA256SUMS`; GitHub CLI verification pinned to the reusable `release-build.yml` signer and predicate; and CI enforcement of configuration independence. Operators deploy the verified release bytes. Reproducibility is not a Phase 1 claim or gate. The source-version and fresh JS mechanisms already on main are reused.
 
 The phase boundaries follow [aram356's round-1 architecture review](https://github.com/IABTechLab/trusted-server/pull/1262#pullrequestreview-5484754857):
 
@@ -33,7 +33,7 @@ and [CLI version output](https://github.com/IABTechLab/trusted-server/blob/f9281
 
 - Rust is pinned to **1.98.1**. The tracked `Cargo.toml`, `Cargo.lock`,
   `.cargo/config.toml`, tool pins, source tree and release profile remain inputs.
-- The two workspace build scripts are core's `build.rs` and JS's `build.rs`.
+- Workspace build scripts include core and JS plus the new CLI and Fastly owner `build.rs` files.
   Core also reads `build_support/git_version.rs`, its source tree, the root
   manifest/lockfile and tracked `edgezero.toml`. The latter supplies the logical
   `trusted_server_config` store ID, not a physical deployment binding.
@@ -65,7 +65,7 @@ with independently obtained roots and source pins. Offline success is build
 proof, not current official membership or deployment authorization.
 
 For #161, release Fastly `x-ts-version` is the full 40-character source commit;
-`ts --version` currently exposes the command name `ts` and Cargo package version. The executable
+`ts --version` labels package version, source commit, target and variant. The executable
 digest is verified externally; exposing it at runtime remains with #161.
 The [verification guide](../../guide/release-verification.md) records these facts
 and the maintainer settings gates. Local Viceroy execution proves a local route,
@@ -83,6 +83,46 @@ forms; see the [compatibility audit](../plans/binary-attestations-phase1-compati
 and slice-map annotations. Rehearsal `.5` passed for the seven-binary implementation at
 `937214a632f9387601dba94f996de78b2e6ee424`; the compatibility audit records the complete evidence.
 Rehearsal `.4` remains historical evidence for the original four assets only.
+
+### Phase 1 review notes — rehearsal .6 pending
+
+Phase 1 is **part of #1235**, pending D7 maintainer settings. These notes supersede
+historical phase applicability, not the retained destination requirements.
+Goals, Non-goals, R-COHORT and R-BOUNDS refer to the original four-artifact design;
+this slice explicitly includes seven binaries / 29 files, including Axum and
+Linux ARM64. Its original four public names stay unchanged; no v1 index is emitted.
+The Node producer helpers and inline publisher are interim exceptions to the
+retained Rust-producer constraint, replaced by slices 2.5 (recipes/inspection),
+2.6 (composition/SPDX) and 2.8 (publication). The frozen Status and tool versions
+below describe #1262, not current Phase 1 implementation status.
+
+Current tool pins: Rust 1.98.1, Node 24.20.0, Fastly CLI 16.0.0, Viceroy 0.21.0;
+verification uses GitHub CLI 2.102.0. The reusable release-build.yml is the signer.
+Rehearsal .5 is historical evidence only; this corrective batch needs .6.
+
+Slice 2.3 immutable build facts are reused from introducing commit
+`bfb697404551a28217af8906024506095bcd9559` and revision
+`6d0efda7210983021ab3c9efe8a0a3190e9eb81b`, as retained at the frozen source.
+Core's resolver and new CLI/Fastly owner build scripts validate
+`TRUSTED_SERVER__RELEASE_BUILD=1` and the full lowercase source SHA.
+Cargo supplies the owning target/package; features supply the variant. Tags and
+run IDs stay external. CLI now labels package/source/target/variant; Fastly queues
+the same immutable facts through existing startup diagnostics. The source audit
+permits exactly this release control, GIT_VERSION and Cargo-owned BUILD_TARGET,
+not deployment values. CLI source-resource cleanup remains deferred.
+
+Axum binding is runtime-only: `EDGEZERO__ADAPTER__HOST` defaults to loopback;
+containers can set `0.0.0.0`, with the existing `PORT` override. The smoke uses
+bridge networking and reaches the process through a published host port.
+TLS termination, graceful shutdown and request/resource limits remain follow-up.
+
+Publication requires `RELEASE_PUBLICATION_ENABLED=true` only after maintainers
+confirm immutable releases and the v\* tag ruleset. There is no settings token or
+prepublication settings API call, following the reviewed signing boundary;
+postpublication immutable=true readback fails loudly. Hyphenated tags are
+prereleases and never Latest. Stable tags are normal releases. Eligibility of
+rc-branch tags is an unresolved maintainer decision; Phase 1 does not implement
+the destination branch-ancestry/ruleset validator or authorize rc tags.
 
 The phase labels on requirement headings below apply only to the reduced Phase 1 subset described above; all additional clauses and requirements marked Phase 2+ remain deferred. The original assurance profiles, custom verifier, retained evidence graph and reproduction gates do not block the first Phase 1 release. The [implementation plan](../plans/2026-10-13-attested-release-implementation.md#phasing--2026-10-22) contains the acceptance mapping and exhaustive slice inventory.
 
