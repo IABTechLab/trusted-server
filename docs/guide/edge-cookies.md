@@ -24,7 +24,9 @@ normalized client IP and a configured secret, with a short random
 suffix appended. On subsequent requests the value is read from the
 `ts-ec` cookie and reused.
 
-**Format:** `64-hex-hmac`.`6-alphanumeric-suffix`
+**Format:** `hmac~<64-hex-hmac>.<6-alphanumeric-suffix>`. The `hmac~`
+prefix is the module code, and a bare value with no prefix, as a
+browser may already hold, still resolves.
 
 **IP normalization:** IPv4 addresses pass through unchanged. IPv6
 addresses are masked to the /64 prefix before hashing, so a device
