@@ -33,8 +33,9 @@ The musl asset needs no dynamic loader or libraries; Alpine and a scratch-like
 container are required smoke images, while distroless-static is another deployment option
 without a separate Phase 1 runtime test. All acquired smoke images are digest-pinned; build logs record their image IDs. These required startup checks do not establish complete platform/tool qualification.
 Axum defaults to `127.0.0.1:8787`. Set runtime `EDGEZERO__ADAPTER__HOST=0.0.0.0`
-and `PORT=8080` for containers and publish that port. Invalid explicit values
-fail startup. This runtime setting is never compiled into the executable.
+and `EDGEZERO__ADAPTER__PORT=8080` for containers and publish that port. `PORT`
+is a compatible alias. When both are set, they must agree; both values are
+validated and any invalid explicit value fails startup. This runtime setting is never compiled into the executable.
 The smoke reaches a bridge-networked container through a host-published port;
 loopback-only binding cannot pass it. TLS termination, graceful shutdown and
 request/resource limits remain follow-up production hardening.
@@ -44,10 +45,12 @@ request initialization. Every Axum smoke mounts the runner's system CA
 bundle read-only at `/ca.pem` with `SSL_CERT_FILE=/ca.pem`; production operators
 must supply their own runtime trust store. This is runtime data, not an embedded
 configuration or dynamically linked library.
-The seven-binary implementation passed hosted CI and [rehearsal `.5`](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6357357438)
+The historical seven-binary implementation passed hosted CI and [rehearsal `.5`](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6357357438)
 at `937214a632f9387601dba94f996de78b2e6ee424`; `.4` proves only the original four binaries. Native
 libraries and provider tools needed by individual `ts` commands retain their
 existing prerequisites. Cloudflare, Spin, Windows and Linux ARM64 CLI releases follow separately.
+
+Rehearsal `.6` at `39a769c3e3d6476395fa7a215bd0a5e74a760f3e` failed after immutable publication at the release-attestation lookup. [Independent verification](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6360012578) passed for all seven binaries / 29 assets, online and offline checks, SPDX equality and the manual Fastly pack/validate/inspect/cmp route; this does not turn the failed workflow green. This corrective batch requires a fresh `.7` rehearsal.
 
 Each `<binary>.spdx.json` is a **conservative build dependency inventory** of
 the selected Cargo target and the installed npm build tree used for that build.
@@ -93,6 +96,8 @@ ASSETS=(trusted-server-fastly.wasm ts-x86_64-unknown-linux-gnu \
 
 gh release download "$TAG" --repo "$REPO" --dir .
 test "$(gh api "repos/$REPO/releases/tags/$TAG" --jq '.immutable')" = true
+gh api "repos/$REPO/attestations/sha1:$COMMIT?per_page=100&predicate_type=release" \
+  --jq '[.attestations[] | {initiator}]'
 gh release verify "$TAG" --repo "$REPO"
 for asset in "${ASSETS[@]}"; do
   for suffix in '' .spdx.json .provenance.sigstore.json .sbom.sigstore.json; do
@@ -255,10 +260,11 @@ For example, after verifying the x86-64 GNU asset and supplying those variables:
 
 ```bash
 chmod u+x ./trusted-server-axum-x86_64-unknown-linux-gnu
-PORT=8080 ./trusted-server-axum-x86_64-unknown-linux-gnu
+EDGEZERO__ADAPTER__PORT=8080 ./trusted-server-axum-x86_64-unknown-linux-gnu
 ```
 
-`PORT` binds Axum to loopback (`127.0.0.1`); use your reviewed reverse proxy and
+With `EDGEZERO__ADAPTER__HOST` unset, either port setting retains loopback
+(`127.0.0.1`); use your reviewed reverse proxy and
 TLS configuration for public traffic. Axum has no help/version or dry-run mode.
 Its build smoke starts an isolated server with a fictional external config
 envelope and requires `/health` to return `200` and `ok`, distinguishing a
@@ -379,7 +385,7 @@ inputs.
 
 Before publication, a maintainer must enable immutable releases, protect `v*`
 tags and approve tag-push authority and required checks. Immutability remains a
-human precondition. Set repository variable `RELEASE_PUBLICATION_ENABLED=true` only after confirming those settings with the read-only commands below. Without it, publication is skipped. There is no repository-administration token or prepublication settings API call, following the reviewed decision to check the published release instead. A
+human precondition. Set repository variable `RELEASE_PUBLICATION_ENABLED=true` only after confirming those settings with the read-only commands below. Without it, both signing and publication are skipped; an early tag push creates no public attestations. There is no repository-administration token or prepublication settings API call, following the reviewed decision to check the published release instead. A
 violation can expose a mutable release before the workflow reports failure.
 
 Tags containing `-` publish as prereleases with Latest disabled; stable tags publish as normal releases. Whether to authorize tags from rc branches is a maintainer decision; the Phase 2 ancestry/ruleset validator is not implemented here.
@@ -393,7 +399,7 @@ and the reviewed publication owner remain additive later work. There are no
 automatic mutation retries or draft-resume claims.
 
 Only post-publish reads may retry: release/asset metadata GETs and the GitHub
-CLI release/asset verification calls. Each check has at most three attempts,
+CLI asset verification calls. Each check has at most three attempts,
 with 2s then 5s backoff. A supplied `Retry-After` can increase a delay, capped
 at 10s (at most 20s waiting per check). A shared three-minute window bounds
 retry scheduling across the job, and individual read requests/commands time out
@@ -406,6 +412,10 @@ ambiguous failures stop. Successful responses with wrong identity, immutability,
 membership or digests, and definitive verification failures stop immediately.
 Release listing before creation and every create/upload/publish mutation remain
 single-shot.
+
+Before cryptographic release verification, a separate availability check makes at most three release-attestation GETs, with 2s then 5s backoff: at most 7s total waiting, inside the same three-minute scheduling window. Only HTTP 200 with no current-tag GitHub release attestation may wait. Any other status, malformed record, duplicate current-tag record, identity/source/asset mismatch or cryptographic verification failure stops immediately. Well-formed other-tag records on the same commit are ignored only after their exact bundles verify; logs name only the ignored tags. They never satisfy the current-tag check. Each GET/verification command has a 10s timeout; no mutation is retried.
+
+If the availability check exhausts its bound, the release is already published and immutable (verified before availability polling). Keep the tag and release unchanged and use the read-only recovery commands below.
 
 If these retries are exhausted, the release has already been published; a
 failure does not undo publication or establish that immutability was verified.
@@ -420,6 +430,8 @@ gh api "repos/$REPO/releases/$RELEASE_ID" \
   --jq '{id, tag_name, draft, immutable, assets: [.assets[] | {name, size, digest}]}'
 test "$(gh api "repos/$REPO/releases/tags/$TAG" --jq '.id')" = "$RELEASE_ID"
 test "$(gh api "repos/$REPO/releases/$RELEASE_ID" --jq '.immutable')" = true
+gh api "repos/$REPO/attestations/sha1:$COMMIT?per_page=100&predicate_type=release" \
+  --jq '[.attestations[] | select(.initiator == "github") | .bundle.dsseEnvelope.payload | @base64d | fromjson | .predicate.tag]'
 gh release verify "$TAG" --repo "$REPO"
 for asset in "${ASSETS[@]}"; do
   for suffix in '' .spdx.json .provenance.sigstore.json .sbom.sigstore.json; do
@@ -492,10 +504,11 @@ The reusable caller declares the maximum signing permissions required by its
 called workflow. GitHub does not allow a read-only caller to invoke a nested
 workflow that declares greater permissions, even for conditionally skipped jobs.
 Actual build/check jobs narrow permissions to contents-read; signing remains
-tag-only. Splitting a new build-only workflow is deferred to preserve this slice.
+tag-only and requires the publication enablement variable. Splitting a new build-only workflow is deferred to preserve this slice.
 
 The configuration scanner covers literal/raw/concatenated macros and literal
 build-script deployment prefixes. It is a best-effort source regression audit,
-not Rust expansion or dataflow analysis: computed names, procedural macros and
-third-party build scripts are not completely analyzed. Planted canary scans and
+not Rust expansion or dataflow analysis: `include!`, raw byte strings (`br"…"` /
+`rb"…"`), computed names, procedural macros and third-party build scripts are not
+completely analyzed. Planted canary scans and
 clean inherited environments provide additional checks, not hermeticity.

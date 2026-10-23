@@ -21,7 +21,7 @@ and slice-map annotations. Rehearsal `.5` passed for the seven-binary implementa
 `937214a632f9387601dba94f996de78b2e6ee424`; the compatibility audit records the complete evidence.
 Rehearsal `.4` remains historical evidence for the original four assets only.
 
-### Phase 1 review notes — rehearsal .6 pending
+### Phase 1 review notes — rehearsal .7 pending
 
 Phase 1 is **part of #1235**, pending D7 maintainer settings. These notes supersede
 historical phase applicability, not the retained destination requirements.
@@ -35,7 +35,7 @@ below describe #1262, not current Phase 1 implementation status.
 
 Current tool pins: Rust 1.98.1, Node 24.20.0, Fastly CLI 16.0.0, Viceroy 0.21.0;
 verification uses GitHub CLI 2.102.0. The reusable release-build.yml is the signer.
-Rehearsal .5 is historical evidence only; this corrective batch needs .6.
+Rehearsal `.6` at `39a769c3e3d6476395fa7a215bd0a5e74a760f3e` failed after immutable publication at the release-attestation lookup. [Independent verification](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6360012578) passed for all seven binaries / 29 assets, online and offline checks, SPDX equality and the manual Fastly pack/validate/inspect/cmp route; this does not turn the failed workflow green. This corrective batch requires a fresh `.7` rehearsal.
 
 Slice 2.3 immutable build facts are reused from introducing commit
 `bfb697404551a28217af8906024506095bcd9559` and revision
@@ -44,12 +44,12 @@ Core's resolver and new CLI/Fastly owner build scripts validate
 `TRUSTED_SERVER__RELEASE_BUILD=1` and the full lowercase source SHA.
 Cargo supplies the owning target/package; features supply the variant. Tags and
 run IDs stay external. CLI now labels package/source/target/variant; Fastly queues
-the same immutable facts through existing startup diagnostics. The source audit
+the same immutable facts through existing startup diagnostics in reuse mode only; single mode retains the source response header without per-request build-fact logs. The source audit
 permits exactly this release control, GIT_VERSION and Cargo-owned BUILD_TARGET,
 not deployment values. CLI source-resource cleanup remains deferred.
 
 Axum binding is runtime-only: `EDGEZERO__ADAPTER__HOST` defaults to loopback;
-containers can set `0.0.0.0`, with the existing `PORT` override. The smoke uses
+containers can set `0.0.0.0`, with runtime `EDGEZERO__ADAPTER__PORT` or the compatible `PORT` override. Both values are validated, and conflicting values fail startup. The smoke uses
 bridge networking and reaches the process through a published host port.
 TLS termination, graceful shutdown and request/resource limits remain follow-up.
 

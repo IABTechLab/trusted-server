@@ -1,6 +1,6 @@
 # Phase 1 compatibility audit and approved alignment
 
-**Audit baseline:** reviewed #1262 at `122b78664b1235c717e9208fd200f9a9b0c335df` versus #1435 at `4dd217125c6e38055e4bcb2cba32c0b95e739914`. The table records the audit of those commits. The approved status below supersedes earlier implementation suggestions in the audit; work in progress is not a claim of completed release qualification. The published SBOM format is **SPDX 2.3**. Rehearsal `.5` passed at `937214a632f9387601dba94f996de78b2e6ee424`; the rehearsal history below records earlier outcomes.
+**Audit baseline:** reviewed #1262 at `122b78664b1235c717e9208fd200f9a9b0c335df` versus #1435 at `4dd217125c6e38055e4bcb2cba32c0b95e739914`. The table records the audit of those commits. The approved status below supersedes earlier implementation suggestions in the audit; work in progress is not a claim of completed release qualification. The published SBOM format is **SPDX 2.3**. Historical rehearsal `.5` passed at `937214a632f9387601dba94f996de78b2e6ee424`; the rehearsal history below records earlier outcomes.
 
 **Conclusion:** the original Phase 1 signer path and CycloneDX public format would have required a later breaking policy replacement. Fix those now. Phase 1 is the first implementation slice of the existing contract: retain its public names, signer/caller distinction, SPDX semantics and original policy files. Introduce no competing release-index schema or weakened consumer policy.
 
@@ -11,7 +11,7 @@ Frozen source references below mean:
 - [Cohort](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/scripts/release/release-cohort.json), [tools](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/scripts/release/release-tools.json), [consumer policy](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/crates/trusted-server-cli/release-policy.json).
 - [Index v1 schema](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/docs/superpowers/specs/schemas/release-index-v1.schema.json), [distribution names](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/crates/trusted-server-release/src/distribution.rs#L55), [consumer companion rules](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/crates/trusted-server-cli/src/release/documents.rs#L236), [SPDX joins](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/crates/trusted-server-cli/src/release/evidence/joins.rs#L188).
 
-### Phase 1 review notes — rehearsal .6 pending
+### Phase 1 review notes — rehearsal .7 pending
 
 Phase 1 is **part of #1235**, pending D7 maintainer settings. These notes supersede
 historical phase applicability, not the retained destination requirements.
@@ -25,7 +25,7 @@ below describe #1262, not current Phase 1 implementation status.
 
 Current tool pins: Rust 1.98.1, Node 24.20.0, Fastly CLI 16.0.0, Viceroy 0.21.0;
 verification uses GitHub CLI 2.102.0. The reusable release-build.yml is the signer.
-Rehearsal .5 is historical evidence only; this corrective batch needs .6.
+Rehearsal `.6` at `39a769c3e3d6476395fa7a215bd0a5e74a760f3e` failed after immutable publication at the release-attestation lookup. [Independent verification](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6360012578) passed for all seven binaries / 29 assets, online and offline checks, SPDX equality and the manual Fastly pack/validate/inspect/cmp route; this does not turn the failed workflow green. This corrective batch requires a fresh `.7` rehearsal.
 
 Slice 2.3 immutable build facts are reused from introducing commit
 `bfb697404551a28217af8906024506095bcd9559` and revision
@@ -34,12 +34,12 @@ Core's resolver and new CLI/Fastly owner build scripts validate
 `TRUSTED_SERVER__RELEASE_BUILD=1` and the full lowercase source SHA.
 Cargo supplies the owning target/package; features supply the variant. Tags and
 run IDs stay external. CLI now labels package/source/target/variant; Fastly queues
-the same immutable facts through existing startup diagnostics. The source audit
+the same immutable facts through existing startup diagnostics in reuse mode only; single mode retains the source response header without per-request build-fact logs. The source audit
 permits exactly this release control, GIT_VERSION and Cargo-owned BUILD_TARGET,
 not deployment values. CLI source-resource cleanup remains deferred.
 
 Axum binding is runtime-only: `EDGEZERO__ADAPTER__HOST` defaults to loopback;
-containers can set `0.0.0.0`, with the existing `PORT` override. The smoke uses
+containers can set `0.0.0.0`, with runtime `EDGEZERO__ADAPTER__PORT` or the compatible `PORT` override. Both values are validated, and conflicting values fail startup. The smoke uses
 bridge networking and reaches the process through a published host port.
 TLS termination, graceful shutdown and request/resource limits remain follow-up.
 
@@ -276,10 +276,17 @@ The reusable caller declares the maximum signing permissions required by its
 called workflow. GitHub does not allow a read-only caller to invoke a nested
 workflow that declares greater permissions, even for conditionally skipped jobs.
 Actual build/check jobs narrow permissions to contents-read; signing remains
-tag-only. Splitting a new build-only workflow is deferred to preserve this slice.
+tag-only and requires the publication enablement variable. Splitting a new build-only workflow is deferred to preserve this slice.
 
 The configuration scanner covers literal/raw/concatenated macros and literal
 build-script deployment prefixes. It is a best-effort source regression audit,
-not Rust expansion or dataflow analysis: computed names, procedural macros and
-third-party build scripts are not completely analyzed. Planted canary scans and
+not Rust expansion or dataflow analysis: `include!`, raw byte strings (`br"…"` /
+`rb"…"`), computed names, procedural macros and third-party build scripts are not
+completely analyzed. Planted canary scans and
 clean inherited environments provide additional checks, not hermeticity.
+
+### Rehearsal .6 outcome
+
+Rehearsal `.6` at `39a769c3e3d6476395fa7a215bd0a5e74a760f3e` failed after immutable publication at the release-attestation lookup. [Independent verification](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6360012578) passed for all seven binaries / 29 assets, online and offline checks, SPDX equality and the manual Fastly pack/validate/inspect/cmp route; this does not turn the failed workflow green. This corrective batch requires a fresh `.7` rehearsal.
+
+The failed publisher check ran at 07:19:53.744 UTC; the independently verified release attestation has a trusted timestamp of 07:19:58 UTC. The pinned CLI hides underlying lookup errors, so the original HTTP status is unknown. The immutable prerelease and its 29 assets remain unchanged. The new availability check waits only for an HTTP 200 result without a current-tag GitHub release attestation: three checks, 2s then 5s, at most 7s total waiting within the existing scheduling window. Other-tag records on the same commit must be well-formed and their exact bundles cryptographically verified before ignoring them; their tag names alone are logged. Current-tag duplicates or identity/source/asset mismatches and every verification failure stop immediately.
