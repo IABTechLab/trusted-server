@@ -109,7 +109,7 @@ fn main() {
 
     // Held outside the sandbox: `serve_custom` owns the `Sandbox` and exposes
     // no slot for application state that is not the retained payload.
-    let mut startup = startup_diagnostics(diagnostics);
+    let mut startup = startup_diagnostics(mode, diagnostics);
 
     match mode {
         ServeMode::Single => {
@@ -125,15 +125,17 @@ fn main() {
     }
 }
 
-fn startup_diagnostics(diagnostics: Vec<String>) -> StartupDiagnostics {
+fn startup_diagnostics(mode: ServeMode, diagnostics: Vec<String>) -> StartupDiagnostics {
     let mut startup = StartupDiagnostics::default();
-    startup.push(format!(
-        "Build facts: package={} source={} target={} variant={}",
-        BUILD_INFO.package_version(),
-        BUILD_INFO.source().unwrap_or("unknown"),
-        BUILD_INFO.target(),
-        BUILD_INFO.variant()
-    ));
+    if matches!(mode, ServeMode::Reuse(_)) {
+        startup.push(format!(
+            "Build facts: package={} source={} target={} variant={}",
+            BUILD_INFO.package_version(),
+            BUILD_INFO.source().unwrap_or("unknown"),
+            BUILD_INFO.target(),
+            BUILD_INFO.variant()
+        ));
+    }
     for message in diagnostics {
         startup.push(message);
     }
@@ -966,18 +968,37 @@ mod tests {
     }
 
     #[test]
-    fn startup_queues_one_build_fact_message_for_existing_log_flush() {
-        let startup = startup_diagnostics(Vec::new());
+    fn single_mode_does_not_queue_build_facts() {
+        let startup = startup_diagnostics(ServeMode::Single, Vec::new());
+        assert_eq!(
+            startup.pending(),
+            0,
+            "should omit build facts in single mode"
+        );
+        let startup = startup_diagnostics(ServeMode::Single, vec!["example diagnostic".to_owned()]);
         assert_eq!(
             startup.pending(),
             1,
-            "should queue exactly one build fact message"
+            "should preserve existing startup diagnostics"
         );
-        let startup = startup_diagnostics(vec!["example diagnostic".to_owned()]);
+    }
+
+    #[test]
+    fn reuse_mode_retains_one_build_fact_message() {
+        let limits = crate::sandbox::SandboxLimits {
+            max_requests: 2,
+            max_memory_mib: 128,
+            max_lifetime: std::time::Duration::from_secs(60),
+            timeout: std::time::Duration::from_secs(1),
+        };
+        let startup = startup_diagnostics(
+            ServeMode::Reuse(limits),
+            vec!["example diagnostic".to_owned()],
+        );
         assert_eq!(
             startup.pending(),
             2,
-            "should preserve existing startup diagnostics"
+            "should retain build facts and supplied diagnostics in reuse mode"
         );
     }
 
