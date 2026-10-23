@@ -45,12 +45,12 @@ request initialization. Every Axum smoke mounts the runner's system CA
 bundle read-only at `/ca.pem` with `SSL_CERT_FILE=/ca.pem`; production operators
 must supply their own runtime trust store. This is runtime data, not an embedded
 configuration or dynamically linked library.
-The historical seven-binary implementation passed hosted CI and [rehearsal `.5`](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6357357438)
-at `937214a632f9387601dba94f996de78b2e6ee424`; `.4` proves only the original four binaries. Native
+The seven-binary implementation passed hosted CI and [rehearsal `.8`](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6362236955)
+at `7a05940e2f7b10c459bdd2d3949f265b755ce42c`; `.4` and `.5` remain historical evidence. Native
 libraries and provider tools needed by individual `ts` commands retain their
 existing prerequisites. Cloudflare, Spin, Windows and Linux ARM64 CLI releases follow separately.
 
-Rehearsal `.6` at `39a769c3e3d6476395fa7a215bd0a5e74a760f3e` failed after immutable publication at the release-attestation lookup. [Independent verification](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6360012578) passed for all seven binaries / 29 assets, online and offline checks, SPDX equality and the manual Fastly pack/validate/inspect/cmp route; this does not turn the failed workflow green. This corrective batch requires a fresh `.7` rehearsal.
+[Rehearsal `.8`](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6362236955) passed at exact implementation SHA `7a05940e2f7b10c459bdd2d3949f265b755ce42c`. Subsequent review-head updates are **docs-only since rehearsed `7a05940e2`**. Rehearsal `.6` at `39a769c3e` failed after immutable publication despite successful independent verification; `.7` at `7a05940e2` was cancelled before signing/publication because GitHub could not assign a macOS ARM runner. The compatibility audit retains those failed outcomes.
 
 Each `<binary>.spdx.json` is a **conservative build dependency inventory** of
 the selected Cargo target and the installed npm build tree used for that build.
@@ -331,15 +331,15 @@ EdgeZero prepared-payload deployment and operation recovery are later phases.
 
 ### Local runtime evidence
 
-The [rehearsal runtime transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6357352104)
+The [rehearsal runtime transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6362236955)
 records local execution of the verified Fastly wasm at
-`937214a632f9387601dba94f996de78b2e6ee424` using pinned Viceroy 0.21.0.
+`7a05940e2f7b10c459bdd2d3949f265b755ce42c` using pinned Viceroy 0.21.0.
 It uses the example configuration with loopback publisher/origin values,
 public development secrets and a local Node origin fixture. A real page request
 returned HTTP 200, the fixture marker, injected JS and the full source SHA in
 `x-ts-version`. Both the wasm and the CLI used to seed local config were verified
 before execution. No Fastly service was deployed. This proves the local prebuilt
-execution route; provider submission and production operation remain separate.
+execution route; default single mode also emitted no Build facts log. Provider submission and production operation remain separate.
 
 ## Build inputs, policy and release administration
 

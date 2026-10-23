@@ -11,7 +11,7 @@ Frozen source references below mean:
 - [Cohort](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/scripts/release/release-cohort.json), [tools](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/scripts/release/release-tools.json), [consumer policy](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/crates/trusted-server-cli/release-policy.json).
 - [Index v1 schema](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/docs/superpowers/specs/schemas/release-index-v1.schema.json), [distribution names](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/crates/trusted-server-release/src/distribution.rs#L55), [consumer companion rules](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/crates/trusted-server-cli/src/release/documents.rs#L236), [SPDX joins](https://github.com/IABTechLab/trusted-server/blob/122b78664b1235c717e9208fd200f9a9b0c335df/crates/trusted-server-cli/src/release/evidence/joins.rs#L188).
 
-### Phase 1 review notes — rehearsal .7 pending
+### Phase 1 review notes — rehearsal .8 passed
 
 Phase 1 is **part of #1235**, pending D7 maintainer settings. These notes supersede
 historical phase applicability, not the retained destination requirements.
@@ -25,7 +25,7 @@ below describe #1262, not current Phase 1 implementation status.
 
 Current tool pins: Rust 1.98.1, Node 24.20.0, Fastly CLI 16.0.0, Viceroy 0.21.0;
 verification uses GitHub CLI 2.102.0. The reusable release-build.yml is the signer.
-Rehearsal `.6` at `39a769c3e3d6476395fa7a215bd0a5e74a760f3e` failed after immutable publication at the release-attestation lookup. [Independent verification](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6360012578) passed for all seven binaries / 29 assets, online and offline checks, SPDX equality and the manual Fastly pack/validate/inspect/cmp route; this does not turn the failed workflow green. This corrective batch requires a fresh `.7` rehearsal.
+[Rehearsal `.8`](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6362236955) passed at exact implementation SHA `7a05940e2f7b10c459bdd2d3949f265b755ce42c`. Subsequent review-head updates are **docs-only since rehearsed `7a05940e2`**. Rehearsal `.6` at `39a769c3e` failed after immutable publication despite successful independent verification; `.7` at `7a05940e2` was cancelled before signing/publication because GitHub could not assign a macOS ARM runner. The compatibility audit retains those failed outcomes.
 
 Slice 2.3 immutable build facts are reused from introducing commit
 `bfb697404551a28217af8906024506095bcd9559` and revision
@@ -58,8 +58,8 @@ unchanged; the phasing sections describe this slice and its rehearsal outcome. T
 Phase 1 audit baseline is `4dd217125c6e38055e4bcb2cba32c0b95e739914`; the
 following corrections are implemented in this slice, with verification and
 rehearsal tracked in the PR description at its current commit. Signing and
-immutable publication rehearsal `.5` passed at `937214a632f9387601dba94f996de78b2e6ee424`; see the
-[full verification transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6357357438).
+immutable publication rehearsal `.8` passed at `7a05940e2f7b10c459bdd2d3949f265b755ce42c`; see the
+[full verification transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6362236955).
 
 The current correction aligns the local input-free `release-build.yml` signer
 with the `release.yml` caller/publisher, real SPDX 2.3 documents, fourteen
@@ -160,8 +160,8 @@ qualified evidence.
 This implementation extends the frozen cohort from four
 to **seven binaries / 29 release files**, retaining all four original names.
 Rehearsal `.4` at `922c2211c` proves only the original four-binary/17-file
-implementation. Rehearsal `.5` passed for the seven-binary implementation at
-`937214a632f9387601dba94f996de78b2e6ee424`; the `.4` evidence is not reused for the expanded cohort.
+implementation. Rehearsal `.8` passed for the seven-binary implementation at
+`7a05940e2f7b10c459bdd2d3949f265b755ce42c`; the `.4` evidence is not reused for the expanded cohort.
 
 The exact cohort diff is three appended records, all default features, empty
 extra features, `variant: default`, `assurance_profile: provenance-sbom`,
@@ -263,12 +263,17 @@ valid.
   [offline proof](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6357351810) and
   [build/local runtime proof](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6357352104).
 
-The exact rehearsed implementation SHA above is retained even when later
-commits change documentation only. This documentation update does not change
-workflows, scripts, tests or release bytes.
+- `v0.0.0-rehearsal.6` at `39a769c3e3d6476395fa7a215bd0a5e74a760f3e`: failed after immutable prerelease publication at the release-attestation lookup. Independent verification passed all 29 assets, online/offline predicates and signer pins, SPDX equality and the manual Fastly route. [Failure and independent proof](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6360012578).
 
-The immutable `.2`, `.3`, `.4` and `.5` releases remain intact; no drafts remain from
-these rehearsals. No upstream tags, releases or repository settings were changed.
+- `v0.0.0-rehearsal.7` at `7a05940e2f7b10c459bdd2d3949f265b755ce42c`: cancelled after the macOS ARM job could not acquire a hosted runner. The remaining build was cancelled; signing/publication executed no steps and no release was created. Its lightweight tag remains unchanged. [Failure record](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6361386927).
+
+- `v0.0.0-rehearsal.8` at `7a05940e2f7b10c459bdd2d3949f265b755ce42c`: all seven builds/signing jobs, immutable prerelease publication and complete independent online/offline/runtime verification passed. All 29 assets, 28 checksum entries, both predicates and signer forms, online store lookup without bundles, SPDX equality and the pinned Fastly pack/validate/inspect/cmp route passed. [Full transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6362236955).
+
+The latest rehearsed implementation is `7a05940e2f7b10c459bdd2d3949f265b755ce42c` from `.8`.
+This review-head update is docs-only since rehearsed `7a05940e2`; workflows,
+scripts, tests and release bytes retain the rehearsed implementation.
+
+The immutable `.2`, `.3`, `.4`, `.5`, `.6` and `.8` releases remain intact; no drafts remain. The `.7` tag has no release. No upstream tags, releases or repository settings were changed.
 
 ### Phase 1 review boundary notes
 
@@ -287,6 +292,6 @@ clean inherited environments provide additional checks, not hermeticity.
 
 ### Rehearsal .6 outcome
 
-Rehearsal `.6` at `39a769c3e3d6476395fa7a215bd0a5e74a760f3e` failed after immutable publication at the release-attestation lookup. [Independent verification](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6360012578) passed for all seven binaries / 29 assets, online and offline checks, SPDX equality and the manual Fastly pack/validate/inspect/cmp route; this does not turn the failed workflow green. This corrective batch requires a fresh `.7` rehearsal.
+Rehearsal `.6` at `39a769c3e3d6476395fa7a215bd0a5e74a760f3e` failed after immutable publication at the release-attestation lookup. [Independent verification](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6360012578) passed for all seven binaries / 29 assets, online and offline checks, SPDX equality and the manual Fastly pack/validate/inspect/cmp route; this does not turn the failed workflow green. Fresh `.8` subsequently passed at `7a05940e2f7b10c459bdd2d3949f265b755ce42c`; see the [full transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6362236955).
 
 The failed publisher check ran at 07:19:53.744 UTC; the independently verified release attestation has a trusted timestamp of 07:19:58 UTC. The pinned CLI hides underlying lookup errors, so the original HTTP status is unknown. The immutable prerelease and its 29 assets remain unchanged. The new availability check waits only for an HTTP 200 result without a current-tag GitHub release attestation: three checks, 2s then 5s, at most 7s total waiting within the existing scheduling window. Other-tag records on the same commit must be well-formed and their exact bundles cryptographically verified before ignoring them; their tag names alone are logged. Current-tag duplicates or identity/source/asset mismatches and every verification failure stop immediately.

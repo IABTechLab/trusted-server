@@ -80,11 +80,11 @@ The cohort records this explicit extension, but tools/policy and the frozen v1
 index schema remain unchanged. Phase 1 emits no index. The later index/consumer
 slices need a reviewed seven-artifact amendment, including new target/capability
 forms; see the [compatibility audit](../plans/binary-attestations-phase1-compatibility.md)
-and slice-map annotations. Rehearsal `.5` passed for the seven-binary implementation at
-`937214a632f9387601dba94f996de78b2e6ee424`; the compatibility audit records the complete evidence.
+and slice-map annotations. Rehearsal `.8` passed for the seven-binary implementation at
+`7a05940e2f7b10c459bdd2d3949f265b755ce42c`; the compatibility audit records the complete evidence.
 Rehearsal `.4` remains historical evidence for the original four assets only.
 
-### Phase 1 review notes — rehearsal .7 pending
+### Phase 1 review notes — rehearsal .8 passed
 
 Phase 1 is **part of #1235**, pending D7 maintainer settings. These notes supersede
 historical phase applicability, not the retained destination requirements.
@@ -98,7 +98,7 @@ below describe #1262, not current Phase 1 implementation status.
 
 Current tool pins: Rust 1.98.1, Node 24.20.0, Fastly CLI 16.0.0, Viceroy 0.21.0;
 verification uses GitHub CLI 2.102.0. The reusable release-build.yml is the signer.
-Rehearsal `.6` at `39a769c3e3d6476395fa7a215bd0a5e74a760f3e` failed after immutable publication at the release-attestation lookup. [Independent verification](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6360012578) passed for all seven binaries / 29 assets, online and offline checks, SPDX equality and the manual Fastly pack/validate/inspect/cmp route; this does not turn the failed workflow green. This corrective batch requires a fresh `.7` rehearsal.
+[Rehearsal `.8`](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6362236955) passed at exact implementation SHA `7a05940e2f7b10c459bdd2d3949f265b755ce42c`. Subsequent review-head updates are **docs-only since rehearsed `7a05940e2`**. Rehearsal `.6` at `39a769c3e` failed after immutable publication despite successful independent verification; `.7` at `7a05940e2` was cancelled before signing/publication because GitHub could not assign a macOS ARM runner. The compatibility audit retains those failed outcomes.
 
 Slice 2.3 immutable build facts are reused from introducing commit
 `bfb697404551a28217af8906024506095bcd9559` and revision

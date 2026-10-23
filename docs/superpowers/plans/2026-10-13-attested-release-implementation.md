@@ -4,7 +4,7 @@
 
 This is the phased rework of [#1262](https://github.com/IABTechLab/trusted-server/pull/1262), frozen at `122b78664b1235c717e9208fd200f9a9b0c335df`. The reviewed contract below is retained as the destination design. This section controls phase applicability; historical statements about first-release gates and PR ownership below refer to the original combined proposal. No new spec approval cycle is introduced by reducing scope.
 
-**Phase 1 contributes to #1235 (D7 settings pending):** tag-triggered builds of Fastly wasm, three native CLI binaries and three production Axum binaries; SLSA provenance and a shipped, attested SBOM for each binary; draft/upload/publish of an immutable release with `SHA256SUMS`; GitHub CLI verification pinned to the release workflow and predicate; and CI enforcement of configuration independence. Operators deploy the verified release bytes. Reproducibility is not a Phase 1 claim or gate. The source-version and fresh JS mechanisms already on main are reused.
+**Phase 1 contributes to #1235 (D7 settings pending):** tag-triggered builds of Fastly wasm, three native CLI binaries and three production Axum binaries; SLSA provenance and a shipped, attested SBOM for each binary; draft/upload/publish of an immutable release with `SHA256SUMS`; GitHub CLI verification pinned to the reusable `release-build.yml` signer and predicate; and CI enforcement of configuration independence. Operators deploy the verified release bytes. Reproducibility is not a Phase 1 claim or gate. The source-version and fresh JS mechanisms already on main are reused.
 
 Phase 1 publishes SPDX 2.3 for a conservative selected-Cargo-target and installed-npm-build-tree inventory, with the final binary hash. CycloneDX is only an intermediate generator format. Complete composition qualification below remains Phase 2+; Phase 1 does not claim exact retained-code or native-source closure.
 
@@ -17,11 +17,11 @@ The cohort records this explicit extension, but tools/policy and the frozen v1
 index schema remain unchanged. Phase 1 emits no index. The later index/consumer
 slices need a reviewed seven-artifact amendment, including new target/capability
 forms; see the [compatibility audit](binary-attestations-phase1-compatibility.md)
-and slice-map annotations. Rehearsal `.5` passed for the seven-binary implementation at
-`937214a632f9387601dba94f996de78b2e6ee424`; the compatibility audit records the complete evidence.
+and slice-map annotations. Rehearsal `.8` passed for the seven-binary implementation at
+`7a05940e2f7b10c459bdd2d3949f265b755ce42c`; the compatibility audit records the complete evidence.
 Rehearsal `.4` remains historical evidence for the original four assets only.
 
-### Phase 1 review notes — rehearsal .7 pending
+### Phase 1 review notes — rehearsal .8 passed
 
 Phase 1 is **part of #1235**, pending D7 maintainer settings. These notes supersede
 historical phase applicability, not the retained destination requirements.
@@ -35,7 +35,7 @@ below describe #1262, not current Phase 1 implementation status.
 
 Current tool pins: Rust 1.98.1, Node 24.20.0, Fastly CLI 16.0.0, Viceroy 0.21.0;
 verification uses GitHub CLI 2.102.0. The reusable release-build.yml is the signer.
-Rehearsal `.6` at `39a769c3e3d6476395fa7a215bd0a5e74a760f3e` failed after immutable publication at the release-attestation lookup. [Independent verification](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6360012578) passed for all seven binaries / 29 assets, online and offline checks, SPDX equality and the manual Fastly pack/validate/inspect/cmp route; this does not turn the failed workflow green. This corrective batch requires a fresh `.7` rehearsal.
+[Rehearsal `.8`](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6362236955) passed at exact implementation SHA `7a05940e2f7b10c459bdd2d3949f265b755ce42c`. Subsequent review-head updates are **docs-only since rehearsed `7a05940e2`**. Rehearsal `.6` at `39a769c3e` failed after immutable publication despite successful independent verification; `.7` at `7a05940e2` was cancelled before signing/publication because GitHub could not assign a macOS ARM runner. The compatibility audit retains those failed outcomes.
 
 Slice 2.3 immutable build facts are reused from introducing commit
 `bfb697404551a28217af8906024506095bcd9559` and revision
@@ -63,14 +63,13 @@ the destination branch-ancestry/ruleset validator or authorize rc tags.
 
 The phase labels on requirement headings below apply only to the reduced Phase 1 subset described above; all additional clauses and requirements marked Phase 2+ remain deferred. The original assurance profiles, custom verifier, retained evidence graph and reproduction gates do not block the first Phase 1 release. The [implementation plan](../plans/2026-10-13-attested-release-implementation.md#phasing--2026-10-22) contains the acceptance mapping and exhaustive slice inventory.
 
-Rehearsal `.5` passed at exact implementation SHA
-`937214a632f9387601dba94f996de78b2e6ee424`; see the
-[full online transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6357357438),
-[offline proof](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6357351810)
-and [local runtime proof](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6357352104).
-All seven builds/signing jobs, 29 immutable release assets, 28 checksum entries,
-both predicates/signer checks, seven SPDX comparisons and startup smokes passed.
-Later documentation-only heads retain this exact rehearsed implementation SHA.
+Rehearsal `.8` passed at exact implementation SHA
+`7a05940e2f7b10c459bdd2d3949f265b755ce42c`; see the [full verification/runtime transcript](https://github.com/IABTechLab/trusted-server/pull/1435#issuecomment-6362236955).
+All seven builds/signing jobs, 29 immutable prerelease assets, 28 checksum entries,
+both predicates/signer checks, bundle and online-store checks, networking-denied
+offline verification, SPDX comparisons and startup smokes passed. The pinned
+manual Fastly route packed, validated, inspected and byte-compared the wasm;
+no deployment occurred. Later review heads are docs-only since rehearsed `7a05940e2`.
 
 ### Phase 1 implementation checklist
 
@@ -84,8 +83,8 @@ Later documentation-only heads retain this exact rehearsed implementation SHA.
 | #1235 acceptance item                                 | Phase 1 evidence                                                                 |
 | ----------------------------------------------------- | -------------------------------------------------------------------------------- |
 | Reviewed spec and compile-time input list             | Retained R-CONFIG/R-INPUTS, this phasing section; #1262 review history           |
-| Tag publishes immutable binaries, SBOMs and checksums | release.yml caller/publisher and release-build.yml signer; rehearsal `.5` passed |
-| Provenance, SBOM predicate and asset verification     | release-verification.md; rehearsal `.5` verification passed                      |
+| Tag publishes immutable binaries, SBOMs and checksums | release.yml caller/publisher and release-build.yml signer; rehearsal `.8` passed |
+| Provenance, SBOM predicate and asset verification     | release-verification.md; rehearsal `.8` verification passed                      |
 | Fresh JS; fail missing npm/install/skip               | Existing main build.rs plus clean npm ci and release preflight                   |
 | Deploy exact bytes                                    | Manual verified Fastly package route; no reproducibility claim                   |
 | Immutable setting and protected tags                  | Maintainer gate; no setting changes by this PR                                   |
