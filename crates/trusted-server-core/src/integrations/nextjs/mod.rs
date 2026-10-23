@@ -791,11 +791,11 @@ mod tests {
             let mut processor = create_html_processor(mixed_config(10000, 10000));
             let mut bytes = processor
                 .process_chunk(first.as_bytes(), false)
-                .expect("should release qualified but unbuffered Flight");
+                .expect("should accept a foreign reference before qualified Flight");
             bytes.extend(
                 processor
                     .process_chunk(&continuation.as_bytes()[..split], false)
-                    .expect("should preserve unbuffered continuation"),
+                    .expect("should buffer the qualified continuation"),
             );
             let last = format!("{}</script><script>{push}</script>", &continuation[split..]);
             bytes.extend(

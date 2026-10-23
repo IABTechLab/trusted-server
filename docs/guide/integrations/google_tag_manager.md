@@ -153,14 +153,17 @@ boundaries rather than applying ordinary script substitutions to raw Flight.
 Complete serialized channel-2 form state is preserved without disabling later
 Flight rewrites.
 
-Buffering is bounded and per document. Unsafe or unsupported payloads retain their
-original bytes. An uncaptured channel-1 data head or binary channel-3 push disables
-Flight rewriting for the rest of the document, including restoration of queued
-payloads; already-streamed complete groups cannot be restored. The conservative
-raw-head guard also applies to inert `self.__next_f.push([1,` text in strings,
-comments, or JSON-LD, so pages quoting Flight source may lose later origin/GTM
-rewrites. A warning identifies the first placeholder-stage document fallback
-without including the source text.
+Buffering is bounded and per document. Payloads that cannot be captured or
+rewritten safely keep their original bytes, and some of these cases turn off
+Flight rewriting for the rest of the document: an uncaptured channel-1 data
+head, a binary channel-3 or other unsupported push, or a payload, script, or
+held-output size limit. Queued payloads that have not yet streamed are then
+restored to their original bytes, but complete groups that already streamed
+cannot be restored. The conservative raw-head guard also applies to inert
+`self.__next_f.push([1,` text in strings, comments, or JSON-LD, so pages quoting
+Flight source may lose later origin/GTM rewrites, even with only `nextjs`
+enabled. The first placeholder-stage fallback logs a warning that names the
+reason without including source text.
 
 Flight rewriting operates on supported quoted URL tokens and complete-record
 URLs, including bare origins; it is not limited to script attributes. This can

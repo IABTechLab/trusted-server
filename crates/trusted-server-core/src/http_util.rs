@@ -149,9 +149,9 @@ impl RequestInfo {
     /// 4. `Fastly-SSL`
     /// 5. Default `http`
     ///
-    /// Fastly and Spin strip forwarded headers with [`sanitize_forwarded_headers`]
-    /// before routing. On those paths, `Host` and [`ClientInfo`] TLS detection
-    /// are the effective sources. Other adapters retain their existing policy.
+    /// Fastly and Spin strip [`SPOOFABLE_FORWARDED_HEADERS`] before routing.
+    /// On those paths, `Host` and [`ClientInfo`] TLS detection are the
+    /// effective sources. Other adapters retain their existing policy.
     ///
     /// The selected host must be an ASCII hostname (including underscores for
     /// local service names), IPv4 address, or bracketed IPv6 address, optionally
