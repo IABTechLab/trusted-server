@@ -187,7 +187,6 @@ fn dispatch(args: Args) -> Result<RunOutcome, String> {
 mod tests {
     use std::path::PathBuf;
 
-    use clap::Parser as _;
     use edgezero_cli::args::{AuthSub, ConfigDiffArgs, ConfigPushArgs, ConfigValidateArgs};
 
     use super::*;
