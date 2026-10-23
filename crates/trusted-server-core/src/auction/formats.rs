@@ -30,7 +30,7 @@ use crate::settings::Settings;
 use super::orchestrator::OrchestrationResult;
 use super::types::{
     AdFormat, AdSlot, AuctionRequest, BidRenderer, DeviceInfo, MediaType, OrchestratorExt,
-    ProviderSummary, PublisherInfo, SiteInfo, UserInfo,
+    ProviderSummary, PublisherInfo, SiteInfo, UserInfo, VideoPlacement,
 };
 
 /// Request body for `POST /auction` (tsjs / Prebid.js wire format).
@@ -82,6 +82,41 @@ pub struct BidConfig {
 #[serde(rename_all = "camelCase")]
 pub struct MediaTypes {
     pub banner: Option<BannerUnit>,
+    pub video: Option<VideoUnit>,
+}
+
+/// Instream player input accepted by the direct auction API.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoUnit {
+    /// The supported player context is `instream`.
+    pub context: String,
+    /// One player size, in flat or single-pair form.
+    pub player_size: VideoPlayerSize,
+    /// Only linear video is supported by this API contract.
+    pub linearity: Option<i32>,
+    /// Typed requirements shared with the routed impression.
+    #[serde(flatten)]
+    pub placement: VideoPlacement,
+}
+
+/// Equivalent wire representations of one player size.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum VideoPlayerSize {
+    /// A width and height pair.
+    Flat([u32; 2]),
+    /// A single nested width and height pair.
+    Nested([[u32; 2]; 1]),
+}
+
+impl VideoPlayerSize {
+    fn dimensions(&self) -> [u32; 2] {
+        match self {
+            Self::Flat(size) => *size,
+            Self::Nested([size]) => *size,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -162,8 +197,8 @@ fn publisher_page_url(req: &Request<EdgeBody>, publisher_domain: &str) -> String
 ///
 /// # Errors
 ///
-/// Returns an error if the request contains invalid banner sizes
-/// (must be `[width, height]`).
+/// Returns an error for malformed banner sizes, invalid video player requirements,
+/// duplicate ad-unit codes in a video auction, or video with configured mediation.
 pub fn convert_tsjs_to_auction_request(
     body: &AdRequest,
     settings: &Settings,
@@ -175,13 +210,14 @@ pub fn convert_tsjs_to_auction_request(
 ) -> Result<AuctionRequest, Report<TrustedServerError>> {
     let ec_id = ec_id.map(str::to_owned);
 
-    // Convert ad units to slots
+    // Validate supported media before provider dispatch.
     let mut slots = Vec::new();
     for unit in &body.ad_units {
-        if let Some(media_types) = &unit.media_types
-            && let Some(banner) = &media_types.banner
-        {
-            let mut formats = Vec::new();
+        let Some(media_types) = &unit.media_types else {
+            continue;
+        };
+        let mut formats = Vec::new();
+        if let Some(banner) = &media_types.banner {
             for size in &banner.sizes {
                 ensure!(
                     size.len() == 2,
@@ -189,30 +225,69 @@ pub fn convert_tsjs_to_auction_request(
                         message: "Invalid banner size; expected [width, height]".to_string(),
                     }
                 );
-
                 formats.push(AdFormat {
                     width: size[0],
                     height: size[1],
                     media_type: MediaType::Banner,
                 });
             }
-
-            // Extract bidder params from the bids array
-            let mut bidders = HashMap::new();
-            if let Some(bids) = &unit.bids {
-                for bid in bids {
-                    bidders.insert(bid.bidder.clone(), bid.params.clone());
-                }
-            }
-
-            slots.push(AdSlot {
-                id: unit.code.clone(),
-                formats,
-                floor_price: None,
-                targeting: HashMap::new(),
-                bidders,
-            });
         }
+        let video = if let Some(video) = &media_types.video {
+            let [width, height] = video.player_size.dimensions();
+            ensure!(
+                video.context == "instream"
+                    && video.linearity.is_none_or(|value| value == 1)
+                    && video.placement.is_valid()
+                    && i32::try_from(width).is_ok_and(|value| value > 0)
+                    && i32::try_from(height).is_ok_and(|value| value > 0),
+                TrustedServerError::BadRequest {
+                    message: format!("Invalid instream video parameters for slot '{}'", unit.code),
+                }
+            );
+            ensure!(
+                !settings.auction.has_mediator(),
+                TrustedServerError::BadRequest {
+                    message: "Video auctions require direct provider selection without a mediator"
+                        .to_string(),
+                }
+            );
+            formats.push(AdFormat {
+                width,
+                height,
+                media_type: MediaType::Video,
+            });
+            Some(video.placement.clone())
+        } else {
+            None
+        };
+        if formats.is_empty() && media_types.banner.is_none() {
+            continue;
+        }
+        let bidders = unit
+            .bids
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|bid| (bid.bidder.clone(), bid.params.clone()))
+            .collect();
+        slots.push(AdSlot {
+            id: unit.code.clone(),
+            formats,
+            video,
+            floor_price: None,
+            targeting: HashMap::new(),
+            bidders,
+        });
+    }
+
+    if slots.iter().any(|slot| slot.video.is_some()) {
+        let mut seen = HashSet::new();
+        ensure!(
+            slots.iter().all(|slot| seen.insert(slot.id.as_str())),
+            TrustedServerError::BadRequest {
+                message: "Video auctions require unique ad unit codes".to_string(),
+            }
+        );
     }
 
     // Build device info with user-agent (always) and geo (if available)
@@ -320,7 +395,8 @@ pub(crate) struct OpenRtbResponseConversion {
 /// [`AuctionConfig::rewrite_creatives`], default-on); with both disabled the
 /// creative ships exactly as the bidder returned it, subject to the 1 MiB
 /// per-creative cap. Typed renderers are serialized in the response extension
-/// instead of entering that pipeline at all.
+/// instead of entering that pipeline at all. Video VAST is returned unchanged,
+/// subject to the same size cap, for validation and playback by the caller.
 ///
 /// [`AuctionConfig::sanitize_creatives`]: crate::auction_config_types::AuctionConfig::sanitize_creatives
 /// [`AuctionConfig::rewrite_creatives`]: crate::auction_config_types::AuctionConfig::rewrite_creatives
@@ -382,7 +458,19 @@ pub(crate) fn convert_to_openrtb_response_with_report(
             })
             .to_ext()
         };
-        let (adm, ext) = if let Some(raw_creative) = bid
+        let (adm, ext) = if bid.video.is_some() {
+            let Some(vast) = bid
+                .creative
+                .as_deref()
+                .filter(|value| !value.trim().is_empty() && value.len() <= 1024 * 1024)
+            else {
+                delivery.record_drop("invalid_video_creative");
+                continue;
+            };
+            // The caller's player owns VAST handling. HTML processing would
+            // alter XML, tracking URLs, and CDATA on this transport path.
+            (Some(vast.to_owned()), None)
+        } else if let Some(raw_creative) = bid
             .creative
             .as_deref()
             .filter(|creative| !creative.trim().is_empty())
@@ -466,9 +554,22 @@ pub(crate) fn convert_to_openrtb_response_with_report(
             adm,
             adid: bid.ad_id.clone(),
             crid: bid.creative_id.clone(),
-            w: width,
-            h: height,
+            w: bid.video.as_ref().map_or(width, |video| {
+                video.width.and_then(|value| i32::try_from(value).ok())
+            }),
+            h: bid.video.as_ref().map_or(height, |video| {
+                video.height.and_then(|value| i32::try_from(value).ok())
+            }),
             adomain: bid.adomain.clone().unwrap_or_default(),
+            mtype: Some(if bid.video.is_some() { 2 } else { 1 }),
+            apis: bid
+                .video
+                .as_ref()
+                .map_or_else(Vec::new, |video| video.apis.clone()),
+            protocol: bid.video.as_ref().and_then(|video| video.protocol),
+            dur: bid.video.as_ref().and_then(|video| video.duration),
+            nurl: bid.video.as_ref().and_then(|_| bid.nurl.clone()),
+            burl: bid.video.as_ref().and_then(|_| bid.burl.clone()),
             ext,
             ..Default::default()
         };
@@ -608,6 +709,7 @@ mod tests {
         AuctionRequest {
             id: "auction-1".to_string(),
             slots: vec![AdSlot {
+                video: None,
                 id: "div-gpt-top".to_string(),
                 formats: vec![AdFormat {
                     media_type: MediaType::Banner,
@@ -645,6 +747,7 @@ mod tests {
 
     fn make_bid(slot_id: &str, bidder: &str, price: Option<f64>) -> Bid {
         Bid {
+            video: None,
             slot_id: slot_id.to_string(),
             price,
             currency: "USD".to_string(),
@@ -709,6 +812,7 @@ mod tests {
             ad_units: vec![AdUnit {
                 code: "div-gpt-top".to_string(),
                 media_types: Some(MediaTypes {
+                    video: None,
                     banner: Some(BannerUnit {
                         sizes: vec![vec![300, 250], vec![728, 90]],
                     }),
@@ -769,6 +873,7 @@ mod tests {
             ad_units: vec![AdUnit {
                 code: "stored-slot".to_string(),
                 media_types: Some(MediaTypes {
+                    video: None,
                     banner: Some(BannerUnit {
                         sizes: vec![vec![300, 250]],
                     }),
@@ -965,6 +1070,256 @@ mod tests {
         }
     }
 
+    fn video_wire_value() -> JsonValue {
+        json!({"adUnits": [{"code": "example-video", "mediaTypes": {"video": {
+            "context": "instream", "playerSize": [640, 360], "mimes": ["video/mp4"],
+            "protocols": [7, 8], "minduration": 0, "maxduration": 30, "plcmt": 1
+        }}}]})
+    }
+
+    #[test]
+    fn video_input_accepts_equivalent_player_sizes_and_mixed_inventory() {
+        for size in [json!([640, 360]), json!([[640, 360]])] {
+            let mut value = video_wire_value();
+            value["adUnits"][0]["mediaTypes"]["video"]["playerSize"] = size;
+            value["adUnits"][0]["mediaTypes"]["video"]["mimes"] = json!([
+                "video/mp4",
+                "application/vnd.apple.mpegurl",
+                "application/x-mpegURL",
+                "application/dash+xml"
+            ]);
+            value["adUnits"][0]["mediaTypes"]["banner"] = json!({"sizes": [[300, 250]]});
+            let body = serde_json::from_value(value).expect("should parse supported video input");
+            let request = convert_body_to_auction_request(&body, &make_settings());
+            assert_eq!(
+                request.slots.len(),
+                1,
+                "should retain one mixed-media impression"
+            );
+            assert_eq!(
+                request.slots[0].formats.len(),
+                2,
+                "should retain both media formats"
+            );
+            let video = request.slots[0]
+                .video
+                .as_ref()
+                .expect("should retain video requirements");
+            assert_eq!(
+                video.protocols,
+                vec![7, 8],
+                "should retain requested VAST protocols"
+            );
+            assert_eq!(
+                video.mimes,
+                vec![
+                    "video/mp4",
+                    "application/vnd.apple.mpegurl",
+                    "application/x-mpegURL",
+                    "application/dash+xml"
+                ],
+                "should retain MP4, HLS and DASH player capabilities"
+            );
+        }
+    }
+
+    #[test]
+    fn video_input_rejects_invalid_player_requirements_before_routing() {
+        let invalid = [
+            ("context", json!("outstream")),
+            ("linearity", json!(2)),
+            ("playerSize", json!([0, 360])),
+            ("playerSize", json!([4294967295_u32, 360])),
+            ("playerSize", json!([[640, 360], [300, 250]])),
+            ("mimes", json!([])),
+            ("mimes", json!(["not-a-mime"])),
+            ("mimes", json!(["audio/mp3"])),
+            ("mimes", json!(["application/octet-stream"])),
+            ("protocols", json!([])),
+            ("protocols", json!([9])),
+            ("protocols", json!([99])),
+            ("minduration", json!(-1)),
+            ("minduration", json!(31)),
+            ("maxduration", json!(0)),
+            ("plcmt", json!(4)),
+            ("api", json!([99])),
+            ("playbackmethod", json!([0])),
+            ("startdelay", json!(-3)),
+            ("skip", json!(2)),
+        ];
+        for (key, bad) in invalid {
+            let mut value = video_wire_value();
+            value["adUnits"][0]["mediaTypes"]["video"][key] = bad;
+            let Ok(body) = serde_json::from_value::<AdRequest>(value) else {
+                continue;
+            };
+            let result = convert_tsjs_to_auction_request(
+                &body,
+                &make_settings(),
+                &noop_services(),
+                &make_request(),
+                ConsentContext::default(),
+                None,
+                None,
+            );
+            assert!(result.is_err(), "should reject invalid {key}");
+        }
+        for key in [
+            "context",
+            "playerSize",
+            "mimes",
+            "protocols",
+            "minduration",
+            "maxduration",
+            "plcmt",
+        ] {
+            let mut value = video_wire_value();
+            value["adUnits"][0]["mediaTypes"]["video"]
+                .as_object_mut()
+                .expect("should find video input")
+                .remove(key);
+            assert!(
+                serde_json::from_value::<AdRequest>(value).is_err(),
+                "should require {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn video_input_rejects_duplicate_codes_and_configured_mediation() {
+        let mut value = video_wire_value();
+        let duplicate = value["adUnits"][0].clone();
+        value["adUnits"]
+            .as_array_mut()
+            .expect("should find units")
+            .push(duplicate);
+        let body = serde_json::from_value(value).expect("should parse duplicate units");
+        let services = noop_services();
+        let request = make_request();
+        assert!(
+            convert_tsjs_to_auction_request(
+                &body,
+                &make_settings(),
+                &services,
+                &request,
+                ConsentContext::default(),
+                None,
+                None
+            )
+            .is_err(),
+            "should reject ambiguous impression IDs"
+        );
+        let body = serde_json::from_value(video_wire_value()).expect("should parse video input");
+        let mut settings = make_settings();
+        settings.auction.mediator = Some("adserver_mock".to_string());
+        assert!(
+            convert_tsjs_to_auction_request(
+                &body,
+                &settings,
+                &services,
+                &request,
+                ConsentContext::default(),
+                None,
+                None
+            )
+            .is_err(),
+            "should reject unsupported video mediation"
+        );
+    }
+
+    #[test]
+    fn video_vast_response_bypasses_html_processing_and_preserves_player_facts() {
+        let mut settings = make_settings();
+        settings.auction.sanitize_creatives = true;
+        settings.auction.rewrite_creatives = true;
+        let vast = " \n<VAST version=\"4.0\"><Ad><InLine><Impression><![CDATA[https://track.example.com/i?a=1&b=${AUCTION_PRICE}]]></Impression><Creatives></Creatives></InLine></Ad></VAST>\n";
+        let mut bid = make_bid("div-gpt-top", "example-server", Some(2.0));
+        bid.video = Some(crate::auction::types::VideoBid {
+            apis: vec![7],
+            protocol: Some(7),
+            duration: Some(15),
+            width: Some(1920),
+            height: Some(1080),
+        });
+        bid.creative = Some(vast.to_string());
+        bid.width = 1920;
+        bid.height = 1080;
+        bid.nurl = Some("https://notify.example.com/win?p=${AUCTION_PRICE}".to_string());
+        let result = make_result(bid);
+        let value = response_json(
+            convert_to_openrtb_response(&result, &settings, &make_auction_request(), true)
+                .expect("should serialize video delivery"),
+        );
+        let delivered = &value["seatbid"][0]["bid"][0];
+        assert_eq!(delivered["adm"], vast, "should preserve VAST byte for byte");
+        assert_eq!(delivered["mtype"], 2, "should identify video to the player");
+        assert_eq!(
+            delivered["protocol"], 7,
+            "should retain the provider protocol"
+        );
+        assert_eq!(delivered["dur"], 15, "should retain the provider duration");
+        assert_eq!(delivered["w"], 1920, "should retain creative dimensions");
+        assert_eq!(
+            delivered["nurl"], "https://notify.example.com/win?p=${AUCTION_PRICE}",
+            "should retain lifecycle notifications for the caller"
+        );
+    }
+
+    #[test]
+    fn video_mixed_inventory_retains_banner_winner_identity() {
+        let mut value = video_wire_value();
+        value["adUnits"][0]["mediaTypes"]["banner"] = json!({"sizes": [[300, 250]]});
+        let body = serde_json::from_value(value).expect("should parse mixed inventory");
+        let settings = make_settings();
+        let request = convert_body_to_auction_request(&body, &settings);
+        let bid = make_bid("example-video", "example-server", Some(2.0));
+        let returned = response_json(
+            convert_to_openrtb_response(&make_result(bid), &settings, &request, true)
+                .expect("should serialize the banner winner"),
+        );
+        assert_eq!(
+            returned["seatbid"][0]["bid"][0]["mtype"], 1,
+            "should identify banner markup for a caller offering both media types"
+        );
+    }
+
+    #[test]
+    fn video_only_wire_request_preserves_the_video_slot() {
+        let settings = make_settings();
+        let body: AdRequest = serde_json::from_value(json!({
+            "adUnits": [{
+                "code": "example-video",
+                "mediaTypes": {"video": {
+                    "context": "instream",
+                    "playerSize": [640, 360],
+                    "mimes": ["video/mp4"],
+                    "protocols": [7, 8],
+                    "minduration": 0,
+                    "maxduration": 30,
+                    "plcmt": 1
+                }},
+                "bids": [{"bidder": "example-server", "params": {"placementId": "example"}}]
+            }]
+        }))
+        .expect("should parse the video request");
+        let request = convert_body_to_auction_request(&body, &settings);
+
+        assert_eq!(
+            request.slots.len(),
+            1,
+            "should preserve video-only inventory"
+        );
+        assert_eq!(
+            request.slots[0].id, "example-video",
+            "should preserve the slot ID"
+        );
+        assert_eq!(
+            request.slots[0].formats[0].media_type,
+            MediaType::Video,
+            "should preserve the media type"
+        );
+    }
+
     #[test]
     fn convert_tsjs_to_auction_request_maps_banner_sizes_to_formats() {
         let settings = make_settings();
@@ -1129,6 +1484,7 @@ mod tests {
             ad_units: vec![AdUnit {
                 code: "div-gpt-top".to_string(),
                 media_types: Some(MediaTypes {
+                    video: None,
                     banner: Some(BannerUnit { sizes: vec![] }),
                 }),
                 bids: None,
@@ -1164,6 +1520,7 @@ mod tests {
             ad_units: vec![AdUnit {
                 code: "div-gpt-top".to_string(),
                 media_types: Some(MediaTypes {
+                    video: None,
                     banner: Some(BannerUnit {
                         sizes: vec![vec![300, 250, 1]],
                     }),
@@ -1205,7 +1562,10 @@ mod tests {
                 },
                 AdUnit {
                     code: "no-banner".to_string(),
-                    media_types: Some(MediaTypes { banner: None }),
+                    media_types: Some(MediaTypes {
+                        banner: None,
+                        video: None,
+                    }),
                     bids: None,
                 },
             ],
@@ -1966,6 +2326,7 @@ mod convert_tests {
             ad_units: vec![AdUnit {
                 code: "atf_sidebar_ad".to_string(),
                 media_types: Some(MediaTypes {
+                    video: None,
                     banner: Some(BannerUnit {
                         sizes: vec![vec![300, 250]],
                     }),
@@ -1995,6 +2356,7 @@ mod convert_tests {
             ad_units: vec![AdUnit {
                 code: "homepage_header_ad".to_string(),
                 media_types: Some(MediaTypes {
+                    video: None,
                     banner: Some(BannerUnit {
                         sizes: vec![vec![970, 90]],
                     }),
@@ -2072,6 +2434,7 @@ mod convert_tests {
             ad_units: vec![AdUnit {
                 code: "bad_slot".to_string(),
                 media_types: Some(MediaTypes {
+                    video: None,
                     banner: Some(BannerUnit {
                         sizes: vec![vec![300, 250, 99]], // invalid — 3 elements
                     }),

@@ -135,6 +135,9 @@ export function parseAuctionResponse(body: any): AuctionBid[] {
     if (!Array.isArray(seatBids)) continue;
 
     for (const bid of seatBids) {
+      // Existing browser consumers render banner HTML. Direct API video
+      // responses belong to the caller's player.
+      if (bid?.mtype !== undefined && bid.mtype !== 1) continue;
       const impid = typeof bid?.impid === 'string' ? bid.impid : '';
       const renderer = parseApsRendererDescriptor(bid?.ext?.trusted_server?.renderer);
       const width = typeof bid?.w === 'number' ? bid.w : (renderer?.width ?? 300);

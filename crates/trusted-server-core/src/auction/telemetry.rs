@@ -816,7 +816,11 @@ fn bid_row(
     row.slot_id = Some(bid.slot_id.clone());
     row.slot_w = Some(u16::try_from(bid.width).unwrap_or(u16::MAX));
     row.slot_h = Some(u16::try_from(bid.height).unwrap_or(u16::MAX));
-    row.media_type = media_type_for_slot(request, &bid.slot_id).map(str::to_owned);
+    row.media_type = if bid.video.is_some() {
+        Some("video".to_owned())
+    } else {
+        media_type_for_slot(request, &bid.slot_id).map(str::to_owned)
+    };
     row.seat = Some(
         bid.returned_seat
             .clone()
@@ -1055,6 +1059,7 @@ mod tests {
         AuctionRequest {
             id: id.to_owned(),
             slots: vec![AdSlot {
+                video: None,
                 id: "slot-1".to_owned(),
                 formats: vec![AdFormat {
                     media_type: MediaType::Banner,
@@ -1082,6 +1087,7 @@ mod tests {
 
     fn bid(slot_id: &str, bidder: &str, ad_id: Option<&str>, price: Option<f64>) -> Bid {
         Bid {
+            video: None,
             slot_id: slot_id.to_owned(),
             price,
             currency: "USD".to_owned(),
@@ -1532,6 +1538,48 @@ mod tests {
         assert!(
             !body.contains("ts-ec-derived-id") && !body.contains("ec-value-that-must-not-leak"),
             "should not serialize internal auction request IDs or EC values"
+        );
+    }
+    #[test]
+    fn video_bid_telemetry_uses_selected_media_in_mixed_inventory() {
+        let mut request = test_request("example-auction");
+        request.slots[0].formats.push(AdFormat {
+            media_type: MediaType::Video,
+            width: 640,
+            height: 360,
+        });
+        request.slots[0].video = Some(crate::auction::types::VideoPlacement {
+            mimes: vec!["video/mp4".to_string()],
+            protocols: vec![7],
+            minduration: 0,
+            maxduration: 30,
+            plcmt: 1,
+            api: Vec::new(),
+            playbackmethod: Vec::new(),
+            startdelay: None,
+            skip: None,
+        });
+        let mut video = bid("slot-1", "example-server", None, Some(2.0));
+        video.video = Some(crate::auction::types::VideoBid {
+            protocol: Some(7),
+            duration: Some(15),
+            ..Default::default()
+        });
+        let observation =
+            AuctionObservationContext::for_test(AuctionSource::AuctionApi, "/auction", 1);
+        let row = bid_row(
+            &observation,
+            "2026-01-01T00:00:00Z",
+            &request,
+            "example-server",
+            &video,
+            1,
+            Some(2.0),
+        );
+        assert_eq!(
+            row.media_type.as_deref(),
+            Some("video"),
+            "should report the selected media rather than the first offered format"
         );
     }
 }

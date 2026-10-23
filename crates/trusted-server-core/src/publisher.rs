@@ -5741,6 +5741,7 @@ pub(crate) fn build_bid_map_with_auction_id(
     };
     winning_bids
         .iter()
+        .filter(|(_, bid)| bid.video.is_none())
         .filter_map(|(slot_id, bid)| {
             bid.price.and_then(|cpm| {
                 let bucket = price_bucket(cpm, granularity);
@@ -8143,6 +8144,7 @@ mod tests {
 
     fn make_test_bid_with_creative(creative: &str) -> Bid {
         Bid {
+            video: None,
             slot_id: "slot".to_string(),
             price: Some(1.0),
             currency: "USD".to_string(),
@@ -9022,6 +9024,7 @@ mod tests {
         AuctionRequest {
             id: "test-auction".to_string(),
             slots: vec![AdSlot {
+                video: None,
                 id: "atf".to_string(),
                 formats: vec![AdFormat {
                     media_type: MediaType::Banner,
@@ -10372,6 +10375,7 @@ mod tests {
                 Ok(crate::auction::types::AuctionResponse::success(
                     STUB_BIDDER,
                     vec![Bid {
+                        video: None,
                         slot_id: "test-slot".to_string(),
                         price: Some(self.price),
                         currency: "USD".to_string(),
@@ -22257,6 +22261,7 @@ mod tests {
             burl: &str,
         ) -> Bid {
             Bid {
+                video: None,
                 slot_id: slot_id.to_string(),
                 price: Some(price),
                 currency: "USD".to_string(),
@@ -22852,6 +22857,7 @@ mod tests {
         // adm, which would undo sanitization and the size cap entirely.
         fn cached_bid_with_creative(creative: &str) -> Bid {
             Bid {
+                video: None,
                 slot_id: "atf_sidebar_ad".to_string(),
                 price: Some(1.50),
                 currency: "USD".to_string(),
@@ -23012,6 +23018,23 @@ mod tests {
             assert!(
                 !adm.contains("/static/tsjs="),
                 "should not inject the tsjs bundle into a foreign-origin creative iframe, got: {adm}"
+            );
+        }
+
+        #[test]
+        fn build_bid_map_keeps_video_out_of_the_gpt_banner_bridge() {
+            let settings = crate::test_support::tests::create_test_settings();
+            let mut video = cached_bid_with_creative("<VAST/>");
+            video.video = Some(crate::auction::types::VideoBid {
+                protocol: Some(7),
+                duration: Some(15),
+                ..Default::default()
+            });
+            let winners = HashMap::from([("example-video".to_string(), video)]);
+            let map = build_bid_map(&winners, PriceGranularity::Dense, &settings, "", false);
+            assert!(
+                map.is_empty(),
+                "should leave video delivery to the caller's player"
             );
         }
 
@@ -23256,6 +23279,7 @@ mod tests {
             winning_bids.insert(
                 "atf_sidebar_ad".to_string(),
                 Bid {
+                    video: None,
                     slot_id: "atf_sidebar_ad".to_string(),
                     price: Some(1.50),
                     currency: "USD".to_string(),
@@ -23312,6 +23336,7 @@ mod tests {
             winning_bids.insert(
                 "atf_sidebar_ad".to_string(),
                 Bid {
+                    video: None,
                     slot_id: "atf_sidebar_ad".to_string(),
                     price: Some(0.50),
                     currency: "USD".to_string(),
@@ -23425,6 +23450,7 @@ mod tests {
             winning_bids.insert(
                 "atf_sidebar_ad".to_string(),
                 Bid {
+                    video: None,
                     slot_id: "atf_sidebar_ad".to_string(),
                     price: Some(0.50),
                     currency: "USD".to_string(),
@@ -23470,6 +23496,7 @@ mod tests {
             winning_bids.insert(
                 "no-price-slot".to_string(),
                 Bid {
+                    video: None,
                     slot_id: "no-price-slot".to_string(),
                     price: None,
                     currency: "USD".to_string(),
@@ -23848,6 +23875,7 @@ mod tests {
             ) -> Result<AuctionResponse, Report<TrustedServerError>> {
                 let bids = if self.winning_bid {
                     vec![Bid {
+                        video: None,
                         slot_id: "atf".to_string(),
                         price: Some(1.50),
                         currency: "USD".to_string(),

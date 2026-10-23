@@ -2707,6 +2707,7 @@ mod tests {
         AuctionRequest {
             id: "fictional-auction".to_string(),
             slots: vec![AdSlot {
+                video: None,
                 id: "fictional-slot".to_string(),
                 formats: vec![AdFormat {
                     media_type: MediaType::Banner,
@@ -3739,6 +3740,7 @@ mod tests {
             })
         });
         Bid {
+            video: None,
             slot_id: "slot-1".to_string(),
             price: Some(price),
             currency: "USD".to_string(),
@@ -3765,6 +3767,7 @@ mod tests {
 
     fn mediated_bid(nurl: Option<String>) -> Bid {
         Bid {
+            video: None,
             slot_id: "header-banner".to_string(),
             price: Some(2.5),
             currency: "USD".to_string(),
@@ -4282,6 +4285,7 @@ mod tests {
             id: "test-auction-123".to_string(),
             slots: vec![
                 AdSlot {
+                    video: None,
                     id: "header-banner".to_string(),
                     formats: vec![AdFormat {
                         media_type: MediaType::Banner,
@@ -4293,6 +4297,7 @@ mod tests {
                     bidders: HashMap::new(),
                 },
                 AdSlot {
+                    video: None,
                     id: "sidebar".to_string(),
                     formats: vec![AdFormat {
                         media_type: MediaType::Banner,
@@ -4620,6 +4625,7 @@ mod tests {
         winning_bids.insert(
             "slot-1".to_string(),
             Bid {
+                video: None,
                 slot_id: "slot-1".to_string(),
                 price: Some(0.50),
                 currency: "USD".to_string(),
@@ -4644,6 +4650,7 @@ mod tests {
         winning_bids.insert(
             "slot-2".to_string(),
             Bid {
+                video: None,
                 slot_id: "slot-2".to_string(),
                 price: Some(2.00),
                 currency: "USD".to_string(),
@@ -5981,6 +5988,7 @@ mod tests {
                 }),
             );
             request.slots.push(AdSlot {
+                video: None,
                 id: "synthetic-no-pbs".to_string(),
                 bidders: HashMap::from([(
                     "trustedServer".to_string(),
@@ -5991,6 +5999,7 @@ mod tests {
             for index in 0..inline_providers {
                 let bidder = if index == 0 { "alpha" } else { "beta" };
                 request.slots.push(AdSlot {
+                    video: None,
                     id:format!("inline-{index}"),
                     bidders:HashMap::from([("trustedServer".to_string(),serde_json::json!({"storedRequest":false,"bidderParams":{bidder:{"placement":index}}}))]),
                     ..template.clone()
@@ -7979,6 +7988,7 @@ mod tests {
         winning_bids.insert(
             "slot-1".to_string(),
             Bid {
+                video: None,
                 slot_id: "slot-1".to_string(),
                 price: None,
                 currency: "USD".to_string(),
@@ -8024,6 +8034,7 @@ mod tests {
         winning_bids.insert(
             "atf".to_string(),
             Bid {
+                video: None,
                 slot_id: "atf".to_string(),
                 price: Some(0.30), // decoded APS price — below $0.50 floor
                 currency: "USD".to_string(),
@@ -8064,6 +8075,7 @@ mod tests {
         winning_bids.insert(
             "atf".to_string(),
             Bid {
+                video: None,
                 slot_id: "atf".to_string(),
                 price: Some(0.75), // decoded APS price — above floor
                 currency: "USD".to_string(),

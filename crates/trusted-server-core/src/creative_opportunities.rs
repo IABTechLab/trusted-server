@@ -967,6 +967,7 @@ impl CreativeOpportunitySlot {
             }
         }
         AdSlot {
+            video: None,
             id: self.id.clone(),
             formats: self
                 .formats
