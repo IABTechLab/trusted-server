@@ -1,7 +1,9 @@
 # Encypher text provenance as a module
 
 Status: implemented on `encypher/v2-provenance-module`, based on row 55 of the
-stack tracked in #777 (`feature/55-scripts-in-crates` at 5be114773).
+stack tracked in #777 (`feature/55-scripts-in-crates` at 5be114773), with the
+repository's CI gates run locally (section 4). Signing against the live
+Encypher API has not been exercised (section 4.2).
 
 ## 1. Problem
 
@@ -98,14 +100,35 @@ middleware = ["provenance.encypher"]
 
 - Core: `finish` ends each processor after the one before it has finished; a
   finish past its deadline passes the held bytes on; a streamed body without
-  an auction takes the chunk pipeline.
+  an auction takes the chunk pipeline; the parser-confirmed auction hold
+  injects bids before `</body>` into a document a middleware processor held
+  and finished asynchronously.
 - Module: the request gates, the cache, policy and sign flows and their
   failure codes (ported), configuration bounds, the missing-entry refusal, the
   path exclusions, and the publisher path signing an article through both the
-  buffered and the streaming finalizer while sending the address without its
-  query, and never sending a page the origin marked private.
+  buffered and the streaming finalizer, against a stub origin and a stub API,
+  while sending the address without its query, and never sending a page the
+  origin marked private.
 - Adapters: the Fastly store opens when linked; Axum KV persists and the
   timer fires while other work is pending.
+
+### 4.1 Runtime smoke
+
+The Axum dev server ran with the module selected, a `[[serve]]` entry on
+`/news/`, runtime KV on and a local origin serving a public and a private
+article. Both pages returned `200` with the article intact. The public page
+was held and passed through with `reason=http_error`, because the configured
+API address had no reachable service. The private page was not held
+(`gate=origin_private`) and nothing was sent for it. The configuration sets
+`[geo] assume_single_jurisdiction = true`, which the stack requires once
+`[ec] module` is set.
+
+### 4.2 Limits
+
+The API address must be `https`, and the dev server's HTTP client trusts the
+public certificate authorities built into it, so the runtime smoke cannot
+reach a local signing stub. Signing a page is proven by the in-process
+publisher-path tests above, not against the live API.
 
 ## 5. Open questions
 
@@ -115,3 +138,5 @@ middleware = ["provenance.encypher"]
 2. Holding the page delays its first byte by the signing time on a cache miss.
    `max_hold_ms` bounds it where a timer exists; on a runtime without one,
    `timeout_ms` bounds each call.
+3. The module skips pages the origin marks private, but cannot detect other
+   personalized pages. A deployment places it on public article routes.
