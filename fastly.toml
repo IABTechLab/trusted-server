@@ -23,6 +23,12 @@ build = """
     [local_server.backends]
 
     [local_server.kv_stores]
+        # The runtime KV store, linked as the logical `trusted_server_kv` that
+        # edgezero.toml declares.
+        [[local_server.kv_stores.trusted_server_kv]]
+            key = "placeholder"
+            data = "placeholder"
+
         [[local_server.kv_stores.counter_store]]
             key = "placeholder"
             data = "placeholder"
