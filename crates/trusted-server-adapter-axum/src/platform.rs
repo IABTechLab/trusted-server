@@ -597,7 +597,88 @@ pub fn open_kv_handle(path: &Path) -> Result<KvHandle, KvError> {
             ))
         })?;
     }
-    Ok(KvHandle::new(Arc::new(PersistentKvStore::new(path)?)))
+    Ok(KvHandle::new(Arc::new(BlockingPoolKvStore(Arc::new(
+        PersistentKvStore::new(path)?,
+    )))))
+}
+
+/// Runs each operation of a synchronous [`KvStore`] on Tokio's blocking pool.
+///
+/// [`PersistentKvStore`] does its `redb` transactions inside its `async fn`s
+/// without yielding, so a slow commit would hold the request task and keep
+/// any timer raced against it (an integration deadline, for example) from
+/// firing. Here the request task only awaits the blocking task and stays
+/// free to observe its deadline.
+///
+/// A caller that stops waiting drops only the join handle: the operation
+/// keeps running to its end in the background. That is safe for `redb`. A
+/// write either commits atomically or fails and its transaction aborts on
+/// drop, and `redb` admits one write transaction at a time, so a later
+/// operation waits for the abandoned one instead of interleaving with it.
+/// Dropping the Tokio runtime waits for running blocking tasks, so a commit in
+/// flight is not cut short when the server stops.
+struct BlockingPoolKvStore<S>(Arc<S>);
+
+impl<S: KvStore + 'static> BlockingPoolKvStore<S> {
+    async fn run<T, F, Fut>(&self, op: F) -> Result<T, KvError>
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<S>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, KvError>>,
+    {
+        let store = Arc::clone(&self.0);
+        tokio::task::spawn_blocking(move || futures::executor::block_on(op(store)))
+            .await
+            .map_err(|err| KvError::Internal(anyhow::anyhow!("KV task failed: {err}")))?
+    }
+}
+
+#[async_trait(?Send)]
+impl<S: KvStore + 'static> KvStore for BlockingPoolKvStore<S> {
+    async fn delete(&self, key: &str) -> Result<(), KvError> {
+        let key = key.to_owned();
+        self.run(move |store| async move { store.delete(&key).await })
+            .await
+    }
+
+    async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, KvError> {
+        let key = key.to_owned();
+        self.run(move |store| async move { store.get_bytes(&key).await })
+            .await
+    }
+
+    async fn list_keys_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<KvPage, KvError> {
+        let prefix = prefix.to_owned();
+        let cursor = cursor.map(str::to_owned);
+        self.run(move |store| async move {
+            store
+                .list_keys_page(&prefix, cursor.as_deref(), limit)
+                .await
+        })
+        .await
+    }
+
+    async fn put_bytes(&self, key: &str, value: Bytes) -> Result<(), KvError> {
+        let key = key.to_owned();
+        self.run(move |store| async move { store.put_bytes(&key, value).await })
+            .await
+    }
+
+    async fn put_bytes_with_ttl(
+        &self,
+        key: &str,
+        value: Bytes,
+        ttl: Duration,
+    ) -> Result<(), KvError> {
+        let key = key.to_owned();
+        self.run(move |store| async move { store.put_bytes_with_ttl(&key, value, ttl).await })
+            .await
+    }
 }
 
 /// Bridges edgezero's [`KvHandle`] to [`PlatformKvStore`].
@@ -1070,6 +1151,89 @@ mod tests {
             result.remaining.is_empty(),
             "no remaining requests expected"
         );
+    }
+
+    /// Stands in for a slow `redb` commit: `put_bytes` blocks its thread
+    /// until the test releases it.
+    struct GatedStore {
+        gate: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        finished: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait(?Send)]
+    impl KvStore for GatedStore {
+        async fn delete(&self, _key: &str) -> Result<(), KvError> {
+            Err(KvError::Unavailable)
+        }
+
+        async fn get_bytes(&self, _key: &str) -> Result<Option<Bytes>, KvError> {
+            Err(KvError::Unavailable)
+        }
+
+        async fn list_keys_page(
+            &self,
+            _prefix: &str,
+            _cursor: Option<&str>,
+            _limit: usize,
+        ) -> Result<KvPage, KvError> {
+            Err(KvError::Unavailable)
+        }
+
+        async fn put_bytes(&self, _key: &str, _value: Bytes) -> Result<(), KvError> {
+            let _ = self
+                .gate
+                .lock()
+                .expect("should lock gate")
+                .recv_timeout(Duration::from_secs(5));
+            self.finished
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn put_bytes_with_ttl(
+            &self,
+            _key: &str,
+            _value: Bytes,
+            _ttl: Duration,
+        ) -> Result<(), KvError> {
+            Err(KvError::Unavailable)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_kv_op_does_not_delay_a_racing_deadline() {
+        let (release, gate) = std::sync::mpsc::channel();
+        let store = Arc::new(GatedStore {
+            gate: std::sync::Mutex::new(gate),
+            finished: std::sync::atomic::AtomicBool::new(false),
+        });
+        let handle = KvHandle::new(Arc::new(BlockingPoolKvStore(Arc::clone(&store))));
+
+        let started = std::time::Instant::now();
+        let raced = tokio::time::timeout(
+            Duration::from_millis(50),
+            handle.put_bytes("key", Bytes::from_static(b"value")),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            raced.is_err(),
+            "the deadline should fire while the store op is still blocked"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the deadline should fire on time, fired after {elapsed:?}"
+        );
+
+        release.send(()).expect("should release the blocked op");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !store.finished.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the abandoned op should still run to completion");
     }
 
     async fn serve_raw_response(response: &'static [u8]) -> String {
