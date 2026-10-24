@@ -883,7 +883,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
 
         let trace_state = Arc::clone(&state);
         let mut builder = RouterService::builder()
-            .pre_dispatch_hook(Arc::new(TracePreDispatchHook::new(
+            .pre_dispatch_hook_arc(Arc::new(TracePreDispatchHook::new(
                 Arc::clone(&state.settings),
                 Arc::new(move |request| trace_metadata(&trace_state, request)),
             )))
@@ -1234,17 +1234,14 @@ mod tests {
             ("host", "client-supplied.example.com"),
             ("x-forwarded-proto", "http"),
         ]);
-        req.extensions_mut().insert(
-            edgezero_core::request::RequestIngress::new(
+        req.extensions_mut()
+            .insert(edgezero_core::request::RequestIngress::new(
                 edgezero_core::request::CapturedTarget::Unavailable(
                     edgezero_core::request::TargetUnavailable::NotExposed,
                 ),
                 None,
                 edgezero_core::request::HeaderFidelity::default(),
-                Vec::new(),
-            )
-            .expect("should freeze path-only runtime ingress"),
-        );
+            ));
 
         normalize_spin_request(&mut req);
         trusted_server_core::forwarder::prepare_trusted_forwarder(

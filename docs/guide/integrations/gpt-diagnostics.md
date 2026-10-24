@@ -312,7 +312,7 @@ Review and commit both the bytes and manifest. Ordinary builds verify the rebuil
 automatically. Unchanged bytes keep
 their existing digest. Once an asset URL is published, add a new asset version
 instead of replacing bytes at that URL. The current tooling supports only v1;
-the [asset versioning follow-up](https://github.com/IABTechLab/trusted-server/blob/06c86df8f49ce186965914d1cf595f0cece11037/docs/superpowers/plans/2026-10-22-trace-asset-versioning-follow-up.md)
+the [asset versioning follow-up](https://github.com/IABTechLab/trusted-server/blob/main/docs/superpowers/plans/2026-10-22-trace-asset-versioning-follow-up.md)
 must be completed before introducing v2.
 
 ## What the Console Shows

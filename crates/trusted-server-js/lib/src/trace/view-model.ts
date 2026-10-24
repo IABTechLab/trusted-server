@@ -99,12 +99,16 @@ function attentionFor(fill: TraceSlotFill, requests: readonly TraceGptRequestCyc
 
 function linkFor(
   runtimeSlotNumber: number,
+  requestNumber: number | undefined,
   joined: TraceEvidenceView | undefined
 ): TraceSlotLink | undefined {
   const links = (joined?.auctions ?? []).flatMap((auction, index) =>
     auction.slots
       .filter(
-        (entry) => entry.correlation === 'matched' && entry.runtimeSlotNumber === runtimeSlotNumber
+        (entry) =>
+          entry.correlation === 'matched' &&
+          entry.runtimeSlotNumber === runtimeSlotNumber &&
+          entry.requestNumber === requestNumber
       )
       .map((entry) => ({
         auctionNumber: index + 1,
@@ -137,7 +141,7 @@ export function summarizeTraceReport(
       requestCount: slot.requests.length,
       timingRequestNumber: cycle?.requestNumber,
       timing: timing(cycle),
-      link: linkFor(slot.runtimeSlotNumber, joined),
+      link: linkFor(slot.runtimeSlotNumber, cycle?.requestNumber, joined),
       attention: attentionFor(fill, slot.requests),
     };
   });

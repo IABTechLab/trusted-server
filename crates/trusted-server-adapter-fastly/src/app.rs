@@ -1296,7 +1296,7 @@ impl TrustedServerApp {
 
     fn routes_for_state(state: &Arc<AppState>) -> RouterService {
         let mut router = RouterService::builder()
-            .pre_dispatch_hook(Arc::new(TracePreDispatchHook::new(
+            .pre_dispatch_hook_arc(Arc::new(TracePreDispatchHook::new(
                 Arc::clone(&state.settings),
                 Arc::new(trace_metadata),
             )))

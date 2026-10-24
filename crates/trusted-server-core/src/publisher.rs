@@ -7745,9 +7745,7 @@ mod tests {
                     .expect("should construct transport origin"),
                 ),
                 edgezero_core::request::HeaderFidelity::default(),
-                vec![],
-            )
-            .expect("should construct ingress");
+            );
             request.extensions_mut().insert(ingress);
             crate::forwarder::prepare_trusted_forwarder(&mut request, &settings);
             let mut snapshot = request_head_snapshot(&request);
@@ -12077,9 +12075,7 @@ mod tests {
                             .expect("should capture the reader transport origin"),
                     ),
                     HeaderFidelity::default(),
-                    vec![],
-                )
-                .expect("should construct the reader ingress");
+                );
                 request.extensions_mut().insert(ingress);
                 *request.uri_mut() = "https://ts.example.com/article?b=2&a=1"
                     .parse()

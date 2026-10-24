@@ -246,9 +246,7 @@ mod tests {
                     .expect("should validate the trusted fictional origin"),
             ),
             HeaderFidelity::default(),
-            vec![],
         )
-        .expect("should construct origin-only ingress metadata")
     }
 
     fn request(action: &str) -> Request<EdgeBody> {
@@ -768,15 +766,11 @@ mod tests {
             let mut request = request("enable");
             request.extensions_mut().remove::<RequestIngress>();
             if !missing_origin {
-                request.extensions_mut().insert(
-                    RequestIngress::new(
-                        CapturedTarget::Unavailable(TargetUnavailable::NotExposed),
-                        None,
-                        HeaderFidelity::default(),
-                        vec![],
-                    )
-                    .expect("should construct metadata without origin trust"),
-                );
+                request.extensions_mut().insert(RequestIngress::new(
+                    CapturedTarget::Unavailable(TargetUnavailable::NotExposed),
+                    None,
+                    HeaderFidelity::default(),
+                ));
             }
             for (name, value) in [
                 ("forwarded", "proto=https;host=publisher.example"),

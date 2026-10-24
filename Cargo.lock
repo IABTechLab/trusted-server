@@ -1530,7 +1530,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?rev=70876c92c52200d37455772f670f33eba760bd9b#70876c92c52200d37455772f670f33eba760bd9b"
+source = "git+https://github.com/IABTechLab/edgezero?rev=d05d5526d95c0b8b237cbdb19a42a84040ebecb3#d05d5526d95c0b8b237cbdb19a42a84040ebecb3"
 dependencies = [
  "base16ct 1.0.0",
  "serde",
@@ -1543,7 +1543,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-axum"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?rev=70876c92c52200d37455772f670f33eba760bd9b#70876c92c52200d37455772f670f33eba760bd9b"
+source = "git+https://github.com/IABTechLab/edgezero?rev=d05d5526d95c0b8b237cbdb19a42a84040ebecb3#d05d5526d95c0b8b237cbdb19a42a84040ebecb3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1571,7 +1571,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-cloudflare"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?rev=70876c92c52200d37455772f670f33eba760bd9b#70876c92c52200d37455772f670f33eba760bd9b"
+source = "git+https://github.com/IABTechLab/edgezero?rev=d05d5526d95c0b8b237cbdb19a42a84040ebecb3#d05d5526d95c0b8b237cbdb19a42a84040ebecb3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1594,7 +1594,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-fastly"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?rev=70876c92c52200d37455772f670f33eba760bd9b#70876c92c52200d37455772f670f33eba760bd9b"
+source = "git+https://github.com/IABTechLab/edgezero?rev=d05d5526d95c0b8b237cbdb19a42a84040ebecb3#d05d5526d95c0b8b237cbdb19a42a84040ebecb3"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1624,7 +1624,7 @@ dependencies = [
 [[package]]
 name = "edgezero-adapter-spin"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?rev=70876c92c52200d37455772f670f33eba760bd9b#70876c92c52200d37455772f670f33eba760bd9b"
+source = "git+https://github.com/IABTechLab/edgezero?rev=d05d5526d95c0b8b237cbdb19a42a84040ebecb3#d05d5526d95c0b8b237cbdb19a42a84040ebecb3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1651,7 +1651,7 @@ dependencies = [
 [[package]]
 name = "edgezero-cli"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?rev=70876c92c52200d37455772f670f33eba760bd9b#70876c92c52200d37455772f670f33eba760bd9b"
+source = "git+https://github.com/IABTechLab/edgezero?rev=d05d5526d95c0b8b237cbdb19a42a84040ebecb3#d05d5526d95c0b8b237cbdb19a42a84040ebecb3"
 dependencies = [
  "chrono",
  "clap",
@@ -1676,7 +1676,7 @@ dependencies = [
 [[package]]
 name = "edgezero-core"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?rev=70876c92c52200d37455772f670f33eba760bd9b#70876c92c52200d37455772f670f33eba760bd9b"
+source = "git+https://github.com/IABTechLab/edgezero?rev=d05d5526d95c0b8b237cbdb19a42a84040ebecb3#d05d5526d95c0b8b237cbdb19a42a84040ebecb3"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -1708,7 +1708,7 @@ dependencies = [
 [[package]]
 name = "edgezero-macros"
 version = "0.1.0"
-source = "git+https://github.com/IABTechLab/edgezero?rev=70876c92c52200d37455772f670f33eba760bd9b#70876c92c52200d37455772f670f33eba760bd9b"
+source = "git+https://github.com/IABTechLab/edgezero?rev=d05d5526d95c0b8b237cbdb19a42a84040ebecb3#d05d5526d95c0b8b237cbdb19a42a84040ebecb3"
 dependencies = [
  "log",
  "proc-macro2",

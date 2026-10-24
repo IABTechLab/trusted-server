@@ -195,6 +195,57 @@ describe('trace report summary', () => {
     expect(none.timing).toEqual([]);
   });
 
+  it.each([true, false])(
+    'keeps the auction link on the representative request cycle (linked: %s)',
+    (representativeLinked) => {
+      const base = report([auction(), auction()]);
+      const slot = base.gpt_diagnostics.slots[0];
+      const cycle = slot.requests[0];
+      const refreshed = {
+        ...base,
+        gpt_diagnostics: {
+          ...base.gpt_diagnostics,
+          slots: [
+            {
+              ...slot,
+              requests: [
+                { ...cycle, requestNumber: 1, isEmpty: true },
+                { ...cycle, requestNumber: 2, isEmpty: false },
+              ],
+            },
+          ],
+        },
+      };
+      const joined = {
+        auctions: base.server_auctions.map((evidence, index) => ({
+          evidence,
+          sourceLabel: `Auction ${index + 1}`,
+          slots: [
+            {
+              serverSlot: evidence.slots[0],
+              correlation: index === 0 || representativeLinked ? 'matched' : 'unknown',
+              runtimeSlotNumber: 1,
+              requestNumber: index + 1,
+            },
+          ],
+        })),
+      } as unknown as TraceEvidenceView;
+
+      const summary = summarizeTraceReport(refreshed, joined);
+
+      expect(summary.slots[0].timingRequestNumber).toBe(2);
+      if (representativeLinked) {
+        expect(summary.slots[0].link?.auctionNumber).toBe(2);
+        expect(summary.slots[0].link?.sourceLabel).toBe('Auction 2');
+      } else {
+        expect(summary.slots[0].link).toBeUndefined();
+        expect(summary.reading).toContain(
+          '1 of 1 ad slot could not be linked to a server auction.'
+        );
+      }
+    }
+  );
+
   it('links a slot only through an exact matched correlation', () => {
     const base = report([auction()]);
     const joined = {

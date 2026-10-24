@@ -1092,22 +1092,18 @@ mod tests {
                     "x-ts-trace-action",
                     HeaderValue::from_str(action).expect("should encode fixed action"),
                 );
-                request.extensions_mut().insert(
-                    RequestIngress::new(
-                        CapturedTarget::Unavailable(TargetUnavailable::NotExposed),
-                        Some(
-                            InboundOrigin::parse(
-                                "https",
-                                "publisher.example.com",
-                                OriginSource::RuntimeUri,
-                            )
-                            .expect("should validate fictional runtime origin"),
-                        ),
-                        HeaderFidelity::default(),
-                        vec![],
-                    )
-                    .expect("should freeze trusted runtime origin"),
-                );
+                request.extensions_mut().insert(RequestIngress::new(
+                    CapturedTarget::Unavailable(TargetUnavailable::NotExposed),
+                    Some(
+                        InboundOrigin::parse(
+                            "https",
+                            "publisher.example.com",
+                            OriginSource::RuntimeUri,
+                        )
+                        .expect("should validate fictional runtime origin"),
+                    ),
+                    HeaderFidelity::default(),
+                ));
             }
             let mut response = futures::executor::block_on(
                 edgezero_core::router::PreDispatchHook::handle(&hook, &mut request),
