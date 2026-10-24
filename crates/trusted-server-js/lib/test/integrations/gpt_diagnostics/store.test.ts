@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
+import { AUCTION_TOKEN, SLOT_TOKEN } from '../../trace/fixtures';
 import {
   CREATIVE_ATTEMPT_WINDOW_MS,
   GptDiagnosticsStore,
@@ -67,10 +68,175 @@ function last<T>(values: readonly T[]): T | undefined {
 }
 
 describe('GptDiagnosticsStore', () => {
+  it.each([undefined, 'private-malformed', 'ts-auc-2234567812344abc8def123456789abc'])(
+    'retains ordinary marker %s without fabricating a trace sidecar',
+    (marker) => {
+      const onTraceCorrelation = vi.fn();
+      const store = new GptDiagnosticsStore({ now: () => 1, onTraceCorrelation });
+      const slot = fakeSlot('example-slot');
+      store.recordTrustedServerOpportunity(
+        slot,
+        'private-slot',
+        'no_candidate',
+        marker,
+        undefined,
+        {
+          diagnostic_auction_id: AUCTION_TOKEN,
+          slot_ref: SLOT_TOKEN,
+        }
+      );
+      store.recordSlotRequested(slot);
+      expect(onTraceCorrelation).not.toHaveBeenCalled();
+      expect(store.snapshot().slots[0]!.requests[0]).toMatchObject({
+        requestPath: 'trusted_server_direct',
+      });
+      expect(store.snapshot().slots[0]!.requests[0]!.trustedServerAuctionId).toBe(marker);
+    }
+  );
+
+  it('emits a sidecar for an exactly matching marker after ordinary trimming', () => {
+    const onTraceCorrelation = vi.fn();
+    const store = new GptDiagnosticsStore({ now: () => 1, onTraceCorrelation });
+    const slot = fakeSlot('example-slot');
+    store.recordTrustedServerOpportunity(
+      slot,
+      'private-slot',
+      'no_candidate',
+      ` ${AUCTION_TOKEN} `,
+      undefined,
+      {
+        diagnostic_auction_id: AUCTION_TOKEN,
+        slot_ref: SLOT_TOKEN,
+      }
+    );
+    store.recordSlotRequested(slot);
+    expect(onTraceCorrelation).toHaveBeenCalledOnce();
+    expect(store.snapshot().slots[0]!.requests[0]!.trustedServerAuctionId).toBe(AUCTION_TOKEN);
+  });
+  it.each(['renderable_candidate', 'unrenderable_candidate', 'no_candidate'] as const)(
+    'emits a trace identity only at the concrete %s request binding',
+    (opportunity) => {
+      const onTraceCorrelation = vi.fn();
+      const store = new GptDiagnosticsStore({ now: () => 10, onTraceCorrelation });
+      const slot = fakeSlot('private-slot');
+      store.recordTrustedServerOpportunity(
+        slot,
+        'private-auction-slot',
+        opportunity,
+        AUCTION_TOKEN,
+        [[300, 250]],
+        { diagnostic_auction_id: AUCTION_TOKEN, slot_ref: SLOT_TOKEN }
+      );
+      expect(onTraceCorrelation).not.toHaveBeenCalled();
+      store.recordSlotRequested(slot);
+      expect(onTraceCorrelation).toHaveBeenCalledExactlyOnceWith({
+        schema_version: 1,
+        diagnostic_auction_id: AUCTION_TOKEN,
+        slot_ref: SLOT_TOKEN,
+        runtime_slot_number: 1,
+        request_number: 1,
+      });
+      store.recordSlotRequested(slot);
+      expect(onTraceCorrelation).toHaveBeenCalledOnce();
+      const cycles = store.snapshot().slots[0]!.requests;
+      expect(cycles[0]).toMatchObject({
+        requestPath: 'trusted_server_direct',
+        trustedServerOpportunity: opportunity,
+        trustedServerAuctionId: AUCTION_TOKEN,
+      });
+      expect(cycles[1]).toMatchObject({ requestPath: 'unattributed' });
+      expect(JSON.stringify(store.snapshot())).not.toContain(SLOT_TOKEN);
+    }
+  );
+
   it('uses the explicit creative-attempt and attribution retention bounds', () => {
     expect(CREATIVE_ATTEMPT_WINDOW_MS).toBe(30_000);
     expect(MAX_CREATIVE_ATTEMPTS).toBe(128);
     expect(MAX_ATTRIBUTION_ISSUES).toBe(128);
+  });
+
+  it('keeps sidecars on the consumed source decision with competing refreshes and exact expiry', () => {
+    let now = 0;
+    const onTraceCorrelation = vi.fn();
+    const store = new GptDiagnosticsStore({ now: () => now, onTraceCorrelation });
+    const slot = fakeSlot('example-slot');
+    const identity = { diagnostic_auction_id: AUCTION_TOKEN, slot_ref: SLOT_TOKEN };
+    store.recordTrustedServerOpportunity(
+      slot,
+      'private-slot',
+      'no_candidate',
+      AUCTION_TOKEN,
+      undefined,
+      identity
+    );
+    store.recordPrebidRefresh([slot]);
+    now = 4_999;
+    store.recordSlotRequested(slot);
+    expect(onTraceCorrelation).toHaveBeenCalledOnce();
+    expect(store.snapshot().slots[0]!.requests[0]!.requestPath).toBe('competing');
+    store.recordTrustedServerOpportunity(
+      slot,
+      'private-slot',
+      'no_candidate',
+      AUCTION_TOKEN,
+      undefined,
+      identity
+    );
+    now += REQUEST_PATH_ATTRIBUTION_WINDOW_MS;
+    store.recordSlotRequested(slot);
+    expect(onTraceCorrelation).toHaveBeenCalledOnce();
+    expect(store.snapshot().slots[0]!.requests[1]!.requestPath).toBe('unattributed');
+  });
+
+  it('owns valid identity data and keeps ordinary cycles intact when a trace callback throws', () => {
+    const onTraceCorrelation = vi.fn(() => {
+      throw new Error('private-callback');
+    });
+    const store = new GptDiagnosticsStore({ now: () => 1, onTraceCorrelation });
+    const slot = fakeSlot('example-slot');
+    const identity = { diagnostic_auction_id: AUCTION_TOKEN, slot_ref: SLOT_TOKEN };
+    store.recordTrustedServerOpportunity(
+      slot,
+      'private-slot',
+      'no_candidate',
+      AUCTION_TOKEN,
+      undefined,
+      identity
+    );
+    identity.slot_ref = 'private-mutated';
+    expect(() => store.recordSlotRequested(slot)).not.toThrow();
+    expect(onTraceCorrelation).toHaveBeenCalledExactlyOnceWith({
+      schema_version: 1,
+      diagnostic_auction_id: AUCTION_TOKEN,
+      slot_ref: SLOT_TOKEN,
+      runtime_slot_number: 1,
+      request_number: 1,
+    });
+    expect(store.snapshot().coverage.slotRequested.matched).toBe(1);
+    expect(store.snapshot().slots[0]!.requests).toHaveLength(1);
+  });
+
+  it('ignores unbound/invalid identities without reading caller token getters', () => {
+    const onTraceCorrelation = vi.fn();
+    const store = new GptDiagnosticsStore({ now: () => 1, onTraceCorrelation });
+    const slot = fakeSlot('example-slot');
+    const getter = vi.fn(() => {
+      throw new Error('private-token');
+    });
+    const identity = { diagnostic_auction_id: AUCTION_TOKEN, slot_ref: SLOT_TOKEN };
+    Object.defineProperty(identity, 'slot_ref', { get: getter });
+    store.recordTrustedServerOpportunity(
+      slot,
+      'private-slot',
+      'no_candidate',
+      undefined,
+      undefined,
+      identity
+    );
+    store.recordSlotRequested(slot);
+    expect(getter).not.toHaveBeenCalled();
+    expect(onTraceCorrelation).not.toHaveBeenCalled();
+    expect(store.snapshot().coverage.slotRequested.matched).toBe(1);
   });
 
   it('records a complete filled lifecycle with valid timings and visibility', () => {

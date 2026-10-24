@@ -4,7 +4,10 @@ use std::net::IpAddr;
 
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::http::Response as HttpResponse;
+use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue};
+use trusted_server_core::forwarder::ForwarderPreparation;
 use trusted_server_core::http_util::SPOOFABLE_FORWARDED_HEADERS;
+use trusted_server_core::settings::Settings;
 use trusted_server_core::settings::TrustedClientIpConfig;
 
 use crate::platform::resolve_client_ip;
@@ -91,10 +94,101 @@ pub(crate) fn resolve_and_sanitize_client_ip(
     client_ip
 }
 
+/// Capture authenticated public origin before native forwarding sanitation.
+pub(crate) fn capture_fastly_forwarder(
+    req: &mut fastly::Request,
+    settings: &Settings,
+) -> ForwarderPreparation {
+    let Some(config) = &settings.trusted_forwarder else {
+        return ForwarderPreparation::default();
+    };
+    let mut headers = HeaderMap::new();
+    let mut valid = true;
+    for name in [
+        config.auth_header.as_str(),
+        "x-forwarded-host",
+        "x-forwarded-proto",
+    ] {
+        for value in req.get_header_all(name) {
+            match (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_bytes(value.as_bytes()),
+            ) {
+                (Ok(name), Ok(value)) => {
+                    headers.append(name, value);
+                }
+                _ => {
+                    valid = false;
+                }
+            }
+        }
+    }
+    req.remove_header(config.auth_header.as_str());
+    if valid {
+        ForwarderPreparation::capture(&headers, settings)
+    } else {
+        ForwarderPreparation::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use trusted_server_core::forwarder::prepare_trusted_forwarder;
+    use trusted_server_core::http_util::RequestInfo;
+    use trusted_server_core::platform::ClientInfo;
     use trusted_server_core::redacted::Redacted;
+    use trusted_server_core::settings::TrustedForwarderConfig;
+
+    #[test]
+    fn fastly_forwarder_survives_native_sanitation_without_credentials() {
+        let mut settings = Settings::default();
+        settings.publisher.domain = "publisher.example.com".to_owned();
+        settings.trusted_forwarder = Some(TrustedForwarderConfig {
+            auth_header: "x-example-forwarder-auth".to_owned(),
+            shared_secret: Redacted::new("fictional-forwarder-secret-0123456789".to_owned()),
+        });
+        for duplicate in [false, true] {
+            let mut native = fastly::Request::get("http://upstream.example.com/path");
+            native.set_header(
+                "x-example-forwarder-auth",
+                "fictional-forwarder-secret-0123456789",
+            );
+            native.set_header("x-forwarded-host", "publisher.example.com:8443");
+            native.set_header("x-forwarded-proto", "https");
+            if duplicate {
+                native.append_header("x-forwarded-host", "publisher.example.com:8443");
+            }
+            let prepared = capture_fastly_forwarder(&mut native, &settings);
+            assert!(
+                native.get_header("x-example-forwarder-auth").is_none(),
+                "should remove native forwarding credential"
+            );
+            sanitize_fastly_forwarded_headers(&mut native, None);
+            let mut core = edgezero_core::http::request_builder()
+                .uri("http://upstream.example.com/path")
+                .header("host", "upstream.example.com")
+                .body(EdgeBody::empty())
+                .expect("should construct converted request");
+            core.extensions_mut().insert(prepared);
+            prepare_trusted_forwarder(&mut core, &settings);
+            let info = RequestInfo::from_request(&core, &ClientInfo::default());
+            assert_eq!(
+                info.host,
+                if duplicate {
+                    "upstream.example.com"
+                } else {
+                    "publisher.example.com:8443"
+                },
+                "should retain the frozen native authentication outcome"
+            );
+            assert_eq!(
+                info.scheme,
+                if duplicate { "http" } else { "https" },
+                "should retain the authenticated public scheme"
+            );
+        }
+    }
 
     fn trusted_client_ip_config(ip_header: &str) -> TrustedClientIpConfig {
         TrustedClientIpConfig {
