@@ -100,10 +100,10 @@ pub use template_cache::{
     TemplateCookieValue, TemplateEntry, TemplateMetadata, TemplateMetadataEncodeError,
     UnavailableTemplateCache, VaryHeaderValues, VarySpec, reader_url_surrogate_key,
 };
+pub use timer::PlatformTimer;
 pub use traits::{
     GeoModule, PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformSecretStore,
 };
-pub use timer::PlatformTimer;
 pub use types::{
     ClientInfo, GeoInfo, PlatformBackendSpec, RuntimeServices, RuntimeServicesBuilder, StoreId,
     StoreName,

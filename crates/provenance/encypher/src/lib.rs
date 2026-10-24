@@ -10,9 +10,12 @@
 //! a `GET` of a `200` page on the configured domain, whose origin did not
 //! mark it as one reader's, is held. The signing work runs in the stream
 //! processor's asynchronous finish, which core awaits at the end of the
-//! document. The module requires no permission: it sends the publisher's own
-//! article text and page address, never anything of the reader's, and a page
-//! the origin marked as one reader's is never sent.
+//! document. The module requires no permission and reads no gated value. It
+//! sends the visible text of the page's article and the page address without
+//! its query. A page whose origin set a cookie or forbade shared caching is
+//! never sent, but the module cannot tell a personalized article that carries
+//! neither, so a deployment places it only on public article routes and has
+//! its origin mark every personalized response private.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -329,7 +332,12 @@ fn admit(signer: &Signer, call: &ModuleCall<'_>, context: &MiddlewareContext<'_>
     let request = ModuleRequest::from_module_context(call).ok()?;
     let page = PageRequest {
         method: request.method().clone(),
-        page_url: format!("{}://{}{}", request.scheme(), request.host(), request.path()),
+        page_url: format!(
+            "{}://{}{}",
+            request.scheme(),
+            request.host(),
+            request.path()
+        ),
         response_status: context.status.as_u16(),
         origin_response_is_private: context.origin_private,
     };

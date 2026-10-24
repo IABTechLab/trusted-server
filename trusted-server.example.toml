@@ -917,9 +917,12 @@ auction_timeout_ms = 500
 # Encypher text provenance. Signs the article on each page a [[serve]] entry
 # names `provenance.encypher` for, with invisible markers and a C2PA manifest
 # link, and passes every page it cannot sign through unchanged. Give the
-# entry a `path` for each section of articles to sign. `worker_token` is the
-# name of the secret-store entry holding the `cwk_` worker credential. Plans
-# are cached in the runtime KV store; without one, pages pass through.
+# entry a `path` for each section of public articles to sign. The article's
+# text and address go to the API; a page whose origin set a cookie or forbade
+# shared caching is never sent, so mark every personalized response private
+# at the origin. `worker_token` is the name of the secret-store entry holding
+# the `cwk_` worker credential. Plans are cached in the runtime KV store;
+# without one, pages pass through.
 # [provenance]
 # module = "encypher"
 #

@@ -3,6 +3,7 @@ use super::*;
 use std::sync::Arc;
 
 use edgezero_core::body::Body as EdgeBody;
+use edgezero_core::key_value_store::KvPage;
 use futures::executor::block_on;
 use http::{Method, Request, header};
 use serde_json::json;
@@ -15,7 +16,6 @@ use trusted_server_core::integrations::IntegrationRegistry;
 use trusted_server_core::platform::test_support::{
     StubHttpClient, build_services_with_http_client,
 };
-use edgezero_core::key_value_store::KvPage;
 use trusted_server_core::platform::{
     KvError, PlatformHttpClient, PlatformKvStore, RuntimeServices,
 };
@@ -133,7 +133,10 @@ fn required_settings_and_bounds_are_enforced() {
             .as_object_mut()
             .expect("should be an object")
             .remove(field);
-        assert!(parsed(&config).is_err(), "config without {field} should fail");
+        assert!(
+            parsed(&config).is_err(),
+            "config without {field} should fail"
+        );
     }
     let defaults = parsed(&config_value()).expect("should parse defaults");
     assert_eq!(defaults.policy_ttl_seconds, 300);
@@ -157,7 +160,10 @@ fn required_settings_and_bounds_are_enforced() {
     ] {
         let mut config = config_value();
         config[field] = value.clone();
-        assert!(parsed(&config).is_err(), "{field} = {value} should be rejected");
+        assert!(
+            parsed(&config).is_err(),
+            "{field} = {value} should be rejected"
+        );
     }
     for (max_hold_ms, timeout_ms, valid) in [
         (499, 250, false),
@@ -188,7 +194,13 @@ fn excluded_paths_leave_the_middleware_out_of_the_chain() {
     };
 
     assert!(middleware.handles_path("/news/harbor-vote"));
-    for path in ["/wp-admin/post", "/feed/", "/sitemap.xml", "/app.js", "/api/v1/x"] {
+    for path in [
+        "/wp-admin/post",
+        "/feed/",
+        "/sitemap.xml",
+        "/app.js",
+        "/api/v1/x",
+    ] {
         assert!(!middleware.handles_path(path), "{path} should be left out");
     }
     assert_eq!(middleware.phases(), [MiddlewarePhase::Serve]);
@@ -293,9 +305,10 @@ fn served(
     let orchestrator = Arc::new(AuctionOrchestrator::from_plan(Arc::new(plan), None));
     let method = request.method().clone();
     block_on(async {
-        let mut ec_context = EcContext::read_from_request_resolving_geo(settings, &request, services)
-            .await
-            .expect("should read the request's state");
+        let mut ec_context =
+            EcContext::read_from_request_resolving_geo(settings, &request, services)
+                .await
+                .expect("should read the request's state");
         let publisher = handle_publisher_request(
             AppContext {
                 settings,
@@ -378,7 +391,8 @@ fn the_publisher_path_signs_an_article_through_both_finalizers() {
         // path detects is `http`.
         let policy_uri = &stub.recorded_request_uris()[1];
         assert!(
-            policy_uri.ends_with("page_url=http%3A%2F%2Fpublisher.example.com%2Fnews%2Fharbor-vote"),
+            policy_uri
+                .ends_with("page_url=http%3A%2F%2Fpublisher.example.com%2Fnews%2Fharbor-vote"),
             "should send the page address without its query: {policy_uri}"
         );
     }
@@ -388,9 +402,17 @@ fn the_publisher_path_signs_an_article_through_both_finalizers() {
 fn a_page_the_origin_marked_private_is_never_sent() {
     let stub = stub("private, max-age=0");
 
-    let page = served(&placed(), &services_for(&stub), page_request(Method::GET), false);
+    let page = served(
+        &placed(),
+        &services_for(&stub),
+        page_request(Method::GET),
+        false,
+    );
 
-    assert!(!page.contains(MARKER), "should not sign a reader's own page");
+    assert!(
+        !page.contains(MARKER),
+        "should not sign a reader's own page"
+    );
     assert_eq!(
         stub.recorded_request_methods(),
         ["GET"],

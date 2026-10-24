@@ -4784,12 +4784,11 @@ async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
     loop {
         match reader.read(&mut buffer) {
             Ok(0) => {
-                let final_out = match processor
-                    .finish(&[], deps.services)
-                    .await
-                    .change_context(TrustedServerError::Proxy {
+                let final_out = match processor.finish(&[], deps.services).await.change_context(
+                    TrustedServerError::Proxy {
                         message: "Failed to finalize processor".to_string(),
-                    }) {
+                    },
+                ) {
                     Ok(output) => output,
                     Err(err) => {
                         abandon_reader_auction(
@@ -27218,7 +27217,10 @@ mod tests {
     fn finish_ends_each_processor_after_the_one_before_it_has_finished() {
         let mut processor = WithStreamProcessors {
             inner: None,
-            processors: vec![Box::new(Bracketing::default()), Box::new(Bracketing::default())],
+            processors: vec![
+                Box::new(Bracketing::default()),
+                Box::new(Bracketing::default()),
+            ],
         };
 
         let streamed = processor
@@ -27246,8 +27248,9 @@ mod tests {
                 Box::new(Bracketing::default()),
             ],
         };
-        let services = noop_services()
-            .with_timer(Arc::new(crate::platform::test_support::ElapsedTimer::default()));
+        let services = noop_services().with_timer(Arc::new(
+            crate::platform::test_support::ElapsedTimer::default(),
+        ));
 
         let finished = futures::executor::block_on(processor.finish(b"doc", &services))
             .expect("should finish the document");
@@ -27990,6 +27993,110 @@ mod tests {
             assert!(
                 html.contains("var b=JSON.parse("),
                 "should collect auction and inject bids before body close. Got: {html}"
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn auction_hold_injects_bids_into_a_document_a_processor_finished_asynchronously() {
+        futures::executor::block_on(async {
+            let settings = create_test_settings();
+            let registry = IntegrationRegistry::with_plan(
+                &settings,
+                Arc::new(
+                    crate::auction::compile_auction_plan(&settings)
+                        .expect("should compile auction plan"),
+                ),
+            )
+            .expect("should create integration registry");
+            let orchestrator = AuctionOrchestrator::new(
+                crate::auction::test_support::legacy_auction_config(&settings),
+            );
+            let services = noop_services();
+            let ad_bids_state = AdBidsState::default();
+            let inline_seam_token = deferred_inline_seam_token(&settings, false, true, true);
+            let (html_processor, _) = create_html_stream_processor(HtmlStreamProcessorParams {
+                prepared: Arc::new(Prepared::default()),
+                public_prefix: &crate::prefix::PublicPrefix::default(),
+                origin_host: "origin.example.com",
+                status: http::StatusCode::OK,
+                origin_private: false,
+                request_host: "proxy.example.com",
+                request_scheme: "https",
+                request_path: "/",
+                settings: &settings,
+                integration_registry: &registry,
+                permissions_script: None,
+                ad_slots_script: Some(
+                    r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
+                        .to_string(),
+                ),
+                ad_bids_state: Arc::clone(ad_bids_state.script_cell()),
+                request_state: IntegrationRequestState::default(),
+                shared_template_authorized: false,
+                csp_nonce_observed: None,
+                deferred_inline_marker: inline_seam_token
+                    .as_ref()
+                    .map(|token| String::from_utf8_lossy(token).into_owned()),
+            })
+            .expect("should build the HTML processor");
+            // A middleware processor that holds the whole document, as a
+            // signing middleware does, and changes it in its asynchronous
+            // finish, so the seam marker reaches the scanner only then.
+            let mut processor = WithStreamProcessors {
+                inner: Some(Box::new(html_processor)),
+                processors: vec![Box::new(Bracketing::default())],
+            };
+            let body = EdgeBody::stream(futures::stream::iter(vec![
+                bytes::Bytes::from_static(b"<html><head></head><body>hello"),
+                bytes::Bytes::from_static(b"</body></html>"),
+            ]));
+            let mut output = Vec::new();
+
+            stream_html_with_auction_hold(
+                body,
+                &mut output,
+                &mut processor,
+                inline_seam_token,
+                Compression::None,
+                Compression::None,
+                AuctionCollectCtx {
+                    dispatched: DispatchedAuction::empty_for_test(test_auction_request(), 10),
+                    telemetry: AuctionTelemetryCarry {
+                        observation: None,
+                        auction_request: Some(test_auction_request()),
+                    },
+                    deps: AuctionCollectDeps {
+                        price_granularity: crate::price_bucket::PriceGranularity::default(),
+                        ad_bids_state: &ad_bids_state,
+                        orchestrator: &orchestrator,
+                        services: &services,
+                        settings: &settings,
+                        request_origin: request_origin("https", "proxy.example.com"),
+                    },
+                },
+            )
+            .await
+            .expect("should process the held document with the auction");
+
+            let html = String::from_utf8(output).expect("should be valid UTF-8");
+            assert!(
+                html.starts_with('[') && html.ends_with(']'),
+                "should emit the document the processor finished: {html}"
+            );
+            assert!(
+                html.contains("var b=JSON.parse("),
+                "should inject the collected bids: {html}"
+            );
+            assert!(
+                !html.contains("ts-inline-body-close"),
+                "should resolve the deferred body-close marker: {html}"
+            );
+            let bids_at = html.find("var b=JSON.parse(").expect("should hold bids");
+            let close_at = html.rfind("</body>").expect("should keep </body>");
+            assert!(
+                bids_at < close_at,
+                "bids should land before </body>: {html}"
             );
         });
     }

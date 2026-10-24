@@ -2353,8 +2353,14 @@ mod tests {
     fn gated_documents_pass_through_with_no_kv_or_api_io() {
         let signer = factory();
         let cases: Vec<(GateCase<'_>, Gate)> = vec![
-            (("method", &signer, |r| r.method = Method::POST), Gate::Method),
-            (("status", &signer, |r| r.response_status = 404), Gate::Status),
+            (
+                ("method", &signer, |r| r.method = Method::POST),
+                Gate::Method,
+            ),
+            (
+                ("status", &signer, |r| r.response_status = 404),
+                Gate::Status,
+            ),
             (
                 ("origin private", &signer, |r| {
                     r.origin_response_is_private = true;

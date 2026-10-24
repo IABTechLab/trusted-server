@@ -60,10 +60,14 @@ to move onto those interfaces, and the core seams it needs have to be neutral.
 ### 2.3 Permission contract
 
 The module requires no permission and reads no gated value. It sends the
-publisher's own article text and the page address without its query, never
-anything of the reader's. A page the origin marked as one reader's is never
-sent. The worker token is a module secret setting, resolved from the secret
-store and never logged.
+visible text of the page's article and the page address without its query.
+A page whose origin set a cookie or sent a `Cache-Control` that forbids shared
+storage is never sent; a test covers this. The module cannot detect a
+personalized article that carries neither signal, so it does not exclude
+reader data automatically. The deployer places the middleware only on public
+article routes, through the `[[serve]]` entry's `path`, and has the origin mark
+every personalized response private. The worker token is a module secret
+setting, resolved from the secret store and never logged.
 
 ### 2.4 What the port removes
 

@@ -187,5 +187,8 @@ async fn application_serves_requests_with_and_without_runtime_kv() {
         statuses[0], statuses[1],
         "the app should answer the same with or without runtime KV"
     );
-    assert!(statuses[0] < 500, "should not fail the request: {statuses:?}");
+    assert!(
+        statuses[0] < 500,
+        "should not fail the request: {statuses:?}"
+    );
 }
