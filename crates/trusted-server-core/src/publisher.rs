@@ -11,12 +11,12 @@
 //! must gate them out before the body enters the rewrite pipeline.
 //!
 //! **Note on platform coupling:** The handler boundaries use portable HTTP
-//! types: [`handle_publisher_request`] and [`stream_publisher_body`] take and
-//! return `http::Request`/`http::Response` over `EdgeBody`, and platform I/O is
-//! reached through `RuntimeServices` rather than a platform SDK directly. The
-//! streaming processor itself is generic: `process_response_streaming` writes
-//! into any [`Write`] (a `Vec<u8>` for buffered routes, a streaming writer for
-//! the streaming route). It is not a content-rewriting concern.
+//! types: [`handle_publisher_request`] and [`stream_publisher_body_async`]
+//! take and return `http::Request`/`http::Response` over `EdgeBody`, and
+//! platform I/O is reached through `RuntimeServices` rather than a platform
+//! SDK directly. The body pipeline itself is generic: it writes into any
+//! [`Write`] (a `Vec<u8>` for buffered routes) or yields a lazy stream for the
+//! streaming route. It is not a content-rewriting concern.
 
 use std::borrow::Cow;
 use std::io::Write;
@@ -32,6 +32,7 @@ use error_stack::{Report, ResultExt};
 use flate2::read::ZlibDecoder;
 use flate2::write::{GzEncoder, ZlibEncoder};
 use futures::StreamExt as _;
+use futures::future::LocalBoxFuture;
 use http::{HeaderValue, Method, Request, Response, StatusCode, Uri, header};
 use sha2::Digest as _;
 use web_time::Instant;
@@ -96,8 +97,8 @@ use crate::settings::{
 use crate::source::{SourceLocation, SourceRequest};
 use crate::source_cache::{Found, Lookup, SourceAddress, SourceCache, SourceVary};
 use crate::streaming_processor::{
-    BodyStreamDecoder, BodyStreamEncoder, Compression, GzipDecodeReader, PipelineConfig,
-    STREAM_CHUNK_SIZE, StreamProcessor, StreamingPipeline,
+    BodyStreamDecoder, BodyStreamEncoder, Compression, GzipDecodeReader, STREAM_CHUNK_SIZE,
+    StreamProcessor,
 };
 use crate::streaming_replacer::create_url_replacer;
 
@@ -261,19 +262,43 @@ impl BodyChunkSource {
     }
 }
 
-fn process_and_encode_chunk<P: StreamProcessor>(
+fn process_and_encode_chunk<P: StreamProcessor + ?Sized>(
     processor: &mut P,
     encoder: &mut BodyStreamEncoder,
     chunk: &[u8],
-    is_last: bool,
     process_error: &str,
 ) -> Result<Option<bytes::Bytes>, Report<TrustedServerError>> {
     let processed =
         processor
-            .process_chunk(chunk, is_last)
+            .process_chunk(chunk, false)
             .change_context(TrustedServerError::Proxy {
                 message: process_error.to_string(),
             })?;
+    encode_processed(encoder, processed)
+}
+
+/// Ends `processor`, awaiting any asynchronous finish of a middleware's
+/// processor, and encodes what it emits last.
+async fn finish_and_encode<P: StreamProcessor + ?Sized>(
+    processor: &mut P,
+    encoder: &mut BodyStreamEncoder,
+    services: &RuntimeServices,
+) -> Result<Option<bytes::Bytes>, Report<TrustedServerError>> {
+    let processed =
+        processor
+            .finish(&[], services)
+            .await
+            .change_context(TrustedServerError::Proxy {
+                message: "Failed to finalize processor".to_string(),
+            })?;
+    encode_processed(encoder, processed)
+}
+
+/// Encodes processed bytes, or `None` when there is nothing to emit.
+fn encode_processed(
+    encoder: &mut BodyStreamEncoder,
+    processed: Vec<u8>,
+) -> Result<Option<bytes::Bytes>, Report<TrustedServerError>> {
     if processed.is_empty() {
         return Ok(None);
     }
@@ -635,36 +660,6 @@ fn parse_single_module_filename(
     registry.js_module_id(stem)
 }
 
-/// Parameters for processing response streaming.
-struct ProcessResponseParams<'a> {
-    content_encoding: &'a str,
-    origin_host: &'a str,
-    origin_url: &'a str,
-    request_host: &'a str,
-    request_scheme: &'a str,
-    /// See [`OwnedProcessResponseParams::request_path`].
-    request_path: &'a str,
-    settings: &'a Settings,
-    content_type: &'a str,
-    /// See [`OwnedProcessResponseParams::status`].
-    status: StatusCode,
-    integration_registry: &'a IntegrationRegistry,
-    /// Head script carrying this request's permission state, or [`None`] under a
-    /// shared-template mode. See [`template_permissions_script`].
-    permissions_script: Option<&'a str>,
-    ad_slots_script: Option<&'a str>,
-    ad_bids_state: &'a Arc<Mutex<Option<String>>>,
-    /// See [`HtmlStreamProcessorParams::request_state`].
-    request_state: &'a IntegrationRequestState,
-    /// See [`HtmlStreamProcessorParams::shared_template_authorized`].
-    shared_template_authorized: bool,
-    /// See [`HtmlStreamProcessorParams::csp_nonce_observed`].
-    csp_nonce_observed: Option<&'a Arc<AtomicBool>>,
-    prepared: &'a Arc<Prepared>,
-    /// See [`OwnedProcessResponseParams::public_prefix`].
-    public_prefix: &'a crate::prefix::PublicPrefix,
-}
-
 struct PublisherBodyProcessor {
     inner: Box<dyn StreamProcessor>,
     /// What the serve middleware write on the response, taken by the
@@ -679,6 +674,8 @@ struct TextResponse<'a> {
     /// The response's `Content-Type`, parameters and all.
     content_type: &'a str,
     status: StatusCode,
+    /// See [`MiddlewareContext::origin_private`](crate::middleware::MiddlewareContext::origin_private).
+    origin_private: bool,
     request_path: &'a str,
     request_host: &'a str,
     request_scheme: &'a str,
@@ -744,6 +741,8 @@ fn middleware_stream_processors(
                 request_host: response.request_host,
                 request_scheme: response.request_scheme,
                 origin_host: response.origin_host,
+                status: response.status,
+                origin_private: response.origin_private,
                 platform: integration_registry.platform(),
                 document_state: &document_state,
                 max_buffered_script_bytes: response.max_buffered_script_bytes,
@@ -898,6 +897,8 @@ async fn prepare_document(
                     request_host: document.request_host,
                     request_scheme: document.request_scheme,
                     origin_host: document.origin_host,
+                    status: document.status,
+                    origin_private: document.origin_private,
                     platform: integration_registry.platform(),
                     document_state: &document_state,
                     max_buffered_script_bytes: document.max_buffered_script_bytes,
@@ -1004,6 +1005,27 @@ impl StreamProcessor for WithStreamProcessors {
             processor.reset();
         }
     }
+
+    /// Ends core's move of the address and then each processor in order, so
+    /// a processor is handed its last chunk only after the one before it has
+    /// finished, its asynchronous finish included.
+    fn finish<'a>(
+        &'a mut self,
+        chunk: &'a [u8],
+        services: &'a RuntimeServices,
+    ) -> LocalBoxFuture<'a, Result<Vec<u8>, std::io::Error>> {
+        Box::pin(async move {
+            let mut output = match &mut self.inner {
+                Some(inner) => inner.finish(chunk, services).await?,
+                None => chunk.to_vec(),
+            };
+            for processor in &mut self.processors {
+                let finished = processor.finish(&output, services).await?;
+                output = finished;
+            }
+            Ok(output)
+        })
+    }
 }
 
 impl PublisherBodyProcessor {
@@ -1029,6 +1051,8 @@ impl PublisherBodyProcessor {
         {
             let (processor, headers) = create_html_stream_processor(HtmlStreamProcessorParams {
                 origin_host: &params.origin_host,
+                status: params.status,
+                origin_private: params.origin_private,
                 request_host: &params.request_host,
                 request_scheme: &params.request_scheme,
                 request_path: &params.request_path,
@@ -1052,6 +1076,7 @@ impl PublisherBodyProcessor {
                 &TextResponse {
                     content_type: &params.content_type,
                     status: params.status,
+                    origin_private: params.origin_private,
                     request_path: &params.request_path,
                     request_host: &params.request_host,
                     request_scheme: &params.request_scheme,
@@ -1093,105 +1118,31 @@ impl StreamProcessor for PublisherBodyProcessor {
     fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, std::io::Error> {
         self.inner.process_chunk(chunk, is_last)
     }
+
+    fn finish<'a>(
+        &'a mut self,
+        chunk: &'a [u8],
+        services: &'a RuntimeServices,
+    ) -> LocalBoxFuture<'a, Result<Vec<u8>, std::io::Error>> {
+        self.inner.finish(chunk, services)
+    }
 }
 
-/// Process response body through the streaming pipeline.
-///
-/// Selects the processor by content type, the HTML rewriter or the text
-/// pass of the entries' middleware, and pipes chunks from `body` through it
-/// into `output`. The caller decides what `output` is, a `Vec<u8>` for
-/// buffered responses or a `StreamingBody` for streaming.
+/// Pipes `body` through the processor its content type selects, the HTML
+/// rewriter or the text pass of the entries' middleware, into `output`, and
+/// ends the processor with its asynchronous finish. A body read whole and a
+/// streamed one take the same chunk pipeline.
 ///
 /// # Errors
 ///
 /// Returns an error if processor creation or chunk processing fails.
-fn process_response_streaming<W: Write>(
-    body: EdgeBody,
-    output: &mut W,
-    params: &ProcessResponseParams,
-    output_compression: Compression,
-) -> Result<Vec<ResponseHeader>, Report<TrustedServerError>> {
-    let is_html = is_html_content_type(params.content_type);
-    log::debug!(
-        "process_response_streaming: content_type={}, content_encoding={}, is_html={}",
-        params.content_type,
-        params.content_encoding,
-        is_html
-    );
-
-    let compression = Compression::from_content_encoding(params.content_encoding);
-    let config = PipelineConfig {
-        input_compression: compression,
-        output_compression,
-        chunk_size: 8192,
-    };
-    // Bound how much decoded gzip output may sit in the heap at once, using the
-    // same ceiling the buffered writer enforces on the rewritten output: a gzip
-    // bomb is then rejected mid-decode instead of materializing its full
-    // expansion first. The bound is per-step, so a large honest body still
-    // streams through and only the buffered writer judges the total — otherwise
-    // gzip would reject bodies the identity, deflate and brotli paths accept.
-    let max_pending_decoded_bytes = params.settings.publisher.max_buffered_body_bytes;
-
-    let response_headers = if is_html {
-        let (processor, headers) = create_html_stream_processor(HtmlStreamProcessorParams {
-            origin_host: params.origin_host,
-            request_host: params.request_host,
-            request_scheme: params.request_scheme,
-            request_path: params.request_path,
-            settings: params.settings,
-            integration_registry: params.integration_registry,
-            permissions_script: params.permissions_script.map(str::to_string),
-            ad_slots_script: params.ad_slots_script.map(str::to_string),
-            ad_bids_state: params.ad_bids_state.clone(),
-            request_state: params.request_state.clone(),
-            shared_template_authorized: params.shared_template_authorized,
-            csp_nonce_observed: params.csp_nonce_observed.cloned(),
-            prepared: Arc::clone(params.prepared),
-            public_prefix: params.public_prefix,
-            deferred_inline_marker: None,
-        })?;
-        StreamingPipeline::new(config, processor)
-            .with_max_pending_decoded_bytes(max_pending_decoded_bytes)
-            .process(body_as_reader(body)?, output)?;
-        headers
-    } else {
-        let (processor, headers) = middleware_stream_processors(
-            &TextResponse {
-                content_type: params.content_type,
-                status: params.status,
-                request_path: params.request_path,
-                request_host: params.request_host,
-                request_scheme: params.request_scheme,
-                origin_host: params.origin_host,
-                request_state: params.request_state,
-                max_buffered_script_bytes: params.settings.publisher.max_buffered_body_bytes,
-                prepared: params.prepared,
-            },
-            params.settings,
-            params.integration_registry,
-        )?
-        .into_processor(
-            params.origin_host,
-            params.origin_url,
-            params.request_host,
-            params.request_scheme,
-        );
-        StreamingPipeline::new(config, processor)
-            .with_max_pending_decoded_bytes(max_pending_decoded_bytes)
-            .process(body_as_reader(body)?, output)?;
-        headers
-    };
-
-    Ok(response_headers)
-}
-
 async fn process_response_streaming_async<W: Write>(
     body: EdgeBody,
     output: &mut W,
     params: &OwnedProcessResponseParams,
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
+    services: &RuntimeServices,
 ) -> Result<Vec<ResponseHeader>, Report<TrustedServerError>> {
     log::debug!(
         "process_response_streaming_async: content_type={}, content_encoding={}",
@@ -1228,6 +1179,7 @@ async fn process_response_streaming_async<W: Write>(
         input_compression,
         output_compression,
         settings.publisher.max_buffered_body_bytes,
+        services,
     )
     .await?;
     Ok(response_headers)
@@ -1239,7 +1191,7 @@ async fn process_response_streaming_async<W: Write>(
 /// [`passthrough_finish_segments`]. Shared by the write-sink driver
 /// ([`process_body_chunks_async`]) and the lazy publisher body stream so the
 /// two no-hold paths cannot drift apart.
-async fn passthrough_step<P: StreamProcessor>(
+async fn passthrough_step<P: StreamProcessor + ?Sized>(
     source: &mut BodyChunkSource,
     decoder: &mut BodyStreamDecoder,
     encoder: &mut BodyStreamEncoder,
@@ -1253,25 +1205,22 @@ async fn passthrough_step<P: StreamProcessor>(
         return Ok(Some(Vec::new()));
     }
     let mut segments = Vec::new();
-    if let Some(encoded) = process_and_encode_chunk(
-        processor,
-        encoder,
-        &decoded,
-        false,
-        "Failed to process chunk",
-    )? {
+    if let Some(encoded) =
+        process_and_encode_chunk(processor, encoder, &decoded, "Failed to process chunk")?
+    {
         segments.push(encoded);
     }
     Ok(Some(segments))
 }
 
-async fn process_body_chunks_async<W: Write, P: StreamProcessor>(
+async fn process_body_chunks_async<W: Write, P: StreamProcessor + ?Sized>(
     body: EdgeBody,
     writer: &mut W,
     processor: &mut P,
     input_compression: Compression,
     output_compression: Compression,
     max_body_bytes: usize,
+    services: &RuntimeServices,
 ) -> Result<(), Report<TrustedServerError>> {
     let mut decoder = BodyStreamDecoder::new(input_compression, max_body_bytes);
     let mut encoder = BodyStreamEncoder::new(output_compression);
@@ -1285,7 +1234,9 @@ async fn process_body_chunks_async<W: Write, P: StreamProcessor>(
         }
     }
 
-    for encoded in passthrough_finish_segments(processor, &mut decoder, &mut encoder)? {
+    for encoded in
+        passthrough_finish_segments(processor, &mut decoder, &mut encoder, services).await?
+    {
         write_encoded_segment(writer, &encoded)?;
     }
     writer.flush().change_context(TrustedServerError::Proxy {
@@ -1308,12 +1259,13 @@ fn write_encoded_segment<W: Write>(
 }
 
 /// Finalize a no-hold chunk pipeline: drain the decoder tail through the
-/// processor, signal end-of-stream to the processor, and emit the encoder
-/// trailer. Returns the encoded segments for the caller to emit.
-fn passthrough_finish_segments<P: StreamProcessor>(
+/// processor, end the processor with its asynchronous finish, and emit the
+/// encoder trailer. Returns the encoded segments for the caller to emit.
+async fn passthrough_finish_segments<P: StreamProcessor + ?Sized>(
     processor: &mut P,
     decoder: &mut BodyStreamDecoder,
     encoder: &mut BodyStreamEncoder,
+    services: &RuntimeServices,
 ) -> Result<Vec<bytes::Bytes>, Report<TrustedServerError>> {
     let mut segments = Vec::new();
     let decoded_tail = decoder.finish()?;
@@ -1322,19 +1274,12 @@ fn passthrough_finish_segments<P: StreamProcessor>(
             processor,
             encoder,
             &decoded_tail,
-            false,
             "Failed to process decoded tail",
         )?
     {
         segments.push(encoded);
     }
-    if let Some(encoded) = process_and_encode_chunk(
-        processor,
-        encoder,
-        &[],
-        true,
-        "Failed to finalize processor",
-    )? {
+    if let Some(encoded) = finish_and_encode(processor, encoder, services).await? {
         segments.push(encoded);
     }
     let trailer = encoder.finish()?;
@@ -1585,8 +1530,9 @@ async fn hold_step_next_chunk<P: StreamProcessor>(
         .map(Some)
 }
 
-/// Drain the decoder tail at end of the origin stream, returning the prefix the
-/// caller must emit before [`hold_finish_tail_segments`].
+/// Drain the decoder tail at end of the origin stream and end the processor,
+/// returning the prefix the caller must emit before
+/// [`hold_finish_tail_segments`].
 ///
 /// A codec can hold document bytes back until its own finalization — the gzip
 /// decoder releases the remainder of the final member at `finish()` — and that
@@ -1594,8 +1540,12 @@ async fn hold_step_next_chunk<P: StreamProcessor>(
 /// collection keeps the invariant the mid-stream path already has: only the
 /// closing `</body>` tail waits for the auction, never renderable content.
 ///
-/// On decoder failure the pending auction is abandoned before the error is
-/// returned.
+/// The processor's end awaits each middleware processor's asynchronous finish
+/// in order, so a seam token a processor held reaches the seam scanner here,
+/// once the whole chain has finished.
+///
+/// On decoder or processor failure the pending auction is abandoned before
+/// the error is returned.
 async fn hold_finish_ready_segments<P: StreamProcessor>(
     processor: &mut P,
     decoder: &mut BodyStreamDecoder,
@@ -1613,18 +1563,18 @@ async fn hold_finish_ready_segments<P: StreamProcessor>(
     let mut step =
         hold_step_decoded_chunk(processor, encoder, &decoded_tail, state, collect_refs).await?;
 
-    let final_processed =
-        match processor
-            .process_chunk(&[], true)
-            .change_context(TrustedServerError::Proxy {
-                message: "Failed to finalize processor".to_string(),
-            }) {
-            Ok(processed) => processed,
-            Err(err) => {
-                abandon_hold_auction(state, collect_refs.services, "stream_process_error").await;
-                return Err(err);
-            }
-        };
+    let final_processed = match processor
+        .finish(&[], collect_refs.services)
+        .await
+        .change_context(TrustedServerError::Proxy {
+            message: "Failed to finalize processor".to_string(),
+        }) {
+        Ok(processed) => processed,
+        Err(err) => {
+            abandon_hold_auction(state, collect_refs.services, "stream_process_error").await;
+            return Err(err);
+        }
+    };
     let final_ready = match state.hold.as_mut() {
         Some(seam) => seam.push(&final_processed),
         None => final_processed,
@@ -1703,6 +1653,10 @@ async fn hold_finish_tail_segments(
 /// registry alive for as long as the processor.
 struct HtmlStreamProcessorParams<'a> {
     origin_host: &'a str,
+    /// See [`OwnedProcessResponseParams::status`].
+    status: StatusCode,
+    /// See [`OwnedProcessResponseParams::origin_private`].
+    origin_private: bool,
     request_host: &'a str,
     request_scheme: &'a str,
     /// See [`OwnedProcessResponseParams::request_path`].
@@ -1920,7 +1874,8 @@ fn create_html_stream_processor(
         .with_body_close(body_close)
         .with_csp_nonce_observer(csp_nonce_observed)
         .with_public_prefix(params.public_prefix.clone())
-        .with_prepared(params.prepared);
+        .with_prepared(params.prepared)
+        .with_response(params.status, params.origin_private);
 
     // The middleware of the first [[fetch]] entry covering this path.
     let fetch = params.integration_registry.middleware_chain(
@@ -1975,6 +1930,8 @@ fn reader_serve_processor(
             request_host: &params.request_host,
             request_scheme: &params.request_scheme,
             origin_host,
+            status: params.status,
+            origin_private: params.origin_private,
             platform: integration_registry.platform(),
             request_state: &params.request_state,
             max_buffered_script_bytes: settings.publisher.max_buffered_body_bytes,
@@ -1985,14 +1942,15 @@ fn reader_serve_processor(
 }
 
 /// Runs the `[[serve]]` entry covering this request over a reader's whole
-/// copy, assembled and not yet encoded, and writes its headers on the
-/// response.
-fn run_serve_pass(
+/// copy, assembled and not yet encoded, ending it with its asynchronous
+/// finish, and writes its headers on the response.
+async fn run_serve_pass(
     bytes: Vec<u8>,
     params: &OwnedProcessResponseParams,
     settings: &Settings,
     integration_registry: &IntegrationRegistry,
     response: &mut Response<EdgeBody>,
+    services: &RuntimeServices,
 ) -> Result<Vec<u8>, Report<TrustedServerError>> {
     let pass = reader_serve_processor(params, settings, integration_registry)?;
     write_response_headers(response, pass.response_headers);
@@ -2000,7 +1958,8 @@ fn run_serve_pass(
         return Ok(bytes);
     };
     processor
-        .process_chunk(&bytes, true)
+        .finish(&bytes, services)
+        .await
         .change_context(TrustedServerError::Proxy {
             message: "a serve middleware could not rewrite the page".to_string(),
         })
@@ -2011,10 +1970,22 @@ fn run_serve_pass(
 fn serve_chunk(
     serve: &mut Option<Box<dyn StreamProcessor>>,
     bytes: Vec<u8>,
-    is_last: bool,
 ) -> Result<Vec<u8>, std::io::Error> {
     match serve {
-        Some(processor) => processor.process_chunk(&bytes, is_last),
+        Some(processor) => processor.process_chunk(&bytes, false),
+        None => Ok(bytes),
+    }
+}
+
+/// The last piece of a streamed reader's copy through the `[[serve]]` entry,
+/// when one covers the request, ending it with its asynchronous finish.
+async fn serve_last_chunk(
+    serve: &mut Option<Box<dyn StreamProcessor>>,
+    bytes: Vec<u8>,
+    services: &RuntimeServices,
+) -> Result<Vec<u8>, std::io::Error> {
+    match serve {
+        Some(processor) => processor.finish(&bytes, services).await,
         None => Ok(bytes),
     }
 }
@@ -2045,7 +2016,7 @@ pub enum PublisherResponse {
         response: Response<EdgeBody>,
         /// Origin body to be piped through the streaming pipeline.
         body: EdgeBody,
-        /// Parameters for [`process_response_streaming`].
+        /// Parameters for [`stream_publisher_body_async`].
         params: Box<OwnedProcessResponseParams>,
     },
     /// A shared template read from template cache, to be assembled on the way out.
@@ -2253,8 +2224,8 @@ fn apply_publisher_asset_cache_policy(
     Ok(())
 }
 
-/// Owned version of [`ProcessResponseParams`] for returning from
-/// [`handle_publisher_request`] without lifetime issues.
+/// Owned body-processing parameters returned from [`handle_publisher_request`]
+/// so the body can be processed after the handler returns.
 pub struct OwnedProcessResponseParams {
     /// Where to store the transformed template, or [`None`] to store nothing.
     ///
@@ -2290,6 +2261,9 @@ pub struct OwnedProcessResponseParams {
     /// The origin's status, which decides whether the entries' middleware
     /// run on a body that is not HTML. See [`text_entry_media_type`].
     pub(crate) status: StatusCode,
+    /// Whether the origin marked its response as one reader's, see
+    /// [`MiddlewareContext::origin_private`](crate::middleware::MiddlewareContext::origin_private).
+    pub(crate) origin_private: bool,
     pub(crate) ad_slots_script: Option<String>,
     pub(crate) ad_bids_state: AdBidsState,
     /// Observation context for the in-flight auction.
@@ -2535,7 +2509,9 @@ pub async fn buffer_publisher_response_async(
                     settings,
                     integration_registry,
                     &mut response,
-                )?;
+                    services,
+                )
+                .await?;
                 encode_complete_body(bytes, response_compression(&response))?
             } else {
                 bytes
@@ -2591,7 +2567,9 @@ pub async fn buffer_publisher_response_async(
                 settings,
                 integration_registry,
                 &mut response,
-            )?;
+                services,
+            )
+            .await?;
             let assembled = encode_complete_body(assembled, response_compression(&response))?;
             response.headers_mut().insert(
                 http::header::CONTENT_LENGTH,
@@ -2803,6 +2781,8 @@ fn build_template_assembly_params(
         request_path: String::new(),
         content_type: entry.metadata.content_type.clone(),
         status: StatusCode::OK,
+        // A stored template passed the gate that keeps one reader's page out.
+        origin_private: false,
         // The template already carries the head seam; re-injecting would duplicate it.
         permissions_json,
         ad_slots_script: None,
@@ -3158,7 +3138,7 @@ pub async fn publisher_response_into_streaming_response(
                 // Each piece goes through the serve entry as it leaves, so
                 // the head is still written before the auction is awaited.
                 let encoded_head = encoder
-                    .encode_chunk(serve_chunk(&mut serve, head.to_vec(), false)?)
+                    .encode_chunk(serve_chunk(&mut serve, head.to_vec())?)
                     .map_err(publisher_stream_error)?;
                 if !encoded_head.is_empty() {
                     yield bytes::Bytes::from(encoded_head);
@@ -3189,14 +3169,14 @@ pub async fn publisher_response_into_streaming_response(
                 let seam = seam_script_for(&params);
                 if !seam.is_empty() {
                     let encoded_seam = encoder
-                        .encode_chunk(serve_chunk(&mut serve, seam.into_bytes(), false)?)
+                        .encode_chunk(serve_chunk(&mut serve, seam.into_bytes())?)
                         .map_err(publisher_stream_error)?;
                     if !encoded_seam.is_empty() {
                         yield bytes::Bytes::from(encoded_seam);
                     }
                 }
                 let encoded_tail = encoder
-                    .encode_chunk(serve_chunk(&mut serve, tail.to_vec(), true)?)
+                    .encode_chunk(serve_last_chunk(&mut serve, tail.to_vec(), &services).await?)
                     .map_err(publisher_stream_error)?;
                 if !encoded_tail.is_empty() {
                     yield bytes::Bytes::from(encoded_tail);
@@ -3410,9 +3390,14 @@ pub async fn publisher_response_into_streaming_response(
                             yield encoded;
                         }
                     }
-                    for encoded in
-                        passthrough_finish_segments(&mut processor, &mut decoder, &mut encoder)
-                            .map_err(publisher_stream_error)?
+                    for encoded in passthrough_finish_segments(
+                        &mut processor,
+                        &mut decoder,
+                        &mut encoder,
+                        &services,
+                    )
+                    .await
+                    .map_err(publisher_stream_error)?
                     {
                         yield encoded;
                     }
@@ -3571,55 +3556,6 @@ impl Write for BoundedWriter {
     }
 }
 
-/// Stream the publisher response body through the processing pipeline.
-///
-/// Called by the adapter after `stream_to_client()` has committed the response
-/// headers. Runs synchronously against an already-materialised body; the async
-/// I/O happened upstream in [`handle_publisher_request`]. Writes processed
-/// chunks directly to `output`.
-///
-/// # Errors
-///
-/// Returns an error if processing fails mid-stream. Since headers are already
-/// committed, the caller should log the error and drop the `StreamingBody`
-/// (client sees a truncated response).
-pub fn stream_publisher_body<W: Write>(
-    body: EdgeBody,
-    output: &mut W,
-    params: &OwnedProcessResponseParams,
-    settings: &Settings,
-    integration_registry: &IntegrationRegistry,
-) -> Result<Vec<ResponseHeader>, Report<TrustedServerError>> {
-    let permissions_script = permissions_script_for(params, settings);
-    let borrowed = ProcessResponseParams {
-        content_encoding: &params.content_encoding,
-        origin_host: &params.origin_host,
-        origin_url: &params.origin_url,
-        request_host: &params.request_host,
-        request_scheme: &params.request_scheme,
-        request_path: &params.request_path,
-        settings,
-        content_type: &params.content_type,
-        status: params.status,
-        integration_registry,
-        permissions_script: permissions_script.as_deref(),
-        ad_slots_script: params.ad_slots_script.as_deref(),
-        ad_bids_state: params.ad_bids_state.script_cell(),
-        request_state: &params.request_state,
-        shared_template_authorized: params.template_cache_key.is_some(),
-        csp_nonce_observed: params.csp_nonce_observed.as_ref(),
-        prepared: &params.prepared,
-        public_prefix: &params.public_prefix,
-    };
-    let input_compression = Compression::from_content_encoding(&params.content_encoding);
-    let output_compression = if params.template_cache_key.is_some() {
-        Compression::None
-    } else {
-        input_compression
-    };
-    process_response_streaming(body, output, &borrowed, output_compression)
-}
-
 /// Stream publisher body with parser-confirmed live bid injection.
 ///
 /// Drives the origin body through the HTML pipeline one chunk at a time. The
@@ -3632,9 +3568,11 @@ pub fn stream_publisher_body<W: Write>(
 /// 3. The generated marker is replaced with the collected bid script.
 ///
 /// For non-HTML content types the auction is collected before any body bytes
-/// are written (no `</body>` to inject).  If `params.dispatched_auction` is
-/// `None` the function falls back to the synchronous
-/// [`stream_publisher_body`] path.
+/// are written (no `</body>` to inject). Without a dispatched auction the body
+/// takes the same chunk pipeline with no seam, whether it was read whole or
+/// arrives as a stream. Every path ends the processor with its asynchronous
+/// finish, so a middleware processor's asynchronous work completes before the
+/// output is finalized.
 ///
 /// # Errors
 ///
@@ -3650,19 +3588,15 @@ pub async fn stream_publisher_body_async<W: Write>(
     services: &RuntimeServices,
 ) -> Result<Vec<ResponseHeader>, Report<TrustedServerError>> {
     let Some(dispatched) = params.dispatched_auction.take() else {
-        if body.is_stream() {
-            return process_response_streaming_async(
-                body,
-                output,
-                params,
-                settings,
-                integration_registry,
-            )
-            .await;
-        }
-
-        // No auction and already-buffered body — keep the existing sync pipeline.
-        return stream_publisher_body(body, output, params, settings, integration_registry);
+        return process_response_streaming_async(
+            body,
+            output,
+            params,
+            settings,
+            integration_registry,
+            services,
+        )
+        .await;
     };
     let telemetry = AuctionTelemetryCarry {
         observation: params.auction_observation.take(),
@@ -3683,17 +3617,15 @@ pub async fn stream_publisher_body_async<W: Write>(
             settings,
         )
         .await;
-        if body.is_stream() {
-            return process_response_streaming_async(
-                body,
-                output,
-                params,
-                settings,
-                integration_registry,
-            )
-            .await;
-        }
-        return stream_publisher_body(body, output, params, settings, integration_registry);
+        return process_response_streaming_async(
+            body,
+            output,
+            params,
+            settings,
+            integration_registry,
+            services,
+        )
+        .await;
     }
 
     // HTML: let lol_html mark the structural body end for the auction seam.
@@ -3708,6 +3640,8 @@ pub async fn stream_publisher_body_async<W: Write>(
             prepared: Arc::clone(&params.prepared),
             public_prefix: &params.public_prefix,
             origin_host: &params.origin_host,
+            status: params.status,
+            origin_private: params.origin_private,
             request_host: &params.request_host,
             request_scheme: &params.request_scheme,
             request_path: &params.request_path,
@@ -3913,6 +3847,8 @@ fn write_serve_middleware_headers(
         request_host: reader.request_host,
         request_scheme: reader.request_scheme,
         origin_host: reader.origin_host,
+        status: response.status(),
+        origin_private: reader.origin_private,
         platform: reader.platform,
         document_state: &document_state,
         max_buffered_script_bytes: reader.max_buffered_script_bytes,
@@ -4848,11 +4784,12 @@ async fn body_close_hold_loop<R: std::io::Read, W: Write, P: StreamProcessor>(
     loop {
         match reader.read(&mut buffer) {
             Ok(0) => {
-                let final_out = match processor.process_chunk(&[], true).change_context(
-                    TrustedServerError::Proxy {
+                let final_out = match processor
+                    .finish(&[], deps.services)
+                    .await
+                    .change_context(TrustedServerError::Proxy {
                         message: "Failed to finalize processor".to_string(),
-                    },
-                ) {
+                    }) {
                     Ok(output) => output,
                     Err(err) => {
                         abandon_reader_auction(
@@ -6121,6 +6058,7 @@ pub async fn handle_publisher_request(
                     let document = TextResponse {
                         content_type: crate::middleware::HTML_MEDIA_TYPE,
                         status: StatusCode::OK,
+                        origin_private: false,
                         request_path: &request_path,
                         request_host,
                         request_scheme,
@@ -6280,6 +6218,11 @@ pub async fn handle_publisher_request(
         response = empty_document(&entry.media_type)?;
     }
 
+    // Read before core writes its own cache policy on the response below, so a
+    // middleware is told what the origin declared.
+    let origin_private = response.headers().contains_key(header::SET_COOKIE)
+        || cache_control_forbids_shared_storage(response.headers());
+
     // Every serve middleware an entry names for this path is asked for the
     // headers it sets on the response that is sent, whatever it is, so a
     // redirect with no body reaches a middleware that rewrites its Location.
@@ -6288,6 +6231,8 @@ pub async fn handle_publisher_request(
         request_host,
         request_scheme,
         origin_host: &origin_host_header,
+        status: response.status(),
+        origin_private,
         platform: integration_registry.platform(),
         request_state: &request_state,
         max_buffered_script_bytes: settings.publisher.max_buffered_body_bytes,
@@ -6538,6 +6483,7 @@ pub async fn handle_publisher_request(
         let document = TextResponse {
             content_type: &content_type,
             status,
+            origin_private,
             request_path: &request_path,
             request_host,
             request_scheme,
@@ -6677,6 +6623,7 @@ pub async fn handle_publisher_request(
                     request_path: request_path.clone(),
                     content_type,
                     status,
+                    origin_private,
                     permissions_json,
                     ad_slots_script: ad_slots_script.clone(),
                     ad_bids_state: ad_bids_state.clone(),
@@ -9821,6 +9768,26 @@ mod tests {
     use http::{Method, Request as HttpRequest, StatusCode, header};
     use std::sync::Arc;
 
+    /// Runs the body pipeline with no auction over `body`, ending the
+    /// processor with the asynchronous finish on services with no timer, as a
+    /// buffered adapter does with a body it read whole.
+    fn stream_publisher_body<W: Write>(
+        body: EdgeBody,
+        output: &mut W,
+        params: &OwnedProcessResponseParams,
+        settings: &Settings,
+        integration_registry: &IntegrationRegistry,
+    ) -> Result<Vec<ResponseHeader>, Report<TrustedServerError>> {
+        futures::executor::block_on(process_response_streaming_async(
+            body,
+            output,
+            params,
+            settings,
+            integration_registry,
+            &noop_services(),
+        ))
+    }
+
     /// A resolved permission state as page JSON, for tests that need a payload
     /// with something in it rather than the empty state.
     ///
@@ -11368,6 +11335,7 @@ mod tests {
             request_path: "/".to_owned(),
             content_type: "application/json".to_owned(),
             status: http::StatusCode::OK,
+            origin_private: false,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -11828,6 +11796,8 @@ mod tests {
                 csp_nonce_observed: None,
                 public_prefix: None,
                 prepared: Arc::new(Prepared::default()),
+                status: StatusCode::OK,
+                origin_private: false,
                 origin_host: "origin.example.com".to_string(),
                 request_host: "example.com".to_string(),
                 request_scheme: "https".to_string(),
@@ -23795,6 +23765,7 @@ mod tests {
             request_path: "/a.txt".to_owned(),
             content_type: content_type.to_string(),
             status: http::StatusCode::OK,
+            origin_private: false,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -23911,6 +23882,7 @@ mod tests {
             request_path: "/a.txt".to_owned(),
             content_type: fixture::FRAMED_MEDIA_TYPE.to_string(),
             status: StatusCode::OK,
+            origin_private: false,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -23980,6 +23952,7 @@ mod tests {
             request_path: "/a.txt".to_owned(),
             content_type: "text/plain; charset=utf-8".to_string(),
             status: http::StatusCode::OK,
+            origin_private: false,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -24035,6 +24008,7 @@ mod tests {
             request_path: "/a.txt".to_owned(),
             content_type: content_type.to_string(),
             status: http::StatusCode::OK,
+            origin_private: false,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -26760,6 +26734,7 @@ mod tests {
             request_path: "/".to_owned(),
             content_type: "text/css".to_string(),
             status: http::StatusCode::OK,
+            origin_private: false,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -26826,6 +26801,7 @@ mod tests {
             request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
             status: http::StatusCode::OK,
+            origin_private: false,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -26913,6 +26889,7 @@ mod tests {
                 request_path: "/".to_owned(),
                 content_type: "text/html; charset=utf-8".to_string(),
                 status: http::StatusCode::OK,
+                origin_private: false,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -27009,6 +26986,7 @@ mod tests {
                 request_path: "/".to_owned(),
                 content_type: "text/html; charset=utf-8".to_string(),
                 status: http::StatusCode::OK,
+                origin_private: false,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -27120,6 +27098,7 @@ mod tests {
             request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
             status: http::StatusCode::OK,
+            origin_private: false,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -27172,6 +27151,7 @@ mod tests {
             request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
             status: http::StatusCode::OK,
+            origin_private: false,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -27304,6 +27284,7 @@ mod tests {
                 request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
                 status: http::StatusCode::OK,
+                origin_private: false,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -27374,6 +27355,7 @@ mod tests {
                 request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
                 status: http::StatusCode::OK,
+                origin_private: false,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -27447,6 +27429,7 @@ mod tests {
                 request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
                 status: http::StatusCode::OK,
+                origin_private: false,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -27520,6 +27503,7 @@ mod tests {
                 request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
                 status: http::StatusCode::OK,
+                origin_private: false,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -27593,6 +27577,7 @@ mod tests {
                 request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
                 status: http::StatusCode::OK,
+                origin_private: false,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -27646,6 +27631,7 @@ mod tests {
             request_path: "/".to_owned(),
             content_type: "text/css".to_string(),
             status: http::StatusCode::OK,
+            origin_private: false,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -27875,6 +27861,7 @@ mod tests {
                 request_path: "/".to_owned(),
                 content_type: "text/html; charset=utf-8".to_string(),
                 status: http::StatusCode::OK,
+                origin_private: false,
                 permissions_json: String::new(),
                 ad_slots_script: Some(
                     r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
@@ -27956,6 +27943,7 @@ mod tests {
                 request_path: "/".to_owned(),
                 content_type: "text/html; charset=utf-8".to_string(),
                 status: http::StatusCode::OK,
+                origin_private: false,
                 permissions_json: String::new(),
                 ad_slots_script: Some(
                     r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
@@ -28039,6 +28027,7 @@ mod tests {
                 request_path: "/".to_owned(),
                 content_type: "text/css".to_string(),
                 status: http::StatusCode::OK,
+                origin_private: false,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -28116,6 +28105,7 @@ mod tests {
             request_path: "/".to_owned(),
             content_type: "text/css".to_string(),
             status: http::StatusCode::OK,
+            origin_private: false,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -28275,6 +28265,7 @@ mod tests {
             request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
             status: http::StatusCode::OK,
+            origin_private: false,
             permissions_json: String::new(),
             ad_slots_script: Some(
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
@@ -28955,6 +28946,7 @@ mod tests {
                 request_path: "/".to_owned(),
                 content_type: "text/html; charset=utf-8".to_string(),
                 status: http::StatusCode::OK,
+                origin_private: false,
                 permissions_json: String::new(),
                 ad_slots_script: None,
                 ad_bids_state: AdBidsState::default(),
@@ -29156,6 +29148,7 @@ mod tests {
             request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
             status: http::StatusCode::OK,
+            origin_private: false,
             permissions_json: String::new(),
             ad_slots_script: Some(
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
@@ -29241,6 +29234,7 @@ mod tests {
             request_path: "/".to_owned(),
             content_type: "Text/HTML; Charset=utf-8".to_string(),
             status: http::StatusCode::OK,
+            origin_private: false,
             permissions_json: String::new(),
             ad_slots_script: Some(
                 r#"<script>(window.tsjs=window.tsjs||{}).adSlots=JSON.parse("[]");</script>"#
@@ -29309,6 +29303,7 @@ mod tests {
             request_path: "/".to_owned(),
             content_type: "text/html".to_string(),
             status: http::StatusCode::OK,
+            origin_private: false,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -29432,6 +29427,7 @@ mod tests {
             request_path: "/".to_owned(),
             content_type: "text/html; charset=utf-8".to_string(),
             status: http::StatusCode::OK,
+            origin_private: false,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),
@@ -29495,6 +29491,7 @@ mod tests {
             request_path: "/".to_owned(),
             content_type: "text/html".to_string(),
             status: http::StatusCode::OK,
+            origin_private: false,
             permissions_json: String::new(),
             ad_slots_script: None,
             ad_bids_state: AdBidsState::default(),

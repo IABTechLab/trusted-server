@@ -658,6 +658,8 @@ mod tests {
             request_host: "www.example.com",
             request_scheme: "https",
             origin_host: "origin.example.com",
+            status: http::StatusCode::OK,
+            origin_private: false,
             platform: test_support::platform(),
             document_state: state,
             max_buffered_script_bytes: 1 << 20,

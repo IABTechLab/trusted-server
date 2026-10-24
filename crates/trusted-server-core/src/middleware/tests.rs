@@ -67,6 +67,8 @@ fn reader(request_state: &IntegrationRequestState) -> ReaderDocument<'_> {
         request_host: REQUEST_HOST,
         request_scheme: "https",
         origin_host: ORIGIN_HOST,
+        status: StatusCode::OK,
+        origin_private: false,
         platform: test_support::platform(),
         request_state,
         max_buffered_script_bytes: 16 * 1024 * 1024,

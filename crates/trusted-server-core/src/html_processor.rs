@@ -7,6 +7,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use futures::future::LocalBoxFuture;
+use http::StatusCode;
 use lol_html::{
     EndTagHandler, Settings as RewriterSettings, element, end,
     html_content::{ContentType, EndTag, TextChunk, TextType},
@@ -22,6 +24,7 @@ use crate::middleware::{
     ElementHandler, MatchedAttribute, MiddlewareChain, MiddlewareContext, MiddlewarePlan, Prepared,
     ResponseHeader, TextHandler,
 };
+use crate::platform::RuntimeServices;
 use crate::prefix::{PUBLIC_PREFIX_ATTRIBUTE, PublicPrefix};
 use crate::publisher::build_empty_bids_script;
 use crate::settings::Settings;
@@ -32,6 +35,8 @@ mod script_text;
 
 use script_text::ScriptTextGuard;
 
+/// The HTML rewriter followed by the middleware's stream processors, each
+/// handed what the one before it produced.
 struct HtmlWithStreamingProcessors {
     inner: Box<dyn StreamProcessor>,
     processors: Vec<Box<dyn StreamProcessor>>,
@@ -51,6 +56,24 @@ impl StreamProcessor for HtmlWithStreamingProcessors {
         for processor in &mut self.processors {
             processor.reset();
         }
+    }
+
+    /// Ends the rewriter once and then each processor in order, so a
+    /// processor is handed its last chunk only after the one before it has
+    /// finished, its asynchronous finish included.
+    fn finish<'a>(
+        &'a mut self,
+        chunk: &'a [u8],
+        services: &'a RuntimeServices,
+    ) -> LocalBoxFuture<'a, Result<Vec<u8>, io::Error>> {
+        Box::pin(async move {
+            let mut output = self.inner.finish(chunk, services).await?;
+            for processor in &mut self.processors {
+                let finished = processor.finish(&output, services).await?;
+                output = finished;
+            }
+            Ok(output)
+        })
     }
 }
 
@@ -125,6 +148,10 @@ pub struct HtmlProcessorConfig {
     /// What the middleware prepared for this document, see
     /// [`Middleware::prepare`](crate::middleware::Middleware::prepare).
     pub prepared: Arc<Prepared>,
+    /// See [`MiddlewareContext::status`].
+    pub status: StatusCode,
+    /// See [`MiddlewareContext::origin_private`].
+    pub origin_private: bool,
 }
 
 impl HtmlProcessorConfig {
@@ -151,6 +178,8 @@ impl HtmlProcessorConfig {
             csp_nonce_observed: None,
             public_prefix: None,
             prepared: Arc::new(Prepared::default()),
+            status: StatusCode::OK,
+            origin_private: false,
         }
     }
 
@@ -222,6 +251,15 @@ impl HtmlProcessorConfig {
     #[must_use]
     pub fn with_prepared(mut self, prepared: Arc<Prepared>) -> Self {
         self.prepared = prepared;
+        self
+    }
+
+    /// Sets the status of the response the document is the body of, and
+    /// whether the origin marked that response as one reader's.
+    #[must_use]
+    pub fn with_response(mut self, status: StatusCode, origin_private: bool) -> Self {
+        self.status = status;
+        self.origin_private = origin_private;
         self
     }
 }
@@ -301,6 +339,8 @@ pub fn create_html_processor_with_middleware(
         request_host: &config.request_host,
         request_scheme: &config.request_scheme,
         origin_host: &config.origin_host,
+        status: config.status,
+        origin_private: config.origin_private,
         platform: config.integrations.platform(),
         document_state: &document_state,
         max_buffered_script_bytes: config.max_buffered_body_bytes,
@@ -313,6 +353,8 @@ pub fn create_html_processor_with_middleware(
                 request_host: &config.request_host,
                 request_scheme: &config.request_scheme,
                 origin_host: &config.origin_host,
+                status: config.status,
+                origin_private: config.origin_private,
                 platform: config.integrations.platform(),
                 request_state: &config.request_state,
                 max_buffered_script_bytes: config.max_buffered_body_bytes,
@@ -336,6 +378,10 @@ pub struct ReaderDocument<'a> {
     /// The host the document names as its own, being the `Host` its source
     /// sends.
     pub origin_host: &'a str,
+    /// See [`MiddlewareContext::status`].
+    pub status: StatusCode,
+    /// See [`MiddlewareContext::origin_private`].
+    pub origin_private: bool,
     /// What the adapter reports about the platform the deployment runs on.
     pub platform: &'a PlatformIdentity,
     /// What modules left on this reader's request for their page changes.
@@ -372,6 +418,8 @@ pub fn create_serve_processor(
         request_host: document.request_host,
         request_scheme: document.request_scheme,
         origin_host: document.origin_host,
+        status: document.status,
+        origin_private: document.origin_private,
         platform: document.platform,
         document_state: &document_state,
         max_buffered_script_bytes: document.max_buffered_script_bytes,
@@ -1240,6 +1288,8 @@ mod tests {
             csp_nonce_observed: None,
             public_prefix: None,
             prepared: Arc::new(Prepared::default()),
+            status: StatusCode::OK,
+            origin_private: false,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_owned(),
             request_host: "test.example.com".to_owned(),
@@ -1991,6 +2041,8 @@ mod tests {
             csp_nonce_observed: None,
             public_prefix: None,
             prepared: Arc::new(Prepared::default()),
+            status: StatusCode::OK,
+            origin_private: false,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -2071,6 +2123,8 @@ mod tests {
             csp_nonce_observed: None,
             public_prefix: None,
             prepared: Arc::new(Prepared::default()),
+            status: StatusCode::OK,
+            origin_private: false,
             body_close: BodyCloseInjection::InlineBids,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -2112,6 +2166,8 @@ mod tests {
             csp_nonce_observed: None,
             public_prefix: None,
             prepared: Arc::new(Prepared::default()),
+            status: StatusCode::OK,
+            origin_private: false,
             body_close: BodyCloseInjection::InlineBids,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -2154,6 +2210,8 @@ mod tests {
             csp_nonce_observed: None,
             public_prefix: None,
             prepared: Arc::new(Prepared::default()),
+            status: StatusCode::OK,
+            origin_private: false,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.test-publisher.example.com".to_string(),
             request_host: request_host.to_string(),
@@ -2210,6 +2268,8 @@ mod tests {
             csp_nonce_observed: None,
             public_prefix: None,
             prepared: Arc::new(Prepared::default()),
+            status: StatusCode::OK,
+            origin_private: false,
             body_close: BodyCloseInjection::InlineBids,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -2244,6 +2304,8 @@ mod tests {
             csp_nonce_observed: None,
             public_prefix: None,
             prepared: Arc::new(Prepared::default()),
+            status: StatusCode::OK,
+            origin_private: false,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),
@@ -2280,6 +2342,8 @@ mod tests {
             ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
             max_buffered_body_bytes: 16 * 1024 * 1024,
             prepared: Arc::new(Prepared::default()),
+            status: StatusCode::OK,
+            origin_private: false,
             request_state: IntegrationRequestState::default(),
         }
     }
@@ -2490,6 +2554,8 @@ mod tests {
             csp_nonce_observed: None,
             public_prefix: None,
             prepared: Arc::new(Prepared::default()),
+            status: StatusCode::OK,
+            origin_private: false,
             body_close: BodyCloseInjection::Marker(MARKER.to_string()),
             origin_host: "origin.example.com".to_string(),
             request_host: "example.com".to_string(),

@@ -144,6 +144,16 @@ pub struct MiddlewareContext<'a> {
     /// sends, the same for a page served from the store as for one fetched
     /// for this request.
     pub origin_host: &'a str,
+    /// The status of the response the document is the body of. A page from
+    /// the store of shared templates was stored from a `200`.
+    pub status: StatusCode,
+    /// Whether the origin marked its response as one reader's, by setting a
+    /// cookie or by a `Cache-Control` that forbids shared storage. Read from
+    /// the origin's own headers, before core writes its cache policy on the
+    /// response, so a middleware that sends the document elsewhere can leave
+    /// a reader's own page alone. A page from the store of shared templates
+    /// was never one reader's.
+    pub origin_private: bool,
     /// What the adapter reports about the platform the deployment runs on,
     /// as the attestation evidence carries it.
     pub platform: &'a PlatformIdentity,
@@ -1103,6 +1113,8 @@ pub mod test_support {
             request_host: REQUEST_HOST,
             request_scheme: "https",
             origin_host: ORIGIN_HOST,
+            status: http::StatusCode::OK,
+            origin_private: false,
             platform,
             document_state,
             max_buffered_script_bytes: 16 * 1024 * 1024,
