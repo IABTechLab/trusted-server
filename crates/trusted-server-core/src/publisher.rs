@@ -27126,7 +27126,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_publisher_body_rejects_stream_body_in_sync_path() {
+    fn a_streamed_body_without_an_auction_takes_the_chunk_pipeline() {
         let settings = create_test_settings();
         let registry = IntegrationRegistry::with_plan(
             &settings,
@@ -27166,12 +27166,95 @@ mod tests {
         )]));
         let mut output = Vec::new();
 
-        let err = stream_publisher_body(body, &mut output, &params, &settings, &registry)
-            .expect_err("should reject stream body in sync path");
+        stream_publisher_body(body, &mut output, &params, &settings, &registry)
+            .expect("should process a streamed body");
 
         assert!(
-            format!("{err:?}").contains("streaming body"),
-            "should explain that Body::Stream is not supported by the sync path: {err:?}"
+            String::from_utf8_lossy(&output).contains("live"),
+            "should emit the streamed document"
+        );
+    }
+
+    /// Holds every byte, and in its asynchronous finish wraps them in `[` and
+    /// `]`, or never completes.
+    #[derive(Default)]
+    struct Bracketing {
+        held: Vec<u8>,
+        never: bool,
+    }
+
+    impl StreamProcessor for Bracketing {
+        fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> io::Result<Vec<u8>> {
+            self.held.extend_from_slice(chunk);
+            Ok(if is_last {
+                std::mem::take(&mut self.held)
+            } else {
+                Vec::new()
+            })
+        }
+
+        fn async_finish<'a>(
+            &'a mut self,
+            held: &'a [u8],
+            _services: &'a RuntimeServices,
+        ) -> Option<crate::streaming_processor::AsyncFinish<'a>> {
+            let never = self.never;
+            Some(crate::streaming_processor::AsyncFinish::new(
+                Duration::from_secs(1),
+                async move {
+                    if never {
+                        futures::future::pending::<()>().await;
+                    }
+                    let mut output = b"[".to_vec();
+                    output.extend_from_slice(held);
+                    output.push(b']');
+                    output
+                },
+            ))
+        }
+    }
+
+    #[test]
+    fn finish_ends_each_processor_after_the_one_before_it_has_finished() {
+        let mut processor = WithStreamProcessors {
+            inner: None,
+            processors: vec![Box::new(Bracketing::default()), Box::new(Bracketing::default())],
+        };
+
+        let streamed = processor
+            .process_chunk(b"doc", false)
+            .expect("should hold the first chunk");
+        let finished = futures::executor::block_on(processor.finish(b"!", &noop_services()))
+            .expect("should finish the document");
+
+        assert!(streamed.is_empty(), "should hold every byte until the end");
+        assert_eq!(
+            finished, b"[[doc!]]",
+            "should hand the second processor what the first finished with"
+        );
+    }
+
+    #[test]
+    fn a_finish_past_its_deadline_emits_the_held_bytes() {
+        let mut processor = WithStreamProcessors {
+            inner: None,
+            processors: vec![
+                Box::new(Bracketing {
+                    never: true,
+                    ..Bracketing::default()
+                }),
+                Box::new(Bracketing::default()),
+            ],
+        };
+        let services = noop_services()
+            .with_timer(Arc::new(crate::platform::test_support::ElapsedTimer::default()));
+
+        let finished = futures::executor::block_on(processor.finish(b"doc", &services))
+            .expect("should finish the document");
+
+        assert_eq!(
+            finished, b"[doc]",
+            "should pass the held bytes of the late finish to the next processor"
         );
     }
 

@@ -6636,6 +6636,7 @@ dependencies = [
  "trusted-server-permission-signal-mtm",
  "trusted-server-permission-signal-tcf",
  "trusted-server-permission-signal-us-privacy",
+ "trusted-server-provenance-encypher",
  "trusted-server-shared-aws",
  "trusted-server-tag-google-tag",
  "trusted-server-tag-google-tag-manager",
@@ -6686,6 +6687,7 @@ dependencies = [
  "trusted-server-permission-signal-mtm",
  "trusted-server-permission-signal-tcf",
  "trusted-server-permission-signal-us-privacy",
+ "trusted-server-provenance-encypher",
  "trusted-server-shared-aws",
  "trusted-server-tag-google-tag",
  "trusted-server-tag-google-tag-manager",
@@ -6742,6 +6744,7 @@ dependencies = [
  "trusted-server-permission-signal-mtm",
  "trusted-server-permission-signal-tcf",
  "trusted-server-permission-signal-us-privacy",
+ "trusted-server-provenance-encypher",
  "trusted-server-shared-aws",
  "trusted-server-tag-google-tag",
  "trusted-server-tag-google-tag-manager",
@@ -6794,6 +6797,7 @@ dependencies = [
  "trusted-server-permission-signal-mtm",
  "trusted-server-permission-signal-tcf",
  "trusted-server-permission-signal-us-privacy",
+ "trusted-server-provenance-encypher",
  "trusted-server-shared-aws",
  "trusted-server-tag-google-tag",
  "trusted-server-tag-google-tag-manager",
@@ -7020,6 +7024,7 @@ dependencies = [
  "trusted-server-identity-lockr",
  "trusted-server-loading-cache-51degrees",
  "trusted-server-middleware-51degrees",
+ "trusted-server-provenance-encypher",
  "trusted-server-shared-aws",
  "trusted-server-tag-google-tag",
  "trusted-server-tag-google-tag-manager",
@@ -7350,6 +7355,27 @@ dependencies = [
  "serde_json",
  "trusted-server-core",
  "trusted-server-permission-signal-gpc",
+]
+
+[[package]]
+name = "trusted-server-provenance-encypher"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "edgezero-core",
+ "error-stack",
+ "futures",
+ "http",
+ "log",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "trusted-server-core",
+ "url",
+ "validator",
+ "web-time",
 ]
 
 [[package]]

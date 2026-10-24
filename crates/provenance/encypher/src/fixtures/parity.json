@@ -1,0 +1,848 @@
+{
+  "generated_from": [
+    "integrations/edge-core/boundary.js",
+    "integrations/edge-core/fragments.js",
+    "integrations/edge-core/embed.js"
+  ],
+  "fixed_plan": {
+    "index_unit": "codepoint",
+    "operations": [
+      {
+        "insert_after_index": -1,
+        "marker": "﻿"
+      },
+      {
+        "insert_after_index": 0,
+        "marker": "︀"
+      },
+      {
+        "insert_after_index": 0,
+        "marker": "︁"
+      }
+    ]
+  },
+  "cases": [
+    {
+      "id": "override-multibyte-prefix",
+      "html": "<!doctype html><html><head><title>Café &amp; News</title></head><body>🙂前<div data=\"story\"><p>Alpha &amp; beta.</p></div></body></html>",
+      "override_selector": "[data=story]",
+      "boundary": {
+        "selector": "override:[data=story]",
+        "start": 78,
+        "end": 126
+      },
+      "text": "Alpha & beta.",
+      "text_rust": "Alpha & beta.",
+      "text_divergence": null,
+      "plan": {
+        "index_unit": "codepoint",
+        "operations": [
+          {
+            "insert_after_index": -1,
+            "marker": "﻿"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︀"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︁"
+          }
+        ]
+      },
+      "expected_output": "<!doctype html><html><head><title>Café &amp; News</title></head><body>🙂前<div data=\"story\"><p>﻿A︀︁lpha &amp; beta.</p></div></body></html>",
+      "invalid_plan": null,
+      "expected_invalid_output": null,
+      "manifest_url": "https://manifest.example.com/c2pa?id=fictional&kind=\"article\"",
+      "expected_meta_output_js": "<!doctype html><html><head><title>Café &amp; News</title><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body>🙂前<div data=\"story\"><p>Alpha &amp; beta.</p></div></body></html>",
+      "expected_meta_output_rust": "<!doctype html><html><head><title>Café &amp; News</title><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body>🙂前<div data=\"story\"><p>Alpha &amp; beta.</p></div></body></html>",
+      "meta_divergence": null
+    },
+    {
+      "id": "article-most-paragraphs",
+      "html": "<html><head><title>Two articles</title></head><body><article><p>Short.</p></article><article><p>First paragraph.</p><p>Second <em>paragraph</em>.</p></article></body></html>",
+      "override_selector": null,
+      "boundary": {
+        "selector": "article",
+        "start": 84,
+        "end": 159
+      },
+      "text": "First paragraph. Second paragraph .",
+      "text_rust": "First paragraph. Second paragraph .",
+      "text_divergence": null,
+      "plan": {
+        "index_unit": "codepoint",
+        "operations": [
+          {
+            "insert_after_index": -1,
+            "marker": "﻿"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︀"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︁"
+          }
+        ]
+      },
+      "expected_output": "<html><head><title>Two articles</title></head><body><article><p>Short.</p></article><article><p>﻿F︀︁irst paragraph.</p><p>Second <em>paragraph</em>.</p></article></body></html>",
+      "invalid_plan": null,
+      "expected_invalid_output": null,
+      "manifest_url": "https://manifest.example.com/c2pa?id=fictional&kind=\"article\"",
+      "expected_meta_output_js": "<html><head><title>Two articles</title><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><article><p>Short.</p></article><article><p>First paragraph.</p><p>Second <em>paragraph</em>.</p></article></body></html>",
+      "expected_meta_output_rust": "<html><head><title>Two articles</title><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><article><p>Short.</p></article><article><p>First paragraph.</p><p>Second <em>paragraph</em>.</p></article></body></html>",
+      "meta_divergence": null
+    },
+    {
+      "id": "cms-class-entities",
+      "html": "<html><head></head><body><div class=\"layout entry-content featured\"><p>Fish &amp; chips &mdash; &#169; &#x1F41F;.</p></div></body></html>",
+      "override_selector": null,
+      "boundary": {
+        "selector": "class:entry-content",
+        "start": 25,
+        "end": 123
+      },
+      "text": "Fish & chips — © 🐟.",
+      "text_rust": "Fish & chips — © 🐟.",
+      "text_divergence": null,
+      "plan": {
+        "index_unit": "codepoint",
+        "operations": [
+          {
+            "insert_after_index": -1,
+            "marker": "﻿"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︀"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︁"
+          }
+        ]
+      },
+      "expected_output": "<html><head></head><body><div class=\"layout entry-content featured\"><p>﻿F︀︁ish &amp; chips &mdash; &#169; &#x1F41F;.</p></div></body></html>",
+      "invalid_plan": null,
+      "expected_invalid_output": null,
+      "manifest_url": "https://manifest.example.com/c2pa?id=fictional&kind=\"article\"",
+      "expected_meta_output_js": "<html><head><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><div class=\"layout entry-content featured\"><p>Fish &amp; chips &mdash; &#169; &#x1F41F;.</p></div></body></html>",
+      "expected_meta_output_rust": "<html><head><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><div class=\"layout entry-content featured\"><p>Fish &amp; chips &mdash; &#169; &#x1F41F;.</p></div></body></html>",
+      "meta_divergence": null
+    },
+    {
+      "id": "itemprop-nbsp",
+      "html": "<html><head></head><body><section itemprop=\"articleBody\"><p>One two&nbsp;three.</p></section></body></html>",
+      "override_selector": null,
+      "boundary": {
+        "selector": "itemprop:articleBody",
+        "start": 25,
+        "end": 94
+      },
+      "text": "One two three.",
+      "text_rust": "One two three.",
+      "text_divergence": null,
+      "plan": {
+        "index_unit": "codepoint",
+        "operations": [
+          {
+            "insert_after_index": -1,
+            "marker": "﻿"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︀"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︁"
+          }
+        ]
+      },
+      "expected_output": "<html><head></head><body><section itemprop=\"articleBody\"><p>﻿O︀︁ne two&nbsp;three.</p></section></body></html>",
+      "invalid_plan": null,
+      "expected_invalid_output": null,
+      "manifest_url": "https://manifest.example.com/c2pa?id=fictional&kind=\"article\"",
+      "expected_meta_output_js": "<html><head><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><section itemprop=\"articleBody\"><p>One two&nbsp;three.</p></section></body></html>",
+      "expected_meta_output_rust": "<html><head><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><section itemprop=\"articleBody\"><p>One two&nbsp;three.</p></section></body></html>",
+      "meta_divergence": null
+    },
+    {
+      "id": "main-inline-tags",
+      "html": "<html><head></head><body><main><h1>Inline</h1><p>Hello <strong>fictional</strong> example.com.</p></main></body></html>",
+      "override_selector": null,
+      "boundary": {
+        "selector": "main",
+        "start": 25,
+        "end": 105
+      },
+      "text": "Inline Hello fictional example.com.",
+      "text_rust": "Inline Hello fictional example.com.",
+      "text_divergence": null,
+      "plan": {
+        "index_unit": "codepoint",
+        "operations": [
+          {
+            "insert_after_index": -1,
+            "marker": "﻿"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︀"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︁"
+          }
+        ]
+      },
+      "expected_output": "<html><head></head><body><main><h1>﻿I︀︁nline</h1><p>Hello <strong>fictional</strong> example.com.</p></main></body></html>",
+      "invalid_plan": null,
+      "expected_invalid_output": null,
+      "manifest_url": "https://manifest.example.com/c2pa?id=fictional&kind=\"article\"",
+      "expected_meta_output_js": "<html><head><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><main><h1>Inline</h1><p>Hello <strong>fictional</strong> example.com.</p></main></body></html>",
+      "expected_meta_output_rust": "<html><head><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><main><h1>Inline</h1><p>Hello <strong>fictional</strong> example.com.</p></main></body></html>",
+      "meta_divergence": null
+    },
+    {
+      "id": "role-main",
+      "html": "<html><head></head><body><div role=\"main\"><p>Role based article boundary.</p></div></body></html>",
+      "override_selector": null,
+      "boundary": {
+        "selector": "role:main",
+        "start": 25,
+        "end": 83
+      },
+      "text": "Role based article boundary.",
+      "text_rust": "Role based article boundary.",
+      "text_divergence": null,
+      "plan": {
+        "index_unit": "codepoint",
+        "operations": [
+          {
+            "insert_after_index": -1,
+            "marker": "﻿"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︀"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︁"
+          }
+        ]
+      },
+      "expected_output": "<html><head></head><body><div role=\"main\"><p>﻿R︀︁ole based article boundary.</p></div></body></html>",
+      "invalid_plan": null,
+      "expected_invalid_output": null,
+      "manifest_url": "https://manifest.example.com/c2pa?id=fictional&kind=\"article\"",
+      "expected_meta_output_js": "<html><head><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><div role=\"main\"><p>Role based article boundary.</p></div></body></html>",
+      "expected_meta_output_rust": "<html><head><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><div role=\"main\"><p>Role based article boundary.</p></div></body></html>",
+      "meta_divergence": null
+    },
+    {
+      "id": "paragraph-cluster",
+      "html": "<html><head></head><body><div class=\"shell\"><p>One.</p><p>Two.</p><p>Three.</p><p>Four.</p><p>Five.</p></div></body></html>",
+      "override_selector": null,
+      "boundary": {
+        "selector": "p-cluster",
+        "start": 25,
+        "end": 109
+      },
+      "text": "One. Two. Three. Four. Five.",
+      "text_rust": "One. Two. Three. Four. Five.",
+      "text_divergence": null,
+      "plan": {
+        "index_unit": "codepoint",
+        "operations": [
+          {
+            "insert_after_index": -1,
+            "marker": "﻿"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︀"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︁"
+          }
+        ]
+      },
+      "expected_output": "<html><head></head><body><div class=\"shell\"><p>﻿O︀︁ne.</p><p>Two.</p><p>Three.</p><p>Four.</p><p>Five.</p></div></body></html>",
+      "invalid_plan": null,
+      "expected_invalid_output": null,
+      "manifest_url": "https://manifest.example.com/c2pa?id=fictional&kind=\"article\"",
+      "expected_meta_output_js": "<html><head><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><div class=\"shell\"><p>One.</p><p>Two.</p><p>Three.</p><p>Four.</p><p>Five.</p></div></body></html>",
+      "expected_meta_output_rust": "<html><head><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><div class=\"shell\"><p>One.</p><p>Two.</p><p>Three.</p><p>Four.</p><p>Five.</p></div></body></html>",
+      "meta_divergence": null
+    },
+    {
+      "id": "body-fallback",
+      "html": "<html><head></head><body><h1>Fallback</h1><span>Body article text.</span></body></html>",
+      "override_selector": null,
+      "boundary": {
+        "selector": "body",
+        "start": 19,
+        "end": 80
+      },
+      "text": "Fallback Body article text.",
+      "text_rust": "Fallback Body article text.",
+      "text_divergence": null,
+      "plan": {
+        "index_unit": "codepoint",
+        "operations": [
+          {
+            "insert_after_index": -1,
+            "marker": "﻿"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︀"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︁"
+          }
+        ]
+      },
+      "expected_output": "<html><head></head><body><h1>﻿F︀︁allback</h1><span>Body article text.</span></body></html>",
+      "invalid_plan": null,
+      "expected_invalid_output": null,
+      "manifest_url": "https://manifest.example.com/c2pa?id=fictional&kind=\"article\"",
+      "expected_meta_output_js": "<html><head><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><h1>Fallback</h1><span>Body article text.</span></body></html>",
+      "expected_meta_output_rust": "<html><head><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><h1>Fallback</h1><span>Body article text.</span></body></html>",
+      "meta_divergence": null
+    },
+    {
+      "id": "nested-same-name-first-close",
+      "html": "<html><head></head><body><article><p>Outer start.</p><article><p>Inner text.</p></article><p>Outer tail omitted by parity.</p></article></body></html>",
+      "override_selector": null,
+      "boundary": {
+        "selector": "article",
+        "start": 25,
+        "end": 90
+      },
+      "text": "Outer start. Inner text.",
+      "text_rust": "Outer start. Inner text.",
+      "text_divergence": null,
+      "plan": {
+        "index_unit": "codepoint",
+        "operations": [
+          {
+            "insert_after_index": -1,
+            "marker": "﻿"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︀"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︁"
+          }
+        ]
+      },
+      "expected_output": "<html><head></head><body><article><p>﻿O︀︁uter start.</p><article><p>Inner text.</p></article><p>Outer tail omitted by parity.</p></article></body></html>",
+      "invalid_plan": null,
+      "expected_invalid_output": null,
+      "manifest_url": "https://manifest.example.com/c2pa?id=fictional&kind=\"article\"",
+      "expected_meta_output_js": "<html><head><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><article><p>Outer start.</p><article><p>Inner text.</p></article><p>Outer tail omitted by parity.</p></article></body></html>",
+      "expected_meta_output_rust": "<html><head><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><article><p>Outer start.</p><article><p>Inner text.</p></article><p>Outer tail omitted by parity.</p></article></body></html>",
+      "meta_divergence": null
+    },
+    {
+      "id": "head-close-inside-script",
+      "html": "<html><head><script>const close = \"</head>\";</script><title>Script case</title></head><body><p>Script boundary fallback.</p></body></html>",
+      "override_selector": null,
+      "boundary": {
+        "selector": "body",
+        "start": 86,
+        "end": 131
+      },
+      "text": "Script boundary fallback.",
+      "text_rust": "Script boundary fallback.",
+      "text_divergence": null,
+      "plan": {
+        "index_unit": "codepoint",
+        "operations": [
+          {
+            "insert_after_index": -1,
+            "marker": "﻿"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︀"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︁"
+          }
+        ]
+      },
+      "expected_output": "<html><head><script>const close = \"</head>\";</script><title>Script case</title></head><body><p>﻿S︀︁cript boundary fallback.</p></body></html>",
+      "invalid_plan": null,
+      "expected_invalid_output": null,
+      "manifest_url": "https://manifest.example.com/c2pa?id=fictional&kind=\"article\"",
+      "expected_meta_output_js": "<html><head><script>const close = \"<meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head>\";</script><title>Script case</title></head><body><p>Script boundary fallback.</p></body></html>",
+      "expected_meta_output_rust": "<html><head><script>const close = \"</head>\";</script><title>Script case</title><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><p>Script boundary fallback.</p></body></html>",
+      "meta_divergence": "JS inserts at a closing-head sequence inside script text; Rust inserts before the structural closing head tag."
+    },
+    {
+      "id": "head-close-inside-comment",
+      "html": "<html><head><!-- misleading </head> marker --><title>Comment case</title></head><body><p>Comment boundary fallback.</p></body></html>",
+      "override_selector": null,
+      "boundary": {
+        "selector": "body",
+        "start": 80,
+        "end": 126
+      },
+      "text": "Comment boundary fallback.",
+      "text_rust": "Comment boundary fallback.",
+      "text_divergence": null,
+      "plan": {
+        "index_unit": "codepoint",
+        "operations": [
+          {
+            "insert_after_index": -1,
+            "marker": "﻿"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︀"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︁"
+          }
+        ]
+      },
+      "expected_output": "<html><head><!-- misleading </head> marker --><title>Comment case</title></head><body><p>﻿C︀︁omment boundary fallback.</p></body></html>",
+      "invalid_plan": null,
+      "expected_invalid_output": null,
+      "manifest_url": "https://manifest.example.com/c2pa?id=fictional&kind=\"article\"",
+      "expected_meta_output_js": "<html><head><!-- misleading <meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head> marker --><title>Comment case</title></head><body><p>Comment boundary fallback.</p></body></html>",
+      "expected_meta_output_rust": "<html><head><!-- misleading </head> marker --><title>Comment case</title><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><p>Comment boundary fallback.</p></body></html>",
+      "meta_divergence": "JS inserts at a closing-head sequence inside a comment; Rust inserts before the structural closing head tag."
+    },
+    {
+      "id": "head-close-inside-title",
+      "html": "<html><head><title>Headline </head> text</title></head><body><p>Title boundary fallback.</p></body></html>",
+      "override_selector": null,
+      "boundary": {
+        "selector": "body",
+        "start": 55,
+        "end": 99
+      },
+      "text": "Title boundary fallback.",
+      "text_rust": "Title boundary fallback.",
+      "text_divergence": null,
+      "plan": {
+        "index_unit": "codepoint",
+        "operations": [
+          {
+            "insert_after_index": -1,
+            "marker": "﻿"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︀"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︁"
+          }
+        ]
+      },
+      "expected_output": "<html><head><title>Headline </head> text</title></head><body><p>﻿T︀︁itle boundary fallback.</p></body></html>",
+      "invalid_plan": null,
+      "expected_invalid_output": null,
+      "manifest_url": "https://manifest.example.com/c2pa?id=fictional&kind=\"article\"",
+      "expected_meta_output_js": "<html><head><title>Headline <meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head> text</title></head><body><p>Title boundary fallback.</p></body></html>",
+      "expected_meta_output_rust": "<html><head><title>Headline </head> text</title><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><p>Title boundary fallback.</p></body></html>",
+      "meta_divergence": "JS inserts at a closing-head sequence inside title text; Rust never searches raw-text or RCDATA content for the closing head tag."
+    },
+    {
+      "id": "javascript-whitespace-set",
+      "html": "<html><head></head><body><article><p>Alpha﻿  beta\t gamma.</p></article></body></html>",
+      "override_selector": null,
+      "boundary": {
+        "selector": "article",
+        "start": 25,
+        "end": 77
+      },
+      "text": "Alpha beta gamma.",
+      "text_rust": "Alpha beta gamma.",
+      "text_divergence": null,
+      "plan": {
+        "index_unit": "codepoint",
+        "operations": [
+          {
+            "insert_after_index": -1,
+            "marker": "﻿"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︀"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︁"
+          }
+        ]
+      },
+      "expected_output": "<html><head></head><body><article><p>﻿A︀︁lpha﻿  beta\t gamma.</p></article></body></html>",
+      "invalid_plan": null,
+      "expected_invalid_output": null,
+      "manifest_url": "https://manifest.example.com/c2pa?id=fictional&kind=\"article\"",
+      "expected_meta_output_js": "<html><head><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><article><p>Alpha﻿  beta\t gamma.</p></article></body></html>",
+      "expected_meta_output_rust": "<html><head><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><article><p>Alpha﻿  beta\t gamma.</p></article></body></html>",
+      "meta_divergence": null
+    },
+    {
+      "id": "skip-raw-elements-and-numeric-entities",
+      "html": "<html><head></head><body><article><p>Visible &#65;.</p><code>Hidden code.</code><pre>Hidden pre.</pre><script>Hidden script.</script><p>Tail &#x42;.</p></article></body></html>",
+      "override_selector": null,
+      "boundary": {
+        "selector": "article",
+        "start": 25,
+        "end": 162
+      },
+      "text": "Visible A. Tail B.",
+      "text_rust": "Visible A. Tail B.",
+      "text_divergence": null,
+      "plan": {
+        "index_unit": "codepoint",
+        "operations": [
+          {
+            "insert_after_index": -1,
+            "marker": "﻿"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︀"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︁"
+          }
+        ]
+      },
+      "expected_output": "<html><head></head><body><article><p>﻿V︀︁isible &#65;.</p><code>Hidden code.</code><pre>Hidden pre.</pre><script>Hidden script.</script><p>Tail &#x42;.</p></article></body></html>",
+      "invalid_plan": null,
+      "expected_invalid_output": null,
+      "manifest_url": "https://manifest.example.com/c2pa?id=fictional&kind=\"article\"",
+      "expected_meta_output_js": "<html><head><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><article><p>Visible &#65;.</p><code>Hidden code.</code><pre>Hidden pre.</pre><script>Hidden script.</script><p>Tail &#x42;.</p></article></body></html>",
+      "expected_meta_output_rust": "<html><head><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><article><p>Visible &#65;.</p><code>Hidden code.</code><pre>Hidden pre.</pre><script>Hidden script.</script><p>Tail &#x42;.</p></article></body></html>",
+      "meta_divergence": null
+    },
+    {
+      "id": "only-the-seven-skip-elements-are-hidden",
+      "html": "<html><head></head><body><article><p>Lead text.</p><textarea>Draft note.</textarea><iframe>Frame fallback.</iframe><title>Inline title.</title><p>After.</p></article></body></html>",
+      "override_selector": null,
+      "boundary": {
+        "selector": "article",
+        "start": 25,
+        "end": 166
+      },
+      "text": "Lead text. Draft note. Frame fallback. Inline title. After.",
+      "text_rust": "Lead text. Draft note. Frame fallback. Inline title. After.",
+      "text_divergence": null,
+      "plan": {
+        "index_unit": "codepoint",
+        "operations": [
+          {
+            "insert_after_index": -1,
+            "marker": "﻿"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︀"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︁"
+          }
+        ]
+      },
+      "expected_output": "<html><head></head><body><article><p>﻿L︀︁ead text.</p><textarea>Draft note.</textarea><iframe>Frame fallback.</iframe><title>Inline title.</title><p>After.</p></article></body></html>",
+      "invalid_plan": null,
+      "expected_invalid_output": null,
+      "manifest_url": "https://manifest.example.com/c2pa?id=fictional&kind=\"article\"",
+      "expected_meta_output_js": "<html><head><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><article><p>Lead text.</p><textarea>Draft note.</textarea><iframe>Frame fallback.</iframe><title>Inline title.</title><p>After.</p></article></body></html>",
+      "expected_meta_output_rust": "<html><head><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><article><p>Lead text.</p><textarea>Draft note.</textarea><iframe>Frame fallback.</iframe><title>Inline title.</title><p>After.</p></article></body></html>",
+      "meta_divergence": null
+    },
+    {
+      "id": "self-closing-svg-hides-nothing",
+      "html": "<html><head></head><body><article><p>Lead text.</p><svg viewBox=\"0 0 1 1\"/><p>After icon.</p></article></body></html>",
+      "override_selector": null,
+      "boundary": {
+        "selector": "article",
+        "start": 25,
+        "end": 103
+      },
+      "text": "Lead text. After icon.",
+      "text_rust": "Lead text. After icon.",
+      "text_divergence": null,
+      "plan": {
+        "index_unit": "codepoint",
+        "operations": [
+          {
+            "insert_after_index": -1,
+            "marker": "﻿"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︀"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︁"
+          }
+        ]
+      },
+      "expected_output": "<html><head></head><body><article><p>﻿L︀︁ead text.</p><svg viewBox=\"0 0 1 1\"/><p>After icon.</p></article></body></html>",
+      "invalid_plan": null,
+      "expected_invalid_output": null,
+      "manifest_url": "https://manifest.example.com/c2pa?id=fictional&kind=\"article\"",
+      "expected_meta_output_js": "<html><head><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><article><p>Lead text.</p><svg viewBox=\"0 0 1 1\"/><p>After icon.</p></article></body></html>",
+      "expected_meta_output_rust": "<html><head><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><article><p>Lead text.</p><svg viewBox=\"0 0 1 1\"/><p>After icon.</p></article></body></html>",
+      "meta_divergence": null
+    },
+    {
+      "id": "quoted-gt-in-attribute",
+      "html": "<html><head></head><body><article><p>Lead text.</p><p><img alt=\"a > b\">Tail text.</p></article></body></html>",
+      "override_selector": null,
+      "boundary": {
+        "selector": "article",
+        "start": 25,
+        "end": 95
+      },
+      "text": "Lead text. b\">Tail text.",
+      "text_rust": "Lead text. Tail text.",
+      "text_divergence": "JS ends a tag at the first \">\", so the rest of the alt value becomes text; Rust ends it at the first \">\" outside a quoted attribute value.",
+      "plan": {
+        "index_unit": "codepoint",
+        "operations": [
+          {
+            "insert_after_index": -1,
+            "marker": "﻿"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︀"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︁"
+          }
+        ]
+      },
+      "expected_output": "<html><head></head><body><article><p>﻿L︀︁ead text.</p><p><img alt=\"a > b\">Tail text.</p></article></body></html>",
+      "invalid_plan": null,
+      "expected_invalid_output": null,
+      "manifest_url": "https://manifest.example.com/c2pa?id=fictional&kind=\"article\"",
+      "expected_meta_output_js": "<html><head><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><article><p>Lead text.</p><p><img alt=\"a > b\">Tail text.</p></article></body></html>",
+      "expected_meta_output_rust": "<html><head><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><article><p>Lead text.</p><p><img alt=\"a > b\">Tail text.</p></article></body></html>",
+      "meta_divergence": null
+    },
+    {
+      "id": "nested-same-name-ignored-element",
+      "html": "<html><head></head><body><article><p>Lead text.</p><code>outer <code>inner</code> tail</code><p>After.</p></article></body></html>",
+      "override_selector": null,
+      "boundary": {
+        "selector": "article",
+        "start": 25,
+        "end": 116
+      },
+      "text": "Lead text. After.",
+      "text_rust": "Lead text. tail After.",
+      "text_divergence": "JS counts nested start and end tags and drops the outer tail; Rust closes the ignored region at the first matching end tag.",
+      "plan": {
+        "index_unit": "codepoint",
+        "operations": [
+          {
+            "insert_after_index": -1,
+            "marker": "﻿"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︀"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︁"
+          }
+        ]
+      },
+      "expected_output": "<html><head></head><body><article><p>﻿L︀︁ead text.</p><code>outer <code>inner</code> tail</code><p>After.</p></article></body></html>",
+      "invalid_plan": null,
+      "expected_invalid_output": null,
+      "manifest_url": "https://manifest.example.com/c2pa?id=fictional&kind=\"article\"",
+      "expected_meta_output_js": "<html><head><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><article><p>Lead text.</p><code>outer <code>inner</code> tail</code><p>After.</p></article></body></html>",
+      "expected_meta_output_rust": "<html><head><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><article><p>Lead text.</p><code>outer <code>inner</code> tail</code><p>After.</p></article></body></html>",
+      "meta_divergence": null
+    },
+    {
+      "id": "self-closing-script-stays-raw-text",
+      "html": "<html><head></head><body><article><p>Lead text.</p><script/>var hidden = 1;</script><p>After.</p></article></body></html>",
+      "override_selector": null,
+      "boundary": {
+        "selector": "article",
+        "start": 25,
+        "end": 107
+      },
+      "text": "Lead text. var hidden = 1; After.",
+      "text_rust": "Lead text. After.",
+      "text_divergence": "JS treats \"<script/>\" as empty and keeps the script body as text; Rust, like browsers, keeps script content hidden until </script>.",
+      "plan": {
+        "index_unit": "codepoint",
+        "operations": [
+          {
+            "insert_after_index": -1,
+            "marker": "﻿"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︀"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︁"
+          }
+        ]
+      },
+      "expected_output": "<html><head></head><body><article><p>﻿L︀︁ead text.</p><script/>var hidden = 1;</script><p>After.</p></article></body></html>",
+      "invalid_plan": null,
+      "expected_invalid_output": null,
+      "manifest_url": "https://manifest.example.com/c2pa?id=fictional&kind=\"article\"",
+      "expected_meta_output_js": "<html><head><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><article><p>Lead text.</p><script/>var hidden = 1;</script><p>After.</p></article></body></html>",
+      "expected_meta_output_rust": "<html><head><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><article><p>Lead text.</p><script/>var hidden = 1;</script><p>After.</p></article></body></html>",
+      "meta_divergence": null
+    },
+    {
+      "id": "end-tag-with-attributes-closes-ignored-element",
+      "html": "<html><head></head><body><article><p>Lead text.</p><script>var hidden = 1;</script data-x><style>p{}</style/><p>After.</p></article></body></html>",
+      "override_selector": null,
+      "boundary": {
+        "selector": "article",
+        "start": 25,
+        "end": 132
+      },
+      "text": "Lead text. After.",
+      "text_rust": "Lead text. After.",
+      "text_divergence": null,
+      "plan": {
+        "index_unit": "codepoint",
+        "operations": [
+          {
+            "insert_after_index": -1,
+            "marker": "﻿"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︀"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︁"
+          }
+        ]
+      },
+      "expected_output": "<html><head></head><body><article><p>﻿L︀︁ead text.</p><script>var hidden = 1;</script data-x><style>p{}</style/><p>After.</p></article></body></html>",
+      "invalid_plan": null,
+      "expected_invalid_output": null,
+      "manifest_url": "https://manifest.example.com/c2pa?id=fictional&kind=\"article\"",
+      "expected_meta_output_js": "<html><head><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><article><p>Lead text.</p><script>var hidden = 1;</script data-x><style>p{}</style/><p>After.</p></article></body></html>",
+      "expected_meta_output_rust": "<html><head><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><article><p>Lead text.</p><script>var hidden = 1;</script data-x><style>p{}</style/><p>After.</p></article></body></html>",
+      "meta_divergence": null
+    },
+    {
+      "id": "abrupt-and-bang-comment-ends",
+      "html": "<html><head></head><body><article><p>Lead text.</p><!-->Shown one.<!--->Shown two.<!-- note --!>Shown three.<p>After.</p></article></body></html>",
+      "override_selector": null,
+      "boundary": {
+        "selector": "article",
+        "start": 25,
+        "end": 131
+      },
+      "text": "Lead text. Shown two.",
+      "text_rust": "Lead text. Shown one. Shown two. Shown three. After.",
+      "text_divergence": "JS ends every comment at the next \"-->\"; Rust, like browsers, treats \"<!-->\" and \"<!--->\" as whole comments and also ends a comment at \"--!>\".",
+      "plan": {
+        "index_unit": "codepoint",
+        "operations": [
+          {
+            "insert_after_index": -1,
+            "marker": "﻿"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︀"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︁"
+          }
+        ]
+      },
+      "expected_output": "<html><head></head><body><article><p>﻿L︀︁ead text.</p><!-->Shown one.<!--->Shown two.<!-- note --!>Shown three.<p>After.</p></article></body></html>",
+      "invalid_plan": null,
+      "expected_invalid_output": null,
+      "manifest_url": "https://manifest.example.com/c2pa?id=fictional&kind=\"article\"",
+      "expected_meta_output_js": "<html><head><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><article><p>Lead text.</p><!-->Shown one.<!--->Shown two.<!-- note --!>Shown three.<p>After.</p></article></body></html>",
+      "expected_meta_output_rust": "<html><head><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><article><p>Lead text.</p><!-->Shown one.<!--->Shown two.<!-- note --!>Shown three.<p>After.</p></article></body></html>",
+      "meta_divergence": null
+    },
+    {
+      "id": "out-of-range-index",
+      "html": "<html><head></head><body><article><p>Small boundary.</p></article></body></html>",
+      "override_selector": null,
+      "boundary": {
+        "selector": "article",
+        "start": 25,
+        "end": 66
+      },
+      "text": "Small boundary.",
+      "text_rust": "Small boundary.",
+      "text_divergence": null,
+      "plan": {
+        "index_unit": "codepoint",
+        "operations": [
+          {
+            "insert_after_index": -1,
+            "marker": "﻿"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︀"
+          },
+          {
+            "insert_after_index": 0,
+            "marker": "︁"
+          }
+        ]
+      },
+      "expected_output": "<html><head></head><body><article><p>﻿S︀︁mall boundary.</p></article></body></html>",
+      "invalid_plan": {
+        "index_unit": "codepoint",
+        "operations": [
+          {
+            "insert_after_index": 15,
+            "marker": "︀"
+          }
+        ]
+      },
+      "expected_invalid_output": null,
+      "manifest_url": "https://manifest.example.com/c2pa?id=fictional&kind=\"article\"",
+      "expected_meta_output_js": "<html><head><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><article><p>Small boundary.</p></article></body></html>",
+      "expected_meta_output_rust": "<html><head><meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/c2pa?id=fictional&amp;kind=&quot;article&quot;\"></head><body><article><p>Small boundary.</p></article></body></html>",
+      "meta_divergence": null
+    }
+  ]
+}
