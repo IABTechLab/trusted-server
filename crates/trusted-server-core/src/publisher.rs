@@ -4449,17 +4449,22 @@ pub async fn handle_publisher_request(
     // Prebid.js requests are not intercepted here anymore. The HTML processor removes
     // publisher-supplied Prebid scripts; the unified TSJS bundle includes Prebid.js when enabled.
 
-    // Extract request host and scheme (uses Host header and TLS detection after edge sanitization)
+    // Extract request host and scheme using Host or URI authority and TLS
+    // detection after edge sanitization.
     let request_info = RequestInfo::from_request(&req, services.client_info());
     let request_host = &request_info.host;
     let request_scheme = &request_info.scheme;
 
     log::debug!(
-        "Request info: host={}, scheme={} (X-Forwarded-Host: {:?}, Host: {:?}, X-Forwarded-Proto: {:?})",
+        "Request info: host={}, scheme={} (X-Forwarded-Host: {:?}, Host: {:?}, URI host: {:?}, URI port: {:?}, X-Forwarded-Proto: {:?})",
         request_host,
         request_scheme,
         req.headers().get("x-forwarded-host"),
         req.headers().get(header::HOST),
+        req.uri().authority().map(http::uri::Authority::host),
+        req.uri()
+            .authority()
+            .and_then(http::uri::Authority::port_u16),
         req.headers().get("x-forwarded-proto"),
     );
 
@@ -19730,6 +19735,81 @@ mod tests {
             Some("max-age=300, stale-while-revalidate=60, stale-if-error=86400"),
             "mismatched hash should retain the short Fastly edge TTL"
         );
+    }
+
+    #[tokio::test]
+    async fn publisher_request_rewrites_html_using_uri_authority() {
+        for version in [http::Version::HTTP_11, http::Version::HTTP_2] {
+            for (uri, empty_host) in [
+                ("https://publisher.example.com:8443/page", false),
+                ("https://user:pass@publisher.example.com:8443/page", false),
+                ("https://publisher.example.com:8443/page", true),
+            ] {
+                let mut settings = create_test_settings();
+                settings.publisher.origin_url = "https://origin.example.com".to_owned();
+                let registry = IntegrationRegistry::new(&settings)
+                    .expect("should create integration registry");
+                let stub = Arc::new(StubHttpClient::new());
+                stub.push_response_with_headers(
+                    200,
+                    b"<html><head></head><body><a href=\"https://origin.example.com/article\">Article</a></body></html>".to_vec(),
+                    vec![("content-type", "text/html; charset=utf-8")],
+                );
+                let services = build_services_with_http_client(
+                    Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+                );
+                let mut req = HttpRequest::builder()
+                    .version(version)
+                    .uri(uri)
+                    .header("x-forwarded-proto", "https")
+                    .header("sec-fetch-dest", "document")
+                    .body(EdgeBody::empty())
+                    .expect("should build authority-only publisher request");
+                if empty_host {
+                    req.headers_mut()
+                        .insert(header::HOST, HeaderValue::from_static(""));
+                }
+                for name in ["forwarded", "x-forwarded-host"] {
+                    assert!(
+                        !req.headers().contains_key(name),
+                        "should have no {name} header"
+                    );
+                }
+
+                assert!(
+                    req.headers()
+                        .get(header::HOST)
+                        .is_none_or(HeaderValue::is_empty),
+                    "should have no nonempty Host header"
+                );
+
+                let publisher_response = run_publisher_proxy(&settings, &services, req).await;
+                let response = buffer_publisher_response_async(
+                    publisher_response,
+                    &Method::GET,
+                    &settings,
+                    &registry,
+                    &AuctionOrchestrator::new(settings.auction.clone()),
+                    &services,
+                )
+                .await
+                .expect("should buffer processed publisher response");
+                let html = response_body_string(response);
+
+                assert!(
+                    html.contains("href=\"https://publisher.example.com:8443/article\""),
+                    "should rewrite origin links using URI authority: {html}"
+                );
+                assert!(
+                    !html.contains("user:pass@"),
+                    "should omit URI userinfo from rewritten HTML: {html}"
+                );
+                assert!(
+                    html.contains("id=\"trustedserver-js\""),
+                    "should inject the Trusted Server script: {html}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
