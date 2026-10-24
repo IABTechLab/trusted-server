@@ -7,7 +7,7 @@ use crate::auction::telemetry::{AuctionTelemetrySink, NoopAuctionTelemetrySink};
 
 use super::{
     GeoModule, PlatformBackend, PlatformConfigStore, PlatformHttpClient, PlatformKvStore,
-    PlatformSecretStore,
+    PlatformSecretStore, PlatformTimer,
 };
 use crate::ec::device::DeviceModule;
 use crate::ec::identifiers::IdentifierModule;
@@ -203,6 +203,9 @@ pub struct RuntimeServices {
     pub(crate) geo: Arc<dyn GeoModule>,
     /// Auction telemetry sink.
     pub(crate) auction_telemetry_sink: Arc<dyn AuctionTelemetrySink>,
+    /// Wall-clock timer, when the runtime can fire one while request work is
+    /// pending. `None` means the platform has no such timer.
+    pub(crate) timer: Option<Arc<dyn PlatformTimer>>,
     /// Per-request client metadata extracted at the entry point.
     pub(crate) client_info: ClientInfo,
     /// Host-computed client signals (TLS JA4, HTTP/2), when the host
@@ -348,6 +351,13 @@ impl RuntimeServices {
     #[must_use]
     pub fn auction_telemetry_sink(&self) -> &dyn AuctionTelemetrySink {
         &*self.auction_telemetry_sink
+    }
+
+    /// Returns the platform timer, or `None` when the runtime cannot fire a
+    /// timer while request work is pending.
+    #[must_use]
+    pub fn timer(&self) -> Option<&dyn PlatformTimer> {
+        self.timer.as_deref()
     }
 
     /// Returns per-request client metadata (IP address, TLS details).
@@ -599,6 +609,15 @@ impl RuntimeServices {
             ..self
         }
     }
+
+    /// Returns a clone of this instance with `timer` as the platform timer.
+    #[must_use]
+    pub fn with_timer(self, timer: Arc<dyn PlatformTimer>) -> Self {
+        Self {
+            timer: Some(timer),
+            ..self
+        }
+    }
 }
 
 impl fmt::Debug for RuntimeServices {
@@ -625,6 +644,7 @@ pub struct RuntimeServicesBuilder {
     http_client: Option<Arc<dyn PlatformHttpClient>>,
     geo: Option<Arc<dyn GeoModule>>,
     auction_telemetry_sink: Option<Arc<dyn AuctionTelemetrySink>>,
+    timer: Option<Arc<dyn PlatformTimer>>,
     client_info: Option<ClientInfo>,
     host_signals: Option<Arc<dyn HostSignals>>,
     resolved_ec_module: Option<Arc<dyn EdgeCookieModule>>,
@@ -648,6 +668,7 @@ impl RuntimeServicesBuilder {
             http_client: None,
             geo: None,
             auction_telemetry_sink: None,
+            timer: None,
             client_info: None,
             host_signals: None,
             resolved_ec_module: None,
@@ -738,6 +759,16 @@ impl RuntimeServicesBuilder {
         auction_telemetry_sink: Arc<dyn AuctionTelemetrySink>,
     ) -> Self {
         self.auction_telemetry_sink = Some(auction_telemetry_sink);
+        self
+    }
+
+    /// Set the platform timer, or `None` when the runtime has none.
+    ///
+    /// Only adapters whose runtime can fire a timer while request work is
+    /// pending provide one. Unset means no timer.
+    #[must_use]
+    pub fn timer(mut self, timer: Option<Arc<dyn PlatformTimer>>) -> Self {
+        self.timer = timer;
         self
     }
 
@@ -856,6 +887,7 @@ impl RuntimeServicesBuilder {
             auction_telemetry_sink: self
                 .auction_telemetry_sink
                 .unwrap_or_else(|| Arc::new(NoopAuctionTelemetrySink)),
+            timer: self.timer,
             client_info: self
                 .client_info
                 .expect("should set client_info before building RuntimeServices"),

@@ -15,6 +15,7 @@
 //! - [`PlatformTemplateCache`] — shared transformed-template caching
 //! - [`PlatformValueCache`], a shared cache of small values with lifetimes
 //! - [`PlatformLoadingCache`], a cache that loads a missing value once per key
+//! - [`PlatformTimer`], an optional timer for bounding asynchronous work
 //!
 //! ## Platform-Agnostic Components
 //!
@@ -57,6 +58,7 @@ mod template_cache;
     reason = "test doubles, offered to other crates' tests under the test-utils feature"
 )]
 pub mod test_support;
+mod timer;
 mod traits;
 mod types;
 mod value_cache;
@@ -101,6 +103,7 @@ pub use template_cache::{
 pub use traits::{
     GeoModule, PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformSecretStore,
 };
+pub use timer::PlatformTimer;
 pub use types::{
     ClientInfo, GeoInfo, PlatformBackendSpec, RuntimeServices, RuntimeServicesBuilder, StoreId,
     StoreName,

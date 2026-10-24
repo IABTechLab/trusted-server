@@ -12,7 +12,7 @@ use super::{
     ClientInfo, GeoInfo, PlatformBackend, PlatformBackendSpec, PlatformCacheIntent,
     PlatformConfigStore, PlatformError, PlatformGeo, PlatformHttpClient, PlatformHttpRequest,
     PlatformImageOptimizerOptions, PlatformPendingRequest, PlatformResponse, PlatformSecretStore,
-    PlatformSelectResult, RuntimeServices, StoreId, StoreName,
+    PlatformSelectResult, PlatformTimer, RuntimeServices, StoreId, StoreName,
 };
 
 pub struct NoopConfigStore;
@@ -58,6 +58,33 @@ impl PlatformSecretStore for NoopSecretStore {
 
     fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
         Err(Report::new(PlatformError::Unsupported))
+    }
+}
+
+/// A timer whose sleeps have always already elapsed, recording each requested
+/// duration. Work still pending when its deadline is first raced misses it.
+#[derive(Default)]
+pub struct ElapsedTimer {
+    pub requested: Mutex<Vec<Duration>>,
+}
+
+#[async_trait::async_trait(?Send)]
+impl PlatformTimer for ElapsedTimer {
+    async fn sleep(&self, duration: Duration) {
+        self.requested
+            .lock()
+            .expect("should lock requested durations")
+            .push(duration);
+    }
+}
+
+/// A timer that never fires.
+pub struct StoppedTimer;
+
+#[async_trait::async_trait(?Send)]
+impl PlatformTimer for StoppedTimer {
+    async fn sleep(&self, _duration: Duration) {
+        futures::future::pending::<()>().await;
     }
 }
 
