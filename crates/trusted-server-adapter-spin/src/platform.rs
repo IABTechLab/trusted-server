@@ -13,8 +13,8 @@ use http_body_util::BodyExt as _;
 use trusted_server_core::platform::{
     AuctionTargetCapabilities, AuctionTargetDescriptor, ClientInfo, GeoInfo, KvError,
     PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError, PlatformGeo,
-    PlatformHttpClient, PlatformKvStore, PlatformSecretStore, RuntimeServices, StoreId, StoreName,
-    UnavailableKvStore,
+    PlatformHttpClient, PlatformKvStore, PlatformSecretStore, PlatformTimer, RuntimeServices,
+    StoreId, StoreName, UnavailableKvStore,
 };
 
 #[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
@@ -758,6 +758,32 @@ impl PlatformSecretStore for SpinSecretStoreAdapter {
 }
 
 // ---------------------------------------------------------------------------
+// Timer — Spin wasm32 only (WASI monotonic clock)
+// ---------------------------------------------------------------------------
+
+/// Wall-clock timer backed by the WASI monotonic clock through
+/// [`spin_sdk::time::sleep`].
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+struct SpinPlatformTimer;
+
+#[cfg(all(feature = "spin", target_arch = "wasm32"))]
+#[async_trait::async_trait(?Send)]
+impl PlatformTimer for SpinPlatformTimer {
+    async fn sleep(&self, duration: Duration) {
+        spin_sdk::time::sleep(duration).await;
+    }
+}
+
+/// The WASI timer in the Spin component; none on the native host.
+fn runtime_timer() -> Option<Arc<dyn PlatformTimer>> {
+    #[cfg(all(feature = "spin", target_arch = "wasm32"))]
+    let timer: Option<Arc<dyn PlatformTimer>> = Some(Arc::new(SpinPlatformTimer));
+    #[cfg(not(all(feature = "spin", target_arch = "wasm32")))]
+    let timer: Option<Arc<dyn PlatformTimer>> = None;
+    timer
+}
+
+// ---------------------------------------------------------------------------
 // build_runtime_services
 // ---------------------------------------------------------------------------
 
@@ -816,6 +842,7 @@ pub fn build_runtime_services(
         // crates this adapter links, so every request asks exactly the ones
         // configuration named, in that order.
         .permission_signal_modules(Arc::clone(permission_signal_modules))
+        .timer(runtime_timer())
         .client_info(ClientInfo {
             client_ip,
             tls_protocol: None,

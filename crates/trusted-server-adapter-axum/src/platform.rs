@@ -16,8 +16,8 @@ use trusted_server_core::platform::{
     AuctionTargetCapabilities, AuctionTargetDescriptor, ClientInfo, GeoInfo, KvError,
     PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError, PlatformGeo,
     PlatformHttpClient, PlatformHttpRequest, PlatformKvStore, PlatformPendingRequest,
-    PlatformResponse, PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId,
-    StoreName, UnavailableKvStore,
+    PlatformResponse, PlatformSecretStore, PlatformSelectResult, PlatformTimer, RuntimeServices,
+    StoreId, StoreName, UnavailableKvStore,
 };
 
 // ---------------------------------------------------------------------------
@@ -764,6 +764,7 @@ pub fn build_runtime_services(
         std::sync::OnceLock::new();
     static BACKEND: std::sync::OnceLock<Arc<dyn PlatformBackend>> = std::sync::OnceLock::new();
     static GEO: std::sync::OnceLock<Arc<dyn PlatformGeo>> = std::sync::OnceLock::new();
+    static TIMER: std::sync::OnceLock<Arc<dyn PlatformTimer>> = std::sync::OnceLock::new();
 
     RuntimeServices::builder()
         .config_store(Arc::clone(CONFIG_STORE.get_or_init(|| {
@@ -791,6 +792,9 @@ pub fn build_runtime_services(
         // crates this adapter links, so every request asks exactly the ones
         // configuration named, in that order.
         .permission_signal_modules(Arc::clone(permission_signal_modules))
+        .timer(Some(Arc::clone(TIMER.get_or_init(|| {
+            Arc::new(AxumPlatformTimer) as Arc<dyn PlatformTimer>
+        }))))
         .client_info(ClientInfo {
             client_ip,
             tls_protocol: None,
@@ -798,6 +802,20 @@ pub fn build_runtime_services(
             ..ClientInfo::default()
         })
         .build()
+}
+
+// ---------------------------------------------------------------------------
+// AxumPlatformTimer
+// ---------------------------------------------------------------------------
+
+/// Wall-clock timer backed by the tokio runtime's time driver.
+pub struct AxumPlatformTimer;
+
+#[async_trait(?Send)]
+impl PlatformTimer for AxumPlatformTimer {
+    async fn sleep(&self, duration: Duration) {
+        tokio::time::sleep(duration).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -847,6 +865,23 @@ mod tests {
         assert!(
             !capabilities.has_enforceable_total_request_deadline(),
             "reqwest's transport timeout is not an adapter-enforced auction deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_timer_releases_work_that_never_completes() {
+        let services = test_services();
+        let timer = services.timer().expect("should provide a runtime timer");
+
+        let raced = futures::future::select(
+            Box::pin(futures::future::pending::<()>()),
+            timer.sleep(Duration::from_millis(5)),
+        )
+        .await;
+
+        assert!(
+            matches!(raced, futures::future::Either::Right(_)),
+            "should fire while the other future stays pending"
         );
     }
 
