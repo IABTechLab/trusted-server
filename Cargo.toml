@@ -22,6 +22,7 @@ members = [
     "crates/ads-txt/iabtl",
     "crates/analytics/tinybird",
     "crates/headers/geo",
+    "crates/provenance/encypher",
     "crates/loading-cache/51degrees",
     "crates/shared/aws",
     "crates/shared/51degrees",
@@ -176,6 +177,7 @@ trusted-server-cmp-inmobi = { path = "crates/cmp/inmobi" }
 trusted-server-ads-txt-iabtl = { path = "crates/ads-txt/iabtl" }
 trusted-server-analytics-tinybird = { path = "crates/analytics/tinybird" }
 trusted-server-headers-geo = { path = "crates/headers/geo" }
+trusted-server-provenance-encypher = { path = "crates/provenance/encypher" }
 trusted-server-loading-cache-51degrees = { path = "crates/loading-cache/51degrees" }
 trusted-server-shared-aws = { path = "crates/shared/aws" }
 trusted-server-shared-51degrees = { path = "crates/shared/51degrees" }

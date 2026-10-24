@@ -1,18 +1,23 @@
 use std::future::Future;
 use std::net::IpAddr;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use edgezero_adapter_axum::key_value_store::PersistentKvStore;
 use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, header};
+use edgezero_core::key_value_store::{KvHandle, KvPage, KvStore};
 use error_stack::{Report, ResultExt as _};
 use trusted_server_core::platform::{
-    AuctionTargetCapabilities, AuctionTargetDescriptor, ClientInfo, GeoInfo, PlatformBackend,
-    PlatformBackendSpec, PlatformConfigStore, PlatformError, PlatformGeo, PlatformHttpClient,
-    PlatformHttpRequest, PlatformPendingRequest, PlatformResponse, PlatformSecretStore,
-    PlatformSelectResult, RuntimeServices, StoreId, StoreName,
+    AuctionTargetCapabilities, AuctionTargetDescriptor, ClientInfo, GeoInfo, KvError,
+    PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError, PlatformGeo,
+    PlatformHttpClient, PlatformHttpRequest, PlatformKvStore, PlatformPendingRequest,
+    PlatformResponse, PlatformSecretStore, PlatformSelectResult, PlatformTimer, RuntimeServices,
+    StoreId, StoreName, UnavailableKvStore,
 };
 
 // ---------------------------------------------------------------------------
@@ -564,16 +569,165 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
 }
 
 // ---------------------------------------------------------------------------
+// Runtime KV
+// ---------------------------------------------------------------------------
+
+/// Environment variable naming the file that backs runtime KV.
+///
+/// When set at startup, the dev server persists runtime KV in that file. When
+/// unset, runtime KV is unavailable.
+pub const KV_PATH_ENV: &str = "TRUSTED_SERVER_KV_PATH";
+
+/// Open the persistent runtime KV store at `path`, creating missing parent
+/// directories.
+///
+/// # Errors
+///
+/// Returns an error when the directory cannot be created or the database
+/// cannot be opened (corrupted file, locked by another process).
+pub fn open_kv_handle(path: &Path) -> Result<KvHandle, KvError> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(|err| {
+            KvError::Internal(anyhow::anyhow!(
+                "failed to create KV directory `{}`: {err}",
+                parent.display()
+            ))
+        })?;
+    }
+    Ok(KvHandle::new(Arc::new(BlockingPoolKvStore(Arc::new(
+        PersistentKvStore::new(path)?,
+    )))))
+}
+
+/// Runs each operation of a synchronous [`KvStore`] on Tokio's blocking pool.
+///
+/// [`PersistentKvStore`] does its `redb` transactions inside its `async fn`s
+/// without yielding, so a slow commit would hold the request task and keep
+/// any timer raced against it (an integration deadline, for example) from
+/// firing. Here the request task only awaits the blocking task and stays
+/// free to observe its deadline.
+///
+/// A caller that stops waiting drops only the join handle: the operation
+/// keeps running to its end in the background. That is safe for `redb`. A
+/// write either commits atomically or fails and its transaction aborts on
+/// drop, and `redb` admits one write transaction at a time, so a later
+/// operation waits for the abandoned one instead of interleaving with it.
+/// Dropping the Tokio runtime waits for running blocking tasks, so a commit in
+/// flight is not cut short when the server stops.
+struct BlockingPoolKvStore<S>(Arc<S>);
+
+impl<S: KvStore + 'static> BlockingPoolKvStore<S> {
+    async fn run<T, F, Fut>(&self, op: F) -> Result<T, KvError>
+    where
+        T: Send + 'static,
+        F: FnOnce(Arc<S>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<T, KvError>>,
+    {
+        let store = Arc::clone(&self.0);
+        tokio::task::spawn_blocking(move || futures::executor::block_on(op(store)))
+            .await
+            .map_err(|err| KvError::Internal(anyhow::anyhow!("KV task failed: {err}")))?
+    }
+}
+
+#[async_trait(?Send)]
+impl<S: KvStore + 'static> KvStore for BlockingPoolKvStore<S> {
+    async fn delete(&self, key: &str) -> Result<(), KvError> {
+        let key = key.to_owned();
+        self.run(move |store| async move { store.delete(&key).await })
+            .await
+    }
+
+    async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, KvError> {
+        let key = key.to_owned();
+        self.run(move |store| async move { store.get_bytes(&key).await })
+            .await
+    }
+
+    async fn list_keys_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<KvPage, KvError> {
+        let prefix = prefix.to_owned();
+        let cursor = cursor.map(str::to_owned);
+        self.run(move |store| async move {
+            store
+                .list_keys_page(&prefix, cursor.as_deref(), limit)
+                .await
+        })
+        .await
+    }
+
+    async fn put_bytes(&self, key: &str, value: Bytes) -> Result<(), KvError> {
+        let key = key.to_owned();
+        self.run(move |store| async move { store.put_bytes(&key, value).await })
+            .await
+    }
+
+    async fn put_bytes_with_ttl(
+        &self,
+        key: &str,
+        value: Bytes,
+        ttl: Duration,
+    ) -> Result<(), KvError> {
+        let key = key.to_owned();
+        self.run(move |store| async move { store.put_bytes_with_ttl(&key, value, ttl).await })
+            .await
+    }
+}
+
+/// Bridges edgezero's [`KvHandle`] to [`PlatformKvStore`].
+struct KvHandleAdapter(KvHandle);
+
+#[async_trait(?Send)]
+impl KvStore for KvHandleAdapter {
+    async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, KvError> {
+        self.0.get_bytes(key).await
+    }
+
+    async fn put_bytes(&self, key: &str, value: Bytes) -> Result<(), KvError> {
+        self.0.put_bytes(key, value).await
+    }
+
+    async fn put_bytes_with_ttl(
+        &self,
+        key: &str,
+        value: Bytes,
+        ttl: Duration,
+    ) -> Result<(), KvError> {
+        self.0.put_bytes_with_ttl(key, value, ttl).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), KvError> {
+        self.0.delete(key).await
+    }
+
+    async fn list_keys_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<KvPage, KvError> {
+        self.0.list_keys_page(prefix, cursor, limit).await
+    }
+}
+
+// ---------------------------------------------------------------------------
 // build_runtime_services
 // ---------------------------------------------------------------------------
 
 /// Construct [`RuntimeServices`] for an incoming Axum request.
 ///
-/// # Degraded features in dev
+/// # Runtime KV
 ///
-/// The generic runtime KV slot uses
-/// [`trusted_server_core::platform::UnavailableKvStore`]. A `warn` log is
-/// emitted once per process.
+/// Runtime KV comes from the KV handle the dev server injects into each
+/// request, which `main` builds when [`KV_PATH_ENV`] is set. Without it the
+/// slot is [`UnavailableKvStore`] and a `warn` log is emitted once per process.
 pub fn build_runtime_services(
     ctx: &edgezero_core::context::RequestContext,
     settings: &trusted_server_core::settings::Settings,
@@ -581,17 +735,25 @@ pub fn build_runtime_services(
         [Arc<dyn trusted_server_core::permission_signal::PermissionSignalModule>],
     >,
 ) -> RuntimeServices {
-    static KV_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    KV_WARNED.get_or_init(|| {
-        log::warn!("Axum dev server: generic runtime KV is unavailable (UnavailableKvStore).");
-    });
+    let kv_store: Arc<dyn PlatformKvStore> = match ctx.kv_store_default() {
+        Some(handle) => Arc::new(KvHandleAdapter(handle)),
+        None => {
+            static KV_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            KV_WARNED.get_or_init(|| {
+                log::warn!(
+                    "Axum dev server: generic runtime KV is unavailable; set {KV_PATH_ENV} to enable it."
+                );
+            });
+            Arc::new(UnavailableKvStore)
+        }
+    };
 
     let client_ip = edgezero_adapter_axum::context::AxumRequestContext::get(ctx.request())
         .and_then(|c| c.remote_addr)
         .map(|addr| addr.ip());
 
     use trusted_server_core::platform::{
-        PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformKvStore, PlatformSecretStore,
+        PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformSecretStore,
     };
 
     // Stateless shims are promoted to process-wide statics so callers clone
@@ -600,9 +762,9 @@ pub fn build_runtime_services(
         std::sync::OnceLock::new();
     static SECRET_STORE: std::sync::OnceLock<Arc<dyn PlatformSecretStore>> =
         std::sync::OnceLock::new();
-    static KV_STORE: std::sync::OnceLock<Arc<dyn PlatformKvStore>> = std::sync::OnceLock::new();
     static BACKEND: std::sync::OnceLock<Arc<dyn PlatformBackend>> = std::sync::OnceLock::new();
     static GEO: std::sync::OnceLock<Arc<dyn PlatformGeo>> = std::sync::OnceLock::new();
+    static TIMER: std::sync::OnceLock<Arc<dyn PlatformTimer>> = std::sync::OnceLock::new();
 
     RuntimeServices::builder()
         .config_store(Arc::clone(CONFIG_STORE.get_or_init(|| {
@@ -611,9 +773,7 @@ pub fn build_runtime_services(
         .secret_store(Arc::clone(SECRET_STORE.get_or_init(|| {
             Arc::new(AxumPlatformSecretStore) as Arc<dyn PlatformSecretStore>
         })))
-        .kv_store(Arc::clone(KV_STORE.get_or_init(|| {
-            Arc::new(trusted_server_core::platform::UnavailableKvStore) as Arc<dyn PlatformKvStore>
-        })))
+        .kv_store(kv_store)
         .backend(Arc::clone(BACKEND.get_or_init(|| {
             Arc::new(AxumPlatformBackend) as Arc<dyn PlatformBackend>
         })))
@@ -632,6 +792,9 @@ pub fn build_runtime_services(
         // crates this adapter links, so every request asks exactly the ones
         // configuration named, in that order.
         .permission_signal_modules(Arc::clone(permission_signal_modules))
+        .timer(Some(Arc::clone(TIMER.get_or_init(|| {
+            Arc::new(AxumPlatformTimer) as Arc<dyn PlatformTimer>
+        }))))
         .client_info(ClientInfo {
             client_ip,
             tls_protocol: None,
@@ -639,6 +802,20 @@ pub fn build_runtime_services(
             ..ClientInfo::default()
         })
         .build()
+}
+
+// ---------------------------------------------------------------------------
+// AxumPlatformTimer
+// ---------------------------------------------------------------------------
+
+/// Wall-clock timer backed by the tokio runtime's time driver.
+pub struct AxumPlatformTimer;
+
+#[async_trait(?Send)]
+impl PlatformTimer for AxumPlatformTimer {
+    async fn sleep(&self, duration: Duration) {
+        tokio::time::sleep(duration).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -688,6 +865,23 @@ mod tests {
         assert!(
             !capabilities.has_enforceable_total_request_deadline(),
             "reqwest's transport timeout is not an adapter-enforced auction deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_timer_releases_work_that_never_completes() {
+        let services = test_services();
+        let timer = services.timer().expect("should provide a runtime timer");
+
+        let raced = futures::future::select(
+            Box::pin(futures::future::pending::<()>()),
+            timer.sleep(Duration::from_millis(5)),
+        )
+        .await;
+
+        assert!(
+            matches!(raced, futures::future::Either::Right(_)),
+            "should fire while the other future stays pending"
         );
     }
 
@@ -992,6 +1186,89 @@ mod tests {
             result.remaining.is_empty(),
             "no remaining requests expected"
         );
+    }
+
+    /// Stands in for a slow `redb` commit: `put_bytes` blocks its thread
+    /// until the test releases it.
+    struct GatedStore {
+        gate: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        finished: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait(?Send)]
+    impl KvStore for GatedStore {
+        async fn delete(&self, _key: &str) -> Result<(), KvError> {
+            Err(KvError::Unavailable)
+        }
+
+        async fn get_bytes(&self, _key: &str) -> Result<Option<Bytes>, KvError> {
+            Err(KvError::Unavailable)
+        }
+
+        async fn list_keys_page(
+            &self,
+            _prefix: &str,
+            _cursor: Option<&str>,
+            _limit: usize,
+        ) -> Result<KvPage, KvError> {
+            Err(KvError::Unavailable)
+        }
+
+        async fn put_bytes(&self, _key: &str, _value: Bytes) -> Result<(), KvError> {
+            let _ = self
+                .gate
+                .lock()
+                .expect("should lock gate")
+                .recv_timeout(Duration::from_secs(5));
+            self.finished
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn put_bytes_with_ttl(
+            &self,
+            _key: &str,
+            _value: Bytes,
+            _ttl: Duration,
+        ) -> Result<(), KvError> {
+            Err(KvError::Unavailable)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocking_kv_op_does_not_delay_a_racing_deadline() {
+        let (release, gate) = std::sync::mpsc::channel();
+        let store = Arc::new(GatedStore {
+            gate: std::sync::Mutex::new(gate),
+            finished: std::sync::atomic::AtomicBool::new(false),
+        });
+        let handle = KvHandle::new(Arc::new(BlockingPoolKvStore(Arc::clone(&store))));
+
+        let started = std::time::Instant::now();
+        let raced = tokio::time::timeout(
+            Duration::from_millis(50),
+            handle.put_bytes("key", Bytes::from_static(b"value")),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            raced.is_err(),
+            "the deadline should fire while the store op is still blocked"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the deadline should fire on time, fired after {elapsed:?}"
+        );
+
+        release.send(()).expect("should release the blocked op");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !store.finished.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the abandoned op should still run to completion");
     }
 
     async fn serve_raw_response(response: &'static [u8]) -> String {

@@ -59,6 +59,16 @@ its `ext.debug` echo of the resolved request) when the `[demand.<name>]` table
 of a Prebid Server demand source sets `debug = true`. Enable it only for short
 local debugging sessions.
 
+## Runtime KV
+
+Generic runtime KV (`RuntimeServices::kv_store`) is off by default. Set
+`TRUSTED_SERVER_KV_PATH` to a file path before starting the server and the dev
+server opens one persistent store at that path, creating missing directories,
+and shares it across all requests. Data survives restarts; two servers pointed
+at different paths do not see each other's data. If the variable is set but the
+store cannot be opened, the server exits with an error. When it is unset,
+runtime KV reports unavailable and a warning is logged once.
+
 ## Runtime boundaries
 
 Axum sanitizes forwarded client-IP headers but does not resolve

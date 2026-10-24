@@ -18,6 +18,8 @@ fn make_config() -> HtmlProcessorConfig {
         ad_bids_state: std::sync::Arc::new(std::sync::Mutex::new(None)),
         max_buffered_body_bytes: 16 * 1024 * 1024,
         prepared: std::sync::Arc::new(trusted_server_core::middleware::Prepared::default()),
+        status: http::StatusCode::OK,
+        origin_private: false,
         request_state: trusted_server_core::integrations::IntegrationRequestState::default(),
         // The benchmark measures URL rewriting, not ad injection, and
         // `ad_slots_script` is `None` here — matching the previous behaviour,

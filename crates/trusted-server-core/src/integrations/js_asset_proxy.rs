@@ -687,6 +687,8 @@ mod tests {
             csp_nonce_observed: None,
             public_prefix: None,
             prepared: std::sync::Arc::new(crate::middleware::Prepared::default()),
+            status: http::StatusCode::OK,
+            origin_private: false,
             body_close: BodyCloseInjection::None,
             origin_host: "origin.example.com".to_string(),
             request_host: "publisher.example.com".to_string(),
