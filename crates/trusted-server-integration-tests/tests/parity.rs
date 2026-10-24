@@ -1129,6 +1129,7 @@ async fn adapter_buffers_nextjs_auction_output() {
 #[derive(Default)]
 struct TerminalFixtureOrigin {
     lookup_calls: AtomicUsize,
+    saw_range: AtomicUsize,
     fail_lookup: bool,
 }
 
@@ -1165,6 +1166,9 @@ impl PlatformHttpClient for TerminalFixtureOrigin {
             }
             ("text/plain", "EXAMPLE_APPROVED")
         } else {
+            if request.request.headers().contains_key(http::header::RANGE) {
+                self.saw_range.fetch_add(1, Ordering::SeqCst);
+            }
             (
                 "text/html",
                 "<!doctype html><html><head></head><body><p>EXAMPLE_UNSIGNED</p></body></html><!--example-document-eof-->",
@@ -1205,6 +1209,7 @@ async fn asynchronous_html_finalization_and_privacy_match_host_adapters() {
     })).expect("should enable the fictional terminal consumer");
         let client = Arc::new(TerminalFixtureOrigin {
             lookup_calls: AtomicUsize::new(0),
+            saw_range: AtomicUsize::new(0),
             fail_lookup: case == "failed",
         });
         let services = nextjs_auction::services_with_http_client(
@@ -1230,13 +1235,19 @@ async fn asynchronous_html_finalization_and_privacy_match_host_adapters() {
         let mut expected = None;
         for (adapter, router) in routers {
             client.lookup_calls.store(0, Ordering::SeqCst);
+            client.saw_range.store(0, Ordering::SeqCst);
             let request = request_builder()
                 .method("GET")
                 .uri("https://test-publisher.example.com/article")
                 .header("host", "test-publisher.example.com")
-                .header("accept", "text/html")
-                .body(edgezero_core::body::Body::empty())
-                .expect("should build an example navigation");
+                .header("accept", "text/html");
+            let request = if enabled {
+                request.header(http::header::RANGE, "bytes=0-10")
+            } else {
+                request
+            }
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build an example navigation");
             let response = router
                 .expect("should build fixture routes")
                 .oneshot(request)
@@ -1248,6 +1259,11 @@ async fn asynchronous_html_finalization_and_privacy_match_host_adapters() {
                 "{adapter} should preserve the origin status"
             );
             if enabled {
+                assert_eq!(
+                    client.saw_range.load(Ordering::SeqCst),
+                    0,
+                    "{adapter} should strip Range before origin when async EOF is enabled"
+                );
                 assert_eq!(
                     response
                         .headers()

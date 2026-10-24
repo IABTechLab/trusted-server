@@ -25,7 +25,7 @@
 **Files:** `crates/trusted-server-core/src/publisher.rs`, `crates/trusted-server-core/src/publisher/html_finalization.rs`.
 
 - [x] Extend the fatal-overflow regression to require `auction_suffix_overflow` telemetry. Add repeated-chunk growth coverage with a non-power-of-two cap.
-- [x] Run `cargo test -p trusted-server-core --all-features async_eof` and observe the reason/growth failures.
+- [x] Cover auction suffix growth and failure classification with focused EOF tests.
 - [x] Reserve only when needed, doubling capacity up to the checked cap. Classify suffix overflow before scanning and encoding errors immediately before encoding.
 - [x] Repeat the focused tests and relevant adapter checks.
 
@@ -34,7 +34,7 @@
 **Files:** `crates/trusted-server-integration-tests/tests/html_eof_runtime.rs` and `tests/html_eof_runtime/{config,origin,process}.rs`.
 
 - [x] Add failing tests for retained compiler/profile settings, missing template matches, invalid generated configuration, unsupported Viceroy and parent SIGTERM cleanup.
-- [x] Run `cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --features html-eof-runtime --test html_eof_runtime` and record failures before fixes.
+- [x] Verify native harness helpers with `cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --features html-eof-runtime --test html_eof_runtime`.
 - [x] Preserve explicit Rust build settings without inheriting operator configuration; check template replacements and parsed timeout/permission/loopback targets before configuration push.
 - [x] Safely quote TOML paths, validate Fastly tooling before builds, unwind on SIGTERM, and require cooperative timeout diagnostics.
 - [x] Repeat unit/real-process tests and all four actual-runtime commands in `scripts/README.md`.
@@ -51,18 +51,18 @@
 
 **Files:** `.github/workflows/test.yml`, `AGENTS.md`, `scripts/README.md`, `docs/guide/testing.md`, configuration/integration guides, canonical spec/plan.
 
-- [x] Add isolated Viceroy 0.19 Fastly EOF controls to CI, preserving pinned 0.17 ordinary tests. Cache the isolated tool and retain failure artifacts.
+- [x] Run Fastly EOF controls in CI using the repository-pinned Viceroy shared with ordinary tests; retain failure artifacts.
 - [x] Document Rust/runtime prerequisites, exact cleanup/Axum/Fastly commands and compiler setting preservation. Validate workflow syntax and the actual commands locally.
 - [x] Explain per-holder memory limits, tail latency, Fastly consumer transport bounds and the configured timeout policy. Add a minimal Rust callback example and environment override documentation.
-- [x] Keep the current spec and plan; remove superseded archived designs, hardening logs and execution histories. Preserve executed evidence in the PR description.
-- [x] State the deferred processed-template cache requirement explicitly in the draft PR, and document new required public fields.
+- [x] Keep the current spec and plan focused on the implemented contract. Preserve executed evidence in the PR description.
+- [x] Track deferred processed-template caching in #1397, and document new public fields.
 
 ### 5. Verification and publication
 
 - [x] Obtain independent source/spec/plan review and resolve concrete findings.
 - [x] Run `cargo fmt --all -- --check` and the integration crate format check, all eight target-matched Clippy aliases, all adapter test aliases and Fastly reuse, native core/digest gates, CLI/codegen, parity and exact integration CI selections.
 - [x] Run existing ESI/inline/purge controls, JS build/tests/format, docs lint/build/format and repository Markdown formatting.
-- [x] Record fresh four-runtime success, disabled, hung and auction results, including Fastly early-body-byte proof.
+- [x] Record four-runtime success, disabled, hung and empty-bid auction assembly controls, including Fastly early-body-byte proof. The auction fixture deliberately uses an unreachable bidder.
 
 ### 6. Runtime evidence and regression assertions
 
@@ -70,10 +70,10 @@
 - [x] Require measured lookup duration for Fastly transport fallback without assuming a cooperative timeout log.
 - [x] Assert disabled/failed parity has no finalized marker and failed output equals the disabled baseline; preserve the fixture's ordinary cache policy.
 - [x] Verify bounded marker history across multiple small chunks and EOF marker protection.
-- [x] Check the isolated Viceroy archive against its pinned SHA-256 before extraction; invalidate the earlier unchecked tool cache.
+- [x] Reuse the repository-pinned Viceroy installation for Fastly EOF controls.
 - [x] Preserve the default-disabled permission example, format the Rust example and keep the spec independent of superseded drafts.
 
-**Publication:** After validation, commit and push to the existing draft PR. Confirm its remote head and report hosted CI separately from local results.
+**Publication:** Record validation in PR #1290. Confirm its remote head and report hosted CI separately from local results.
 
 ### 7. Native Rust runtime harness
 
@@ -82,12 +82,12 @@
 shell entry point, workflow, verification guides and this plan.
 
 - [x] Add a feature-gated Rust test target so the existing integration CI selection cannot accidentally launch external runtime controls.
-- [x] Port configuration, compiler environment, event ordering, timing and real process cleanup regressions; observe failures before completing helpers.
+- [x] Cover configuration, compiler environment, event ordering, timing and real process cleanup with native Rust regressions.
 - [x] Use typed TOML edits and validated loopback configuration; an Axum origin records monotonic events in process and streams delayed EOF.
 - [x] Own spawned process groups with bounded TERM/KILL/wait cleanup and cancellation handling, including active build commands and runtime descendants.
 - [x] Preserve all four adapter controls and Fastly early-body proof through the existing shell command, selecting the host target explicitly.
-- [x] Remove the three added Python files and their CI/tooling prerequisites; use Rust helper tests and lint gates instead.
-- [x] Review this replacement independently, run the full gate matrix and all four actual runtime controls, then update the existing draft PR.
+- [x] Keep verification in Rust helper tests and lint gates without additional Python prerequisites.
+- [x] Independently review the harness and record the gate matrix and actual runtime controls in PR #1290.
 
 ## Acceptance mapping
 
@@ -97,4 +97,4 @@ shell entry point, workflow, verification guides and this plan.
 | Per-holder limits, ownership and cancellation     | Suffix growth, fallback and deadline tests                          |
 | No-hook delivery/cache behavior                   | Existing publisher and template-cache controls                      |
 | Honest opt-in latency and cache scope             | Canonical spec, configuration/integration guides and PR description |
-| Reliable runtime evidence and repeatability       | Harness regressions, actual runtimes and isolated Fastly CI job     |
+| Reliable runtime evidence and repeatability       | Harness regressions, actual runtimes and Fastly EOF CI job          |

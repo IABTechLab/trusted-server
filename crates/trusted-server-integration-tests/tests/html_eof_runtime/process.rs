@@ -30,6 +30,7 @@ pub(super) fn build_environment(
                     name,
                     "PATH"
                         | "RUSTUP_HOME"
+                        | "RUSTUP_TOOLCHAIN"
                         | "CARGO_HOME"
                         | "CARGO_TARGET_DIR"
                         | "TMPDIR"
@@ -148,6 +149,7 @@ impl ManagedChild {
         cancellation.check()?;
         #[cfg(unix)]
         command.process_group(0);
+        command.stdin(Stdio::null());
         let child = command.spawn().change_context(HarnessError::Runtime)?;
         cancellation
             .groups
@@ -227,6 +229,7 @@ mod tests {
         let source = [
             ("PATH", "/tmp/example-bin"),
             ("RUSTFLAGS", "-D warnings"),
+            ("RUSTUP_TOOLCHAIN", "1.98.1"),
             ("CARGO_PROFILE_DEV_DEBUG", "0"),
             ("CARGO_INCREMENTAL", "0"),
             ("CARGO_TARGET_DIR", "/tmp/example-target"),
@@ -240,6 +243,7 @@ mod tests {
         for name in [
             "PATH",
             "RUSTFLAGS",
+            "RUSTUP_TOOLCHAIN",
             "CARGO_PROFILE_DEV_DEBUG",
             "CARGO_INCREMENTAL",
             "CARGO_TARGET_DIR",
@@ -283,6 +287,25 @@ mod tests {
                 .expect("should lock groups")
                 .is_empty(),
             "should release ownership"
+        );
+    }
+
+    #[test]
+    fn managed_child_closes_stdin() {
+        let cancellation = Cancellation::default();
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "if read value; then exit 1; fi"])
+            .stdin(Stdio::piped());
+        let mut child = ManagedChild::spawn(&mut command, &cancellation)
+            .expect("should launch a child with closed stdin");
+        assert!(
+            child.child.stdin.is_none(),
+            "should replace inherited input with null"
+        );
+        assert!(
+            child.wait().expect("should observe EOF on stdin").success(),
+            "should complete without reading terminal input"
         );
     }
 
@@ -430,8 +453,9 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(20));
         }
-        fs::write(directory.join("owner.ready"), leaf.child.id().to_string())
-            .expect("should report owned descendant");
+        let staged = directory.join("owner.ready.tmp");
+        fs::write(&staged, leaf.child.id().to_string()).expect("should stage owned descendant");
+        fs::rename(&staged, directory.join("owner.ready")).expect("should report owned descendant");
         let result = leaf
             .wait()
             .expect_err("should interrupt an active owned command");

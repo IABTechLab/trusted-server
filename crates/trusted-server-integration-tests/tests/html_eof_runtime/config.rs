@@ -87,6 +87,8 @@ pub(super) fn fixture_config(
         if providers.is_empty() {
             return Err(invalid("auction.providers"));
         }
+        // No listener runs on this port: this controls empty-bid seam assembly,
+        // rather than successful or delayed bidder collection.
         for (_, provider) in providers.iter_mut() {
             replace(
                 provider,

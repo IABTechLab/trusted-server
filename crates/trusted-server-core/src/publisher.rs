@@ -1100,7 +1100,7 @@ async fn hold_step_decoded_chunk<P: StreamProcessor>(
                 return Err(err);
             }
         };
-    match encode_processed_html(encoder, processed, Some(state)) {
+    match encode_processed_html(encoder, processed, state) {
         Ok(step) => Ok(step),
         Err(error) => {
             abandon_hold_auction(state, collect_refs.services, "stream_encode_error").await;
@@ -1112,19 +1112,13 @@ async fn hold_step_decoded_chunk<P: StreamProcessor>(
 fn encode_processed_html(
     encoder: &mut BodyStreamEncoder,
     processed: Vec<u8>,
-    state: Option<&mut AuctionHoldState>,
+    state: &mut AuctionHoldState,
 ) -> Result<HoldStepSegments, Report<TrustedServerError>> {
-    let mut close_found = false;
-    let bytes = if let Some(state) = state {
-        let bytes = match state.hold.as_mut() {
-            Some(seam) => seam.push(&processed),
-            None => processed,
-        };
-        close_found = state.hold.as_ref().is_some_and(InlineBodyCloseSeam::found);
-        bytes
-    } else {
-        processed
+    let bytes = match state.hold.as_mut() {
+        Some(seam) => seam.push(&processed),
+        None => processed,
     };
+    let close_found = state.hold.as_ref().is_some_and(InlineBodyCloseSeam::found);
     let encoded = encoder
         .encode_chunk(bytes)
         .change_context(TrustedServerError::Proxy {
@@ -1819,7 +1813,9 @@ enum TemplateStoreOutcome {
 /// # Errors
 ///
 /// Returns an error if the streaming pipeline fails to process the response
-/// body, or if the processed body exceeds the configured buffer cap.
+/// body, if the processed body exceeds the configured buffer cap, or if async
+/// HTML completion lacks operator permission or has inconsistent factory/session
+/// capabilities.
 ///
 /// # Panics
 ///
@@ -2462,8 +2458,9 @@ async fn store_template_if_authorized(
 ///
 /// # Errors
 ///
-/// Returns an error if processor construction fails before the streaming body
-/// is created; a dispatched auction is abandoned with `processor_init_error`
+/// Returns an error if async HTML completion lacks operator permission, has
+/// inconsistent factory/session capabilities, or processor construction fails
+/// before the streaming body is created; a dispatched auction is abandoned with `processor_init_error`
 /// telemetry first, matching the buffered finalizer.
 ///
 /// # Panics
@@ -2674,14 +2671,32 @@ pub async fn publisher_response_into_streaming_response(
                 .await?;
                 let stream = async_stream::try_stream! {
                     let deps = AuctionCollectDeps {
-                        price_granularity: params.price_granularity, ad_bids_state: &params.ad_bids_state,
-                        orchestrator: &orchestrator, services: &services, settings: &settings,
-                        request_origin: request_origin(&params.request_scheme, &params.request_host),
+                        price_granularity: params.price_granularity,
+                        ad_bids_state: &params.ad_bids_state,
+                        orchestrator: &orchestrator,
+                        services: &services,
+                        settings: &settings,
+                        request_origin: request_origin(
+                            &params.request_scheme,
+                            &params.request_host,
+                        ),
                     };
-                    while let Some(step) = driver.next_step(&deps).await.map_err(publisher_stream_error)? {
-                        for segment in step.ready { yield segment; }
+                    while let Some(step) = driver
+                        .next_step(&deps)
+                        .await
+                        .map_err(publisher_stream_error)?
+                    {
+                        for segment in step.ready {
+                            yield segment;
+                        }
                         if step.close_found {
-                            for segment in driver.collect_close(&deps).await.map_err(publisher_stream_error)? { yield segment; }
+                            for segment in driver
+                                .collect_close(&deps)
+                                .await
+                                .map_err(publisher_stream_error)?
+                            {
+                                yield segment;
+                            }
                         }
                     }
                 };
@@ -3192,14 +3207,15 @@ async fn stream_html_eof<W: Write>(
 /// 3. The generated marker is replaced with the collected bid script.
 ///
 /// For non-HTML content types the auction is collected before any body bytes
-/// are written (no `</body>` to inject).  If `params.dispatched_auction` is
-/// `None` the function falls back to the synchronous
-/// [`stream_publisher_body`] path.
+/// are written (no `</body>` to inject). Opted-in HTML always uses the ordered
+/// EOF driver, including when no auction was dispatched. Other responses without
+/// `params.dispatched_auction` use the synchronous [`stream_publisher_body`] path.
 ///
 /// # Errors
 ///
-/// Returns an error if processing fails mid-stream. Headers are already
-/// committed at that point; the caller logs and drops the `StreamingBody`.
+/// Returns an error for missing async HTML operator permission or inconsistent
+/// factory/session capabilities, or if processing fails mid-stream. If headers
+/// are already committed, the caller logs the error and drops the body.
 pub async fn stream_publisher_body_async<W: Write>(
     body: EdgeBody,
     output: &mut W,
@@ -5829,7 +5845,11 @@ pub async fn handle_publisher_request(
                     services,
                     auction_observation.take(),
                     dispatched,
-                    "buffered_unmodified_response",
+                    if range_associated_html_bypass {
+                        "partial_response"
+                    } else {
+                        "buffered_unmodified_response"
+                    },
                 )
                 .await;
             }
@@ -10169,6 +10189,39 @@ mod tests {
             }
         }
 
+        #[test]
+        fn async_eof_rejects_template_authorization_before_input() {
+            let settings = crate::publisher::allow_eof_test_settings(create_test_settings());
+            let cache = RecordingCache::default();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
+                AsyncTailFactory(Arc::clone(&calls)),
+            )]);
+            let mut params = html_stream_params("gzip", None);
+            params.template_cache_key = Some(authorization(&cache));
+            let error = super::super::html_finalization::HtmlEofDriver::new(
+                EdgeBody::empty(),
+                &mut params,
+                &settings,
+                &registry,
+            )
+            .err()
+            .expect("should reject shared-template authorization for async HTML");
+            assert!(
+                format!("{error:?}").contains("template"),
+                "should explain the registry mismatch"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "should not invoke optional work"
+            );
+            assert!(
+                cache.recorded().is_empty(),
+                "should not publish async output as a template"
+            );
+        }
+
         #[tokio::test]
         async fn an_unauthorized_response_stores_nothing() {
             // `None` is what the gate leaves behind on every bypass, and it is also the
@@ -11082,6 +11135,13 @@ mod tests {
                         Some(if live { "abandoned" } else { "skipped" }),
                         "should abandon dispatched bids once and preserve ordinary skipped telemetry"
                     );
+                    if live {
+                        assert_eq!(
+                            summaries[0].terminal_reason.as_deref(),
+                            Some("partial_response"),
+                            "should match direct finalizer range abandonment"
+                        );
+                    }
                 }
             }
         }
@@ -21584,6 +21644,152 @@ mod tests {
     }
 
     #[test]
+    fn async_eof_writer_flushes_before_non_retaining_callback() {
+        struct FlushRecorder {
+            bytes: Arc<Mutex<Vec<u8>>>,
+            flushed: Arc<AtomicUsize>,
+        }
+        impl Write for FlushRecorder {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.bytes
+                    .lock()
+                    .expect("should lock")
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.flushed.store(
+                    self.bytes.lock().expect("should lock").len(),
+                    Ordering::SeqCst,
+                );
+                Ok(())
+            }
+        }
+        let settings = crate::publisher::allow_eof_test_settings(create_test_settings());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
+            AsyncTailFactory(Arc::clone(&calls)),
+        )]);
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let flushed = Arc::new(AtomicUsize::new(0));
+        let mut writer = FlushRecorder {
+            bytes: Arc::clone(&bytes),
+            flushed: Arc::clone(&flushed),
+        };
+        let orchestrator = AuctionOrchestrator::new(settings.auction.clone());
+        let mut params = html_stream_params("", None);
+        let services = noop_services();
+        let mut work = Box::pin(stream_publisher_body_async(
+            EdgeBody::from(&b"<html><head></head><body>Example probe</body></html>"[..]),
+            &mut writer,
+            &mut params,
+            &settings,
+            &registry,
+            &orchestrator,
+            &services,
+        ));
+        let waker = futures::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(
+            work.as_mut().poll(&mut context).is_pending(),
+            "should pend on the callback"
+        );
+        drop(work);
+        let written = bytes.lock().expect("should lock").len();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "should start the callback");
+        assert!(written > 0, "should write the page");
+        assert_eq!(
+            flushed.load(Ordering::SeqCst),
+            written,
+            "should flush every written byte before awaiting the callback"
+        );
+    }
+
+    #[test]
+    fn inline_body_close_seam_rejects_partial_token_larger_than_limit() {
+        let _ = InlineBodyCloseSeam::new(b"TOKEN".to_vec())
+            .push_bounded(b"pageTOK", 2)
+            .expect_err("should reject a partial token that exceeds the retained limit");
+    }
+
+    #[test]
+    fn async_eof_lazy_input_enforces_raw_and_decoded_limits_for_every_body_kind() {
+        for streamed in [false, true] {
+            for encoding in ["", "gzip", "deflate", "br"] {
+                let mut settings =
+                    crate::publisher::allow_eof_test_settings(create_test_settings());
+                settings.publisher.max_buffered_body_bytes = 256 * 1024;
+                let settings = Arc::new(settings);
+                let calls = Arc::new(AtomicUsize::new(0));
+                let registry = IntegrationRegistry::from_html_stream_processors(vec![Arc::new(
+                    AsyncTailFactory(Arc::clone(&calls)),
+                )]);
+                let html = format!(
+                    "<html><head></head><body>{}</body></html>",
+                    "x".repeat(4 * 1024 * 1024)
+                );
+                let encoded = match encoding {
+                    "gzip" => gzip_encode(html.as_bytes()),
+                    "deflate" => deflate_encode(html.as_bytes()),
+                    "br" => brotli_encode(html.as_bytes()),
+                    _ => html.into_bytes(),
+                };
+                let body = if streamed {
+                    EdgeBody::stream(futures::stream::iter(vec![bytes::Bytes::from(encoded)]))
+                } else {
+                    EdgeBody::from(encoded)
+                };
+                let publisher = PublisherResponse::Stream {
+                    response: Response::builder()
+                        .header(header::CONTENT_TYPE, "text/html")
+                        .body(EdgeBody::empty())
+                        .expect("should build limited HTML response"),
+                    body,
+                    params: Box::new(html_stream_params(encoding, None)),
+                };
+                let response =
+                    futures::executor::block_on(publisher_response_into_streaming_response(
+                        publisher,
+                        &Method::GET,
+                        Arc::clone(&settings),
+                        &registry,
+                        Arc::new(AuctionOrchestrator::new(settings.auction.clone())),
+                        noop_services(),
+                    ))
+                    .expect("should create lazy limited response");
+                let EdgeBody::Stream(mut stream) = response.into_body() else {
+                    panic!("should return lazy output")
+                };
+                let mut failed = false;
+                // A broken decoder can reach the deliberately pending callback. Poll
+                // explicitly so the regression reports failure instead of hanging.
+                let waker = futures::task::noop_waker();
+                let mut context = std::task::Context::from_waker(&waker);
+                loop {
+                    let mut next = Box::pin(stream.next());
+                    match core::future::Future::poll(next.as_mut(), &mut context) {
+                        std::task::Poll::Ready(Some(Err(_))) => {
+                            failed = true;
+                            break;
+                        }
+                        std::task::Poll::Ready(Some(Ok(_))) => {}
+                        _ => break,
+                    }
+                }
+                assert!(
+                    failed,
+                    "should reject oversized {encoding:?} input (streamed={streamed})"
+                );
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    0,
+                    "should reject input before optional work"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn async_eof_lazy_delivery_releases_page_before_pending_io() {
         for streamed in [false, true] {
             let settings = Arc::new(crate::publisher::allow_eof_test_settings(
@@ -21911,6 +22117,11 @@ mod tests {
                                     summaries[0].terminal_status.as_deref(),
                                     Some("abandoned"),
                                     "should report range bypass abandonment"
+                                );
+                                assert_eq!(
+                                    summaries[0].terminal_reason.as_deref(),
+                                    Some("partial_response"),
+                                    "should classify range abandonment consistently"
                                 );
                             }
                         }
@@ -22321,7 +22532,7 @@ mod tests {
                     .header(header::ACCEPT, "text/html")
                     .body(EdgeBody::empty())
                     .expect("should build a complete document request");
-                let publisher = futures::executor::block_on(handle_publisher_request(
+                let mut publisher = futures::executor::block_on(handle_publisher_request(
                     &settings,
                     &services,
                     None,
@@ -22336,6 +22547,9 @@ mod tests {
                     EdgeCacheHeader::SurrogateControl,
                 ))
                 .expect("should fetch complete success or error HTML");
+                if let PublisherResponse::Stream { response, .. } = &mut publisher {
+                    response.headers_mut().remove(header::CACHE_CONTROL);
+                }
                 let response = if buffered {
                     futures::executor::block_on(buffer_publisher_response_async(
                         publisher,
@@ -22360,6 +22574,11 @@ mod tests {
                     response.status().as_u16(),
                     status,
                     "should retain the origin status"
+                );
+                assert_eq!(
+                    response.headers()[header::CACHE_CONTROL],
+                    "no-store, private",
+                    "should apply privacy in the finalizer for direct callers"
                 );
                 let _ = futures::executor::block_on(
                     response.into_body().into_bytes_bounded(1024 * 1024),
@@ -22888,9 +23107,15 @@ mod tests {
             None,
             &EcContext::default(),
         ));
-        let source = format!(
-            "<html><head></head><body>Example</body>{}</html>",
-            "x".repeat(settings.publisher.max_buffered_body_bytes + 1)
+        // URL rewriting expands only the retained suffix beyond the cap while
+        // origin bytes remain below both raw and decoded input limits.
+        params.request_host = format!("{}.example.com", ["example"; 28].join("."));
+        let source = String::from(
+            r#"<html><head></head><body>Example</body><img src="https://origin.example.com/tail.png"></html>"#,
+        );
+        assert!(
+            source.len() < settings.publisher.max_buffered_body_bytes,
+            "should reach suffix growth before the raw input cap"
         );
         let mut output = Vec::new();
         let error = futures::executor::block_on(stream_publisher_body_async(

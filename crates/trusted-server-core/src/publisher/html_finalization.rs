@@ -1,22 +1,19 @@
 //! Ordered optional HTML EOF work with driver-owned fallback and streaming output.
 
 use std::collections::VecDeque;
-use std::io::{self, Read};
 use std::sync::Arc;
 use std::time::Duration;
 
-use brotli::Decompressor;
 use bytes::Bytes;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt as _};
-use flate2::{Decompress, FlushDecompress, Status};
 use futures::future::{Fuse, LocalBoxFuture};
 use http::StatusCode;
 
 use super::{
     AuctionCollectDeps, AuctionHoldState, AuctionTelemetryCarry, BodyChunkSource,
     DispatchedAuctionGuard, HoldStepSegments, HtmlStreamProcessorParams, InlineBodyCloseSeam,
-    OwnedProcessResponseParams, abandon_hold_auction, body_as_reader,
+    OwnedProcessResponseParams, abandon_hold_auction,
     create_html_stream_processor_with_document_state, deferred_inline_seam_token,
     hold_collect_close_tail, hold_finish_tail_segments,
 };
@@ -27,136 +24,32 @@ use crate::integrations::{IntegrationDocumentState, IntegrationRegistry};
 use crate::settings::Settings;
 use crate::streaming_processor::finish::StreamFinishDeadline;
 use crate::streaming_processor::{
-    BodyStreamDecoder, BodyStreamEncoder, Compression, GzipDecodeReader, STREAM_CHUNK_SIZE,
-    StreamProcessor,
+    BodyStreamDecoder, BodyStreamEncoder, Compression, STREAM_CHUNK_SIZE, StreamProcessor,
 };
 
-// The reader codec must prove StreamEnd before terminal work starts. The
-// ordinary flate2 Read wrapper also returns EOF for an incomplete zlib stream.
-struct ValidatedZlibReader {
-    reader: Box<dyn Read>,
-    decoder: Decompress,
-    input: [u8; STREAM_CHUNK_SIZE],
-    offset: usize,
-    available: usize,
-    eof: bool,
-    complete: bool,
-}
-
-impl ValidatedZlibReader {
-    fn new(reader: Box<dyn Read>) -> Self {
-        Self {
-            reader,
-            decoder: Decompress::new(true),
-            input: [0; STREAM_CHUNK_SIZE],
-            offset: 0,
-            available: 0,
-            eof: false,
-            complete: false,
-        }
-    }
-}
-
-impl Read for ValidatedZlibReader {
-    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-        if output.is_empty() || self.complete {
-            return Ok(0);
-        }
-        loop {
-            if self.offset == self.available && !self.eof {
-                self.available = self.reader.read(&mut self.input)?;
-                self.offset = 0;
-                self.eof = self.available == 0;
-            }
-            let before_in = self.decoder.total_in();
-            let before_out = self.decoder.total_out();
-            let status = self
-                .decoder
-                .decompress(
-                    &self.input[self.offset..self.available],
-                    output,
-                    if self.eof {
-                        FlushDecompress::Finish
-                    } else {
-                        FlushDecompress::None
-                    },
-                )
-                .map_err(io::Error::other)?;
-            let consumed =
-                usize::try_from(self.decoder.total_in() - before_in).map_err(io::Error::other)?;
-            let produced =
-                usize::try_from(self.decoder.total_out() - before_out).map_err(io::Error::other)?;
-            self.offset += consumed;
-            self.complete = status == Status::StreamEnd;
-            if produced > 0 || self.complete {
-                return Ok(produced);
-            }
-            if self.eof || (consumed == 0 && self.offset < self.available) {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "incomplete publisher zlib stream",
-                ));
-            }
-        }
-    }
-}
-
-enum TerminalInput {
-    Stream {
-        source: BodyChunkSource,
-        decoder: Box<BodyStreamDecoder>,
-    },
-    Materialized(Box<dyn Read>),
+struct TerminalInput {
+    source: BodyChunkSource,
+    decoder: Box<BodyStreamDecoder>,
 }
 
 impl TerminalInput {
-    fn new(
-        body: EdgeBody,
-        compression: Compression,
-        limit: usize,
-    ) -> Result<Self, Report<TrustedServerError>> {
-        if body.is_stream() {
-            return Ok(Self::Stream {
-                source: BodyChunkSource::new(body, STREAM_CHUNK_SIZE).with_max_bytes(limit),
-                decoder: Box::new(BodyStreamDecoder::new(compression, limit)),
-            });
+    fn new(body: EdgeBody, compression: Compression, limit: usize) -> Self {
+        Self {
+            source: BodyChunkSource::new(body, STREAM_CHUNK_SIZE).with_max_bytes(limit),
+            decoder: Box::new(BodyStreamDecoder::new(compression, limit)),
         }
-        // Preserve the existing reader codecs and per-step gzip decode budget.
-        let reader = body_as_reader(body)?;
-        let reader: Box<dyn Read> = match compression {
-            Compression::None => Box::new(reader),
-            Compression::Gzip => Box::new(GzipDecodeReader::new(reader, limit)),
-            Compression::Deflate => Box::new(ValidatedZlibReader::new(Box::new(reader))),
-            Compression::Brotli => Box::new(Decompressor::new(reader, STREAM_CHUNK_SIZE)),
-        };
-        Ok(Self::Materialized(reader))
     }
 
     async fn next(
         &mut self,
         failure_reason: &mut &'static str,
     ) -> Result<(Bytes, bool), Report<TrustedServerError>> {
-        match self {
-            Self::Stream { source, decoder } => {
-                *failure_reason = "stream_read_error";
-                let raw = source.next_chunk().await?;
-                *failure_reason = "stream_decode_error";
-                match raw {
-                    Some(raw) => Ok((decoder.decode_chunk(raw)?, false)),
-                    None => Ok((Bytes::from(decoder.finish()?), true)),
-                }
-            }
-            Self::Materialized(reader) => {
-                *failure_reason = "stream_read_error";
-                let mut bytes = vec![0; STREAM_CHUNK_SIZE];
-                let size = reader
-                    .read(&mut bytes)
-                    .change_context(TrustedServerError::Proxy {
-                        message: "Failed to read decoded HTML terminal input".to_string(),
-                    })?;
-                bytes.truncate(size);
-                Ok((Bytes::from(bytes), size == 0))
-            }
+        *failure_reason = "stream_read_error";
+        let raw = self.source.next_chunk().await?;
+        *failure_reason = "stream_decode_error";
+        match raw {
+            Some(raw) => Ok((self.decoder.decode_chunk(raw)?, false)),
+            None => Ok((Bytes::from(self.decoder.finish()?), true)),
         }
     }
 }
@@ -167,7 +60,6 @@ pub(super) struct HtmlEofDriver {
     encoder: BodyStreamEncoder,
     processor: HtmlWithStreamingProcessors,
     replay: VecDeque<Bytes>,
-    marker: Option<Vec<u8>>,
     hold: Option<AuctionHoldState>,
     limit: usize,
     timeout: Duration,
@@ -191,6 +83,11 @@ impl HtmlEofDriver {
         registry: &IntegrationRegistry,
     ) -> Result<Self, Report<TrustedServerError>> {
         registry.ensure_async_html_finish_allowed(settings)?;
+        if params.template_cache_key.is_some() {
+            return Err(Report::new(TrustedServerError::Configuration {
+                message: "Async HTML completion cannot use shared-template authorization; request and response registries must match".to_string(),
+            }));
+        }
         let document_state = IntegrationDocumentState::default();
         let marker = deferred_inline_seam_token(
             settings,
@@ -225,7 +122,7 @@ impl HtmlEofDriver {
         processor.set_finish_marker(marker.as_deref());
         let compression = Compression::from_content_encoding(&params.content_encoding);
         let limit = settings.publisher.max_buffered_body_bytes;
-        let input = TerminalInput::new(body, compression, limit)?;
+        let input = TerminalInput::new(body, compression, limit);
         let hold = params.dispatched_auction.take().map(|dispatched| {
             AuctionHoldState::new(
                 DispatchedAuctionGuard::new(dispatched),
@@ -242,7 +139,6 @@ impl HtmlEofDriver {
             encoder: BodyStreamEncoder::new(compression),
             processor,
             replay: VecDeque::new(),
-            marker,
             hold,
             limit,
             timeout: Duration::from_millis(u64::from(
@@ -338,7 +234,6 @@ impl HtmlEofDriver {
                             .expect("should start EOF deadline after parser completion"),
                         timer: &mut self.finish_timer,
                         limit: self.limit,
-                        marker: self.marker.as_deref(),
                     })
                     .await
                     .change_context(TrustedServerError::Proxy {
@@ -403,7 +298,7 @@ impl HtmlEofDriver {
             }
             let (decoded, ended) = self.input.next(&mut self.failure_reason).await?;
             if !decoded.is_empty() {
-                self.accept(&decoded, false)?;
+                self.accept(&decoded)?;
             }
             if ended {
                 self.failure_reason = "stream_process_error";
@@ -424,14 +319,13 @@ impl HtmlEofDriver {
         }
     }
 
-    fn accept(&mut self, bytes: &[u8], is_last: bool) -> Result<(), Report<TrustedServerError>> {
+    fn accept(&mut self, bytes: &[u8]) -> Result<(), Report<TrustedServerError>> {
         self.failure_reason = "stream_process_error";
-        let output = self
-            .processor
-            .process_chunk(bytes, is_last)
-            .change_context(TrustedServerError::Proxy {
+        let output = self.processor.process_chunk(bytes, false).change_context(
+            TrustedServerError::Proxy {
                 message: "Failed to process HTML terminal input".to_string(),
-            })?;
+            },
+        )?;
         self.replay.push_back(Bytes::from(output));
         Ok(())
     }
@@ -454,34 +348,6 @@ impl HtmlEofDriver {
     pub(super) async fn abandon(&mut self, deps: &AuctionCollectDeps<'_>, reason: &'static str) {
         if let Some(hold) = self.hold.as_mut() {
             abandon_hold_auction(hold, deps.services, reason).await;
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn materialized_deflate_requires_validated_end_before_terminal_eof() {
-        let mut encoder =
-            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-        std::io::Write::write_all(&mut encoder, b"<html><body>Example</body></html>")
-            .expect("should encode an example page");
-        let compressed = encoder.finish().expect("should finish zlib input");
-        let mut valid =
-            ValidatedZlibReader::new(Box::new(std::io::Cursor::new(compressed.clone())));
-        let mut output = Vec::new();
-        valid
-            .read_to_end(&mut output)
-            .expect("should accept a validated zlib trailer");
-        for missing in [1, 4, 8] {
-            let mut reader = ValidatedZlibReader::new(Box::new(std::io::Cursor::new(
-                compressed[..compressed.len() - missing].to_vec(),
-            )));
-            let _ = reader
-                .read_to_end(&mut Vec::new())
-                .expect_err("should reject a truncated trailer before terminal EOF");
         }
     }
 }

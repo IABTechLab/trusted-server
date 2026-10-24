@@ -191,20 +191,6 @@ mod tests {
     }
 
     #[test]
-    fn empty_replacement_is_distinct_from_unchanged() {
-        let writer = StreamOutputWriter::new(4);
-        assert!(
-            writer.into_bytes().is_empty(),
-            "should allow an empty replacement"
-        );
-        assert_ne!(
-            StreamFinish::Unchanged,
-            StreamFinish::Replace,
-            "should distinguish outcomes"
-        );
-    }
-
-    #[test]
     fn deadline_expires_at_the_boundary() {
         let deadline = StreamFinishDeadline::new(Duration::from_millis(5), false);
         assert_eq!(

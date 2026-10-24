@@ -25,7 +25,7 @@ The aliases in `.cargo/config.toml` select the correct target and feature set:
 Fastly tests require the Viceroy version recorded in `.tool-versions`:
 
 ```bash
-cargo install viceroy --version 0.17.0 --locked --force
+cargo install viceroy --version "$(awk '$1 == "viceroy" { print $2 }' .tool-versions)" --locked --force
 rustup target add wasm32-wasip1 wasm32-unknown-unknown
 ```
 
@@ -49,7 +49,9 @@ and runs disabled, successful, hung and enabled-auction controls against a loopb
 origin. It uses the native Rust integration-test target and requires Rust and pinned Node. Compiler/profile
 settings and an explicit `CARGO_TARGET_DIR` are preserved; operator configuration and `CARGO_BUILD_TARGET` are
 not inherited because the harness selects native and adapter targets. Logs, bodies, headers and timing JSON remain in its printed temporary
-directory. Owned process groups are stopped on normal exit, failure and SIGTERM.
+directory. Owned process groups are stopped on normal exit, failure, SIGTERM and SIGINT.
+The auction control deliberately uses an unreachable bidder; it checks empty-bid
+script assembly after finalized output, rather than successful or delayed bids.
 
 ```bash
 cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --features html-eof-runtime --test html_eof_runtime
@@ -62,12 +64,11 @@ Workers requires `worker-build` and `wasm-bindgen` matching the locked SDK plus 
 Spin requires the Spin CLI. `--release` selects production-profile fixture artifacts.
 
 The Fastly EOF timeout fixture requires **Viceroy 0.19 or newer** for backend timeout
-simulation. Install it in an isolated location; ordinary WASI tests continue to use
-repository-pinned Viceroy 0.17:
+simulation. The repository-pinned Viceroy meets this requirement and is shared with
+ordinary WASI tests. Install it with the command above, then run:
 
 ```bash
-cargo install viceroy --version 0.19.0 --locked --root /tmp/example-eof-viceroy
-PATH="/tmp/example-eof-viceroy/bin:$PATH" ./scripts/async-html-finalization-local-test.sh fastly --release --auction
+./scripts/async-html-finalization-local-test.sh fastly --release --auction
 ```
 
 The harness checks this prerequisite before building adapter fixtures. Fastly additionally proves

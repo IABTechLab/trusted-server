@@ -746,7 +746,10 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
             server_region: None,
         });
     #[cfg(all(feature = "spin", target_arch = "wasm32"))]
-    let builder = builder.timer(Arc::new(SpinTimer));
+    static TIMER: std::sync::OnceLock<Arc<dyn trusted_server_core::platform::PlatformTimer>> =
+        std::sync::OnceLock::new();
+    #[cfg(all(feature = "spin", target_arch = "wasm32"))]
+    let builder = builder.timer(Arc::clone(TIMER.get_or_init(|| Arc::new(SpinTimer))));
     builder.build()
 }
 

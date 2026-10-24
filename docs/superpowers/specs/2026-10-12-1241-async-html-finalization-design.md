@@ -1,8 +1,8 @@
 # Ordered asynchronous HTML processor completion
 
-**Issue:** #1241. **Status:** draft implementation; review hardening and local verification complete.
+**Issue:** #1241. **Status:** implemented; shared-template caching for async output is deferred to #1397.
 
-The [implementation plan](../plans/2026-10-12-1241-async-html-finalization.md) maps this contract to implementation and verification. Fresh executed evidence is recorded in the draft PR.
+The [implementation plan](../plans/2026-10-12-1241-async-html-finalization.md) maps this contract to implementation and verification. Fresh executed evidence is recorded in PR #1290.
 
 ## 1. Requirement and scope
 
@@ -42,8 +42,8 @@ capability. Metadata and the created session's capability must agree; undeclared
 async work must never silently disappear through a synchronous driver.
 
 Use one production processor lifecycle without a separate finalizer factory,
-session trait or registration list. Tests can use a test-only adapter to this
-lifecycle.
+session trait or registration list. Tests use ordinary `StreamProcessor` fixtures
+for this lifecycle.
 
 Factory metadata is available before template lookup, without creating a session,
 reading HTML or polling a future. Every session uses the existing request-local
@@ -172,9 +172,9 @@ promise insertion into an earlier head or before an already emitted body end.
 
 Use active async factory metadata before the first processed-template lookup to skip
 shared-template reads, reservations and stores. Raw-origin readthrough is independent.
-This intentionally defers the issue's shared-template cold-miss storage behavior until
-maintainers accept an output identity, freshness and hit-execution policy. Keep the
-PR in draft and describe it as partial coverage of #1241 until that scope is accepted.
+This intentionally defers the issue's shared-template cold-miss storage behavior.
+Maintainers accepted this scope for #1241; cacheable async output is tracked in
+#1397.
 Processed opted-in HTML uses `Cache-Control: no-store, private` even when work fails,
 returns unchanged, or is bypassed after overflow. Cacheable async output needs a
 separate identity, freshness, invalidation and hit-execution contract.
@@ -234,7 +234,9 @@ adapter; normal helper tests need no adapter tools. The shell entry point select
 the adapter/profile and invokes Cargo with the explicit native target.
 
 Preserve disabled/success/hung/auction controls on all four adapters and actual
-early-body delivery on Fastly. Validate typed, isolated configuration before use,
+early-body delivery on Fastly. The runtime auction control uses a deliberately
+unreachable bidder and verifies empty-bid script assembly after finalized output;
+it does not establish successful bid collection or slow-bidder timing. Validate typed, isolated configuration before use,
 retain diagnostics, preserve compiler/profile settings, and clean process groups
 on normal return, failure, SIGTERM and SIGINT. Use existing workspace dependencies
 only for tests. No added verification path requires Python.

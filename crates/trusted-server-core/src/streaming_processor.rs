@@ -55,7 +55,12 @@ pub trait StreamProcessor {
 
     /// Report whether this processor requires an asynchronous EOF driver.
     ///
-    /// Synchronous drivers reject this capability before consuming input.
+    /// Must return the same value for the processor's lifetime and match the
+    /// creating factory's `requires_async_finish`; drivers validate the pair
+    /// on every chunk and fail the response on a mismatch. To skip optional
+    /// work for one document, return `None` from [`Self::async_finish`]
+    /// instead. Synchronous drivers reject this capability before consuming
+    /// input.
     fn requires_async_finish(&self) -> bool {
         false
     }

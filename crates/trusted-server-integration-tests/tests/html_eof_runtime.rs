@@ -1,5 +1,7 @@
 //! Native verification of ordered HTML EOF work on actual local runtimes.
 
+#![cfg(unix)]
+
 #[path = "html_eof_runtime/config.rs"]
 mod config;
 #[path = "html_eof_runtime/origin.rs"]
@@ -596,6 +598,7 @@ fn actual_runtime() -> HarnessResult<()> {
     let mut baseline = Vec::new();
     for case in cases {
         harness.cancellation.check()?;
+        // Auction controls deliberately use an unreachable bidder and verify empty-bid assembly.
         let config = config::fixture_config(&template, case, origin.port, available_port()?)?;
         fs::write(harness.workspace.join("trusted-server.toml"), config)
             .change_context(HarnessError::Io)?;
@@ -704,12 +707,17 @@ fn actual_runtime() -> HarnessResult<()> {
             }
             "auction" => {
                 let body = String::from_utf8_lossy(&body);
+                let finalized = body
+                    .find("EXAMPLE_FINALIZED")
+                    .expect("should finalize the document");
+                let assembled = body
+                    .find("var b=JSON.parse(")
+                    .expect("should assemble the empty-bid script");
                 assert!(
-                    body.contains("EXAMPLE_FINALIZED")
+                    finalized < assembled
                         && body.contains("adSlots")
-                        && body.contains("bids")
                         && !body.contains("ts-inline-body-close-"),
-                    "should finish EOF work and auction assembly"
+                    "should emit finalized output before empty-bid assembly"
                 );
             }
             _ => {

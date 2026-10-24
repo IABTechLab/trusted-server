@@ -32,9 +32,11 @@ pub(crate) struct HtmlWithStreamingProcessors {
     inner: Box<dyn StreamProcessor>,
     stages: Vec<HtmlProcessorStage>,
     finish_index: Option<usize>,
-    marker_length: usize,
+    finish_marker: Option<Vec<u8>>,
 }
 
+// This composite uses begin_finish/finish_next rather than the leaf async_finish
+// callback so each completed stage can release output before the next one awaits.
 impl StreamProcessor for HtmlWithStreamingProcessors {
     fn process_chunk(&mut self, chunk: &[u8], is_last: bool) -> Result<Vec<u8>, io::Error> {
         self.validate_capabilities()?;
@@ -45,7 +47,11 @@ impl StreamProcessor for HtmlWithStreamingProcessors {
         }
         let mut output = self.inner.process_chunk(chunk, is_last)?;
         for stage in &mut self.stages {
-            output = stage.process(&output, is_last, self.marker_length)?;
+            output = stage.process(
+                &output,
+                is_last,
+                self.finish_marker.as_ref().map_or(0, Vec::len),
+            )?;
         }
         Ok(output)
     }
@@ -789,7 +795,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_document_state_observes_parser_callbacks_and_isolates_requests() {
+    fn terminal_document_state_exposes_parser_observations() {
         struct ArticleObserver;
         impl IntegrationScriptRewriter for ArticleObserver {
             fn integration_id(&self) -> &'static str {
@@ -830,7 +836,7 @@ mod tests {
             assert_eq!(
                 article.as_str(),
                 text,
-                "should share this document's observed text without leaking another request"
+                "should expose the text observed by this document's parser"
             );
         }
     }

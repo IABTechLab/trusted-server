@@ -65,7 +65,8 @@ pub struct Publisher {
     /// trips, so the response is truncated mid-body (with the error logged)
     /// rather than replaced with a 5xx.
     ///
-    /// Buffered adapters keep using it as the post-rewrite output buffer cap.
+    /// The async HTML EOF driver also caps cumulative raw and decoded input on
+    /// every adapter. Other buffered responses use the post-rewrite output cap.
     /// There it additionally bounds how much decoded gzip output may sit in the
     /// heap at once, so a bomb is rejected mid-decode instead of after its full
     /// expansion; that bound is per-step, never cumulative, so a gzip-encoded
@@ -82,10 +83,20 @@ pub struct Publisher {
     ///
     /// Defaults to false. Enabled work can delay response delivery, especially
     /// on buffered adapters and processors retaining output until EOF.
-    #[serde(default)]
+    ///
+    /// Skipped from serialization while false: [`Publisher`] denies unknown
+    /// fields, so a default blob must stay readable by a binary built before
+    /// this field existed.
+    #[serde(default, skip_serializing_if = "is_false")]
     pub allow_async_html_finish: bool,
     /// Whole-chain HTML EOF budget in milliseconds; inert without an async processor.
-    #[serde(default = "default_html_finalization_timeout_ms")]
+    ///
+    /// Skipped from serialization at its default for the same rollback reason
+    /// as [`Self::allow_async_html_finish`].
+    #[serde(
+        default = "default_html_finalization_timeout_ms",
+        skip_serializing_if = "is_default_html_finalization_timeout_ms"
+    )]
     #[validate(range(
         min = 1,
         max = 60000,
@@ -96,6 +107,10 @@ pub struct Publisher {
 
 fn default_html_finalization_timeout_ms() -> u32 {
     5000
+}
+
+fn is_default_html_finalization_timeout_ms(value: &u32) -> bool {
+    *value == default_html_finalization_timeout_ms()
 }
 
 fn default_max_buffered_body_bytes() -> usize {
@@ -3884,6 +3899,49 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn default_publisher_omits_async_finish_settings_for_rollback() {
+        let serialized = serde_json::to_value(Publisher::default())
+            .expect("should serialize default publisher settings");
+        for field in ["allow_async_html_finish", "html_finalization_timeout_ms"] {
+            assert!(
+                serialized.get(field).is_none(),
+                "should omit default {field} for older binaries"
+            );
+        }
+    }
+
+    #[test]
+    fn enabled_publisher_async_finish_settings_round_trip() {
+        let publisher = Publisher {
+            allow_async_html_finish: true,
+            html_finalization_timeout_ms: 1500,
+            ..Publisher::default()
+        };
+        let serialized =
+            serde_json::to_value(&publisher).expect("should serialize enabled EOF settings");
+        assert_eq!(
+            serialized["allow_async_html_finish"],
+            json!(true),
+            "should serialize permission"
+        );
+        assert_eq!(
+            serialized["html_finalization_timeout_ms"],
+            json!(1500),
+            "should serialize custom timeout"
+        );
+        let restored: Publisher =
+            serde_json::from_value(serialized).expect("should restore EOF settings");
+        assert!(
+            restored.allow_async_html_finish,
+            "should preserve permission"
+        );
+        assert_eq!(
+            restored.html_finalization_timeout_ms, 1500,
+            "should preserve timeout"
+        );
+    }
+
     /// `DebugConfig` denies unknown fields, so a binary built before
     /// `sandbox_metrics_enabled` existed must still accept a default blob.
     /// That only holds while the flag is skipped during serialization.

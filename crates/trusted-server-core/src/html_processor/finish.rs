@@ -136,7 +136,6 @@ pub(crate) struct HtmlFinishContext<'a> {
     pub deadline: &'a StreamFinishDeadline,
     pub timer: &'a mut Option<Fuse<LocalBoxFuture<'static, ()>>>,
     pub limit: usize,
-    pub marker: Option<&'a [u8]>,
 }
 
 fn marker_count(prefix: &[u8], bytes: &[u8], marker: &[u8]) -> usize {
@@ -161,6 +160,7 @@ async fn finish_output(
     stage: &mut HtmlProcessorStage,
     fallback: Vec<u8>,
     context: &mut HtmlFinishContext<'_>,
+    marker: Option<&[u8]>,
 ) -> Vec<u8> {
     if stage.skip_async || !stage.async_capable {
         return fallback;
@@ -215,15 +215,6 @@ async fn finish_output(
     if result.is_none() {
         context.deadline.mark_expired();
     }
-    if result.is_none() || context.deadline.is_expired_at(Instant::now()) {
-        log::warn!(
-            "HTML EOF processor {} times out after {} ms; retains {} bytes",
-            stage.integration_id,
-            context.deadline.elapsed().as_millis(),
-            fallback.len()
-        );
-        return fallback;
-    }
     if let Some(Err(error)) = &result {
         let outcome = match error.current_context() {
             StreamFinishError::Unavailable => "unavailable",
@@ -235,25 +226,34 @@ async fn finish_output(
             stage.integration_id
         );
     }
-    if !matches!(result, Some(Ok(StreamFinish::Replace))) || candidate.is_poisoned() {
-        return fallback;
-    }
-    let replacement = candidate.into_bytes();
-    if context.marker.is_some_and(|marker| {
-        marker_count(&stage.previous_suffix, &fallback, marker)
-            != marker_count(&stage.previous_suffix, &replacement, marker)
-    }) {
+    let replacement =
+        if matches!(result, Some(Ok(StreamFinish::Replace))) && !candidate.is_poisoned() {
+            let replacement = candidate.into_bytes();
+            if marker.is_some_and(|marker| {
+                marker_count(&stage.previous_suffix, &fallback, marker)
+                    != marker_count(&stage.previous_suffix, &replacement, marker)
+            }) {
+                log::warn!(
+                    "HTML EOF processor {} retains input after invalid assembly markers",
+                    stage.integration_id
+                );
+                None
+            } else {
+                Some(replacement)
+            }
+        } else {
+            None
+        };
+    if result.is_none() || context.deadline.is_expired_at(Instant::now()) {
         log::warn!(
-            "HTML EOF processor {} retains input after invalid assembly markers",
-            stage.integration_id
+            "HTML EOF processor {} times out after {} ms; retains {} bytes",
+            stage.integration_id,
+            context.deadline.elapsed().as_millis(),
+            fallback.len()
         );
         return fallback;
     }
-    if context.deadline.is_expired_at(Instant::now()) {
-        fallback
-    } else {
-        replacement
-    }
+    replacement.unwrap_or(fallback)
 }
 
 impl HtmlWithStreamingProcessors {
@@ -265,7 +265,7 @@ impl HtmlWithStreamingProcessors {
             inner,
             stages,
             finish_index: None,
-            marker_length: 0,
+            finish_marker: None,
         }
     }
 
@@ -277,7 +277,7 @@ impl HtmlWithStreamingProcessors {
     }
 
     pub(crate) fn set_finish_marker(&mut self, marker: Option<&[u8]>) {
-        self.marker_length = marker.map_or(0, <[u8]>::len);
+        self.finish_marker = marker.map(<[u8]>::to_vec);
     }
 
     pub(crate) fn next_finish_requires_async(&self) -> bool {
@@ -293,7 +293,11 @@ impl HtmlWithStreamingProcessors {
         }
         let mut output = self.inner.process_chunk(&[], true)?;
         for stage in &mut self.stages {
-            output = stage.process(&output, false, self.marker_length)?;
+            output = stage.process(
+                &output,
+                false,
+                self.finish_marker.as_ref().map_or(0, Vec::len),
+            )?;
         }
         self.finish_index = Some(0);
         Ok(output)
@@ -310,10 +314,15 @@ impl HtmlWithStreamingProcessors {
             return Ok(None);
         };
         let fallback = stage.output(&[], true)?;
-        let mut output = finish_output(stage, fallback, &mut context).await;
-        stage.remember_suffix(&output, self.marker_length);
+        let mut output =
+            finish_output(stage, fallback, &mut context, self.finish_marker.as_deref()).await;
+        stage.remember_suffix(&output, self.finish_marker.as_ref().map_or(0, Vec::len));
         for downstream in &mut self.stages[index + 1..] {
-            output = downstream.process(&output, false, self.marker_length)?;
+            output = downstream.process(
+                &output,
+                false,
+                self.finish_marker.as_ref().map_or(0, Vec::len),
+            )?;
         }
         self.finish_index = Some(index + 1);
         Ok(Some(output))
@@ -415,6 +424,54 @@ mod tests {
     }
 
     #[test]
+    fn async_eof_direct_composite_eof_rejects_before_parser_effects() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let calls = Rc::new(Cell::new(0));
+        let mut chain = HtmlWithStreamingProcessors::from_stages(
+            stage("parser", b"parser-tail", None, &events, &calls),
+            vec![HtmlProcessorStage::new(
+                "B",
+                stage("B", b"tail", Some(b"late"), &events, &calls),
+                true,
+                false,
+                64,
+            )],
+        );
+        chain
+            .process_chunk(b"page", true)
+            .expect_err("should reject synchronous EOF for an async-capable chain");
+        assert!(
+            events.borrow().is_empty(),
+            "should reject before parser or stage effects"
+        );
+        assert_eq!(calls.get(), 0, "should not start optional work");
+    }
+
+    #[test]
+    fn async_eof_retention_without_async_capability_rejects_before_parser_effects() {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let calls = Rc::new(Cell::new(0));
+        let mut chain = HtmlWithStreamingProcessors::from_stages(
+            stage("parser", b"parser-tail", None, &events, &calls),
+            vec![HtmlProcessorStage::new(
+                "invalid-retention",
+                stage("B", b"tail", None, &events, &calls),
+                false,
+                true,
+                64,
+            )],
+        );
+        chain
+            .process_chunk(b"page", false)
+            .expect_err("should reject retention without asynchronous EOF capability");
+        assert!(
+            events.borrow().is_empty(),
+            "should validate retention before parser or stage effects"
+        );
+        assert_eq!(calls.get(), 0, "should not start optional work");
+    }
+
+    #[test]
     fn async_eof_output_reaches_downstream_before_its_eof() {
         let events = Rc::new(RefCell::new(Vec::new()));
         let calls = Rc::new(Cell::new(0));
@@ -461,7 +518,6 @@ mod tests {
             deadline: &deadline,
             timer: &mut timer,
             limit: 64,
-            marker: None,
         }))
         .expect("should finish upstream stage")
         .expect("should produce a stage result");
@@ -476,7 +532,6 @@ mod tests {
             deadline: &deadline,
             timer: &mut timer,
             limit: 64,
-            marker: None,
         }))
         .expect("should finish downstream stage")
         .expect("should return its tail");
@@ -541,7 +596,6 @@ mod tests {
             deadline: &deadline,
             timer: &mut timer,
             limit: 4,
-            marker: None,
         }))
         .expect("should finish bypassed stage")
         .expect("should emit sync tail");
@@ -584,7 +638,6 @@ mod tests {
             deadline: &deadline,
             timer: &mut timer,
             limit: 64,
-            marker: Some(b"TOKEN"),
         }))
         .expect("should retain marker fallback")
         .expect("should return EOF output");
@@ -604,7 +657,6 @@ mod tests {
             deadline: &deadline,
             timer: &mut timer,
             limit,
-            marker: Some(b"TOKEN"),
         }))
         .expect("should finish the marker-aware stage")
         .expect("should return stage EOF output")
@@ -853,7 +905,6 @@ mod tests {
             deadline: &deadline,
             timer: &mut timer,
             limit: 64,
-            marker: None,
         }))
         .expect("should finish a callback after ready-prefix delivery");
         let requested = requested
@@ -961,7 +1012,6 @@ mod tests {
             deadline: &deadline,
             timer: &mut timer,
             limit: 64,
-            marker: None,
         }))
         .expect("should retain output on timeout")
         .expect("should return held output");
@@ -1016,7 +1066,6 @@ mod tests {
             deadline: &deadline,
             timer: &mut timer,
             limit: 64,
-            marker: None,
         }))
         .expect("should finish timed-out upstream")
         .expect("should return transformed fallback");
@@ -1030,7 +1079,6 @@ mod tests {
             deadline: &deadline,
             timer: &mut timer,
             limit: 64,
-            marker: None,
         }))
         .expect("should complete downstream EOF")
         .expect("should return its synchronous tail");
@@ -1175,7 +1223,6 @@ mod tests {
             deadline: &deadline,
             timer: &mut timer,
             limit: 64,
-            marker: None,
         }))
         .expect("should complete synchronous EOF despite optional failure")
         .expect("should return the selected stage output");
@@ -1326,7 +1373,6 @@ mod tests {
             deadline: &deadline,
             timer: &mut timer,
             limit: 64,
-            marker: None,
         }))
         .expect("should commit the upstream replacement")
         .expect("should return the downstream stage's ready output");
@@ -1346,7 +1392,6 @@ mod tests {
             deadline: &deadline,
             timer: &mut timer,
             limit: 64,
-            marker: None,
         }))
         .expect("should retain downstream fallback on optional failure")
         .expect("should release downstream retained output");
@@ -1400,7 +1445,6 @@ mod tests {
             deadline: &deadline,
             timer: &mut timer,
             limit: 64,
-            marker: None,
         }))
         .expect("should finish timerless work that completes late")
         .expect("should retain synchronous output");
@@ -1453,7 +1497,6 @@ mod tests {
             deadline: &deadline,
             timer: &mut timer,
             limit: 64,
-            marker: None,
         }))
         .expect("should deliver an oversized synchronous tail")
         .expect("should return the complete tail");
@@ -1552,7 +1595,6 @@ mod tests {
                 deadline: &deadline,
                 timer: &mut timer,
                 limit: 64,
-                marker: Some(b"|"),
             }))
             .expect("should retain output after invalid marker replacement")
             .expect("should return the fallback tail");
@@ -1637,7 +1679,6 @@ mod tests {
             deadline: &deadline,
             timer: &mut timer,
             limit: 12,
-            marker: None,
         }))
         .expect("should accept exact-cap EOF completion")
         .expect("should return retained output through its replacement");
@@ -1709,7 +1750,6 @@ mod tests {
             deadline: &deadline,
             timer: &mut timer,
             limit: 64,
-            marker: None,
         }))
         .expect("should retain fallback after constructor consumes budget");
         assert_eq!(

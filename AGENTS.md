@@ -370,7 +370,7 @@ finalization, publisher or HTML-processor code:
 
 - Native Rust HTML EOF harness configuration, timing and cleanup: `cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --features html-eof-runtime --test html_eof_runtime` and `cargo clippy --manifest-path crates/trusted-server-integration-tests/Cargo.toml --features html-eof-runtime --test html_eof_runtime -- -D warnings`
 - Actual Axum EOF/auction controls: `./scripts/async-html-finalization-local-test.sh axum --auction`
-- Actual Fastly EOF/auction controls with isolated Viceroy 0.19+: `PATH="/tmp/example-eof-viceroy/bin:$PATH" ./scripts/async-html-finalization-local-test.sh fastly --release --auction`; install with `cargo install viceroy --version 0.19.0 --locked --root /tmp/example-eof-viceroy`. Ordinary tests retain pinned Viceroy 0.17. See `scripts/README.md` for retained diagnostics and other runtimes.
+- Actual Fastly EOF/auction controls with repository-pinned Viceroy (the fixture requires 0.19+): `./scripts/async-html-finalization-local-test.sh fastly --release --auction`. The auction control checks empty-bid assembly with a deliberately unreachable bidder. See `scripts/README.md` for retained diagnostics and other runtimes.
 
 ---
 

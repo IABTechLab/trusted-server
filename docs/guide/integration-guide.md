@@ -234,6 +234,9 @@ Fastly, use an HTTP lookup whose transport timeouts are capped with
 use error_stack::Report;
 use futures::future::LocalBoxFuture;
 use std::io;
+use trusted_server_core::integrations::{
+    IntegrationHtmlStreamContext, IntegrationHtmlStreamProcessorFactory,
+};
 use trusted_server_core::streaming_processor::StreamProcessor;
 use trusted_server_core::streaming_processor::finish::{
     StreamFinish, StreamFinishError, StreamFinishInput,
@@ -241,6 +244,23 @@ use trusted_server_core::streaming_processor::finish::{
 
 /// Append a fixed footer when an example KV key is present.
 pub struct ExampleFooterProcessor;
+
+/// Create a request-local footer processor with matching EOF capability.
+pub struct ExampleFooterFactory;
+
+impl IntegrationHtmlStreamProcessorFactory for ExampleFooterFactory {
+    fn integration_id(&self) -> &'static str {
+        "example_footer"
+    }
+
+    fn requires_async_finish(&self) -> bool {
+        true
+    }
+
+    fn create(&self, _context: IntegrationHtmlStreamContext) -> Box<dyn StreamProcessor> {
+        Box::new(ExampleFooterProcessor)
+    }
+}
 
 impl StreamProcessor for ExampleFooterProcessor {
     fn process_chunk(&mut self, bytes: &[u8], _is_last: bool) -> io::Result<Vec<u8>> {
@@ -279,8 +299,9 @@ impl StreamProcessor for ExampleFooterProcessor {
 
 <!-- documentation-snippet:html-eof:end -->
 
-The factory also returns `true` from `requires_async_finish()` and creates this
-session. Leave `buffer_output_until_eof()` at its default `false` for this append
+The factory and session both return `true` from `requires_async_finish()` for
+their entire lifetimes. Their capabilities must match; a mismatch fails the request.
+Leave `buffer_output_until_eof()` at its default `false` for this append
 operation. KV must be available on the runtime; unavailable lookup falls back to
 the synchronous tail. Fastly consumers must use host operations with independently
 bounded latency and cap configurable transport timeouts with `input.deadline.remaining()`;
