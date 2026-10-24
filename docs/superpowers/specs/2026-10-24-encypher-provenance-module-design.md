@@ -125,10 +125,10 @@ API address had no reachable service. The private page was not held
 
 ### 4.2 Limits
 
-The API address must be `https`, and the dev server's HTTP client trusts the
-public certificate authorities built into it, so the runtime smoke cannot
-reach a local signing stub. Signing a page is proven by the in-process
-publisher-path tests above, not against the live API.
+The runtime smoke pointed the module at a signing endpoint that was not
+available, to exercise fail-open. Successful signing is tested in process
+only, by the publisher-path tests above against a stub API. The live Encypher
+API was not exercised.
 
 ## 5. Open questions
 

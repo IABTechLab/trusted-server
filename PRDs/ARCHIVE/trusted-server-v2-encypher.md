@@ -63,14 +63,14 @@ contribution onto those interfaces as `crates/provenance/encypher`
 
 ## Success Criteria
 
-| Criterion                                | Result                                                                                    |
-| ---------------------------------------- | ----------------------------------------------------------------------------------------- |
-| Signing works through the publisher path | Met in process: buffered and streaming finalizers sign against a stub origin and stub API |
-| Every failure passes the page through    | Met: ported failure tests; runtime smoke `reason=http_error` with the page intact         |
-| A private origin page is never sent      | Met: in-process test and runtime smoke `gate=origin_private`                              |
-| Core names no vendor or platform         | Met: `scripts/lint-core-platform-names.py` exit 0                                         |
-| CI gates green                           | Met locally, see Completion Notes                                                         |
-| Live API signing                         | Not met: not exercised, see limits                                                        |
+| Criterion                                 | Result                                                                                    |
+| ----------------------------------------- | ----------------------------------------------------------------------------------------- |
+| Signing works through the publisher path  | Met in process: buffered and streaming finalizers sign against a stub origin and stub API |
+| Every failure passes the page through     | Met: ported failure tests; runtime smoke `reason=http_error` with the page intact         |
+| A private origin page is never sent       | Met: in-process test and runtime smoke `gate=origin_private`                              |
+| Core platform-name neutrality lint passes | Met: `scripts/lint-core-platform-names.py` exit 0                                         |
+| CI gates green                            | Met locally, see Completion Notes                                                         |
+| Live API signing                          | Not met: not exercised, see limits                                                        |
 
 ## Completion Notes
 
@@ -123,10 +123,9 @@ commit.
 
 Limits:
 
-- Live API: the API address must be `https`, and the Axum client trusts only
-  the public certificate authorities built into it, so the runtime smoke could
-  not reach a local signing stub. The client was not weakened. Signing is proven
-  in process only.
+- Live API: the runtime smoke pointed the module at a signing endpoint that
+  was not available, to exercise fail-open. Successful signing was tested in
+  process only, against a stub API. The live Encypher API was not exercised.
 - Personalized pages: the module skips pages whose origin set a cookie or
   forbade shared caching, and cannot detect others. A deployment places it on
   public article routes.
