@@ -3958,6 +3958,7 @@ mod tests {
                 "ad-tag.google.diagnostics",
                 "ads-txt.iabtl",
                 "headers.geo",
+                "provenance.encypher",
                 "51degrees",
                 "analytics.tinybird",
                 "auction-protocol.openrtb",

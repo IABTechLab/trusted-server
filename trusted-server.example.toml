@@ -423,6 +423,7 @@ pull_sync_concurrency = 3
 #   "ad-tag.google.loader",
 #   "ad-tag.google.diagnostics",
 #   "headers.geo",
+#   "provenance.encypher",
 #   "51degrees.client_hints",
 #   "service_version",
 # ]
@@ -912,6 +913,20 @@ auction_timeout_ms = 500
 # carrying its hints, and is on unless set to false.
 # [middleware.51degrees.client_hints]
 # critical = true
+
+# Encypher text provenance. Signs the article on each page a [[serve]] entry
+# names `provenance.encypher` for, with invisible markers and a C2PA manifest
+# link, and passes every page it cannot sign through unchanged. Give the
+# entry a `path` for each section of articles to sign. `worker_token` is the
+# name of the secret-store entry holding the `cwk_` worker credential. Plans
+# are cached in the runtime KV store; without one, pages pass through.
+# [provenance]
+# module = "encypher"
+#
+# [provenance.encypher]
+# api_base_url = "https://api.example.com"
+# domain = "publisher.example.com"
+# worker_token = "encypher_worker_token"
 
 # Permutive DMP. `organization_id` and `workspace_id` are required.
 # [audience]
