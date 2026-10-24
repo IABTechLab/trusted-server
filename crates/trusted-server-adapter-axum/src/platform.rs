@@ -1,18 +1,23 @@
 use std::future::Future;
 use std::net::IpAddr;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use edgezero_adapter_axum::key_value_store::PersistentKvStore;
 use edgezero_core::http::{HeaderMap, HeaderName, HeaderValue, header};
+use edgezero_core::key_value_store::{KvHandle, KvPage, KvStore};
 use error_stack::{Report, ResultExt as _};
 use trusted_server_core::platform::{
-    AuctionTargetCapabilities, AuctionTargetDescriptor, ClientInfo, GeoInfo, PlatformBackend,
-    PlatformBackendSpec, PlatformConfigStore, PlatformError, PlatformGeo, PlatformHttpClient,
-    PlatformHttpRequest, PlatformPendingRequest, PlatformResponse, PlatformSecretStore,
-    PlatformSelectResult, RuntimeServices, StoreId, StoreName,
+    AuctionTargetCapabilities, AuctionTargetDescriptor, ClientInfo, GeoInfo, KvError,
+    PlatformBackend, PlatformBackendSpec, PlatformConfigStore, PlatformError, PlatformGeo,
+    PlatformHttpClient, PlatformHttpRequest, PlatformKvStore, PlatformPendingRequest,
+    PlatformResponse, PlatformSecretStore, PlatformSelectResult, RuntimeServices, StoreId,
+    StoreName, UnavailableKvStore,
 };
 
 // ---------------------------------------------------------------------------
@@ -564,16 +569,84 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
 }
 
 // ---------------------------------------------------------------------------
+// Runtime KV
+// ---------------------------------------------------------------------------
+
+/// Environment variable naming the file that backs runtime KV.
+///
+/// When set at startup, the dev server persists runtime KV in that file. When
+/// unset, runtime KV is unavailable.
+pub const KV_PATH_ENV: &str = "TRUSTED_SERVER_KV_PATH";
+
+/// Open the persistent runtime KV store at `path`, creating missing parent
+/// directories.
+///
+/// # Errors
+///
+/// Returns an error when the directory cannot be created or the database
+/// cannot be opened (corrupted file, locked by another process).
+pub fn open_kv_handle(path: &Path) -> Result<KvHandle, KvError> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(|err| {
+            KvError::Internal(anyhow::anyhow!(
+                "failed to create KV directory `{}`: {err}",
+                parent.display()
+            ))
+        })?;
+    }
+    Ok(KvHandle::new(Arc::new(PersistentKvStore::new(path)?)))
+}
+
+/// Bridges edgezero's [`KvHandle`] to [`PlatformKvStore`].
+struct KvHandleAdapter(KvHandle);
+
+#[async_trait(?Send)]
+impl KvStore for KvHandleAdapter {
+    async fn get_bytes(&self, key: &str) -> Result<Option<Bytes>, KvError> {
+        self.0.get_bytes(key).await
+    }
+
+    async fn put_bytes(&self, key: &str, value: Bytes) -> Result<(), KvError> {
+        self.0.put_bytes(key, value).await
+    }
+
+    async fn put_bytes_with_ttl(
+        &self,
+        key: &str,
+        value: Bytes,
+        ttl: Duration,
+    ) -> Result<(), KvError> {
+        self.0.put_bytes_with_ttl(key, value, ttl).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), KvError> {
+        self.0.delete(key).await
+    }
+
+    async fn list_keys_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<KvPage, KvError> {
+        self.0.list_keys_page(prefix, cursor, limit).await
+    }
+}
+
+// ---------------------------------------------------------------------------
 // build_runtime_services
 // ---------------------------------------------------------------------------
 
 /// Construct [`RuntimeServices`] for an incoming Axum request.
 ///
-/// # Degraded features in dev
+/// # Runtime KV
 ///
-/// The generic runtime KV slot uses
-/// [`trusted_server_core::platform::UnavailableKvStore`]. A `warn` log is
-/// emitted once per process.
+/// Runtime KV comes from the KV handle the dev server injects into each
+/// request, which `main` builds when [`KV_PATH_ENV`] is set. Without it the
+/// slot is [`UnavailableKvStore`] and a `warn` log is emitted once per process.
 pub fn build_runtime_services(
     ctx: &edgezero_core::context::RequestContext,
     settings: &trusted_server_core::settings::Settings,
@@ -581,17 +654,25 @@ pub fn build_runtime_services(
         [Arc<dyn trusted_server_core::permission_signal::PermissionSignalModule>],
     >,
 ) -> RuntimeServices {
-    static KV_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    KV_WARNED.get_or_init(|| {
-        log::warn!("Axum dev server: generic runtime KV is unavailable (UnavailableKvStore).");
-    });
+    let kv_store: Arc<dyn PlatformKvStore> = match ctx.kv_store_default() {
+        Some(handle) => Arc::new(KvHandleAdapter(handle)),
+        None => {
+            static KV_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            KV_WARNED.get_or_init(|| {
+                log::warn!(
+                    "Axum dev server: generic runtime KV is unavailable; set {KV_PATH_ENV} to enable it."
+                );
+            });
+            Arc::new(UnavailableKvStore)
+        }
+    };
 
     let client_ip = edgezero_adapter_axum::context::AxumRequestContext::get(ctx.request())
         .and_then(|c| c.remote_addr)
         .map(|addr| addr.ip());
 
     use trusted_server_core::platform::{
-        PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformKvStore, PlatformSecretStore,
+        PlatformBackend, PlatformConfigStore, PlatformGeo, PlatformSecretStore,
     };
 
     // Stateless shims are promoted to process-wide statics so callers clone
@@ -600,7 +681,6 @@ pub fn build_runtime_services(
         std::sync::OnceLock::new();
     static SECRET_STORE: std::sync::OnceLock<Arc<dyn PlatformSecretStore>> =
         std::sync::OnceLock::new();
-    static KV_STORE: std::sync::OnceLock<Arc<dyn PlatformKvStore>> = std::sync::OnceLock::new();
     static BACKEND: std::sync::OnceLock<Arc<dyn PlatformBackend>> = std::sync::OnceLock::new();
     static GEO: std::sync::OnceLock<Arc<dyn PlatformGeo>> = std::sync::OnceLock::new();
 
@@ -611,9 +691,7 @@ pub fn build_runtime_services(
         .secret_store(Arc::clone(SECRET_STORE.get_or_init(|| {
             Arc::new(AxumPlatformSecretStore) as Arc<dyn PlatformSecretStore>
         })))
-        .kv_store(Arc::clone(KV_STORE.get_or_init(|| {
-            Arc::new(trusted_server_core::platform::UnavailableKvStore) as Arc<dyn PlatformKvStore>
-        })))
+        .kv_store(kv_store)
         .backend(Arc::clone(BACKEND.get_or_init(|| {
             Arc::new(AxumPlatformBackend) as Arc<dyn PlatformBackend>
         })))

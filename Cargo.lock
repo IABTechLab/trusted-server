@@ -6594,9 +6594,11 @@ dependencies = [
 name = "trusted-server-adapter-axum"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "axum",
  "base64",
+ "bytes",
  "edgezero-adapter-axum",
  "edgezero-core",
  "error-stack",
@@ -6606,6 +6608,7 @@ dependencies = [
  "serde_json",
  "simple_logger",
  "temp-env",
+ "tempfile",
  "tokio",
  "tower 0.4.13",
  "trusted-server-ad-server-iabtl",

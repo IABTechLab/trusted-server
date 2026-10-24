@@ -1,7 +1,10 @@
+use std::path::Path;
+
 use edgezero_adapter_axum::dev_server::{AxumDevServer, AxumDevServerConfig};
 use edgezero_core::app::Hooks as _;
 use log::LevelFilter;
 use trusted_server_adapter_axum::app::TrustedServerApp;
+use trusted_server_adapter_axum::platform::{KV_PATH_ENV, open_kv_handle};
 
 /// Environment variable that sets the maximum log level.
 const LOG_LEVEL_ENV: &str = "RUST_LOG";
@@ -39,7 +42,21 @@ fn main() {
 
     log::info!("Listening on http://{}", config.addr);
     let router = TrustedServerApp::routes();
-    if let Err(err) = AxumDevServer::with_config(router, config).run() {
+    let mut server = AxumDevServer::with_config(router, config);
+    if let Some(path) = std::env::var_os(KV_PATH_ENV).filter(|path| !path.is_empty()) {
+        // Construct the store once so every request shares one handle.
+        match open_kv_handle(Path::new(&path)) {
+            Ok(handle) => {
+                log::info!("Runtime KV: {}", Path::new(&path).display());
+                server = server.with_kv_handle(handle);
+            }
+            Err(err) => {
+                log::error!("{KV_PATH_ENV} is set but the KV store cannot be opened: {err}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if let Err(err) = server.run() {
         log::error!("trusted-server-adapter-axum failed: {err}");
         std::process::exit(1);
     }
