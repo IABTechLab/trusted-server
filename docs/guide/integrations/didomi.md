@@ -159,10 +159,16 @@ caches must include the full path and query in their cache key and honor the
 geo-less redirect's `private, no-store` policy. Trusted Server does not replace
 Didomi's freshness policy with a hard-coded TTL.
 
-Every other SDK request bypasses the platform outbound cache, including other SDK
-assets, POST requests, and loaders with `geo_query_parameters = false`. Their URLs
-do not establish a validated trusted geo cache identity, even when they contain
-caller-supplied country/region parameters. All of these responses use
+Other SDK GETs, including static core, UI, and translation files, retain default
+outbound caching and all origin cache metadata regardless of geo availability or
+`geo_query_parameters`. Didomi's cache headers control their freshness in the
+platform cache and browser; Trusted Server does not impose a TTL.
+
+Noncanonical loaders (any SDK path ending in `/loader.js` without a validated
+canonical URL) and SDK POSTs bypass the platform outbound cache. This includes
+loaders with `geo_query_parameters = false`, root `/loader.js`, and nested loader
+paths. Their URLs do not establish a validated trusted geo cache identity, even
+when they contain caller-supplied country/region parameters. These responses use
 `Cache-Control: no-store, private`; expiry, validators, age, and independent CDN
 cache directives are removed. This applies even when no trusted geo is available.
 Client conditional cache headers are not forwarded to Didomi.
@@ -202,9 +208,12 @@ Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS
 This is a compatibility change for deployments that supply `FastlyGeo-*` request
 headers. Those headers no longer influence upstream Didomi geo headers. Use the
 runtime's trusted client IP and platform geo service; setting or restoring caller
-headers is not a supported fallback. Verify notice selection when trusted geo is
-missing, especially on adapters without complete country/region support. Didomi
-may use its own fallback when Trusted Server omits geo headers.
+headers is not a supported fallback. If Trusted Server runs behind another CDN or
+proxy, configure [CDN-fronted client IP](/guide/fastly#cdn-fronted-client-ip);
+otherwise platform geo resolves the proxy's address rather than the visitor's.
+Verify notice selection when trusted geo is missing, especially on adapters
+without complete country/region support. Didomi may use its own fallback when
+Trusted Server omits geo headers.
 
 Purge existing SDK entries from the platform outbound cache and any downstream
 shared caches before serving traffic with this change. Previously cached browser
@@ -212,11 +221,25 @@ responses can remain fresh until their old TTL expires; plan a cache-busting SDK
 URL change or an expiry window if immediate migration is required. New response
 policies cannot retroactively invalidate fresh browser entries.
 
-Expect increased origin traffic and latency for noncanonical SDK requests,
-including all SDK requests with `geo_query_parameters = false`. Check Didomi
-origin capacity and monitor errors during rollout. To retain loader cache reuse
-on a supported platform, validate trusted geo coverage before enabling
-`geo_query_parameters`; other SDK assets remain non-storable.
+Noncanonical loaders bypass caching and contact Didomi on every request, including
+loaders with the default `geo_query_parameters = false`. Didomi's reverse-proxy
+requirements linked above prohibit querying its CDN on every end-user request and
+warn that excessive queries can cause automatic throttling and disablement without
+warning. This
+remaining loader bypass is a security trade-off, not a production caching mode
+that meets those requirements.
+
+For Fastly production deployments, validate complete trusted country/region
+coverage and enable `geo_query_parameters = true` so canonical notice loaders can
+reuse the outbound cache under Didomi's freshness policy. Ensure the SDK uses the
+supported `/<public-api-key>/loader.js` path. Cloudflare, Axum, and Spin currently
+lack complete trusted geo and have no compliant loader-caching mode through this
+proxy. Do not deploy the geo-less loader proxy as a production workaround on those
+adapters. To use Didomi's supported direct SDK delivery instead, set
+`[integrations.didomi].enabled = false` (or remove the integration block) and
+restore the direct Didomi embed and SDK paths; the enabled integration rewrites
+`didomiConfig.sdkPath` through the proxy. Other SDK GETs, including static assets,
+continue to honor Didomi's cache policy.
 
 ### Enabling canonical notice loaders
 
@@ -230,8 +253,8 @@ Before enabling `geo_query_parameters`:
 4. Test at least two locations that require different notices.
 5. Verify repeated canonical loader requests for one country/region reuse the cached response
    and retain Didomi's freshness and validator headers.
-6. Verify API and noncanonical SDK requests never enter the outbound or downstream
-   cache.
+6. Verify API requests, noncanonical loaders, and SDK POSTs never enter the
+   outbound or downstream cache; other SDK GETs should retain origin cache policy.
 7. Purge loader and API entries cached before this behavior was enabled.
 8. Test from egress whose geo can shift between requests (carrier NAT pools,
    relay-style proxies). The loader canonicalizes with one redirect per stable
