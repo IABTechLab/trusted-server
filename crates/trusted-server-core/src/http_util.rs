@@ -123,8 +123,9 @@ pub fn is_navigation_request(req: &Request<EdgeBody>) -> bool {
 /// The parser checks forwarded headers (`Forwarded`, `X-Forwarded-Host`,
 /// `X-Forwarded-Proto`) as fallbacks, but on the Fastly edge
 /// [`sanitize_forwarded_headers`] strips those headers before this method is
-/// called, so the `Host` header (falling back to URI authority) and Fastly SDK
-/// TLS detection are the effective sources in production.
+/// called. The `Host` header and Fastly SDK TLS detection are the normal sources
+/// in production. URI authority fills in only when no usable `Host` arrives
+/// (absolute-form HTTP/1.1, or HTTP/2 without `Host`).
 #[derive(Debug, Clone)]
 pub struct RequestInfo {
     /// The effective host for URL rewriting (`Host` or URI authority after edge sanitization).
@@ -136,11 +137,11 @@ pub struct RequestInfo {
 impl RequestInfo {
     /// Extract host and scheme information from a request.
     ///
-    /// Host fallback order (first present wins):
+    /// Host fallback order (first nonempty, valid string wins):
     /// 1. `Forwarded` header (`host=...`)
     /// 2. `X-Forwarded-Host`
     /// 3. `Host` header
-    /// 4. Request URI authority (including any port)
+    /// 4. Request URI authority (host and port only, excluding userinfo)
     ///
     /// Scheme fallback order:
     /// 1. Fastly SDK TLS detection
@@ -150,8 +151,9 @@ impl RequestInfo {
     /// 5. Default `http`
     ///
     /// In production the forwarded headers are stripped by
-    /// [`sanitize_forwarded_headers`] at the edge, so `Host` or URI authority
-    /// and [`ClientInfo`] TLS detection are the effective sources.
+    /// [`sanitize_forwarded_headers`] at the edge, so `Host` and [`ClientInfo`]
+    /// TLS detection are the normal sources. URI authority is a fallback for
+    /// absolute-form HTTP/1.1 or HTTP/2 requests without a usable `Host`.
     pub fn from_request(req: &Request<EdgeBody>, client_info: &ClientInfo) -> Self {
         let host = extract_request_host(req);
         let scheme = detect_request_scheme(
@@ -179,8 +181,18 @@ fn extract_request_host(req: &Request<EdgeBody>) -> String {
             req.headers()
                 .get(header::HOST)
                 .and_then(|h| h.to_str().ok())
+                .filter(|host| !host.is_empty())
         })
-        .or_else(|| req.uri().authority().map(http::uri::Authority::as_str))
+        .or_else(|| {
+            // Absolute-form HTTP/1.1 and HTTP/2 may carry the host only in the URI.
+            // Drop userinfo so credentials never reach rewritten URLs.
+            req.uri().authority().map(|authority| {
+                let authority = authority.as_str();
+                authority
+                    .rsplit_once('@')
+                    .map_or(authority, |(_, host_and_port)| host_and_port)
+            })
+        })
         .unwrap_or_default()
         .to_owned()
 }
@@ -586,6 +598,18 @@ mod tests {
                 "publisher.example.com:8443",
             ),
             ("https://[2001:db8::1]:8443/page", "[2001:db8::1]:8443"),
+            (
+                "https://user:secret@publisher.example.com/page",
+                "publisher.example.com",
+            ),
+            (
+                "https://user:pass@publisher.example.com:8443/page",
+                "publisher.example.com:8443",
+            ),
+            (
+                "https://user:pass@[2001:db8::1]:8443/page",
+                "[2001:db8::1]:8443",
+            ),
         ] {
             let req = Request::builder()
                 .version(http::Version::HTTP_2)
@@ -598,7 +622,7 @@ mod tests {
 
             assert_eq!(
                 info.host, expected_host,
-                "should preserve URI authority including ports and IPv6 brackets"
+                "should use only the host and port, preserving IPv6 brackets"
             );
         }
     }
@@ -607,6 +631,7 @@ mod tests {
     fn request_info_preserves_host_header_precedence_over_uri_authority() {
         for (headers, expected_host) in [
             (vec![("host", "header.example.com")], "header.example.com"),
+            (vec![("host", "")], "authority.example.com"),
             (
                 vec![
                     ("host", "header.example.com"),
