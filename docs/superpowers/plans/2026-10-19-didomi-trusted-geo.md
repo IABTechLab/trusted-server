@@ -87,8 +87,4 @@ Passed checks:
 - Added-line domain lint; the optional full-repository audit reports pre-existing
   violations and this follow-up adds none.
 
-Fastly tests used Viceroy 0.21.0; the installed 0.17.0 cannot load a required
-Fastly import. Runtime tests needed macOS keychain/loopback access. JS checks used
-Node 24.12.0. The release-producer checks listed in the current workflow
-instructions cannot run because this branch has no `scripts/release/` directory.
 No live Fastly deployment or CDN smoke test was performed.

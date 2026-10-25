@@ -48,9 +48,12 @@ ts config push --adapter fastly
 | `sdk_origin`           | string  | No       | `https://sdk.privacy-center.org`      | Changes the SDK origin, primarily for testing           |
 | `api_origin`           | string  | No       | `https://api.privacy-center.org`      | Changes the API origin, primarily for testing           |
 
-`geo_query_parameters` is disabled by default for compatibility. It currently
-supports Fastly only because Cloudflare does not expose a trusted region through
-the pinned EdgeZero adapter, while Axum and Spin do not provide platform geo.
+`geo_query_parameters` defaults to `false`, which is not a compliant production
+loader-caching mode; review the [rollout checks](#rollout-checks) before enabling
+the integration. `ts audit generate` leaves detected Didomi disabled and flags it
+for manual review. Canonical loader caching currently supports Fastly only because
+Cloudflare does not expose a trusted region through the pinned EdgeZero adapter,
+while Axum and Spin do not provide platform geo.
 
 The normal configuration source is TOML. `TRUSTED_SERVER__...` variables are
 optional overlays applied by `ts config validate` and `ts config push`; they are
@@ -225,9 +228,8 @@ Noncanonical loaders bypass caching and contact Didomi on every request, includi
 loaders with the default `geo_query_parameters = false`. Didomi's reverse-proxy
 requirements linked above prohibit querying its CDN on every end-user request and
 warn that excessive queries can cause automatic throttling and disablement without
-warning. This
-remaining loader bypass is a security trade-off, not a production caching mode
-that meets those requirements.
+warning. This remaining loader bypass is a security trade-off, not a production
+caching mode that meets those requirements.
 
 For Fastly production deployments, validate complete trusted country/region
 coverage and enable `geo_query_parameters = true` so canonical notice loaders can
