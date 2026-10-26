@@ -40,6 +40,7 @@ pub(crate) struct RequestIdentity {
     runtime: Option<Arc<IdentityRuntime>>,
     rate_limiter: Option<Arc<dyn RateLimiter + Send + Sync>>,
     runs_auction: bool,
+    hold_dispatched: bool,
     mutation: IdentityMutation,
     pending_removals: Option<IdentityMutation>,
     removal_lost: u32,
@@ -113,11 +114,23 @@ impl RequestIdentity {
         self.rate_limiter = Some(limiter);
     }
 
-    /// Whether this navigation runs an auction, so hold-mode providers were
-    /// dispatched before it (or not at all) and phase 4 must not run them.
+    /// Whether this navigation runs an auction, so hold-mode providers may
+    /// be dispatched before it.
     #[must_use]
     pub(crate) fn runs_auction(&self) -> bool {
         self.runs_auction
+    }
+
+    /// Whether the hold dispatch considered every hold-mode provider on a
+    /// usable phase 1 row, so phase 4 must not run them again.
+    #[must_use]
+    pub(crate) fn hold_dispatched(&self) -> bool {
+        self.hold_dispatched
+    }
+
+    /// Records that the hold dispatch ran on a usable phase 1 row.
+    pub(crate) fn set_hold_dispatched(&mut self) {
+        self.hold_dispatched = true;
     }
 
     /// Records that this navigation runs an auction (spec 4.7 step 7).

@@ -113,7 +113,9 @@ pub fn run_after_send(input: AfterSendInput<'_>) -> FlushOutcome {
     }
 
     let now = current_timestamp();
-    let facts = request_facts(context, now);
+    // Hold-mode providers run in phase 4 unless the hold dispatch already
+    // considered them on a usable row (spec 4.7 step 7).
+    let facts = request_facts(context, now, context.identity().hold_dispatched());
     let phase_one = context.kv_snapshot().clone();
     let phase_one_entry = phase_one.entry_for(&ec_id);
     let phase_one_view =
@@ -293,7 +295,7 @@ fn write_failed(
 }
 
 /// What eligibility reads about the request itself.
-pub(super) fn request_facts(context: &EcContext, now: u64) -> RequestFacts {
+pub(super) fn request_facts(context: &EcContext, now: u64, runs_auction: bool) -> RequestFacts {
     let identity = context.identity();
     let mut available_inputs = BTreeSet::new();
     for (input, present) in [
@@ -314,10 +316,7 @@ pub(super) fn request_facts(context: &EcContext, now: u64) -> RequestFacts {
         },
         writer: identity.writer(),
         new_visitor: context.ec_generated(),
-        // A navigation that ran an auction dispatched its hold-mode providers
-        // before it, so phase 4 runs them only for one that ran none
-        // (spec 4.7 step 7).
-        runs_auction: identity.runs_auction(),
+        runs_auction,
         now: UnixTime::from_secs(now),
         available_inputs,
     }

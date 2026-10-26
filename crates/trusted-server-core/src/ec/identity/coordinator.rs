@@ -1615,22 +1615,26 @@ pub(crate) fn opt_out_clears(
 }
 
 /// Runs [`run_hold`] with the request's runtime and limiter. `None` when the
-/// adapter set no identity runtime, so no provider is configured.
+/// adapter set no identity runtime (no provider is configured) or no limiter
+/// (fails closed).
 pub(crate) fn hold_before_auction(
     settings: &Settings,
     services: &RuntimeServices,
     context: &mut EcContext,
 ) -> Option<HoldResults> {
     let runtime = context.identity().runtime().cloned()?;
-    let limiter = context.identity().rate_limiter();
+    let Some(limiter) = context.identity().rate_limiter() else {
+        // Without a limiter the burst cap and breaker cannot hold, so fail
+        // closed: dispatch nothing before the response.
+        log::warn!("Skipping the identity hold dispatch: no rate limiter is set for the request");
+        return None;
+    };
     let random = ThreadRandom;
     let deps = runtime.deps(
         settings,
         services,
         &random,
-        limiter
-            .as_deref()
-            .map(|limiter| -> &dyn RateLimiter { limiter }),
+        Some(limiter.as_ref() as &dyn RateLimiter),
     );
     Some(run_hold(&deps, context))
 }
@@ -1681,7 +1685,8 @@ pub(crate) fn run_hold(deps: &IdentityDeps<'_>, context: &mut EcContext) -> Hold
     };
 
     let now = current_timestamp();
-    let facts = request_facts(context, now);
+    let facts = request_facts(context, now, true);
+    context.identity_mut().set_hold_dispatched();
     let view = EligibilityView::from_kv(&entry);
     let calls: Vec<Call> = deps
         .catalog
@@ -1735,6 +1740,8 @@ pub(crate) fn run_hold(deps: &IdentityDeps<'_>, context: &mut EcContext) -> Hold
         },
     );
 
+    // Computed on the phase 1 row; the flush applies the same mutation to the
+    // phase 4 live row, which may differ.
     let apply_context = ApplyContext {
         now,
         random: deps.random,
@@ -1749,6 +1756,9 @@ pub(crate) fn run_hold(deps: &IdentityDeps<'_>, context: &mut EcContext) -> Hold
                 source.parse::<SourceDomain>(),
                 record.w.as_deref().and_then(|writer| writer.parse().ok()),
             ) else {
+                log::debug!(
+                    "Skipping a hold answer for source '{source}': no parseable writer on the record"
+                );
                 continue;
             };
             results
@@ -4149,7 +4159,7 @@ mod tests {
         fixture.client.respond("c.example.com", 200, b"{}");
         fixture
             .client
-            .delay("a.example.com", Duration::from_millis(60));
+            .delay("b.example.com", Duration::from_millis(60));
         fixture.client.time_out("c.example.com");
 
         let outcomes = fixture.run(
@@ -4899,35 +4909,84 @@ mod tests {
             fixture.settings.ec.identity.hold_budget_ms = 50;
             fixture
                 .client
-                .respond("a.example.com", 200, &found_body("slow-uid"));
+                .respond("a.example.com", 200, &found_body("fast-uid"));
             fixture
                 .client
                 .respond("b.example.com", 200, &found_body("late-uid"));
-            fixture
-                .client
-                .delay("a.example.com", Duration::from_millis(120));
+            let delay = Duration::from_millis(400);
+            fixture.client.delay("b.example.com", delay);
 
+            let before = current_timestamp();
             let started = Instant::now();
             let results = fixture.run_hold();
             let elapsed = started.elapsed();
+            let outcome = fixture.flush(StatusCode::OK);
 
             assert!(
-                elapsed >= Duration::from_millis(50),
-                "should wait out the budget before the auction starts: {elapsed:?}"
-            );
-            assert!(
-                elapsed < Duration::from_millis(1_000),
-                "should not wait past the slow provider: {elapsed:?}"
+                // The call's timeout is the budget left when it was sent.
+                elapsed >= Duration::from_millis(45) && elapsed < delay,
+                "should start the auction at the budget, not at the slow answer: {elapsed:?}"
             );
             assert_eq!(
                 results.additions.keys().collect::<Vec<_>>(),
                 [&source("a.example.com")],
-                "should keep the answer that arrived and drop the one the budget cut off"
+                "should keep the fast answer and drop the slow one"
+            );
+            assert_eq!(outcome, FlushOutcome::Written, "should write the flush");
+            let row = fixture.row();
+            let retry = fixture.settings.ec.identity.hold_retry_sec;
+            assert!(
+                row.ps["b"]
+                    .n
+                    .is_some_and(|n| n >= before + retry && n <= before + retry + 5),
+                "should wait hold_retry_sec after the cut-off: {:?}",
+                row.ps["b"]
+            );
+            assert_eq!(row.ps["b"].f, 0, "should count no failure for the cut-off");
+            assert_eq!(
+                fixture.limiter.count_of("identity-fail:b"),
+                0,
+                "should not feed the breaker"
+            );
+            assert!(
+                row.ids.contains_key("a.example.com") && !row.ids.contains_key("b.example.com"),
+                "should store the fast answer and not the slow one"
+            );
+        }
+
+        #[test]
+        fn hold_providers_still_run_after_send_when_hold_found_no_usable_row() {
+            let mut fixture = HoldFixture::new(
+                vec![hold_provider("p", HOLD_HOST, HOLD_SOURCE)],
+                &live_row(),
+                true,
+            );
+            fixture
+                .client
+                .respond(HOLD_HOST, 200, &found_body("late-uid"));
+            fixture
+                .context
+                .set_kv_snapshot(crate::ec::EcKvSnapshot::NotRead);
+
+            let held = fixture.run_hold();
+            let before_send = fixture.client.sent_hosts();
+            let outcome = fixture.flush(StatusCode::OK);
+
+            assert_eq!(
+                (held, before_send),
+                (HoldResults::default(), Vec::<String>::new()),
+                "should dispatch nothing in hold without a usable row"
+            );
+            assert_eq!(outcome, FlushOutcome::Written, "should write the answer");
+            assert_eq!(
+                fixture.client.sent_hosts(),
+                [HOLD_HOST],
+                "should run the hold-mode provider once, after send"
             );
             assert_eq!(
-                fixture.client.sent_hosts().len(),
-                2,
-                "control: should have sent both calls up front"
+                fixture.row().ids[HOLD_SOURCE].eids,
+                single_entry("late-uid"),
+                "should store the answer"
             );
         }
 

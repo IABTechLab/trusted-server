@@ -8132,7 +8132,7 @@ mod tests {
 
     /// Drives a returning writer navigation that runs an auction, with one
     /// hold-mode provider that answers `found` for `ids.example.com`.
-    async fn run_hold_navigation() -> HoldNavigation {
+    async fn run_hold_navigation(with_limiter: bool) -> HoldNavigation {
         use crate::ec::identity::test_support::fake_http::{
             AnsweringProvider, FakeBackend, FakeHttpClient,
         };
@@ -8214,6 +8214,11 @@ mod tests {
             )
             .expect("should build the runtime"),
         ));
+        if with_limiter {
+            ec_context.set_identity_rate_limiter(Arc::new(
+                crate::ec::identity::test_support::FakeRateLimiter::new(),
+            ));
+        }
         let registry = PartnerRegistry::from_config(&[pull_partner_config("ids.example.com")])
             .expect("should build partner registry");
         let captured = Arc::new(Mutex::new(None));
@@ -8282,7 +8287,7 @@ mod tests {
 
     #[tokio::test]
     async fn hold_answer_reaches_the_navigation_auction_and_the_writer_mutation() {
-        let navigation = run_hold_navigation().await;
+        let navigation = run_hold_navigation(true).await;
 
         assert_eq!(
             navigation.provider_hosts,
@@ -8308,8 +8313,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hold_without_a_rate_limiter_dispatches_nothing() {
+        let navigation = run_hold_navigation(false).await;
+
+        assert!(
+            navigation.provider_hosts.is_empty(),
+            "should fail closed and call no provider without a limiter: {:?}",
+            navigation.provider_hosts
+        );
+        assert_eq!(
+            navigation.auction_eids,
+            serde_json::Value::Null,
+            "should run the auction without a hold answer"
+        );
+        assert!(
+            navigation.runs_auction && navigation.staged_sources.is_empty(),
+            "control: the navigation still ran its auction and staged nothing"
+        );
+    }
+
+    #[tokio::test]
     async fn hold_sets_no_cookie() {
-        let navigation = run_hold_navigation().await;
+        let navigation = run_hold_navigation(true).await;
 
         assert_eq!(
             navigation.provider_hosts,

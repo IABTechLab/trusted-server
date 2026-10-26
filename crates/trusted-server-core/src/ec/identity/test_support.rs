@@ -986,6 +986,8 @@ pub mod fake_http {
         host: String,
         route: Route,
         delay: Duration,
+        /// The first-byte timeout the request's backend was registered with.
+        timeout: Option<Duration>,
     }
 
     /// An HTTP client that answers per host, and records what it was sent.
@@ -994,6 +996,7 @@ pub mod fake_http {
         delays: Mutex<BTreeMap<String, Duration>>,
         sent: Mutex<Vec<String>>,
         uris: Mutex<Vec<String>>,
+        backend: Mutex<Option<Arc<FakeBackend>>>,
     }
 
     impl FakeHttpClient {
@@ -1005,7 +1008,15 @@ pub mod fake_http {
                 delays: Mutex::new(BTreeMap::new()),
                 sent: Mutex::new(Vec::new()),
                 uris: Mutex::new(Vec::new()),
+                backend: Mutex::new(None),
             }
+        }
+
+        /// Makes a wait that outlasts the first-byte timeout `backend` last
+        /// registered for the host fail once that timeout has passed, as a
+        /// real backend does.
+        pub fn honour_timeouts_of(&self, backend: &Arc<FakeBackend>) {
+            *self.backend.lock().expect("should lock the backend") = Some(Arc::clone(backend));
         }
 
         /// Answers `host` with `status` and `body`.
@@ -1101,10 +1112,17 @@ pub mod fake_http {
                 .get(&host)
                 .copied()
                 .unwrap_or_default();
+            let timeout = self
+                .backend
+                .lock()
+                .expect("should lock the backend")
+                .as_ref()
+                .and_then(|backend| backend.last_first_byte_timeout(&host));
             Ok(PlatformPendingRequest::new(FakePending {
                 host,
                 route,
                 delay,
+                timeout,
             }))
         }
 
@@ -1131,6 +1149,12 @@ pub mod fake_http {
             let pending = pending
                 .downcast::<FakePending>()
                 .map_err(|_| Report::new(PlatformError::HttpClient))?;
+            if let Some(timeout) = pending.timeout
+                && pending.delay > timeout
+            {
+                std::thread::sleep(timeout);
+                return Err(Report::new(PlatformError::HttpClient));
+            }
             if !pending.delay.is_zero() {
                 std::thread::sleep(pending.delay);
             }
@@ -1166,6 +1190,17 @@ pub mod fake_http {
             Self {
                 specs: Mutex::new(Vec::new()),
             }
+        }
+
+        /// The first-byte timeout `host` was last registered with.
+        fn last_first_byte_timeout(&self, host: &str) -> Option<Duration> {
+            self.specs
+                .lock()
+                .expect("should lock the specs")
+                .iter()
+                .rev()
+                .find(|spec| spec.host == host)
+                .map(|spec| spec.first_byte_timeout)
         }
 
         /// The first-byte timeouts the backends were registered with, in order.
@@ -1206,6 +1241,7 @@ pub mod fake_http {
         client: &Arc<FakeHttpClient>,
         backend: &Arc<FakeBackend>,
     ) -> RuntimeServices {
+        client.honour_timeouts_of(backend);
         RuntimeServices::builder()
             .config_store(Arc::new(NoopConfigStore))
             .secret_store(Arc::new(NoopSecretStore))
