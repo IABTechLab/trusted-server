@@ -287,6 +287,17 @@ pub(crate) fn effective_tcf(ctx: &ConsentContext) -> Option<&types::TcfConsent> 
     })
 }
 
+/// Whether TCF applies to this request: `gdpr_applies`, or a jurisdiction of
+/// GDPR or unknown.
+#[must_use]
+pub(crate) fn tcf_applies(ctx: &ConsentContext) -> bool {
+    ctx.gdpr_applies
+        || matches!(
+            ctx.jurisdiction,
+            jurisdiction::Jurisdiction::Gdpr | jurisdiction::Jurisdiction::Unknown
+        )
+}
+
 /// Returns whether a server-side auction may be dispatched for this request.
 ///
 /// Fails closed for GDPR-relevant traffic: when an EU TCF signal is present
@@ -296,12 +307,7 @@ pub(crate) fn effective_tcf(ctx: &ConsentContext) -> Option<&types::TcfConsent> 
 /// non-GDPR jurisdiction with no EU TCF signal are freely allowed.
 #[must_use]
 pub fn consent_allows_server_side_auction(ctx: &ConsentContext) -> bool {
-    let requires_tcf_purpose1 = ctx.gdpr_applies
-        || matches!(
-            ctx.jurisdiction,
-            jurisdiction::Jurisdiction::Gdpr | jurisdiction::Jurisdiction::Unknown
-        );
-    if !requires_tcf_purpose1 {
+    if !tcf_applies(ctx) {
         return true;
     }
     effective_tcf(ctx).is_some_and(|tcf| tcf.has_purpose_consent(1))
@@ -780,6 +786,11 @@ mod tests {
                 section_ids: vec![2],
                 eu_tcf: Some(make_tcf(gpp_last_updated_ds, gpp_allows_eids)),
                 us_sale_opt_out: None,
+                us_sharing_opt_out: None,
+                us_targeted_advertising_opt_out: None,
+                us_gpc: None,
+                us_known_child: None,
+                us_privacy_section: None,
             }),
             ..ConsentContext::default()
         }
@@ -792,6 +803,11 @@ mod tests {
             section_ids: vec![2],
             eu_tcf: Some(make_tcf(0, allows_eids)),
             us_sale_opt_out: None,
+            us_sharing_opt_out: None,
+            us_targeted_advertising_opt_out: None,
+            us_gpc: None,
+            us_known_child: None,
+            us_privacy_section: None,
         };
         let cases = [
             (
@@ -952,6 +968,11 @@ mod tests {
                 section_ids: vec![2],
                 eu_tcf: Some(TcfBuilder::new().with_storage(true).build()),
                 us_sale_opt_out: None,
+                us_sharing_opt_out: None,
+                us_targeted_advertising_opt_out: None,
+                us_gpc: None,
+                us_known_child: None,
+                us_privacy_section: None,
             }),
             ..ConsentContext::default()
         };
@@ -1113,6 +1134,11 @@ mod tests {
                 section_ids: vec![2],
                 eu_tcf: Some(make_tcf(0, true)),
                 us_sale_opt_out: None,
+                us_sharing_opt_out: None,
+                us_targeted_advertising_opt_out: None,
+                us_gpc: None,
+                us_known_child: None,
+                us_privacy_section: None,
             }),
             ..ConsentContext::default()
         };
@@ -1226,6 +1252,11 @@ mod tests {
                 section_ids: vec![2],
                 eu_tcf: Some(make_tcf_with_storage(true)),
                 us_sale_opt_out: None,
+                us_sharing_opt_out: None,
+                us_targeted_advertising_opt_out: None,
+                us_gpc: None,
+                us_known_child: None,
+                us_privacy_section: None,
             }),
             gdpr_applies: true,
             ..ConsentContext::default()
@@ -1441,6 +1472,11 @@ mod tests {
                 section_ids: vec![7],
                 eu_tcf: None,
                 us_sale_opt_out: Some(false),
+                us_sharing_opt_out: None,
+                us_targeted_advertising_opt_out: None,
+                us_gpc: None,
+                us_known_child: None,
+                us_privacy_section: None,
             }),
             ..ConsentContext::default()
         };
@@ -1459,6 +1495,11 @@ mod tests {
                 section_ids: vec![7],
                 eu_tcf: None,
                 us_sale_opt_out: Some(true),
+                us_sharing_opt_out: None,
+                us_targeted_advertising_opt_out: None,
+                us_gpc: None,
+                us_known_child: None,
+                us_privacy_section: None,
             }),
             ..ConsentContext::default()
         };
@@ -1482,6 +1523,11 @@ mod tests {
                 section_ids: vec![7],
                 eu_tcf: None,
                 us_sale_opt_out: Some(false),
+                us_sharing_opt_out: None,
+                us_targeted_advertising_opt_out: None,
+                us_gpc: None,
+                us_known_child: None,
+                us_privacy_section: None,
             }),
             ..ConsentContext::default()
         };
@@ -1501,6 +1547,11 @@ mod tests {
                 section_ids: vec![7],
                 eu_tcf: None,
                 us_sale_opt_out: Some(true),
+                us_sharing_opt_out: None,
+                us_targeted_advertising_opt_out: None,
+                us_gpc: None,
+                us_known_child: None,
+                us_privacy_section: None,
             }),
             ..ConsentContext::default()
         };
@@ -1523,6 +1574,11 @@ mod tests {
                 section_ids: vec![7],
                 eu_tcf: None,
                 us_sale_opt_out: Some(false),
+                us_sharing_opt_out: None,
+                us_targeted_advertising_opt_out: None,
+                us_gpc: None,
+                us_known_child: None,
+                us_privacy_section: None,
             }),
             us_privacy: Some(UsPrivacy {
                 version: 1,
@@ -1551,6 +1607,11 @@ mod tests {
                 section_ids: vec![2],
                 eu_tcf: None,
                 us_sale_opt_out: None,
+                us_sharing_opt_out: None,
+                us_targeted_advertising_opt_out: None,
+                us_gpc: None,
+                us_known_child: None,
+                us_privacy_section: None,
             }),
             us_privacy: Some(UsPrivacy {
                 version: 1,

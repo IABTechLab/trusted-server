@@ -12,20 +12,18 @@ use http::{StatusCode, header};
 use web_time::Instant;
 
 use super::catalog::ProviderCatalog;
-use super::descriptor::{
-    ConsentPolicy, Input, ProviderDescriptor, ResolveKind, Resolves, UsOptOut,
-};
+use super::descriptor::{Input, ProviderDescriptor, ResolveKind, Resolves};
 use super::exchange::{ProviderRequest, ProviderResponse};
 use super::ids::{IdentityProviderId, SourceDomain, UnixTime};
 use super::input::{RandomSource, ResolveInput, ResolveSignals};
 use super::mutation::{PartnerIdChange, ProviderResult, ProviderStateChange, StateUpdate};
-use super::policy::{PolicySignals, policy_allows, tcf_applies, us_sale_opt_out};
+use super::policy::{PolicySignals, policy_allows};
 use super::provider::IdentityProvider;
 use super::resolution::{
     EntrySet, EntrySets, IdentityProviderError, Resolution, ResolvedEid, StateChange, entry_sets,
 };
 use super::revision::{IdentityKeys, StateRevision, record_revision, uid_hash, visitor_key};
-use crate::consent::{ConsentContext, effective_tcf};
+use crate::consent::ConsentContext;
 use crate::ec::kv_types::{KvEntry, KvOptOut, KvPartnerId};
 use crate::ec::rate_limiter::RateLimiter;
 use crate::platform::{
@@ -34,17 +32,6 @@ use crate::platform::{
 };
 use crate::settings::{IdentitySettings, ProviderMode, ProviderSettings, Settings};
 use crate::streaming_processor::{BodyStreamDecoder, Compression};
-
-/// The highest TCF purpose the fingerprint has a bit for.
-const FINGERPRINT_PURPOSES: u8 = 10;
-/// Fingerprint bit of the vendor consent. Purposes 1 to 10 hold bits 0 to 9.
-const FINGERPRINT_VENDOR_BIT: u32 = 10;
-/// Fingerprint bit of the US sale opt-out.
-const FINGERPRINT_SALE_BIT: u32 = 11;
-/// Fingerprint bit of Global Privacy Control.
-const FINGERPRINT_GPC_BIT: u32 = 12;
-/// Fingerprint bit of `DNT: 1`.
-const FINGERPRINT_DNT_BIT: u32 = 13;
 
 /// How long a burst-capped provider waits: one limiter window.
 const BURST_WAIT_SECS: u64 = 60;
@@ -463,57 +450,6 @@ fn has_unexpired_id(catalog: &ProviderCatalog, record: &KvPartnerId, now: UnixTi
     })
 }
 
-/// The consent an opt-out's `fp` records, as a lowercase hex bitmask (spec 8).
-///
-/// Each signal has a fixed bit, whatever the policy reads:
-///
-/// - bits 0 to 9: TCF purposes 1 to 10, set when consent grants the purpose
-/// - bit 10: the policy's vendor, set when consent grants it
-/// - bit 11: the US sale opt-out, from `us_privacy` or GPP
-/// - bit 12: GPC
-/// - bit 13: DNT
-///
-/// A signal the policy does not read or relaxes stays 0. Later parts append
-/// bits after these and keep these where they are.
-#[must_use]
-// Temporary: the request wiring, the first non-test caller, arrives in a later task.
-#[allow(dead_code)]
-pub(crate) fn fingerprint_bits(
-    policy: &ConsentPolicy,
-    consent: &ConsentContext,
-    signals: PolicySignals,
-) -> String {
-    let mut bits: u64 = 0;
-    if !policy.is_eid_persistence_only() {
-        if tcf_applies(consent)
-            && let Some(tcf) = effective_tcf(consent)
-        {
-            for purpose in policy.tcf_purposes() {
-                if (1..=FINGERPRINT_PURPOSES).contains(purpose)
-                    && tcf.has_purpose_consent(usize::from(*purpose))
-                {
-                    bits |= 1 << (purpose - 1);
-                }
-            }
-            if let Some(vendor) = policy.tcf_vendor()
-                && tcf.has_vendor_consent(vendor)
-            {
-                bits |= 1 << FINGERPRINT_VENDOR_BIT;
-            }
-        }
-        if !policy.allows_us_opt_out(UsOptOut::Sale) && us_sale_opt_out(consent) {
-            bits |= 1 << FINGERPRINT_SALE_BIT;
-        }
-        if !policy.allows_gpc() && consent.gpc {
-            bits |= 1 << FINGERPRINT_GPC_BIT;
-        }
-        if !policy.allows_dnt() && signals.dnt {
-            bits |= 1 << FINGERPRINT_DNT_BIT;
-        }
-    }
-    format!("{bits:x}")
-}
-
 /// What one provider call came to.
 #[derive(Debug)]
 pub(crate) enum CallOutcome {
@@ -553,7 +489,7 @@ pub(crate) struct OutcomeContext<'a> {
     pub(crate) identity: &'a IdentitySettings,
     /// The state revision the call read, for a provider with private state.
     pub(crate) expected_state: Option<StateRevision>,
-    /// The consent bits an opt-out records, from [`fingerprint_bits`].
+    /// The consent bits an opt-out records, from [`super::policy::fingerprint_bits`].
     pub(crate) fingerprint: &'a str,
 }
 
@@ -1510,6 +1446,7 @@ pub(crate) fn dispatch(
 
 #[cfg(test)]
 mod tests {
+    use crate::ec::identity::policy::fingerprint_bits;
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::Duration;
@@ -2345,6 +2282,11 @@ mod tests {
             section_ids: vec![7],
             eu_tcf: None,
             us_sale_opt_out: Some(true),
+            us_sharing_opt_out: None,
+            us_targeted_advertising_opt_out: None,
+            us_gpc: None,
+            us_known_child: None,
+            us_privacy_section: None,
         });
         assert_eq!(
             bits(&gpp_sale, signals),

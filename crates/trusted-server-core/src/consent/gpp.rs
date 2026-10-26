@@ -23,7 +23,7 @@
 
 use error_stack::Report;
 
-use super::types::{ConsentDecodeError, GppConsent, TcfConsent};
+use super::types::{ConsentDecodeError, GppConsent, TcfConsent, UsPrivacy};
 
 /// Maximum length of a raw GPP string before parsing.
 ///
@@ -71,7 +71,8 @@ pub fn decode_gpp_string(gpp_string: &str) -> Result<GppConsent, Report<ConsentD
     // Section ID 2 = TcfEuV2 in the GPP spec.
     let eu_tcf = decode_tcf_from_gpp(&parsed);
 
-    let us_sale_opt_out = decode_us_sale_opt_out(&parsed);
+    let us_sections = decode_us_sections(&parsed);
+    let us_sale_opt_out = aggregate_us_signal(&us_sections, us_sale_opt_out_from_section);
 
     Ok(GppConsent {
         // The GPP header version is always 1 for current spec.
@@ -79,6 +80,14 @@ pub fn decode_gpp_string(gpp_string: &str) -> Result<GppConsent, Report<ConsentD
         section_ids,
         eu_tcf,
         us_sale_opt_out,
+        us_sharing_opt_out: aggregate_us_signal(&us_sections, us_sharing_opt_out_from_section),
+        us_targeted_advertising_opt_out: aggregate_us_signal(
+            &us_sections,
+            us_targeted_advertising_opt_out_from_section,
+        ),
+        us_gpc: aggregate_us_signal(&us_sections, us_gpc_from_section),
+        us_known_child: aggregate_us_signal(&us_sections, us_known_child_from_section),
+        us_privacy_section: decode_us_privacy_section(&parsed),
     })
 }
 
@@ -111,36 +120,44 @@ fn decode_tcf_from_gpp(parsed: &iab_gpp::v1::GPPString) -> Option<TcfConsent> {
 /// 21=UsNj, 22=UsTn, 23=UsMn.
 const US_SECTION_ID_RANGE: std::ops::RangeInclusive<u16> = 7..=23;
 
-/// Extracts the `sale_opt_out` signal across all US sections in a parsed GPP
-/// string.
+/// Decodes every US section (IDs 7–23) in a parsed GPP string.
 ///
-/// Iterates through section IDs looking for any in the US range (7–23),
-/// decodes each US section, and aggregates the result conservatively:
-///
-/// - `Some(true)` if any decodable US section says the user opted out of sale
-/// - `Some(false)` if at least one decodable US section says they did not opt
-///   out and none say they opted out
-/// - `None` if no US section is present or no decodable US section yields a
-///   usable `sale_opt_out` signal
-fn decode_us_sale_opt_out(parsed: &iab_gpp::v1::GPPString) -> Option<bool> {
-    let mut result = None;
-
-    for us_section_id in parsed
+/// A section that fails to decode is logged and skipped, so one malformed
+/// section never hides a valid one.
+fn decode_us_sections(parsed: &iab_gpp::v1::GPPString) -> Vec<iab_gpp::sections::Section> {
+    parsed
         .section_ids()
         .filter(|id| US_SECTION_ID_RANGE.contains(&(**id as u16)))
-    {
-        match parsed.decode_section(*us_section_id) {
-            Ok(section) => match us_sale_opt_out_from_section(&section) {
-                Some(true) => return Some(true),
-                Some(false) => result = Some(false),
-                None => {}
+        .filter_map(
+            |us_section_id| match parsed.decode_section(*us_section_id) {
+                Ok(section) => Some(section),
+                Err(e) => {
+                    log::warn!("Failed to decode US GPP section {us_section_id}: {e}");
+                    None
+                }
             },
-            Err(e) => {
-                log::warn!("Failed to decode US GPP section {us_section_id}: {e}");
-            }
+        )
+        .collect()
+}
+
+/// Aggregates one boolean signal across decoded US sections, conservatively:
+///
+/// - `Some(true)` if any section reports the signal set
+/// - `Some(false)` if at least one section reports it unset and none report
+///   it set
+/// - `None` if no section yields the signal
+fn aggregate_us_signal(
+    sections: &[iab_gpp::sections::Section],
+    extract: fn(&iab_gpp::sections::Section) -> Option<bool>,
+) -> Option<bool> {
+    let mut result = None;
+    for section in sections {
+        match extract(section) {
+            Some(true) => return Some(true),
+            Some(false) => result = Some(false),
+            None => {}
         }
     }
-
     result
 }
 
@@ -177,6 +194,107 @@ fn us_sale_opt_out_from_section(section: &iab_gpp::sections::Section) -> Option<
     Some(*sale_opt_out == OptOut::OptedOut)
 }
 
+/// Reads the sharing opt-out, defined by the US National and California
+/// sections only.
+fn us_sharing_opt_out_from_section(section: &iab_gpp::sections::Section) -> Option<bool> {
+    use iab_gpp::sections::Section;
+    use iab_gpp::sections::us_common::OptOut;
+
+    let sharing_opt_out = match section {
+        Section::UsNat(s) => match &s.core {
+            iab_gpp::sections::usnat::Core::V1(c) => &c.sharing_opt_out,
+            iab_gpp::sections::usnat::Core::V2(c) => &c.sharing_opt_out,
+            _ => return None,
+        },
+        Section::UsCa(s) => &s.core.sharing_opt_out,
+        _ => return None,
+    };
+
+    Some(*sharing_opt_out == OptOut::OptedOut)
+}
+
+/// Reads the targeted-advertising opt-out from the US National section and
+/// every state section that defines it (all but California).
+fn us_targeted_advertising_opt_out_from_section(
+    section: &iab_gpp::sections::Section,
+) -> Option<bool> {
+    use iab_gpp::sections::Section;
+    use iab_gpp::sections::us_common::OptOut;
+
+    // Keep this match in sync with new US-state variants added by `iab_gpp`.
+    let targeted_advertising_opt_out = match section {
+        Section::UsNat(s) => match &s.core {
+            iab_gpp::sections::usnat::Core::V1(c) => &c.targeted_advertising_opt_out,
+            iab_gpp::sections::usnat::Core::V2(c) => &c.targeted_advertising_opt_out,
+            _ => return None,
+        },
+        Section::UsVa(s) => &s.core.targeted_advertising_opt_out,
+        Section::UsCo(s) => &s.core.targeted_advertising_opt_out,
+        Section::UsUt(s) => &s.core.targeted_advertising_opt_out,
+        Section::UsCt(s) => &s.core.targeted_advertising_opt_out,
+        Section::UsFl(s) => &s.core.targeted_advertising_opt_out,
+        Section::UsMt(s) => &s.core.targeted_advertising_opt_out,
+        Section::UsOr(s) => &s.core.targeted_advertising_opt_out,
+        Section::UsTx(s) => &s.core.targeted_advertising_opt_out,
+        Section::UsDe(s) => &s.core.targeted_advertising_opt_out,
+        Section::UsIa(s) => &s.core.targeted_advertising_opt_out,
+        Section::UsNe(s) => &s.core.targeted_advertising_opt_out,
+        Section::UsNh(s) => &s.core.targeted_advertising_opt_out,
+        Section::UsNj(s) => &s.core.targeted_advertising_opt_out,
+        Section::UsTn(s) => &s.core.targeted_advertising_opt_out,
+        Section::UsMn(s) => &s.core.targeted_advertising_opt_out,
+        _ => return None,
+    };
+
+    Some(*targeted_advertising_opt_out == OptOut::OptedOut)
+}
+
+/// Reads the Global Privacy Control segment of the US National section.
+fn us_gpc_from_section(section: &iab_gpp::sections::Section) -> Option<bool> {
+    match section {
+        iab_gpp::sections::Section::UsNat(s) => s.gpc,
+        _ => None,
+    }
+}
+
+/// Reads whether the US National section marks a known child without consent.
+fn us_known_child_from_section(section: &iab_gpp::sections::Section) -> Option<bool> {
+    use iab_gpp::sections::Section;
+    use iab_gpp::sections::us_common::Consent;
+
+    let Section::UsNat(s) = section else {
+        return None;
+    };
+    match &s.core {
+        iab_gpp::sections::usnat::Core::V1(c) => {
+            let child = &c.known_child_sensitive_data_consents;
+            Some(child.from_13_to_16 == Consent::NoConsent || child.under_13 == Consent::NoConsent)
+        }
+        iab_gpp::sections::usnat::Core::V2(c) => {
+            let child = &c.known_child_sensitive_data_consents;
+            Some(
+                child.process_sensitive_data_from_13_to_16 == Consent::NoConsent
+                    || child.process_sensitive_data_under_13 == Consent::NoConsent
+                    || child.process_personal_data_from_16_to_17 == Consent::NoConsent,
+            )
+        }
+        _ => None,
+    }
+}
+
+/// Reads GPP section 6, the US Privacy string, through the standalone
+/// decoder. Returns `None` when absent or undecodable.
+fn decode_us_privacy_section(parsed: &iab_gpp::v1::GPPString) -> Option<UsPrivacy> {
+    let raw = parsed.section(iab_gpp::sections::SectionId::UspV1)?;
+    match super::us_privacy::decode_us_privacy(raw) {
+        Ok(us_privacy) => Some(us_privacy),
+        Err(e) => {
+            log::warn!("GPP contains a US Privacy section but decoding failed: {e}");
+            None
+        }
+    }
+}
+
 /// Parses a `__gpp_sid` cookie value into a vector of section IDs.
 ///
 /// The cookie is a comma-separated list of integer section IDs, e.g. `"2,6"`.
@@ -210,6 +328,8 @@ pub fn parse_gpp_sid_cookie(raw: &str) -> Option<Vec<u16>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::consent::types::PrivacyFlag;
+    use crate::consent::us_privacy::decode_us_privacy;
 
     // A known-good GPP string with US Privacy section (section ID 6).
     // Header "DBABTA" encodes: version=1, section IDs=[6] (UspV1).
@@ -460,5 +580,289 @@ mod tests {
             result.us_sale_opt_out, None,
             "should return None when no decodable US section yields sale_opt_out"
         );
+    }
+
+    // Encodes a US core segment: a 6-bit version, then 2-bit fields.
+    fn us_core_segment(version: u8, fields: &[u8]) -> String {
+        const BASE64_URL: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+        let mut bits = format!("{version:06b}");
+        for field in fields {
+            bits.push_str(&format!("{field:02b}"));
+        }
+        while bits.len() % 6 != 0 {
+            bits.push('0');
+        }
+        bits.as_bytes()
+            .chunks(6)
+            .map(|chunk| {
+                let value = u8::from_str_radix(
+                    core::str::from_utf8(chunk).expect("should encode segment bits as utf8"),
+                    2,
+                )
+                .expect("should parse 6-bit chunk");
+                char::from(BASE64_URL[value as usize])
+            })
+            .collect()
+    }
+
+    // The US National core, version 1. `child` holds the two known-child
+    // consent fields. Opt-out values: 1 opted out, 2 did not.
+    fn us_nat_section(sale: u8, sharing: u8, targeted: u8, child: [u8; 2], gpc: bool) -> String {
+        let mut fields = vec![1, 1, 1, 1, 1, 1, sale, sharing, targeted];
+        fields.extend([2; 12]);
+        fields.extend(child);
+        // Personal data consent, MSPA covered transaction and the two modes.
+        fields.extend([2, 2, 1, 1]);
+        let core = us_core_segment(1, &fields);
+        let gpc_segment = if gpc { "YA" } else { "QA" };
+        format!("{core}.{gpc_segment}")
+    }
+
+    // The California core: sale, then sharing.
+    fn us_ca_section(sale: u8, sharing: u8) -> String {
+        let mut fields = vec![1, 1, 1, sale, sharing];
+        fields.extend([2; 9]);
+        fields.extend([2, 2]);
+        fields.extend([2, 2, 1, 1]);
+        format!("{}.QA", us_core_segment(1, &fields))
+    }
+
+    // The Virginia core: sale, then targeted advertising.
+    fn us_va_section(sale: u8, targeted: u8) -> String {
+        let mut fields = vec![1, 1, 1, sale, targeted];
+        fields.extend([2; 8]);
+        fields.push(2);
+        fields.extend([2, 1, 1]);
+        us_core_segment(1, &fields)
+    }
+
+    #[test]
+    fn decodes_the_sharing_opt_out_from_us_national_and_california() {
+        let nat = gpp_with_sections(&[(7, &us_nat_section(2, 1, 2, [2, 2], false))]);
+        let result = decode_gpp_string(&nat).expect("should decode US National");
+        assert_eq!(
+            result.us_sharing_opt_out,
+            Some(true),
+            "should read the US National sharing opt-out"
+        );
+        assert_eq!(
+            result.us_sale_opt_out,
+            Some(false),
+            "should keep the sale signal apart from the sharing signal"
+        );
+
+        let nat_control = gpp_with_sections(&[(7, &us_nat_section(2, 2, 2, [2, 2], false))]);
+        assert_eq!(
+            decode_gpp_string(&nat_control)
+                .expect("should decode US National control")
+                .us_sharing_opt_out,
+            Some(false),
+            "should read no sharing opt-out when it is not set"
+        );
+
+        let california = gpp_with_sections(&[(8, &us_ca_section(2, 1))]);
+        assert_eq!(
+            decode_gpp_string(&california)
+                .expect("should decode California")
+                .us_sharing_opt_out,
+            Some(true),
+            "should read the California sharing opt-out"
+        );
+        let california_control = gpp_with_sections(&[(8, &us_ca_section(2, 2))]);
+        assert_eq!(
+            decode_gpp_string(&california_control)
+                .expect("should decode California control")
+                .us_sharing_opt_out,
+            Some(false),
+            "should read no California sharing opt-out when it is not set"
+        );
+
+        let virginia = gpp_with_sections(&[(9, &us_va_section(2, 2))]);
+        assert_eq!(
+            decode_gpp_string(&virginia)
+                .expect("should decode Virginia")
+                .us_sharing_opt_out,
+            None,
+            "should leave sharing unset for a section that does not define it"
+        );
+    }
+
+    #[test]
+    fn decodes_the_targeted_advertising_opt_out_from_sections_that_define_it() {
+        let nat = gpp_with_sections(&[(7, &us_nat_section(2, 2, 1, [2, 2], false))]);
+        let result = decode_gpp_string(&nat).expect("should decode US National");
+        assert_eq!(
+            result.us_targeted_advertising_opt_out,
+            Some(true),
+            "should read the US National targeted-advertising opt-out"
+        );
+        assert_eq!(
+            result.us_sharing_opt_out,
+            Some(false),
+            "should keep the sharing signal apart from the targeted signal"
+        );
+
+        let virginia = gpp_with_sections(&[(9, &us_va_section(2, 1))]);
+        assert_eq!(
+            decode_gpp_string(&virginia)
+                .expect("should decode Virginia")
+                .us_targeted_advertising_opt_out,
+            Some(true),
+            "should read the Virginia targeted-advertising opt-out"
+        );
+        let virginia_control = gpp_with_sections(&[(9, &us_va_section(2, 2))]);
+        assert_eq!(
+            decode_gpp_string(&virginia_control)
+                .expect("should decode Virginia control")
+                .us_targeted_advertising_opt_out,
+            Some(false),
+            "should read no targeted-advertising opt-out when it is not set"
+        );
+
+        let california = gpp_with_sections(&[(8, &us_ca_section(2, 2))]);
+        assert_eq!(
+            decode_gpp_string(&california)
+                .expect("should decode California")
+                .us_targeted_advertising_opt_out,
+            None,
+            "should leave targeted advertising unset for a section that does not define it"
+        );
+    }
+
+    #[test]
+    fn any_section_opt_out_wins_for_the_new_opt_outs() {
+        let gpp = gpp_with_sections(&[
+            (7, &us_nat_section(2, 2, 2, [2, 2], false)),
+            (9, &us_va_section(2, 1)),
+        ]);
+        let result = decode_gpp_string(&gpp).expect("should decode both sections");
+        assert_eq!(
+            result.us_targeted_advertising_opt_out,
+            Some(true),
+            "should treat any decodable targeted opt-out as authoritative"
+        );
+    }
+
+    #[test]
+    fn decodes_the_us_national_gpc_field() {
+        let set = gpp_with_sections(&[(7, &us_nat_section(2, 2, 2, [2, 2], true))]);
+        assert_eq!(
+            decode_gpp_string(&set)
+                .expect("should decode US National with GPC")
+                .us_gpc,
+            Some(true),
+            "should read the GPC field when it is set"
+        );
+        let unset = gpp_with_sections(&[(7, &us_nat_section(2, 2, 2, [2, 2], false))]);
+        assert_eq!(
+            decode_gpp_string(&unset)
+                .expect("should decode US National without GPC")
+                .us_gpc,
+            Some(false),
+            "should read GPC false when the segment says so"
+        );
+        assert_eq!(
+            decode_gpp_string(GPP_USP_ONLY)
+                .expect("should decode USP only")
+                .us_gpc,
+            None,
+            "should leave GPC unset without a US National section"
+        );
+    }
+
+    #[test]
+    fn decodes_a_known_child_without_consent() {
+        // Known-child fields: 1 means no consent, 2 consent, 0 not applicable.
+        let no_consent = gpp_with_sections(&[(7, &us_nat_section(2, 2, 2, [2, 1], false))]);
+        assert_eq!(
+            decode_gpp_string(&no_consent)
+                .expect("should decode known child")
+                .us_known_child,
+            Some(true),
+            "should flag a known child without consent"
+        );
+        let consent = gpp_with_sections(&[(7, &us_nat_section(2, 2, 2, [2, 2], false))]);
+        assert_eq!(
+            decode_gpp_string(&consent)
+                .expect("should decode consenting child")
+                .us_known_child,
+            Some(false),
+            "should not flag a known child who has consent"
+        );
+        let not_applicable = gpp_with_sections(&[(7, &us_nat_section(2, 2, 2, [0, 0], false))]);
+        assert_eq!(
+            decode_gpp_string(&not_applicable)
+                .expect("should decode not-applicable child")
+                .us_known_child,
+            Some(false),
+            "should not flag a section that marks no known child"
+        );
+        assert_eq!(
+            decode_gpp_string(GPP_USP_ONLY)
+                .expect("should decode USP only")
+                .us_known_child,
+            None,
+            "should leave known child unset without a US National section"
+        );
+    }
+
+    #[test]
+    fn decodes_section_6_through_the_us_privacy_decoder() {
+        let result = decode_gpp_string(GPP_USP_ONLY).expect("should decode USP only");
+        assert_eq!(
+            result.us_privacy_section,
+            Some(decode_us_privacy("1YNN").expect("should decode 1YNN")),
+            "should read section 6 as a US Privacy string"
+        );
+        let opted_out = decode_gpp_string(&gpp_with_sections(&[(6, "1YYN")]))
+            .expect("should decode an opted-out section 6");
+        assert_eq!(
+            opted_out
+                .us_privacy_section
+                .expect("should carry section 6")
+                .opt_out_sale,
+            PrivacyFlag::Yes,
+            "should read the section 6 sale opt-out"
+        );
+        assert_eq!(
+            opted_out.us_sale_opt_out, None,
+            "should keep us_sale_opt_out to the US state sections"
+        );
+        let no_section = decode_gpp_string(&gpp_with_sections(&[(
+            7,
+            &us_nat_section(2, 2, 2, [2, 2], false),
+        )]))
+        .expect("should decode US National");
+        assert!(
+            no_section.us_privacy_section.is_none(),
+            "should leave section 6 unset when absent"
+        );
+    }
+
+    #[test]
+    fn header_only_gpp_decodes_with_no_section_fields() {
+        let result = decode_gpp_string("DBAA").expect("should decode a header-only GPP string");
+        assert!(result.section_ids.is_empty(), "should list no section IDs");
+        assert_eq!(result.us_sale_opt_out, None, "should leave sale unset");
+        assert_eq!(
+            result.us_sharing_opt_out, None,
+            "should leave sharing unset"
+        );
+        assert_eq!(
+            result.us_targeted_advertising_opt_out, None,
+            "should leave targeted advertising unset"
+        );
+        assert_eq!(result.us_gpc, None, "should leave GPC unset");
+        assert_eq!(
+            result.us_known_child, None,
+            "should leave known child unset"
+        );
+        assert!(
+            result.us_privacy_section.is_none(),
+            "should leave section 6 unset"
+        );
+        assert!(result.eu_tcf.is_none(), "should carry no TCF section");
     }
 }

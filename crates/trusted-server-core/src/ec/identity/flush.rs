@@ -13,13 +13,13 @@ use http::StatusCode;
 
 use super::coordinator::{
     Call, Eligibility, EligibilityInput, EligibilityView, OutcomeChanges, OutcomeContext, Phase,
-    RequestFacts, dispatch, eligibility, fingerprint_bits, outcome_to_changes,
+    RequestFacts, dispatch, eligibility, outcome_to_changes,
 };
 use super::descriptor::{Input, Resolves};
 use super::ids::{IdentityProviderId, SourceDomain, UnixTime};
 use super::input::{ProviderConsent, Region, ResolveSignals, StoredId, ThreadRandom};
 use super::mutation::{ApplyContext, IdentityMutation, apply};
-use super::policy::PolicySignals;
+use super::policy::{PolicySignals, fingerprint_bits};
 use super::provider::IdentityProvider;
 use super::removal::{log_removal_lost, write_removals};
 use super::revision::StateRevision;

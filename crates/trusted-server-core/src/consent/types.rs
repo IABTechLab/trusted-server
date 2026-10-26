@@ -105,7 +105,7 @@ impl fmt::Display for RawConsentSignals {
 ///
 /// Built from [`RawConsentSignals`] by the decoding pipeline in
 /// [`super::build_consent_context`].
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct ConsentContext {
     /// Raw TC String from `euconsent-v2` cookie, passed as-is in `user.consent`.
     pub raw_tc_string: Option<String>,
@@ -146,6 +146,33 @@ pub struct ConsentContext {
     pub jurisdiction: super::jurisdiction::Jurisdiction,
     /// Source of the consent data (for debugging).
     pub source: ConsentSource,
+}
+
+/// Prints `[redacted]` in place of every raw consent string, so a stray
+/// `{:?}` never writes a consent string to a log.
+impl fmt::Debug for ConsentContext {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn redacted(raw: &Option<String>) -> Option<&'static str> {
+            raw.as_ref().map(|_| "[redacted]")
+        }
+
+        formatter
+            .debug_struct("ConsentContext")
+            .field("raw_tc_string", &redacted(&self.raw_tc_string))
+            .field("raw_gpp_string", &redacted(&self.raw_gpp_string))
+            .field("gpp_section_ids", &self.gpp_section_ids)
+            .field("raw_us_privacy", &redacted(&self.raw_us_privacy))
+            .field("raw_ac_string", &redacted(&self.raw_ac_string))
+            .field("gdpr_applies", &self.gdpr_applies)
+            .field("tcf", &self.tcf)
+            .field("gpp", &self.gpp)
+            .field("us_privacy", &self.us_privacy)
+            .field("expired", &self.expired)
+            .field("gpc", &self.gpc)
+            .field("jurisdiction", &self.jurisdiction)
+            .field("source", &self.source)
+            .finish()
+    }
 }
 
 impl ConsentContext {
@@ -308,6 +335,24 @@ pub struct GppConsent {
     /// - `Some(false)` — a US section is present and user did not opt out
     /// - `None` — no US section exists in the GPP string
     pub us_sale_opt_out: Option<bool>,
+    /// Whether the user opted out of sharing for cross-context behavioural
+    /// advertising via a US GPP section that defines it (US National,
+    /// California). `None` when no such section is present or decodable.
+    pub us_sharing_opt_out: Option<bool>,
+    /// Whether the user opted out of targeted advertising via a US GPP
+    /// section that defines it (US National and most state sections). `None`
+    /// when no such section is present or decodable.
+    pub us_targeted_advertising_opt_out: Option<bool>,
+    /// The Global Privacy Control field of the US National section. `None`
+    /// when that section or its GPC segment is absent.
+    pub us_gpc: Option<bool>,
+    /// Whether the US National section marks a known child without consent.
+    /// `Some(false)` when the section is present and marks none, `None` when
+    /// it is absent or undecodable.
+    pub us_known_child: Option<bool>,
+    /// The US Privacy string carried as GPP section 6, read through the
+    /// standalone US Privacy decoder. `None` when absent or undecodable.
+    pub us_privacy_section: Option<UsPrivacy>,
 }
 
 // ---------------------------------------------------------------------------
@@ -413,6 +458,45 @@ impl core::error::Error for ConsentDecodeError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consent_context_debug_redacts_raw_strings() {
+        let context = ConsentContext {
+            raw_tc_string: Some("tc-string-example".to_owned()),
+            raw_gpp_string: Some("gpp-string-example".to_owned()),
+            raw_us_privacy: Some("usp-string-example".to_owned()),
+            raw_ac_string: Some("ac-string-example".to_owned()),
+            gdpr_applies: true,
+            gpc: true,
+            ..ConsentContext::default()
+        };
+
+        let rendered = format!("{context:?}");
+
+        for raw in [
+            "tc-string-example",
+            "gpp-string-example",
+            "usp-string-example",
+            "ac-string-example",
+        ] {
+            assert!(
+                !rendered.contains(raw),
+                "should not print the raw string {raw}"
+            );
+        }
+        assert!(
+            rendered.contains("[redacted]"),
+            "should mark the raw strings as redacted"
+        );
+        assert!(
+            rendered.contains("gdpr_applies: true") && rendered.contains("gpc: true"),
+            "should still print the non-secret fields"
+        );
+        assert!(
+            format!("{:?}", ConsentContext::default()).contains("raw_tc_string: None"),
+            "should print an absent raw string as None"
+        );
+    }
 
     #[test]
     fn empty_signals() {
