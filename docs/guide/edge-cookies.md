@@ -304,6 +304,15 @@ sets `Path=/`, `Secure`, `HttpOnly`, `SameSite=Lax`, and a `Max-Age`.
 `Domain` is computed as `.{publisher.domain}`. The separate
 `cookie_domain` setting applies only to non-EC cookies.
 
+## Cookies Forwarded to the Origin
+
+`ts-ec` still reaches the publisher origin. `ts-eids` and the
+`__Host-ts-eids-s` mirror cookie do not: Trusted Server strips both from
+the request before it forwards it. Origin code that read `ts-eids`
+should read the `x-ts-eids` response header instead. Prebid Server never
+receives any Trusted Server identity cookie (`ts-ec`, `ts-eids`, or
+`__Host-ts-eids-s`).
+
 ## Operational Notes
 
 - Rotate the secret periodically. Rotation produces a new 64-hex base
