@@ -677,7 +677,7 @@ fails the build. Controlled JS preparation still pins esbuild 0.27.3 while the
 current lock selects 0.28.2. Its full collector fixture is visibly disabled, and
 `TRUSTED_SERVER__RELEASE_JS_TESTS=1` fails against the unsupported lock. Ordinary
 release builds and the Gate 1 Fastly A/B adapter do not use that observer. See the
-[compatibility gap](../superpowers/plans/binary-attestations-phase1-compatibility.md#controlled-js-observer-gap).
+[compatibility gap](https://github.com/IABTechLab/trusted-server/blob/b2cde8be6a061c17edf6b4ad1f2c3884fbd7121d/docs/superpowers/plans/binary-attestations-phase1-compatibility.md#controlled-js-observer-gap).
 
 ---
 
