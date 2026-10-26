@@ -13,6 +13,8 @@ pub(crate) enum ReleaseError {
     Source,
     #[display("Git object verification failed")]
     GitObject,
+    #[display("Original release material is not verified")]
+    Material,
     #[display("Bounded release child process failed")]
     Process,
 }

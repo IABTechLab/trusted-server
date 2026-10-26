@@ -8,6 +8,8 @@ mod git_objects;
 mod ordinary;
 #[allow(dead_code, reason = "confined execution callers are staged in Phase 2")]
 mod process;
+#[allow(dead_code, reason = "tool tree recipe callers are staged in Phase 2")]
+mod tool_tree;
 
 use std::io::Write as _;
 use std::process::ExitCode;
