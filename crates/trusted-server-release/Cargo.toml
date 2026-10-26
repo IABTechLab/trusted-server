@@ -13,12 +13,24 @@ flate2.workspace = true
 hex.workspace = true
 libc.workspace = true
 jsonschema = { version = "=0.58.6", default-features = false }
+object = { version = "=0.37.3", default-features = false, features = [
+    "elf",
+    "macho",
+    "read_core",
+    "std",
+] }
 serde.workspace = true
 serde_json.workspace = true
 sha1-checked = { version = "=0.10.0", default-features = false }
 sha2.workspace = true
 tempfile.workspace = true
 time = { workspace = true, features = ["parsing"] }
+wasmparser = { version = "=0.247.0", default-features = false, features = [
+    "features",
+    "simd",
+    "std",
+    "validate",
+] }
 
 [lints]
 workspace = true
