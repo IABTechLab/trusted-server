@@ -1,5 +1,6 @@
 //! Shared SDK URL corpus and attribute-rewrite assertions.
 
+use lol_html::{RewriteStrSettings, element, rewrite_str};
 use serde::Deserialize;
 
 use super::{AttributeRewriteAction, IntegrationAttributeContext, IntegrationAttributeRewriter};
@@ -43,6 +44,11 @@ pub(super) fn assert_sdk_url_rewrite(
         AttributeRewriteAction::Keep
     };
     for (attribute, element) in [("src", "script"), ("href", "link")] {
+        assert!(
+            integration.handles_attribute(attribute),
+            "should route {attribute} to the {} rewriter",
+            integration.integration_id()
+        );
         let context = IntegrationAttributeContext {
             attribute_name: attribute,
             element_name: element,
@@ -57,6 +63,57 @@ pub(super) fn assert_sdk_url_rewrite(
             integration.integration_id(),
             case.name,
             case.url
+        );
+    }
+}
+
+/// Assert that a matching SDK URL is rewritten after HTML attribute tokenization.
+///
+/// # Panics
+///
+/// Panics if HTML processing fails or the SDK attribute is not replaced.
+pub(super) fn assert_sdk_html_attribute_rewrite(
+    integration: &dyn IntegrationAttributeRewriter,
+    case: &SdkUrlCase,
+    sdk_path: &str,
+) {
+    for (attribute, tag) in [("src", "script"), ("href", "link")] {
+        let html = format!(
+            "<{tag} {attribute}=\"{}\"></{tag}>",
+            case.url.replace('"', "&quot;")
+        );
+        let context = IntegrationAttributeContext {
+            attribute_name: attribute,
+            element_name: tag,
+            request_host: "edge.example.com",
+            request_scheme: "https",
+            origin_host: "origin.example.com",
+        };
+        let output = rewrite_str(
+            &html,
+            RewriteStrSettings {
+                element_content_handlers: vec![element!(tag, |element| {
+                    let value = element
+                        .get_attribute(attribute)
+                        .expect("should read the SDK URL attribute");
+                    assert_eq!(
+                        integration.rewrite(attribute, &value, &context),
+                        AttributeRewriteAction::Replace(sdk_path.to_string()),
+                        "should rewrite HTML {attribute} for {}",
+                        case.name
+                    );
+                    element.set_attribute(attribute, sdk_path)?;
+                    Ok(())
+                })],
+                ..RewriteStrSettings::default()
+            },
+        )
+        .expect("should process SDK URL markup");
+        assert_eq!(
+            output,
+            format!("<{tag} {attribute}=\"{sdk_path}\"></{tag}>"),
+            "should replace the SDK URL in HTML for {}",
+            case.name
         );
     }
 }

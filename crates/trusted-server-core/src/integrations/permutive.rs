@@ -100,7 +100,7 @@ impl PermutiveIntegration {
 
     /// Check if a URL is a Permutive SDK URL.
     fn is_permutive_sdk_url(&self, url: &str) -> bool {
-        // Keep browser/Rust cases in test/fixtures/sdk-url-ownership.json aligned.
+        // Keep browser/Rust cases in crates/trusted-server-js/lib/test/fixtures/sdk-url-ownership.json aligned.
         let Some(parsed) = parse_sdk_network_url(url) else {
             return false;
         };
@@ -483,7 +483,9 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::integrations::sdk_url_test_support::{assert_sdk_url_rewrite, sdk_url_cases};
+    use crate::integrations::sdk_url_test_support::{
+        assert_sdk_html_attribute_rewrite, assert_sdk_url_rewrite, sdk_url_cases,
+    };
     use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
     use crate::test_support::tests::create_test_settings;
 
@@ -511,6 +513,13 @@ mod tests {
             );
 
             assert_sdk_url_rewrite(integration.as_ref(), &case, "/integrations/permutive/sdk");
+            if matches {
+                assert_sdk_html_attribute_rewrite(
+                    integration.as_ref(),
+                    &case,
+                    "/integrations/permutive/sdk",
+                );
+            }
         }
     }
 

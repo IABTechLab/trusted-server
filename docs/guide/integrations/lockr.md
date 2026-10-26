@@ -148,7 +148,7 @@ The Lockr integration is implemented in [crates/trusted-server-core/src/integrat
 - Route: `/integrations/lockr/api/*` (GET, POST) proxies Lockr API calls
 - Purpose: Keep SDK delivery and identity API traffic on the publisher origin
 
-### SDK URL rewriting
+**SDK URL Rewriting**:
 
 Server-side attribute rewriting and the browser script guard recognize only
 `aim.loc.kr` and `identity.loc.kr` URLs whose pathname contains

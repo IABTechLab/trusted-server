@@ -99,7 +99,7 @@ impl LockrIntegration {
 
     /// Check if a URL is a Lockr SDK URL.
     fn is_lockr_sdk_url(&self, url: &str) -> bool {
-        // Keep browser/Rust cases in test/fixtures/sdk-url-ownership.json aligned.
+        // Keep browser/Rust cases in crates/trusted-server-js/lib/test/fixtures/sdk-url-ownership.json aligned.
         let Some(parsed) = parse_sdk_network_url(url) else {
             return false;
         };
@@ -443,7 +443,9 @@ mod tests {
     use edgezero_core::http::Method as HttpMethod;
     use serde_json::json;
 
-    use crate::integrations::sdk_url_test_support::{assert_sdk_url_rewrite, sdk_url_cases};
+    use crate::integrations::sdk_url_test_support::{
+        assert_sdk_html_attribute_rewrite, assert_sdk_url_rewrite, sdk_url_cases,
+    };
     use crate::platform::test_support::{StubHttpClient, build_services_with_http_client};
     use crate::test_support::tests::create_test_settings;
 
@@ -485,6 +487,13 @@ mod tests {
             );
 
             assert_sdk_url_rewrite(integration.as_ref(), &case, "/integrations/lockr/sdk");
+            if matches {
+                assert_sdk_html_attribute_rewrite(
+                    integration.as_ref(),
+                    &case,
+                    "/integrations/lockr/sdk",
+                );
+            }
         }
     }
 
@@ -496,6 +505,16 @@ mod tests {
         assert!(integration.is_lockr_sdk_url("https://aim.loc.kr/identity-lockr-v1.0.js"));
         assert!(integration.is_lockr_sdk_url("https://aim.loc.kr/identity-lockr-trust-server.js"));
         assert!(integration.is_lockr_sdk_url("https://identity.loc.kr/identity-lockr-v2.0.js"));
+
+        // Hosts that only end with a Lockr SDK host are different hosts.
+        assert!(
+            !integration.is_lockr_sdk_url("https://notaim.loc.kr/identity-lockr.js"), // allow-domain: notaim.loc.kr
+            "should require an exact aim.loc.kr hostname"
+        );
+        assert!(
+            !integration.is_lockr_sdk_url("https://notidentity.loc.kr/identity-lockr.js"), // allow-domain: notidentity.loc.kr
+            "should require an exact identity.loc.kr hostname"
+        );
 
         // Should not match non-SDK resources on Lockr domains
         assert!(

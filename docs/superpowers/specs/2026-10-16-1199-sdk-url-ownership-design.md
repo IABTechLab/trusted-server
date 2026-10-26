@@ -50,14 +50,30 @@ guards.
 
 ### Input forms
 
-- Trim ASCII whitespace before parsing: space, tab, LF, CR, form feed, and vertical
-  tab. Do not trim Unicode whitespace such as U+FEFF or U+0085. Include those
-  boundary cases in the shared corpus.
-- Require an explicit `http://`, `https://`, or `//` prefix, case-insensitive for
-  schemes. Reject shorthand such as `https:host/path` and `https:/host/path`.
+- Reject literal NULs in raw matcher inputs: HTML replaces them with U+FFFD,
+  unlike direct URL-property assignment, which can trim them. This prevents raw
+  HTML recognition from claiming a URL that the browser would not load as an SDK.
+- Before checking the prefix, apply the browser URL preprocessing rules: trim
+  leading/trailing C0 controls and space (U+0001–U+0020), then remove tab, LF, and
+  CR throughout the input. Do not trim Unicode whitespace such as U+FEFF or
+  U+0085. These boundary cases remain in the shared corpus.
+- Require an explicit HTTP(S) scheme followed by two authority separators, or
+  two separators for a protocol-relative URL. Each separator may be `/` or `\`,
+  matching browser HTTP(S) backslash handling. Scheme matching is case-insensitive.
+  Leave path/query interpretation to the native parser rather than replacing
+  backslashes globally.
+- Reject base-dependent shorthand such as `https:host/path` and `https:/host/path`
+  in raw/server matching. Whether those forms resolve to a vendor host or a
+  publisher path depends on the document scheme and base URL. Dynamic insertion
+  guards can recognize the DOM-resolved URL, but static markup using these forms
+  can still load the vendor SDK directly.
 - Accept absolute HTTP and HTTPS URLs, including uppercase schemes and hosts.
-  After the prefix check, malformed means rejected by the native URL parser;
-  normal parser normalization is allowed.
+  After preprocessing and the authority check, malformed means rejected by the
+  native URL parser. Normal parser normalization is allowed, but runtimes differ:
+  Node and Chromium accept some punycode labels rejected by Rust's `url` crate
+  and jsdom; Chromium also normalizes some fullwidth-percent encoded-dot host
+  spellings rejected by those runtimes. These remain fail-open recognition
+  limits, not a promise to recognize every browser-loadable spelling.
 - Accept protocol-relative URLs by adding `https:` before parsing. Ownership is
   independent of the page's HTTP/HTTPS scheme.
 - Reject empty, malformed, non-network, relative-path, and bare-host inputs.
@@ -119,8 +135,10 @@ Direct private-matcher assertions remain in each integration's tests.
 Create `crates/trusted-server-js/lib/test/fixtures/sdk-url-ownership.json`. Each
 case records a descriptive name, input URL, and expected integration ID or null.
 An optional `insertionOwner` records a different expectation after native DOM URL
-resolution. In particular, raw matchers reject shorthand schemes, while a script
-or link URL getter normalizes them to absolute vendor URLs before insertion.
+resolution. In particular, raw matchers reject shorthand schemes. With the
+fixture's `https:` shorthand and jsdom's `http:` page, script and link URL getters
+resolve them to absolute vendor URLs before insertion. On an `https:` publisher
+page, the same inputs resolve to publisher paths and remain unowned.
 Rust tests and raw browser claimant tests use `owner`; DOM insertion tests use
 `insertionOwner` when present. This distinguishes parser input policy from the
 browser's existing attribute-resolution behavior.
@@ -142,7 +160,10 @@ The corpus must cover:
 - Already-rewritten first-party GPT URLs whose query mentions a vendor host.
 - Empty/malformed, relative, bare-host, shorthand-scheme, and non-network inputs.
 - Trailing-dot hostnames, percent-encoded SDK path text, the bare
-  `edge.permutive.app` host, and ASCII/Unicode whitespace boundaries.
+  `edge.permutive.app` host, and C0/space/Unicode whitespace boundaries.
+- Tab/CR/LF preprocessing, backslash and mixed authority separators, and
+  normalized lookalike/user-information/path/query negatives.
+- NUL-containing raw attributes versus DOM URL properties and HTML tokenization.
 
 Replace stale comments pointing to Rust line numbers with pointers to this
 shared corpus.
@@ -155,7 +176,10 @@ For each corpus case, run both Rust matchers and assert whether the expected
 owner equals that integration. Run the corresponding JS guards against the
 same input URL so parser decisions cannot drift behind duplicated case lists.
 Also assert server attribute rewrite actions for matching and nonmatching cases,
-including `src` and `href`, while retaining disabled-rewrite coverage.
+including `src` and `href`, while retaining disabled-rewrite coverage. Check
+attribute-routing eligibility before calling the rewriter. For owned corpus
+cases, also tokenize actual script/link markup with lol_html and assert the
+rewritten attributes in the output.
 
 ### All-guard ownership and insertion tests
 
@@ -170,7 +194,9 @@ production dispatcher API.
 Separately exercise actual insertion through both `script.src = url` and native
 `Element.prototype.setAttribute.call(script, 'src', url)`, then append the node.
 Assert the final first-party route or unchanged attribute. Account for ordinary
-DOM relative-URL resolution separately from the raw matcher assertion.
+DOM relative-URL resolution separately from the raw matcher assertion. Exercise
+shorthand URLs with both HTTP and HTTPS document bases in
+`test/shared/sdk_url.test.ts`; same-scheme shorthand must remain a publisher path.
 
 Include the issue's three reproduced Lockr collision cases in
 `test/integrations/lockr/url_collision.test.ts`. Force Lockr ahead of GPT/GTM in
@@ -196,10 +222,10 @@ query-bearing valid SDKs and false positives, through append and insertBefore.
 Focused checks from the JS library directory:
 
 ```sh
-npx vitest run test/integrations/lockr test/integrations/permutive test/shared/dom_insertion_dispatcher.test.ts
+npx vitest run test/integrations/lockr test/integrations/permutive test/shared/sdk_url.test.ts test/shared/dom_insertion_dispatcher.test.ts
 ```
 
-Focused checks from the repository root, using the pinned Rust 1.95 toolchain
+Focused checks from the repository root, using the pinned Rust toolchain
 and core's default feature set:
 
 ```sh
@@ -216,7 +242,7 @@ coordinate those commands instead of running competing dependency installs.
 
 ## Independent review
 
-A fresh Pi process using `openai-codex/gpt-6.1-sol` reviewed this spec, the full
+A fresh-context reviewer read this spec, the full
 issue, and current code without conversation history or edits. It found no
 blocking defects. Its suggestions were accepted: bypass GPT assignment patches
 in raw claimant tests, add explicit trailing-dot/encoded-path/bare-edge-host
@@ -230,13 +256,15 @@ focused JS tests. It reported no findings.
 
 ## Validation results
 
-The regression tests failed against the original matchers before the fixes.
-The final shared corpus contains 83 cases. The all-guard test expands them into
-1,068 ownership and insertion checks across both handler orders and DOM paths.
+The original regression tests failed against the substring matchers before the
+ownership fixes. The normalization regressions also failed before expanding the
+common preprocessing policy. The shared corpus now contains 105 cases, including
+22 normalization positives and negatives. The all-guard test expands them into
+1,376 ownership and insertion checks across both handler orders and DOM paths.
 
 | Check                                                                                                         | Result                                                                      |
 | ------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| Full JS suite, `npx vitest run`                                                                               | Passed, 2,279 tests across 51 files; no reported type errors                |
+| Full JS suite, `npx vitest run --maxWorkers=4`                                                                | Passed, 2,605 tests across 52 files; no reported type errors                |
 | JS `npm run lint`, `npm run format`, `npm run build`                                                          | Passed                                                                      |
 | Native Lockr and Permutive inline test modules                                                                | Passed, 11 and 9 tests, including the shared corpus and attribute rewriting |
 | `cargo test-fastly`, `cargo test-fastly-reuse`, `cargo test-axum`, `cargo test-cloudflare`, `cargo test-spin` | Passed; existing ignored tests remain ignored                               |
@@ -247,14 +275,8 @@ The final shared corpus contains 83 cases. The all-guard test expands them into
 | Docs and repository Markdown formatting                                                                       | Passed                                                                      |
 | URL-host lint on added lines                                                                                  | Passed                                                                      |
 
-An additional full native-core run, `cargo test -p trusted-server-core`, had
-2,940 passing tests and 12 pre-existing legacy settings-test failures. Cargo
-injects `TRUSTED_SERVER__GIT_VERSION`, which the legacy environment settings
-loader rejects as the unknown field `git_version`. This was reproduced in an
-untouched archive of `5bc388625` with
-`cargo test -p trusted-server-core settings::tests::test_origin_host_header_override_env -- --exact`.
-No settings or version-handling changes are included here. The required Fastly
-core suite and focused native integration tests pass.
+Default-worker JS runs hit timeouts in core, creative, and Prebid tests locally.
+The full four-worker run passed without changing test timeouts or assertions.
 
 No live vendor SDK fetch or production deployment smoke test was performed.
 
