@@ -539,6 +539,14 @@ mod tests {
             self.keys.borrow_mut().push(key.to_owned());
             Ok(self.exceeded)
         }
+
+        fn record(&self, _key: &str) -> Result<(), Report<TrustedServerError>> {
+            Ok(())
+        }
+
+        fn count(&self, _key: &str) -> Result<u32, Report<TrustedServerError>> {
+            Ok(0)
+        }
     }
 
     struct Fixture {

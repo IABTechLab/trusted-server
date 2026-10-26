@@ -988,6 +988,14 @@ mod tests {
         fn exceeded(&self, _key: &str, _limit: u32) -> Result<bool, Report<TrustedServerError>> {
             Ok(false)
         }
+
+        fn record(&self, _key: &str) -> Result<(), Report<TrustedServerError>> {
+            Ok(())
+        }
+
+        fn count(&self, _key: &str) -> Result<u32, Report<TrustedServerError>> {
+            Ok(0)
+        }
     }
 
     /// Marks `request` as sent by a real browser at a client address.

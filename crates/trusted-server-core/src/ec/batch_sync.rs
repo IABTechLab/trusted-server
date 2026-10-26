@@ -341,6 +341,14 @@ mod tests {
         ) -> Result<bool, Report<TrustedServerError>> {
             Ok(self.should_exceed)
         }
+
+        fn record(&self, _key: &str) -> Result<(), Report<TrustedServerError>> {
+            Ok(())
+        }
+
+        fn count(&self, _key: &str) -> Result<u32, Report<TrustedServerError>> {
+            Ok(0)
+        }
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]

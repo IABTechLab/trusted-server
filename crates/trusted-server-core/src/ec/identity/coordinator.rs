@@ -249,7 +249,7 @@ pub(crate) enum Phase {
 
 /// Why a provider was not eligible. Each variant names the step of spec 4.7
 /// that stopped it. The breaker (step 6) and the burst cap (step 8) are
-/// checked elsewhere.
+/// checked in [`dispatch`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SkipReason {
     /// The provider declares no `resolves`, so it never makes a call.
@@ -470,8 +470,6 @@ pub(crate) enum CallOutcome {
     /// A transport failure, timeout, 429 or 5xx.
     TransportFailure,
     /// The circuit breaker was open, so nothing was sent.
-    // Temporary: the breaker, the only producer, arrives in a later task.
-    #[allow(dead_code)]
     BreakerOpen,
     /// The burst cap stopped the call.
     BurstCapped,
@@ -1204,6 +1202,52 @@ fn call_timeout(
     (timeout_ms > 0).then(|| (Duration::from_millis(u64::from(timeout_ms)), budget_limited))
 }
 
+/// The limiter key counting a provider's transport failures.
+fn breaker_key(provider: &IdentityProviderId) -> String {
+    format!("identity-fail:{provider}")
+}
+
+/// Whether the provider's circuit breaker is open: its failure count in the
+/// last minute has reached `breaker_failures_per_minute`. A count that cannot
+/// be read leaves the breaker closed.
+fn breaker_open(
+    deps: &IdentityDeps<'_>,
+    provider: &IdentityProviderId,
+    settings: &ProviderSettings,
+) -> bool {
+    let Some(limiter) = deps.rate_limiter else {
+        return false;
+    };
+    match limiter.count(&breaker_key(provider)) {
+        Ok(count) => count >= settings.breaker_failures_per_minute,
+        Err(error) => {
+            log::warn!(
+                "Identity provider '{provider}' breaker count unreadable, treating it as closed: {}",
+                error.current_context()
+            );
+            false
+        }
+    }
+}
+
+/// Feeds a transport failure to the circuit breaker. Nothing else is
+/// recorded: a hold cut-off is a budget decision, and an input failure only
+/// backs off its own visitor. A limiter error is logged and the outcome kept.
+fn record_failure(deps: &IdentityDeps<'_>, provider: &IdentityProviderId, outcome: &CallOutcome) {
+    if !matches!(outcome, CallOutcome::TransportFailure) {
+        return;
+    }
+    let Some(limiter) = deps.rate_limiter else {
+        return;
+    };
+    if let Err(error) = limiter.record(&breaker_key(provider)) {
+        log::warn!(
+            "Identity provider '{provider}' failure not recorded for the breaker: {}",
+            error.current_context()
+        );
+    }
+}
+
 /// Whether the burst cap stops the call. `Err` when it could not be read.
 fn burst_capped(
     deps: &IdentityDeps<'_>,
@@ -1247,6 +1291,11 @@ fn prepare_call<'a>(
     let descriptor = provider.descriptor();
     let id = descriptor.id();
     let settings = deps.settings.ec.identity.provider(id);
+
+    if breaker_open(deps, id, &settings) {
+        log::debug!("Identity provider '{id}' not dispatched: its circuit breaker is open");
+        return Prepared::Settled(CallOutcome::BreakerOpen);
+    }
 
     let input = ResolveInput::new(descriptor, call.kinds.clone(), signals)
         .with_state_json(call.state_json.clone());
@@ -1424,13 +1473,17 @@ pub(crate) fn dispatch(
                 Waited::Failed => CallOutcome::TransportFailure,
                 Waited::Dropped => CallOutcome::HoldCutOff,
             };
+            record_failure(deps, &id, &outcome);
             outcomes.push((id, outcome));
         }
     };
 
     for call in &calls {
         match prepare_call(deps, call, signals, started, budget) {
-            Prepared::Settled(outcome) => outcomes.push((call.provider.clone(), outcome)),
+            Prepared::Settled(outcome) => {
+                record_failure(deps, &call.provider, &outcome);
+                outcomes.push((call.provider.clone(), outcome));
+            }
             Prepared::Sent(sent_call, pending) => {
                 sent.insert(call.provider.clone(), sent_call);
                 in_flight.push((call.provider.clone(), pending));
@@ -1464,6 +1517,7 @@ mod tests {
     use crate::ec::identity::policy::fingerprint_bits;
     use crate::ec::identity::resolution::{ResolvedEid, ResolvedUid};
     use crate::ec::identity::revision::{record_revision, uid_hash};
+    use crate::ec::identity::test_support::FakeRateLimiter;
     use crate::ec::identity::test_support::fake_http::{
         FakeBackend, FakeHttpClient, ScriptedProvider, fake_services,
     };
@@ -3537,6 +3591,14 @@ mod tests {
             }
             Ok(self.exceeded)
         }
+
+        fn record(&self, _key: &str) -> Result<(), Report<crate::error::TrustedServerError>> {
+            Ok(())
+        }
+
+        fn count(&self, _key: &str) -> Result<u32, Report<crate::error::TrustedServerError>> {
+            Ok(0)
+        }
     }
 
     /// Providers, a fake client and everything `dispatch` reads.
@@ -4003,6 +4065,250 @@ mod tests {
         assert!(
             matches!(outcome_of(&outcomes, "p"), CallOutcome::Resolved(_)),
             "should dispatch under the cap (control)"
+        );
+    }
+
+    /// A fixture with provider `p` whose breaker opens at `threshold` and
+    /// whose burst cap never stops a test.
+    fn breaker_fixture(threshold: u32) -> DispatchFixture {
+        let mut fixture =
+            DispatchFixture::new(vec![scripted("p", "p.example.com", "p.example.com")]);
+        fixture.settings.ec.identity.providers.insert(
+            "p".to_owned(),
+            ProviderSettings {
+                breaker_failures_per_minute: threshold,
+                max_calls_per_minute: 10_000,
+                ..ProviderSettings::default()
+            },
+        );
+        fixture
+    }
+
+    #[test]
+    fn breaker_opens_at_threshold_and_skips_every_visitor() {
+        let fixture = breaker_fixture(3);
+        fixture.client.respond("p.example.com", 503, b"{}");
+        let limiter = FakeRateLimiter::new();
+
+        for call in 0..3 {
+            let outcomes = fixture.run(&["p"], 1_000, None, Some(&limiter));
+            assert!(
+                matches!(outcome_of(&outcomes, "p"), CallOutcome::TransportFailure),
+                "should dispatch while the breaker is closed (call {call})"
+            );
+        }
+        assert_eq!(
+            limiter.count_of("identity-fail:p"),
+            3,
+            "should record each transport failure"
+        );
+        let sent_before = fixture.client.sent_hosts().len();
+        let burst_before = limiter.keys();
+
+        let outcomes = fixture.run(&["p"], 1_000, None, Some(&limiter));
+
+        assert!(
+            matches!(outcome_of(&outcomes, "p"), CallOutcome::BreakerOpen),
+            "should skip the provider once the count reaches the threshold"
+        );
+        assert_eq!(
+            fixture.client.sent_hosts().len(),
+            sent_before,
+            "should send nothing while the breaker is open"
+        );
+        assert_eq!(
+            limiter.count_of("identity-fail:p"),
+            3,
+            "should not record a failure for a call it never made"
+        );
+        assert_eq!(
+            limiter.keys(),
+            burst_before,
+            "should not touch the burst counter of an open breaker"
+        );
+    }
+
+    #[test]
+    fn breaker_is_per_provider() {
+        let mut fixture = breaker_fixture(1);
+        fixture.catalog = ProviderCatalog::new(
+            vec![
+                scripted("p", "p.example.com", "p.example.com"),
+                scripted("q", "q.example.com", "q.example.com"),
+            ],
+            BTreeMap::new(),
+        );
+        fixture.client.respond("q.example.com", 200, b"{}");
+        let limiter = FakeRateLimiter::new().with_count("identity-fail:p", 1);
+
+        let outcomes = fixture.run(&["p", "q"], 1_000, None, Some(&limiter));
+
+        assert!(
+            matches!(outcome_of(&outcomes, "p"), CallOutcome::BreakerOpen),
+            "should open the breaker of the failing provider"
+        );
+        assert!(
+            matches!(outcome_of(&outcomes, "q"), CallOutcome::Resolved(_)),
+            "should leave another provider's breaker closed (control)"
+        );
+    }
+
+    #[test]
+    fn four_xx_and_malformed_never_open_the_breaker() {
+        let fixture = breaker_fixture(50);
+        fixture.client.respond("p.example.com", 400, b"{}");
+        let limiter = FakeRateLimiter::new();
+
+        for _ in 0..1_000 {
+            let outcomes = fixture.run(&["p"], 1_000, None, Some(&limiter));
+            assert!(
+                matches!(outcome_of(&outcomes, "p"), CallOutcome::InputFailure),
+                "should count a 400 as an input failure"
+            );
+        }
+        assert_eq!(
+            limiter.count_of("identity-fail:p"),
+            0,
+            "should never record an input failure"
+        );
+
+        fixture.client.respond("p.example.com", 503, b"{}");
+        fixture.run(&["p"], 1_000, None, Some(&limiter));
+        assert_eq!(
+            limiter.count_of("identity-fail:p"),
+            1,
+            "should record a 503 (control)"
+        );
+    }
+
+    #[test]
+    fn hold_cut_off_does_not_record_a_failure() {
+        let fixture = breaker_fixture(50);
+        fixture.client.respond("p.example.com", 200, b"{}");
+        let limiter = FakeRateLimiter::new();
+
+        let outcomes = fixture.run(&["p"], 1_000, Some(Duration::ZERO), Some(&limiter));
+        assert!(
+            matches!(outcome_of(&outcomes, "p"), CallOutcome::HoldCutOff),
+            "should cut off a hold call with no budget"
+        );
+        assert_eq!(
+            limiter.count_of("identity-fail:p"),
+            0,
+            "should not record a budget cut as a provider failure"
+        );
+
+        fixture.client.time_out("p.example.com");
+        let outcomes = fixture.run(&["p"], 1_000, None, Some(&limiter));
+        assert!(
+            matches!(outcome_of(&outcomes, "p"), CallOutcome::TransportFailure),
+            "should count an after-send timeout as a transport failure"
+        );
+        assert_eq!(
+            limiter.count_of("identity-fail:p"),
+            1,
+            "should record a timeout (control)"
+        );
+    }
+
+    #[test]
+    fn burst_cap_is_checked_after_every_other_eligibility_step() {
+        let mut fixture = breaker_fixture(1);
+        fixture.catalog = ProviderCatalog::new(
+            vec![
+                scripted("p", "p.example.com", "p.example.com"),
+                ScriptedProvider::new("u", "u.example.com", "u.example.com", false)
+                    .reading_undeclared_user_agent()
+                    .into_provider(),
+            ],
+            BTreeMap::new(),
+        );
+        fixture.client.respond("p.example.com", 200, b"{}");
+        fixture.client.respond("u.example.com", 200, b"{}");
+        let limiter = FakeRateLimiter::new().with_count("identity-fail:p", 1);
+
+        // The breaker is open for `p`, and `u` fails its input check.
+        let outcomes = fixture.run(&["p", "u"], 1_000, None, Some(&limiter));
+        assert!(
+            matches!(outcome_of(&outcomes, "p"), CallOutcome::BreakerOpen),
+            "should stop `p` at the breaker"
+        );
+        assert!(
+            matches!(outcome_of(&outcomes, "u"), CallOutcome::InputFailure),
+            "should stop `u` at its input check"
+        );
+        // A hold call with no budget left is cut off.
+        fixture.run(&["u"], 1_000, Some(Duration::ZERO), Some(&limiter));
+        assert_eq!(
+            limiter.keys(),
+            vec!["identity-fail:p".to_owned()],
+            "should never touch the burst counter of a provider that stopped earlier"
+        );
+
+        let eligible = breaker_fixture(1);
+        eligible.client.respond("p.example.com", 200, b"{}");
+        let open_limiter = FakeRateLimiter::new();
+        eligible.run(&["p"], 1_000, None, Some(&open_limiter));
+        assert!(
+            open_limiter
+                .keys()
+                .iter()
+                .any(|key| key.starts_with("identity:p:")),
+            "should increment the burst counter of a provider that reaches dispatch (control)"
+        );
+    }
+
+    #[test]
+    fn breaker_count_error_treats_the_breaker_as_closed() {
+        let fixture = breaker_fixture(1);
+        fixture.client.respond("p.example.com", 200, b"{}");
+        let limiter = FakeRateLimiter::new()
+            .with_count("identity-fail:p", 100)
+            .failing_count();
+
+        let outcomes = fixture.run(&["p"], 1_000, None, Some(&limiter));
+
+        assert!(
+            matches!(outcome_of(&outcomes, "p"), CallOutcome::Resolved(_)),
+            "should dispatch when the failure count cannot be read"
+        );
+        assert_eq!(fixture.client.sent_hosts().len(), 1, "should send the call");
+    }
+
+    #[test]
+    fn burst_cap_error_skips_the_dispatch() {
+        let fixture = breaker_fixture(50);
+        fixture.client.respond("p.example.com", 200, b"{}");
+        let limiter = FakeRateLimiter::new().failing_exceeded();
+
+        let outcomes = fixture.run(&["p"], 1_000, None, Some(&limiter));
+
+        assert!(
+            matches!(outcome_of(&outcomes, "p"), CallOutcome::NotDispatched),
+            "should not dispatch when the burst cap cannot be read"
+        );
+        assert!(
+            fixture.client.sent_hosts().is_empty(),
+            "should send nothing"
+        );
+    }
+
+    #[test]
+    fn record_error_keeps_the_outcome() {
+        let fixture = breaker_fixture(50);
+        fixture.client.respond("p.example.com", 503, b"{}");
+        let limiter = FakeRateLimiter::new().failing_record();
+
+        let outcomes = fixture.run(&["p"], 1_000, None, Some(&limiter));
+
+        assert!(
+            matches!(outcome_of(&outcomes, "p"), CallOutcome::TransportFailure),
+            "should keep the transport failure when recording it fails"
+        );
+        assert_eq!(
+            limiter.count_of("identity-fail:p"),
+            0,
+            "should not have recorded it"
         );
     }
 

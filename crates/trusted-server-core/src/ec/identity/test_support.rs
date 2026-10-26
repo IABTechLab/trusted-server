@@ -8,9 +8,9 @@
     )
 )]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use error_stack::Report;
@@ -40,6 +40,7 @@ use crate::ec::identity::revision::{StateRevision, new_revision};
 use crate::ec::kv_backend::in_memory::InMemoryEcKv;
 use crate::ec::kv_backend::{EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome};
 use crate::ec::kv_types::{KvEid, KvPartnerId, KvUid};
+use crate::ec::rate_limiter::RateLimiter;
 use crate::error::TrustedServerError;
 use crate::redacted::Redacted;
 use crate::settings::{EcPartner, IdentitySettings, ProviderSettings};
@@ -814,6 +815,125 @@ struct DescriptorOnly(ProviderDescriptor);
 impl IdentityProvider for DescriptorOnly {
     fn descriptor(&self) -> &ProviderDescriptor {
         &self.0
+    }
+}
+
+/// An in-memory [`RateLimiter`] that can be set to fail each method.
+///
+/// `exceeded` counts like the Fastly limiter: it increments on every check
+/// under the limit. `record` and `count` use the same counts.
+#[derive(Debug, Default)]
+pub struct FakeRateLimiter {
+    counts: Mutex<HashMap<String, u32>>,
+    fail_exceeded: AtomicBool,
+    fail_record: AtomicBool,
+    fail_count: AtomicBool,
+}
+
+#[allow(clippy::missing_panics_doc, reason = "the fake locks its own mutex")]
+impl FakeRateLimiter {
+    /// An empty limiter whose methods all succeed.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Makes `exceeded` and `exceeded_per_minute` fail.
+    #[must_use]
+    pub fn failing_exceeded(self) -> Self {
+        self.fail_exceeded.store(true, Ordering::SeqCst);
+        self
+    }
+
+    /// Makes `record` fail.
+    #[must_use]
+    pub fn failing_record(self) -> Self {
+        self.fail_record.store(true, Ordering::SeqCst);
+        self
+    }
+
+    /// Makes `count` fail.
+    #[must_use]
+    pub fn failing_count(self) -> Self {
+        self.fail_count.store(true, Ordering::SeqCst);
+        self
+    }
+
+    /// Sets the count of `key`.
+    #[must_use]
+    pub fn with_count(self, key: &str, count: u32) -> Self {
+        self.counts
+            .lock()
+            .expect("should lock the counts")
+            .insert(key.to_owned(), count);
+        self
+    }
+
+    /// The count of `key`, 0 when it was never touched.
+    #[must_use]
+    pub fn count_of(&self, key: &str) -> u32 {
+        self.counts
+            .lock()
+            .expect("should lock the counts")
+            .get(key)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Every key with a count, sorted.
+    #[must_use]
+    pub fn keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .counts
+            .lock()
+            .expect("should lock the counts")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    fn unavailable() -> Report<TrustedServerError> {
+        Report::new(TrustedServerError::Proxy {
+            message: "limiter unavailable".to_owned(),
+        })
+    }
+}
+
+impl RateLimiter for FakeRateLimiter {
+    fn exceeded(&self, key: &str, hourly_limit: u32) -> Result<bool, Report<TrustedServerError>> {
+        if self.fail_exceeded.load(Ordering::SeqCst) {
+            return Err(Self::unavailable());
+        }
+        let limit = hourly_limit.div_ceil(60);
+        let mut counts = self.counts.lock().expect("should lock the counts");
+        let current = counts.entry(key.to_owned()).or_insert(0);
+        if *current >= limit {
+            return Ok(true);
+        }
+        *current += 1;
+        Ok(false)
+    }
+
+    fn record(&self, key: &str) -> Result<(), Report<TrustedServerError>> {
+        if self.fail_record.load(Ordering::SeqCst) {
+            return Err(Self::unavailable());
+        }
+        *self
+            .counts
+            .lock()
+            .expect("should lock the counts")
+            .entry(key.to_owned())
+            .or_insert(0) += 1;
+        Ok(())
+    }
+
+    fn count(&self, key: &str) -> Result<u32, Report<TrustedServerError>> {
+        if self.fail_count.load(Ordering::SeqCst) {
+            return Err(Self::unavailable());
+        }
+        Ok(self.count_of(key))
     }
 }
 
