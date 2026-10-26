@@ -92,12 +92,18 @@ The local unpublished GNU masking commit `b91c7450a4f617d5ec879f612b295a532c7d7e
 
 - [x] Re-read source/map, independently investigate capture dependencies and carried build facts.
 - [x] Assemble Phase 2 and Phase 3 scratch trees; run host check and strict clippy; correct prerequisite ownership.
-- [ ] Commit this assignment and [tracking-issue draft](binary-attestations-phases-2-4-tracking-issue.md) on Phase 2.
+- [x] Commit this assignment and [tracking-issue draft](binary-attestations-phases-2-4-tracking-issue.md) on Phase 2 (`26d69ce95`).
 - [ ] Port source by module, preserving Phase 1 hunks and recording each current-main adaptation; update per-path landing metadata in the slice map.
 - [ ] Adapt closed producer tables to the seven Phase 1 assets and current pins without opening qualifications or changing the index schema.
 - [ ] Run explicitly selected pure tests with a nonzero-selection guard; compile platform-specific branches in CI; keep process/ignored tests CI-only.
 - [ ] Obtain independent and security reviews; pass touched CI gates before pushing and rehearse only an exact green reviewed head.
 - [ ] Request the separate Fastly integration design approval before implementing its missing gate/writer. Do not claim the intended Phase 2 capability is shipped by porting closed code.
+
+### Initial Phase 2 port
+
+The first implementation unit ports `crates/trusted-server-cli/src/prebid_bundle.rs` byte-for-byte from the frozen source: 80 additions and five removals to an existing Rust file, including three pure filesystem tests. Release builds compile out the developer-checkout fallback and discover required resources from the runtime checkout; development fallback is preserved. Already-landed build-facts scripts and version output are unchanged.
+
+Verification selects each of the three new tests by its exact full name, requires exactly one listed test and one passing/non-ignored result, and requires a total of three executed tests. The default configuration passes; the release-build configuration also passes. CLI target-matched clippy, workspace Rust formatting, domain lint and independent review pass. CLI documentation generation completes with existing warnings. No process-spawning or ignored tests are selected. The larger producer port and seven-artifact adaptations remain pending; these initial checks do not establish phase-wide CI or release readiness.
 
 ## Full path ledger
 
@@ -218,7 +224,7 @@ The landing phase below is exclusive file ownership. Shared files receive later 
 | `crates/trusted-server-adapter-fastly/build.rs`                                                                | 1 — carried   | Build facts landed in #1435; preserve current refinements |
 | `crates/trusted-server-adapter-fastly/src/main.rs`                                                             | 1 — carried   | Build facts landed in #1435; preserve current refinements |
 | `crates/trusted-server-cli/build.rs`                                                                           | 1 — carried   | Build facts landed in #1435; preserve current refinements |
-| `crates/trusted-server-cli/src/prebid_bundle.rs`                                                               | 2             | Pending                                                   |
+| `crates/trusted-server-cli/src/prebid_bundle.rs`                                                               | 2             | Initial source-identical port                             |
 | `crates/trusted-server-cli/tests/release_build_facts.rs`                                                       | 1 — carried   | Build facts landed in #1435; preserve current refinements |
 | `crates/trusted-server-core/build.rs`                                                                          | 1 — carried   | Build facts landed in #1435; preserve current refinements |
 | `crates/trusted-server-core/build_support/git_version.rs`                                                      | 1 — carried   | Build facts landed in #1435; preserve current refinements |
