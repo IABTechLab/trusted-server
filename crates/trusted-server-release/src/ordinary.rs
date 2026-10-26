@@ -15,6 +15,7 @@ use crate::documents::{self, Role};
 use crate::error::ReleaseError;
 
 mod archive;
+mod run;
 
 const PROFILE: &str = "ordinary-release-fastly-byte-equality-v1";
 const ASSET: &str = "trusted-server-fastly.wasm";
