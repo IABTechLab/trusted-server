@@ -47,7 +47,7 @@ const LINUX_X86_64_NEEDED: &[&str] = &[
 /// runtime string is not a build path. Complete GNU recipe acceptance also
 /// requires read-only unbound scratch, IPC without writable shared memory,
 /// no image-declared volumes, and the bound host/execution-root scan in
-/// `crate::recipe::PreparedRecipe`. This list alone cannot establish build
+/// [`crate::recipe::PreparedRecipe`]. This list alone cannot establish build
 /// path provenance. The default macOS list retains `/tmp/` until its own
 /// filesystem boundary is qualified.
 const LINUX_X86_64_DENIED_PATH_PREFIXES: &[&str] = &[
