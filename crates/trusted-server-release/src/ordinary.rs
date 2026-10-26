@@ -15,6 +15,7 @@ use crate::documents::{self, Role};
 use crate::error::ReleaseError;
 
 mod archive;
+mod inputs;
 mod run;
 mod transfer;
 
