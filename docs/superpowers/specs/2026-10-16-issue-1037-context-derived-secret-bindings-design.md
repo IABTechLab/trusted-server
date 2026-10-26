@@ -2,9 +2,11 @@
 
 ## Decision and status
 
-For [issue #1037](https://github.com/IABTechLab/trusted-server/issues/1037), keep credentials as raw native secret values. Derive each physical secret key from its schema-owned purpose, actual identity, approved destination or route policy, and existing configured reference. Provisioning a value at that key authorizes that particular use. Changing an authorization-relevant input selects a different key, not the same credential with new permissions.
+For [issue #1037](https://github.com/IABTechLab/trusted-server/issues/1037), keep credentials as raw native secret values. Derive each physical secret key from its schema-owned purpose, actual identity, and approved destination or route policy. Operators configure the feature and provide its credential, but do not invent a reference label or physical key. Provisioning a value at the generated key authorizes that particular use. Changing an authorization-relevant input selects a different key, not the same credential with new permissions.
 
-This is the selected design, not an implemented security fix. Implementation, migration tooling, and native runtime proof remain required before the issue can close.
+This is the selected design, not an implemented security fix. The operator workflow now includes context-aware Fastly writes through existing deployment configuration, rather than requiring manual key copying. Implementation, provisioning guides, migration tooling, and native runtime proof remain required before the issue can close. The [implementation plan](../plans/2026-10-26-issue-1037-secret-bindings-implementation-plan.md) defines the work sequence.
+
+This revision replaces the earlier label-bearing draft before any binding ABI has shipped. There is no compatibility lookup for that draft's names.
 
 The alternative considered was a protected JSON record containing the credential and its authorization, selected by new slot and owner IDs. Both approaches can enforce the required boundary. Context-derived bindings avoid a second stored policy representation, a credential-record parser, and new configuration identifiers. They instead make deterministic naming and normalization a provisioning compatibility contract. Operators need a reviewed secret-free binding plan to explain otherwise opaque names and retire former authorizations.
 
@@ -44,34 +46,42 @@ This protects against config-only reassignment, not malicious code with process-
 
 ## Config contract
 
-Keep existing secret field names and reference strings. A reference such as `partner_pull_token` becomes an opaque label, not a physical key. It must be a nonempty, non-whitespace-only string. Preserve its bytes exactly; do not trim, case-fold, parse a prefix, or interpret a generated-looking name specially. Labels need not satisfy native secret-name grammar because they are never native names.
+Remove operator-chosen secret references from unresolved app config. The twelve former secret leaves in the inventory below identify roles being migrated, not fields that remain configurable. Do not accept inline values, arbitrary labels, generated keys, `slot:` markers, `secret_owner_id`, physical binding overrides, or new per-field store selectors. Reject the removed reference properties with a schema-path-only migration error whenever present, including on disabled features, rather than silently ignoring a likely incomplete migration. Existing deprecated store selectors remain deserialize-only, ignored, and safely warned about. Tinybird's already discarded `access_token_secret` remains discarded and `access_enabled=true` remains rejected.
+
+An enabled feature implies its required credential. Ordinary configuration supplies its identity and destination:
 
 ```toml
+[tinybird]
+enabled = true
+api_host = "api.tinybird.example.com"
+auction_dataset = "auction_events_raw"
+
 [[ec.partners]]
 name = "Example partner"
 source_domain = "partner.example.com"
-api_token = "partner_api_token"
+api_token_enabled = true
 pull_sync_enabled = true
-ts_pull_token = "partner_pull_token"
 pull_sync_url = "https://sync.example.com/pull"
 pull_sync_allowed_domains = ["sync.example.com"]
 ```
 
-No `slot:` marker, `secret_owner_id`, physical binding override, or per-field store selector is introduced. The same label may be used in different scopes or identities. Supplying a complete derived key as the label just derives another key; it never bypasses derivation.
+This is the proposed breaking schema, not configuration accepted by today's binary. Tinybird needs no token-name property. Partner inbound authentication uses a new boolean `api_token_enabled`, defaulting to false, to preserve the former optional-token behavior. Enabling it requires the partner's inbound binding; a missing credential never silently disables authentication. Pull sync keeps its existing activation flag and requires its separate pull binding.
 
-Retain existing optionality and ordinary identity validation. Disabled Tinybird, disabled DataDome Protection/bypass, and disabled pull sync do not resolve stale references. Absent/null optional leaves skip lookup; malformed present structures remain errors. An omitted partner array is empty. Normalize boolean/string pull activation consistently without treating `"false"` as true. Deploy validation, lookup planning, and runtime loading must share these activation rules.
+For S3 auth, `access_key_id` and `secret_access_key` become implicit required roles. The new boolean `session_token_enabled` under route `auth` defaults to false; when true it requires the session-token binding. No lookup probes for optional bindings. Both new flags accept booleans only. The existing boolean/string pull activation is normalized consistently without treating `"false"` as true.
 
-Materialize defaults before planning lookups. S3 defaults remain the existing labels `access_key_id` and `secret_access_key`, resolved through separate contexts. Session token remains absent by default. `s3_sig_v4` and `s3_sigv4` use identical policy. Deprecated store selectors remain deserialize-only, ignored, and safely warned about. Tinybird's dormant `access_token_secret` remains discarded and `access_enabled=true` remains rejected.
+Publisher proxy and EC passphrase credentials are implicit required app roles. Each handler requires its password binding. Presence of trusted-client-IP configuration requires its shared-secret binding. Existing Tinybird, DataDome Protection, and bypass activation determine their required roles. Disabled uses make no secret reads; malformed present structures remain errors. An omitted partner array is empty. Deploy validation, lookup planning, and runtime loading share these rules.
 
-Replace obsolete reference-based validation. `PartnerRegistry::validate_config_for_deploy` must no longer reject two inbound labels merely because their strings match when their compiled identities differ. Validate compiled lookup identity instead. Keep duplicate normalized partner-domain rejection and runtime duplicate resolved-token-hash rejection. Replace the mandatory mutable pull-allowlist rule with the endpoint assertion contract below.
+Materialize ordinary defaults and effective S3 route/query policy before planning. Remove legacy S3 reference defaults instead of treating them as credential bytes. `s3_sig_v4` and `s3_sigv4` use identical policy. Preserve ordinary collection identity validation, including duplicate normalized partner-domain rejection and runtime duplicate resolved-token-hash rejection. Replace reference-string uniqueness checks with compiled lookup identity checks. Replace the mandatory mutable pull-allowlist rule with the endpoint assertion contract below.
 
-Correct existing guide statements describing `trusted_client_ip.shared_secret` as inline during implementation. Runtime already resolves it from the store; this is not an additional inline-to-store migration.
+Separate unresolved configuration from resolved credential state. Internal resolved fields may temporarily retain their existing Rust names for validation, but config deserialization cannot populate them and config serialization cannot emit them. A plain `Settings` object is not proof of a loaded credential binding.
+
+Correct existing guide statements describing `trusted_client_ip.shared_secret` as inline during implementation. Runtime already resolves that value from the store; removing its reference field is not an inline-to-store migration.
 
 ## Deterministic naming contract
 
-One TS-owned policy module compiles each active reference into a private request containing a fixed executable scope code, the exact label, a normalized subject vector, and a normalized export vector. Only core constructs this request. Adapters map native identities and perform lookup, not authorization.
+One TS-owned policy module compiles each active credential role into a private request containing a fixed executable scope code, a normalized subject vector, and a normalized export vector. Only core constructs this request. Adapters map native identities and perform lookup, not authorization. The purpose is fixed in code, but an outbound credential's physical key is not fixed independently of its destination.
 
-Derive EdgeZero metadata and the CLI lookup plan from the same descriptors. Unknown secret metadata or unsupported descriptor kinds fail closed. Keep the generic `PlatformSecretStore` interface for native access and separate signing/management uses; do not create an authorization engine in each adapter.
+Derive active credential metadata and the CLI lookup plan from the same descriptors. Descriptors identify the owning config path, fixed purpose, activation, subject, and export policy even though no reference leaf exists there. Unknown metadata or unsupported descriptor kinds fail closed. Keep the generic `PlatformSecretStore` interface for native access and separate signing/management uses; do not create an authorization engine in each adapter.
 
 ### Encoding and versioning
 
@@ -83,7 +93,6 @@ VEC(xs)  = u32 big-endian element count || LP(x1) || ... || LP(xn)
 
 payload  = ASCII("trusted-server-secret-binding-v1\0")
            || LP(scope)
-           || LP(reference_label)
            || VEC(subject)
            || VEC(export)
 
@@ -94,36 +103,37 @@ The domain separator ends with one NUL byte. The base32 alphabet is `abcdefghijk
 
 Element counts and length prefixes distinguish all components, including empty optional values. Do not substitute delimiter-concatenated strings, generic object serialization, array indexes, or provider-specific hashing. The restricted key alphabet avoids Axum case/replacement aliases. Spin must still apply its existing native store/key mapping.
 
-The encoding, subject/export shapes, defaults, and normalization rules together form the v1 provisioning ABI. Pin shared golden fixtures before integration, including every scope, optional markers, Unicode labels, and accepted/rejected normalization cases. CLI plans, unresolved serialization, runtime loading, and actual send targets must agree. A library upgrade must not silently change v1 names or expand endpoint equivalence. Intentional incompatible changes require a new version/namespace and migration, not an old-key retry.
+The encoding, subject/export shapes, defaults, and normalization rules together form the v1 provisioning ABI. Pin shared golden fixtures before integration, including every scope, optional markers, UTF-8 subject components, and accepted/rejected normalization cases. CLI plans, unresolved serialization, runtime loading, and actual send targets must agree. A library upgrade must not silently change v1 names or expand endpoint equivalence. Intentional incompatible changes require a new version/namespace and migration, not an old-key retry.
 
 One fictional model vector to confirm independently in the shipping implementation is:
 
 ```text
 scope:    ecpull
-label:    shared
 subject:  ["partner", "partner.example.com"]
 export:   ["pull", "https://sync.example.com/pull"]
-key:      ts1_ais2qpyk56tzecpap4de43vv7yedwcm2wo2tf5udw3chx46rsepq
+key:      ts1_2hsjuldwgmfhyotnokgn5mqrao6xnkyo3dwva33hez4vx43yvcjq
 ```
 
 A matching model vector proves only those encoding bytes, not native compatibility, collision resistance, or exporter confinement.
 
 ### Complete context inventory
 
-| Secret path                                                           | Fixed scope | Subject | Export                      | Activation                                                         |
-| --------------------------------------------------------------------- | ----------- | ------- | --------------------------- | ------------------------------------------------------------------ |
-| `publisher.proxy_secret`                                              | `proxy`     | App     | None                        | Required                                                           |
-| `ec.passphrase`                                                       | `ecpass`    | App     | None                        | Required                                                           |
-| `ec.partners[*].api_token`                                            | `ecin`      | Partner | None                        | Optional; absence disables inbound authentication for that partner |
-| `ec.partners[*].ts_pull_token`                                        | `ecpull`    | Partner | Pull endpoint               | Required when pull sync is enabled                                 |
-| `handlers[*].password`                                                | `handler`   | Handler | None                        | Required for each configured handler                               |
-| `trusted_client_ip.shared_secret`                                     | `clientip`  | App     | None                        | Required when trusted-client-IP configuration exists               |
-| `tinybird.auction_token_secret`                                       | `tinybird`  | App     | Events endpoint and dataset | Required when Tinybird auction telemetry is enabled                |
-| `integrations.datadome.server_side_key_secret_name`                   | `ddserver`  | App     | Protection endpoint         | Required when integration and Protection are enabled               |
-| `integrations.datadome.protection_test_bypass.credential_secret_name` | `ddbypass`  | App     | None                        | Required when integration, Protection, and bypass are enabled      |
-| `proxy.asset_routes[*].auth.access_key_id`                            | `s3id`      | Route   | S3                          | Required for S3 auth                                               |
-| `proxy.asset_routes[*].auth.secret_access_key`                        | `s3secret`  | Route   | S3                          | Required for S3 auth                                               |
-| `proxy.asset_routes[*].auth.session_token`                            | `s3sess`    | Route   | S3                          | Optional for S3 auth                                               |
+The CLI selectors are fixed descriptor IDs, not operator-chosen names or additional hash inputs. Repeated roles also require selection of a compiled subject from the plan.
+
+| Former reference property                                             | CLI selector       | Fixed scope | Subject | Export                      | Activation                                  |
+| --------------------------------------------------------------------- | ------------------ | ----------- | ------- | --------------------------- | ------------------------------------------- |
+| `publisher.proxy_secret`                                              | `publisher.proxy`  | `proxy`     | App     | None                        | Required                                    |
+| `ec.passphrase`                                                       | `ec.passphrase`    | `ecpass`    | App     | None                        | Required                                    |
+| `ec.partners[*].api_token`                                            | `ec.inbound`       | `ecin`      | Partner | None                        | `api_token_enabled=true`                    |
+| `ec.partners[*].ts_pull_token`                                        | `ec.pull`          | `ecpull`    | Partner | Pull endpoint               | Pull sync enabled                           |
+| `handlers[*].password`                                                | `handler.password` | `handler`   | Handler | None                        | Each configured handler                     |
+| `trusted_client_ip.shared_secret`                                     | `clientip.shared`  | `clientip`  | App     | None                        | Trusted-client-IP configuration exists      |
+| `tinybird.auction_token_secret`                                       | `tinybird.auction` | `tinybird`  | App     | Events endpoint and dataset | Tinybird auction telemetry enabled          |
+| `integrations.datadome.server_side_key_secret_name`                   | `datadome.server`  | `ddserver`  | App     | Protection endpoint         | Integration and Protection enabled          |
+| `integrations.datadome.protection_test_bypass.credential_secret_name` | `datadome.bypass`  | `ddbypass`  | App     | None                        | Integration, Protection, and bypass enabled |
+| `proxy.asset_routes[*].auth.access_key_id`                            | `s3.access-id`     | `s3id`      | Route   | S3                          | S3 auth                                     |
+| `proxy.asset_routes[*].auth.secret_access_key`                        | `s3.secret`        | `s3secret`  | Route   | S3                          | S3 auth                                     |
+| `proxy.asset_routes[*].auth.session_token`                            | `s3.session`       | `s3sess`    | Route   | S3                          | S3 auth and `session_token_enabled=true`    |
 
 Vectors have these fixed shapes:
 
@@ -144,7 +154,7 @@ S3:        ["s3"]
 
 For optional route pattern/target fields, presence is the literal `absent` or `present`; absence has an empty value component. Encode effective query policy as the literal `preserve` or `strip`. Use effective normalized route values after defaults, not raw aliases. Partner domains use the existing normalized source-domain function. Handler paths use exact validated regex strings, not regex equivalence. Dataset must be nonempty and is not silently trimmed into another value.
 
-The subject is the identity, so there is no separately mutable owner ID. Reordering entries leaves keys unchanged. Changing a handler username, partner domain, or authenticated route policy changes keys. Equal purpose, subject, export, and label intentionally share one binding; existing collection uniqueness rules still apply. Copying a whole provisioned identity selects that identity, not another identity's credential.
+The subject is the identity, so there is no separately mutable owner ID. Reordering entries leaves keys unchanged. Changing a handler username, partner domain, or authenticated route policy changes keys. Equal purpose, subject, and export intentionally share one binding; existing collection uniqueness rules still apply. There is one value per effective context, not a configurable choice of credential generations. Copying a whole provisioned identity selects that identity, not another identity's credential.
 
 All three S3 fields use the same compiled route subject, but distinct scopes. Bind prefix, origin, regex/rewrite policy, region, and effective query policy. Request-dependent object paths and permitted incoming queries remain dynamic; this is not a bucket/object authorization system. Image-optimizer behavior must not change the bound effective query policy. Any future send-affecting field requires a context review, not an assumption that the current inventory remains complete.
 
@@ -180,9 +190,9 @@ Validate header, form, and signing representation before backend creation. Pull 
 
 ### Unresolved and resolved normalization
 
-Separate reference/config normalization from credential handling. Validate original endpoint syntax before URL parsing or trimming can erase forbidden input. Preserve label bytes in `TrustedServerAppConfig::deserialize` and unresolved serialization. Materialize S3 defaults and effective route/query policy before planning; never hash an incomplete raw tree.
+Separate unresolved config normalization from credential handling. Validate original endpoint syntax before URL parsing or trimming can erase forbidden input. Reject removed reference properties before unresolved serialization can discard them. Materialize S3 defaults and effective route/query policy before planning; never hash an incomplete raw tree.
 
-After lookup, preserve credential bytes through settings construction, runtime preparation, and exporter construction. Address current S3 normalization, Tinybird label/dataset normalization, DataDome startup normalization, and repeated `prepare_runtime` calls explicitly. Existing normalization cannot be reused unchanged if it trims a resolved credential or changes the compiled target. Apply activation consistently before secret reads without letting inactive cleanup hide malformed present structures.
+After lookup, preserve credential bytes through settings construction, runtime preparation, and exporter construction. Address current S3 normalization, Tinybird dataset normalization, DataDome startup normalization, and repeated `prepare_runtime` calls explicitly. Existing normalization cannot be reused unchanged if it trims a resolved credential or changes the compiled target. Apply activation consistently before secret reads without letting inactive cleanup hide malformed present structures.
 
 ### Private construction and snapshots
 
@@ -205,7 +215,7 @@ flowchart TD
     E --> F[Verified TLS and one send per operation to the bound target]
 ```
 
-Errors expose only safe schema paths and fixed categories. Do not attach labels, native lookup diagnostics, credentials, URLs/queries, usernames, request bodies, or header values. Audit `Debug`, traces, request-builder errors, panic paths, form payload logging, and header sensitivity. No raw-key retry, alternate-store retry, plaintext fallback, or prefix/suffix bypass exists.
+Errors expose only safe schema paths and fixed categories. Do not attach native lookup diagnostics, credentials, URLs/queries, usernames, request bodies, or header values. Provisioning commands may deliberately show reviewed subject/target metadata as specified below; runtime errors must not. Audit `Debug`, traces, request-builder errors, panic paths, form payload logging, and header sensitivity. No raw-key retry, alternate-store retry, plaintext fallback, or prefix/suffix bypass exists.
 
 Signing uses its existing fixed signing-store identity and separate `current-kid`; management uses its fixed credential identity and API host. Keep these separately audited paths outside app-config derivation. Do not redesign signing management or accidentally route app-config fields through a generic raw-reference extractor.
 
@@ -226,38 +236,87 @@ A host-usable renderer must share TS adapters' actual native mapping implementat
 
 The pinned EdgeZero CLI's `run_adapter_typed_checks` and `typed_secret_checks` both walk raw leaves; validate, push, and diff consume those paths. Its Spin adapter lowercases those leaves, validates native-looking names, and rejects duplicates without TS's store/key escaping. Old labels passing this check would still be validation of the wrong names.
 
-Add a default-compatible opt-in hook returning active `field_path`, `store_id`, and derived key. The exact public API can follow upstream conventions. For TS plans, reconcile both raw walkers with active/defaulted compiled lookups while retaining metadata and logical store declaration validation. Native validation uses generated lookups and final TS rendering; serialized labels remain unchanged. Other applications retain existing behavior when the hook is absent. Do not disable Spin validation globally.
+Add a default-compatible opt-in hook representing implicit active credentials with descriptor ID, owning `field_path`, `store_id`, and derived key. The exact public API can follow upstream conventions. For TS plans, replace both raw-leaf walkers with active/defaulted compiled lookups while retaining metadata and logical store declaration validation. The hook must not require a credential reference leaf to exist, reinsert dummy labels, or skip required roles whose old fields have disappeared. Native validation uses generated lookups and final TS rendering; unresolved serialization contains feature configuration only. Other applications retain existing behavior when the hook is absent. Do not disable Spin validation globally.
 
 Before substantial exporter/tooling work, demonstrate the hook through real validate/push/diff consumers and TS's host-usable renderer with fictional data. Cover omitted optional fields, defaults, inactive cleanup, metadata completeness, repeated identical requests, distinct contexts, and final binding collisions. Publish and pin the companion dependency before claiming CLI parity.
 
 The 56-byte key does not prove provider acceptance. Under the inspected TS Spin mapping, its name with `trusted_server_secrets` is 92 bytes. Verify actual generated names, declarations, value-size limits, secure provisioning, and config-writer IAM separation in isolated native environments. Unavailable environments remain blockers, not assumed passes.
 
+### Reuse existing deployment configuration
+
+Do not introduce `deploy/production.toml`, a new `--target` descriptor, or a second source of service/store mappings. TS already delegates lifecycle commands to EdgeZero. Reuse `edgezero.toml`, the adapter manifest, existing service-selection rules, and deploy-process or GitHub Environment variables.
+
+On Fastly, `fastly.toml` already supplies `service_id`. Provisioning also supports `FASTLY_SERVICE_ID` and rejects a conflict with the manifest. Managed deployment supports explicit `--service-id`; otherwise it resolves the verified manifest/environment selection. Expose any shared resolution needed for secrets through the companion dependency rather than maintaining another TS implementation. Existing physical store selectors are:
+
+```text
+EDGEZERO__STORES__SECRETS__TRUSTED_SERVER_SECRETS__NAME
+EDGEZERO__STORES__CONFIG__TRUSTED_SERVER_CONFIG__NAME
+EDGEZERO__STORES__KV__TRUSTED_SERVER_KV__NAME
+```
+
+These select names, not provider IDs. Resolve and record the exact physical resources with the existing provider machinery. An unset selector retains the existing logical-name default, which must be visible in the plan. `FASTLY_API_TOKEN` supplies authentication for managed direct API calls; a CLI profile alone does not replace it. Honor existing manifest selection, including `EDGEZERO_MANIFEST`, without adding conflicting path precedence.
+
+`ts provision --adapter fastly` creates or reuses resources. Managed `ts deploy` links the selected physical stores to the target service version under logical IDs such as `trusted_server_secrets`. The runtime opens that logical ID and does not read deploy selectors from a Config Store. `--staging` is not a store selector; production and staging must supply different physical-store mappings where isolation is required. Secret writes do not deploy, activate a version, create resource links, or refresh retained state.
+
 ### First-release operator tooling
 
-Generate a secret-free binding plan from unresolved config using the shared core compiler. Include schema paths, normalized subject/export contexts, derived keys, final native identities/declarations, and the reviewed config/version identity. Retain the reviewed plan as access-controlled operational configuration metadata; it is not a credential inventory service. It must contain no credential values and must make policy changes and retirement reviewable.
+Provide a secret-free plan and native rendering/checking for all four adapters, plus a context-aware Fastly `set` workflow in the first release. The command interface below is proposed, not available today:
 
-Native provider tools perform writes/deletes through secure operator input. Reuse existing CLI facilities where possible. Do not add record-validation commands, provider write orchestration, credential discovery, automatic rotation, or persistent runtime authorization/inventory state. Never print values in normal output, command arguments, diffs, or committed generated files.
+```bash
+ts secrets plan --adapter fastly --app-config trusted-server.toml --out bindings.json
+ts secrets set tinybird.auction --adapter fastly --app-config trusted-server.toml --plan bindings.json
+ts secrets check --adapter fastly --app-config trusted-server.toml --plan bindings.json
+```
+
+Reuse existing app-config path and overlay semantics. The plan must record the effective unresolved config identity, overlay policy, compiler/ABI version, descriptor IDs, owning schema paths, normalized subject/export contexts, derived keys, final native identities/declarations, and resolved deployment resources. Keep a complete reviewed plan with the release/config records. Plan creation does not authorize its contents, and its checksum is not an approval signature.
+
+`set` recompiles from the supplied config and current deployment inputs and rejects a stale, tampered, unsupported-version, or mismatched plan before reading a credential or making a provider mutation. Compare the full relevant plan and resolved provider identities, not just the selected entry's key. Select only an active compiled descriptor. Singleton `tinybird.auction` needs no extra name. For repeated roles, list the human-readable compiled subjects interactively; noninteractive callers must supply an unambiguous tool-generated `--binding` entry ID from that plan. Never choose the first array entry or accept a raw key/store override.
+
+Show the selected purpose, subject, exact endpoint/dataset or route policy, service, physical store, and intended create/replace action for confirmation. This is intentional metadata output, not a runtime diagnostic. A changed target or provider resource requires a new reviewed plan. Keep this metadata access-controlled even though it contains no credential values.
+
+Read the raw value through a hidden prompt by default or `--stdin` for automation. Require `--yes` with stdin; it replaces interactive approval only. Preserve bytes exactly, reject invalid credential representation and provider value limits before mutation, and fail without panics. Do not accept a value argument, print values, place them on subprocess argv, or write them to tracked files. Reuse provider tooling only if it supports secure input and sanitized errors; otherwise use a narrow adapter operation with equivalent handling. Do not execute commands embedded in a plan.
+
+Resolve native IDs before mutation and use those exact IDs for the write. Report create versus replacement safely. Re-running an identical logical write must not allocate new names. Verify provider replacement and propagation behavior in isolated tests; report uncertain outcomes without automatically granting another context or deleting the former binding. S3 multi-key writes are not transactional. Do not infer immediate fleet-wide activation from successful storage.
+
+`check` validates plan/config/deployment agreement and native binding/declaration existence where the provider exposes it without reading values. It must distinguish missing bindings, unsupported checks, and provider errors. It does not prove credential validity, external delivery, TLS behavior, or warm-state refresh. Unsupported direct `set` adapters fail explicitly before accepting input. Axum, Cloudflare, and Spin get generated native identities/declarations and tested secure native-tool instructions; do not imply that a subprocess can export variables into its parent shell or add a new persistent credential service.
+
+Native tools may still perform deletion and advanced provider operations using generated identities from the reviewed plan. No credential discovery, automatic rotation, background reconciliation, protected-record parser, or persistent runtime authorization/inventory state is introduced. This narrow explicit write workflow replaces the earlier draft's prohibition on all provider writes, not its exclusion of a general secret-management system.
+
+### Automation and provisioning guides
+
+A dedicated trusted provisioning workflow can call the same command through stdin. The following Bash example is proposed and assumes the provider credential and reviewed deployment selectors are already supplied by the environment:
+
+```bash
+set +x
+set -euo pipefail
+: "${TINYBIRD_AUCTION_TOKEN:?Missing Tinybird credential}"
+: "${FASTLY_API_TOKEN:?Missing Fastly provisioning credential}"
+printf '%s' "$TINYBIRD_AUCTION_TOKEN" |
+  env -u TINYBIRD_AUCTION_TOKEN ts secrets set tinybird.auction \
+    --adapter fastly --app-config trusted-server.toml \
+    --plan bindings.json --stdin --yes
+```
+
+Do not provision automatically on each ordinary config push or from the live mutable blob. CI is a trusted secret writer and must run approved CLI/workflow code against a reviewed revision and plan. Use protected provisioning credentials and an approval boundary that config-only publishers cannot bypass, a separate admin-controlled repository where necessary, and serialized writes to the same binding. Do not expose these credentials to untrusted pull-request jobs. An environment approval does not make attacker-controlled workflow code safe. Missing inputs, changed overlays, changed service/store selectors, or changed config/plan must fail before provider mutation. CI logs and artifacts must not contain credential values.
+
+As implementation deliverables, add dedicated provisioning, CI, and migration guides and update configuration, CLI, Fastly, Axum, Cloudflare, Spin, Tinybird, DataDome, and S3 documentation plus examples and navigation. Include complete label-free TOML, interactive input, secure Bash stdin, a protected GitHub Actions workflow, environment-variable tables, provider-native walkthroughs, existence checks versus runtime smoke tests, rotation/retirement, and troubleshooting. Examples use fictional `example.com` endpoints and never real deployment identities. Mark proposed interfaces as proposed until executable help/tests and isolated rehearsals establish their behavior.
 
 ## Migration, rotation, and retirement
 
 1. Inventory active uses and approved subjects/destinations without printing values. Separate cross-role credential reuse and verify config writers cannot modify native secrets or deployment bindings.
-2. Generate the plan from reviewed existing config. A trusted operator approves its normalized contexts. Blindly provisioning a plan derived from attacker-edited live config would grant the attacker new authority.
-3. Copy existing raw values to derived native names through secure provider input. Secret contents and existing reference strings need not change. Update declarations, examples/local fixtures, and retain the reviewed secret-free plan.
-4. Deploy to an isolated version, exercise valid and attacker-modified blobs, and confirm newly created state uses derived bindings. Switch traffic only after release gates pass.
-5. Remove legacy raw-name entries after an explicitly owned rollback window. Revoke credentials at recipients if earlier exposure is suspected.
+2. Create a reviewed new-schema config. Remove all twelve legacy reference properties. Set `api_token_enabled` for partners formerly using inbound tokens and `session_token_enabled` for S3 routes formerly using session tokens. Keep feature activation explicit; absence of a secret is not a disable signal.
+3. Generate and approve the plan from that config and the existing deployment inputs. Blindly provisioning a plan derived from attacker-edited live config would grant the attacker new authority.
+4. Copy existing raw values to the generated native identities through secure input. Use the Fastly `set` workflow or the tested generated/native instructions for other adapters. Update declarations and local fixtures, and retain the reviewed secret-free plan. No JSON wrapping or credential-value change is required unless validation or suspected compromise requires one.
+5. Deploy the matching new config and binary to an isolated version. Old binaries and new binaries need separate compatible config snapshots/stores during a mixed rollout; sharing the new config with an old binary is unsafe. Exercise valid and attacker-modified blobs, recreate state, and switch traffic only after release gates pass.
+6. Remove legacy raw-name entries after an explicitly owned rollback window. Revoke credentials at recipients if earlier exposure is suspected.
 
-For an endpoint, subject, label, or derivation-version change:
+For an endpoint, subject, route-policy, or derivation-version change, review old/new plans, provision the new binding/declarations, switch config and recreate state, then remove every retired key/declaration within an owned window. The old context remains authorized for fresh loads while its key exists. Replace retained old states, account for in-flight requests, and verify that replaying retired config fails on newly created state.
 
-1. Review the old/new plans and provision the new binding/declarations.
-2. Switch config, recreate state, and verify the new authorized flow.
-3. Remove every retired key/declaration within an owned, time-bounded window using native tools. The old context remains authorized for fresh loads while its key exists; provisioning a new key does not revoke it.
-4. Replace retained old states and account for in-flight requests. Verify that replaying retired config fails on newly created state. Revoke at external recipients when exposure is suspected.
-
-Ordinary value rotation at an unchanged context updates the raw value at the same name and requires state recreation. For coordinated S3 changes, stage new labels across all credential scopes, provision them first, then change config references together. Native multi-key updates are not a transaction.
+Ordinary value rotation at an unchanged context updates the raw value at the same name and requires state recreation. Removing labels removes independently selectable same-context generations. Do not add a hidden label, generation ID, or raw-key override to recover that capability. Document provider replacement semantics and an overlap window at the external recipient where supported. If old and new values cannot overlap, use a coordinated maintenance cutover. For S3, update the required credential roles while affected state creation/traffic is paused, verify all writes, then recreate state and resume. Native multi-key updates are not a transaction; a provider requiring an unavailable atomic swap is a reported rollout blocker.
 
 Axum normally requires process restart. Fastly requires new state/sandboxes, including reusable-sandbox mode. Cloudflare and Spin follow existing runner app-state construction. No immediate warm-instance refresh or global revocation guarantee is added.
 
-Unchanged labels can preserve the config shape during mixed rollout while old and new native names coexist, but old binaries remain vulnerable. Strict endpoint rules can still force config changes. Rollback requires retained legacy names and restores the original attack. Prefer rolling forward or disabling affected exporters. The new binary never reads legacy names.
+Rollback requires the old binary's compatible config snapshot and retained legacy names and restores the original attack. Prefer rolling forward or disabling affected exporters. The new binary never reads legacy or earlier label-bearing draft names.
 
 ## Acceptance and proof contract
 
@@ -265,21 +324,23 @@ These are required executable results, not passing claims:
 
 | Issue criterion                                           | Decision                                                                                 | Required evidence                                                                                                                                                                 |
 | --------------------------------------------------------- | ---------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| No unrestricted physical key from app config              | Typed contexts and derived keys only                                                     | Spy-store coverage of all twelve paths; arbitrary raw/generated-key labels never become direct lookups                                                                            |
+| No unrestricted physical key from app config              | Implicit typed roles and derived keys only                                               | Spy-store coverage of all twelve roles; removed raw/generated-key reference properties reject before lookup                                                                       |
 | Consistent scopes on all four adapters                    | Shared descriptors/encoder; trusted native mapping                                       | Golden vectors, native name/read tests, then Viceroy/Fastly, Axum HTTPS, Wrangler/workerd, and Spin smoke                                                                         |
-| Unrelated values cannot become pull Bearer tokens         | Scope is in the hashed context                                                           | Substitute publisher, inbound, handler, and sibling-role labels with valid checksums; no unrelated value returned, backend created, or HTTP send                                  |
+| Unrelated values cannot become pull Bearer tokens         | Fixed purpose is in the hashed context                                                   | Inject legacy reference properties or mutate identities with valid checksums; no unrelated value returned, backend created, or HTTP send                                          |
 | Blob edits cannot redirect a pull credential              | Exact subject/endpoint are in the key; fixed TLS/no-follow policy                        | Change URL and allowlist together, host/port/path, syntax, and TLS toggle; no lookup of the old key and zero sends. Approved 3xx sends once per operation and never to `Location` |
 | Migration documents provisioning and required moves       | Raw-value copy, approved plans, native declarations, retirement, unsafe rollback warning | Fictional four-adapter operator walkthrough, including retired-context replay                                                                                                     |
 | Config-only attacker rejected before any outbound request | Atomic loading and private resolved-use construction                                     | Production envelope reconstruction with valid-checksum mutations, backend/HTTP counters, and native/runtime negative sends                                                        |
 
 Also test:
 
-- Field reordering, label reuse across contexts, complete authorized identity selection, generated-name labels, framing boundaries, UTF-8 lengths, checked integer conversion, optional markers, and native declaration collisions.
-- Malformed/optional/inactive structures, S3 defaults/auth alias/effective query policy, partner normalization, preserved resolved-token collision checks, handler subject changes, DataDome/Tinybird retargeting, and every bound S3 route-policy mutation.
-- Exact label/credential-byte preservation through all normalization and repeated runtime preparation; schema-only safe diagnostics with fictional sentinel values.
-- CLI validate/push/diff and unchanged unresolved serialization; default-compatible behavior for other EdgeZero users; actual send method/authority/path/query equal to compiled context, including Host/SNI and Tinybird dataset encoding.
+- Field reordering, complete authorized identity selection, identical context deduplication, framing boundaries, UTF-8 lengths, checked integer conversion, optional markers, and native declaration collisions. Removed reference properties must reject even if they contain real generated keys.
+- Malformed/optional/inactive structures, both new activation flags and their defaults, missing enabled credentials, S3 auth aliases/effective query policy, partner normalization, preserved resolved-token collision checks, handler subject changes, sibling retargeting, and every bound S3 route-policy mutation.
+- Exact credential-byte preservation through all normalization and repeated runtime preparation; unresolved config contains no credential values or references; schema-only safe runtime diagnostics with fictional sentinel values.
+- CLI validate/push/diff for implicit roles and feature-only serialization; default-compatible behavior for other EdgeZero users; actual send method/authority/path/query equal to compiled context, including Host/SNI and Tinybird dataset encoding.
+- Plan/config/overlay/compiler/native-mapping/resource mismatch, manifest/environment service conflicts, staging selectors, wrong-store selection, ambiguous repeated-role selection, unsupported adapters, cancelled input, invalid bytes, secure stdin, sanitized provider failures, replacement/uncertain outcomes, and zero mutation on any preflight failure. Never publish credential values in argv, logs, plans, generated declarations, or CI artifacts.
+- Protected CI approval and trusted-code boundaries, deterministic reruns, presence-only check limitations, independent runtime smoke, and fictional four-adapter provisioning-guide rehearsals.
 - Mandatory TLS despite proxy toggles/backend reuse, no credential-bearing redirect following, DataDome form encoding, all S3 signing/HEAD/GET preflight branches, and Tinybird no-follow without claiming observed responses.
-- State recreation and in-flight snapshots, same-name value rotation, staged S3 rotation, policy change/retirement, replay rejection, and rollback behavior.
+- State recreation and in-flight snapshots, same-name value rotation, coordinated S3 rotation without labels, policy change/retirement, replay rejection, mixed-version config isolation, and rollback behavior.
 
 Two high-risk facts remain unproven: every export-capable path can be confined to its loaded credential/target snapshot, and every native mapping/transport preserves that authorization. The cheapest next proofs are the production-loader/store/backend spy slice and the actual EdgeZero/TS renderer path, followed by native lookup and send tests.
 
