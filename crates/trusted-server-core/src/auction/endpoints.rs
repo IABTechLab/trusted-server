@@ -20,7 +20,8 @@ use crate::ec::eids::{resolve_partner_ids, to_eids};
 use crate::ec::identity::UnixTime;
 use crate::ec::identity::catalog::ProviderCatalog;
 use crate::ec::identity::policy::PolicySignals;
-use crate::ec::identity::servable::{ServeContext, opted_out_providers};
+use crate::ec::identity::request::opted_out;
+use crate::ec::identity::servable::ServeContext;
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::partner::normalize_partner_source_domain;
 use crate::ec::prebid_eids::parse_prebid_eids_cookie;
@@ -480,15 +481,22 @@ pub(crate) fn resolve_auction_eids(
     let Some(now) = checked_current_timestamp() else {
         return Some(Vec::new());
     };
-    // Until the request's identity runtime is on `EcContext`, no provider is
-    // configured, so only unowned records without a writer are servable.
-    let catalog = ProviderCatalog::empty();
-    let opted_out = opted_out_providers(entry);
+    // Without a runtime no provider is configured, so only unowned records
+    // without a writer are servable.
+    let empty_catalog;
+    let catalog = match ec_context.identity_runtime() {
+        Some(runtime) => runtime.catalog(),
+        None => {
+            empty_catalog = ProviderCatalog::empty();
+            &empty_catalog
+        }
+    };
+    let opted_out = opted_out(entry);
     let serve = ServeContext {
         now: UnixTime::from_secs(now),
         consent: ec_context.consent(),
         signals,
-        catalog: &catalog,
+        catalog,
         opted_out: &opted_out,
     };
     let resolved = resolve_partner_ids(registry, entry, &serve);
@@ -1786,6 +1794,75 @@ mod tests {
         assert!(
             eids.is_empty(),
             "should return empty vec on KV error (degraded mode)"
+        );
+    }
+
+    #[test]
+    fn generic_pull_record_with_writer_is_served_after_flush() {
+        use crate::ec::identity::IdentityRuntime;
+        use crate::ec::identity::test_support::{ec_partner, record_for_test};
+        use crate::test_support::tests::create_test_settings;
+
+        let mut partner = ec_partner(
+            "ssp.example.com",
+            "https://sync.ssp.example.com/pull",
+            "example-token-value-0123456789abcdef",
+        );
+        partner.api_token = Some(crate::redacted::Redacted::new(
+            "token-ssp-example-com-32-bytes-minimum".to_owned(),
+        ));
+        let registry = PartnerRegistry::from_config(std::slice::from_ref(&partner))
+            .expect("should build registry");
+        let mut settings = create_test_settings();
+        settings.ec.partners = vec![partner];
+        let with_provider = std::sync::Arc::new(
+            IdentityRuntime::from_settings(&settings).expect("should build the runtime"),
+        );
+        settings.ec.partners = Vec::new();
+        let without_provider = std::sync::Arc::new(
+            IdentityRuntime::from_settings(&settings).expect("should build the runtime"),
+        );
+
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let mut entry = crate::ec::kv_types::KvEntry::minimal("other.example.com", "other", 1);
+        entry.ids.insert(
+            "ssp.example.com".to_owned(),
+            record_for_test("pulled-uid", Some("pull-ssp-example-com"), 1),
+        );
+        let snapshot = EcKvSnapshot::Present {
+            ec_id: ec_id.clone(),
+            entry: Box::new(entry),
+            generation: None,
+        };
+        let resolve = |runtime: Option<std::sync::Arc<IdentityRuntime>>| {
+            let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+            if let Some(runtime) = runtime {
+                ec_context.set_identity_runtime(runtime);
+            }
+            resolve_auction_eids(
+                &snapshot,
+                Some(&registry),
+                &ec_context,
+                PolicySignals::default(),
+            )
+            .expect("should resolve EIDs")
+        };
+
+        let served = resolve(Some(with_provider));
+        let dropped = resolve(Some(without_provider));
+        let no_runtime = resolve(None);
+
+        assert!(
+            served.iter().any(|eid| eid.source == "ssp.example.com"),
+            "should send the pulled UID when the runtime's catalog holds its writer"
+        );
+        assert!(
+            dropped.iter().all(|eid| eid.source != "ssp.example.com"),
+            "control: should drop the record when the catalog lacks its writer"
+        );
+        assert!(
+            no_runtime.iter().all(|eid| eid.source != "ssp.example.com"),
+            "control: should drop the record without a runtime"
         );
     }
 

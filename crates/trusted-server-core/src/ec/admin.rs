@@ -36,10 +36,12 @@ use crate::openrtb::Eid;
 use super::checked_current_timestamp;
 use super::eids::{resolve_partner_ids, to_eids};
 use super::generation::is_valid_ec_id;
+use super::identity::IdentityRuntime;
 use super::identity::UnixTime;
 use super::identity::catalog::ProviderCatalog;
 use super::identity::policy::PolicySignals;
-use super::identity::servable::{ServeContext, opted_out_providers};
+use super::identity::request::opted_out;
+use super::identity::servable::ServeContext;
 use super::kv::KvIdentityGraph;
 use super::kv_backend::EcKvLookup;
 use super::kv_types::{KvEntry, KvMetadata};
@@ -283,6 +285,7 @@ struct SkippedPartnerId {
 pub fn handle_admin_ec_lookup(
     kv: Option<&KvIdentityGraph>,
     registry: &PartnerRegistry,
+    runtime: Option<&IdentityRuntime>,
     req: &Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
     let Some(kv) = kv else {
@@ -304,7 +307,7 @@ pub fn handle_admin_ec_lookup(
     };
 
     log::info!("Admin EC lookup: returning entry for '{}'", log_id(&ec_id));
-    let payload = build_lookup_response(registry, kv.store_name(), ec_id, &lookup);
+    let payload = build_lookup_response(registry, runtime, kv.store_name(), ec_id, &lookup);
     let body =
         serde_json::to_string(&payload).change_context(TrustedServerError::Configuration {
             message: "failed to serialize admin EC lookup response".to_owned(),
@@ -394,6 +397,7 @@ fn redact_provider_state(entry: &mut JsonValue) {
 /// corrupt entries remain inspectable.
 fn build_lookup_response(
     registry: &PartnerRegistry,
+    runtime: Option<&IdentityRuntime>,
     store_name: &str,
     ec_id: String,
     lookup: &EcKvLookup,
@@ -427,7 +431,7 @@ fn build_lookup_response(
                         .and_then(|dropped| entry.validate().map(|()| dropped));
                     match upgraded {
                         Ok(dropped) => {
-                            payload.auction = Some(build_auction_view(registry, &entry));
+                            payload.auction = Some(build_auction_view(registry, &entry, runtime));
                             if !dropped.is_empty() {
                                 payload.entry_error =
                                     Some(format!("dropped on read: {}", dropped.join("; ")));
@@ -513,21 +517,32 @@ fn iso_timestamp(unix_seconds: u64) -> Option<String> {
 
 /// Derives the auction EID view for a valid entry, mirroring the filters in
 /// [`resolve_partner_ids`] and reporting why each stored ID was skipped.
-fn build_auction_view(registry: &PartnerRegistry, entry: &KvEntry) -> AuctionEidsView {
+fn build_auction_view(
+    registry: &PartnerRegistry,
+    entry: &KvEntry,
+    runtime: Option<&IdentityRuntime>,
+) -> AuctionEidsView {
     // The admin view has no request, so it reads with permissive consent. A
     // failed clock resolves no KV IDs, as the auction does (spec 4.4).
     let consent = ConsentContext {
         jurisdiction: Jurisdiction::NonRegulated,
         ..ConsentContext::default()
     };
-    let catalog = ProviderCatalog::empty();
-    let opted_out = opted_out_providers(entry);
+    let empty_catalog;
+    let catalog = match runtime {
+        Some(runtime) => runtime.catalog(),
+        None => {
+            empty_catalog = ProviderCatalog::empty();
+            &empty_catalog
+        }
+    };
+    let opted_out = opted_out(entry);
     let now = checked_current_timestamp();
     let serve = ServeContext {
         now: UnixTime::from_secs(now.unwrap_or(0)),
         consent: &consent,
         signals: PolicySignals::default(),
-        catalog: &catalog,
+        catalog,
         opted_out: &opted_out,
     };
     let resolved = if now.is_some() {
@@ -1031,7 +1046,7 @@ mod tests {
         let kv = kv_with_entry(&ec_id, entry);
         let req = get_request(&format!("/_ts/admin/ec/{ec_id}"));
 
-        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
             .expect("should handle lookup");
         response_json(response)
     }
@@ -1088,7 +1103,7 @@ mod tests {
         let req = get_request(&format!("/_ts/admin/ec/{ec_id}"));
 
         let json = response_json(
-            handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+            handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
                 .expect("should handle lookup"),
         );
 
@@ -1104,6 +1119,49 @@ mod tests {
     }
 
     #[test]
+    fn admin_view_serves_generic_pull_records_with_the_runtime_catalog() {
+        use crate::ec::identity::test_support::{ec_partner, record_for_test};
+        use crate::test_support::tests::create_test_settings;
+
+        let mut partner = ec_partner(
+            "ssp.example.com",
+            "https://sync.ssp.example.com/pull",
+            "example-token-value-0123456789abcdef",
+        );
+        partner.api_token = Some(crate::redacted::Redacted::new(
+            "token-ssp-example-com-32-bytes-minimum".to_owned(),
+        ));
+        let registry = PartnerRegistry::from_config(std::slice::from_ref(&partner))
+            .expect("should build registry");
+        let mut settings = create_test_settings();
+        settings.ec.partners = vec![partner];
+        let runtime = IdentityRuntime::from_settings(&settings).expect("should build the runtime");
+        let mut entry = KvEntry::minimal("other.example.com", "other", 1);
+        entry.ids.insert(
+            "ssp.example.com".to_owned(),
+            record_for_test("pulled-uid", Some("pull-ssp-example-com"), 1),
+        );
+
+        let with_runtime = build_auction_view(&registry, &entry, Some(&runtime));
+        let without_runtime = build_auction_view(&registry, &entry, None);
+
+        assert!(
+            with_runtime
+                .eids
+                .iter()
+                .any(|eid| eid.source == "ssp.example.com"),
+            "should serve the pulled record when the runtime's catalog holds its writer"
+        );
+        assert!(
+            without_runtime
+                .eids
+                .iter()
+                .all(|eid| eid.source != "ssp.example.com"),
+            "control: should not serve it without a runtime"
+        );
+    }
+
+    #[test]
     fn auction_view_reports_an_expired_record_as_not_servable() {
         let mut entry = KvEntry::minimal("bidstream.example", "uid-expired", 1_741_824_000);
         entry
@@ -1112,7 +1170,7 @@ mod tests {
             .expect("should hold the source")
             .exp = Some(50);
 
-        let view = build_auction_view(&test_registry(), &entry);
+        let view = build_auction_view(&test_registry(), &entry, None);
 
         assert!(view.eids.is_empty(), "should not resolve the expired ID");
         assert_eq!(view.skipped.len(), 1, "should explain the dropped ID");
@@ -1128,7 +1186,7 @@ mod tests {
         let kv = kv_with_entry(&ec_id, &sample_entry());
         let req = get_request(&format!("/_ts/admin/ec/{ec_id}"));
 
-        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
             .expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -1224,7 +1282,7 @@ mod tests {
         let kv = kv_with_raw_body_and_metadata(&ec_id, &body, &metadata);
         let req = get_request(&format!("/_ts/admin/ec/{ec_id}"));
 
-        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
             .expect("should handle lookup");
         let json = response_json(response);
 
@@ -1251,7 +1309,7 @@ mod tests {
         let kv = kv_with_raw_body(&ec_id, &body);
         let req = get_request(&format!("/_ts/admin/ec/{ec_id}"));
 
-        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
             .expect("should handle lookup");
         let json = response_json(response);
 
@@ -1283,7 +1341,7 @@ mod tests {
         );
         let req = get_request(&format!("/_ts/admin/ec/{ec_id}"));
 
-        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
             .expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -1303,7 +1361,7 @@ mod tests {
         let kv = KvIdentityGraph::in_memory("test-store");
         let req = get_request(&format!("/_ts/admin/ec/{}", test_ec_id()));
 
-        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
             .expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -1314,7 +1372,7 @@ mod tests {
         let kv = KvIdentityGraph::in_memory("test-store");
         let req = get_request("/_ts/admin/ec/not-a-valid-id");
 
-        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
             .expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -1326,7 +1384,7 @@ mod tests {
         let kv = kv_with_raw_body(&ec_id, "not json at all");
         let req = get_request(&format!("/_ts/admin/ec/{ec_id}"));
 
-        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
             .expect("should handle lookup");
 
         assert_eq!(
@@ -1367,7 +1425,7 @@ mod tests {
         let kv = kv_with_raw_body(&ec_id, &body);
         let req = get_request(&format!("/_ts/admin/ec/{ec_id}"));
 
-        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
             .expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -1392,7 +1450,7 @@ mod tests {
         let kv = kv_with_entry(&ec_id, &sample_entry());
         let req = get_request_with_cookie("/_ts/admin/ec", &format!("other=1; ts-ec={ec_id}; x=2"));
 
-        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
             .expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -1417,7 +1475,7 @@ mod tests {
             &format!("ts-ec={stale_ec_id}; ts-ec={live_ec_id}"),
         );
 
-        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
             .expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -1434,7 +1492,7 @@ mod tests {
         let kv = KvIdentityGraph::in_memory("test-store");
         let req = get_request("/_ts/admin/ec");
 
-        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req)
             .expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -1452,8 +1510,8 @@ mod tests {
     fn missing_identity_graph_returns_501() {
         let req = get_request(&format!("/_ts/admin/ec/{}", test_ec_id()));
 
-        let response =
-            handle_admin_ec_lookup(None, &test_registry(), &req).expect("should handle lookup");
+        let response = handle_admin_ec_lookup(None, &test_registry(), None, &req)
+            .expect("should handle lookup");
 
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     }
@@ -1487,7 +1545,7 @@ mod tests {
         let kv = KvIdentityGraph::failing("broken-store");
         let req = get_request(&format!("/_ts/admin/ec/{}", test_ec_id()));
 
-        let result = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req);
+        let result = handle_admin_ec_lookup(Some(&kv), &test_registry(), None, &req);
 
         assert!(result.is_err(), "should propagate KV read failures");
     }

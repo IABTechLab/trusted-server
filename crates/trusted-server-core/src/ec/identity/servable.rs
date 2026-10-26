@@ -7,7 +7,7 @@ use super::catalog::ProviderCatalog;
 use super::ids::{IdentityProviderId, SourceDomain, UnixTime};
 use super::policy::{PolicySignals, policy_allows};
 use crate::consent::ConsentContext;
-use crate::ec::kv_types::{KvEntry, KvPartnerId};
+use crate::ec::kv_types::KvPartnerId;
 
 /// What a servability decision needs from the request.
 pub(crate) struct ServeContext<'a> {
@@ -17,20 +17,6 @@ pub(crate) struct ServeContext<'a> {
     pub(crate) catalog: &'a ProviderCatalog,
     /// The providers with a `ps.o` in the row the request read.
     pub(crate) opted_out: &'a BTreeSet<IdentityProviderId>,
-}
-
-/// The providers with a sticky opt-out (`ps.o`) in the row the request read.
-///
-/// Read from KV only, never from the request (spec 7.1). A key that is not a
-/// valid provider ID cannot name a configured provider and is skipped.
-#[must_use]
-pub(crate) fn opted_out_providers(entry: &KvEntry) -> BTreeSet<IdentityProviderId> {
-    entry
-        .ps
-        .iter()
-        .filter(|(_, state)| state.o.is_some())
-        .filter_map(|(provider, _)| provider.parse().ok())
-        .collect()
 }
 
 /// Whether a stored record, the source's whole entry set, may be sent from

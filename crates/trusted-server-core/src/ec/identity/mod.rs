@@ -18,8 +18,10 @@ pub(crate) mod mutation;
 pub(crate) mod policy;
 pub mod provider;
 pub(crate) mod removal;
+pub(crate) mod request;
 pub mod resolution;
 pub(crate) mod revision;
+pub mod runtime;
 pub(crate) mod servable;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_support;
@@ -35,3 +37,4 @@ pub use provider::{IdentityProvider, IdentityProviderConfig};
 pub use resolution::{
     IdentityProviderError, Resolution, ResolvedEid, ResolvedUid, StateChange, When,
 };
+pub use runtime::IdentityRuntime;

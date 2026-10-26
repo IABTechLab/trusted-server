@@ -825,6 +825,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                         kv: None,
                         ec_context: &mut ec_context,
                         services: &services,
+                        is_real_browser: false,
                         req,
                     })
                     .await

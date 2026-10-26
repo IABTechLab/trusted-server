@@ -232,6 +232,7 @@ async fn dispatch_fallback(
                 kv: None,
                 ec_context: &mut ec_context,
                 services,
+                is_real_browser: false,
                 req,
             })
             .await

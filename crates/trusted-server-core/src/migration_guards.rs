@@ -123,8 +123,16 @@ fn checked_sources() -> &'static [(&'static str, &'static str)] {
             include_str!("ec/identity/removal.rs"),
         ),
         (
+            "ec/identity/request.rs",
+            include_str!("ec/identity/request.rs"),
+        ),
+        (
             "ec/identity/resolution.rs",
             include_str!("ec/identity/resolution.rs"),
+        ),
+        (
+            "ec/identity/runtime.rs",
+            include_str!("ec/identity/runtime.rs"),
         ),
         (
             "ec/identity/servable.rs",

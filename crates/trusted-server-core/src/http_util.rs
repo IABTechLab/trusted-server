@@ -78,6 +78,31 @@ pub fn sanitize_forwarded_headers(req: &mut Request<EdgeBody>) {
     }
 }
 
+/// Returns whether the request is a top-level document navigation.
+///
+/// True only for `Sec-Fetch-Dest: document`. Unlike [`is_navigation_request`]
+/// there is no `Accept` fallback, because `fetch()` can set `Accept: text/html`.
+#[must_use]
+pub fn is_document_navigation(req: &Request<EdgeBody>) -> bool {
+    req.headers()
+        .get("sec-fetch-dest")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|dest| dest.trim().eq_ignore_ascii_case("document"))
+}
+
+/// Returns true when the request advertises itself as a prefetch via either
+/// the standard `Sec-Purpose` or the legacy `Purpose` header.
+#[must_use]
+pub fn is_prefetch_request(req: &Request<EdgeBody>) -> bool {
+    let header = |name: &str| {
+        req.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains("prefetch"))
+    };
+    header("sec-purpose") || header("purpose")
+}
+
 /// Returns `true` when the request looks like a top-level document navigation.
 ///
 /// Uses [`Sec-Fetch-Dest`] when available (preferred — it is a forbidden
@@ -490,6 +515,38 @@ mod tests {
     use crate::redacted::Redacted;
     use crate::settings::TrustedClientIpConfig;
     use http::{HeaderName, HeaderValue, Method};
+
+    #[test]
+    fn document_navigation_requires_sec_fetch_dest_document() {
+        let with_dest = Request::builder()
+            .header("sec-fetch-dest", "document")
+            .body(EdgeBody::empty())
+            .expect("should build the request");
+        let accept_only = Request::builder()
+            .header(header::ACCEPT, "text/html")
+            .body(EdgeBody::empty())
+            .expect("should build the request");
+        let iframe = Request::builder()
+            .header("sec-fetch-dest", "iframe")
+            .body(EdgeBody::empty())
+            .expect("should build the request");
+        assert!(
+            is_document_navigation(&with_dest),
+            "should count a document destination"
+        );
+        assert!(
+            !is_document_navigation(&accept_only),
+            "should not count the Accept fallback"
+        );
+        assert!(
+            is_navigation_request(&accept_only),
+            "control: the broad check should still accept it"
+        );
+        assert!(
+            !is_document_navigation(&iframe),
+            "should not count an iframe"
+        );
+    }
 
     fn build_request(method: Method, uri: &str) -> Request<EdgeBody> {
         Request::builder()

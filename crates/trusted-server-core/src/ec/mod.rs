@@ -69,10 +69,13 @@ pub fn log_id(ec_id: &str) -> String {
     format!("{prefix}\u{2026}")
 }
 
+use std::sync::Arc;
+
 use cookie::CookieJar;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::Report;
-use http::Request;
+use http::{Request, header};
+use url::Url;
 
 use crate::consent::{self as consent_mod, ConsentContext, ConsentPipelineInput};
 use crate::constants::{COOKIE_TS_EC, COOKIE_TS_EC_PULL_COMPLETE};
@@ -80,11 +83,14 @@ use crate::cookies::handle_request_cookies;
 use crate::ec::cookies::ec_id_has_only_allowed_chars;
 use crate::error::TrustedServerError;
 use crate::geo::GeoInfo;
+use crate::http_util::{is_document_navigation, is_prefetch_request};
 use crate::openrtb::Eid;
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 use device::DeviceSignals;
 
+use self::identity::request::{RequestIdentity, WriterDecision};
+use self::identity::runtime::IdentityRuntime;
 use self::kv::{CreateIfAbsentOutcome, KvIdentityGraph};
 use self::kv_types::KvEntry;
 use self::pull_sync_marker::{PullSyncMarkerState, validate_marker_state};
@@ -284,6 +290,8 @@ pub struct EcContext {
     pull_sync_marker: PullSyncMarkerState,
     /// Allowed returning-user EID persistence source, assigned only after request filters pass.
     eid_sync_source: Option<EidSyncSource>,
+    /// Identity state this request decides and collects.
+    identity: RequestIdentity,
 }
 
 impl EcContext {
@@ -366,6 +374,7 @@ impl EcContext {
             client_eids: None,
             pull_sync_marker: PullSyncMarkerState::from_cookie(parsed.pull_sync_marker),
             eid_sync_source: None,
+            identity: RequestIdentity::default(),
         })
     }
 
@@ -513,6 +522,79 @@ impl EcContext {
     /// [`generate_if_needed`]: Self::generate_if_needed
     pub fn set_device_signals(&mut self, signals: DeviceSignals) {
         self.device_signals = Some(signals);
+    }
+
+    /// The identity state this request decides and collects.
+    #[must_use]
+    // Temporary: first used by a later identity task.
+    #[allow(dead_code)]
+    pub(crate) fn identity(&self) -> &RequestIdentity {
+        &self.identity
+    }
+
+    /// The identity state this request decides and collects, to fill.
+    // Temporary: first used by a later identity task.
+    #[allow(dead_code)]
+    pub(crate) fn identity_mut(&mut self) -> &mut RequestIdentity {
+        &mut self.identity
+    }
+
+    /// Gives the request the identity runtime built for the settings load.
+    ///
+    /// The adapter calls this where it builds the request's EC state.
+    pub fn set_identity_runtime(&mut self, runtime: Arc<IdentityRuntime>) {
+        self.identity.set_runtime(runtime);
+    }
+
+    /// The identity runtime, when the adapter set one.
+    #[must_use]
+    pub(crate) fn identity_runtime(&self) -> Option<&IdentityRuntime> {
+        self.identity.runtime().map(Arc::as_ref)
+    }
+
+    /// Records whether the request passed the real-browser check, for a route
+    /// that is never the writer.
+    pub fn set_real_browser(&mut self, is_real_browser: bool) {
+        self.identity.set_real_browser(is_real_browser);
+    }
+
+    /// Decides whether this request is the one browser-driven identity writer.
+    ///
+    /// Only an organic real-browser top-level document navigation that is not
+    /// a prefetch writes (spec 5.1). Also captures the user agent, `DNT` and
+    /// the page URL without query or fragment.
+    pub fn decide_writer(
+        &mut self,
+        req: &Request<EdgeBody>,
+        organic_route: bool,
+        is_real_browser: bool,
+    ) {
+        let writer = organic_route
+            && is_document_navigation(req)
+            && !is_prefetch_request(req)
+            && is_real_browser;
+        let user_agent = req
+            .headers()
+            .get(header::USER_AGENT)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let dnt = req
+            .headers()
+            .get("dnt")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.trim() == "1");
+        let page_url = Url::parse(&req.uri().to_string()).ok().map(|mut url| {
+            url.set_query(None);
+            url.set_fragment(None);
+            url
+        });
+        self.identity.set_writer_decision(WriterDecision {
+            writer,
+            is_real_browser,
+            user_agent,
+            dnt,
+            page_url,
+        });
     }
 
     /// Returns the device signals, if set.
@@ -667,6 +749,7 @@ impl EcContext {
             client_eids: None,
             pull_sync_marker: PullSyncMarkerState::Absent,
             eid_sync_source: None,
+            identity: RequestIdentity::default(),
         }
     }
 
@@ -692,6 +775,7 @@ impl EcContext {
             client_eids: None,
             pull_sync_marker: PullSyncMarkerState::Absent,
             eid_sync_source: None,
+            identity: RequestIdentity::default(),
         }
     }
 
@@ -720,6 +804,7 @@ impl EcContext {
             client_eids: None,
             pull_sync_marker: PullSyncMarkerState::Absent,
             eid_sync_source: None,
+            identity: RequestIdentity::default(),
         }
     }
 }
@@ -774,6 +859,67 @@ mod tests {
     };
     use crate::platform::test_support::noop_services;
     use crate::test_support::tests::create_test_settings;
+
+    #[test]
+    fn decide_writer_needs_every_condition() {
+        let navigation = || {
+            Request::builder()
+                .uri("https://www.example.com/a?b=c#d")
+                .header("sec-fetch-dest", "document")
+                .header(header::USER_AGENT, "ExampleBrowser/1.0")
+                .header("dnt", "1")
+                .body(EdgeBody::empty())
+                .expect("should build the request")
+        };
+        let mut context = EcContext::default();
+        context.decide_writer(&navigation(), true, true);
+        assert!(
+            context.identity().writer(),
+            "should make an organic real-browser document navigation the writer"
+        );
+        assert!(
+            context.identity().is_real_browser(),
+            "should record the real browser"
+        );
+        assert_eq!(
+            context.identity().page_url().map(Url::as_str),
+            Some("https://www.example.com/a"),
+            "should drop the query and fragment"
+        );
+        assert_eq!(
+            context.identity().user_agent(),
+            Some("ExampleBrowser/1.0"),
+            "should capture the user agent"
+        );
+        assert!(context.identity().dnt(), "should capture DNT");
+
+        for (name, organic, browser, request) in [
+            ("named route", false, true, navigation()),
+            ("bot", true, false, navigation()),
+            (
+                "prefetch",
+                true,
+                true,
+                Request::builder()
+                    .header("sec-fetch-dest", "document")
+                    .header("sec-purpose", "prefetch")
+                    .body(EdgeBody::empty())
+                    .expect("should build the request"),
+            ),
+        ] {
+            let mut context = EcContext::default();
+            context.decide_writer(&request, organic, browser);
+            assert!(
+                !context.identity().writer(),
+                "should not be a writer: {name}"
+            );
+            assert_eq!(
+                context.identity().is_real_browser(),
+                browser,
+                "should keep the real-browser flag: {name}"
+            );
+        }
+    }
 
     /// [`EcKvStore`] wrapper whose first `collisions` `Add` writes report a
     /// precondition failure, forcing generation to retry with a fresh suffix.

@@ -806,6 +806,8 @@ pub struct ProxyDispatchInput<'a> {
     pub kv: Option<&'a KvIdentityGraph>,
     pub ec_context: &'a mut EcContext,
     pub services: &'a RuntimeServices,
+    /// Whether the client looks like a real browser. EC generation needs it.
+    pub is_real_browser: bool,
     pub req: Request<EdgeBody>,
 }
 
@@ -1039,19 +1041,21 @@ impl IntegrationRegistry {
             kv,
             ec_context,
             services,
+            is_real_browser,
             mut req,
         } = input;
         if let Some((proxy, _)) = self.find_route(method, path) {
             // Organic proxy handler: generate if needed (best effort).
-            // Only generate for document navigations — subresource requests
-            // may lack consent signals such as the Sec-GPC header.
-            if is_navigation_request(&req) {
+            // Only generate for document navigations by real browsers —
+            // subresource requests may lack consent signals such as the
+            // Sec-GPC header.
+            if is_real_browser && is_navigation_request(&req) {
                 if let Err(err) = ec_context.generate_if_needed(settings, kv) {
                     log::warn!("EC generation failed for integration proxy: {err:?}");
                 }
             } else {
                 log::debug!(
-                    "EC generation skipped for integration proxy: non-document request (path={path})",
+                    "EC generation skipped for integration proxy: not a real-browser document request (path={path})",
                 );
             }
 
@@ -1690,6 +1694,7 @@ mod tests {
             kv: None,
             ec_context: &mut ec_context,
             services: &noop_services(),
+            is_real_browser: true,
             req,
         }))
         .expect("should match route")
@@ -2047,6 +2052,7 @@ mod tests {
             kv: None,
             ec_context: &mut ec_context,
             services: &services,
+            is_real_browser: true,
             req,
         }));
 
@@ -2097,6 +2103,7 @@ mod tests {
             kv: None,
             ec_context: &mut ec_context,
             services: &services,
+            is_real_browser: true,
             req,
         }))
         .expect("should handle proxy request");
@@ -2146,6 +2153,7 @@ mod tests {
             kv: None,
             ec_context: &mut ec_context,
             services: &services,
+            is_real_browser: true,
             req,
         }))
         .expect("should handle proxy request");
@@ -2192,6 +2200,7 @@ mod tests {
             kv: None,
             ec_context: &mut ec_context,
             services: &services,
+            is_real_browser: true,
             req,
         }));
 

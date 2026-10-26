@@ -21,7 +21,8 @@ use super::identity::SourceDomain;
 use super::identity::UnixTime;
 use super::identity::catalog::ProviderCatalog;
 use super::identity::policy::PolicySignals;
-use super::identity::servable::{ServeContext, is_servable, opted_out_providers};
+use super::identity::request::opted_out;
+use super::identity::servable::{ServeContext, is_servable};
 use super::kv::KvIdentityGraph;
 use super::kv_types::KvPartnerId;
 use super::log_id;
@@ -107,15 +108,21 @@ pub fn handle_identify(
                 // the row's stored snapshot. A failed clock serves nothing,
                 // because a zero time would make every expiry check pass.
                 if let Some(now) = checked_current_timestamp() {
-                    // Until the request's identity runtime is on `EcContext`, no
-                    // provider is configured.
-                    let catalog = ProviderCatalog::empty();
-                    let opted_out = opted_out_providers(&entry);
+                    // Without a runtime no provider is configured.
+                    let empty_catalog;
+                    let catalog = match ec_context.identity_runtime() {
+                        Some(runtime) => runtime.catalog(),
+                        None => {
+                            empty_catalog = ProviderCatalog::empty();
+                            &empty_catalog
+                        }
+                    };
+                    let opted_out = opted_out(&entry);
                     let serve = ServeContext {
                         now: UnixTime::from_secs(now),
                         consent: ec_context.consent(),
                         signals: PolicySignals::from_headers(req.headers()),
-                        catalog: &catalog,
+                        catalog,
                         opted_out: &opted_out,
                     };
                     if let Some(partner_uid) = entry

@@ -113,6 +113,7 @@ use trusted_server_core::ec::batch_sync::handle_batch_sync;
 use trusted_server_core::ec::consent::ec_consent_withdrawn;
 use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::identify::{cors_preflight_identify, handle_identify};
+use trusted_server_core::ec::identity::IdentityRuntime;
 use trusted_server_core::ec::kv::KvIdentityGraph;
 use trusted_server_core::ec::registry::PartnerRegistry;
 use trusted_server_core::ec::{EcContext, EidSyncSource};
@@ -189,6 +190,8 @@ pub(crate) struct AppState {
     pub(crate) registry: Arc<IntegrationRegistry>,
     pub(crate) default_kv_store: Arc<dyn PlatformKvStore>,
     pub(crate) auction_telemetry_sink: Arc<dyn AuctionTelemetrySink>,
+    /// Identity providers, keys and policy, built once per settings load.
+    pub(crate) identity: Arc<IdentityRuntime>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -215,6 +218,17 @@ pub(crate) fn load_settings_from_config_store(
     )
 }
 
+/// Builds the identity runtime for one settings load.
+///
+/// # Errors
+///
+/// Returns an error when a provider cannot be described or the catalog rules fail.
+pub(crate) fn build_identity_runtime(
+    settings: &Settings,
+) -> Result<Arc<IdentityRuntime>, Report<TrustedServerError>> {
+    IdentityRuntime::from_settings(settings).map(Arc::new)
+}
+
 pub(crate) fn build_state_from_settings(
     settings: Settings,
 ) -> Result<Arc<AppState>, Report<TrustedServerError>> {
@@ -224,6 +238,7 @@ pub(crate) fn build_state_from_settings(
     plan.validate_for_target(trusted_server_core::platform::AuctionTargetId::Fastly)?;
     let orchestrator = build_orchestrator_with_plan(Arc::clone(&plan), &settings)?;
     let registry = IntegrationRegistry::with_plan(&settings, plan)?;
+    let identity = build_identity_runtime(&settings)?;
 
     let auction_telemetry_sink = crate::tinybird::auction_sink_from_settings(&settings);
     let default_kv_store = Arc::new(UnavailableKvStore) as Arc<dyn PlatformKvStore>;
@@ -234,6 +249,7 @@ pub(crate) fn build_state_from_settings(
         registry: Arc::new(registry),
         default_kv_store,
         auction_telemetry_sink,
+        identity,
     }))
 }
 
@@ -402,10 +418,11 @@ fn device_signals_for(req: &Request) -> DeviceSignals {
 /// Builds the per-request EC state, mirroring the pre-routing prelude of the
 /// legacy `route_request` step by step.
 fn build_ec_request_state(
-    settings: &Settings,
+    state: &AppState,
     services: &RuntimeServices,
     req: &Request,
 ) -> EcRequestState {
+    let settings = &*state.settings;
     let device_signals = device_signals_for(req);
     let is_real_browser = device_signals.looks_like_browser();
     if !is_real_browser {
@@ -432,6 +449,8 @@ fn build_ec_request_state(
         match EcContext::read_from_request_with_geo(settings, req, services, geo_info.as_ref()) {
             Ok(mut context) => {
                 context.set_device_signals(device_signals);
+                context.set_real_browser(is_real_browser);
+                context.set_identity_runtime(Arc::clone(&state.identity));
                 // Orphan-recovery eligibility is intentionally left false here.
                 // Authorizing it during generic pre-routing would let named
                 // routes and request-filter short circuits (e.g. a DataDome
@@ -583,7 +602,12 @@ async fn execute_named(
                     // copy is bot-gated, while operators use curl for this
                     // authenticated diagnostic.
                     let kv = crate::maybe_identity_graph(&state.settings);
-                    handle_admin_ec_lookup(kv.as_ref(), &registry, &req)
+                    handle_admin_ec_lookup(
+                        kv.as_ref(),
+                        &registry,
+                        Some(state.identity.as_ref()),
+                        &req,
+                    )
                 }
                 NamedRouteHandler::AdminEidsLookup => handle_admin_eids_lookup(&registry, &req),
                 _ => unreachable!("admin diagnostics should use early dispatch"),
@@ -599,7 +623,7 @@ async fn execute_named(
         return Ok(http_error(&report));
     }
 
-    let mut ec = build_ec_request_state(&state.settings, &services, &req);
+    let mut ec = build_ec_request_state(&state, &services, &req);
     // EcContext creation errors short-circuit before filters, mirroring legacy:
     // the legacy path returns its error response before running filter_request.
     if let Some(report) = ec.setup_error.take() {
@@ -788,7 +812,7 @@ async fn dispatch_fallback(
         return http_error(&report);
     }
 
-    let mut ec = build_ec_request_state(&state.settings, services, &req);
+    let mut ec = build_ec_request_state(state, services, &req);
     if let Some(report) = ec.setup_error.take() {
         let response = http_error(&report);
         return attach_dispatch_extensions(response, ec, RequestFilterEffects::default());
@@ -810,6 +834,7 @@ async fn dispatch_fallback(
         // Integration-proxy responses are not bounded by
         // publisher.max_buffered_body_bytes. Publisher fallback below uses the
         // publisher-specific streaming finalizer instead.
+        ec.ec_context.decide_writer(&req, true, ec.is_real_browser);
         state
             .registry
             .handle_proxy(ProxyDispatchInput {
@@ -819,6 +844,7 @@ async fn dispatch_fallback(
                 kv: ec.kv_graph.as_ref(),
                 ec_context: &mut ec.ec_context,
                 services,
+                is_real_browser: ec.is_real_browser,
                 req,
             })
             .await
@@ -844,6 +870,7 @@ async fn dispatch_fallback(
         // Only for document navigations by recognised browsers; subresource
         // requests may lack consent signals such as Sec-GPC.
         let is_navigation = is_navigation_request(&req);
+        ec.ec_context.decide_writer(&req, true, ec.is_real_browser);
         if is_navigation {
             ec.ec_context.set_eid_sync_source(EidSyncSource::Navigation);
         }
@@ -1372,9 +1399,9 @@ mod tests {
     use super::{
         AppState, AuctionDispatch, EcContext, EdgeCacheHeader, EidSyncSource, HandlerFuture,
         NAMED_ROUTES, NamedRouteHandler, PAGE_BIDS_LEGACY_PATH, PAGE_BIDS_PATH, RuntimeStoreConfig,
-        TrustedServerApp, build_orchestrator_with_plan, build_per_request_services,
-        build_state_from_settings, compile_auction_plan, handle_publisher_request,
-        publisher_response_into_streaming_response, startup_error_router,
+        TrustedServerApp, build_identity_runtime, build_orchestrator_with_plan,
+        build_per_request_services, build_state_from_settings, compile_auction_plan,
+        handle_publisher_request, publisher_response_into_streaming_response, startup_error_router,
     };
     use base64::Engine as _;
     use bytes::Bytes;
@@ -1566,6 +1593,8 @@ mod tests {
         filters: Vec<Arc<dyn IntegrationRequestFilter>>,
     ) -> RouterService {
         let settings = test_settings();
+        let identity =
+            build_identity_runtime(&settings).expect("should build the identity runtime");
         let plan = Arc::new(
             trusted_server_core::auction::compile_auction_plan(&settings)
                 .expect("should compile auction plan"),
@@ -1584,6 +1613,7 @@ mod tests {
             orchestrator: Arc::new(orchestrator),
             registry: Arc::new(registry),
             default_kv_store,
+            identity,
         });
         TrustedServerApp::routes_for_state(&state)
     }

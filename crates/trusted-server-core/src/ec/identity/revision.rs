@@ -16,8 +16,6 @@ type HmacSha256 = Hmac<Sha256>;
 /// It is the only keyed value: nothing stored in the row is keyed
 /// (spec 9.3).
 #[derive(Clone)]
-// Temporary: first used by a later identity task.
-#[allow(dead_code)]
 pub(crate) struct IdentityKeys {
     visitor: [u8; 32],
 }
@@ -32,7 +30,6 @@ impl IdentityKeys {
     /// Derives the visitor key from `ec.passphrase`.
     #[must_use]
     // Temporary: first used by a later identity task.
-    #[allow(dead_code)]
     pub(crate) fn from_settings(settings: &Settings) -> Self {
         let passphrase = settings.ec.passphrase.expose().as_bytes();
         let mut mac =

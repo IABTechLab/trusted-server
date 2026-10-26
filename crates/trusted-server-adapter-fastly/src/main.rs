@@ -43,7 +43,7 @@ mod template_cache;
 mod tinybird;
 
 use crate::app::{
-    AppState, EcFinalizeState, RuntimeStoreConfig, TrustedServerApp,
+    AppState, EcFinalizeState, RuntimeStoreConfig, TrustedServerApp, build_identity_runtime,
     load_settings_from_config_store,
 };
 use crate::ec_kv::FastlyEcKvStore;
@@ -526,6 +526,14 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
         } else {
             match load_settings_from_config_store(&runtime_stores) {
                 Ok(settings) => {
+                    // No application state was built, so build the identity
+                    // runtime from the reloaded settings.
+                    match build_identity_runtime(&settings) {
+                        Ok(identity) => ec_state.ec_context.set_identity_runtime(identity),
+                        Err(e) => {
+                            log::warn!("identity runtime unavailable after settings reload: {e:?}");
+                        }
+                    }
                     match apply_edgezero_ec_finalize(&settings, &mut ec_state, &mut response) {
                         Ok(partner_registry) => {
                             send_edgezero_response(

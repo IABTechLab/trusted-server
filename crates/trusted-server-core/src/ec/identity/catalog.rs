@@ -112,7 +112,6 @@ impl ProviderCatalog {
     /// Returns [`TrustedServerError::Configuration`] when a pull partner
     /// cannot be described or the catalog rules fail.
     // Temporary: first used by a later identity task.
-    #[allow(dead_code)]
     pub(crate) fn from_settings(settings: &Settings) -> Result<Self, Report<TrustedServerError>> {
         let providers = settings
             .ec
@@ -171,7 +170,6 @@ impl ProviderCatalog {
     /// does not declare and a narrowing to nothing.
     #[must_use]
     // Temporary: first used by a later identity task.
-    #[allow(dead_code)]
     pub(crate) fn with_narrowing(
         mut self,
         narrowing: BTreeMap<IdentityProviderId, Vec<SourceDomain>>,

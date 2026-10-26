@@ -194,6 +194,13 @@ impl IdentityMutation {
         self.cluster_size = Some(size);
     }
 
+    /// How many changes the mutation holds: stand-alone ones, provider
+    /// results and provider state changes. Holds no UID, so it is safe to log.
+    #[must_use]
+    pub(crate) fn change_count(&self) -> usize {
+        self.partner_ids.len() + self.results.len() + self.provider_state.len()
+    }
+
     /// Whether nothing would change.
     #[must_use]
     // Temporary: first used by a later identity task.
@@ -576,9 +583,8 @@ fn apply_clear(entry: &mut KvEntry, provider: &IdentityProviderId, clear: u64) {
     }
 }
 
-// Temporary: first used by a later identity task.
-#[allow(dead_code)]
-fn is_opted_out(entry: &KvEntry, provider: &str) -> bool {
+/// Whether `provider` has a sticky opt-out in `entry` that no later clear lifts.
+pub(crate) fn is_opted_out(entry: &KvEntry, provider: &str) -> bool {
     entry
         .ps
         .get(provider)
