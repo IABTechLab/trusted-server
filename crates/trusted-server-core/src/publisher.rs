@@ -38,7 +38,7 @@ use sha2::Digest as _;
 use web_time::Instant;
 
 use crate::auction::endpoints::{
-    merge_auction_eids, mirror_member, resolve_auction_eids, resolve_client_auction_eids,
+    AuctionIdentity, auction_identity, mirror_member, resolve_client_auction_eids,
 };
 use crate::auction::formats::sanitize_publisher_page_url;
 use crate::auction::orchestrator::{
@@ -66,6 +66,7 @@ use crate::creative_opportunities::{
     AdStackGateInput, AssemblyMode, CreativeOpportunitiesConfig, RuntimeAdStackExpected,
     evaluate_ad_stack_gate,
 };
+use crate::ec::identity::mirror::MirrorPayload;
 use crate::ec::identity::policy::PolicySignals;
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::registry::PartnerRegistry;
@@ -5543,11 +5544,12 @@ struct AuctionEidTargeting<'a> {
 ///
 /// Shared verbatim by the initial-page and page-bids dispatch paths so the EID
 /// resolution and consent gating live in one place; `path_label` only varies
-/// the consent-stripped warning message.
+/// the consent-stripped warning message. Returns the request's
+/// [`AuctionIdentity`], so the page-bids mirror reads the same server set.
 fn apply_auction_eids_and_device(
     auction_request: &mut AuctionRequest,
     targeting: &AuctionEidTargeting<'_>,
-) {
+) -> AuctionIdentity {
     let ts_eids_value = targeting
         .cookie_jar
         .and_then(|j| j.get(COOKIE_TS_EIDS))
@@ -5557,13 +5559,13 @@ fn apply_auction_eids_and_device(
     } else {
         None
     };
-    let kv_eids = resolve_auction_eids(
+    let identity = auction_identity(
         targeting.kv_snapshot,
         targeting.partner_registry,
         targeting.ec_context,
         targeting.signals,
     );
-    let merged_eids = merge_auction_eids(client_eids, kv_eids);
+    let merged_eids = identity.merge(client_eids.as_deref());
     let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
     auction_request.user.eids =
         gate_eids_by_consent(merged_eids, auction_request.user.consent.as_ref());
@@ -5587,6 +5589,7 @@ fn apply_auction_eids_and_device(
         device.ip = client_ip;
         device.geo = targeting.geo.cloned();
     }
+    identity
 }
 
 /// Build an [`AuctionRequest`] from matched creative opportunity slots.
@@ -7058,9 +7061,9 @@ pub async fn handle_page_bids(
     // unchanged) but skip the live auction, matching the existing behavior.
     let ad_stack_enabled = ad_templates_enabled && auction_enabled && consent_allows_auction;
 
-    // The row the auction read, for the `ts-eids-s` mirror. It stays
-    // `NotRead` when no auction runs, so the mirror is then absent.
-    let mut mirror_snapshot = crate::ec::EcKvSnapshot::NotRead;
+    // What the auction's KV read gave it, for the `ts-eids-s` mirror. It stays
+    // `None` when no auction runs, so the mirror is then absent.
+    let mut auction_identity_read: Option<AuctionIdentity> = None;
     let (winning_bids, prebuilt_bid_map) = if matched_slots.is_empty() {
         (std::collections::HashMap::new(), None)
     } else {
@@ -7107,7 +7110,7 @@ pub async fn handle_page_bids(
                 &settings.publisher.domain,
                 user_agent,
             );
-            apply_auction_eids_and_device(
+            let identity = apply_auction_eids_and_device(
                 &mut auction_request,
                 &AuctionEidTargeting {
                     cookie_jar: cookie_jar.as_ref(),
@@ -7121,7 +7124,7 @@ pub async fn handle_page_bids(
                     path_label: "Page-bids",
                 },
             );
-            mirror_snapshot = page_bids_kv_snapshot;
+            auction_identity_read = Some(identity);
             let timeout_ms = co_config
                 .auction_timeout_ms
                 .unwrap_or(settings.auction.timeout_ms);
@@ -7237,12 +7240,22 @@ pub async fn handle_page_bids(
         "slots": slots_json,
         "bids": bid_map,
     });
-    if let Some(mirror) = mirror_member(
-        &mirror_snapshot,
-        auction.registry,
-        ec_context,
-        PolicySignals::from_headers(req.headers()),
-    ) {
+    // A consent denial clears the mirror, as `/auction` does, so a
+    // withdrawal reaches the cookie (spec 5.6).
+    let mirror = if consent_allows_auction {
+        match &auction_identity_read {
+            Some(identity) => identity.mirror_member(ec_context),
+            None => mirror_member(
+                &crate::ec::EcKvSnapshot::NotRead,
+                None,
+                ec_context,
+                PolicySignals::from_headers(req.headers()),
+            ),
+        }
+    } else {
+        Some(MirrorPayload::Clear.to_json())
+    };
+    if let Some(mirror) = mirror {
         body["ts_eids_s"] = mirror;
     }
     let body = serde_json::to_string(&body).change_context(TrustedServerError::Proxy {
@@ -8048,6 +8061,151 @@ mod tests {
                 }
             ]),
             "navigation and page-bids auctions should forward the cookie entry as sent, then KV-only sources"
+        );
+    }
+
+    /// The navigation and page-bids merge for `snapshot` and a `ts-eids`
+    /// cookie holding `cookie_entries`, plus any `extra_cookie`.
+    fn publisher_merge(
+        snapshot: &EcKvSnapshot,
+        registry: &PartnerRegistry,
+        ec_context: &EcContext,
+        cookie_entries: &serde_json::Value,
+        extra_cookie: Option<&str>,
+    ) -> Option<Vec<crate::openrtb::Eid>> {
+        let cookie =
+            BASE64.encode(serde_json::to_vec(cookie_entries).expect("should serialize cookie"));
+        let mut header = format!("{COOKIE_TS_EIDS}={cookie}");
+        if let Some(extra) = extra_cookie {
+            header.push_str("; ");
+            header.push_str(extra);
+        }
+        let jar = parse_cookies_to_jar(&header);
+        let services = noop_services();
+        let mut auction_request = canonical_parity_auction_request();
+        auction_request.user.consent = None;
+        auction_request.user.eids = None;
+        apply_auction_eids_and_device(
+            &mut auction_request,
+            &AuctionEidTargeting {
+                cookie_jar: Some(&jar),
+                ec_id: ec_context.ec_value(),
+                kv_snapshot: snapshot,
+                partner_registry: Some(registry),
+                ec_context,
+                signals: PolicySignals::default(),
+                services: &services,
+                geo: None,
+                path_label: "Test",
+            },
+        );
+        auction_request.user.eids
+    }
+
+    fn publisher_merge_fixture(entry: KvEntry) -> (EcKvSnapshot, PartnerRegistry, EcContext) {
+        let ec_id = format!("{}.navmrg", "a".repeat(64));
+        let registry = PartnerRegistry::from_config(&[
+            marker_partner("ids.example.com"),
+            marker_partner("other.example.com"),
+        ])
+        .expect("should build partner registry");
+        let snapshot = EcKvSnapshot::Present {
+            ec_id: ec_id.clone(),
+            entry: Box::new(entry),
+            generation: None,
+        };
+        let ec_context = EcContext::new_for_test(
+            Some(ec_id),
+            ConsentContext {
+                jurisdiction: Jurisdiction::NonRegulated,
+                ..ConsentContext::default()
+            },
+        );
+        (snapshot, registry, ec_context)
+    }
+
+    fn publisher_eid(source: &str, id: &str, atype: i32) -> crate::openrtb::Eid {
+        crate::openrtb::Eid {
+            source: source.to_owned(),
+            uids: vec![crate::openrtb::Uid {
+                id: id.to_owned(),
+                atype: Some(atype),
+                ext: None,
+            }],
+            inserter: None,
+            matcher: None,
+            mm: None,
+            ext: None,
+        }
+    }
+
+    #[test]
+    fn merge_publisher_never_reads_the_mirror_cookie() {
+        let entry = KvEntry::minimal("other.example.com", "kv-other", 1000);
+        let (snapshot, registry, ec_context) = publisher_merge_fixture(entry);
+        let cookie_entries = serde_json::json!([{ "source": "ids.example.com", "uids": [{ "id": "b", "atype": 1 }] }]);
+        let mirror = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&serde_json::json!({ "v": 1, "eids": [
+                { "source": "mirror-only.example.com", "uids": [{ "id": "m", "atype": 1 }] }
+            ] }))
+            .expect("should serialize the mirror"),
+        );
+
+        let without = publisher_merge(&snapshot, &registry, &ec_context, &cookie_entries, None);
+        let with = publisher_merge(
+            &snapshot,
+            &registry,
+            &ec_context,
+            &cookie_entries,
+            Some(&format!("__Host-ts-eids-s={mirror}")),
+        );
+
+        assert_eq!(
+            with,
+            Some(vec![
+                publisher_eid("ids.example.com", "b", 1),
+                publisher_eid(
+                    "other.example.com",
+                    "kv-other",
+                    crate::settings::EcPartner::default_openrtb_atype()
+                ),
+            ]),
+            "should merge the cookie and KV only"
+        );
+        assert_eq!(with, without, "the mirror cookie should change nothing");
+    }
+
+    #[test]
+    fn merge_publisher_denial_drops_a_browser_uid_in_a_claimants_iv_for_an_unowned_source() {
+        let mut entry = KvEntry::minimal("other.example.com", "kv-other", 1000);
+        entry.ps.insert(
+            "pull-ids-example-com".to_owned(),
+            crate::ec::kv_types::KvProviderState {
+                iv: vec![crate::ec::identity::revision::uid_hash("invalidated")],
+                ..Default::default()
+            },
+        );
+        let (snapshot, registry, mut ec_context) = publisher_merge_fixture(entry);
+        let mut settings = create_test_settings();
+        settings.ec.partners = vec![marker_partner("ids.example.com")];
+        ec_context.set_identity_runtime(Arc::new(
+            crate::ec::identity::IdentityRuntime::from_settings(&settings)
+                .expect("should build the runtime"),
+        ));
+        let cookie_entries = serde_json::json!([
+            { "source": "ids.example.com", "uids": [{ "id": "invalidated", "atype": 1 }] }
+        ]);
+
+        let merged = publisher_merge(&snapshot, &registry, &ec_context, &cookie_entries, None);
+
+        assert_eq!(
+            merged,
+            Some(vec![publisher_eid(
+                "other.example.com",
+                "kv-other",
+                crate::settings::EcPartner::default_openrtb_atype()
+            )]),
+            "the invalidated browser UID should not be sent"
         );
     }
 
@@ -24312,6 +24470,37 @@ mod tests {
             assert_eq!(
                 mirror["max_age"], 86_400,
                 "should live a day without an exp"
+            );
+        }
+
+        #[tokio::test]
+        async fn page_bids_clears_the_mirror_when_consent_denies_the_auction() {
+            let settings = auction_settings();
+            let graph = seeded_graph(&[(MIRROR_SOURCE, "uid-mirror")]);
+            // GDPR applies without a TC string: EC use stays allowed outside a
+            // GDPR jurisdiction, but the server-side auction gate denies.
+            let mut ec_context = EcContext::new_for_test(
+                Some(mirror_ec_id()),
+                crate::consent::ConsentContext {
+                    jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                    gdpr_applies: true,
+                    ..Default::default()
+                },
+            );
+            assert!(ec_context.ec_allowed(), "should allow EC use");
+
+            let body = page_bids_body(
+                &settings,
+                &graph,
+                &mut ec_context,
+                make_page_bids_request("/2024/01/my-article/"),
+            )
+            .await;
+
+            assert_eq!(
+                body["ts_eids_s"],
+                serde_json::json!({ "clear": true }),
+                "should clear the mirror as /auction does on a consent denial"
             );
         }
 

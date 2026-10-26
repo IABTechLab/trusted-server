@@ -8,6 +8,7 @@
 
 pub(crate) mod catalog;
 pub(crate) mod coordinator;
+pub(crate) mod denials;
 pub mod descriptor;
 pub mod exchange;
 pub(crate) mod generic_pull;

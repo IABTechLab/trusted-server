@@ -187,8 +187,6 @@ impl ProviderCatalog {
     }
 
     /// Every provider, ordered by ID.
-    // Temporary: first used by a later identity task.
-    #[allow(dead_code)]
     pub(crate) fn providers(&self) -> impl Iterator<Item = &Arc<dyn IdentityProvider>> {
         self.providers.values()
     }
@@ -212,8 +210,6 @@ impl ProviderCatalog {
     }
 
     /// Every provider that claims `source` after narrowing, ordered by ID.
-    // Temporary: first used by a later identity task.
-    #[allow(dead_code)]
     pub(crate) fn claimants<'a>(
         &'a self,
         source: &'a SourceDomain,

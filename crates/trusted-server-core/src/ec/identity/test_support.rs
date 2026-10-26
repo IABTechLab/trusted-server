@@ -26,7 +26,7 @@ use crate::consent::types::TcfConsent;
 use crate::ec::identity::catalog::ProviderCatalog;
 use crate::ec::identity::coordinator::{OutcomeContext, RequestFacts};
 use crate::ec::identity::descriptor::{
-    Captures, ConsentPolicy, Input, ProviderDescriptor, ResolveKind, Resolves,
+    Captures, ConsentPolicy, EidProvenance, Input, ProviderDescriptor, ResolveKind, Resolves,
 };
 use crate::ec::identity::exchange::{ProviderRequest, ProviderResponse};
 use crate::ec::identity::ids::{IdentityProviderId, SourceDomain, UnixTime};
@@ -161,6 +161,32 @@ pub fn fixed_capture_provider(id: &str, sources: &[&str]) -> Arc<dyn IdentityPro
     Arc::new(DescriptorOnly(
         builder.build().expect("should build the descriptor"),
     ))
+}
+
+/// A [`fixed_provider`] that also declares a `with_provenance` default per
+/// listed source.
+///
+/// # Panics
+///
+/// Panics when `id` or a source is not valid.
+#[must_use]
+pub fn provenance_provider(
+    id: &str,
+    sources: &[&str],
+    provenance: Vec<(&str, EidProvenance)>,
+) -> Arc<dyn IdentityProvider> {
+    let mut builder =
+        ProviderDescriptor::builder(id.parse().expect("should parse the provider ID"))
+            .with_resolves(Resolves::new().with_endpoint("https://api.example.com"))
+            .with_consent_policy(ConsentPolicy::eid_persistence_only());
+    for source in sources {
+        builder = builder.with_source(source.parse().expect("should parse the source"));
+    }
+    for (source, default) in provenance {
+        builder =
+            builder.with_provenance(&source.parse().expect("should parse the source"), default);
+    }
+    provider_from(builder.build().expect("should build the descriptor"))
 }
 
 /// A descriptor-only provider for `descriptor`, for tests that need more

@@ -9,7 +9,9 @@ use serde_json::value::RawValue;
 
 use crate::auction::formats::AdRequest;
 use crate::auction::orchestrator::OrchestrationResult;
-use crate::consent::{consent_allows_server_side_auction, gate_eids_by_consent};
+use crate::consent::{
+    allows_eid_persistence, consent_allows_server_side_auction, gate_eids_by_consent,
+};
 use crate::constants::COOKIE_TS_EIDS;
 use crate::cookies::extract_cookie_value;
 use crate::ec::EcContext;
@@ -17,10 +19,11 @@ use crate::ec::EcKvSnapshot;
 use crate::ec::checked_current_timestamp;
 use crate::ec::client_eids::parse_client_eids;
 use crate::ec::current_timestamp;
-use crate::ec::eids::{ResolvedPartnerId, resolve_partner_ids, to_eids};
+use crate::ec::eids::{ServerSet, server_set};
 use crate::ec::identity::IdentityRuntime;
 use crate::ec::identity::UnixTime;
 use crate::ec::identity::catalog::ProviderCatalog;
+use crate::ec::identity::denials::{Denials, denials, filter_browser_candidates};
 use crate::ec::identity::mirror::{MirrorPayload, MirrorRead, MirrorSource, mirror_payload};
 use crate::ec::identity::policy::PolicySignals;
 use crate::ec::identity::request::opted_out;
@@ -331,8 +334,8 @@ pub async fn handle_auction(
         ec_context.set_kv_snapshot(auction_kv_snapshot.clone());
     }
     let signals = PolicySignals::from_headers(http_req.headers());
-    let eids = resolve_auction_eids(&auction_kv_snapshot, registry, ec_context, signals);
-    let mirror = mirror_member(&auction_kv_snapshot, registry, ec_context, signals);
+    let identity = auction_identity(&auction_kv_snapshot, registry, ec_context, signals);
+    let mirror = identity.mirror_member(ec_context);
 
     // Look up geo for device info.
     let geo = services
@@ -354,9 +357,10 @@ pub async fn handle_auction(
         geo,
     )?;
 
-    // Forward the browser entries as sent, append KV entries for registered
-    // sources the browser did not send, then apply consent gating.
-    let merged_eids = merge_auction_eids(client_eids, eids);
+    // Forward the browser entries that pass the provider denials, append the
+    // server set for sources the browser did not send, then apply consent
+    // gating.
+    let merged_eids = identity.merge(client_eids.as_deref());
     let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
     auction_request.user.eids =
         gate_eids_by_consent(merged_eids, auction_request.user.consent.as_ref());
@@ -452,53 +456,168 @@ pub async fn handle_auction(
     Ok(conversion.response)
 }
 
-/// Resolves partner EIDs from the KV identity graph for bidstream decoration.
-///
-/// Returns `None` when any prerequisite is missing (no KV store, no partner
-/// store, no EC, consent denied). On KV or partner-resolution errors, logs a
-/// warning and returns empty EIDs so the auction can proceed in degraded mode.
-/// A stored record is sent only when the shared servability check passes under
-/// this request's consent and `signals`.
-pub(crate) fn resolve_auction_eids(
-    snapshot: &EcKvSnapshot,
-    registry: Option<&PartnerRegistry>,
-    ec_context: &EcContext,
-    signals: PolicySignals,
-) -> Option<Vec<Eid>> {
-    resolve_servable_ids(snapshot, registry, ec_context, signals).map(|resolved| to_eids(&resolved))
+/// What the row a request read means for the `ts-eids-s` mirror (spec 6.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MirrorState {
+    /// No KV read for this request's EC: no mirror member.
+    NotRead,
+    /// EC use is denied, or the row is missing, a tombstone or withdrawn.
+    Cleared,
+    /// A live row: the mirror carries the servable server set.
+    Live,
 }
 
-/// The servable stored records behind [`resolve_auction_eids`], before they
-/// become EIDs.
-fn resolve_servable_ids(
+/// What one request's KV read gives the auction, resolved once (spec 7.1).
+///
+/// Servability is decided once, at one clock read, and both the bidstream
+/// merge and the `ts-eids-s` mirror read the same [`ServerSet`].
+pub(crate) struct AuctionIdentity {
+    /// `None` when the request may not use KV IDs at all (no registry, no
+    /// EC, or EC use denied).
+    server: Option<ServerSet>,
+    denials: Denials,
+    mirror: MirrorState,
+    /// The clock read servability used, when there was one.
+    now: Option<u64>,
+}
+
+impl AuctionIdentity {
+    /// The server set's EIDs, before browser precedence.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn server_eids(&self) -> Option<Vec<Eid>> {
+        self.server.as_ref().map(ServerSet::eids)
+    }
+
+    /// The request's bidstream EIDs before consent gating: the browser's
+    /// candidates after the denials, then the server set (spec 7.1).
+    #[must_use]
+    pub(crate) fn merge(&self, client_eids: Option<&[Eid]>) -> Option<Vec<Eid>> {
+        let empty = ServerSet::default();
+        let merged = merge_auction_eids(
+            client_eids.unwrap_or_default(),
+            self.server.as_ref().unwrap_or(&empty),
+            &self.denials,
+        );
+        if merged.is_empty() {
+            None
+        } else {
+            Some(merged)
+        }
+    }
+
+    /// The mirror member of an `/auction` or `/_ts/page-bids` response
+    /// (spec 6.2).
+    ///
+    /// The mirror carries the same server set as the bidstream, provenance
+    /// defaults included, and never an ID consent would strip.
+    #[must_use]
+    pub(crate) fn mirror_member(&self, ec_context: &EcContext) -> Option<serde_json::Value> {
+        let sources = match self.mirror {
+            MirrorState::NotRead | MirrorState::Cleared => Vec::new(),
+            MirrorState::Live if allows_eid_persistence(ec_context.consent()) => self
+                .server
+                .as_ref()
+                .map(|server| mirror_sources(server, ec_context))
+                .unwrap_or_default(),
+            MirrorState::Live => Vec::new(),
+        };
+        let read = if self.mirror == MirrorState::NotRead {
+            MirrorRead::NotRead
+        } else if sources.is_empty() {
+            MirrorRead::Cleared
+        } else {
+            MirrorRead::Servable(&sources)
+        };
+        let now = self.now.unwrap_or_else(current_timestamp);
+        mirror_payload(read, now).map(|payload| payload.to_json())
+    }
+}
+
+/// One [`MirrorSource`] per source of `server`, ranked by its writer's
+/// `cookie_priority`.
+fn mirror_sources(server: &ServerSet, ec_context: &EcContext) -> Vec<MirrorSource> {
+    let identity = ec_context.identity_runtime().map(IdentityRuntime::identity);
+    server
+        .sources()
+        .iter()
+        .map(|source| {
+            let priority = match (&source.writer, identity) {
+                (Some(writer), Some(identity)) => identity
+                    .providers
+                    .get(writer.as_str())
+                    .map_or(0, |settings| settings.cookie_priority),
+                _ => 0,
+            };
+            MirrorSource {
+                source: source.source_domain.clone(),
+                provider: source.writer.clone(),
+                priority,
+                expires_at: source.expires_at,
+                eids: source.eids.clone(),
+            }
+        })
+        .collect()
+}
+
+fn mirror_state(
+    snapshot: &EcKvSnapshot,
+    registry: Option<&PartnerRegistry>,
+    ec_context: &EcContext,
+) -> MirrorState {
+    if !ec_context.ec_allowed() {
+        return MirrorState::Cleared;
+    }
+    let (Some(ec_id), Some(_)) = (ec_context.ec_value(), registry) else {
+        return MirrorState::NotRead;
+    };
+    match snapshot {
+        EcKvSnapshot::Missing { ec_id: read } if read == ec_id => MirrorState::Cleared,
+        EcKvSnapshot::Present {
+            ec_id: read, entry, ..
+        } if read == ec_id => {
+            if entry.consent.ok {
+                MirrorState::Live
+            } else {
+                MirrorState::Cleared
+            }
+        }
+        _ => MirrorState::NotRead,
+    }
+}
+
+/// Resolves what the request's KV read gives the auction, once.
+///
+/// The server set is `None` when any prerequisite is missing (no partner
+/// store, no EC, consent denied), and empty on a KV miss, a failed read, a
+/// withdrawn row or a failed clock, so the auction proceeds in degraded
+/// mode. A stored record is in it only when the shared servability check
+/// passes under this request's consent and `signals`. The denials come from
+/// the row read, whatever its consent state.
+pub(crate) fn auction_identity(
     snapshot: &EcKvSnapshot,
     registry: Option<&PartnerRegistry>,
     ec_context: &EcContext,
     signals: PolicySignals,
-) -> Option<Vec<ResolvedPartnerId>> {
-    let registry = registry?;
-
+) -> AuctionIdentity {
+    let mut identity = AuctionIdentity {
+        server: None,
+        denials: Denials::default(),
+        mirror: mirror_state(snapshot, registry, ec_context),
+        now: None,
+    };
+    let Some(registry) = registry else {
+        return identity;
+    };
     if !ec_context.ec_allowed() {
-        return None;
+        return identity;
     }
-
-    let ec_id = ec_context.ec_value()?;
-
-    let Some(entry) = snapshot.entry_for(ec_id) else {
-        return Some(Vec::new());
+    let Some(ec_id) = ec_context.ec_value() else {
+        return identity;
     };
-
-    if !entry.consent.ok {
-        return Some(Vec::new());
-    }
-
-    // A zero time would make every expiry check pass (spec 4.4), so a failed
-    // clock resolves no KV IDs.
-    let Some(now) = checked_current_timestamp() else {
-        return Some(Vec::new());
-    };
+    let entry = snapshot.entry_for(ec_id);
     // Without a runtime no provider is configured, so only unowned records
-    // without a writer are servable.
+    // without a writer are servable, and no provider denies anything.
     let empty_catalog;
     let catalog = match ec_context.identity_runtime() {
         Some(runtime) => runtime.catalog(),
@@ -507,7 +626,17 @@ fn resolve_servable_ids(
             &empty_catalog
         }
     };
-    let opted_out = opted_out(entry);
+    if let Some(entry) = entry {
+        identity.denials = denials(entry, catalog);
+    }
+    // A zero time would make every expiry check pass (spec 4.4), so a failed
+    // clock resolves no KV IDs.
+    let Some(now) = checked_current_timestamp() else {
+        identity.server = Some(ServerSet::default());
+        return identity;
+    };
+    identity.now = Some(now);
+    let opted_out = entry.map(opted_out).unwrap_or_default();
     let serve = ServeContext {
         now: UnixTime::from_secs(now),
         consent: ec_context.consent(),
@@ -515,82 +644,34 @@ fn resolve_servable_ids(
         catalog,
         opted_out: &opted_out,
     };
-    Some(resolve_partner_ids(registry, entry, &serve))
+    identity.server = Some(server_set(entry, registry, &serve));
+    identity
 }
 
-/// What the request's KV read gives the `ts-eids-s` mirror (spec 6.2).
+/// Resolves partner EIDs from the KV identity graph for bidstream decoration.
 ///
-/// `sources` receives the servable server set, one [`MirrorSource`] per
-/// source, after `gate_eids_by_consent`: the mirror never carries an ID
-/// consent filtered out. The returned [`MirrorRead`] borrows it.
-///
-/// Consent that denies EC use clears the mirror before any KV read is
-/// needed, so a withdrawal reaches the cookie. Otherwise the result follows
-/// the row this request read: [`MirrorRead::NotRead`] when it read none,
-/// [`MirrorRead::Cleared`] for a missing row, a tombstone or `consent.ok =
-/// false`, and the servable set for a live row.
-pub(crate) fn mirror_read<'a>(
+/// Returns `None` when any prerequisite is missing (no KV store, no partner
+/// store, no EC, consent denied), and empty EIDs on a KV miss or error so
+/// the auction can proceed in degraded mode. See [`auction_identity`].
+#[cfg(test)]
+pub(crate) fn resolve_auction_eids(
     snapshot: &EcKvSnapshot,
     registry: Option<&PartnerRegistry>,
     ec_context: &EcContext,
     signals: PolicySignals,
-    sources: &'a mut Vec<MirrorSource>,
-) -> MirrorRead<'a> {
-    if !ec_context.ec_allowed() {
-        return MirrorRead::Cleared;
-    }
-    let (Some(ec_id), Some(_)) = (ec_context.ec_value(), registry) else {
-        return MirrorRead::NotRead;
-    };
-    match snapshot {
-        EcKvSnapshot::Missing { ec_id: read } if read == ec_id => return MirrorRead::Cleared,
-        EcKvSnapshot::Present {
-            ec_id: read, entry, ..
-        } if read == ec_id && !entry.consent.ok => {
-            return MirrorRead::Cleared;
-        }
-        EcKvSnapshot::Present { ec_id: read, .. } if read == ec_id => {}
-        _ => return MirrorRead::NotRead,
-    }
-    let resolved =
-        resolve_servable_ids(snapshot, registry, ec_context, signals).unwrap_or_default();
-    let identity = ec_context.identity_runtime().map(IdentityRuntime::identity);
-    let candidates: Vec<MirrorSource> = resolved
-        .iter()
-        .map(|record| {
-            let priority = match (&record.writer, identity) {
-                (Some(writer), Some(identity)) => identity.provider(writer).cookie_priority,
-                _ => 0,
-            };
-            MirrorSource {
-                source: record.source_domain.clone(),
-                provider: record.writer.clone(),
-                priority,
-                expires_at: record.expires_at,
-                eids: to_eids(core::slice::from_ref(record)),
-            }
-        })
-        .collect();
-    match gate_eids_by_consent(Some(candidates), Some(ec_context.consent())) {
-        Some(gated) => {
-            *sources = gated;
-            MirrorRead::Servable(sources)
-        }
-        None => MirrorRead::Cleared,
-    }
+) -> Option<Vec<Eid>> {
+    auction_identity(snapshot, registry, ec_context, signals).server_eids()
 }
 
 /// The mirror member of an `/auction` or `/_ts/page-bids` response, from the
-/// row this request read (spec 6.2).
+/// row this request read (spec 6.2). See [`AuctionIdentity::mirror_member`].
 pub(crate) fn mirror_member(
     snapshot: &EcKvSnapshot,
     registry: Option<&PartnerRegistry>,
     ec_context: &EcContext,
     signals: PolicySignals,
 ) -> Option<serde_json::Value> {
-    let mut sources = Vec::new();
-    let read = mirror_read(snapshot, registry, ec_context, signals, &mut sources);
-    mirror_payload(read, current_timestamp()).map(|payload| payload.to_json())
+    auction_identity(snapshot, registry, ec_context, signals).mirror_member(ec_context)
 }
 
 /// Resolves the request's browser EIDs: the `/auction` body when it has a
@@ -619,23 +700,23 @@ fn parse_cookie_auction_eids(cookie_value: Option<&str>) -> Option<Vec<Eid>> {
     }
 }
 
-/// Merges the request's browser EIDs with KV-resolved partner EIDs.
+/// Merges the request's browser EIDs with the server set (spec 7.1).
 ///
-/// Browser entries are forwarded as parsed, in wire order, never altered or
-/// combined: they are what Prebid sent the `trustedServer` adapter, and a
-/// source may repeat with different EID-level fields. KV entries are appended
-/// after them, only for registered sources no browser entry carries. Sources
-/// are compared as the partner registry normalizes them (lowercase, trailing
-/// dot removed). For a source the browser sends, KV's UIDs, `atype` and `ext`
-/// are not used: KV keeps the first value it stored, so it is the staler copy.
-/// Entries without UIDs are dropped.
+/// The browser's candidates first pass the provider `denials`. Those left
+/// are forwarded as parsed, in wire order, never altered beyond a denied
+/// UID: they are what Prebid sent the `trustedServer` adapter, and a source
+/// may repeat with different EID-level fields. A server source's whole entry
+/// set is appended after them, only when no browser entry carries the source,
+/// so the two are never mixed. Sources are compared as the partner registry
+/// normalizes them (lowercase, trailing dot removed). Entries without UIDs are
+/// dropped.
 pub(crate) fn merge_auction_eids(
-    client_eids: Option<Vec<Eid>>,
-    resolved_eids: Option<Vec<Eid>>,
-) -> Option<Vec<Eid>> {
-    let mut merged: Vec<Eid> = client_eids
+    client_eids: &[Eid],
+    server: &ServerSet,
+    denials: &Denials,
+) -> Vec<Eid> {
+    let mut merged: Vec<Eid> = filter_browser_candidates(client_eids, denials)
         .into_iter()
-        .flatten()
         .filter(|eid| !eid.uids.is_empty())
         .collect();
     let browser_sources: HashSet<String> = merged
@@ -643,22 +724,17 @@ pub(crate) fn merge_auction_eids(
         .filter_map(|eid| normalize_partner_source_domain(&eid.source).ok())
         .collect();
 
-    for eid in resolved_eids.into_iter().flatten() {
+    for eid in server.sources().iter().flat_map(|source| &source.eids) {
         if eid.uids.is_empty() {
             continue;
         }
         let carried_by_browser = normalize_partner_source_domain(&eid.source)
             .is_ok_and(|source| browser_sources.contains(&source));
         if !carried_by_browser {
-            merged.push(eid);
+            merged.push(eid.clone());
         }
     }
-
-    if merged.is_empty() {
-        None
-    } else {
-        Some(merged)
-    }
+    merged
 }
 
 #[cfg(test)]
@@ -670,6 +746,9 @@ mod tests {
     use crate::auction::types::{AuctionRequest, AuctionResponse};
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::ConsentContext;
+    use crate::ec::identity::revision::uid_hash;
+    use crate::ec::identity::test_support::{ec_partner, example_entry_set, full_record};
+    use crate::ec::kv_types::{KvEid, KvEntry, KvPartnerId, KvProviderState, KvUid};
     use crate::error::IntoHttpResponse as _;
     use crate::openrtb::Uid;
     use crate::platform::test_support::{
@@ -2110,7 +2189,422 @@ mod tests {
     }
 
     fn merged_json(client: Option<Vec<Eid>>, kv: Option<Vec<Eid>>) -> JsonValue {
-        serde_json::to_value(merge_auction_eids(client, kv)).expect("should serialize merged EIDs")
+        let merged = merge_auction_eids(
+            &client.unwrap_or_default(),
+            &ServerSet::from_eids(kv.unwrap_or_default()),
+            &Denials::default(),
+        );
+        let merged = (!merged.is_empty()).then_some(merged);
+        serde_json::to_value(merged).expect("should serialize merged EIDs")
+    }
+
+    const MERGE_EC_ID_PREFIX: &str = "merge";
+
+    fn merge_ec_id() -> String {
+        format!("{}.{MERGE_EC_ID_PREFIX}", "a".repeat(64))
+    }
+
+    fn merge_registry(sources: &[&str]) -> PartnerRegistry {
+        let partners: Vec<_> = sources
+            .iter()
+            .map(|source| counting_test_partner(source))
+            .collect();
+        PartnerRegistry::from_config(&partners).expect("should build registry")
+    }
+
+    fn merge_entry(records: Vec<(&str, KvPartnerId)>) -> KvEntry {
+        let mut entry = KvEntry::minimal("unused.example.com", "unused", 1);
+        entry.ids.clear();
+        for (source, record) in records {
+            entry.ids.insert(source.to_owned(), record);
+        }
+        entry
+    }
+
+    /// The request's [`AuctionIdentity`] for `entry`, with no providers.
+    fn merge_identity(entry: KvEntry, registry: &PartnerRegistry) -> AuctionIdentity {
+        let ec_id = merge_ec_id();
+        let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        let snapshot = EcKvSnapshot::Present {
+            ec_id,
+            entry: Box::new(entry),
+            generation: None,
+        };
+        auction_identity(
+            &snapshot,
+            Some(registry),
+            &ec_context,
+            PolicySignals::default(),
+        )
+    }
+
+    fn default_atype() -> i32 {
+        crate::settings::EcPartner::default_openrtb_atype()
+    }
+
+    fn plain_eid(source: &str, id: &str, atype: Option<i32>) -> Eid {
+        Eid {
+            source: source.to_owned(),
+            uids: vec![Uid {
+                id: id.to_owned(),
+                atype,
+                ext: None,
+            }],
+            inserter: None,
+            matcher: None,
+            mm: None,
+            ext: None,
+        }
+    }
+
+    #[test]
+    fn merge_browser_value_wins_for_unowned_source() {
+        let registry = merge_registry(&[SOURCE_S]);
+        let identity = merge_identity(
+            merge_entry(vec![(SOURCE_S, KvPartnerId::new("server"))]),
+            &registry,
+        );
+
+        let merged = identity.merge(Some(&[plain_eid(SOURCE_S, "browser", Some(1))]));
+
+        assert_eq!(
+            merged,
+            Some(vec![plain_eid(SOURCE_S, "browser", Some(1))]),
+            "the browser's value should win for an unowned source"
+        );
+    }
+
+    #[test]
+    fn merge_server_value_goes_out_when_the_browser_did_not_send_the_source() {
+        let registry = merge_registry(&[SOURCE_S, SOURCE_T]);
+        let identity = merge_identity(
+            merge_entry(vec![(SOURCE_T, KvPartnerId::new("server"))]),
+            &registry,
+        );
+
+        let merged = identity.merge(Some(&[plain_eid(SOURCE_S, "browser", Some(1))]));
+
+        assert_eq!(
+            merged,
+            Some(vec![
+                plain_eid(SOURCE_S, "browser", Some(1)),
+                plain_eid(SOURCE_T, "server", Some(default_atype())),
+            ]),
+            "the server value should follow the browser entries"
+        );
+    }
+
+    #[test]
+    fn merge_expired_entry_is_not_sent() {
+        let registry = merge_registry(&[SOURCE_S, SOURCE_T]);
+        let expired = KvPartnerId {
+            exp: Some(1),
+            ..KvPartnerId::new("expired")
+        };
+        let identity = merge_identity(
+            merge_entry(vec![
+                (SOURCE_S, expired),
+                (SOURCE_T, KvPartnerId::new("live")),
+            ]),
+            &registry,
+        );
+
+        assert_eq!(
+            identity.merge(None),
+            Some(vec![plain_eid(SOURCE_T, "live", Some(default_atype()))]),
+            "an expired record should not be sent"
+        );
+    }
+
+    #[test]
+    fn merge_stored_atype_and_ext_are_emitted() {
+        let registry = merge_registry(&[SOURCE_S]);
+        let identity = merge_identity(
+            merge_entry(vec![(SOURCE_S, full_record(None, example_entry_set()))]),
+            &registry,
+        );
+
+        assert_eq!(
+            identity.merge(None),
+            Some(vec![
+                Eid {
+                    source: SOURCE_S.to_owned(),
+                    uids: vec![
+                        Uid {
+                            id: "example-a".to_owned(),
+                            atype: Some(1),
+                            ext: None,
+                        },
+                        Uid {
+                            id: "example-b".to_owned(),
+                            atype: Some(3),
+                            ext: Some(json!({ "stype": "ppuid" })),
+                        },
+                    ],
+                    inserter: Some("example.com".to_owned()),
+                    matcher: None,
+                    mm: Some(3),
+                    ext: None,
+                },
+                Eid {
+                    source: SOURCE_S.to_owned(),
+                    uids: vec![Uid {
+                        id: "example-c".to_owned(),
+                        atype: Some(1),
+                        ext: None,
+                    }],
+                    inserter: None,
+                    matcher: Some("partner.example.com".to_owned()),
+                    mm: None,
+                    ext: None,
+                },
+            ]),
+            "the stored atype, UID ext and EID-level fields should go out"
+        );
+    }
+
+    #[test]
+    fn merge_entry_set_goes_out_one_eid_per_entry_in_stored_order_after_browser_entries() {
+        let registry = merge_registry(&[SOURCE_S, SOURCE_T]);
+        let identity = merge_identity(
+            merge_entry(vec![(SOURCE_S, full_record(None, example_entry_set()))]),
+            &registry,
+        );
+
+        let merged = identity
+            .merge(Some(&[plain_eid(SOURCE_T, "browser", None)]))
+            .expect("should merge EIDs");
+
+        let shape: Vec<(String, Vec<String>)> = merged
+            .iter()
+            .map(|eid| {
+                (
+                    eid.source.clone(),
+                    eid.uids.iter().map(|uid| uid.id.clone()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                (SOURCE_T.to_owned(), vec!["browser".to_owned()]),
+                (
+                    SOURCE_S.to_owned(),
+                    vec!["example-a".to_owned(), "example-b".to_owned()]
+                ),
+                (SOURCE_S.to_owned(), vec!["example-c".to_owned()]),
+            ],
+            "the stored set should go out one EID per entry, in order, after the browser"
+        );
+    }
+
+    fn decode_eids_header(value: &str) -> Vec<Eid> {
+        serde_json::from_slice(&BASE64.decode(value).expect("should be base64"))
+            .expect("should be EID JSON")
+    }
+
+    #[test]
+    fn merge_x_ts_eids_matches_what_was_sent() {
+        let registry = merge_registry(&[SOURCE_S, SOURCE_T]);
+        let identity = merge_identity(
+            merge_entry(vec![(SOURCE_S, full_record(None, example_entry_set()))]),
+            &registry,
+        );
+        let merged = identity
+            .merge(Some(&[plain_eid(SOURCE_T, "browser", Some(1))]))
+            .expect("should merge EIDs");
+
+        let (header, truncated) =
+            crate::ec::eids::encode_eids_header(&merged).expect("should encode the header");
+
+        assert!(!truncated, "should fit without truncation");
+        assert_eq!(
+            decode_eids_header(&header),
+            merged,
+            "x-ts-eids should carry exactly what was sent"
+        );
+    }
+
+    #[test]
+    fn merge_header_still_truncates_per_entry() {
+        let registry = merge_registry(&[SOURCE_S]);
+        let entries: Vec<KvEid> = (0..40)
+            .map(|index| KvEid {
+                uids: vec![KvUid {
+                    id: format!("{index:03}-{}", "x".repeat(100)),
+                    atype: Some(1),
+                    ext: None,
+                }],
+                ..KvEid::default()
+            })
+            .collect();
+        let identity = merge_identity(
+            merge_entry(vec![(SOURCE_S, full_record(None, entries))]),
+            &registry,
+        );
+        let merged = identity.merge(None).expect("should merge EIDs");
+
+        let (header, truncated) =
+            crate::ec::eids::encode_eids_header(&merged).expect("should encode the header");
+
+        assert_eq!(merged.len(), 40, "user.eids should hold the whole set");
+        assert!(truncated, "x-ts-eids-truncated should be set");
+        let carried = decode_eids_header(&header);
+        assert!(
+            !carried.is_empty() && carried.len() < merged.len(),
+            "x-ts-eids should hold the entries that fit"
+        );
+        assert_eq!(
+            carried,
+            merged[..carried.len()].to_vec(),
+            "the header should hold a prefix of whole entries"
+        );
+    }
+
+    #[test]
+    fn merge_denials_apply_through_the_request_identity() {
+        let partner = ec_partner(
+            "ssp.example.com",
+            "https://sync.ssp.example.com/pull",
+            "example-token-value-0123456789abcdef",
+        );
+        let mut settings = create_test_settings();
+        settings.ec.partners = vec![partner];
+        let runtime = std::sync::Arc::new(
+            IdentityRuntime::from_settings(&settings).expect("should build the runtime"),
+        );
+        let registry = merge_registry(&["ssp.example.com"]);
+        let ec_id = merge_ec_id();
+        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        ec_context.set_identity_runtime(runtime);
+        let mut entry = merge_entry(Vec::new());
+        entry.ps.insert(
+            "pull-ssp-example-com".to_owned(),
+            KvProviderState {
+                iv: vec![uid_hash("invalidated")],
+                ..KvProviderState::default()
+            },
+        );
+        let snapshot = EcKvSnapshot::Present {
+            ec_id,
+            entry: Box::new(entry),
+            generation: None,
+        };
+        let identity = auction_identity(
+            &snapshot,
+            Some(&registry),
+            &ec_context,
+            PolicySignals::default(),
+        );
+
+        let merged = identity.merge(Some(&[
+            plain_eid("ssp.example.com", "invalidated", Some(1)),
+            plain_eid(SOURCE_T, "kept", Some(1)),
+        ]));
+
+        assert_eq!(
+            merged,
+            Some(vec![plain_eid(SOURCE_T, "kept", Some(1))]),
+            "a browser UID the claiming provider invalidated should not be sent"
+        );
+    }
+
+    #[test]
+    fn golden_merge_one_uid_row_goes_out_as_on_main() {
+        let registry = merge_registry(&["a.example.com", "b.example.com"]);
+        let identity = merge_identity(
+            merge_entry(vec![
+                ("b.example.com", KvPartnerId::new("ub")),
+                ("a.example.com", KvPartnerId::new("ua")),
+            ]),
+            &registry,
+        );
+
+        // Written from `main`'s `merge_auction_eids(None, Some(to_eids(..)))`.
+        let expected = vec![
+            Eid {
+                source: "a.example.com".to_owned(),
+                uids: vec![Uid {
+                    id: "ua".to_owned(),
+                    atype: Some(3),
+                    ext: None,
+                }],
+                inserter: None,
+                matcher: None,
+                mm: None,
+                ext: None,
+            },
+            Eid {
+                source: "b.example.com".to_owned(),
+                uids: vec![Uid {
+                    id: "ub".to_owned(),
+                    atype: Some(3),
+                    ext: None,
+                }],
+                inserter: None,
+                matcher: None,
+                mm: None,
+                ext: None,
+            },
+        ];
+        assert_eq!(
+            identity.merge(None),
+            Some(expected),
+            "a one-UID row should go out exactly as on main"
+        );
+    }
+
+    #[test]
+    fn golden_merge_browser_entries_are_forwarded_unchanged() {
+        let client = vec![
+            Eid {
+                source: SOURCE_S.to_owned(),
+                uids: vec![
+                    Uid {
+                        id: "s1".to_owned(),
+                        atype: Some(1),
+                        ext: Some(json!({ "stype": "ppuid" })),
+                    },
+                    Uid {
+                        id: "s2".to_owned(),
+                        atype: None,
+                        ext: None,
+                    },
+                ],
+                inserter: Some("inserter-1.example.com".to_owned()),
+                matcher: Some("matcher.example.com".to_owned()),
+                mm: Some(1),
+                ext: Some(json!({ "segments": ["a"] })),
+            },
+            Eid {
+                source: SOURCE_T.to_owned(),
+                uids: Vec::new(),
+                inserter: None,
+                matcher: None,
+                mm: None,
+                ext: None,
+            },
+            Eid {
+                source: SOURCE_S.to_owned(),
+                uids: vec![Uid {
+                    id: "s1".to_owned(),
+                    atype: Some(3),
+                    ext: None,
+                }],
+                inserter: Some("inserter-2.example.com".to_owned()),
+                matcher: None,
+                mm: Some(2),
+                ext: None,
+            },
+        ];
+
+        let merged = merge_auction_eids(&client, &ServerSet::default(), &Denials::default());
+
+        assert_eq!(
+            merged,
+            vec![client[0].clone(), client[2].clone()],
+            "browser entries should go out as today, minus entries without UIDs"
+        );
     }
 
     #[test]
