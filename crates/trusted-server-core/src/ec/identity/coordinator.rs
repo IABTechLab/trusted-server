@@ -1,28 +1,39 @@
-//! Coordinator eligibility and outcomes (spec 4.7 and 8).
+//! Coordinator eligibility, dispatch and outcomes (spec 4.7 and 8).
 //!
-//! Pure logic: which of a provider's sources need a call, and what stored
-//! changes a call's outcome becomes. Dispatch, the breaker and the burst cap
-//! live elsewhere.
-
-// Temporary: the dispatcher, the first non-test caller, arrives in a later
-// task. Remove this when it lands.
-#![allow(dead_code)]
+//! Which of a provider's sources need a call, how the calls are sent under
+//! the transport limits, and what stored changes a call's outcome becomes.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
+
+use edgezero_core::body::Body as EdgeBody;
+use error_stack::Report;
+use http::{StatusCode, header};
+use web_time::Instant;
 
 use super::catalog::ProviderCatalog;
 use super::descriptor::{
     ConsentPolicy, Input, ProviderDescriptor, ResolveKind, Resolves, UsOptOut,
 };
+use super::exchange::{ProviderRequest, ProviderResponse};
 use super::ids::{IdentityProviderId, SourceDomain, UnixTime};
+use super::input::{RandomSource, ResolveInput, ResolveSignals};
 use super::mutation::{PartnerIdChange, ProviderResult, ProviderStateChange, StateUpdate};
 use super::policy::{PolicySignals, policy_allows, tcf_applies, us_sale_opt_out};
 use super::provider::IdentityProvider;
-use super::resolution::{EntrySet, EntrySets, Resolution, ResolvedEid, StateChange, entry_sets};
-use super::revision::{StateRevision, record_revision, uid_hash};
+use super::resolution::{
+    EntrySet, EntrySets, IdentityProviderError, Resolution, ResolvedEid, StateChange, entry_sets,
+};
+use super::revision::{IdentityKeys, StateRevision, record_revision, uid_hash, visitor_key};
 use crate::consent::{ConsentContext, effective_tcf};
 use crate::ec::kv_types::{KvEntry, KvOptOut, KvPartnerId};
-use crate::settings::{IdentitySettings, ProviderMode, ProviderSettings};
+use crate::ec::rate_limiter::RateLimiter;
+use crate::platform::{
+    PlatformBackendSpec, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
+    RuntimeServices,
+};
+use crate::settings::{IdentitySettings, ProviderMode, ProviderSettings, Settings};
+use crate::streaming_processor::{BodyStreamDecoder, Compression};
 
 /// The highest TCF purpose the fingerprint has a bit for.
 const FINGERPRINT_PURPOSES: u8 = 10;
@@ -51,6 +62,8 @@ const TRANSPORT_BACKOFF_BASE_SECS: u64 = 300;
 const TRANSPORT_BACKOFF_CAP_SECS: u64 = 3_600;
 
 /// One provider's `ps` entry, as the request read it.
+// Temporary: the request wiring, the first non-test caller, arrives in a later task.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 struct ProviderView {
     n: Option<u64>,
@@ -65,6 +78,8 @@ struct ProviderView {
 /// What eligibility and outcomes read from the KV row the request read
 /// (spec 4.7), and nothing else. It never reads `ts-eids-s`: every removal is
 /// already in KV (spec 5.3).
+// Temporary: the request wiring, the first non-test caller, arrives in a later task.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct EligibilityView {
     records: BTreeMap<SourceDomain, KvPartnerId>,
@@ -76,6 +91,8 @@ impl EligibilityView {
     /// source domain or provider ID cannot name a configured one and is
     /// skipped.
     #[must_use]
+    // Temporary: the request wiring, the first non-test caller, arrives in a later task.
+    #[allow(dead_code)]
     pub(crate) fn from_kv(entry: &KvEntry) -> Self {
         let records = entry
             .ids
@@ -105,6 +122,8 @@ impl EligibilityView {
 
     /// A view of a row with no records and no provider state.
     #[must_use]
+    // Temporary: the request wiring, the first non-test caller, arrives in a later task.
+    #[allow(dead_code)]
     pub(crate) fn empty() -> Self {
         Self::default()
     }
@@ -134,6 +153,8 @@ impl EligibilityView {
 
     /// The provider's private state `st`, which a call reads.
     #[must_use]
+    // Temporary: the request wiring, the first non-test caller, arrives in a later task.
+    #[allow(dead_code)]
     pub(crate) fn state(&self, provider: &IdentityProviderId) -> Option<&serde_json::Value> {
         self.providers
             .get(provider)
@@ -142,6 +163,8 @@ impl EligibilityView {
 
     /// Whether the provider's opt-out removed a UID with this hash, `ps.ov`.
     #[must_use]
+    // Temporary: the request wiring, the first non-test caller, arrives in a later task.
+    #[allow(dead_code)]
     pub(crate) fn has_opt_out_hash(&self, provider: &IdentityProviderId, hash: &str) -> bool {
         self.providers
             .get(provider)
@@ -204,6 +227,8 @@ impl EligibilityView {
 }
 
 /// What the request is, as eligibility reads it.
+// Temporary: the request wiring, the first non-test caller, arrives in a later task.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct RequestFacts {
     /// The client looks like a real browser (step 1).
@@ -225,6 +250,8 @@ pub(crate) struct RequestFacts {
 }
 
 /// When a provider is dispatched, relative to the navigation response.
+// Temporary: the request wiring, the first non-test caller, arrives in a later task.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Phase {
     /// Before the auction, within the hold budget.
@@ -272,6 +299,8 @@ pub(crate) enum Eligibility {
 }
 
 /// What [`eligibility`] reads about one provider.
+// Temporary: the request wiring, the first non-test caller, arrives in a later task.
+#[allow(dead_code)]
 pub(crate) struct EligibilityInput<'a> {
     pub(crate) provider: &'a dyn IdentityProvider,
     pub(crate) settings: &'a ProviderSettings,
@@ -282,6 +311,8 @@ pub(crate) struct EligibilityInput<'a> {
 
 /// Whether the provider is eligible for this request, steps 1 to 7 of spec
 /// 4.7 in order, and which sources need which kind of call.
+// Temporary: the request wiring, the first non-test caller, arrives in a later task.
+#[allow(dead_code)]
 #[must_use]
 pub(crate) fn eligibility(
     input: &EligibilityInput<'_>,
@@ -445,6 +476,8 @@ fn has_unexpired_id(catalog: &ProviderCatalog, record: &KvPartnerId, now: UnixTi
 /// A signal the policy does not read or relaxes stays 0. Later parts append
 /// bits after these and keep these where they are.
 #[must_use]
+// Temporary: the request wiring, the first non-test caller, arrives in a later task.
+#[allow(dead_code)]
 pub(crate) fn fingerprint_bits(
     policy: &ConsentPolicy,
     consent: &ConsentContext,
@@ -501,6 +534,8 @@ pub(crate) enum CallOutcome {
     /// A transport failure, timeout, 429 or 5xx.
     TransportFailure,
     /// The circuit breaker was open, so nothing was sent.
+    // Temporary: the breaker, the only producer, arrives in a later task.
+    #[allow(dead_code)]
     BreakerOpen,
     /// The burst cap stopped the call.
     BurstCapped,
@@ -509,6 +544,8 @@ pub(crate) enum CallOutcome {
 }
 
 /// What an outcome needs besides the provider and the view.
+// Temporary: the request wiring, the first non-test caller, arrives in a later task.
+#[allow(dead_code)]
 pub(crate) struct OutcomeContext<'a> {
     pub(crate) now: UnixTime,
     pub(crate) catalog: &'a ProviderCatalog,
@@ -534,6 +571,8 @@ pub(crate) struct OutcomeChanges {
 }
 
 /// The stored changes of an outcome: the table of spec 8, row by row.
+// Temporary: the request wiring, the first non-test caller, arrives in a later task.
+#[allow(dead_code)]
 #[must_use]
 pub(crate) fn outcome_to_changes(
     provider: &dyn IdentityProvider,
@@ -930,11 +969,526 @@ fn state_update(provider: &IdentityProviderId, resolution: &Resolution) -> State
     }
 }
 
+/// Everything a dispatch reads that is not per call.
+// Temporary: the request wiring, the first non-test caller, arrives in a later task.
+#[allow(dead_code)]
+pub(crate) struct IdentityDeps<'a> {
+    pub(crate) settings: &'a Settings,
+    pub(crate) catalog: &'a ProviderCatalog,
+    pub(crate) keys: &'a IdentityKeys,
+    /// Draws record revisions when a mutation applies.
+    // Temporary: first read when the mutations are applied.
+    #[allow(dead_code)]
+    pub(crate) random: &'a dyn RandomSource,
+    pub(crate) services: &'a RuntimeServices,
+    pub(crate) rate_limiter: Option<&'a dyn RateLimiter>,
+}
+
+/// One provider call to dispatch: the provider and the kind each of its
+/// sources needs.
+// Temporary: the request wiring, the first non-test caller, arrives in a later task.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct Call {
+    pub(crate) provider: IdentityProviderId,
+    pub(crate) kinds: BTreeMap<SourceDomain, ResolveKind>,
+}
+
+/// A call that was sent and is waiting for its answer.
+struct InFlightCall<'a> {
+    provider: &'a dyn IdentityProvider,
+    input: ResolveInput<'a>,
+    call_context: Option<String>,
+}
+
+/// What preparing one call came to.
+enum Prepared<'a> {
+    /// The call is settled without being sent.
+    Settled(CallOutcome),
+    /// The call was sent.
+    Sent(InFlightCall<'a>, PlatformPendingRequest),
+}
+
+/// Whether the provider is a generic pull provider, the only kind given the
+/// full EC ID.
+fn is_generic_pull(provider: &dyn IdentityProvider) -> bool {
+    provider
+        .descriptor()
+        .resolves()
+        .is_some_and(Resolves::gets_ec_id)
+}
+
+/// The order calls are dispatched in. Generic pull providers keep the
+/// fairness rule of spec 10.4: sorted by source domain, then rotated left by
+/// `(now / 3600) % len`, so the starting partner changes each hour when
+/// `max_concurrency` limits a batch. Every other provider follows, by ID.
+fn dispatch_order(calls: Vec<Call>, catalog: &ProviderCatalog, now: UnixTime) -> Vec<Call> {
+    let (mut generic, mut others): (Vec<Call>, Vec<Call>) = calls.into_iter().partition(|call| {
+        catalog
+            .get(&call.provider)
+            .is_some_and(|provider| is_generic_pull(provider.as_ref()))
+    });
+    generic.sort_by(|left, right| {
+        let source = |call: &Call| {
+            catalog
+                .get(&call.provider)
+                .map(|provider| provider.descriptor().primary_source().clone())
+        };
+        source(left)
+            .cmp(&source(right))
+            .then_with(|| left.provider.cmp(&right.provider))
+    });
+    if !generic.is_empty() {
+        let hour = usize::try_from(now.as_secs() / 3600).unwrap_or(0);
+        let offset = hour % generic.len();
+        generic.rotate_left(offset);
+    }
+    others.sort_by(|left, right| left.provider.cmp(&right.provider));
+    generic.extend(others);
+    generic
+}
+
+/// Allows an `https` request to a declared host, with no `Cookie` header.
+///
+/// # Errors
+///
+/// [`IdentityProviderError::Config`] for any other request.
+pub(crate) fn check_request(
+    request: &ProviderRequest,
+    descriptor: &ProviderDescriptor,
+) -> Result<(), Report<IdentityProviderError>> {
+    if request.url().scheme() != "https" {
+        return Err(IdentityProviderError::config(
+            "a provider request must use https",
+        ));
+    }
+    let host = request.url().host_str().unwrap_or_default();
+    let declared = descriptor.resolves().is_some_and(|resolves| {
+        resolves
+            .hosts()
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(host))
+    });
+    if !declared {
+        return Err(IdentityProviderError::config(
+            "a provider request must go to a declared host",
+        ));
+    }
+    if request.has_cookie_header() {
+        return Err(IdentityProviderError::config(
+            "a provider request must not set a Cookie header",
+        ));
+    }
+    Ok(())
+}
+
+/// Decodes a response body to at most `cap` bytes: identity, `gzip` or `br`.
+///
+/// `None` when the decoded body is over `cap`, does not decode, or the
+/// encoding is unknown. The cap applies while decoding, so a small body
+/// cannot expand past it.
+pub(crate) fn decode_body(encoding: Option<&str>, body: Vec<u8>, cap: usize) -> Option<Vec<u8>> {
+    let compression = match encoding.map(str::trim) {
+        None | Some("") => Compression::None,
+        Some(name) if name.eq_ignore_ascii_case("identity") => Compression::None,
+        Some(name) if name.eq_ignore_ascii_case("gzip") => Compression::Gzip,
+        Some(name) if name.eq_ignore_ascii_case("br") => Compression::Brotli,
+        Some(_) => return None,
+    };
+    if compression == Compression::None {
+        return (body.len() <= cap).then_some(body);
+    }
+    let mut decoder = BodyStreamDecoder::new(compression, cap);
+    let mut decoded = decoder
+        .decode_chunk(bytes::Bytes::from(body))
+        .ok()?
+        .to_vec();
+    decoded.extend(decoder.finish().ok()?);
+    (decoded.len() <= cap).then_some(decoded)
+}
+
+/// Whether the response declares a body over `cap`, or an unreadable length.
+pub(crate) fn content_length_exceeds_limit(
+    response: &PlatformResponse,
+    cap: usize,
+    label: &str,
+) -> bool {
+    let Some(value) = response.response.headers().get(header::CONTENT_LENGTH) else {
+        return false;
+    };
+    let Some(length) = value
+        .to_str()
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+    else {
+        log::warn!("'{label}' returned an unreadable Content-Length header, rejecting");
+        return true;
+    };
+    if length > cap {
+        log::warn!("'{label}' returned an oversized Content-Length ({length} bytes), rejecting");
+        return true;
+    }
+    false
+}
+
+/// Buffers a response body of at most `cap` bytes, as sent (still encoded).
+/// `None` when the declared or actual length is over `cap`.
+pub(crate) fn buffered_body(
+    response: PlatformResponse,
+    cap: usize,
+    label: &str,
+) -> Option<(http::response::Parts, bytes::Bytes)> {
+    if content_length_exceeds_limit(&response, cap, label) {
+        return None;
+    }
+    let (parts, body) = response.response.into_parts();
+    let body = body.into_bytes().unwrap_or_default();
+    if body.len() > cap {
+        log::warn!(
+            "'{label}' returned an oversized response ({} bytes), rejecting",
+            body.len()
+        );
+        return None;
+    }
+    Some((parts, body))
+}
+
+/// What waiting for one in-flight request came to.
+pub(crate) enum Waited {
+    /// The response arrived.
+    Response(PlatformResponse),
+    /// The request failed or timed out.
+    Failed,
+    /// The caller stopped waiting, so the request was dropped.
+    Dropped,
+}
+
+/// Waits for each in-flight request in turn and empties `in_flight`. All were
+/// sent up front, so waiting in turn does not change concurrency.
+///
+/// `keep_waiting` is asked before each wait. Once it returns `false`, every
+/// request still pending is dropped without waiting.
+pub(crate) fn drain_in_flight<T: core::fmt::Display>(
+    in_flight: &mut Vec<(T, PlatformPendingRequest)>,
+    services: &RuntimeServices,
+    mut keep_waiting: impl FnMut() -> bool,
+) -> Vec<(T, Waited)> {
+    let mut waiting = true;
+    in_flight
+        .drain(..)
+        .map(|(label, pending)| {
+            waiting = waiting && keep_waiting();
+            if !waiting {
+                return (label, Waited::Dropped);
+            }
+            match futures::executor::block_on(services.http_client().wait(pending)) {
+                Ok(response) => (label, Waited::Response(response)),
+                Err(error) => {
+                    log::warn!("Request failed for '{label}': {error:?}");
+                    (label, Waited::Failed)
+                }
+            }
+        })
+        .collect()
+}
+
+/// Logs a provider `Config` failure. Only the error's own context is logged,
+/// never its attachments.
+fn log_config(provider: &IdentityProviderId, error: &Report<IdentityProviderError>) {
+    log::error!(
+        "Identity provider '{provider}' configuration error: {}",
+        error.current_context()
+    );
+}
+
+/// The outcome a `request` error becomes.
+fn request_error_outcome(
+    provider: &IdentityProviderId,
+    error: &Report<IdentityProviderError>,
+) -> CallOutcome {
+    if matches!(
+        error.current_context(),
+        IdentityProviderError::InputUnavailable { .. }
+    ) {
+        return CallOutcome::InputUnavailable;
+    }
+    log_config(provider, error);
+    CallOutcome::InputFailure
+}
+
+/// The outcome a `response` error becomes.
+fn response_error_outcome(error: &Report<IdentityProviderError>) -> CallOutcome {
+    match error.current_context() {
+        IdentityProviderError::Rejected { status }
+            if *status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() =>
+        {
+            CallOutcome::TransportFailure
+        }
+        IdentityProviderError::InvalidState => CallOutcome::InvalidState(None),
+        _ => CallOutcome::InputFailure,
+    }
+}
+
+/// The first-byte timeout of a call, or `None` when a hold dispatch has no
+/// budget left.
+fn call_timeout(
+    deps: &IdentityDeps<'_>,
+    settings: &ProviderSettings,
+    remaining: Option<Duration>,
+) -> Option<Duration> {
+    let policy = deps.services.backend().naming_policy();
+    let millis = |value: u64| u32::try_from(value).unwrap_or(u32::MAX);
+    let timeout_ms = match remaining {
+        None => {
+            let configured = millis(settings.after_send_timeout_ms);
+            policy.canonicalize_transport_timeout_ms(configured, configured)
+        }
+        Some(remaining) => {
+            let configured = millis(
+                settings
+                    .timeout_ms
+                    .unwrap_or(deps.settings.ec.identity.hold_budget_ms),
+            );
+            let remaining_ms = u32::try_from(remaining.as_millis()).unwrap_or(u32::MAX);
+            policy.canonicalize_transport_timeout_ms(remaining_ms, configured)
+        }
+    };
+    (timeout_ms > 0).then(|| Duration::from_millis(u64::from(timeout_ms)))
+}
+
+/// Whether the burst cap stops the call. `Err` when it could not be read.
+fn burst_capped(
+    deps: &IdentityDeps<'_>,
+    provider: &IdentityProviderId,
+    ec_id: Option<&str>,
+    settings: &ProviderSettings,
+) -> Result<bool, ()> {
+    let Some(limiter) = deps.rate_limiter else {
+        return Ok(false);
+    };
+    let Some(ec_id) = ec_id else {
+        log::warn!("Identity provider '{provider}' not dispatched: the request has no EC ID");
+        return Err(());
+    };
+    let key = format!("identity:{provider}:{}", visitor_key(deps.keys, ec_id));
+    limiter
+        .exceeded_per_minute(&key, settings.max_calls_per_minute)
+        .map_err(|error| {
+            log::warn!(
+                "Identity provider '{provider}' not dispatched, burst cap unreadable: {error:?}"
+            );
+        })
+}
+
+/// Builds, checks and sends one call.
+fn prepare_call<'a>(
+    deps: &IdentityDeps<'a>,
+    call: &'a Call,
+    signals: &'a ResolveSignals<'a>,
+    started: Instant,
+    budget: Option<Duration>,
+) -> Prepared<'a> {
+    let Some(provider) = deps.catalog.get(&call.provider) else {
+        log::error!(
+            "Identity provider '{}' is not in the catalog, not dispatched",
+            call.provider
+        );
+        return Prepared::Settled(CallOutcome::InputFailure);
+    };
+    let provider: &dyn IdentityProvider = provider.as_ref();
+    let descriptor = provider.descriptor();
+    let id = descriptor.id();
+    let settings = deps.settings.ec.identity.provider(id);
+
+    let input = ResolveInput::new(descriptor, call.kinds.clone(), signals);
+    let request = provider.request(&input);
+    if !input.recorded_errors().is_empty() {
+        log::error!("Identity provider '{id}' read an input it did not declare");
+        return Prepared::Settled(CallOutcome::InputFailure);
+    }
+    let request = match request {
+        Ok(Some(request)) => request,
+        Ok(None) => return Prepared::Settled(CallOutcome::Skipped),
+        Err(error) => return Prepared::Settled(request_error_outcome(id, &error)),
+    };
+    if let Err(error) = check_request(&request, descriptor) {
+        log_config(id, &error);
+        return Prepared::Settled(CallOutcome::InputFailure);
+    }
+
+    let remaining = budget.map(|budget| budget.saturating_sub(started.elapsed()));
+    let Some(timeout) = call_timeout(deps, &settings, remaining) else {
+        return Prepared::Settled(CallOutcome::HoldCutOff);
+    };
+    match burst_capped(deps, id, signals.ec_id.as_deref(), &settings) {
+        Ok(true) => return Prepared::Settled(CallOutcome::BurstCapped),
+        Ok(false) => {}
+        Err(()) => return Prepared::Settled(CallOutcome::NotDispatched),
+    }
+
+    let url = request.url();
+    let backend = deps.services.backend().ensure(&PlatformBackendSpec {
+        scheme: url.scheme().to_owned(),
+        host: url.host_str().unwrap_or_default().to_owned(),
+        port: url.port(),
+        host_header_override: None,
+        certificate_check: deps.settings.proxy.certificate_check,
+        first_byte_timeout: timeout,
+        between_bytes_timeout: timeout,
+        discriminator: Some(id.to_string()),
+    });
+    let backend = match backend {
+        Ok(name) => name,
+        Err(error) => {
+            log::warn!("Identity provider '{id}': failed to resolve the backend: {error:?}");
+            return Prepared::Settled(CallOutcome::TransportFailure);
+        }
+    };
+
+    let mut builder = http::Request::builder()
+        .method(request.method().clone())
+        .uri(url.as_str());
+    for (name, value) in request.headers() {
+        builder = builder.header(name, value);
+    }
+    let body = if request.body().is_empty() {
+        EdgeBody::empty()
+    } else {
+        EdgeBody::from(request.body().to_vec())
+    };
+    let Ok(outbound) = builder.body(body) else {
+        log::error!("Identity provider '{id}': the request could not be built");
+        return Prepared::Settled(CallOutcome::InputFailure);
+    };
+    let call_context = request.call_context_json().map(str::to_owned);
+
+    match futures::executor::block_on(
+        deps.services
+            .http_client()
+            .send_async(PlatformHttpRequest::new(outbound, backend)),
+    ) {
+        Ok(pending) => Prepared::Sent(
+            InFlightCall {
+                provider,
+                input,
+                call_context,
+            },
+            pending,
+        ),
+        Err(error) => {
+            log::warn!("Identity provider '{id}': failed to send: {error:?}");
+            Prepared::Settled(CallOutcome::TransportFailure)
+        }
+    }
+}
+
+/// The outcome of a call whose response arrived.
+fn finish_call(
+    call: &InFlightCall<'_>,
+    response: PlatformResponse,
+    max_response_bytes: usize,
+) -> CallOutcome {
+    let id = call.provider.descriptor().id();
+    let Some((parts, raw)) = buffered_body(response, max_response_bytes, id.as_str()) else {
+        return CallOutcome::TransportFailure;
+    };
+    let encoding = parts
+        .headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok());
+    let Some(body) = decode_body(encoding, raw.to_vec(), max_response_bytes) else {
+        log::warn!("Identity provider '{id}' returned a body that is over the cap or undecodable");
+        return CallOutcome::TransportFailure;
+    };
+    let response =
+        ProviderResponse::new(parts.status, parts.headers, body, call.call_context.clone());
+    let result = call.provider.response(&response, &call.input);
+    if !call.input.recorded_errors().is_empty() {
+        log::error!("Identity provider '{id}' read an input it did not declare");
+        return CallOutcome::InputFailure;
+    }
+    match result {
+        Ok(resolution) if call.input.state_decode_failed() => {
+            CallOutcome::InvalidState(Some(resolution))
+        }
+        Ok(resolution) => CallOutcome::Resolved(resolution),
+        Err(error) => {
+            if matches!(
+                error.current_context(),
+                IdentityProviderError::Config { .. }
+            ) {
+                log_config(id, &error);
+            }
+            response_error_outcome(&error)
+        }
+    }
+}
+
+/// Dispatches `calls` and returns each provider's outcome (spec 4.7).
+///
+/// At most `max_concurrency` calls are in flight. `budget` is `Some(the
+/// remaining hold budget)` for a hold dispatch before the auction, and
+/// `None` after the response is sent: there, a call that misses its timeout is
+/// an ordinary transport failure.
+// Temporary: the request wiring, the first non-test caller, arrives in a later task.
+#[allow(dead_code)]
+pub(crate) fn dispatch(
+    deps: &IdentityDeps<'_>,
+    calls: Vec<Call>,
+    signals: &ResolveSignals<'_>,
+    budget: Option<Duration>,
+) -> Vec<(IdentityProviderId, CallOutcome)> {
+    let started = Instant::now();
+    let identity = &deps.settings.ec.identity;
+    let max_concurrency = identity.max_concurrency.max(1);
+    let calls = dispatch_order(calls, deps.catalog, signals.now);
+    let mut outcomes = Vec::with_capacity(calls.len());
+    let mut in_flight: Vec<(IdentityProviderId, PlatformPendingRequest)> = Vec::new();
+    let mut sent: BTreeMap<IdentityProviderId, InFlightCall<'_>> = BTreeMap::new();
+
+    let drain = |in_flight: &mut Vec<(IdentityProviderId, PlatformPendingRequest)>,
+                 sent: &mut BTreeMap<IdentityProviderId, InFlightCall<'_>>,
+                 outcomes: &mut Vec<(IdentityProviderId, CallOutcome)>| {
+        let within_budget = || budget.is_none_or(|budget| started.elapsed() < budget);
+        for (id, waited) in drain_in_flight(in_flight, deps.services, within_budget) {
+            let Some(call) = sent.remove(&id) else {
+                continue;
+            };
+            let outcome = match waited {
+                Waited::Response(response) => {
+                    finish_call(&call, response, identity.max_response_bytes)
+                }
+                Waited::Failed if budget.is_some() => CallOutcome::HoldCutOff,
+                Waited::Failed => CallOutcome::TransportFailure,
+                Waited::Dropped => CallOutcome::HoldCutOff,
+            };
+            outcomes.push((id, outcome));
+        }
+    };
+
+    for call in &calls {
+        match prepare_call(deps, call, signals, started, budget) {
+            Prepared::Settled(outcome) => outcomes.push((call.provider.clone(), outcome)),
+            Prepared::Sent(sent_call, pending) => {
+                sent.insert(call.provider.clone(), sent_call);
+                in_flight.push((call.provider.clone(), pending));
+                if in_flight.len() >= max_concurrency {
+                    drain(&mut in_flight, &mut sent, &mut outcomes);
+                }
+            }
+        }
+    }
+    drain(&mut in_flight, &mut sent, &mut outcomes);
+    outcomes
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::Duration;
+
+    use std::io::Write as _;
 
     use serde_json::json;
 
@@ -944,8 +1498,12 @@ mod tests {
     use crate::ec::identity::descriptor::{
         ConsentPolicy, Input, ProviderDescriptor, ResolveKind, Resolves, UsOptOut,
     };
+    use crate::ec::identity::input::{ProviderConsent, SeededRandom, ThreadRandom};
     use crate::ec::identity::resolution::{ResolvedEid, ResolvedUid};
     use crate::ec::identity::revision::{record_revision, uid_hash};
+    use crate::ec::identity::test_support::fake_http::{
+        FakeBackend, FakeHttpClient, ScriptedProvider, fake_services,
+    };
     use crate::ec::identity::test_support::{
         OutcomeFixture, allowing_consent, facts_for_writer, fixed_capture_provider, fixed_provider,
         pid, provider_from, record_for_test, source, stateful_fixed_provider,
@@ -953,6 +1511,7 @@ mod tests {
     };
     use crate::ec::kv_types::{KvEid, KvUid};
     use crate::settings::ProviderMode;
+    use crate::test_support::tests::create_test_settings;
 
     /// The six lines every eligibility test repeats: one provider, its
     /// catalog and the settings and consent the call reads.
@@ -2971,6 +3530,486 @@ mod tests {
             record.eids,
             vec![one_entry("example-a")],
             "should drop the duplicate"
+        );
+    }
+
+    // Dispatch
+
+    struct RecordingLimiter {
+        exceeded: bool,
+        fail: bool,
+        keys: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingLimiter {
+        fn new(exceeded: bool, fail: bool) -> Self {
+            Self {
+                exceeded,
+                fail,
+                keys: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl RateLimiter for RecordingLimiter {
+        fn exceeded(
+            &self,
+            key: &str,
+            _hourly_limit: u32,
+        ) -> Result<bool, Report<crate::error::TrustedServerError>> {
+            self.keys
+                .lock()
+                .expect("should lock the keys")
+                .push(key.to_owned());
+            if self.fail {
+                return Err(Report::new(crate::error::TrustedServerError::Proxy {
+                    message: "limiter unavailable".to_owned(),
+                }));
+            }
+            Ok(self.exceeded)
+        }
+    }
+
+    /// Providers, a fake client and everything `dispatch` reads.
+    struct DispatchFixture {
+        settings: Settings,
+        catalog: ProviderCatalog,
+        keys: IdentityKeys,
+        client: Arc<FakeHttpClient>,
+        backend: Arc<FakeBackend>,
+        services: RuntimeServices,
+    }
+
+    impl DispatchFixture {
+        fn new(providers: Vec<Arc<dyn IdentityProvider>>) -> Self {
+            let settings = create_test_settings();
+            let client = Arc::new(FakeHttpClient::new());
+            let backend = Arc::new(FakeBackend::new());
+            let services = fake_services(&client, &backend);
+            Self {
+                keys: IdentityKeys::from_settings(&settings),
+                catalog: ProviderCatalog::new(providers, BTreeMap::new()),
+                settings,
+                client,
+                backend,
+                services,
+            }
+        }
+
+        fn run(
+            &self,
+            ids: &[&str],
+            now: u64,
+            budget: Option<Duration>,
+            limiter: Option<&dyn RateLimiter>,
+        ) -> Vec<(IdentityProviderId, CallOutcome)> {
+            let deps = IdentityDeps {
+                settings: &self.settings,
+                catalog: &self.catalog,
+                keys: &self.keys,
+                random: &SeededRandom::new(1),
+                services: &self.services,
+                rate_limiter: limiter,
+            };
+            let calls = ids
+                .iter()
+                .map(|id| {
+                    let provider = self
+                        .catalog
+                        .get(&pid(id))
+                        .expect("should hold the provider");
+                    Call {
+                        provider: pid(id),
+                        kinds: BTreeMap::from([(
+                            provider.descriptor().primary_source().clone(),
+                            ResolveKind::Initial,
+                        )]),
+                    }
+                })
+                .collect();
+            let signals = ResolveSignals {
+                client_ip: None,
+                user_agent: Some("ExampleBrowser/1.0"),
+                page_url: None,
+                region: None,
+                hashed_email: None,
+                consent: ProviderConsent::default(),
+                publisher_domain: "www.example.com",
+                now: UnixTime::from_secs(now),
+                random: &ThreadRandom,
+                ec_id: Some(format!("{}.ABC123", "a".repeat(64))),
+                stored: BTreeMap::new(),
+                state_json: None,
+            };
+            dispatch(&deps, calls, &signals, budget)
+        }
+    }
+
+    fn outcome_of<'a>(
+        outcomes: &'a [(IdentityProviderId, CallOutcome)],
+        id: &str,
+    ) -> &'a CallOutcome {
+        &outcomes
+            .iter()
+            .find(|(provider, _)| *provider == pid(id))
+            .expect("should hold an outcome for the provider")
+            .1
+    }
+
+    fn scripted(id: &str, host: &str, source: &str) -> Arc<dyn IdentityProvider> {
+        ScriptedProvider::new(id, host, source, false).into_provider()
+    }
+
+    #[test]
+    fn check_request_enforces_https_host_and_no_cookie() {
+        let descriptor = fixed_provider("p", &["a.example.com"]).descriptor().clone();
+        let good = ProviderRequest::get(
+            &"https://api.example.com/x"
+                .parse()
+                .expect("should parse the URL"),
+        );
+        check_request(&good, &descriptor)
+            .expect("should allow an https request to a declared host (control)");
+        for (name, request) in [
+            (
+                "http",
+                ProviderRequest::get(
+                    &"http://api.example.com/x"
+                        .parse()
+                        .expect("should parse the URL"),
+                ),
+            ),
+            (
+                "host",
+                ProviderRequest::get(
+                    &"https://other.example.net/x"
+                        .parse()
+                        .expect("should parse the URL"),
+                ),
+            ),
+            (
+                "cookie",
+                good.clone()
+                    .try_with_header("cookie", "a=1")
+                    .expect("should add the header"),
+            ),
+        ] {
+            assert!(
+                check_request(&request, &descriptor).is_err(),
+                "should reject the {name} case"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_body_caps_decoded_size() {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder
+            .write_all(&vec![b'a'; 10_000])
+            .expect("should write to the encoder");
+        let gzipped = encoder.finish().expect("should finish the gzip stream");
+        assert_eq!(
+            decode_body(Some("gzip"), gzipped.clone(), 10_000).map(|body| body.len()),
+            Some(10_000),
+            "should decode a body that fits"
+        );
+        assert!(
+            decode_body(Some("gzip"), gzipped, 9_999).is_none(),
+            "should reject a body over the cap after decoding"
+        );
+        assert!(
+            decode_body(Some("zstd"), vec![1], 10).is_none(),
+            "should reject an unknown encoding"
+        );
+        assert_eq!(
+            decode_body(None, b"ok".to_vec(), 10).as_deref(),
+            Some(&b"ok"[..]),
+            "should pass an identity body through"
+        );
+        assert!(
+            decode_body(None, vec![0; 11], 10).is_none(),
+            "should reject an identity body over the cap"
+        );
+    }
+
+    #[test]
+    fn dispatch_maps_status_codes_to_outcomes() {
+        let mut fixture = DispatchFixture::new(vec![
+            scripted("ok", "ok.example.com", "ok.example.com"),
+            scripted("busy", "busy.example.com", "busy.example.com"),
+            scripted("bad", "bad.example.com", "bad.example.com"),
+            scripted("big", "big.example.com", "big.example.com"),
+            scripted("long", "long.example.com", "long.example.com"),
+        ]);
+        fixture.settings.ec.identity.max_response_bytes = 8;
+        fixture.client.respond("ok.example.com", 200, b"{}");
+        fixture.client.respond("busy.example.com", 503, b"{}");
+        fixture.client.respond("bad.example.com", 400, b"{}");
+        fixture
+            .client
+            .respond("big.example.com", 200, b"0123456789");
+        fixture.client.respond_with_headers(
+            "long.example.com",
+            200,
+            b"{}",
+            &[("content-length", "9999")],
+        );
+
+        let outcomes = fixture.run(&["ok", "busy", "bad", "big", "long"], 1_000, None, None);
+
+        assert!(
+            matches!(outcome_of(&outcomes, "ok"), CallOutcome::Resolved(_)),
+            "should resolve a 200"
+        );
+        assert!(
+            matches!(outcome_of(&outcomes, "busy"), CallOutcome::TransportFailure),
+            "should count a 503 as a transport failure"
+        );
+        assert!(
+            matches!(outcome_of(&outcomes, "bad"), CallOutcome::InputFailure),
+            "should count a 400 as an input failure"
+        );
+        assert!(
+            matches!(outcome_of(&outcomes, "big"), CallOutcome::TransportFailure),
+            "should count a body over the cap as a transport failure"
+        );
+        assert!(
+            matches!(outcome_of(&outcomes, "long"), CallOutcome::TransportFailure),
+            "should count a Content-Length over the cap as a transport failure"
+        );
+    }
+
+    #[test]
+    fn dispatch_rejects_a_body_that_decodes_over_the_cap() {
+        let mut fixture =
+            DispatchFixture::new(vec![scripted("p", "p.example.com", "p.example.com")]);
+        fixture.settings.ec.identity.max_response_bytes = 4_096;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder
+            .write_all(&vec![b'a'; 100_000])
+            .expect("should write to the encoder");
+        let gzipped = encoder.finish().expect("should finish the gzip stream");
+        assert!(
+            gzipped.len() < 4_096,
+            "should compress under the cap (control)"
+        );
+        fixture.client.respond_with_headers(
+            "p.example.com",
+            200,
+            &gzipped,
+            &[("content-encoding", "gzip")],
+        );
+
+        let outcomes = fixture.run(&["p"], 1_000, None, None);
+
+        assert!(
+            matches!(outcome_of(&outcomes, "p"), CallOutcome::TransportFailure),
+            "should count a decompression bomb as a transport failure"
+        );
+    }
+
+    #[test]
+    fn after_send_timeout_is_a_transport_failure_not_a_cut_off() {
+        let fixture = DispatchFixture::new(vec![scripted("p", "p.example.com", "p.example.com")]);
+        fixture.client.time_out("p.example.com");
+
+        let outcomes = fixture.run(&["p"], 1_000, None, None);
+
+        assert!(
+            matches!(outcome_of(&outcomes, "p"), CallOutcome::TransportFailure),
+            "should count a missed after-send timeout as a transport failure"
+        );
+        assert_eq!(
+            fixture.backend.first_byte_timeouts(),
+            vec![Duration::from_millis(
+                ProviderSettings::default_after_send_timeout_ms()
+            )],
+            "should wait the after-send timeout for the first byte"
+        );
+    }
+
+    #[test]
+    fn hold_dispatch_cuts_off_a_call_the_budget_ran_out_on() {
+        let fixture = DispatchFixture::new(vec![
+            scripted("a", "a.example.com", "a.example.com"),
+            scripted("b", "b.example.com", "b.example.com"),
+            scripted("c", "c.example.com", "c.example.com"),
+        ]);
+        fixture.client.respond("a.example.com", 200, b"{}");
+        fixture.client.respond("b.example.com", 200, b"{}");
+        fixture.client.respond("c.example.com", 200, b"{}");
+        fixture
+            .client
+            .delay("a.example.com", Duration::from_millis(60));
+        fixture.client.time_out("c.example.com");
+
+        let outcomes = fixture.run(
+            &["a", "b", "c"],
+            1_000,
+            Some(Duration::from_millis(20)),
+            None,
+        );
+
+        assert!(
+            matches!(outcome_of(&outcomes, "a"), CallOutcome::Resolved(_)),
+            "should keep a response that arrived in flight"
+        );
+        assert!(
+            matches!(outcome_of(&outcomes, "b"), CallOutcome::HoldCutOff),
+            "should drop a call still pending when the budget ran out"
+        );
+        assert!(
+            matches!(outcome_of(&outcomes, "c"), CallOutcome::HoldCutOff),
+            "should drop a later call too, and a hold timeout is a cut off"
+        );
+        assert_eq!(
+            fixture.backend.first_byte_timeouts().len(),
+            3,
+            "should have sent all three before the budget ran out"
+        );
+    }
+
+    #[test]
+    fn hold_dispatch_with_no_budget_sends_nothing() {
+        let fixture = DispatchFixture::new(vec![scripted("p", "p.example.com", "p.example.com")]);
+        fixture.client.respond("p.example.com", 200, b"{}");
+
+        let outcomes = fixture.run(&["p"], 1_000, Some(Duration::ZERO), None);
+
+        assert!(
+            matches!(outcome_of(&outcomes, "p"), CallOutcome::HoldCutOff),
+            "should cut off a hold call with no budget left"
+        );
+        assert!(
+            fixture.client.sent_hosts().is_empty(),
+            "should send nothing"
+        );
+    }
+
+    #[test]
+    fn hold_dispatch_waits_the_smaller_of_the_hold_timeout_and_the_budget() {
+        let mut fixture =
+            DispatchFixture::new(vec![scripted("p", "p.example.com", "p.example.com")]);
+        fixture.settings.ec.identity.hold_budget_ms = 80;
+        fixture.client.respond("p.example.com", 200, b"{}");
+
+        fixture.run(&["p"], 1_000, Some(Duration::from_secs(10)), None);
+        fixture.run(&["p"], 1_000, Some(Duration::from_millis(30)), None);
+
+        let timeouts = fixture.backend.first_byte_timeouts();
+        assert_eq!(
+            timeouts[0],
+            Duration::from_millis(80),
+            "should wait the hold timeout when the budget is larger"
+        );
+        assert!(
+            timeouts[1] <= Duration::from_millis(30),
+            "should wait no longer than the remaining budget"
+        );
+    }
+
+    #[test]
+    fn burst_cap_skips_without_counting_a_failure() {
+        let fixture = DispatchFixture::new(vec![scripted("p", "p.example.com", "p.example.com")]);
+        fixture.client.respond("p.example.com", 200, b"{}");
+        let capped = RecordingLimiter::new(true, false);
+        let broken = RecordingLimiter::new(false, true);
+
+        let outcomes = fixture.run(&["p"], 1_000, None, Some(&capped));
+        assert!(
+            matches!(outcome_of(&outcomes, "p"), CallOutcome::BurstCapped),
+            "should report a burst-capped call"
+        );
+        assert!(
+            fixture.client.sent_hosts().is_empty(),
+            "should not send a burst-capped call"
+        );
+        let keys = capped.keys.lock().expect("should lock the keys");
+        assert!(
+            keys[0].starts_with("identity:p:") && !keys[0].contains(&"a".repeat(64)),
+            "should key the cap by provider and the keyed visitor hash, not the EC ID"
+        );
+        drop(keys);
+
+        let outcomes = fixture.run(&["p"], 1_000, None, Some(&broken));
+        assert!(
+            matches!(outcome_of(&outcomes, "p"), CallOutcome::NotDispatched),
+            "should not dispatch when the limiter cannot be read"
+        );
+        assert!(
+            fixture.client.sent_hosts().is_empty(),
+            "should not send when the limiter cannot be read"
+        );
+
+        let allowing = RecordingLimiter::new(false, false);
+        let outcomes = fixture.run(&["p"], 1_000, None, Some(&allowing));
+        assert!(
+            matches!(outcome_of(&outcomes, "p"), CallOutcome::Resolved(_)),
+            "should dispatch under the cap (control)"
+        );
+    }
+
+    #[test]
+    fn undeclared_read_is_an_input_failure_even_when_ignored() {
+        let fixture = DispatchFixture::new(vec![
+            ScriptedProvider::new("p", "p.example.com", "p.example.com", false)
+                .reading_undeclared_user_agent()
+                .into_provider(),
+        ]);
+        fixture.client.respond("p.example.com", 200, b"{}");
+
+        let outcomes = fixture.run(&["p"], 1_000, None, None);
+
+        assert!(
+            matches!(outcome_of(&outcomes, "p"), CallOutcome::InputFailure),
+            "should fail a provider that read an undeclared input, though it ignored the error"
+        );
+        assert!(
+            fixture.client.sent_hosts().is_empty(),
+            "should not send the call"
+        );
+    }
+
+    #[test]
+    fn generic_pull_dispatch_order_rotates_hourly() {
+        let generic =
+            |id: &str, host: &str| ScriptedProvider::new(id, host, host, true).into_provider();
+        let mut fixture = DispatchFixture::new(vec![
+            generic("gamma", "gamma.example.com"),
+            generic("alpha", "alpha.example.com"),
+            generic("beta", "beta.example.com"),
+            scripted("other", "other.example.com", "other.example.com"),
+        ]);
+        fixture.settings.ec.identity.max_concurrency = 1;
+        for host in ["alpha", "beta", "gamma", "other"] {
+            fixture
+                .client
+                .respond(&format!("{host}.example.com"), 200, b"{}");
+        }
+        let ids = ["other", "gamma", "beta", "alpha"];
+
+        fixture.run(&ids, 100, None, None);
+        fixture.run(&ids, 3_600, None, None);
+        fixture.run(&ids, 7_200, None, None);
+
+        let sent = fixture.client.sent_hosts();
+        assert_eq!(
+            sent,
+            [
+                "alpha.example.com",
+                "beta.example.com",
+                "gamma.example.com",
+                "other.example.com",
+                "beta.example.com",
+                "gamma.example.com",
+                "alpha.example.com",
+                "other.example.com",
+                "gamma.example.com",
+                "alpha.example.com",
+                "beta.example.com",
+                "other.example.com",
+            ],
+            "should sort generic pull by source, rotate the start each hour, and send other providers after"
         );
     }
 }

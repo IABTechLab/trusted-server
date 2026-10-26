@@ -410,8 +410,6 @@ impl<'a> ResolveInput<'a> {
     /// declared, so reading it is not an error of the provider, but it is
     /// unavailable (spec 4.4).
     #[must_use]
-    // Temporary: first used by a later identity task.
-    #[allow(dead_code)]
     pub(crate) fn new(
         descriptor: &'a ProviderDescriptor,
         kinds: BTreeMap<SourceDomain, ResolveKind>,
@@ -462,16 +460,12 @@ impl<'a> ResolveInput<'a> {
     /// Undeclared reads recorded so far. The coordinator logs them as
     /// `Config`, and the harness fails the test.
     #[must_use]
-    // Temporary: first used by a later identity task.
-    #[allow(dead_code)]
     pub(crate) fn recorded_errors(&self) -> Vec<Access> {
         self.undeclared.borrow().clone()
     }
 
     /// Whether a `state()` call failed to decode.
     #[must_use]
-    // Temporary: first used by a later identity task.
-    #[allow(dead_code)]
     pub(crate) fn state_decode_failed(&self) -> bool {
         *self.state_failed.borrow()
     }

@@ -380,8 +380,6 @@ impl Resolves {
 
     /// Hosts the provider may call.
     #[must_use]
-    // Temporary: first used by a later identity task.
-    #[allow(dead_code)]
     pub(crate) fn hosts(&self) -> &[String] {
         &self.hosts
     }
@@ -398,8 +396,6 @@ impl Resolves {
 
     /// Every input declared for any kind, needed or wanted.
     #[must_use]
-    // Temporary: first used by a later identity task.
-    #[allow(dead_code)]
     pub(crate) fn declared_inputs(&self) -> BTreeSet<Input> {
         let mut all = self.needs.clone();
         all.extend(self.wants.iter().copied());
@@ -411,8 +407,6 @@ impl Resolves {
 
     /// Inputs passed when available.
     #[must_use]
-    // Temporary: first used by a later identity task.
-    #[allow(dead_code)]
     pub(crate) fn wants(&self) -> &BTreeSet<Input> {
         &self.wants
     }
@@ -431,8 +425,6 @@ impl Resolves {
 
     /// Whether the provider receives the full EC ID.
     #[must_use]
-    // Temporary: first used by a later identity task.
-    #[allow(dead_code)]
     pub(crate) fn gets_ec_id(&self) -> bool {
         self.ec_id
     }

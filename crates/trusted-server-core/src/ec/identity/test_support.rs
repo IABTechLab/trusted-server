@@ -311,3 +311,317 @@ impl IdentityProvider for DescriptorOnly {
         &self.0
     }
 }
+
+/// A fake HTTP client, backend and provider for dispatch tests.
+#[cfg(test)]
+pub(crate) mod fake_http {
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use error_stack::Report;
+
+    use crate::ec::identity::descriptor::{ConsentPolicy, ProviderDescriptor, Resolves};
+    use crate::ec::identity::exchange::{ProviderRequest, ProviderResponse};
+    use crate::ec::identity::input::ResolveInput;
+    use crate::ec::identity::provider::IdentityProvider;
+    use crate::ec::identity::resolution::{IdentityProviderError, Resolution};
+    use crate::platform::test_support::{NoopConfigStore, NoopGeo, NoopSecretStore};
+    use crate::platform::{
+        BackendNamingPolicy, ClientInfo, PlatformBackend, PlatformBackendSpec, PlatformError,
+        PlatformHttpClient, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
+        PlatformSelectResult, RuntimeServices,
+    };
+
+    /// What the fake does for one host.
+    #[derive(Clone)]
+    enum Route {
+        Respond {
+            status: u16,
+            headers: Vec<(String, String)>,
+            body: Vec<u8>,
+        },
+        Fail,
+    }
+
+    struct FakePending {
+        host: String,
+        route: Route,
+        delay: Duration,
+    }
+
+    /// An HTTP client that answers per host, and records what it was sent.
+    pub(crate) struct FakeHttpClient {
+        routes: Mutex<BTreeMap<String, Route>>,
+        delays: Mutex<BTreeMap<String, Duration>>,
+        sent: Mutex<Vec<String>>,
+    }
+
+    impl FakeHttpClient {
+        pub(crate) fn new() -> Self {
+            Self {
+                routes: Mutex::new(BTreeMap::new()),
+                delays: Mutex::new(BTreeMap::new()),
+                sent: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// Answers `host` with `status` and `body`.
+        pub(crate) fn respond(&self, host: &str, status: u16, body: &[u8]) {
+            self.respond_with_headers(host, status, body, &[]);
+        }
+
+        /// Answers `host` with `status`, `headers` and `body`.
+        pub(crate) fn respond_with_headers(
+            &self,
+            host: &str,
+            status: u16,
+            body: &[u8],
+            headers: &[(&str, &str)],
+        ) {
+            let route = Route::Respond {
+                status,
+                headers: headers
+                    .iter()
+                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                    .collect(),
+                body: body.to_vec(),
+            };
+            self.routes
+                .lock()
+                .expect("should lock the routes")
+                .insert(host.to_owned(), route);
+        }
+
+        /// Makes the wait for `host` fail, as a first-byte timeout does.
+        pub(crate) fn time_out(&self, host: &str) {
+            self.routes
+                .lock()
+                .expect("should lock the routes")
+                .insert(host.to_owned(), Route::Fail);
+        }
+
+        /// Makes the wait for `host` take `delay` of wall-clock time.
+        pub(crate) fn delay(&self, host: &str, delay: Duration) {
+            self.delays
+                .lock()
+                .expect("should lock the delays")
+                .insert(host.to_owned(), delay);
+        }
+
+        /// The hosts requests were sent to, in order.
+        pub(crate) fn sent_hosts(&self) -> Vec<String> {
+            self.sent
+                .lock()
+                .expect("should lock the sent hosts")
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl PlatformHttpClient for FakeHttpClient {
+        async fn send(
+            &self,
+            _request: PlatformHttpRequest,
+        ) -> Result<PlatformResponse, Report<PlatformError>> {
+            Err(Report::new(PlatformError::Unsupported))
+        }
+
+        async fn send_async(
+            &self,
+            request: PlatformHttpRequest,
+        ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
+            let host = request.request.uri().host().unwrap_or_default().to_owned();
+            self.sent
+                .lock()
+                .expect("should lock the sent hosts")
+                .push(host.clone());
+            let route = self
+                .routes
+                .lock()
+                .expect("should lock the routes")
+                .get(&host)
+                .cloned()
+                .ok_or_else(|| Report::new(PlatformError::HttpClient))?;
+            let delay = self
+                .delays
+                .lock()
+                .expect("should lock the delays")
+                .get(&host)
+                .copied()
+                .unwrap_or_default();
+            Ok(PlatformPendingRequest::new(FakePending {
+                host,
+                route,
+                delay,
+            }))
+        }
+
+        async fn select(
+            &self,
+            mut pending_requests: Vec<PlatformPendingRequest>,
+        ) -> Result<PlatformSelectResult, Report<PlatformError>> {
+            if pending_requests.is_empty() {
+                return Err(Report::new(PlatformError::HttpClient));
+            }
+            let first = pending_requests.remove(0);
+            let ready = self.wait(first).await;
+            Ok(PlatformSelectResult {
+                ready,
+                remaining: pending_requests,
+                failed_backend_name: None,
+            })
+        }
+
+        async fn wait(
+            &self,
+            pending: PlatformPendingRequest,
+        ) -> Result<PlatformResponse, Report<PlatformError>> {
+            let pending = pending
+                .downcast::<FakePending>()
+                .map_err(|_| Report::new(PlatformError::HttpClient))?;
+            if !pending.delay.is_zero() {
+                std::thread::sleep(pending.delay);
+            }
+            match pending.route {
+                Route::Fail => Err(Report::new(PlatformError::HttpClient)),
+                Route::Respond {
+                    status,
+                    headers,
+                    body,
+                } => {
+                    let mut builder = edgezero_core::http::response_builder().status(status);
+                    for (name, value) in headers {
+                        builder = builder.header(name, value);
+                    }
+                    let response = builder
+                        .body(edgezero_core::body::Body::from(body))
+                        .map_err(|_| Report::new(PlatformError::HttpClient))?;
+                    Ok(PlatformResponse::new(response).with_backend_name(pending.host))
+                }
+            }
+        }
+    }
+
+    /// A backend named after its host, that records each spec it is given.
+    pub(crate) struct FakeBackend {
+        specs: Mutex<Vec<PlatformBackendSpec>>,
+    }
+
+    impl FakeBackend {
+        pub(crate) fn new() -> Self {
+            Self {
+                specs: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// The first-byte timeouts the backends were registered with, in order.
+        pub(crate) fn first_byte_timeouts(&self) -> Vec<Duration> {
+            self.specs
+                .lock()
+                .expect("should lock the specs")
+                .iter()
+                .map(|spec| spec.first_byte_timeout)
+                .collect()
+        }
+    }
+
+    impl PlatformBackend for FakeBackend {
+        fn naming_policy(&self) -> BackendNamingPolicy {
+            BackendNamingPolicy::Axum
+        }
+
+        fn predict_name(
+            &self,
+            spec: &PlatformBackendSpec,
+        ) -> Result<String, Report<PlatformError>> {
+            Ok(spec.host.clone())
+        }
+
+        fn ensure(&self, spec: &PlatformBackendSpec) -> Result<String, Report<PlatformError>> {
+            self.specs
+                .lock()
+                .expect("should lock the specs")
+                .push(spec.clone());
+            Ok(spec.host.clone())
+        }
+    }
+
+    /// Services that send through `client` and register backends in `backend`.
+    pub(crate) fn fake_services(
+        client: &Arc<FakeHttpClient>,
+        backend: &Arc<FakeBackend>,
+    ) -> RuntimeServices {
+        RuntimeServices::builder()
+            .config_store(Arc::new(NoopConfigStore))
+            .secret_store(Arc::new(NoopSecretStore))
+            .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+            .backend(backend.clone())
+            .http_client(client.clone())
+            .geo(Arc::new(NoopGeo))
+            .client_info(ClientInfo::default())
+            .build()
+    }
+
+    /// A resolver that calls its endpoint and answers `no_match` to a 2xx.
+    pub(crate) struct ScriptedProvider {
+        descriptor: ProviderDescriptor,
+        reads_user_agent: bool,
+    }
+
+    impl ScriptedProvider {
+        /// A provider `id` calling `host`, claiming `source`. With `generic`
+        /// it is a generic pull provider.
+        pub(crate) fn new(id: &str, host: &str, source: &str, generic: bool) -> Self {
+            let mut resolves = Resolves::new().with_endpoint(&format!("https://{host}/resolve"));
+            if generic {
+                resolves = resolves.with_ec_id();
+            }
+            let descriptor =
+                ProviderDescriptor::builder(id.parse().expect("should parse the provider ID"))
+                    .with_source(source.parse().expect("should parse the source"))
+                    .with_resolves(resolves)
+                    .with_consent_policy(ConsentPolicy::eid_persistence_only())
+                    .build()
+                    .expect("should build the descriptor");
+            Self {
+                descriptor,
+                reads_user_agent: false,
+            }
+        }
+
+        /// Reads `user_agent()` without declaring it, and ignores the error.
+        pub(crate) fn reading_undeclared_user_agent(mut self) -> Self {
+            self.reads_user_agent = true;
+            self
+        }
+
+        pub(crate) fn into_provider(self) -> Arc<dyn IdentityProvider> {
+            Arc::new(self)
+        }
+    }
+
+    impl IdentityProvider for ScriptedProvider {
+        fn descriptor(&self) -> &ProviderDescriptor {
+            &self.descriptor
+        }
+
+        fn request(
+            &self,
+            input: &ResolveInput<'_>,
+        ) -> Result<Option<ProviderRequest>, Report<IdentityProviderError>> {
+            if self.reads_user_agent {
+                let _ = input.user_agent().ok();
+            }
+            Ok(Some(ProviderRequest::get(input.endpoint()?)))
+        }
+
+        fn response(
+            &self,
+            response: &ProviderResponse,
+            _input: &ResolveInput<'_>,
+        ) -> Result<Resolution, Report<IdentityProviderError>> {
+            response.success_text().map(|_| Resolution::no_match())
+        }
+    }
+}

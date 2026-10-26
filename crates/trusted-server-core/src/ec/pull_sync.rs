@@ -9,7 +9,7 @@
 //! the entry no longer stores per-partner sync timestamps.
 
 use edgezero_core::body::Body as EdgeBody;
-use http::{Method, StatusCode, header};
+use http::{Method, StatusCode};
 use serde::Deserialize;
 use url::Url;
 
@@ -21,6 +21,7 @@ use crate::platform::{
 use crate::settings::Settings;
 
 use super::generation::{ec_hash, is_valid_ec_id};
+use super::identity::coordinator::{Waited, buffered_body, drain_in_flight};
 use super::kv::{KvIdentityGraph, PartnerIdUpdate};
 use super::kv_types::KvEntry;
 use super::rate_limiter::RateLimiter;
@@ -44,11 +45,6 @@ impl PullSyncContext {
     pub fn ec_id(&self) -> &str {
         &self.ec_id
     }
-}
-
-struct InFlightPull {
-    source_domain: String,
-    pending: PlatformPendingRequest,
 }
 
 #[derive(Debug, Deserialize)]
@@ -182,7 +178,7 @@ pub fn dispatch_pull_sync(
     }
 
     let max_concurrency = settings.ec.identity.max_concurrency.max(1);
-    let mut in_flight: Vec<InFlightPull> = Vec::new();
+    let mut in_flight: Vec<(String, PlatformPendingRequest)> = Vec::new();
     let mut updates = Vec::new();
 
     for partner in pull_partners {
@@ -271,10 +267,7 @@ pub fn dispatch_pull_sync(
             }
         };
 
-        in_flight.push(InFlightPull {
-            source_domain: partner.source_domain.clone(),
-            pending,
-        });
+        in_flight.push((partner.source_domain.clone(), pending));
 
         if in_flight.len() >= max_concurrency {
             drain_pull_batch(&mut in_flight, services, &mut updates);
@@ -375,25 +368,16 @@ fn pull_rate_limit_key(source_domain: &str, ec_id: &str) -> String {
 }
 
 fn drain_pull_batch(
-    in_flight: &mut Vec<InFlightPull>,
+    in_flight: &mut Vec<(String, PlatformPendingRequest)>,
     services: &RuntimeServices,
     updates: &mut Vec<PartnerIdUpdate>,
 ) {
-    for pending in in_flight.drain(..) {
-        let source_domain = pending.source_domain;
-        // All requests were dispatched up front via send_async, so waiting on
-        // each in turn does not change concurrency.
-        let response =
-            match futures::executor::block_on(services.http_client().wait(pending.pending)) {
-                Ok(response) => response,
-                Err(err) => {
-                    log::warn!(
-                        "Pull sync: request failed for partner '{}': {err:?}",
-                        source_domain
-                    );
-                    continue;
-                }
-            };
+    // All requests were dispatched up front via send_async, so waiting on
+    // each in turn does not change concurrency.
+    for (source_domain, waited) in drain_in_flight(in_flight, services, || true) {
+        let Waited::Response(response) = waited else {
+            continue;
+        };
 
         let Some(uid) = extract_pull_uid(response, &source_domain) else {
             continue;
@@ -408,39 +392,6 @@ fn drain_pull_batch(
 /// The expected response is `{"uid":"<string>"}`, so 64 KiB is generous.
 /// This prevents a misbehaving partner from exhausting WASM memory.
 const MAX_PULL_RESPONSE_BYTES: usize = 64 * 1024;
-
-fn response_content_length_exceeds_limit(response: &PlatformResponse, source_domain: &str) -> bool {
-    let Some(value) = response.response.headers().get(header::CONTENT_LENGTH) else {
-        return false;
-    };
-
-    let Some(value) = value.to_str().ok() else {
-        log::warn!(
-            "Pull sync: partner '{}' returned invalid Content-Length header, rejecting",
-            source_domain
-        );
-        return true;
-    };
-
-    let Ok(length) = value.parse::<usize>() else {
-        log::warn!(
-            "Pull sync: partner '{}' returned malformed Content-Length header, rejecting",
-            source_domain
-        );
-        return true;
-    };
-
-    if length > MAX_PULL_RESPONSE_BYTES {
-        log::warn!(
-            "Pull sync: partner '{}' returned oversized Content-Length ({} bytes), rejecting",
-            source_domain,
-            length
-        );
-        return true;
-    }
-
-    false
-}
 
 fn extract_pull_uid(response: PlatformResponse, source_domain: &str) -> Option<String> {
     let status = response.response.status();
@@ -462,23 +413,7 @@ fn extract_pull_uid(response: PlatformResponse, source_domain: &str) -> Option<S
         return None;
     }
 
-    if response_content_length_exceeds_limit(&response, source_domain) {
-        return None;
-    }
-
-    let body = response
-        .response
-        .into_body()
-        .into_bytes()
-        .unwrap_or_default();
-    if body.len() > MAX_PULL_RESPONSE_BYTES {
-        log::warn!(
-            "Pull sync: partner '{}' returned oversized response ({} bytes), rejecting",
-            source_domain,
-            body.len()
-        );
-        return None;
-    }
+    let (_, body) = buffered_body(response, MAX_PULL_RESPONSE_BYTES, source_domain)?;
     let payload = match serde_json::from_slice::<PullSyncResponse>(&body) {
         Ok(payload) => payload,
         Err(err) => {
@@ -522,6 +457,7 @@ mod tests {
     use crate::platform::PlatformResponse;
     use crate::redacted::Redacted;
     use crate::test_support::tests::purpose_one_only_consent;
+    use http::header;
 
     fn make_response(status: u16, body: &[u8]) -> PlatformResponse {
         PlatformResponse::new(

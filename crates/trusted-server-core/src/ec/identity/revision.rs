@@ -148,8 +148,6 @@ pub(crate) fn push_hashes(list: &mut Vec<String>, hashes: Vec<String>) {
 
 /// The per-visitor rate-limit key component, from the full EC ID.
 #[must_use]
-// Temporary: first used by a later identity task.
-#[allow(dead_code)]
 pub(crate) fn visitor_key(keys: &IdentityKeys, ec_id: &str) -> String {
     let mut mac = HmacSha256::new_from_slice(&keys.visitor).expect("should accept a 32-byte key");
     mac.update(ec_id.as_bytes());
