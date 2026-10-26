@@ -713,6 +713,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
                 }
                 let mut ec_context = build_ec_context(&s.settings, &services, &req);
                 let auction = AuctionDispatch {
+                    integration_registry: &s.registry,
                     orchestrator: &s.orchestrator,
                     slots: s.settings.creative_opportunity_slots(),
                     registry: None,
@@ -836,6 +837,7 @@ fn build_router(state: &Arc<AppState>) -> RouterService {
             } else {
                 let mut ec_context = build_ec_context(&state.settings, &services, &req);
                 let auction = AuctionDispatch {
+                    integration_registry: &state.registry,
                     orchestrator: &state.orchestrator,
                     slots: state.settings.creative_opportunity_slots(),
                     registry: None,

@@ -83,35 +83,48 @@ fn parse_bind_address(
     port: Option<&std::ffi::OsStr>,
     adapter_port: Option<&std::ffi::OsStr>,
 ) -> Result<std::net::SocketAddr, String> {
-    let [host, port, adapter_port] = [host, port, adapter_port].map(|value| {
+    let [host, port, adapter_port] = [
+        ("EDGEZERO__ADAPTER__HOST", host),
+        ("PORT", port),
+        ("EDGEZERO__ADAPTER__PORT", adapter_port),
+    ]
+    .map(|(name, value)| {
         value
             .map(|value| {
                 value
                     .to_str()
-                    .ok_or_else(|| "Runtime bind values must be Unicode".to_owned())
+                    .ok_or_else(|| format!("{name} must be Unicode; startup refused"))
             })
             .transpose()
     });
     let host = host?;
     let port = port?;
     let adapter_port = adapter_port?;
+    for (name, value) in [("PORT", port), ("EDGEZERO__ADAPTER__PORT", adapter_port)] {
+        if let Some(value) = value
+            && !resolve_bind_addr(None, Some(value), None, None)
+                .warnings
+                .is_empty()
+        {
+            return Err(format!(
+                "{name}={value:?} must be a port in 1–65535; startup refused"
+            ));
+        }
+    }
     let primary = resolve_bind_addr(host, adapter_port.or(port), None, None);
     if !primary.warnings.is_empty() {
         return Err(format!(
-            "Runtime bind address must use a valid IP and port 1–65535: {}",
-            primary.warnings.join("; ")
+            "EDGEZERO__ADAPTER__HOST={:?} must be a valid IP address; startup refused",
+            host.unwrap_or_default()
         ));
     }
     if let Some(port) = port {
         let legacy = resolve_bind_addr(None, Some(port), None, None);
-        if !legacy.warnings.is_empty() {
-            return Err(format!(
-                "PORT must be 1–65535: {}",
-                legacy.warnings.join("; ")
-            ));
-        }
         if legacy.addr.port() != primary.addr.port() {
-            return Err("PORT and EDGEZERO__ADAPTER__PORT must agree when both are set".to_owned());
+            return Err(
+                "PORT and EDGEZERO__ADAPTER__PORT must agree when both are set; startup refused"
+                    .to_owned(),
+            );
         }
     }
     Ok(primary.addr)
@@ -219,6 +232,55 @@ mod tests {
             parse_bind_address(None, Some(port), Some(std::ffi::OsStr::from_bytes(b"\xff")))
                 .is_err(),
             "should reject non-Unicode adapter port"
+        );
+    }
+
+    #[test]
+    fn bind_address_errors_identify_the_input_and_refuse_startup() {
+        for invalid in ["0", "invalid", "65536"] {
+            let invalid = std::ffi::OsStr::new(invalid);
+            let valid = std::ffi::OsStr::new("8080");
+            for (legacy, adapter, variable) in [
+                (Some(invalid), None, "PORT"),
+                (None, Some(invalid), "EDGEZERO__ADAPTER__PORT"),
+                (Some(invalid), Some(valid), "PORT"),
+                (Some(valid), Some(invalid), "EDGEZERO__ADAPTER__PORT"),
+            ] {
+                let error = parse_bind_address(None, legacy, adapter)
+                    .expect_err("should refuse invalid ports");
+                assert!(
+                    error.contains(&format!("{variable}=")),
+                    "should identify the invalid input: {error}"
+                );
+                if variable == "PORT" {
+                    assert!(
+                        !error.contains("EDGEZERO__ADAPTER__PORT"),
+                        "should not attribute legacy PORT to the adapter variable: {error}"
+                    );
+                }
+                assert!(
+                    error.contains("startup refused"),
+                    "should state refusal: {error}"
+                );
+                assert!(
+                    !error.contains("falling back"),
+                    "should not promise fallback: {error}"
+                );
+            }
+        }
+        let error = parse_bind_address(Some(std::ffi::OsStr::new("localhost")), None, None)
+            .expect_err("should refuse a hostname");
+        assert!(
+            error.contains("EDGEZERO__ADAPTER__HOST="),
+            "should identify the host input"
+        );
+        assert!(
+            error.contains("startup refused"),
+            "should state host refusal"
+        );
+        assert!(
+            !error.contains("falling back"),
+            "should not promise host fallback"
         );
     }
 

@@ -7,6 +7,14 @@ license = { workspace = true }
 publish = { workspace = true }
 version = { workspace = true }
 
+[features]
+html-eof-runtime = []
+
+[[test]]
+name = "html_eof_runtime"
+path = "tests/html_eof_runtime.rs"
+required-features = ["html-eof-runtime"]
+
 [[test]]
 name = "integration"
 path = "tests/integration.rs"
@@ -29,11 +37,13 @@ trusted-server-core = { workspace = true, features = ["test-utils"] }
 [dev-dependencies]
 async-trait = { workspace = true }
 axum = { workspace = true }
+base64 = { workspace = true }
 bytes = { workspace = true }
 derive_more = { workspace = true }
 edgezero-adapter-axum = { workspace = true, features = ["axum"] }
 env_logger = { workspace = true }
 error-stack = { workspace = true }
+futures = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
 libc = { workspace = true }
@@ -41,7 +51,8 @@ log = { workspace = true }
 reqwest = { workspace = true, features = ["blocking", "cookies"] }
 scraper = { workspace = true }
 testcontainers = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["net", "rt-multi-thread", "signal"] }
 tower = { workspace = true, features = ["util"] }
 trusted-server-adapter-axum = { path = "../trusted-server-adapter-axum" }
 trusted-server-adapter-cloudflare = { path = "../trusted-server-adapter-cloudflare" }
