@@ -1365,7 +1365,7 @@ A module with settings of its own reads them from its own block, `[robots-txt.<n
 1. With `refuse_all` selected the file is the refusal and nothing else, whatever else is selected, and every response the deployment finalizes carries `X-Robots-Tag: noindex, nofollow`.
 2. A path in `always_allow` stays open to every crawler a module's rules refuse the whole site to, `*` included. A narrower rule is kept as the module gave it, so `Disallow: /ads` still closes off `/ads.txt`.
 3. The rules appear in the order `modules` names them, between `top_text` above and the `Sitemap` line and `bottom_text` below.
-4. A module is asked for the host the request was addressed to, never one that `Forwarded` or `X-Forwarded-Host` names, and is given nothing of the crawler's connection. Holding is the normal case. A module's answer is held for that host in the loading cache of the one loading cache module the build links, or of the module `[cache.robots-txt]` names, briefly in memory and in the shared store outside it, so a module is asked again only when no copy young enough is held, rather than by every request, and `[cache.robots-txt]` sets how long the copies last, as described under [Loading caches](#loading-caches). The last answer is also kept apart for 30 days, in the value cache on Fastly and in the key-value store on Cloudflare and Spin, and Axum, which has no key-value store, keeps none. A value cache can drop an entry early, so on Fastly an answer past its age is likely, rather than certain, to be there when a module cannot answer.
+4. A module is asked for the host the request was addressed to, never one that `Forwarded` or `X-Forwarded-Host` names, and is given nothing of the crawler's connection. Holding is the normal case. A module's answer is held for that host in the loading cache of the one loading cache module the build links, or of the module `[cache.robots-txt]` names, briefly in memory and in the shared store outside it, so a module is asked again only when no copy young enough is held, rather than by every request, and `[cache.robots-txt]` sets how long the copies last, as described under [Loading caches](#loading-caches). The last answer is also kept apart for 30 days, in the value cache on Fastly and in the key-value store on Cloudflare and Spin. Axum persists it in the runtime KV file when `TRUSTED_SERVER_KV_PATH` is set; with the variable unset, it keeps no persistent fallback. A value cache can drop an entry early, so on Fastly an answer past its age is likely, rather than certain, to be there when a module cannot answer.
 5. A module that cannot answer has its last answer served past its age. With no answer kept at all, or with no rule anywhere in the file, the file is `503` with `Retry-After: 600`, never an empty file, which a crawler would read as permission to crawl everything. Select `allow_all` to allow every crawler.
 6. Spin's key-value store gives an entry no lifetime, so there a kept answer stays until it is replaced, and one kept for settings that have since changed stays until it is deleted from the store. With no loading cache module linked, or several linked and none named in `[cache.robots-txt]`, no copy is held, so every request for the file asks each module, and a deployment whose key-value store cannot be opened keeps no last answer either.
 7. The file is made by the `robots_txt` middleware, which runs on `text/plain` at `/robots.txt` alone, in the phase the entry places it in, prepares the file before the document is processed, and replaces the origin's `text/plain` file with it. The origin is asked for its whole file, without a crawler's conditional or range headers. Any other answer to a `GET` or `HEAD`, such as a `404`, a page from a single-page application's catch-all, a redirect or a `401` from a staging site behind a login, has the file made in its place with status `200`. An origin that cannot be reached gives `502`, which a crawler reads as refusing everything. The response takes the deployment's cache policy for the path, as every file does, so where the response is stored a module is asked only when the stored copy has ended, however soon its refresh is due. A refusal, as in point 5, is answered before any document is processed, and nothing is stored.
@@ -2095,8 +2095,10 @@ build their state for each request. The copy in the shared store is the one
 every instance reads. The shared store is the host's value cache where
 it supplies one, being Fastly's cache, and its key-value store otherwise, being
 the `TRUSTED_SERVER_KV` namespace on Cloudflare and the `default` store on
-Spin. Axum has neither, so there the memory copy is the only one. A
-copy in the shared store goes when its lifetime ends, or sooner when no request
+Spin. Axum uses the persistent redb file named by `TRUSTED_SERVER_KV_PATH`
+when set; loading caches and Encypher share that runtime store. With the variable
+unset, Axum holds only the in-memory copy. A copy in the shared store goes when
+its lifetime ends, or sooner when no request
 has used it for the idle time, and an answer with a shorter lifetime of its own
 ends sooner still. Every key starts with `ts.` and the publisher's domain, with
 a leading `www.` dropped, so publishers sharing a store never share a copy.
@@ -2397,6 +2399,17 @@ generated configuration places it in.
 | `51degrees.client_hints`      | `[[serve]]` | Asks the 51Degrees service which client hints the reader's browser can send, writes `Accept-CH` and `Critical-CH` unless the browser already sends those hints, `Permissions-Policy` on the response and the `Delegate-CH` tag in the head for that list, and leaves the names in the request's state                                                             |
 | `robots_txt`                  | `[[fetch]]` | Makes the `robots.txt` that `[robots-txt]` describes, in place of whatever the origin answers, on `text/plain` and at `/robots.txt` alone                                                                                                                                                                                                                         |
 | `service_version`             | `[[serve]]` | Writes `X-TS-Version`, the git version the build compiled in, and `X-TS-Service-Version`, the platform's version number of the service, when each is known. Core supplies it, so no section selects it                                                                                                                                                            |
+
+Encypher identifies a reusable signing plan by canonical article text, policy
+and credential context. Page URL and title are deliberately not part of that
+identity: the matching service deduplicates equal canonical text, so a reused
+manifest can retain the first canonical source URL. Configure the middleware
+only where that content identity is correct for the publisher.
+
+`max_document_bytes` also bounds the final signed HTML. The module counts
+inserted marker bytes and the escaped manifest meta element before allocating
+the rendered page; a plan that would cross the bound leaves the original page
+unchanged.
 
 An entry that could not do what it says refuses the configuration, both when
 a deployment is validated and when the settings load. That is a media type

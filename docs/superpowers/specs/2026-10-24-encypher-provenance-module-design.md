@@ -31,8 +31,10 @@ to move onto those interfaces, and the core seams it needs have to be neutral.
    path is removed, so no path silently skips a finish. A finish that outlives
    its deadline on a runtime with a timer is dropped and the held bytes go on.
 2. **`PlatformTimer`**, optional on `RuntimeServices`. The Cloudflare, Spin and
-   Axum adapters provide one; a runtime whose host calls block the guest
-   provides none, and work there is bounded by transport timeouts.
+   Axum adapters provide one. Fastly provides none: its backend setting bounds
+   the first byte and each between-byte gap, not total elapsed work. A peer can
+   keep a request open beyond `max_hold_ms` by sending each byte before the gap
+   timeout, and Fastly KV calls have no module deadline.
 3. **Response facts for middleware.** `MiddlewareContext` carries the
    response `status` and `origin_private`, whether the origin marked its
    response as one reader's by a cookie or a `Cache-Control` that forbids
@@ -42,6 +44,16 @@ to move onto those interfaces, and the core seams it needs have to be neutral.
    `TRUSTED_SERVER_KV_PATH`, running each operation on the blocking pool so a
    timer raced against it can fire. Cloudflare and Spin already open their
    declared store on the stack and are unchanged.
+5. **An optional outbound response-body bound.** A caller can ask every
+   adapter to reject a response before buffering or yielding more than a
+   chosen byte count. Axum reads reqwest chunks, Cloudflare reads its
+   `ByteStream`, Spin reads `IncomingBodyExt::stream`, and Fastly reads
+   `fastly::Body`. Axum, Cloudflare and Spin can inspect a transport or
+   host-created chunk only after that one chunk exists, but none collects the
+   complete response before enforcing the bound. Spin applies the same limit
+   to gzip and Brotli output.
+   Fastly preserves the limit on a direct pending wait and refuses bounded
+   handles through `select`, whose host API does not preserve wrapper metadata.
 
 ### 2.2 The module
 
@@ -54,10 +66,22 @@ to move onto those interfaces, and the core seams it needs have to be neutral.
   of the chain by `handles_path`.
 - **Create** returns a stream processor that holds the document up to
   `max_document_bytes`, and signs in its asynchronous finish: policy digest,
-  plan cache, sign call, cache writes, render. Every failure emits the held
-  document unchanged.
+  plan cache, sign call, cache writes, render. Before allocating rendered
+  output, it checks the exact marker and escaped manifest expansion against
+  the same bound. Every failure emits the held document unchanged.
 - **Serve phase only**, so a failed signing is never stored as the shared
   template every reader receives.
+- **Cache integrity** keeps positive plans and policy digests apart from
+  negative results, reads a positive first, and uses versioned namespaces:
+  `encypher:plan:v4:`, `encypher:plan-skip:v4:`,
+  `encypher:policy:v3:` and `encypher:policy-skip:v3:`. Malformed or
+  structurally invalid entries are deleted best effort. An alignment failure
+  for one HTML representation does not delete a valid plan.
+- **Content identity** remains the policy digest, credential context and
+  canonical article-text hash, not the page URL. The matching Encypher server
+  contract deliberately deduplicates equal canonical text across URL or title
+  changes. A reused plan's manifest URL can therefore retain the first
+  canonical source URL.
 
 ### 2.3 Permission contract
 
@@ -103,14 +127,18 @@ middleware = ["provenance.encypher"]
   an auction takes the chunk pipeline; the parser-confirmed auction hold
   injects bids before `</body>` into a document a middleware processor held
   and finished asynchronously.
-- Module: the request gates, the cache, policy and sign flows and their
-  failure codes (ported), configuration bounds, the missing-entry refusal, the
-  path exclusions, and the publisher path signing an article through both the
-  buffered and the streaming finalizer, against a stub origin and a stub API,
-  while sending the address without its query, and never sending a page the
-  origin marked private.
+- Module: the request gates, policy and sign flows, credential-bound cache
+  bypass, positive/negative cache races, malformed-entry recovery, output
+  expansion at the buffered publisher limit, configuration bounds, the
+  missing-entry refusal, path exclusions, and publisher-path signing through
+  both the buffered and streaming finalizer against a stub origin and API. The
+  tests also verify the address without its query and the private-page gate.
 - Adapters: the Fastly store opens when linked; Axum KV persists and the
-  timer fires while other work is pending.
+  timer fires while other work is pending. Core's test client rejects an
+  over-limit body on direct and asynchronous sends. All four adapter
+  collectors exercise exact-limit and over-limit bodies; Axum uses a chunked
+  TCP response, Cloudflare and Spin use multi-chunk host-stream equivalents,
+  and Fastly covers buffered reads and a crossing chunk yielded by a stream.
 
 ### 4.1 Runtime smoke
 
@@ -130,13 +158,15 @@ available, to exercise fail-open. Successful signing is tested in process
 only, by the publisher-path tests above against a stub API. The live Encypher
 API was not exercised.
 
-## 5. Open questions
+## 5. Limits and operator obligations
 
-1. Spin's declared KV store is `default`, which also holds the settings. The
-   module's keys are namespaced (`encypher:v3:`, `encypher:policy:v2:`), but a
-   dedicated label would separate them.
+1. Spin's declared KV store is `default`, which also holds the settings.
+   Encypher entries have the four exact namespaces above. Spin KV supplies no
+   TTL, so `expires_at` prevents stale reads and on-read deletion removes
+   encountered stale entries, but abandoned content keys need the
+   namespace-retirement procedure in the Spin deployment guide.
 2. Holding the page delays its first byte by the signing time on a cache miss.
-   `max_hold_ms` bounds it where a timer exists; on a runtime without one,
-   `timeout_ms` bounds each call.
+   `max_hold_ms` is a total module bound on Cloudflare, Spin and Axum. Fastly
+   has only first-byte and between-byte transport bounds, as described above.
 3. The module skips pages the origin marks private, but cannot detect other
    personalized pages. A deployment places it on public article routes.

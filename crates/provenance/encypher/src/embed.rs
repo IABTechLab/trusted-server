@@ -1,23 +1,15 @@
-use std::sync::LazyLock;
-
-use regex::Regex;
-
 use super::api::EmbeddingPlan;
 use super::boundary::Boundary;
-use super::text::{
-    assemble_text, decode_html_entities, extract_fragments, is_js_whitespace, structural_close_tag,
-};
+use super::text::visit_canonical_text;
 
 const MAGIC_PREFIX: &str = "\u{e01df}\u{e01e0}\u{e01e1}\u{e01e2}";
+const MANIFEST_META_PREFIX: &str = r#"<meta name="c2pa-manifest-url" content=""#;
+const MANIFEST_META_SUFFIX: &str = r#"">"#;
 
-static MANIFEST_META: LazyLock<Option<Regex>> = LazyLock::new(|| {
-    Regex::new(r#"(?i)<meta\s+[^>]*name\s*=\s*['"]c2pa-manifest-url['"][^>]*>"#).ok()
-});
-
-struct MappedChar {
-    ch: char,
-    start: usize,
-    end: usize,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApplyError {
+    Alignment,
+    TooLarge,
 }
 
 /// Reports whether a string contains the four-character Encypher magic prefix.
@@ -26,213 +18,140 @@ pub fn has_existing_markers(s: &str) -> bool {
     s.contains(MAGIC_PREFIX)
 }
 
-/// Reports whether HTML already declares a C2PA manifest URL meta element.
-#[must_use]
-pub fn has_manifest_meta(html: &str) -> bool {
-    MANIFEST_META
-        .as_ref()
-        .is_some_and(|regex| regex.is_match(html))
-}
-
-/// Applies a codepoint embedding plan within an article boundary.
+/// Applies a codepoint embedding plan and optional manifest insertion in one
+/// exact-capacity output allocation.
 ///
-/// The plan must already have passed [`super::api::validate_plan`]; markers are
-/// inserted verbatim. Returns `None` when the boundary has no visible text, an
-/// index has no text position, or text-to-byte alignment fails.
-#[must_use]
-pub fn apply_plan(html: &str, boundary: &Boundary, plan: &EmbeddingPlan) -> Option<String> {
-    let boundary_html = html.get(boundary.start..boundary.end)?;
-    let fragments = extract_fragments(boundary_html);
-    let visible = assemble_text(boundary_html, &fragments);
-    let visible_chars: Vec<char> = visible.chars().collect();
-    if visible_chars.is_empty() {
-        return None;
+/// The plan must already have passed [`super::api::validate_plan`]. At an
+/// equal source offset, plan markers precede the manifest in plan order.
+pub(crate) fn apply_plan(
+    html: &str,
+    boundary: &Boundary,
+    plan: &EmbeddingPlan,
+    manifest: Option<(&str, usize)>,
+    max_output_bytes: usize,
+) -> Result<String, ApplyError> {
+    let marker_bytes = plan
+        .operations
+        .iter()
+        .try_fold(0usize, |total, operation| {
+            total.checked_add(operation.marker.len())
+        })
+        .ok_or(ApplyError::TooLarge)?;
+    let manifest_bytes = manifest
+        .map_or(Some(0), |(url, _)| manifest_meta_len(url))
+        .ok_or(ApplyError::TooLarge)?;
+    let output_len = html
+        .len()
+        .checked_add(marker_bytes)
+        .and_then(|with_markers| with_markers.checked_add(manifest_bytes))
+        .ok_or(ApplyError::TooLarge)?;
+    if output_len > max_output_bytes {
+        return Err(ApplyError::TooLarge);
     }
 
-    let mut insertion_offsets = vec![None; visible_chars.len()];
+    let boundary_html = html
+        .get(boundary.start..boundary.end)
+        .ok_or(ApplyError::Alignment)?;
+    let offsets_needed = match plan
+        .operations
+        .iter()
+        .filter_map(|operation| usize::try_from(operation.insert_after_index).ok())
+        .max()
+    {
+        Some(index) => index.checked_add(1).ok_or(ApplyError::Alignment)?,
+        None => 0,
+    };
+    let mut insertion_offsets = Vec::with_capacity(offsets_needed.min(boundary_html.len()));
     let mut first_visible_start = None;
-    let mut previous_visible_end = None;
-    let mut visible_cursor = 0_usize;
-
-    for fragment in fragments {
-        let raw = boundary_html.get(fragment.start..fragment.end)?;
-        let normalized = normalize_mapped(decode_with_offsets(raw));
-        if normalized.is_empty() {
-            continue;
+    visit_canonical_text(boundary_html, |item| {
+        if first_visible_start.is_none() {
+            first_visible_start = Some(item.start);
         }
-
-        while visible_chars.get(visible_cursor) == Some(&' ') {
-            if let Some(offset) = previous_visible_end
-                && let Some(slot) = insertion_offsets.get_mut(visible_cursor)
-            {
-                *slot = Some(offset);
-            }
-            visible_cursor = visible_cursor.saturating_add(1);
+        if insertion_offsets.len() < offsets_needed {
+            insertion_offsets.push(item.end);
         }
-
-        for item in normalized {
-            let target = visible_chars.get(visible_cursor)?;
-            if !equivalent(item.ch, *target) {
-                return None;
-            }
-            let start = fragment.start.checked_add(item.start)?;
-            let end = fragment.start.checked_add(item.end)?;
-            if first_visible_start.is_none() {
-                first_visible_start = Some(start);
-            }
-            let slot = insertion_offsets.get_mut(visible_cursor)?;
-            *slot = Some(end);
-            previous_visible_end = Some(end);
-            visible_cursor = visible_cursor.saturating_add(1);
-        }
-    }
-
-    while visible_chars.get(visible_cursor) == Some(&' ') {
-        if let Some(offset) = previous_visible_end {
-            let slot = insertion_offsets.get_mut(visible_cursor)?;
-            *slot = Some(offset);
-        }
-        visible_cursor = visible_cursor.saturating_add(1);
-    }
-    if visible_cursor != visible_chars.len() {
-        return None;
-    }
-    let first_visible_start = first_visible_start?;
+        insertion_offsets.len() < offsets_needed
+    });
+    let first_visible_start = first_visible_start.ok_or(ApplyError::Alignment)?;
 
     let mut insertions = Vec::with_capacity(plan.operations.len());
-    let mut output_len = html.len();
     for operation in &plan.operations {
         let relative = if operation.insert_after_index == -1 {
             first_visible_start
         } else {
-            let index = usize::try_from(operation.insert_after_index).ok()?;
-            insertion_offsets.get(index).copied().flatten()?
+            let index =
+                usize::try_from(operation.insert_after_index).map_err(|_| ApplyError::Alignment)?;
+            insertion_offsets
+                .get(index)
+                .copied()
+                .ok_or(ApplyError::Alignment)?
         };
-        let absolute = boundary.start.checked_add(relative)?;
-        output_len = output_len.checked_add(operation.marker.len())?;
+        let absolute = boundary
+            .start
+            .checked_add(relative)
+            .ok_or(ApplyError::Alignment)?;
         insertions.push((absolute, operation.marker.as_str()));
     }
     // Stable sorting preserves API order for multiple markers at the same offset.
     insertions.sort_by_key(|(offset, _)| *offset);
+
     let mut result = String::with_capacity(output_len);
     let mut cursor = 0;
+    let mut manifest = manifest;
     for (offset, marker) in insertions {
-        result.push_str(html.get(cursor..offset)?);
+        if manifest.is_some_and(|(_, manifest_offset)| manifest_offset < offset) {
+            let (url, manifest_offset) = manifest.take().ok_or(ApplyError::Alignment)?;
+            result.push_str(
+                html.get(cursor..manifest_offset)
+                    .ok_or(ApplyError::Alignment)?,
+            );
+            push_manifest_meta(&mut result, url);
+            cursor = manifest_offset;
+        }
+        result.push_str(html.get(cursor..offset).ok_or(ApplyError::Alignment)?);
         result.push_str(marker);
         cursor = offset;
     }
-    result.push_str(html.get(cursor..)?);
-    Some(result)
-}
-
-/// Injects an escaped manifest meta element before the structural closing head tag.
-///
-/// Returns the input unchanged when the URL is empty, a manifest meta already exists,
-/// or no structural closing head tag exists.
-#[must_use]
-pub fn inject_manifest_meta(html: &str, manifest_url: &str) -> String {
-    if html.is_empty() || manifest_url.is_empty() || has_manifest_meta(html) {
-        return html.to_owned();
+    if let Some((url, manifest_offset)) = manifest {
+        result.push_str(
+            html.get(cursor..manifest_offset)
+                .ok_or(ApplyError::Alignment)?,
+        );
+        push_manifest_meta(&mut result, url);
+        cursor = manifest_offset;
     }
-    let Some(offset) = structural_close_tag(html, "head") else {
-        return html.to_owned();
-    };
-    let safe_url = manifest_url
-        .replace('&', "&amp;")
-        .replace('"', "&quot;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;");
-    let meta = format!(r#"<meta name="c2pa-manifest-url" content="{safe_url}">"#);
-    let Some(before) = html.get(..offset) else {
-        return html.to_owned();
-    };
-    let Some(after) = html.get(offset..) else {
-        return html.to_owned();
-    };
-    let mut output = String::with_capacity(html.len().saturating_add(meta.len()));
-    output.push_str(before);
-    output.push_str(&meta);
-    output.push_str(after);
-    output
+    result.push_str(html.get(cursor..).ok_or(ApplyError::Alignment)?);
+    Ok(result)
 }
 
-fn decode_with_offsets(raw: &str) -> Vec<MappedChar> {
-    let mut mapped = Vec::new();
-    let mut cursor = 0_usize;
-    while cursor < raw.len() {
-        if raw.as_bytes().get(cursor) == Some(&b'&')
-            && let Some(relative_semicolon) = raw
-                .as_bytes()
-                .get(cursor.saturating_add(1)..)
-                // Entity names/numbers cannot contain another ampersand or markup.
-                // Stop there rather than rescanning the suffix for every literal '&'.
-                .and_then(|tail| {
-                    let end = tail
-                        .iter()
-                        .position(|byte| !byte.is_ascii_alphanumeric() && *byte != b'#')?;
-                    (tail[end] == b';').then_some(end)
-                })
-        {
-            let end = cursor
-                .saturating_add(1)
-                .saturating_add(relative_semicolon)
-                .saturating_add(1);
-            if let Some(token) = raw.get(cursor..end) {
-                let decoded = decode_html_entities(token);
-                if decoded != token {
-                    mapped.extend(decoded.chars().map(|ch| MappedChar {
-                        ch,
-                        start: cursor,
-                        end,
-                    }));
-                    cursor = end;
-                    continue;
-                }
-            }
-        }
-
-        let Some(ch) = raw.get(cursor..).and_then(|tail| tail.chars().next()) else {
-            break;
-        };
-        let end = cursor.saturating_add(ch.len_utf8());
-        mapped.push(MappedChar {
-            ch,
-            start: cursor,
-            end,
-        });
-        cursor = end;
-    }
-    mapped
-}
-
-fn normalize_mapped(mapped: Vec<MappedChar>) -> Vec<MappedChar> {
-    let mut normalized: Vec<MappedChar> = Vec::with_capacity(mapped.len());
-    for item in mapped {
-        if is_js_whitespace(item.ch) {
-            let Some(last) = normalized.last_mut() else {
-                continue;
+/// Exact byte length of a manifest meta element after attribute escaping.
+fn manifest_meta_len(manifest_url: &str) -> Option<usize> {
+    manifest_url.chars().try_fold(
+        MANIFEST_META_PREFIX.len() + MANIFEST_META_SUFFIX.len(),
+        |total, character| {
+            let bytes = match character {
+                '&' => 5,
+                '"' => 6,
+                '<' | '>' => 4,
+                _ => character.len_utf8(),
             };
-            if last.ch == ' ' {
-                last.end = item.end;
-            } else {
-                normalized.push(MappedChar {
-                    ch: ' ',
-                    start: item.start,
-                    end: item.end,
-                });
-            }
-        } else {
-            normalized.push(item);
-        }
-    }
-    while normalized.last().is_some_and(|item| item.ch == ' ') {
-        normalized.pop();
-    }
-    normalized
+            total.checked_add(bytes)
+        },
+    )
 }
 
-fn equivalent(left: char, right: char) -> bool {
-    left == right || matches!((left, right), ('\u{00a0}', ' ') | (' ', '\u{00a0}'))
+fn push_manifest_meta(output: &mut String, manifest_url: &str) {
+    output.push_str(MANIFEST_META_PREFIX);
+    for character in manifest_url.chars() {
+        match character {
+            '&' => output.push_str("&amp;"),
+            '"' => output.push_str("&quot;"),
+            '<' => output.push_str("&lt;"),
+            '>' => output.push_str("&gt;"),
+            _ => output.push(character),
+        }
+    }
+    output.push_str(MANIFEST_META_SUFFIX);
 }
 
 #[cfg(test)]
@@ -242,7 +161,27 @@ mod tests {
     use super::*;
     use crate::api::{EmbeddingPlan, PlanOperation};
     use crate::boundary::{Boundary, find_article_boundary};
-    use crate::text::{assemble_text, extract_fragments};
+    use crate::text::{document_metadata, visible_text};
+
+    fn apply(html: &str, boundary: &Boundary, plan: &EmbeddingPlan) -> Option<String> {
+        apply_plan(html, boundary, plan, None, usize::MAX).ok()
+    }
+
+    fn manifest_output(html: &str, manifest_url: &str) -> String {
+        let metadata = document_metadata(html);
+        if manifest_url.is_empty() || metadata.manifest_present {
+            return html.to_owned();
+        }
+        let Some(offset) = metadata.head_close else {
+            return html.to_owned();
+        };
+        let mut output =
+            String::with_capacity(html.len() + manifest_meta_len(manifest_url).unwrap_or(0));
+        output.push_str(html.get(..offset).expect("metadata offset should be valid"));
+        push_manifest_meta(&mut output, manifest_url);
+        output.push_str(html.get(offset..).expect("metadata offset should be valid"));
+        output
+    }
 
     #[test]
     fn adversarial_ampersands_have_bounded_embedding_work() {
@@ -255,10 +194,49 @@ mod tests {
                 marker: "\u{fe00}".to_owned(),
             }],
         };
-        let output = apply_plan(&html, &boundary, &plan).expect("valid plan");
+        let output = apply(&html, &boundary, &plan).expect("valid plan");
         assert_eq!(
             output,
             format!("<article>&\u{fe00}{}</article>", "&".repeat(99_999))
+        );
+    }
+
+    #[test]
+    fn ordered_entity_replacements_preserve_original_insertion_spans() {
+        let html = "<article>&amp;lt;|&amp;#65;|&#38;lt;</article>";
+        let boundary = find_article_boundary(html, None).expect("article");
+        let plan = EmbeddingPlan {
+            index_unit: "codepoint".to_owned(),
+            operations: vec![
+                PlanOperation {
+                    insert_after_index: 0,
+                    marker: "\u{fe00}".to_owned(),
+                },
+                PlanOperation {
+                    insert_after_index: 2,
+                    marker: "\u{fe01}".to_owned(),
+                },
+                PlanOperation {
+                    insert_after_index: 4,
+                    marker: "\u{fe02}".to_owned(),
+                },
+            ],
+        };
+
+        assert_eq!(
+            visible_text(
+                html.get(boundary.start..boundary.end)
+                    .expect("boundary should be valid"),
+                usize::MAX,
+            )
+            .0,
+            "<|A|&lt;"
+        );
+        assert_eq!(
+            apply(html, &boundary, &plan),
+            Some(
+                "<article>&amp;lt;\u{fe00}|&amp;#65;\u{fe01}|&#38;\u{fe02}lt;</article>".to_owned()
+            )
         );
     }
 
@@ -280,7 +258,7 @@ mod tests {
                 })
                 .collect(),
         };
-        let output = apply_plan(&html, &boundary, &plan).expect("valid dense plan");
+        let output = apply(&html, &boundary, &plan).expect("valid dense plan");
         assert_eq!(
             output,
             format!(
@@ -290,6 +268,39 @@ mod tests {
                 "x".repeat(4_900_000)
             )
         );
+    }
+
+    #[test]
+    fn sparse_plan_on_markup_dense_article_bounds_fragment_work() {
+        let html = format!("<article>{}</article>", "<b>a</b>".repeat(612_500));
+        let boundary = find_article_boundary(&html, None).expect("article");
+        let plan = EmbeddingPlan {
+            index_unit: "codepoint".to_owned(),
+            operations: vec![
+                PlanOperation {
+                    insert_after_index: -1,
+                    marker: "\u{fe00}".to_owned(),
+                },
+                PlanOperation {
+                    insert_after_index: 0,
+                    marker: "\u{fe01}".to_owned(),
+                },
+                PlanOperation {
+                    insert_after_index: 0,
+                    marker: "\u{fe02}".to_owned(),
+                },
+            ],
+        };
+
+        let output = apply(&html, &boundary, &plan).expect("valid sparse plan");
+        let marker_bytes = plan
+            .operations
+            .iter()
+            .map(|operation| operation.marker.len())
+            .sum::<usize>();
+        assert_eq!(output.len(), html.len() + marker_bytes);
+        assert!(output.starts_with("<article><b>\u{fe00}a\u{fe01}\u{fe02}</b>"));
+        assert!(output.ends_with("</article>"));
     }
 
     #[derive(Deserialize)]
@@ -351,7 +362,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            apply_plan(html, &boundary, &plan),
+            apply(html, &boundary, &plan),
             Some("🐟<article>A\u{fe00}\u{fe01}&nbsp;B</article>".to_string())
         );
     }
@@ -359,9 +370,46 @@ mod tests {
     #[test]
     fn manifest_meta_uses_structural_head_close_and_escapes() {
         let html = "<head><script>\"</head>\"</script></head><body></body>";
-        let output = inject_manifest_meta(html, "https://example.com/?a=1&b=\"x\"");
+        let output = manifest_output(html, "https://example.com/?a=1&b=\"x\"");
         assert!(output.contains("</script><meta name=\"c2pa-manifest-url\""));
         assert!(output.contains("&amp;b=&quot;x&quot;"));
+    }
+
+    #[test]
+    fn manifest_detection_ignores_inert_markup() {
+        for html in [
+            r#"<!-- <meta name="c2pa-manifest-url" content="https://comment.example"> -->"#,
+            r#"<script>const meta = '<meta name="c2pa-manifest-url" content="https://script.example">';</script>"#,
+            r#"<div data-template='<meta name="c2pa-manifest-url" content="https://attribute.example">'></div>"#,
+        ] {
+            assert!(
+                !document_metadata(html).manifest_present,
+                "inert markup must not declare a manifest: {html}"
+            );
+        }
+        assert!(
+            document_metadata(
+                r#"<head><meta content="https://real.example" name="c2pa-manifest-url"></head>"#
+            )
+            .manifest_present
+        );
+    }
+
+    #[test]
+    fn invalid_less_than_and_declarations_do_not_hide_manifest_meta() {
+        let html = concat!(
+            "text < y ",
+            "<!bogus \"quoted > remainder\">",
+            "<?meta>",
+            r#"<meta name="c2pa-manifest-url" content="https://real.example">"#
+        );
+        assert!(document_metadata(html).manifest_present);
+        assert!(
+            !document_metadata(
+                r#"< meta name="c2pa-manifest-url"><!meta name="c2pa-manifest-url">"#
+            )
+            .manifest_present
+        );
     }
 
     #[test]
@@ -369,7 +417,7 @@ mod tests {
         let prefix = r#"<head><meta data-x="></head><img src=x onerror=alert(1)>">"#;
         let html = format!("{prefix}</head><article>Visible</article>");
         assert_eq!(
-            inject_manifest_meta(&html, "javascript:alert(1)"),
+            manifest_output(&html, "javascript:alert(1)"),
             format!(
                 "{prefix}<meta name=\"c2pa-manifest-url\" content=\"javascript:alert(1)\"></head><article>Visible</article>"
             )
@@ -378,7 +426,7 @@ mod tests {
         let script =
             r#"<head><script>const x = "</bogus><article>hidden</article></head>";</script>"#;
         assert_eq!(
-            inject_manifest_meta(
+            manifest_output(
                 &format!("{script}</head>"),
                 "data:text/html,<script>alert(1)</script>"
             ),
@@ -396,7 +444,7 @@ mod tests {
             r#"<head><meta name=x"y><meta content="a>b</head><img src=x onerror=alert(1)>">"#;
         let html = format!("{prefix}</head><body>Visible</body>");
         assert_eq!(
-            inject_manifest_meta(&html, "https://manifest.example.com/m"),
+            manifest_output(&html, "https://manifest.example.com/m"),
             format!(
                 "{prefix}<meta name=\"c2pa-manifest-url\" content=\"https://manifest.example.com/m\"></head><body>Visible</body>"
             )
@@ -420,8 +468,7 @@ mod tests {
                 .html
                 .get(boundary.start..boundary.end)
                 .expect("fixture boundary should be valid");
-            let fragments = extract_fragments(boundary_html);
-            let text = assemble_text(boundary_html, &fragments);
+            let text = visible_text(boundary_html, usize::MAX).0;
             assert_eq!(text, fixture.text_rust, "{}", fixture.id);
             if fixture.text_divergence.is_some() {
                 assert_ne!(text, fixture.text, "{}", fixture.id);
@@ -429,20 +476,20 @@ mod tests {
                 assert_eq!(text, fixture.text, "{}", fixture.id);
             }
             assert_eq!(
-                apply_plan(&fixture.html, &boundary, &fixture.plan),
+                apply(&fixture.html, &boundary, &fixture.plan),
                 Some(fixture.expected_output),
                 "{}",
                 fixture.id
             );
             if let Some(invalid_plan) = fixture.invalid_plan {
                 assert_eq!(
-                    apply_plan(&fixture.html, &boundary, &invalid_plan),
+                    apply(&fixture.html, &boundary, &invalid_plan),
                     fixture.expected_invalid_output,
                     "{}",
                     fixture.id
                 );
             }
-            let meta = inject_manifest_meta(&fixture.html, &fixture.manifest_url);
+            let meta = manifest_output(&fixture.html, &fixture.manifest_url);
             assert_eq!(meta, fixture.expected_meta_output_rust, "{}", fixture.id);
             if fixture.meta_divergence.is_some() {
                 assert_ne!(meta, fixture.expected_meta_output_js, "{}", fixture.id);
@@ -463,14 +510,13 @@ mod tests {
                         .get(..end)
                         .expect("prefix range should be valid"),
                 );
-                let fragments = extract_fragments(&prefix);
-                let _ = assemble_text(&prefix, &fragments);
+                let _ = visible_text(&prefix, usize::MAX);
                 if let Some(boundary) =
                     find_article_boundary(&prefix, fixture.override_selector.as_deref())
                 {
-                    let _ = apply_plan(&prefix, &boundary, &fixture.plan);
+                    let _ = apply(&prefix, &boundary, &fixture.plan);
                 }
-                let _ = inject_manifest_meta(&prefix, &fixture.manifest_url);
+                let _ = manifest_output(&prefix, &fixture.manifest_url);
             }
         }
     }

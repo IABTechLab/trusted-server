@@ -347,29 +347,69 @@ fn edge_request_to_fastly(
     Ok(fastly_req)
 }
 
-/// Maximum origin response body size copied into WASM heap.
-///
-/// `take_body_bytes()` copies the full origin response into a single
-/// allocation.  This cap prevents oversized origin responses from exhausting
-/// the WASM address space.  The Content-Length pre-check avoids the copy
-/// entirely for responses that declare their size.
+/// Maximum upstream response body copied into one buffered WASM allocation.
 const MAX_PLATFORM_RESPONSE_BODY_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
 
-fn fastly_body_to_edge_stream(body: fastly::Body) -> edgezero_core::body::Body {
-    let stream = futures::stream::unfold(Some(body), |state| async move {
-        let mut body = state?;
+fn fastly_body_to_edge_stream(
+    body: fastly::Body,
+    limit: Option<usize>,
+) -> edgezero_core::body::Body {
+    let stream = futures::stream::unfold(Some((body, 0usize)), move |state| async move {
+        let (mut body, consumed) = state?;
         let mut chunk = vec![0; 8192];
         match body.read(&mut chunk) {
             Ok(0) => None,
             Ok(bytes_read) => {
+                let Some(next_consumed) = consumed.checked_add(bytes_read) else {
+                    return Some((
+                        Err(std::io::Error::other("response body byte count overflowed")),
+                        None,
+                    ));
+                };
+                if let Some(limit) = limit
+                    && next_consumed > limit
+                {
+                    return Some((
+                        Err(std::io::Error::other(format!(
+                            "response body exceeded caller limit of {limit} bytes"
+                        ))),
+                        None,
+                    ));
+                }
                 chunk.truncate(bytes_read);
-                Some((Ok(Bytes::from(chunk)), Some(body)))
+                Some((Ok(Bytes::from(chunk)), Some((body, next_consumed))))
             }
             Err(err) => Some((Err(err), None)),
         }
     });
 
     edgezero_core::body::Body::from_stream(stream)
+}
+
+fn read_fastly_body_bounded(
+    mut body: fastly::Body,
+    limit: usize,
+) -> Result<Vec<u8>, Report<PlatformError>> {
+    let mut output = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let bytes_read = body.read(&mut chunk).map_err(|error| {
+            Report::new(PlatformError::HttpClient)
+                .attach(format!("failed to read upstream response body: {error}"))
+        })?;
+        if bytes_read == 0 {
+            return Ok(output);
+        }
+        output
+            .len()
+            .checked_add(bytes_read)
+            .filter(|length| *length <= limit)
+            .ok_or_else(|| {
+                Report::new(PlatformError::HttpClient)
+                    .attach(format!("origin response body exceeded {limit}-byte limit"))
+            })?;
+        output.extend_from_slice(&chunk[..bytes_read]);
+    }
 }
 
 /// Return whether a response is allowed to carry a body.
@@ -391,24 +431,33 @@ fn fastly_response_to_platform(
     backend_name: impl Into<String>,
     stream_response: bool,
     request_is_head: bool,
+    caller_limit: Option<usize>,
 ) -> Result<PlatformResponse, Report<PlatformError>> {
     let status = resp.get_status();
     let response_body_expected = response_carries_body(request_is_head, status);
+    let enforced_limit = if stream_response {
+        caller_limit.map(|limit| limit.min(MAX_PLATFORM_RESPONSE_BODY_BYTES))
+    } else {
+        Some(
+            caller_limit.map_or(MAX_PLATFORM_RESPONSE_BODY_BYTES, |limit| {
+                limit.min(MAX_PLATFORM_RESPONSE_BODY_BYTES)
+            }),
+        )
+    };
 
-    // Pre-flight: reject oversized responses before copying bytes into WASM heap.
-    // Content-Length is advisory but covers most origin responses; chunked
-    // responses without it fall through to the post-materialization check below.
+    // Content-Length permits an early refusal, but every body path below
+    // enforces the same limit while reading or yielding unknown-length bodies.
     if response_body_expected
-        && !stream_response
+        && let Some(limit) = enforced_limit
         && let Some(claimed_len) = resp
             .get_header("content-length")
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.trim().parse::<usize>().ok())
-        && claimed_len > MAX_PLATFORM_RESPONSE_BODY_BYTES
+        && claimed_len > limit
     {
         return Err(Report::new(PlatformError::HttpClient).attach(format!(
             "origin Content-Length {claimed_len} exceeds \
-                     {MAX_PLATFORM_RESPONSE_BODY_BYTES}-byte response body limit"
+             {limit}-byte response body limit"
         )));
     }
 
@@ -419,20 +468,10 @@ fn fastly_response_to_platform(
     let body = if !response_body_expected {
         edgezero_core::body::Body::empty()
     } else if stream_response {
-        fastly_body_to_edge_stream(resp.take_body())
+        fastly_body_to_edge_stream(resp.take_body(), enforced_limit)
     } else {
-        let body_bytes = resp.take_body_bytes();
-
-        // Belt-and-suspenders: catches chunked responses without Content-Length.
-        if body_bytes.len() > MAX_PLATFORM_RESPONSE_BODY_BYTES {
-            return Err(Report::new(PlatformError::HttpClient).attach(format!(
-                "origin response body {} bytes exceeds \
-                 {MAX_PLATFORM_RESPONSE_BODY_BYTES}-byte limit",
-                body_bytes.len()
-            )));
-        }
-
-        edgezero_core::body::Body::from(body_bytes)
+        let limit = enforced_limit.expect("buffered responses always have a limit");
+        edgezero_core::body::Body::from(read_fastly_body_bounded(resp.take_body(), limit)?)
     };
     let edge_response = builder
         .body(body)
@@ -518,6 +557,7 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         let image_optimizer = request.image_optimizer;
         let stream_response = request.stream_response;
         let cache_intent = request.cache_intent.clone();
+        let max_response_body_bytes = request.max_response_body_bytes;
         let request_is_head = request.request.method() == edgezero_core::http::Method::HEAD;
         let mut fastly_req = edge_request_to_fastly(request.request)?;
         if let Some(options) = image_optimizer {
@@ -527,7 +567,13 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         let fastly_resp = fastly_req
             .send(&backend_name)
             .change_context(PlatformError::HttpClient)?;
-        fastly_response_to_platform(fastly_resp, backend_name, stream_response, request_is_head)
+        fastly_response_to_platform(
+            fastly_resp,
+            backend_name,
+            stream_response,
+            request_is_head,
+            max_response_body_bytes,
+        )
     }
 
     async fn send_async(
@@ -542,6 +588,7 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         let stream_response = request.stream_response;
         let request_method = request.request.method().clone();
         let cache_intent = request.cache_intent.clone();
+        let max_response_body_bytes = request.max_response_body_bytes;
         let mut fastly_req = edge_request_to_fastly(request.request)?;
         apply_fastly_cache_intent(&mut fastly_req, &cache_intent);
         let pending = fastly_req
@@ -549,7 +596,8 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
             .change_context(PlatformError::HttpClient)?;
         Ok(PlatformPendingRequest::new(pending)
             .with_backend_name(backend_name)
-            .with_response_handling(stream_response, request_method))
+            .with_response_handling(stream_response, request_method)
+            .with_max_response_body_bytes(max_response_body_bytes))
     }
 
     async fn select(
@@ -565,10 +613,10 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
 
         if pending_requests
             .iter()
-            .any(PlatformPendingRequest::stream_response)
+            .any(|pending| pending.stream_response() || pending.max_response_body_bytes().is_some())
         {
             return Err(Report::new(PlatformError::HttpClient)
-                .attach("stream-marked pending request requires direct wait"));
+                .attach("stream-marked or response-bounded pending request requires direct wait"));
         }
 
         let mut fastly_pending: Vec<PendingRequest> = Vec::with_capacity(pending_requests.len());
@@ -606,7 +654,13 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
                 };
                 let request_is_head = backend_request.get_method() == fastly::http::Method::HEAD;
                 (
-                    fastly_response_to_platform(fastly_resp, backend_name, false, request_is_head),
+                    fastly_response_to_platform(
+                        fastly_resp,
+                        backend_name,
+                        false,
+                        request_is_head,
+                        None,
+                    ),
                     None,
                 )
             }
@@ -637,6 +691,7 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
         let backend_hint = pending.backend_name().map(str::to_owned);
         let stream_response = pending.stream_response();
         let request_is_head = pending.request_method() == Some(&edgezero_core::http::Method::HEAD);
+        let max_response_body_bytes = pending.max_response_body_bytes();
         let pending = pending.downcast::<PendingRequest>().map_err(|pending| {
             let backend_name = pending.backend_name().unwrap_or("<unknown>");
             Report::new(PlatformError::HttpClient).attach(format!(
@@ -652,7 +707,13 @@ impl PlatformHttpClient for FastlyPlatformHttpClient {
                 Report::new(PlatformError::HttpClient)
                     .attach("wait: response has no backend name; correlation impossible")
             })?;
-        fastly_response_to_platform(response, backend_name, stream_response, request_is_head)
+        fastly_response_to_platform(
+            response,
+            backend_name,
+            stream_response,
+            request_is_head,
+            max_response_body_bytes,
+        )
     }
 }
 
@@ -1193,7 +1254,7 @@ mod tests {
         let mut response = fastly::Response::from_status(fastly::http::StatusCode::FOUND);
         response.set_header("location", "https://redirect.example/next");
 
-        let platform = fastly_response_to_platform(response, "origin", false, false)
+        let platform = fastly_response_to_platform(response, "origin", false, false, None)
             .expect("should convert redirect response");
 
         assert_eq!(platform.response.status().as_u16(), 302);
@@ -1283,9 +1344,14 @@ mod tests {
                 oversized_content_length.as_str(),
             );
 
-            let platform_response =
-                fastly_response_to_platform(fastly_response, "origin", false, request_is_head)
-                    .expect("should allow oversized metadata for a bodiless response");
+            let platform_response = fastly_response_to_platform(
+                fastly_response,
+                "origin",
+                false,
+                request_is_head,
+                None,
+            )
+            .expect("should allow oversized metadata for a bodiless response");
 
             assert_eq!(
                 platform_response
@@ -1313,7 +1379,7 @@ mod tests {
             (MAX_PLATFORM_RESPONSE_BODY_BYTES + 1).to_string(),
         );
 
-        let error = fastly_response_to_platform(fastly_response, "origin", false, false)
+        let error = fastly_response_to_platform(fastly_response, "origin", false, false, None)
             .expect_err("should reject oversized buffered GET metadata");
         let expected_error =
             format!("exceeds {MAX_PLATFORM_RESPONSE_BODY_BYTES}-byte response body limit");
@@ -1321,6 +1387,48 @@ mod tests {
         assert!(
             format!("{error:?}").contains(&expected_error),
             "should retain the buffered response size limit: {error:?}"
+        );
+    }
+
+    #[test]
+    fn fastly_response_to_platform_reads_unknown_length_body_within_caller_limit() {
+        let response = fastly::Response::from_status(200).with_body("abcd");
+        let platform_response =
+            fastly_response_to_platform(response, "origin", false, false, Some(4))
+                .expect("an exact-limit body should be accepted");
+        let body = platform_response
+            .response
+            .into_body()
+            .into_bytes()
+            .expect("should return a buffered body");
+        assert_eq!(body.as_ref(), b"abcd");
+
+        let response = fastly::Response::from_status(200).with_body("abcde");
+        let error = fastly_response_to_platform(response, "origin", false, false, Some(4))
+            .expect_err("an unknown-length body over the caller limit must be rejected");
+        assert!(
+            format!("{error:?}").contains("4"),
+            "the error should report the caller's limit: {error:?}"
+        );
+    }
+
+    #[test]
+    fn fastly_streaming_response_enforces_caller_limit_while_yielding() {
+        let response = fastly::Response::from_status(200).with_body("abcde");
+        let platform_response =
+            fastly_response_to_platform(response, "origin", true, false, Some(4))
+                .expect("the body is read while its stream is consumed");
+
+        let error = futures::executor::block_on(
+            platform_response
+                .response
+                .into_body()
+                .into_bytes_bounded(16),
+        )
+        .expect_err("the stream must reject its first chunk crossing the caller limit");
+        assert!(
+            format!("{error:?}").contains("4"),
+            "the stream error should report the caller's limit: {error:?}"
         );
     }
 
@@ -1416,18 +1524,24 @@ mod tests {
     }
 
     #[test]
-    fn fastly_platform_http_client_rejects_stream_marked_pending_from_select() {
-        let client = FastlyPlatformHttpClient;
-        let pending = PlatformPendingRequest::new(42_u32)
-            .with_backend_name("origin-a")
-            .with_response_handling(true, edgezero_core::http::Method::GET);
-        let err = futures::executor::block_on(client.select(vec![pending]))
-            .expect_err("should reject stream-marked pending handles from select");
+    fn fastly_platform_http_client_rejects_stream_or_bounded_pending_from_select() {
+        for pending in [
+            PlatformPendingRequest::new(42_u32)
+                .with_backend_name("origin-a")
+                .with_response_handling(true, edgezero_core::http::Method::GET),
+            PlatformPendingRequest::new(42_u32)
+                .with_backend_name("origin-a")
+                .with_max_response_body_bytes(Some(4)),
+        ] {
+            let client = FastlyPlatformHttpClient;
+            let err = futures::executor::block_on(client.select(vec![pending]))
+                .expect_err("metadata-bearing pending handles require direct wait");
 
-        assert!(
-            format!("{err:?}").contains("stream-marked pending request"),
-            "should explain that streaming pendings require direct wait: {err:?}"
-        );
+            assert!(
+                format!("{err:?}").contains("requires direct wait"),
+                "should explain that metadata cannot survive select: {err:?}"
+            );
+        }
     }
 
     #[test]

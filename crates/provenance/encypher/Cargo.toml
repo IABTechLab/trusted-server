@@ -20,7 +20,6 @@ error-stack = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }
 log = { workspace = true }
-regex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

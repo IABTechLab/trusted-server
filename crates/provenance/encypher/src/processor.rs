@@ -39,10 +39,14 @@ use trusted_server_core::streaming_processor::{AsyncFinish, StreamProcessor};
 const SIGN_PATH: &str = "/api/v1/public/cdn/sign";
 const POLICY_PATH: &str = "/api/v1/public/cdn/trusted-server/policy";
 const WORKER_TOKEN_HEADER: &str = "x-encypher-worker-token";
-/// Article plan and skip keys. Entries carry their own `expires_at`.
-const CACHE_KEY_PREFIX: &str = "encypher:v3";
-/// Policy digest and policy skip keys. Entries carry their own `expires_at`.
-const POLICY_KEY_PREFIX: &str = "encypher:policy:v2";
+/// Successful article plans. Entries carry their own `expires_at`.
+const PLAN_KEY_PREFIX: &str = "encypher:plan:v4";
+/// Article failures, separate so a delayed failure cannot replace a plan.
+const PLAN_SKIP_KEY_PREFIX: &str = "encypher:plan-skip:v4";
+/// Successful policy digests. Entries carry their own `expires_at`.
+const POLICY_KEY_PREFIX: &str = "encypher:policy:v3";
+/// Policy failures, separate so a delayed failure cannot replace a digest.
+const POLICY_SKIP_KEY_PREFIX: &str = "encypher:policy-skip:v3";
 /// Part of `max_hold_ms` kept back from resolve work so a skip can still be
 /// written after the work runs out of time.
 const SKIP_WRITE_RESERVE: Duration = Duration::from_millis(200);
@@ -115,6 +119,7 @@ enum Reason {
     Signed,
     CacheHit,
     DocumentTooLarge,
+    OutputTooLarge,
     NotUtf8,
     NoBoundary,
     AlreadySigned,
@@ -151,6 +156,7 @@ impl Reason {
             Self::Signed => "signed",
             Self::CacheHit => "cache_hit",
             Self::DocumentTooLarge => "document_too_large",
+            Self::OutputTooLarge => "output_too_large",
             Self::NotUtf8 => "not_utf8",
             Self::NoBoundary => "no_boundary",
             Self::AlreadySigned => "already_signed",
@@ -288,6 +294,7 @@ pub(crate) struct Signer {
     sign_url: String,
     policy_url: String,
     policy_key: String,
+    policy_skip_key: String,
     /// First 16 hex characters of `sha256(api_base_url \n domain \n token)`.
     cache_context: String,
     /// Set by the first TTL write the store reports as unsupported, or by reading
@@ -318,6 +325,7 @@ impl Signer {
             sign_url,
             policy_url,
             policy_key: format!("{POLICY_KEY_PREFIX}:{cache_context}"),
+            policy_skip_key: format!("{POLICY_SKIP_KEY_PREFIX}:{cache_context}"),
             cache_context,
             ttl_less: AtomicBool::new(false),
         }
@@ -424,6 +432,10 @@ struct Article {
     text: String,
     /// Unicode scalars in `text`.
     scalars: usize,
+    /// First structural closing-head offset in the original document.
+    head_close: Option<usize>,
+    /// First completed structural title's inner byte range.
+    title_range: Option<(usize, usize)>,
 }
 
 /// Time a document's resolve may still take, on runtimes with a timer.
@@ -530,13 +542,11 @@ impl Signer {
         if embed::has_existing_markers(article) {
             return Err(Reason::AlreadySigned);
         }
-        if embed::has_manifest_meta(html) {
+        let metadata = text::document_metadata(html);
+        if metadata.manifest_present {
             return Err(Reason::ManifestPresent);
         }
-        let mut visible = text::visible_text(article);
-        let sign_len = text::truncate_scalars(&visible, api::MAX_TEXT_SCALARS).len();
-        visible.truncate(sign_len);
-        let scalars = text::scalar_count(&visible);
+        let (visible, scalars) = text::visible_text(article, api::MAX_TEXT_SCALARS);
         if scalars < self.config.min_text_length {
             return Err(Reason::TextTooShort);
         }
@@ -544,6 +554,8 @@ impl Signer {
             boundary,
             text: visible,
             scalars,
+            head_close: metadata.head_close,
+            title_range: metadata.title_range,
         })
     }
 
@@ -573,34 +585,62 @@ impl Signer {
         work.start().await;
 
         let policy_digest = self.policy_digest(request, services, kv, &mut work).await?;
-        let key = format!(
-            "{CACHE_KEY_PREFIX}:{}:{policy_digest}:{}",
+        let suffix = format!(
+            "{}:{policy_digest}:{}",
             self.cache_context,
             text::content_hash_hex(&article.text)
         );
-        let outcome = match self.read::<CacheEntry>(kv, &key, &mut work).await {
+        let plan_key = format!("{PLAN_KEY_PREFIX}:{suffix}");
+        let skip_key = format!("{PLAN_SKIP_KEY_PREFIX}:{suffix}");
+        let outcome = match self.read::<CacheEntry>(kv, &plan_key, &mut work).await {
             Ok(Some(CacheEntry::Plan {
                 plan, manifest_url, ..
             })) => {
-                api::validate_plan(&plan, manifest_url.as_deref(), article.scalars)
-                    .map_err(|_| Reason::CachedPlanInvalid)?;
-                return render(html, &article.boundary, &plan, manifest_url.as_deref())
-                    .map(|signed| (signed, Reason::CacheHit))
-                    .ok_or(Reason::CachedPlanInvalid);
+                if api::validate_plan(&plan, manifest_url.as_deref(), article.scalars).is_err() {
+                    self.delete_invalid_entry(kv, &plan_key, &mut work).await;
+                    return Err(Reason::CachedPlanInvalid);
+                }
+                return render(
+                    html,
+                    article,
+                    &plan,
+                    manifest_url.as_deref(),
+                    self.max_document_bytes,
+                )
+                .map(|signed| (signed, Reason::CacheHit))
+                .map_err(render_reason);
             }
-            Ok(Some(CacheEntry::Skip { .. })) => return Err(Reason::CachedSkip),
+            Ok(Some(CacheEntry::Skip { .. })) => {
+                self.delete_invalid_entry(kv, &plan_key, &mut work).await;
+                return Err(Reason::CachedEntryInvalid);
+            }
             Err(Reason::Timeout) => Err(Reason::Timeout),
             Err(reason) => return Err(reason),
-            Ok(None) => self
-                .request_plan(request, services, html, article, &policy_digest, &mut work)
-                .await
-                .and_then(|(plan, manifest_url)| {
-                    api::validate_plan(&plan, manifest_url.as_deref(), article.scalars)
-                        .map_err(|_| Reason::InvalidPlan)?;
-                    let signed = render(html, &article.boundary, &plan, manifest_url.as_deref())
-                        .ok_or(Reason::AlignmentFailed)?;
-                    Ok((signed, plan, manifest_url))
-                }),
+            Ok(None) => match self.read::<CacheEntry>(kv, &skip_key, &mut work).await {
+                Ok(Some(CacheEntry::Skip { .. })) => return Err(Reason::CachedSkip),
+                Ok(Some(CacheEntry::Plan { .. })) => {
+                    self.delete_invalid_entry(kv, &skip_key, &mut work).await;
+                    return Err(Reason::CachedEntryInvalid);
+                }
+                Err(Reason::Timeout) => Err(Reason::Timeout),
+                Err(reason) => return Err(reason),
+                Ok(None) => self
+                    .request_plan(request, services, html, article, &policy_digest, &mut work)
+                    .await
+                    .and_then(|(plan, manifest_url)| {
+                        api::validate_plan(&plan, manifest_url.as_deref(), article.scalars)
+                            .map_err(|_| Reason::InvalidPlan)?;
+                        let signed = render(
+                            html,
+                            article,
+                            &plan,
+                            manifest_url.as_deref(),
+                            self.max_document_bytes,
+                        )
+                        .map_err(render_reason)?;
+                        Ok((signed, plan, manifest_url))
+                    }),
+            },
         };
         match outcome {
             Ok((signed, plan, manifest_url)) => {
@@ -611,8 +651,14 @@ impl Signer {
                     expires_at: Self::expires_at(self.config.plan_ttl_seconds),
                     ttl_less: false,
                 };
-                self.write(kv, &key, entry, self.config.plan_ttl_seconds, &mut work)
-                    .await;
+                self.write(
+                    kv,
+                    &plan_key,
+                    entry,
+                    self.config.plan_ttl_seconds,
+                    &mut work,
+                )
+                .await;
                 Ok((signed, Reason::Signed))
             }
             Err(reason) => {
@@ -620,8 +666,7 @@ impl Signer {
                 if matches!(reason, Reason::PolicyChanged | Reason::PolicyDigestMismatch) {
                     self.evict_policy(kv, &mut deadline).await;
                 }
-                self.write_skip(kv, &key, reason, article.scalars, &mut deadline)
-                    .await;
+                self.write_skip(kv, &skip_key, reason, &mut deadline).await;
                 Err(reason)
             }
         }
@@ -634,20 +679,37 @@ impl Signer {
         kv: &dyn PlatformKvStore,
         work: &mut Deadline<'_>,
     ) -> Result<String, Reason> {
-        let result = match self.read::<PolicyEntry>(kv, &self.policy_key, work).await {
+        match self.read::<PolicyEntry>(kv, &self.policy_key, work).await {
             Ok(Some(PolicyEntry::Digest { policy_digest, .. }))
                 if api::valid_policy_digest(&policy_digest) =>
             {
                 return Ok(policy_digest);
             }
-            Ok(Some(PolicyEntry::Skip { .. })) => return Err(Reason::CachedSkip),
-            Ok(Some(PolicyEntry::Digest { .. })) => Err(Reason::CachedEntryInvalid),
+            Ok(Some(PolicyEntry::Digest { .. })) | Ok(Some(PolicyEntry::Skip { .. })) => {
+                self.delete_invalid_entry(kv, &self.policy_key, work).await;
+                return Err(Reason::CachedEntryInvalid);
+            }
             // Nothing can be cached without a store.
             Err(Reason::KvUnavailable) => return Err(Reason::KvUnavailable),
-            Err(reason) => Err(reason),
-            Ok(None) => self.request_policy(request, services, work).await,
-        };
-        let reason = match result {
+            Err(reason) => return Err(reason),
+            Ok(None) => {}
+        }
+        match self
+            .read::<PolicyEntry>(kv, &self.policy_skip_key, work)
+            .await
+        {
+            Ok(Some(PolicyEntry::Skip { .. })) => return Err(Reason::CachedSkip),
+            Ok(Some(PolicyEntry::Digest { .. })) => {
+                self.delete_invalid_entry(kv, &self.policy_skip_key, work)
+                    .await;
+                return Err(Reason::CachedEntryInvalid);
+            }
+            Err(Reason::KvUnavailable) => return Err(Reason::KvUnavailable),
+            Err(reason) => return Err(reason),
+            Ok(None) => {}
+        }
+
+        let reason = match self.request_policy(request, services, work).await {
             Ok(policy_digest) => {
                 let entry = PolicyEntry::Digest {
                     policy_digest: policy_digest.clone(),
@@ -679,7 +741,7 @@ impl Signer {
         };
         self.write(
             kv,
-            &self.policy_key,
+            &self.policy_skip_key,
             entry,
             ttl,
             &mut Self::skip_deadline(services),
@@ -717,21 +779,15 @@ impl Signer {
     }
 
     async fn evict_policy(&self, kv: &dyn PlatformKvStore, deadline: &mut Deadline<'_>) {
-        if matches!(
-            deadline.race(kv.delete(&self.policy_key)).await,
-            Some(Ok(()))
-        ) {
-            return;
+        if !self.delete_cache_key(kv, &self.policy_key, deadline).await {
+            log::debug!("encypher: policy digest eviction failed");
         }
-        // If deletion fails, try to replace the stale digest with a bounded skip.
-        let ttl = self.policy_skip_ttl();
-        let entry = PolicyEntry::Skip {
-            reason: Reason::PolicyChanged,
-            expires_at: Self::expires_at(ttl),
-            ttl_less: false,
-        };
-        self.write(kv, &self.policy_key, entry, ttl, deadline).await;
-        log::debug!("encypher: policy eviction failed");
+        if !self
+            .delete_cache_key(kv, &self.policy_skip_key, deadline)
+            .await
+        {
+            log::debug!("encypher: policy skip eviction failed");
+        }
     }
 
     /// Call the sign API once. Every failure maps to a reason code.
@@ -744,7 +800,7 @@ impl Signer {
         policy_digest: &str,
         work: &mut Deadline<'_>,
     ) -> Result<(EmbeddingPlan, Option<String>), Reason> {
-        let title = text::extract_title(html);
+        let title = text::title_from_range(html, article.title_range);
         let body = serde_json::to_vec(&SignRequest {
             text: &article.text,
             page_url: &request.page_url,
@@ -806,12 +862,12 @@ impl Signer {
         )
         .map_err(|_| Reason::Backend)?;
 
+        let response_limit = max_response_bytes.saturating_add(1);
+        let platform_request = PlatformHttpRequest::new(http_request, backend)
+            .with_cache_bypass()
+            .with_max_response_body_bytes(response_limit);
         let response = match work
-            .race(
-                services
-                    .http_client()
-                    .send(PlatformHttpRequest::new(http_request, backend)),
-            )
+            .race(services.http_client().send(platform_request))
             .await
         {
             None => return Err(Reason::Timeout),
@@ -831,11 +887,7 @@ impl Signer {
         }
         // One byte over the limit is enough for the parser to report TooLarge.
         match work
-            .race(
-                response
-                    .into_body()
-                    .into_bytes_bounded(max_response_bytes.saturating_add(1)),
-            )
+            .race(response.into_body().into_bytes_bounded(response_limit))
             .await
         {
             None => Err(Reason::Timeout),
@@ -859,7 +911,13 @@ impl Signer {
             Some(Ok(None)) => return Ok(None),
             Some(Ok(Some(bytes))) => bytes,
         };
-        let entry: T = serde_json::from_slice(&bytes).map_err(|_| Reason::CachedEntryInvalid)?;
+        let entry: T = match serde_json::from_slice(&bytes) {
+            Ok(entry) => entry,
+            Err(_) => {
+                self.delete_invalid_entry(kv, key, deadline).await;
+                return Err(Reason::CachedEntryInvalid);
+            }
+        };
         // An entry written without a TTL shows the mode to an instance that has
         // not written yet, as on Spin, which instantiates the module per request.
         if entry.ttl_less() {
@@ -868,12 +926,33 @@ impl Signer {
         if is_fresh(entry.expires_at(), unix_now()) {
             return Ok(Some(entry));
         }
-        if self.ttl_less.load(Ordering::Relaxed)
-            && !matches!(deadline.race(kv.delete(key)).await, Some(Ok(())))
+        if self.ttl_less.load(Ordering::Relaxed) && !self.delete_cache_key(kv, key, deadline).await
         {
             log::debug!("encypher: expired cache entry could not be deleted");
         }
         Ok(None)
+    }
+
+    /// Best-effort cache deletion, bounded by the caller's existing deadline.
+    async fn delete_cache_key(
+        &self,
+        kv: &dyn PlatformKvStore,
+        key: &str,
+        deadline: &mut Deadline<'_>,
+    ) -> bool {
+        matches!(deadline.race(kv.delete(key)).await, Some(Ok(())))
+    }
+
+    /// Delete a malformed or structurally invalid entry without masking fail-open.
+    async fn delete_invalid_entry(
+        &self,
+        kv: &dyn PlatformKvStore,
+        key: &str,
+        deadline: &mut Deadline<'_>,
+    ) {
+        if !self.delete_cache_key(kv, key, deadline).await {
+            log::debug!("encypher: invalid cache entry could not be deleted");
+        }
     }
 
     /// Best-effort cache write; failures are logged and ignored.
@@ -923,25 +1002,14 @@ impl Signer {
         }
     }
 
-    /// Write a negative entry unless a fresh, valid plan is already cached for the key.
-    ///
-    /// The KV trait has no insert-if-absent, so this re-reads first: a concurrent
-    /// successful sign for the same text keeps its plan.
+    /// Write a negative article entry under its separate skip key.
     async fn write_skip(
         &self,
         kv: &dyn PlatformKvStore,
         key: &str,
         reason: Reason,
-        scalars: usize,
         deadline: &mut Deadline<'_>,
     ) {
-        if let Ok(Some(CacheEntry::Plan {
-            plan, manifest_url, ..
-        })) = self.read::<CacheEntry>(kv, key, deadline).await
-            && api::validate_plan(&plan, manifest_url.as_deref(), scalars).is_ok()
-        {
-            return;
-        }
         let ttl = self.config.negative_ttl_seconds;
         let entry = CacheEntry::Skip {
             reason,
@@ -963,19 +1031,25 @@ fn encode(entry: &impl Serialize) -> Option<Bytes> {
     }
 }
 
-/// Apply a plan that passed [`api::validate_plan`] against the signed text, and
-/// add the manifest meta tag when a manifest URL was returned.
+/// Apply a validated plan and optional manifest in one exact-sized output.
 fn render(
     html: &str,
-    boundary: &Boundary,
+    article: &Article,
     plan: &EmbeddingPlan,
     manifest_url: Option<&str>,
-) -> Option<String> {
-    let signed = embed::apply_plan(html, boundary, plan)?;
-    Some(match manifest_url {
-        Some(url) => embed::inject_manifest_meta(&signed, url),
-        None => signed,
-    })
+    max_output_bytes: usize,
+) -> Result<String, embed::ApplyError> {
+    let manifest = manifest_url
+        .filter(|url| !url.is_empty())
+        .and_then(|url| article.head_close.map(|offset| (url, offset)));
+    embed::apply_plan(html, &article.boundary, plan, manifest, max_output_bytes)
+}
+
+fn render_reason(error: embed::ApplyError) -> Reason {
+    match error {
+        embed::ApplyError::Alignment => Reason::AlignmentFailed,
+        embed::ApplyError::TooLarge => Reason::OutputTooLarge,
+    }
 }
 
 fn parse_error_reason(error: &ApiError) -> Reason {
@@ -1001,8 +1075,8 @@ mod tests {
         StoppedTimer, StubHttpClient, build_services_with_http_client,
     };
     use trusted_server_core::platform::{
-        PlatformError, PlatformHttpClient, PlatformPendingRequest, PlatformResponse,
-        PlatformSelectResult,
+        PlatformCacheIntent, PlatformError, PlatformHttpClient, PlatformPendingRequest,
+        PlatformResponse, PlatformSelectResult,
     };
 
     const TOKEN: &str = "cwk_test_worker_token_value";
@@ -1082,6 +1156,8 @@ mod tests {
         ttl_unsupported: bool,
         /// `Pending` polls before every operation completes.
         pending_polls: usize,
+        /// Positive entry inserted after a negative writer's final read but before its put.
+        concurrent_positive_before_skip_write: Mutex<Option<(String, Bytes)>>,
     }
 
     impl MemoryKv {
@@ -1100,6 +1176,17 @@ mod tests {
             );
         }
 
+        fn insert_raw(&self, key: &str, value: impl Into<Bytes>) {
+            self.entries
+                .lock()
+                .expect("should lock entries")
+                .insert(key.to_owned(), value.into());
+        }
+
+        fn entry_bytes(&self, key: &str) -> Bytes {
+            self.entries()[key].clone()
+        }
+
         fn remove(&self, key: &str) {
             self.entries
                 .lock()
@@ -1107,12 +1194,14 @@ mod tests {
                 .remove(key);
         }
 
-        /// The single article entry under the current plan namespace.
+        /// The single article entry under either current article namespace.
         fn only_entry(&self) -> (String, serde_json::Value) {
             let entries: Vec<_> = self
                 .entries()
                 .into_keys()
-                .filter(|key| key.starts_with("encypher:v3:"))
+                .filter(|key| {
+                    key.starts_with(PLAN_KEY_PREFIX) || key.starts_with(PLAN_SKIP_KEY_PREFIX)
+                })
                 .collect();
             assert_eq!(entries.len(), 1, "should hold exactly one article entry");
             let key = entries.into_iter().next().expect("should have an entry");
@@ -1133,6 +1222,28 @@ mod tests {
                     && !self.hung_first_write_taken.swap(true, Ordering::SeqCst))
             {
                 futures::future::pending::<()>().await;
+            }
+            let writes_skip = serde_json::from_slice::<serde_json::Value>(&value)
+                .ok()
+                .and_then(|entry| {
+                    entry
+                        .get("kind")
+                        .and_then(|kind| kind.as_str())
+                        .map(str::to_owned)
+                })
+                .as_deref()
+                == Some("skip");
+            if writes_skip
+                && let Some((positive_key, positive)) = self
+                    .concurrent_positive_before_skip_write
+                    .lock()
+                    .expect("should lock concurrent write")
+                    .take()
+            {
+                self.entries
+                    .lock()
+                    .expect("should lock entries")
+                    .insert(positive_key, positive);
             }
             self.entries
                 .lock()
@@ -1158,7 +1269,7 @@ mod tests {
                     message: "test failure".to_owned(),
                 });
             }
-            if key.starts_with(CACHE_KEY_PREFIX)
+            if key.starts_with(PLAN_KEY_PREFIX)
                 && self
                     .hidden_reads
                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
@@ -1359,8 +1470,29 @@ mod tests {
         factory_with(config_json(TOKEN), 5_000_000)
     }
 
+    fn article_with_selector(html: &str, selector: Option<&str>) -> Article {
+        let boundary =
+            boundary::find_article_boundary(html, selector).expect("should find boundary");
+        let metadata = text::document_metadata(html);
+        let boundary_html = html
+            .get(boundary.start..boundary.end)
+            .expect("boundary should be valid");
+        let (text, scalars) = text::visible_text(boundary_html, api::MAX_TEXT_SCALARS);
+        Article {
+            boundary,
+            text,
+            scalars,
+            head_close: metadata.head_close,
+            title_range: metadata.title_range,
+        }
+    }
+
     fn policy_key() -> String {
         factory().policy_key.clone()
+    }
+
+    fn policy_skip_key() -> String {
+        factory().policy_skip_key.clone()
     }
 
     /// Services without a timer, as on Fastly.
@@ -1511,13 +1643,13 @@ mod tests {
                 assert_eq!(view(&factory(), &services), ARTICLE, "{case}");
             }
             assert_eq!(http.recorded_request_methods(), ["GET"], "{case}");
-            assert_eq!(kv.entry(&policy_key())["kind"], "skip", "{case}");
+            assert_eq!(kv.entry(&policy_skip_key())["kind"], "skip", "{case}");
             assert_eq!(
-                kv.ttls.lock().expect("lock")[&policy_key()],
+                kv.ttls.lock().expect("lock")[&policy_skip_key()],
                 Duration::from_secs(300)
             );
             // Once the skip is gone, refresh may reuse only the matching old plan.
-            kv.remove(&policy_key());
+            kv.remove(&policy_skip_key());
             http.push_response(200, policy_response(POLICY_DIGEST));
             assert_signed(&view(&factory(), &services));
             assert_eq!(http.recorded_request_methods(), ["GET", "GET"]);
@@ -1525,7 +1657,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_cached_policy_cannot_unlock_a_cached_article() {
+    fn malformed_cached_policy_fails_closed_for_one_view_then_recovers() {
         let future = unix_now() + 300;
         for value in [
             json!("not an entry"),
@@ -1540,13 +1672,25 @@ mod tests {
         ] {
             let kv = Arc::new(MemoryKv::default());
             seed_plan(&kv);
-            kv.insert(&policy_key(), &value);
+            let key = policy_key();
+            kv.insert(&key, &value);
             let http = Arc::new(StubHttpClient::new());
             let services = services(Arc::clone(&http) as Arc<dyn PlatformHttpClient>, &kv);
-            for _ in 0..2 {
-                assert_eq!(view(&factory(), &services), ARTICLE, "{value}");
-            }
+
+            assert_eq!(view(&factory(), &services), ARTICLE, "{value}");
             assert!(http.recorded_request_methods().is_empty(), "{value}");
+            assert!(
+                kv.deletes.lock().expect("lock deletes").contains(&key),
+                "{value}: malformed policy should be evicted"
+            );
+            assert!(
+                !kv.entries().contains_key(&key),
+                "{value}: malformed policy should not remain"
+            );
+
+            http.push_response(200, policy_response(POLICY_DIGEST));
+            assert_signed(&view(&factory(), &services));
+            assert_eq!(http.recorded_request_methods(), ["GET"], "{value}");
         }
     }
 
@@ -1645,7 +1789,7 @@ mod tests {
             let factory = factory_with(config, 5_000_000);
             assert_eq!(view(&factory, &services(http, &kv)), ARTICLE);
             assert_eq!(
-                kv.ttls.lock().expect("lock")[&factory.policy_key],
+                kv.ttls.lock().expect("lock")[&factory.policy_skip_key],
                 Duration::from_secs(expected)
             );
         }
@@ -1663,6 +1807,11 @@ mod tests {
 
         assert_signed(&output);
         assert_eq!(http.recorded_request_methods(), ["GET", "POST"]);
+        assert_eq!(
+            http.recorded_cache_intents(),
+            [PlatformCacheIntent::Bypass, PlatformCacheIntent::Bypass],
+            "credential-bound policy and sign responses must bypass intermediary caches"
+        );
         assert_eq!(
             http.recorded_request_uris(),
             [
@@ -1701,16 +1850,189 @@ mod tests {
         assert!(!sent_text.contains("Footer") && !sent_text.contains("Home"));
         let (key, entry) = kv.only_entry();
         assert!(
-            key.starts_with("encypher:v3:") && key.contains(POLICY_DIGEST),
+            key.starts_with("encypher:plan:v4:") && key.contains(POLICY_DIGEST),
             "unexpected cache key {key}"
         );
         assert!(!key.contains(TOKEN), "cache key must not contain the token");
         assert!(
-            policy_key().starts_with("encypher:policy:v2:"),
+            policy_key().starts_with("encypher:policy:v3:"),
             "unexpected policy key"
         );
         assert_eq!(entry["kind"], "plan");
         assert_eq!(entry["plan"], plan_json(MARKER));
+    }
+
+    #[test]
+    fn a_fresh_plan_that_expands_past_the_document_budget_passes_through() {
+        let http = signing_http();
+        let kv = Arc::new(MemoryKv::default());
+        let signer = factory_with(config_json(TOKEN), ARTICLE.len());
+
+        let output = view(
+            &signer,
+            &services(Arc::clone(&http) as Arc<dyn PlatformHttpClient>, &kv),
+        );
+
+        assert_eq!(
+            output, ARTICLE,
+            "the original document fits its exact budget"
+        );
+        assert_eq!(http.recorded_request_methods(), ["GET", "POST"]);
+    }
+
+    #[test]
+    fn a_cached_plan_that_expands_past_the_document_budget_passes_through() {
+        let kv = Arc::new(MemoryKv::default());
+        seed_plan(&kv);
+        let http = Arc::new(StubHttpClient::new());
+        let signer = factory_with(config_json(TOKEN), ARTICLE.len());
+
+        let output = view(
+            &signer,
+            &services(Arc::clone(&http) as Arc<dyn PlatformHttpClient>, &kv),
+        );
+
+        assert_eq!(
+            output, ARTICLE,
+            "the original document fits its exact budget"
+        );
+        assert!(
+            http.recorded_request_methods().is_empty(),
+            "a cached plan should not call the API"
+        );
+    }
+
+    #[test]
+    fn render_budget_matches_the_exact_escaped_output_size() {
+        let article = factory().extract(ARTICLE).expect("should extract article");
+        let plan: EmbeddingPlan =
+            serde_json::from_value(plan_json(MARKER)).expect("should build a valid plan");
+        let manifest_url = r#"https://manifest.example/?a=1&b="x"<y>"#;
+        let expected = render(ARTICLE, &article, &plan, Some(manifest_url), usize::MAX)
+            .expect("unbounded render should succeed");
+        assert!(
+            expected.contains("a=1&amp;b=&quot;x&quot;&lt;y&gt;"),
+            "fixture should exercise every escaped manifest expansion"
+        );
+
+        assert_eq!(
+            render(ARTICLE, &article, &plan, Some(manifest_url), expected.len(),)
+                .expect("the exact output budget should fit"),
+            expected
+        );
+        assert_eq!(
+            render(
+                ARTICLE,
+                &article,
+                &plan,
+                Some(manifest_url),
+                expected.len() - 1,
+            ),
+            Err(embed::ApplyError::TooLarge),
+            "one byte below the exact output size must fail before rendering"
+        );
+    }
+
+    #[test]
+    fn render_orders_equal_head_offset_markers_before_manifest_meta() {
+        let html = "<head>A</head>";
+        let article = article_with_selector(html, Some("head"));
+        let plan = EmbeddingPlan {
+            index_unit: "codepoint".to_owned(),
+            operations: vec![
+                api::PlanOperation {
+                    insert_after_index: 0,
+                    marker: "\u{fe00}".to_owned(),
+                },
+                api::PlanOperation {
+                    insert_after_index: 0,
+                    marker: "\u{fe01}".to_owned(),
+                },
+            ],
+        };
+
+        assert_eq!(
+            render(
+                html,
+                &article,
+                &plan,
+                Some(r#"https://example.com/?a=1&b="x""#),
+                usize::MAX,
+            )
+            .expect("render should succeed"),
+            concat!(
+                "<head>A\u{fe00}\u{fe01}",
+                r#"<meta name="c2pa-manifest-url" content="https://example.com/?a=1&amp;b=&quot;x&quot;">"#,
+                "</head>"
+            )
+        );
+    }
+
+    #[test]
+    fn render_preserves_manifest_placement_around_malformed_head_closes() {
+        let plan = EmbeddingPlan {
+            index_unit: "codepoint".to_owned(),
+            operations: vec![api::PlanOperation {
+                insert_after_index: 0,
+                marker: "\u{fe00}".to_owned(),
+            }],
+        };
+        let meta = r#"<meta name="c2pa-manifest-url" content="https://manifest.example.com/m">"#;
+        for (html, expected) in [
+            (
+                "</head><article>A</article>",
+                format!("{meta}</head><article>A\u{fe00}</article>"),
+            ),
+            (
+                "<article>A</head>B</article>",
+                format!("<article>A\u{fe00}{meta}</head>B</article>"),
+            ),
+        ] {
+            let article = article_with_selector(html, None);
+            assert_eq!(
+                render(
+                    html,
+                    &article,
+                    &plan,
+                    Some("https://manifest.example.com/m"),
+                    usize::MAX,
+                )
+                .expect("render should succeed"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn render_omits_manifest_for_an_empty_url_or_missing_head_close() {
+        let plan = EmbeddingPlan {
+            index_unit: "codepoint".to_owned(),
+            operations: vec![api::PlanOperation {
+                insert_after_index: 0,
+                marker: "\u{fe00}".to_owned(),
+            }],
+        };
+        for (html, selector, manifest_url, expected) in [
+            (
+                "<article>A</article>",
+                None,
+                Some("https://manifest.example.com/m"),
+                "<article>A\u{fe00}</article>",
+            ),
+            (
+                "<head>A</head>",
+                Some("head"),
+                Some(""),
+                "<head>A\u{fe00}</head>",
+            ),
+        ] {
+            let article = article_with_selector(html, selector);
+            assert_eq!(
+                render(html, &article, &plan, manifest_url, usize::MAX,)
+                    .expect("render should succeed"),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -1757,26 +2079,109 @@ mod tests {
     }
 
     #[test]
-    fn a_failure_does_not_replace_a_fresh_plan_written_since_the_first_read() {
+    fn a_delayed_skip_write_cannot_overwrite_a_concurrent_plan() {
         let seeded = Arc::new(MemoryKv::default());
         seed_plan(&seeded);
-        // The first read misses, as if a concurrent request wrote the plan after it.
+        let (plan_key, _) = seeded.only_entry();
+        let policy_key = policy_key();
         let kv = Arc::new(MemoryKv {
-            entries: Mutex::new(seeded.entries()),
-            hidden_reads: AtomicUsize::new(1),
+            entries: Mutex::new(HashMap::from([(
+                policy_key.clone(),
+                seeded.entry_bytes(&policy_key),
+            )])),
+            concurrent_positive_before_skip_write: Mutex::new(Some((
+                plan_key,
+                seeded
+                    .entries()
+                    .into_iter()
+                    .find(|(key, _)| key.starts_with(PLAN_KEY_PREFIX))
+                    .expect("seeded plan")
+                    .1,
+            ))),
             ..MemoryKv::default()
         });
-        let http = Arc::new(StubHttpClient::new());
-        http.push_response(503, Vec::new());
+        let failed = Arc::new(StubHttpClient::new());
+        failed.push_response(503, Vec::new());
 
-        let output = view(
-            &factory(),
-            &services(Arc::clone(&http) as Arc<dyn PlatformHttpClient>, &kv),
+        assert_eq!(
+            view(
+                &factory(),
+                &services(Arc::clone(&failed) as Arc<dyn PlatformHttpClient>, &kv),
+            ),
+            ARTICLE,
+            "the failed request should pass through"
+        );
+        assert_eq!(failed.recorded_request_methods(), ["POST"]);
+        let entries = kv.entries();
+        assert!(
+            entries
+                .values()
+                .any(|value| serde_json::from_slice::<serde_json::Value>(value)
+                    .is_ok_and(|entry| entry["kind"] == "plan")),
+            "the concurrent plan must survive"
+        );
+        assert!(
+            entries
+                .values()
+                .any(|value| serde_json::from_slice::<serde_json::Value>(value)
+                    .is_ok_and(|entry| entry["kind"] == "skip")),
+            "the delayed failure should remain negatively cached under its own key"
         );
 
-        assert_eq!(output, ARTICLE, "the failed request should pass through");
-        assert_eq!(http.recorded_backend_names().len(), 1);
-        assert_eq!(kv.only_entry().1["kind"], "plan", "the plan should survive");
+        let no_api = Arc::new(StubHttpClient::new());
+        assert_signed(&view(
+            &factory(),
+            &services(Arc::clone(&no_api) as Arc<dyn PlatformHttpClient>, &kv),
+        ));
+        assert!(no_api.recorded_request_methods().is_empty());
+    }
+
+    #[test]
+    fn a_delayed_policy_skip_cannot_overwrite_a_concurrent_digest() {
+        let seeded = Arc::new(MemoryKv::default());
+        seed_plan(&seeded);
+        let policy_key = policy_key();
+        let kv = Arc::new(MemoryKv {
+            concurrent_positive_before_skip_write: Mutex::new(Some((
+                policy_key.clone(),
+                seeded.entry_bytes(&policy_key),
+            ))),
+            ..MemoryKv::default()
+        });
+        let failed = Arc::new(StubHttpClient::new());
+        failed.push_response(503, Vec::new());
+
+        assert_eq!(
+            view(
+                &factory(),
+                &services(Arc::clone(&failed) as Arc<dyn PlatformHttpClient>, &kv),
+            ),
+            ARTICLE,
+        );
+        assert_eq!(failed.recorded_request_methods(), ["GET"]);
+        let entries = kv.entries();
+        assert!(
+            entries
+                .values()
+                .any(|value| serde_json::from_slice::<serde_json::Value>(value)
+                    .is_ok_and(|entry| entry["kind"] == "digest")),
+            "the concurrent policy digest must survive"
+        );
+        assert!(
+            entries
+                .values()
+                .any(|value| serde_json::from_slice::<serde_json::Value>(value)
+                    .is_ok_and(|entry| entry["kind"] == "skip")),
+            "the delayed policy failure should remain under its own key"
+        );
+
+        let sign = Arc::new(StubHttpClient::new());
+        sign.push_response(200, sign_response(MARKER));
+        assert_signed(&view(
+            &factory(),
+            &services(Arc::clone(&sign) as Arc<dyn PlatformHttpClient>, &kv),
+        ));
+        assert_eq!(sign.recorded_request_methods(), ["POST"]);
     }
 
     #[test]
@@ -1852,7 +2257,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tampered_cached_plan_is_rejected_without_calling_the_api() {
+    fn a_tampered_cached_plan_is_evicted_then_the_next_view_recovers() {
         for (field, value) in [
             ("/plan/operations/0/marker", "<img src=x onerror=alert(1)>"),
             ("/manifest_url", "http://manifest.example.com/doc-1"),
@@ -1866,17 +2271,116 @@ mod tests {
             kv.insert(&key, &entry);
 
             let http = Arc::new(StubHttpClient::new());
-            let output = view(
-                &factory(),
-                &services(Arc::clone(&http) as Arc<dyn PlatformHttpClient>, &kv),
+            let services = services(Arc::clone(&http) as Arc<dyn PlatformHttpClient>, &kv);
+            assert_eq!(
+                view(&factory(), &services),
+                ARTICLE,
+                "{field}: should pass through"
             );
-
-            assert_eq!(output, ARTICLE, "{field}: should pass through");
             assert!(
                 http.recorded_backend_names().is_empty(),
-                "{field}: should make no API call"
+                "{field}: should make no API call on the failure view"
             );
+            assert!(
+                kv.deletes.lock().expect("lock deletes").contains(&key),
+                "{field}: the invalid plan should be evicted"
+            );
+
+            http.push_response(200, sign_response(MARKER));
+            assert_signed(&view(&factory(), &services));
+            assert_eq!(http.recorded_request_methods(), ["POST"], "{field}");
         }
+    }
+
+    #[test]
+    fn malformed_ttl_less_plan_is_evicted_then_the_next_view_recovers() {
+        let kv = Arc::new(MemoryKv {
+            ttl_unsupported: true,
+            ..MemoryKv::default()
+        });
+        seed_plan(&kv);
+        let (key, _) = kv.only_entry();
+        kv.insert_raw(&key, Bytes::from_static(b"not json"));
+        let http = Arc::new(StubHttpClient::new());
+        let services = services(Arc::clone(&http) as Arc<dyn PlatformHttpClient>, &kv);
+
+        assert_eq!(view(&factory(), &services), ARTICLE);
+        assert!(http.recorded_request_methods().is_empty());
+        assert!(
+            kv.deletes.lock().expect("lock deletes").contains(&key),
+            "malformed entries must be deleted even when their ttl_less flag cannot be decoded"
+        );
+
+        http.push_response(200, sign_response(MARKER));
+        assert_signed(&view(&factory(), &services));
+        assert_eq!(http.recorded_request_methods(), ["POST"]);
+    }
+
+    #[test]
+    fn representation_alignment_failure_does_not_evict_a_valid_cached_plan() {
+        let kv = Arc::new(MemoryKv::default());
+        seed_plan(&kv);
+        let (key, _) = kv.only_entry();
+        let signer = factory();
+        let mut article = signer.extract(ARTICLE).expect("should extract article");
+        article.boundary.end = ARTICLE.len() + 1;
+        let http = Arc::new(StubHttpClient::new());
+        let services = services(http, &kv);
+
+        let result =
+            futures::executor::block_on(signer.resolve(&request(), &services, ARTICLE, &article));
+
+        assert_eq!(
+            result.expect_err("alignment should fail"),
+            Reason::AlignmentFailed
+        );
+        assert!(
+            kv.entries().contains_key(&key),
+            "valid plan should remain cached"
+        );
+        assert!(
+            !kv.deletes.lock().expect("lock deletes").contains(&key),
+            "representation-specific alignment must not evict a reusable plan"
+        );
+    }
+
+    #[test]
+    fn extraction_cap_counts_the_inter_fragment_separator() {
+        let leading = "a".repeat(api::MAX_TEXT_SCALARS - 1);
+        let html = format!(
+            "<article><p>{leading}</p><p>{}</p></article>",
+            "&amp;".repeat(100_000)
+        );
+        let article = factory().extract(&html).expect("should extract article");
+
+        assert_eq!(article.scalars, api::MAX_TEXT_SCALARS);
+        assert_eq!(article.text, format!("{leading} "));
+    }
+
+    #[test]
+    fn underlength_article_maps_a_valid_api_range_plan_to_alignment_failed() {
+        let html = "<article>A</article>";
+        let article = article_with_selector(html, None);
+        assert_eq!(
+            html.get(article.boundary.start..article.boundary.end),
+            Some(html)
+        );
+        let plan = EmbeddingPlan {
+            index_unit: "codepoint".to_owned(),
+            operations: vec![api::PlanOperation {
+                insert_after_index: 1,
+                marker: MARKER.to_owned(),
+            }],
+        };
+        assert!(
+            api::validate_plan(&plan, None, api::MAX_TEXT_SCALARS).is_ok(),
+            "the plan index is valid within the signing API range"
+        );
+
+        let reason = render(html, &article, &plan, None, usize::MAX)
+            .map_err(render_reason)
+            .expect_err("the article has no canonical scalar at index 1");
+        assert_eq!(reason, Reason::AlignmentFailed);
     }
 
     #[test]
@@ -1949,7 +2453,7 @@ mod tests {
 
         assert_eq!(output, ARTICLE, "should release the page unchanged");
         assert_eq!(hung.sends.load(Ordering::SeqCst), 1);
-        let skip = kv.entry(&policy_key());
+        let skip = kv.entry(&policy_skip_key());
         assert_eq!(skip["kind"], "skip");
         assert_eq!(skip["reason"], "timeout");
 
@@ -2009,7 +2513,7 @@ mod tests {
     #[test]
     fn a_plan_write_that_runs_out_of_time_still_returns_the_signed_page() {
         let kv = Arc::new(MemoryKv {
-            hung_writes_to: Some(CACHE_KEY_PREFIX),
+            hung_writes_to: Some(PLAN_KEY_PREFIX),
             ..MemoryKv::default()
         });
         let http = signing_http();
@@ -2024,7 +2528,7 @@ mod tests {
         assert!(
             kv.entries()
                 .keys()
-                .all(|key| !key.starts_with(CACHE_KEY_PREFIX)),
+                .all(|key| !key.starts_with(PLAN_KEY_PREFIX)),
             "the abandoned plan write should store nothing"
         );
     }
@@ -2049,18 +2553,18 @@ mod tests {
             ["GET"],
             "no sign call after the digest write ran out of time"
         );
-        let skip = kv.entry(&policy_key());
+        let skip = kv.entry(&policy_skip_key());
         assert_eq!(skip["kind"], "skip");
         assert_eq!(skip["reason"], "timeout");
         assert!(
             kv.entries()
                 .keys()
-                .all(|key| !key.starts_with(CACHE_KEY_PREFIX)),
+                .all(|key| !key.starts_with(PLAN_SKIP_KEY_PREFIX)),
             "no plan skip under a digest the next view cannot know"
         );
 
         // A hung client turns any API call into a full hold, so zero sends
-        // after one KV read shows the next view is a cached skip.
+        // after the positive and negative policy reads shows a cached skip.
         let reads = kv.reads();
         let hung = Arc::new(HungHttpClient::default());
         let next = view(
@@ -2069,7 +2573,7 @@ mod tests {
         );
         assert_eq!(next, ARTICLE);
         assert_eq!(hung.sends.load(Ordering::SeqCst), 0, "no API call");
-        assert_eq!(kv.reads() - reads, 1, "only the policy entry is read");
+        assert_eq!(kv.reads() - reads, 2, "positive policy miss, then skip hit");
     }
 
     #[test]
@@ -2093,7 +2597,7 @@ mod tests {
             "module sleeps {module:?} should fit within max_hold_ms"
         );
         assert_eq!(
-            kv.entry(&policy_key())["reason"],
+            kv.entry(&policy_skip_key())["reason"],
             "timeout",
             "the module deadline, not the backstop, should release the page"
         );
@@ -2159,12 +2663,30 @@ mod tests {
         });
         let (plan_key, _) = kv.only_entry();
         set_expiry(&kv, &plan_key, expired());
-        let http = Arc::new(StubHttpClient::new());
-        http.push_response(503, Vec::new());
+        let failed = Arc::new(StubHttpClient::new());
+        failed.push_response(503, Vec::new());
 
-        assert_eq!(view(&factory(), &services(http, &kv)), ARTICLE);
+        assert_eq!(
+            view(
+                &factory(),
+                &services(Arc::clone(&failed) as Arc<dyn PlatformHttpClient>, &kv),
+            ),
+            ARTICLE
+        );
+        assert_eq!(failed.recorded_request_methods(), ["POST"]);
 
-        assert_eq!(kv.entry(&plan_key)["kind"], "skip");
+        let no_api = Arc::new(StubHttpClient::new());
+        assert_eq!(
+            view(
+                &factory(),
+                &services(Arc::clone(&no_api) as Arc<dyn PlatformHttpClient>, &kv),
+            ),
+            ARTICLE
+        );
+        assert!(
+            no_api.recorded_request_methods().is_empty(),
+            "the fresh skip should suppress a second signing call"
+        );
     }
 
     #[test]
@@ -2253,8 +2775,8 @@ mod tests {
                 serde_json::from_slice(&value).expect("should store JSON");
             entry.as_object_mut().expect("object").remove("expires_at");
             let old_key = key
-                .replace("encypher:v3:", "encypher:v2:")
-                .replace("encypher:policy:v2:", "encypher:policy:v1:");
+                .replace("encypher:plan:v4:", "encypher:v3:")
+                .replace("encypher:policy:v3:", "encypher:policy:v2:");
             kv.insert(&old_key, &entry);
         }
         let old_entries = kv.entries();
@@ -2303,48 +2825,6 @@ mod tests {
                 "should make no API call"
             );
         }
-    }
-
-    #[test]
-    fn an_unbound_kv_store_logs_kv_unavailable_and_warns_once() {
-        let Some(logs) = capture_logs(|| {
-            let http: Arc<dyn PlatformHttpClient> = Arc::new(StubHttpClient::new());
-            let unbound = Arc::new(MemoryKv {
-                unavailable: true,
-                ..MemoryKv::default()
-            });
-            for _ in 0..2 {
-                view(&factory(), &services(Arc::clone(&http), &unbound));
-            }
-            let failing = Arc::new(MemoryKv {
-                fail_reads: true,
-                ..MemoryKv::default()
-            });
-            view(&factory(), &services(http, &failing));
-        }) else {
-            // Log lines go to a logger installed elsewhere and cannot be observed here.
-            return;
-        };
-
-        let outcomes: Vec<_> = logs
-            .iter()
-            .filter(|line| line.contains("encypher: outcome="))
-            .collect();
-        assert_eq!(
-            outcomes,
-            [
-                "INFO encypher: outcome=passed_through reason=kv_unavailable",
-                "INFO encypher: outcome=passed_through reason=kv_unavailable",
-                "INFO encypher: outcome=passed_through reason=kv_error",
-            ]
-        );
-        assert_eq!(
-            logs.iter()
-                .filter(|line| line.starts_with("WARN") && line.contains("KV store is unavailable"))
-                .count(),
-            1,
-            "should warn once per instance: {logs:?}"
-        );
     }
 
     // --- gates and skips ----------------------------------------------------
@@ -2514,7 +2994,7 @@ mod tests {
         for line in &logs {
             assert!(!line.contains(TOKEN), "log line leaks the token: {line}");
             assert!(
-                !line.contains("encypher:v3:") && !line.contains("encypher:policy:v2:"),
+                !line.contains("encypher:plan:v4:") && !line.contains("encypher:policy:v3:"),
                 "log line leaks the cache key: {line}"
             );
             assert!(

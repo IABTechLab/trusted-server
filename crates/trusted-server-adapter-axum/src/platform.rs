@@ -20,6 +20,10 @@ use trusted_server_core::platform::{
     StoreId, StoreName, UnavailableKvStore,
 };
 
+/// Do not trust an upstream `Content-Length` with an arbitrarily large
+/// allocation before any response bytes arrive.
+const MAX_INITIAL_RESPONSE_BODY_CAPACITY: usize = 64 * 1024;
+
 // ---------------------------------------------------------------------------
 // Env-var naming helpers
 // ---------------------------------------------------------------------------
@@ -377,11 +381,68 @@ impl AxumPlatformHttpClient {
         Ok(())
     }
 
+    fn response_carries_body(request_is_head: bool, status: reqwest::StatusCode) -> bool {
+        !request_is_head
+            && !status.is_informational()
+            && status != reqwest::StatusCode::NO_CONTENT
+            && status != reqwest::StatusCode::RESET_CONTENT
+            && status != reqwest::StatusCode::NOT_MODIFIED
+    }
+
+    async fn response_body(
+        mut response: reqwest::Response,
+        limit: Option<usize>,
+        request_is_head: bool,
+    ) -> Result<Vec<u8>, Report<PlatformError>> {
+        let Some(limit) = limit else {
+            return response
+                .bytes()
+                .await
+                .map(|bytes| bytes.to_vec())
+                .change_context(PlatformError::HttpClient);
+        };
+        let content_length = if Self::response_carries_body(request_is_head, response.status()) {
+            response
+                .content_length()
+                .and_then(|length| usize::try_from(length).ok())
+        } else {
+            None
+        };
+        if content_length.is_some_and(|length| length > limit) {
+            return Err(Report::new(PlatformError::HttpClient).attach(format!(
+                "upstream Content-Length exceeds caller response body limit of {limit} bytes"
+            )));
+        }
+        let capacity = content_length
+            .unwrap_or(0)
+            .min(limit)
+            .min(MAX_INITIAL_RESPONSE_BODY_CAPACITY);
+        let mut body = Vec::with_capacity(capacity);
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .change_context(PlatformError::HttpClient)?
+        {
+            body.len()
+                .checked_add(chunk.len())
+                .filter(|length| *length <= limit)
+                .ok_or_else(|| {
+                    Report::new(PlatformError::HttpClient).attach(format!(
+                        "upstream response body exceeded caller limit of {limit} bytes"
+                    ))
+                })?;
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
+    }
+
     async fn execute(
         &self,
         request: PlatformHttpRequest,
     ) -> Result<PlatformResponse, Report<PlatformError>> {
         Self::refuse_image_optimizer_metadata(&request)?;
+        let max_response_body_bytes = request.max_response_body_bytes;
+        let request_is_head = request.request.method() == edgezero_core::http::Method::HEAD;
         let uri = request.request.uri().to_string();
         let method = reqwest::Method::from_bytes(request.request.method().as_str().as_bytes())
             .change_context(PlatformError::HttpClient)?;
@@ -408,19 +469,16 @@ impl AxumPlatformHttpClient {
         for (name, value) in sanitized_response_headers(resp.headers()) {
             edge_builder = edge_builder.header(name.as_str(), value.as_slice());
         }
-        let resp_bytes = resp
-            .bytes()
-            .await
-            .change_context(PlatformError::HttpClient)?;
-        // Upstream responses are buffered whole with no cap — acceptable for
-        // the dev server, but log the size so a large or hostile upstream is
-        // visible instead of silently growing the heap.
+        let resp_bytes =
+            Self::response_body(resp, max_response_body_bytes, request_is_head).await?;
+        // A caller limit is enforced chunk by chunk before this Vec grows past it.
+        // Unbounded callers retain the dev server's previous whole-body behavior.
         log::debug!(
             "buffered {} upstream response bytes from {uri}",
             resp_bytes.len()
         );
         let edge_resp = edge_builder
-            .body(edgezero_core::body::Body::from(resp_bytes.to_vec()))
+            .body(edgezero_core::body::Body::from(resp_bytes))
             .change_context(PlatformError::HttpClient)?;
 
         Ok(PlatformResponse::new(edge_resp).with_backend_name(request.backend_name))
@@ -448,9 +506,11 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
     ) -> Result<PlatformPendingRequest, Report<PlatformError>> {
         Self::refuse_image_optimizer_metadata(&request)?;
         let backend_name = request.backend_name.clone();
+        let max_response_body_bytes = request.max_response_body_bytes;
 
         // Extract all Send-compatible parts before spawning.
         let uri = request.request.uri().to_string();
+        let request_is_head = request.request.method() == edgezero_core::http::Method::HEAD;
         let method_bytes = request.request.method().as_str().as_bytes().to_vec();
         let headers: Vec<(String, Vec<u8>)> = request
             .request
@@ -480,13 +540,8 @@ impl PlatformHttpClient for AxumPlatformHttpClient {
             })?;
             let status = resp.status().as_u16();
             let resp_headers = sanitized_response_headers(resp.headers());
-            let body = resp
-                .bytes()
-                .await
-                .map_err(|e| Report::new(PlatformError::HttpClient).attach(e.to_string()))?
-                .to_vec();
-            // Same unbounded-buffering note as the synchronous path: log the
-            // size so large upstream responses are visible in dev.
+            let body = Self::response_body(resp, max_response_body_bytes, request_is_head).await?;
+            // The same collector enforces a caller limit inside the spawned path.
             log::debug!("buffered {} upstream response bytes from {uri}", body.len());
             Ok::<_, Report<PlatformError>>((status, resp_headers, body))
         });
@@ -1145,6 +1200,61 @@ mod tests {
             b"ok",
             "should preserve decoded response body"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn http_client_enforces_response_body_limit_while_reading_chunked_responses() {
+        let raw = b"HTTP/1.1 200 OK\r\n\
+                    Transfer-Encoding: chunked\r\n\
+                    \r\n\
+                    2\r\n\
+                    ab\r\n\
+                    2\r\n\
+                    cd\r\n\
+                    0\r\n\
+                    \r\n";
+
+        let exact_url = serve_raw_response(raw).await;
+        let exact_request = edgezero_core::http::request_builder()
+            .uri(exact_url)
+            .body(EdgeBody::empty())
+            .expect("should build outbound request");
+        let exact = AxumPlatformHttpClient::new()
+            .send(
+                PlatformHttpRequest::new(exact_request, "test_backend")
+                    .with_max_response_body_bytes(4),
+            )
+            .await
+            .expect("an exact-limit chunked body should be accepted")
+            .response
+            .into_body()
+            .into_bytes()
+            .expect("should return a buffered body");
+        assert_eq!(exact.as_ref(), b"abcd");
+
+        for asynchronous in [false, true] {
+            let url = serve_raw_response(raw).await;
+            let request = edgezero_core::http::request_builder()
+                .uri(url)
+                .body(EdgeBody::empty())
+                .expect("should build outbound request");
+            let request =
+                PlatformHttpRequest::new(request, "test_backend").with_max_response_body_bytes(3);
+            let client = AxumPlatformHttpClient::new();
+            let result = if asynchronous {
+                match client.send_async(request).await {
+                    Ok(pending) => client.wait(pending).await,
+                    Err(error) => Err(error),
+                }
+            } else {
+                client.send(request).await
+            };
+
+            assert!(
+                result.is_err(),
+                "asynchronous={asynchronous}: a chunked body over the limit must be rejected"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

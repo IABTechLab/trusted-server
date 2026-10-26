@@ -1,6 +1,4 @@
-use std::sync::LazyLock;
-
-use regex::Regex;
+use super::text::{StructuralTag, TagKind, scan_structural_tags};
 
 const CMS_CONTENT_CLASSES: [&str; 13] = [
     "entry-content",
@@ -18,28 +16,6 @@ const CMS_CONTENT_CLASSES: [&str; 13] = [
     "RichTextStoryBody",
 ];
 
-static ARTICLE: LazyLock<Option<Regex>> = LazyLock::new(|| tag_opening("article"));
-static MAIN: LazyLock<Option<Regex>> = LazyLock::new(|| tag_opening("main"));
-static BODY: LazyLock<Option<Regex>> = LazyLock::new(|| tag_opening("body"));
-static CLUSTER_CONTAINERS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-    ["div", "section", "main"]
-        .into_iter()
-        .filter_map(tag_opening)
-        .collect()
-});
-static PARAGRAPH: LazyLock<Option<Regex>> = LazyLock::new(|| Regex::new(r"(?i)<p(?-u:\b)").ok());
-static CMS_CLASSES: LazyLock<Vec<(&str, Regex)>> = LazyLock::new(|| {
-    CMS_CONTENT_CLASSES
-        .into_iter()
-        .filter_map(|class_name| Some((class_name, class_opening(class_name)?)))
-        .collect()
-});
-static ITEMPROP_ARTICLE_BODY: LazyLock<Option<Regex>> =
-    LazyLock::new(|| attribute_opening("itemprop", "articleBody"));
-static ROLE_MAIN: LazyLock<Option<Regex>> = LazyLock::new(|| attribute_opening("role", "main"));
-static SELECTOR_ATTRIBUTE: LazyLock<Option<Regex>> =
-    LazyLock::new(|| Regex::new(r#"\[([A-Za-z0-9_]+)=["']?([^"'\]]+)["']?\]"#).ok());
-
 /// The UTF-8 byte range and detection label of an article's outer HTML.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Boundary {
@@ -51,175 +27,288 @@ pub struct Boundary {
     pub selector: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ElementMatch {
+    start: usize,
+    end: usize,
+}
+
+#[derive(Clone, Copy)]
+enum FirstMatch<'a> {
+    Unseen,
+    Open { start: usize, name: &'a str },
+    Complete(ElementMatch),
+}
+
+impl<'a> FirstMatch<'a> {
+    fn observe(&mut self, tag: StructuralTag<'a>, opening_matches: bool) {
+        match (*self, tag.kind) {
+            (Self::Unseen, TagKind::Opening) if opening_matches => {
+                *self = Self::Open {
+                    start: tag.start,
+                    name: tag.name,
+                };
+            }
+            (Self::Open { start, name }, TagKind::Closing)
+                if tag.name.eq_ignore_ascii_case(name) =>
+            {
+                *self = Self::Complete(ElementMatch {
+                    start,
+                    end: tag.end,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn complete(self) -> Option<ElementMatch> {
+        match self {
+            Self::Complete(element) => Some(element),
+            Self::Unseen | Self::Open { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ActiveCount {
+    start: usize,
+    paragraphs: usize,
+}
+
+#[derive(Clone, Copy)]
+struct ScoredMatch {
+    element: ElementMatch,
+    paragraphs: usize,
+}
+
+#[derive(Clone, Copy)]
+struct CountedMatches {
+    name: &'static str,
+    active: Option<ActiveCount>,
+    best: Option<ScoredMatch>,
+}
+
+impl CountedMatches {
+    const fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            active: None,
+            best: None,
+        }
+    }
+
+    fn observe(&mut self, tag: StructuralTag<'_>) {
+        match tag.kind {
+            TagKind::Opening => {
+                if let Some(active) = &mut self.active {
+                    if tag.name.eq_ignore_ascii_case("p") {
+                        active.paragraphs += 1;
+                    }
+                } else if tag.name.eq_ignore_ascii_case(self.name) {
+                    self.active = Some(ActiveCount {
+                        start: tag.start,
+                        paragraphs: 0,
+                    });
+                }
+            }
+            TagKind::Closing if tag.name.eq_ignore_ascii_case(self.name) => {
+                let Some(active) = self.active.take() else {
+                    return;
+                };
+                let candidate = ScoredMatch {
+                    element: ElementMatch {
+                        start: active.start,
+                        end: tag.end,
+                    },
+                    paragraphs: active.paragraphs,
+                };
+                if self
+                    .best
+                    .is_none_or(|best| candidate.paragraphs > best.paragraphs)
+                {
+                    self.best = Some(candidate);
+                }
+            }
+            TagKind::Closing => {}
+        }
+    }
+}
+
+enum Selector<'a> {
+    Tag(&'a str),
+    Class(&'a str),
+    Attribute(&'a str, &'a str),
+}
+
+impl Selector<'_> {
+    fn matches(&self, tag: &StructuralTag<'_>) -> bool {
+        match *self {
+            Self::Tag(name) => tag.name.eq_ignore_ascii_case(name),
+            Self::Class(name) => tag
+                .attribute("class")
+                .is_some_and(|value| class_matches(value, name)),
+            Self::Attribute(attribute, value) => attribute_matches(tag, attribute, value),
+        }
+    }
+}
+
 /// Finds an article boundary using the edge-core priority chain, excluding JSON-LD P5.
 #[must_use]
 pub fn find_article_boundary(html: &str, override_selector: Option<&str>) -> Option<Boundary> {
-    if let Some(selector) = override_selector.filter(|selector| !selector.is_empty())
-        && let Some(range) = match_selector(html, selector)
+    let override_label = override_selector.filter(|selector| !selector.is_empty());
+    let override_matcher = override_label.and_then(parse_selector);
+    let mut override_element = FirstMatch::Unseen;
+    let mut article = CountedMatches::new("article");
+    let mut cms = [FirstMatch::Unseen; CMS_CONTENT_CLASSES.len()];
+    let mut itemprop = FirstMatch::Unseen;
+    let mut main = FirstMatch::Unseen;
+    let mut role = FirstMatch::Unseen;
+    let mut body = FirstMatch::Unseen;
+    let mut div_cluster = CountedMatches::new("div");
+    let mut section_cluster = CountedMatches::new("section");
+    let mut main_cluster = CountedMatches::new("main");
+
+    // All priority candidates share one structural pass. Each first-match
+    // state deliberately keeps an unclosed first opening from being rescued
+    // by a later one, matching the previous selector scans.
+    scan_structural_tags(html, |tag| {
+        let opening = tag.kind == TagKind::Opening;
+        override_element.observe(
+            tag,
+            opening
+                && override_matcher
+                    .as_ref()
+                    .is_some_and(|selector| selector.matches(&tag)),
+        );
+        let class = opening.then(|| tag.attribute("class")).flatten();
+        for (state, expected) in cms.iter_mut().zip(CMS_CONTENT_CLASSES) {
+            state.observe(
+                tag,
+                class.is_some_and(|value| class_matches(value, expected)),
+            );
+        }
+        itemprop.observe(
+            tag,
+            opening && attribute_matches(&tag, "itemprop", "articleBody"),
+        );
+        main.observe(tag, opening && tag.name.eq_ignore_ascii_case("main"));
+        role.observe(tag, opening && attribute_matches(&tag, "role", "main"));
+        body.observe(tag, opening && tag.name.eq_ignore_ascii_case("body"));
+        article.observe(tag);
+        div_cluster.observe(tag);
+        section_cluster.observe(tag);
+        main_cluster.observe(tag);
+        true
+    });
+
+    if let (Some(selector), Some(element)) = (override_label, override_element.complete()) {
+        return Some(boundary(element, format!("override:{selector}")));
+    }
+    if let Some(selected) = article.best {
+        return Some(boundary(selected.element, "article"));
+    }
+    for (state, class_name) in cms.into_iter().zip(CMS_CONTENT_CLASSES) {
+        if let Some(element) = state.complete() {
+            return Some(boundary(element, format!("class:{class_name}")));
+        }
+    }
+    if let Some(element) = itemprop.complete() {
+        return Some(boundary(element, "itemprop:articleBody"));
+    }
+    if let Some(element) = main.complete() {
+        return Some(boundary(element, "main"));
+    }
+    if let Some(element) = role.complete() {
+        return Some(boundary(element, "role:main"));
+    }
+
+    let mut cluster = None;
+    for candidate in [div_cluster.best, section_cluster.best, main_cluster.best]
+        .into_iter()
+        .flatten()
+        .filter(|candidate| candidate.paragraphs > 4)
     {
-        return Some(Boundary {
-            start: range.0,
-            end: range.1,
-            selector: format!("override:{selector}"),
-        });
-    }
-
-    let articles = ARTICLE
-        .as_ref()
-        .map_or_else(Vec::new, |opening| match_all(html, opening));
-    if let Some(first) = articles.first().copied() {
-        let mut selected = first;
-        let mut selected_count = count_paragraphs(html.get(first.0..first.1).unwrap_or(""));
-        for candidate in articles.iter().copied().skip(1) {
-            let candidate_count =
-                count_paragraphs(html.get(candidate.0..candidate.1).unwrap_or(""));
-            if candidate_count > selected_count {
-                selected = candidate;
-                selected_count = candidate_count;
-            }
-        }
-        return Some(boundary(selected, "article"));
-    }
-
-    for (class_name, opening) in CMS_CLASSES.iter() {
-        if let Some(range) = match_first(html, opening) {
-            return Some(boundary(range, &format!("class:{class_name}")));
+        if cluster.is_none_or(|best: ScoredMatch| candidate.paragraphs > best.paragraphs) {
+            cluster = Some(candidate);
         }
     }
-
-    if let Some(range) = match_fixed(html, &ITEMPROP_ARTICLE_BODY) {
-        return Some(boundary(range, "itemprop:articleBody"));
+    if let Some(selected) = cluster {
+        return Some(boundary(selected.element, "p-cluster"));
     }
-    if let Some(range) = match_fixed(html, &MAIN) {
-        return Some(boundary(range, "main"));
-    }
-    if let Some(range) = match_fixed(html, &ROLE_MAIN) {
-        return Some(boundary(range, "role:main"));
-    }
-    if let Some(range) = find_largest_p_cluster(html) {
-        return Some(boundary(range, "p-cluster"));
-    }
-    match_fixed(html, &BODY).map(|range| boundary(range, "body"))
+    body.complete().map(|element| boundary(element, "body"))
 }
 
-fn boundary((start, end): (usize, usize), selector: &str) -> Boundary {
+fn boundary(element: ElementMatch, selector: impl Into<String>) -> Boundary {
     Boundary {
-        start,
-        end,
-        selector: selector.to_owned(),
+        start: element.start,
+        end: element.end,
+        selector: selector.into(),
     }
 }
 
-// Every opening pattern captures the element's tag name as group 1.
-fn tag_opening(tag_name: &str) -> Option<Regex> {
-    Regex::new(&format!(
-        r"(?i)<({})(?-u:\b)[^>]*>",
-        regex::escape(tag_name)
-    ))
-    .ok()
-}
-
-fn class_opening(class_name: &str) -> Option<Regex> {
-    Regex::new(&format!(
-        r#"(?i)<([A-Za-z0-9_]+)(?-u:\b)[^>]*class\s*=\s*["'][^"']*(?-u:\b){}(?-u:\b)[^"']*["'][^>]*>"#,
-        regex::escape(class_name)
-    ))
-    .ok()
-}
-
-fn attribute_opening(attribute: &str, value: &str) -> Option<Regex> {
-    Regex::new(&format!(
-        r#"(?i)<([A-Za-z0-9_]+)(?-u:\b)[^>]*{}\s*=\s*["']{}["'][^>]*>"#,
-        regex::escape(attribute),
-        regex::escape(value)
-    ))
-    .ok()
-}
-
-fn match_fixed(html: &str, opening: &LazyLock<Option<Regex>>) -> Option<(usize, usize)> {
-    match_first(html, opening.as_ref()?)
-}
-
-fn match_first(html: &str, opening: &Regex) -> Option<(usize, usize)> {
-    let captures = opening.captures(html)?;
-    let whole = captures.get(0)?;
-    close_first_element(html, whole.start(), whole.end(), captures.get(1)?.as_str())
-}
-
-fn match_all(html: &str, opening: &Regex) -> Vec<(usize, usize)> {
-    let mut matches = Vec::new();
-    let mut cursor = 0_usize;
-    while let Some(tail) = html.get(cursor..) {
-        let Some(captures) = opening.captures(tail) else {
-            break;
-        };
-        let (Some(whole), Some(tag_name)) = (captures.get(0), captures.get(1)) else {
-            break;
-        };
-        let start = cursor.saturating_add(whole.start());
-        let opening_end = cursor.saturating_add(whole.end());
-        let Some(range) = close_first_element(html, start, opening_end, tag_name.as_str()) else {
-            break;
-        };
-        matches.push(range);
-        cursor = range.1;
+fn parse_selector(selector: &str) -> Option<Selector<'_>> {
+    if let Some(class_name) = selector.strip_prefix('.').filter(|name| !name.is_empty()) {
+        return Some(Selector::Class(class_name));
     }
-    matches
+    if selector.starts_with('[') {
+        let (attribute, value) = parse_attribute_selector(selector)?;
+        return Some(Selector::Attribute(attribute, value));
+    }
+    Some(Selector::Tag(selector))
 }
 
-// An operator-configured selector is compiled per document.
-fn match_selector(html: &str, selector: &str) -> Option<(usize, usize)> {
-    if let Some(class_name) = selector.strip_prefix('.') {
-        return match_first(html, &class_opening(class_name)?);
-    }
-    if selector.starts_with('[')
-        && let Some(captures) = SELECTOR_ATTRIBUTE.as_ref()?.captures(selector)
+fn parse_attribute_selector(selector: &str) -> Option<(&str, &str)> {
+    let content = selector.strip_prefix('[')?.strip_suffix(']')?;
+    let (attribute, raw_value) = content.split_once('=')?;
+    if attribute.is_empty()
+        || !attribute
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
     {
-        let opening = attribute_opening(captures.get(1)?.as_str(), captures.get(2)?.as_str())?;
-        return match_first(html, &opening);
+        return None;
     }
-    match_first(html, &tag_opening(selector)?)
+    let value = match (
+        raw_value.as_bytes().first().copied(),
+        raw_value.as_bytes().last().copied(),
+    ) {
+        (Some(first @ (b'"' | b'\'')), Some(last)) if first == last => {
+            raw_value.get(1..raw_value.len().saturating_sub(1))?
+        }
+        (Some(b'"' | b'\''), _) => return None,
+        _ => raw_value,
+    };
+    (!value.is_empty()
+        && !value
+            .bytes()
+            .any(|byte| matches!(byte, b'"' | b'\'' | b']')))
+    .then_some((attribute, value))
 }
 
-/// Extends an opening tag to the first `</tag_name>` after it, ASCII case-insensitively.
-fn close_first_element(
-    html: &str,
-    opening_start: usize,
-    opening_end: usize,
-    tag_name: &str,
-) -> Option<(usize, usize)> {
-    let closing = format!("</{tag_name}>");
-    let tail = html.as_bytes().get(opening_end..)?;
-    let offset = tail
-        .windows(closing.len())
-        .position(|window| window.eq_ignore_ascii_case(closing.as_bytes()))?;
-    Some((
-        opening_start,
-        opening_end
-            .saturating_add(offset)
-            .saturating_add(closing.len()),
-    ))
+fn attribute_matches(tag: &StructuralTag<'_>, attribute: &str, expected: &str) -> bool {
+    tag.attribute(attribute)
+        .is_some_and(|value| value.eq_ignore_ascii_case(expected))
 }
 
-fn count_paragraphs(html: &str) -> usize {
-    PARAGRAPH
-        .as_ref()
-        .map_or(0, |regex| regex.find_iter(html).count())
-}
-
-fn find_largest_p_cluster(html: &str) -> Option<(usize, usize)> {
-    let mut best = None;
-    let mut best_count = 4_usize;
-    for opening in CLUSTER_CONTAINERS.iter() {
-        for range in match_all(html, opening) {
-            let count = count_paragraphs(html.get(range.0..range.1).unwrap_or(""));
-            if count > best_count {
-                best = Some(range);
-                best_count = count;
-            }
+fn class_matches(value: &str, expected: &str) -> bool {
+    let mut expected_parts = expected.split_ascii_whitespace();
+    let Some(first) = expected_parts.next() else {
+        return false;
+    };
+    let second = expected_parts.next();
+    if expected_parts.next().is_some() {
+        return false;
+    }
+    let mut previous_was_first = false;
+    for class in value.split_ascii_whitespace() {
+        if second.is_some_and(|second| previous_was_first && class.eq_ignore_ascii_case(second)) {
+            return true;
+        }
+        previous_was_first = class.eq_ignore_ascii_case(first);
+        if second.is_none() && previous_was_first {
+            return true;
         }
     }
-    best
+    false
 }
 
 #[cfg(test)]
@@ -261,6 +350,77 @@ mod tests {
             html.get(boundary.start..boundary.end),
             Some("<DIV class=\"Entry-Content\">x</div>")
         );
+    }
+
+    #[test]
+    fn article_detection_ignores_inert_opening_markup() {
+        let real = "<article><p>Real article.</p></article>";
+        for inert in [
+            "<!-- <article><p>Comment template.</p></article> -->",
+            r#"<script>const template = "<article><p>Script template.</p></article>";</script>"#,
+            r#"<div data-template="<article><p>Attribute template.</p></article>"></div>"#,
+        ] {
+            let html = format!("{inert}{real}");
+            let boundary = find_article_boundary(&html, None).expect("should find real article");
+            assert_eq!(
+                html.get(boundary.start..boundary.end),
+                Some(real),
+                "inert markup must not become the article: {inert}"
+            );
+        }
+    }
+
+    #[test]
+    fn inert_closing_markup_does_not_truncate_an_article() {
+        for inert in [
+            "<!-- </article> -->",
+            r#"<script>const close = "</article>";</script>"#,
+            r#"<span data-close="</article>">Attribute text.</span>"#,
+        ] {
+            let html = format!("<article><p>Start.</p>{inert}<p>End.</p></article>");
+            let boundary = find_article_boundary(&html, None).expect("should find article");
+            assert_eq!(
+                html.get(boundary.start..boundary.end),
+                Some(html.as_str()),
+                "inert markup must not close the article: {inert}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_less_than_and_declarations_do_not_hide_or_create_articles() {
+        let real = "<article><p>Real article.</p></article>";
+        for prefix in [
+            "text < y ",
+            "< article><p>False spaced article.</p></ article>",
+            "<!article><p>False declaration.</p></article>",
+            "<?article><p>False instruction.</p></article>",
+            "<!bogus \"quoted > remainder\">",
+        ] {
+            let html = format!("{prefix}{real}");
+            let boundary = find_article_boundary(&html, None).expect("should find real article");
+            assert_eq!(
+                html.get(boundary.start..boundary.end),
+                Some(real),
+                "invalid markup must not hide or create the article: {prefix}"
+            );
+        }
+
+        let html = "<article><p>Start.</p></ article><p>End.</p></article>";
+        let boundary = find_article_boundary(html, None).expect("should find article");
+        assert_eq!(html.get(boundary.start..boundary.end), Some(html));
+    }
+
+    #[test]
+    fn dense_documents_select_articles_without_a_document_sized_tag_index() {
+        let padding = "<i></i>".repeat(700_000);
+        let first = "<article><p>First.</p></article>";
+        let second = "<article><p>Second.</p><p>Wins.</p></article>";
+        let html = format!("{padding}{first}{second}");
+
+        let boundary = find_article_boundary(&html, None).expect("should find article");
+        assert_eq!(boundary.selector, "article");
+        assert_eq!(html.get(boundary.start..boundary.end), Some(second));
     }
 
     #[test]

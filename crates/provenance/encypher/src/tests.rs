@@ -282,6 +282,19 @@ fn stub(cache_control: &str) -> Arc<StubHttpClient> {
     stub
 }
 
+fn origin_stub(cache_control: &str) -> Arc<StubHttpClient> {
+    let stub = Arc::new(StubHttpClient::new());
+    stub.push_response_with_headers(
+        200,
+        ARTICLE.as_bytes().to_vec(),
+        vec![
+            ("content-type", "text/html; charset=utf-8"),
+            ("cache-control", cache_control),
+        ],
+    );
+    stub
+}
+
 fn page_request(method: Method) -> Request<EdgeBody> {
     Request::builder()
         .method(method)
@@ -291,14 +304,14 @@ fn page_request(method: Method) -> Request<EdgeBody> {
         .expect("should build the page request")
 }
 
-/// The page body a reader receives from the publisher path, through the
+/// The response a reader receives from the publisher path, through the
 /// buffered or the streaming finalizer.
-fn served(
+fn served_response(
     settings: &Settings,
     services: &RuntimeServices,
     request: Request<EdgeBody>,
     streaming: bool,
-) -> String {
+) -> http::Response<EdgeBody> {
     let registry = IntegrationRegistry::with_registrations(settings, &[builder()])
         .expect("should build the registry");
     let plan = compile_auction_plan(settings).expect("should compile the auction plan");
@@ -327,7 +340,7 @@ fn served(
         )
         .await
         .expect("should fetch the page");
-        let response = if streaming {
+        if streaming {
             publisher_response_into_streaming_response(
                 publisher,
                 &method,
@@ -348,7 +361,19 @@ fn served(
             )
             .await
         }
-        .expect("should finish the page");
+        .expect("should finish the page")
+    })
+}
+
+/// The page body a reader receives from the publisher path.
+fn served(
+    settings: &Settings,
+    services: &RuntimeServices,
+    request: Request<EdgeBody>,
+    streaming: bool,
+) -> String {
+    let response = served_response(settings, services, request, streaming);
+    block_on(async {
         let body = response
             .into_body()
             .into_bytes_bounded(16 * 1024 * 1024)
@@ -359,8 +384,12 @@ fn served(
 }
 
 fn services_for(stub: &Arc<StubHttpClient>) -> RuntimeServices {
+    services_for_kv(stub, Arc::new(MemoryKv::default()))
+}
+
+fn services_for_kv(stub: &Arc<StubHttpClient>, kv: Arc<MemoryKv>) -> RuntimeServices {
     build_services_with_http_client(Arc::clone(stub) as Arc<dyn PlatformHttpClient>)
-        .with_kv_store(Arc::new(MemoryKv::default()))
+        .with_kv_store(kv)
 }
 
 #[test]
@@ -396,6 +425,79 @@ fn the_publisher_path_signs_an_article_through_both_finalizers() {
             "should send the page address without its query: {policy_uri}"
         );
     }
+}
+
+/// The unsigned bytes produced by the same public publisher pipeline before
+/// its final writer applies the configured bound. Core middleware may rewrite
+/// the origin body before Encypher sees it, so the origin fixture length is not
+/// the final unsigned length.
+fn unsigned_public_page() -> String {
+    let stub = origin_stub("public, max-age=60");
+    let page = served(
+        &placed(),
+        &services_for(&stub),
+        page_request(Method::GET),
+        false,
+    );
+    assert!(
+        page.len() > ARTICLE.len(),
+        "fixture must retain the HTML rewriter's output overhead"
+    );
+    page
+}
+
+#[test]
+fn fresh_expansion_over_the_buffered_limit_returns_the_unsigned_page() {
+    let unsigned = unsigned_public_page();
+    let mut settings = placed();
+    settings.publisher.max_buffered_body_bytes = unsigned.len();
+    let stub = stub("public, max-age=60");
+    let response = served_response(
+        &settings,
+        &services_for(&stub),
+        page_request(Method::GET),
+        false,
+    );
+
+    assert_eq!(response.status(), 200);
+    let body = block_on(response.into_body().into_bytes_bounded(unsigned.len()))
+        .expect("the unsigned pipeline output should fit its exact buffered limit");
+    assert_eq!(body.as_ref(), unsigned.as_bytes());
+    assert_eq!(stub.recorded_request_methods(), ["GET", "GET", "POST"]);
+}
+
+#[test]
+fn cached_expansion_over_the_buffered_limit_returns_the_unsigned_page() {
+    let unsigned = unsigned_public_page();
+    let kv = Arc::new(MemoryKv::default());
+    let first = stub("public, max-age=60");
+    let signed = served(
+        &placed(),
+        &services_for_kv(&first, Arc::clone(&kv)),
+        page_request(Method::GET),
+        false,
+    );
+    assert!(signed.contains(MARKER), "should seed a valid plan");
+
+    let mut settings = placed();
+    settings.publisher.max_buffered_body_bytes = unsigned.len();
+    let cached = origin_stub("public, max-age=60");
+    let response = served_response(
+        &settings,
+        &services_for_kv(&cached, kv),
+        page_request(Method::GET),
+        false,
+    );
+
+    assert_eq!(response.status(), 200);
+    let body = block_on(response.into_body().into_bytes_bounded(unsigned.len()))
+        .expect("the unsigned pipeline output should fit its exact buffered limit");
+    assert_eq!(body.as_ref(), unsigned.as_bytes());
+    assert_eq!(
+        cached.recorded_request_methods(),
+        ["GET"],
+        "the cached policy and plan should make no Encypher API request"
+    );
 }
 
 #[test]

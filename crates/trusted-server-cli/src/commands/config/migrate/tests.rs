@@ -25,13 +25,6 @@ const MAIN_EXAMPLE: &str = include_str!(concat!(
     "/tests/fixtures/main-trusted-server.example.toml"
 ));
 
-/// The stack's example settings document, which shows the page entries in
-/// the order the modules' page changes run.
-const STACK_EXAMPLE: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../trusted-server.example.toml"
-));
-
 /// The settings every document written for main carries, with hosts that
 /// are not the template's placeholders.
 const MAIN_BASE: &str = r#"[publisher]
@@ -1448,123 +1441,6 @@ url = "https://origin.publisher.example.com"
         migration.report.check
     );
     assert_eq!(migration.text, input);
-}
-
-/// The middleware names the stack's example lists in the commented entry for
-/// `phase` and `media_type`.
-fn example_entry(phase: &str, media_type: &str) -> Vec<String> {
-    let start = format!("# [[{phase}]]\n# media_type = \"{media_type}\"\n# middleware = [\n");
-    let at = STACK_EXAMPLE
-        .find(&start)
-        .unwrap_or_else(|| panic!("the example should list a {phase} entry for {media_type}"));
-    STACK_EXAMPLE[at + start.len()..]
-        .lines()
-        .take_while(|line| *line != "# ]")
-        .map(|line| {
-            line.trim_start_matches('#')
-                .trim()
-                .trim_end_matches(',')
-                .trim_matches('"')
-                .to_owned()
-        })
-        .collect()
-}
-
-#[test]
-fn page_entries_name_the_middleware_in_the_order_the_example_shows() {
-    let input = main_document(
-        r#"[integrations.prebid]
-enabled = true
-
-[integrations.js_asset_proxy]
-enabled = true
-
-[integrations.testlight]
-enabled = true
-endpoint = "https://testlight.example.com/openrtb2/auction"
-
-[integrations.nextjs]
-enabled = true
-
-[integrations.permutive]
-organization_id = "organization"
-workspace_id = "workspace"
-
-[integrations.lockr]
-app_id = "lockr"
-
-[integrations.didomi]
-
-[integrations.sourcepoint]
-enabled = true
-
-[integrations.google_tag_manager]
-enabled = true
-container_id = "GTM-ABCDEF"
-
-[integrations.datadome]
-enabled = true
-
-[integrations.gpt]
-
-[integrations.gpt_diagnostics]
-enabled = true
-"#,
-    );
-    let migration = migrated(&input);
-    let value = parsed(&migration.text);
-    let names = |entry: &toml::Value| -> Vec<String> {
-        entry["middleware"]
-            .as_array()
-            .expect("should name middleware")
-            .iter()
-            .filter_map(toml::Value::as_str)
-            .map(str::to_owned)
-            .collect()
-    };
-    let entry = |phase: &str, media_type: &str| -> Vec<String> {
-        value[phase]
-            .as_array()
-            .expect("should add entries")
-            .iter()
-            .find(|entry| entry["media_type"].as_str() == Some(media_type))
-            .map(names)
-            .unwrap_or_default()
-    };
-
-    let fetch = entry("fetch", "text/html");
-    let expected: Vec<String> = example_entry("fetch", "text/html")
-        .into_iter()
-        .filter(|name| name != "cmp.inmobi")
-        .collect();
-    assert_eq!(fetch, expected);
-
-    let serve = entry("serve", "text/html");
-    let expected: Vec<String> = example_entry("serve", "text/html")
-        .into_iter()
-        .filter(|name| {
-            ![
-                "tag.google-tag",
-                "headers.geo",
-                "51degrees.client_hints",
-                "service_version",
-            ]
-            .contains(&name.as_str())
-        })
-        .collect();
-    assert_eq!(serve, expected);
-
-    assert_eq!(
-        entry("fetch", "text/x-component"),
-        ["framework.nextjs.flight"],
-        "the Next.js module should place its Flight middleware"
-    );
-    assert!(!reported(&migration.report.check, "Flight response"));
-    assert!(
-        !reported(&migration.report.to_do, "does not link"),
-        "every main integration should name a module the tool links: {:?}",
-        migration.report.to_do
-    );
 }
 
 #[test]

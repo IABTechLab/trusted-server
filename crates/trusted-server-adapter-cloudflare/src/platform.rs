@@ -230,14 +230,56 @@ struct CloudflarePendingResponse {
 #[cfg(target_arch = "wasm32")]
 pub struct CloudflareHttpClient;
 
-/// Maximum buffered upstream response body, mirroring the Fastly adapter's cap.
+/// Maximum buffered upstream response body.
 ///
-/// Cloudflare Workers isolates have a bounded memory budget (~128 MB), so a
-/// large or hostile upstream could OOM the isolate. `execute` buffers the whole
-/// body via `resp.bytes()`, so it caps both the declared Content-Length and the
-/// materialized byte count at this limit.
+/// Workers delivers one host-created chunk at a time. The adapter checks each
+/// chunk before copying it into the response Vec, so the whole response is
+/// never materialized before this ceiling is enforced.
 #[cfg(target_arch = "wasm32")]
 const MAX_PLATFORM_RESPONSE_BODY_BYTES: usize = 10 * 1024 * 1024; // 10 MiB
+
+#[cfg(target_arch = "wasm32")]
+fn effective_response_body_limit(caller_limit: Option<usize>) -> usize {
+    caller_limit
+        .unwrap_or(MAX_PLATFORM_RESPONSE_BODY_BYTES)
+        .min(MAX_PLATFORM_RESPONSE_BODY_BYTES)
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+async fn collect_bounded_response_stream<S, E>(
+    stream: S,
+    limit: usize,
+) -> Result<Vec<u8>, Report<PlatformError>>
+where
+    S: futures::Stream<Item = Result<Vec<u8>, E>>,
+    E: std::fmt::Display,
+{
+    use futures::StreamExt as _;
+
+    futures::pin_mut!(stream);
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            Report::new(PlatformError::HttpClient)
+                .attach(format!("failed to read Workers response body: {error}"))
+        })?;
+        body.len()
+            .checked_add(chunk.len())
+            .filter(|length| *length <= limit)
+            .ok_or_else(|| {
+                Report::new(PlatformError::HttpClient).attach(format!(
+                    "upstream response body exceeded {limit}-byte limit"
+                ))
+            })?;
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn response_carries_body(request_is_head: bool, status: u16) -> bool {
+    !request_is_head && !(100..200).contains(&status) && !matches!(status, 204 | 205 | 304)
+}
 
 /// Collect the lowercased tokens listed in the upstream `Connection:` header(s).
 ///
@@ -348,6 +390,8 @@ impl CloudflareHttpClient {
         }
 
         let cache_mode = outbound_cache_mode(&request.cache_intent);
+        let response_limit = effective_response_body_limit(request.max_response_body_bytes);
+        let request_is_head = request.request.method() == edgezero_core::http::Method::HEAD;
 
         let uri = request.request.uri().to_string();
         // http::Method always stores uppercase; worker 0.7 implements From<String> only.
@@ -412,22 +456,21 @@ impl CloudflareHttpClient {
 
         let status = resp.status_code();
 
-        // Pre-flight: reject oversized responses before copying bytes into the
-        // isolate heap. Content-Length is advisory (and absent on chunked
-        // responses), so the post-buffer check below is the real guard; this
-        // just rejects honestly-declared large bodies cheaply. Mirrors the
-        // Fastly adapter's two-stage cap.
-        if let Some(claimed_len) = resp
-            .headers()
-            .get("content-length")
-            .ok()
-            .flatten()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            && claimed_len > MAX_PLATFORM_RESPONSE_BODY_BYTES
+        // Content-Length permits an early refusal, but the stream collector is
+        // authoritative for missing or dishonest lengths.
+        let response_body_expected = response_carries_body(request_is_head, status);
+        if response_body_expected
+            && let Some(claimed_len) = resp
+                .headers()
+                .get("content-length")
+                .ok()
+                .flatten()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+            && claimed_len > response_limit
         {
             return Err(Report::new(PlatformError::HttpClient).attach(format!(
                 "origin Content-Length {claimed_len} exceeds \
-                 {MAX_PLATFORM_RESPONSE_BODY_BYTES}-byte response body limit"
+                 {response_limit}-byte response body limit"
             )));
         }
 
@@ -438,9 +481,9 @@ impl CloudflareHttpClient {
             // chunked transfer — strip these headers so the proxy layer does not
             // attempt a second decompression pass on the already-decoded body.
             // Content-Length is stripped too: the origin value describes the
-            // compressed payload, not the decoded bytes returned by `bytes()`,
-            // and forwarding it stale would truncate pass-through responses.
-            // The accurate length is set from the decoded body below.
+            // compressed payload, not the decoded chunks returned by the
+            // Workers stream, and forwarding it stale would truncate
+            // pass-through responses. The accurate length is set below.
             if name.eq_ignore_ascii_case("content-encoding")
                 || name.eq_ignore_ascii_case("transfer-encoding")
                 || name.eq_ignore_ascii_case("content-length")
@@ -455,19 +498,12 @@ impl CloudflareHttpClient {
             }
             edge_builder = edge_builder.header(name.as_str(), value.as_bytes());
         }
-        let body_bytes = resp
-            .bytes()
-            .await
-            .change_context(PlatformError::HttpClient)?;
-
-        // Belt-and-suspenders: catches chunked responses with no Content-Length.
-        if body_bytes.len() > MAX_PLATFORM_RESPONSE_BODY_BYTES {
-            return Err(Report::new(PlatformError::HttpClient).attach(format!(
-                "origin response body {} bytes exceeds \
-                 {MAX_PLATFORM_RESPONSE_BODY_BYTES}-byte limit",
-                body_bytes.len()
-            )));
-        }
+        let body_bytes = if response_body_expected {
+            let stream = resp.stream().change_context(PlatformError::HttpClient)?;
+            collect_bounded_response_stream(stream, response_limit).await?
+        } else {
+            Vec::new()
+        };
         edge_builder = edge_builder.header(
             edgezero_core::http::header::CONTENT_LENGTH,
             body_bytes.len(),
@@ -513,9 +549,9 @@ impl PlatformHttpClient for CloudflareHttpClient {
             .collect();
         let body_bytes = match response.response.into_body() {
             edgezero_core::body::Body::Once(bytes) => bytes.to_vec(),
-            // execute() always buffers via resp.bytes().await → Body::Once.
-            // Return a typed error rather than panicking in the request path
-            // in case that edgezero implementation detail ever changes.
+            // execute() always collects the bounded response stream into
+            // Body::Once. Return a typed error in case that edgezero
+            // implementation detail changes.
             edgezero_core::body::Body::Stream(_) => {
                 return Err(Report::new(PlatformError::HttpClient).attach(
                     "unexpected streaming body from CloudflareHttpClient::execute \
@@ -915,6 +951,30 @@ mod tests {
         assert_eq!(backend.canonicalize_transport_timeout_ms(2000, 100), 100);
         assert_eq!(backend.transport_timeout_bucket_count(2000), 1);
     }
+
+    #[tokio::test]
+    async fn response_stream_rejects_the_chunk_that_crosses_the_caller_limit() {
+        let exact =
+            futures::stream::iter([Ok::<_, std::io::Error>(b"ab".to_vec()), Ok(b"cd".to_vec())]);
+        let body = collect_bounded_response_stream(exact, 4)
+            .await
+            .expect("an exact-limit streamed body should fit");
+        assert_eq!(body, b"abcd");
+
+        let oversized = futures::stream::iter([
+            Ok::<_, std::io::Error>(b"ab".to_vec()),
+            Ok(b"cd".to_vec()),
+            Ok(b"e".to_vec()),
+        ]);
+        let error = collect_bounded_response_stream(oversized, 4)
+            .await
+            .expect_err("the chunk crossing the limit must be rejected");
+        assert!(
+            format!("{error:?}").contains("4"),
+            "the error should report the enforced limit: {error:?}"
+        );
+    }
+
     use edgezero_core::http::{HeaderValue, request_builder};
     use edgezero_core::params::PathParams;
 
