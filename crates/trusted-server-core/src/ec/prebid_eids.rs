@@ -148,11 +148,14 @@ fn raw_diagnostic_sources(raw: &RawValue) -> Vec<DiagnosticEidSource> {
 /// route the cookie. The `sharedId` cookie is applied last, so it wins over a
 /// Prebid EID for the same partner. With repeated sources, the later entry's
 /// first valid UID is the candidate for that partner.
+///
+/// When `now` is `Some`, each update carries it as its acquisition time.
 pub(crate) fn collect_eid_updates(
     eids_cookie: Option<&str>,
     sharedid_cookie: Option<&str>,
     body_eids: Option<&[Eid]>,
     registry: &PartnerRegistry,
+    now: Option<u64>,
 ) -> Vec<PartnerIdUpdate> {
     if registry.is_empty() {
         return Vec::new();
@@ -169,6 +172,12 @@ pub(crate) fn collect_eid_updates(
         && let Some(update) = collect_sharedid_update(cookie, registry)
     {
         updates.push(update);
+    }
+    if let Some(now) = now {
+        updates = updates
+            .into_iter()
+            .map(|update| update.with_acquired_at(now))
+            .collect();
     }
     dedupe_partner_updates(updates)
 }
@@ -233,13 +242,10 @@ fn collect_prebid_eid_updates_from_eids(
 pub(crate) fn dedupe_partner_updates(updates: Vec<PartnerIdUpdate>) -> Vec<PartnerIdUpdate> {
     let mut latest = std::collections::BTreeMap::new();
     for update in updates {
-        latest.insert(update.partner_id, update.uid);
+        latest.insert(update.partner_id.clone(), update);
     }
 
-    latest
-        .into_iter()
-        .map(|(partner_id, uid)| PartnerIdUpdate::new(partner_id, uid))
-        .collect()
+    latest.into_values().collect()
 }
 
 fn first_valid_uid(uids: &[Uid]) -> Option<&Uid> {
@@ -313,6 +319,8 @@ mod tests {
     use base64::engine::general_purpose::STANDARD as BASE64;
     use serde_json::json;
 
+    use crate::ec::kv::apply_partner_id_updates;
+    use crate::ec::kv_types::KvEntry;
     use crate::ec::registry::PartnerRegistry;
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
@@ -689,7 +697,13 @@ mod tests {
             {"source": "id5-sync.com", "uids": [{"id": "ID5_abc", "atype": 1}]}
         ]));
 
-        let updates = collect_eid_updates(Some(&eids_cookie), Some(" shared-1 "), None, &registry);
+        let updates = collect_eid_updates(
+            Some(&eids_cookie),
+            Some(" shared-1 "),
+            None,
+            &registry,
+            None,
+        );
 
         assert_eq!(
             updates.len(),
@@ -729,7 +743,8 @@ mod tests {
             ),
         ];
 
-        let updates = collect_eid_updates(Some(&eids_cookie), None, Some(&body_eids), &registry);
+        let updates =
+            collect_eid_updates(Some(&eids_cookie), None, Some(&body_eids), &registry, None);
 
         assert_eq!(
             updates,
@@ -750,7 +765,8 @@ mod tests {
             {"source": "id5-sync.com", "uids": [{"id": "ID5_abc", "atype": 1}]}
         ]));
 
-        let updates = collect_eid_updates(Some(&eids_cookie), Some("shared-1"), None, &registry);
+        let updates =
+            collect_eid_updates(Some(&eids_cookie), Some("shared-1"), None, &registry, None);
 
         assert!(
             updates.is_empty(),
@@ -791,7 +807,13 @@ mod tests {
             {"source": "liveramp.com", "uids": [{"id": "LR_xyz", "atype": 3}]}
         ]));
 
-        let updates = collect_eid_updates(Some(&cookie), Some("shared-cookie-id"), None, &registry);
+        let updates = collect_eid_updates(
+            Some(&cookie),
+            Some("shared-cookie-id"),
+            None,
+            &registry,
+            None,
+        );
 
         assert_eq!(
             updates,
@@ -814,7 +836,7 @@ mod tests {
             }
         ]));
 
-        let updates = collect_eid_updates(Some(&cookie), None, None, &registry);
+        let updates = collect_eid_updates(Some(&cookie), None, None, &registry, None);
 
         assert_eq!(
             updates,
@@ -830,7 +852,8 @@ mod tests {
             {"source": "sharedid.org", "uids": [{"id": "prebid-shared", "atype": 3}]}
         ]));
 
-        let updates = collect_eid_updates(Some(&cookie), Some("cookie-shared"), None, &registry);
+        let updates =
+            collect_eid_updates(Some(&cookie), Some("cookie-shared"), None, &registry, None);
 
         assert_eq!(
             updates,
@@ -846,11 +869,53 @@ mod tests {
             {"source": "unknown.example", "uids": [{"id": "unknown", "atype": 1}]}
         ]));
 
-        let updates = collect_eid_updates(Some(&cookie), None, None, &registry);
+        let updates = collect_eid_updates(Some(&cookie), None, None, &registry, None);
 
         assert!(
             updates.is_empty(),
             "should ignore unmatched partner updates"
+        );
+    }
+
+    #[test]
+    fn golden_browser_ingest_stores_one_uid_per_registered_source() {
+        let registry = make_registry(vec![("id5", "id5-sync.com"), ("sharedid", "sharedid.org")]);
+        let eids_cookie = encode_json(&json!([
+            { "source": "id5-sync.com", "uids": [{ "id": "ID5_earlier_entry", "atype": 1 }] },
+            {
+                "source": "id5-sync.com",
+                "uids": [
+                    { "id": " ", "atype": 1 },
+                    { "id": "ID5_first", "atype": 1, "ext": { "linkType": 2 } },
+                    { "id": "ID5_second", "atype": 1 }
+                ],
+                "inserter": "example.com",
+                "matcher": "partner.example.com",
+                "mm": 3,
+                "ext": { "segments": ["example-segment"] }
+            },
+            { "source": "sharedid.org", "uids": [{ "id": "prebid-shared-id", "atype": 1 }] },
+            { "source": "unregistered.example.com", "uids": [{ "id": "other", "atype": 1 }] }
+        ]));
+        let updates = collect_eid_updates(
+            Some(&eids_cookie),
+            Some(" cookie-shared-id "),
+            None,
+            &registry,
+            Some(1_760_000_000),
+        );
+        let mut entry = KvEntry::minimal("example.com", "existing", 1);
+        apply_partner_id_updates(&mut entry, &updates);
+        let stored = serde_json::to_value(&entry.ids).expect("should serialize ids");
+
+        assert_eq!(
+            stored,
+            json!({
+                "example.com": { "eids": [{ "uids": [{ "id": "existing" }] }] },
+                "id5-sync.com": { "at": 1_760_000_000, "eids": [{ "uids": [{ "id": "ID5_first" }] }] },
+                "sharedid.org": { "at": 1_760_000_000, "eids": [{ "uids": [{ "id": "cookie-shared-id" }] }] }
+            }),
+            "should store one UID per registered source by today's rule, with no EID-level field, atype or ext"
         );
     }
 }

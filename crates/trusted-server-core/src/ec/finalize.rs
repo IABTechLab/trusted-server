@@ -24,7 +24,7 @@ use super::kv_types::KvEntry;
 use super::prebid_eids::collect_eid_updates;
 use super::pull_sync_marker::{expire_marker, reconcile_marker};
 use super::registry::PartnerRegistry;
-use super::{EcKvSnapshot, EidSyncSource, current_timestamp, log_id};
+use super::{EcKvSnapshot, EidSyncSource, checked_current_timestamp, current_timestamp, log_id};
 
 /// TS-managed response headers tied to EC identity output.
 const EC_RESPONSE_HEADERS: &[&str] = &[
@@ -84,7 +84,13 @@ pub fn ec_finalize_response(
             let collected = source
                 .map(|_| {
                     let (cookie_input, client_input) = browser_eid_input(ec_context, eids_cookie);
-                    collect_eid_updates(cookie_input, sharedid_cookie, client_input, registry)
+                    collect_eid_updates(
+                        cookie_input,
+                        sharedid_cookie,
+                        client_input,
+                        registry,
+                        checked_current_timestamp(),
+                    )
                 })
                 .unwrap_or_default();
             let had_eid_updates = !collected.is_empty();
@@ -138,7 +144,13 @@ pub fn ec_finalize_response(
 
         let (cookie_input, client_input) = browser_eid_input(ec_context, eids_cookie);
         let updates = gate_eid_updates_by_consent(
-            collect_eid_updates(cookie_input, sharedid_cookie, client_input, registry),
+            collect_eid_updates(
+                cookie_input,
+                sharedid_cookie,
+                client_input,
+                registry,
+                checked_current_timestamp(),
+            ),
             ec_context.consent(),
         );
         sync_eid_cookie_updates(graph, ec_context, &ec_id, &updates, EidSyncSource::NewEc);

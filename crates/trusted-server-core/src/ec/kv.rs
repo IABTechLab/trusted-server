@@ -77,15 +77,25 @@ pub(crate) struct PartnerIdUpdate {
     pub(crate) partner_id: String,
     /// Partner-scoped user ID value.
     pub(crate) uid: String,
+    /// Unix seconds this request saw the ID. Stored as the record's `at`.
+    pub(crate) acquired_at: Option<u64>,
 }
 
 impl PartnerIdUpdate {
-    /// Creates a partner UID update.
+    /// Creates a partner UID update with no acquisition time.
     pub(crate) fn new(partner_id: impl Into<String>, uid: impl Into<String>) -> Self {
         Self {
             partner_id: partner_id.into(),
             uid: uid.into(),
+            acquired_at: None,
         }
+    }
+
+    /// Records when this request saw the ID.
+    #[must_use]
+    pub(crate) fn with_acquired_at(mut self, at: u64) -> Self {
+        self.acquired_at = Some(at);
+        self
     }
 }
 
@@ -137,12 +147,13 @@ fn apply_cookie_partner_id_updates(
 ) -> CookieUpdateApplication {
     let mut latest_updates = BTreeMap::new();
     for update in updates {
-        latest_updates.insert(update.partner_id.as_str(), update.uid.as_str());
+        latest_updates.insert(update.partner_id.as_str(), update);
     }
 
     let mut changed = false;
     let mut deferred = false;
-    for (partner_id, uid) in latest_updates {
+    for (partner_id, update) in latest_updates {
+        let uid = update.uid.as_str();
         match entry.ids.get(partner_id) {
             Some(existing) if existing.first_uid() == Some(uid) => continue,
             // Browser EID cookies carry no value-owned sequence or timestamp.
@@ -157,7 +168,7 @@ fn apply_cookie_partner_id_updates(
 
         entry.ids.insert(
             partner_id.to_owned(),
-            super::kv_types::KvPartnerId::new(uid),
+            super::kv_types::KvPartnerId::browser(uid, update.acquired_at),
         );
         changed = true;
     }
@@ -174,25 +185,26 @@ fn apply_cookie_partner_id_updates(
 fn partner_id_updates_match(entry: &KvEntry, updates: &[PartnerIdUpdate]) -> bool {
     let mut latest_updates = BTreeMap::new();
     for update in updates {
-        latest_updates.insert(update.partner_id.as_str(), update.uid.as_str());
+        latest_updates.insert(update.partner_id.as_str(), update);
     }
 
-    latest_updates.into_iter().all(|(partner_id, uid)| {
+    latest_updates.into_iter().all(|(partner_id, update)| {
         entry
             .ids
             .get(partner_id)
-            .is_some_and(|existing| existing.first_uid() == Some(uid))
+            .is_some_and(|existing| existing.first_uid() == Some(update.uid.as_str()))
     })
 }
 
 pub(crate) fn apply_partner_id_updates(entry: &mut KvEntry, updates: &[PartnerIdUpdate]) -> bool {
     let mut latest_updates = BTreeMap::new();
     for update in updates {
-        latest_updates.insert(update.partner_id.as_str(), update.uid.as_str());
+        latest_updates.insert(update.partner_id.as_str(), update);
     }
 
     let mut changed = false;
-    for (partner_id, uid) in latest_updates {
+    for (partner_id, update) in latest_updates {
+        let uid = update.uid.as_str();
         if entry
             .ids
             .get(partner_id)
@@ -203,7 +215,7 @@ pub(crate) fn apply_partner_id_updates(entry: &mut KvEntry, updates: &[PartnerId
 
         entry.ids.insert(
             partner_id.to_owned(),
-            super::kv_types::KvPartnerId::new(uid),
+            super::kv_types::KvPartnerId::browser(uid, update.acquired_at),
         );
         changed = true;
     }
@@ -2197,6 +2209,27 @@ mod tests {
 
         assert!(!changed, "should not change when UID already matches");
         assert_eq!(entry.ids["ssp_x"].first_uid(), Some("uid-1"));
+    }
+
+    #[test]
+    fn browser_ingest_records_acquisition_time() {
+        let mut entry = KvEntry::minimal("sharedid.org", "existing", 1);
+        let updates =
+            [PartnerIdUpdate::new("example.com", "new-uid").with_acquired_at(1_760_000_000)];
+
+        let changed = apply_partner_id_updates(&mut entry, &updates);
+
+        assert!(changed, "should report a change");
+        assert_eq!(
+            entry.ids["example.com"],
+            crate::ec::kv_types::KvPartnerId::browser("new-uid", Some(1_760_000_000)),
+            "should store the UID with at and no writer"
+        );
+        assert_eq!(
+            entry.ids["sharedid.org"],
+            crate::ec::kv_types::KvPartnerId::new("existing"),
+            "should leave other sources alone"
+        );
     }
 
     #[test]
