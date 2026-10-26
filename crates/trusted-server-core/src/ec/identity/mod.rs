@@ -13,6 +13,7 @@ pub mod input;
 pub(crate) mod policy;
 pub mod provider;
 pub mod resolution;
+pub(crate) mod revision;
 
 pub use descriptor::{
     Access, Captures, ConsentPolicy, EidProvenance, Input, ProviderDescriptor,
