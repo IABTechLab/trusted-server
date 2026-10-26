@@ -1516,6 +1516,18 @@ impl KvIdentityGraph {
             .count_keys_with_prefix(hash_prefix, CLUSTER_LIST_LIMIT)
     }
 
+    /// Counts the entries sharing `ec_id`'s hash prefix, without writing.
+    ///
+    /// The prefix list and count only. A caller that wants the size kept
+    /// stages it on a write of its own.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TrustedServerError::KvStore`] on store or list failure.
+    pub fn compute_cluster_size(&self, ec_id: &str) -> Result<u32, Report<TrustedServerError>> {
+        self.count_hash_prefix_keys(ec_hash(ec_id))
+    }
+
     /// Evaluates the cluster size for an EC entry.
     ///
     /// Returns the stored `cluster_size` when it has already been evaluated
@@ -1550,8 +1562,7 @@ impl KvIdentityGraph {
         }
 
         // Compute cluster size via prefix list.
-        let hash_prefix = ec_hash(ec_id);
-        let cluster_size = self.count_hash_prefix_keys(hash_prefix)?;
+        let cluster_size = self.compute_cluster_size(ec_id)?;
 
         log::debug!(
             "evaluate_cluster: computed cluster_size={cluster_size} for '{}'",

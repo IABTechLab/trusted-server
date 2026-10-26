@@ -96,11 +96,10 @@ pub fn handle_identify(
     let mut cluster_size: Option<u32> = None;
 
     match kv.get(ec_id) {
-        Ok(Some((entry, generation))) => {
+        Ok(Some((entry, _generation))) => {
             if !entry.consent.ok {
                 // Tombstone entries preserve the withdrawal signal for 24 hours.
-                // Do not extract IDs or evaluate cluster size because that would
-                // write back with the live-entry TTL.
+                // Do not extract IDs or evaluate cluster size.
                 log::trace!("Identify found tombstone for '{}'", log_id(ec_id));
             } else {
                 // Extract only this partner's UID, and only when the shared
@@ -141,16 +140,25 @@ pub fn handle_identify(
                     }
                 }
 
-                // Evaluate cluster size lazily for identify responses. Existing
-                // stored cluster_size values are reused without a prefix-list call.
-                match kv.evaluate_cluster(ec_id, &entry, generation) {
-                    Ok(size) => {
-                        cluster_size = size;
-                    }
-                    Err(err) => {
-                        log::warn!("Cluster evaluation failed for '{}': {err:?}", log_id(ec_id));
-                    }
-                }
+                // Reuse a stored cluster_size; otherwise count without writing.
+                // The writer stores the size, never this read path.
+                cluster_size = match entry
+                    .network
+                    .as_ref()
+                    .and_then(|network| network.cluster_size)
+                {
+                    Some(size) => Some(size),
+                    None => match kv.compute_cluster_size(ec_id) {
+                        Ok(size) => Some(size),
+                        Err(err) => {
+                            log::warn!(
+                                "Cluster evaluation failed for '{}': {err:?}",
+                                log_id(ec_id)
+                            );
+                            None
+                        }
+                    },
+                };
             }
         }
         Ok(None) => {}
@@ -376,7 +384,7 @@ mod tests {
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{ConsentContext, ConsentSource};
     use crate::ec::identity::test_support::{example_entry_set, full_record};
-    use crate::ec::kv_types::KvEntry;
+    use crate::ec::kv_types::{KvEid, KvEntry, KvUid};
     use crate::ec::registry::PartnerRegistry;
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
@@ -683,8 +691,20 @@ mod tests {
     }
 
     fn identify_body(kv: &KvIdentityGraph, ec_id: &str) -> serde_json::Value {
+        identify_body_for(
+            kv,
+            ec_id,
+            make_test_partner("ssp.example.com", VALID_API_TOKEN),
+        )
+    }
+
+    fn identify_body_for(
+        kv: &KvIdentityGraph,
+        ec_id: &str,
+        partner: EcPartner,
+    ) -> serde_json::Value {
         let settings = create_test_settings();
-        let partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
+        let partners = vec![partner];
         let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
         let req = Request::builder()
             .method("GET")
@@ -735,6 +755,67 @@ mod tests {
         let body = identify_body(&kv, &ec_id);
 
         assert_eq!(body["uid"], "live-uid", "should return the unexpired ID");
+    }
+
+    #[test]
+    fn identify_computes_cluster_size_without_writing() {
+        let (kv, store) = KvIdentityGraph::write_counting("identify-store");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let entry = KvEntry::minimal("ssp.example.com", "example-uid", 1);
+        assert!(
+            entry.network.is_none(),
+            "should seed a row without a stored cluster size"
+        );
+        kv.create(&ec_id, &entry).expect("should seed KV entry");
+        store.reset_counts();
+
+        let body = identify_body(&kv, &ec_id);
+
+        assert!(body["cluster_size"].is_number(), "should report a size");
+        assert_eq!(store.writes().total(), 0, "should not write");
+    }
+
+    #[test]
+    fn identify_returns_the_first_uid_of_a_multi_entry_record_with_the_partner_atype() {
+        let (kv, _store) = KvIdentityGraph::write_counting("identify-store");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let mut entry = KvEntry::minimal("other.example.com", "other-uid", 1);
+        let set = [&["example-a", "example-b"][..], &["example-c"][..]]
+            .iter()
+            .enumerate()
+            .map(|(index, ids)| KvEid {
+                uids: ids
+                    .iter()
+                    .map(|id| KvUid {
+                        id: (*id).to_owned(),
+                        atype: Some(1),
+                        ext: None,
+                    })
+                    .collect(),
+                inserter: (index == 0).then(|| "example.com".to_owned()),
+                ..KvEid::default()
+            })
+            .collect();
+        entry
+            .ids
+            .insert("partner.example.com".to_owned(), full_record(None, set));
+        kv.create(&ec_id, &entry).expect("should seed KV entry");
+        let mut partner = make_test_partner("partner.example.com", VALID_API_TOKEN);
+        partner.openrtb_atype = 3;
+        partner.bidstream_enabled = true;
+
+        let body = identify_body_for(&kv, &ec_id, partner);
+
+        assert_eq!(
+            body["uid"],
+            serde_json::json!("example-a"),
+            "should return the first UID of the first entry"
+        );
+        assert_eq!(
+            body["eid"],
+            serde_json::json!({ "source": "partner.example.com", "uids": [{ "id": "example-a", "atype": 3 }] }),
+            "should return one UID with the partner's openrtb_atype, as for a one-UID record"
+        );
     }
 
     #[test]
