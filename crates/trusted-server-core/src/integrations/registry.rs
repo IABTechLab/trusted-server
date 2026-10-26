@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use async_trait::async_trait;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::Report;
+use futures::StreamExt as _;
 use http::{Method, Request, Response};
 use matchit::Router;
 
@@ -12,6 +13,8 @@ use crate::auction::AuctionPlan;
 use crate::constants::HEADER_X_TS_EC;
 use crate::ec::EcContext;
 use crate::ec::finalize::BrowserSeed;
+use crate::ec::identity::coordinator::{CaptureCall, decode_body, has_capture_rule, run_capture};
+use crate::ec::identity::input::ThreadRandom;
 use crate::ec::identity::{IdentityProvider, IdentityProviderError};
 use crate::ec::kv::KvIdentityGraph;
 use crate::error::TrustedServerError;
@@ -893,6 +896,135 @@ pub struct ProxyDispatchInput<'a> {
     pub req: Request<EdgeBody>,
 }
 
+/// What capturing a proxied response reads besides the response.
+struct CaptureExchange<'a> {
+    settings: &'a Settings,
+    services: &'a RuntimeServices,
+    kv: Option<&'a KvIdentityGraph>,
+    ec_context: &'a mut EcContext,
+    method: &'a Method,
+    path: &'a str,
+    is_real_browser: bool,
+}
+
+/// A proxied body, buffered for capture or left alone.
+enum Buffered {
+    /// The whole body, as sent (still encoded).
+    Whole(bytes::Bytes),
+    /// A body over the cap, rebuilt so the browser still receives every byte.
+    Passthrough(EdgeBody),
+}
+
+/// Buffers `body` up to `cap` bytes. A body over the cap, or a stream that
+/// fails, is handed back whole so the browser receives it unchanged.
+async fn buffer_up_to(body: EdgeBody, cap: usize) -> Buffered {
+    match body {
+        EdgeBody::Once(bytes) if bytes.len() <= cap => Buffered::Whole(bytes),
+        EdgeBody::Stream(mut stream) => {
+            let mut items = Vec::new();
+            let mut total = 0_usize;
+            while let Some(item) = stream.next().await {
+                let over = match &item {
+                    Ok(chunk) => {
+                        total = total.saturating_add(chunk.len());
+                        total > cap
+                    }
+                    Err(_) => true,
+                };
+                items.push(item);
+                if over {
+                    return Buffered::Passthrough(EdgeBody::from_stream(
+                        futures::stream::iter(items).chain(stream),
+                    ));
+                }
+            }
+            let mut whole = Vec::with_capacity(total);
+            for chunk in items.iter().filter_map(|item| item.as_ref().ok()) {
+                whole.extend_from_slice(chunk);
+            }
+            Buffered::Whole(bytes::Bytes::from(whole))
+        }
+        other => Buffered::Passthrough(other),
+    }
+}
+
+/// Offers a proxied 2xx response to the identity providers whose capture rule
+/// matches, and returns it unchanged (spec 4.7).
+///
+/// A body over `max_response_bytes` is passed through uncaptured. The request
+/// body is never read here.
+async fn capture_proxied_response(
+    exchange: CaptureExchange<'_>,
+    response: Response<EdgeBody>,
+) -> Response<EdgeBody> {
+    let CaptureExchange {
+        settings,
+        services,
+        kv,
+        ec_context,
+        method,
+        path,
+        is_real_browser,
+    } = exchange;
+    if !response.status().is_success() {
+        return response;
+    }
+    let Some(runtime) = ec_context.identity().runtime().cloned() else {
+        return response;
+    };
+    if !has_capture_rule(runtime.catalog(), method, path) {
+        return response;
+    }
+
+    let cap = settings.ec.identity.max_response_bytes;
+    let (parts, body) = response.into_parts();
+    let declared_over_cap = parts
+        .headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .is_some_and(|length| length > cap);
+    if declared_over_cap {
+        log::debug!("Skipping capture on '{path}': the response is over the size cap");
+        return Response::from_parts(parts, body);
+    }
+    let raw = match buffer_up_to(body, cap).await {
+        Buffered::Whole(raw) => raw,
+        Buffered::Passthrough(body) => {
+            log::debug!("Skipping capture on '{path}': the response is over the size cap");
+            return Response::from_parts(parts, body);
+        }
+    };
+
+    let encoding = parts
+        .headers
+        .get(http::header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok());
+    match decode_body(encoding, raw.to_vec(), cap) {
+        Some(decoded) => {
+            let random = ThreadRandom;
+            let deps = runtime.deps(settings, services, &random, None);
+            run_capture(
+                &deps,
+                kv,
+                ec_context,
+                &CaptureCall {
+                    method,
+                    path,
+                    is_real_browser,
+                    status: parts.status,
+                    headers: &parts.headers,
+                    body: &decoded,
+                },
+            );
+        }
+        None => {
+            log::debug!("Skipping capture on '{path}': the body is undecodable or over the cap")
+        }
+    }
+    Response::from_parts(parts, EdgeBody::from_bytes(raw))
+}
+
 /// In-memory registry of integrations discovered from settings.
 #[derive(Clone, Default)]
 pub struct IntegrationRegistry {
@@ -1172,7 +1304,23 @@ impl IntegrationRegistry {
             // Remove any caller-supplied EC header rather than forwarding it.
             req.headers_mut().remove(HEADER_X_TS_EC.clone());
 
-            Some(proxy.handle(settings, services, req).await)
+            let handled = proxy.handle(settings, services, req).await;
+            Some(match handled {
+                Ok(response) => Ok(capture_proxied_response(
+                    CaptureExchange {
+                        settings,
+                        services,
+                        kv,
+                        ec_context,
+                        method,
+                        path,
+                        is_real_browser,
+                    },
+                    response,
+                )
+                .await),
+                Err(error) => Err(error),
+            })
         } else {
             None
         }
@@ -2885,5 +3033,429 @@ mod tests {
             "should report the duplicate: {error}"
         );
         assert_eq!(registry.identity_providers().len(), 1, "should hold one");
+    }
+
+    /// Revoke-only capture around `handle_proxy` (spec 4.7).
+    mod capture_proxy {
+        use std::collections::BTreeMap;
+        use std::io::Write as _;
+        use std::sync::{Arc, Mutex};
+
+        use bytes::Bytes;
+        use serde_json::json;
+
+        use super::*;
+        use crate::ec::identity::IdentityRuntime;
+        use crate::ec::identity::revision::set_hashes;
+        use crate::ec::identity::test_support::hold_fixture::live_row;
+        use crate::ec::identity::test_support::{
+            TEST_EC_ID, WriteCountingEcKv, allowing_consent, answering_capture_provider,
+            record_for_test,
+        };
+        use crate::ec::kv_types::KvEntry;
+        use crate::test_support::logs::{captured_logs, install_capturing_logger};
+        use crate::test_support::tests::create_test_settings;
+
+        const FIRST: &str = "a.example.com";
+
+        /// How the upstream answers.
+        #[derive(Clone)]
+        struct Upstream {
+            status: StatusCode,
+            headers: Vec<(&'static str, &'static str)>,
+            body: Vec<u8>,
+            streamed: bool,
+        }
+
+        impl Upstream {
+            fn json(body: &serde_json::Value) -> Self {
+                Self {
+                    status: StatusCode::OK,
+                    headers: vec![("content-type", "application/json")],
+                    body: serde_json::to_vec(body).expect("should serialize the body"),
+                    streamed: false,
+                }
+            }
+        }
+
+        struct ScriptedProxy {
+            upstream: Upstream,
+            request_body: Arc<Mutex<Option<Vec<u8>>>>,
+        }
+
+        #[async_trait(?Send)]
+        impl IntegrationProxy for ScriptedProxy {
+            fn integration_name(&self) -> &'static str {
+                "lockr"
+            }
+
+            fn routes(&self) -> Vec<IntegrationEndpoint> {
+                vec![
+                    IntegrationEndpoint::post("/integrations/lockr/*"),
+                    IntegrationEndpoint::post("/integrations/examplecapture/*"),
+                ]
+            }
+
+            async fn handle(
+                &self,
+                _settings: &Settings,
+                _services: &RuntimeServices,
+                req: Request<EdgeBody>,
+            ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+                let seen = req.into_body().into_bytes().unwrap_or_default().to_vec();
+                *self.request_body.lock().expect("should lock the body") = Some(seen);
+                let mut builder = Response::builder().status(self.upstream.status);
+                for (name, value) in &self.upstream.headers {
+                    builder = builder.header(*name, *value);
+                }
+                let body = if self.upstream.streamed {
+                    let chunks: Vec<Result<Bytes, std::io::Error>> = self
+                        .upstream
+                        .body
+                        .chunks(7)
+                        .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+                        .collect();
+                    EdgeBody::from_stream(futures::stream::iter(chunks))
+                } else {
+                    EdgeBody::from(self.upstream.body.clone())
+                };
+                Ok(builder.body(body).expect("should build the response"))
+            }
+        }
+
+        /// What one proxied call left behind.
+        struct Exchange {
+            response: Response<EdgeBody>,
+            request_body: Option<Vec<u8>>,
+            store: Arc<WriteCountingEcKv>,
+            context: EcContext,
+            row: Option<KvEntry>,
+        }
+
+        impl Exchange {
+            fn response_bytes(self) -> Vec<u8> {
+                futures::executor::block_on(self.response.into_body().into_bytes_bounded(1 << 20))
+                    .expect("should read the response body")
+                    .to_vec()
+            }
+        }
+
+        struct Call<'a> {
+            provider: Arc<dyn IdentityProvider>,
+            path: &'a str,
+            upstream: Upstream,
+            request_body: &'a [u8],
+            real_browser: bool,
+            row: Option<&'a KvEntry>,
+            max_response_bytes: usize,
+        }
+
+        fn call<'a>(
+            provider: Arc<dyn IdentityProvider>,
+            path: &'a str,
+            upstream: Upstream,
+        ) -> Call<'a> {
+            Call {
+                provider,
+                path,
+                upstream,
+                request_body: b"{}",
+                real_browser: true,
+                row: None,
+                max_response_bytes: 65_536,
+            }
+        }
+
+        fn exchange(call: Call<'_>) -> Exchange {
+            let mut settings = create_test_settings();
+            settings.ec.identity.max_response_bytes = call.max_response_bytes;
+            let request_body = Arc::new(Mutex::new(None));
+            let registry = IntegrationRegistry::from_registrations(vec![
+                IntegrationRegistration::builder("lockr")
+                    .with_proxy(Arc::new(ScriptedProxy {
+                        upstream: call.upstream,
+                        request_body: Arc::clone(&request_body),
+                    }))
+                    .with_identity_provider(call.provider)
+                    .build(),
+            ])
+            .expect("should build the registry");
+            let runtime = Arc::new(
+                IdentityRuntime::from_settings_with_providers(
+                    &settings,
+                    registry.identity_providers(),
+                    BTreeMap::new(),
+                )
+                .expect("should build the runtime"),
+            );
+            let (graph, store) = KvIdentityGraph::write_counting("capture-proxy-store");
+            if let Some(row) = call.row {
+                graph.create(TEST_EC_ID, row).expect("should seed the row");
+            }
+            let mut context = EcContext::new_for_test_with_ip(
+                Some(TEST_EC_ID.to_owned()),
+                allowing_consent(),
+                Some("192.0.2.10".to_owned()),
+            );
+            context.set_identity_runtime(runtime);
+            context.set_kv_snapshot(graph.load_snapshot(TEST_EC_ID));
+            store.reset_counts();
+
+            let req = http::Request::builder()
+                .method(http::Method::POST)
+                .uri(format!("https://www.example.com{}", call.path))
+                .body(EdgeBody::from(call.request_body.to_vec()))
+                .expect("should build the request");
+            let response = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
+                method: &http::Method::POST,
+                path: call.path,
+                settings: &settings,
+                kv: Some(&graph),
+                ec_context: &mut context,
+                services: &noop_services(),
+                is_real_browser: call.real_browser,
+                seed: &BrowserSeed::empty(),
+                req,
+            }))
+            .expect("should match the route")
+            .expect("the proxy should answer");
+            let row = graph.get(TEST_EC_ID).ok().flatten().map(|(row, _)| row);
+            Exchange {
+                response,
+                request_body: request_body.lock().expect("should lock the body").clone(),
+                store,
+                context,
+                row,
+            }
+        }
+
+        fn token_body() -> serde_json::Value {
+            json!({"tokens": [{"source": FIRST, "value": "secret-uid-a"}]})
+        }
+
+        fn gzip(bytes: &[u8]) -> Vec<u8> {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(bytes).expect("should compress");
+            encoder.finish().expect("should finish the stream")
+        }
+
+        fn brotli(bytes: &[u8]) -> Vec<u8> {
+            let mut out = Vec::new();
+            {
+                let mut encoder = ::brotli::CompressorWriter::new(&mut out, 4096, 5, 22);
+                encoder.write_all(bytes).expect("should compress");
+            }
+            out
+        }
+
+        fn counted(exchange: &Exchange) -> usize {
+            exchange.context.identity().capture_unpersisted().len()
+        }
+
+        #[test]
+        fn capture_runs_only_for_matching_rules() {
+            let token = json!({"tokens": [{
+                "source": "examplecapture.example.com", "value": "v", "expires": 4_102_444_800_u64
+            }]});
+            let provider = || -> Arc<dyn IdentityProvider> {
+                Arc::new(ExampleCaptureProvider::new().expect("should build the provider"))
+            };
+
+            let matching = exchange(call(
+                provider(),
+                "/integrations/examplecapture/api/token",
+                Upstream::json(&token),
+            ));
+            let other_path = exchange(call(
+                provider(),
+                "/integrations/examplecapture/api/other",
+                Upstream::json(&token),
+            ));
+
+            assert_eq!(counted(&matching), 1, "should capture on the matching rule");
+            assert_eq!(
+                counted(&other_path),
+                0,
+                "should not capture on a path outside the rules"
+            );
+        }
+
+        #[test]
+        fn capture_runs_only_on_a_2xx_response() {
+            let provider = || answering_capture_provider("lockr", &[FIRST], None);
+            let path = "/integrations/lockr/api/token";
+            let mut failing = Upstream::json(&token_body());
+            failing.status = StatusCode::INTERNAL_SERVER_ERROR;
+
+            let ok = exchange(call(provider(), path, Upstream::json(&token_body())));
+            let error = exchange(call(provider(), path, failing));
+
+            assert_eq!(counted(&ok), 1, "should capture a 200");
+            assert_eq!(counted(&error), 0, "should not capture a 500");
+            assert_eq!(
+                error.response.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "should still return the 500"
+            );
+        }
+
+        #[test]
+        fn capture_decodes_gzip_and_brotli_responses_and_forwards_them_unchanged() {
+            let plain = serde_json::to_vec(&token_body()).expect("should serialize");
+            for (encoding, compressed) in [("gzip", gzip(&plain)), ("br", brotli(&plain))] {
+                let upstream = Upstream {
+                    status: StatusCode::OK,
+                    headers: vec![
+                        ("content-type", "application/json"),
+                        ("content-encoding", encoding),
+                    ],
+                    body: compressed.clone(),
+                    streamed: false,
+                };
+
+                let result = exchange(call(
+                    answering_capture_provider("lockr", &[FIRST], None),
+                    "/integrations/lockr/api/token",
+                    upstream,
+                ));
+
+                assert_eq!(counted(&result), 1, "should decode {encoding} for capture");
+                assert_eq!(
+                    result.response.headers()["content-encoding"],
+                    encoding,
+                    "should keep the encoding header"
+                );
+                assert_eq!(
+                    result.response_bytes(),
+                    compressed,
+                    "should forward the {encoding} bytes unchanged"
+                );
+            }
+        }
+
+        #[test]
+        fn capture_never_reads_the_request_body() {
+            install_capturing_logger();
+            let request_body = serde_json::to_vec(
+                &json!({"email": "capture-body-7731@example.com", "consent": true}),
+            )
+            .expect("should serialize");
+            let mut request = call(
+                answering_capture_provider("lockr", &[FIRST], None),
+                "/integrations/lockr/api/token",
+                Upstream::json(&token_body()),
+            );
+            request.request_body = &request_body;
+
+            let result = exchange(request);
+
+            assert_eq!(
+                result.request_body.as_deref(),
+                Some(request_body.as_slice()),
+                "should hand the upstream the request body unchanged"
+            );
+            assert_eq!(counted(&result), 1, "control: the response is captured");
+            assert!(
+                !captured_logs()
+                    .iter()
+                    .any(|line| line.contains("capture-body-7731")),
+                "should log nothing from the request body"
+            );
+        }
+
+        #[test]
+        fn capture_skips_an_oversized_proxied_body() {
+            let body = json!({"tokens": [{"source": FIRST, "value": "x".repeat(200)}]});
+            let provider = || answering_capture_provider("lockr", &[FIRST], None);
+            let path = "/integrations/lockr/api/token";
+            let plain = serde_json::to_vec(&body).expect("should serialize");
+
+            for streamed in [false, true] {
+                let mut upstream = Upstream::json(&body);
+                upstream.streamed = streamed;
+                let mut oversized = call(provider(), path, upstream.clone());
+                oversized.max_response_bytes = 64;
+                let skipped = exchange(oversized);
+                assert_eq!(
+                    counted(&skipped),
+                    0,
+                    "should not capture (streamed={streamed})"
+                );
+                assert_eq!(
+                    skipped.response_bytes(),
+                    plain,
+                    "should pass the body through unchanged (streamed={streamed})"
+                );
+
+                let within = exchange(call(provider(), path, upstream));
+                assert_eq!(counted(&within), 1, "control: captures within the cap");
+                assert_eq!(
+                    within.response_bytes(),
+                    plain,
+                    "control: forwards the buffered body unchanged (streamed={streamed})"
+                );
+            }
+        }
+
+        #[test]
+        fn capture_removal_from_a_real_browser_is_written_before_the_response_returns() {
+            let mut seeded = live_row();
+            seeded
+                .ids
+                .insert(FIRST.to_owned(), record_for_test("secret-uid-a", None, 500));
+            let mut request = call(
+                answering_capture_provider("lockr", &[FIRST], None),
+                "/integrations/lockr/api/token",
+                Upstream::json(&json!({"invalidate": [FIRST]})),
+            );
+            request.row = Some(&seeded);
+
+            let result = exchange(request);
+
+            let row = result.row.as_ref().expect("should hold the row");
+            assert!(!row.ids.contains_key(FIRST), "should remove the record");
+            assert_eq!(
+                row.ps["lockr"].iv,
+                set_hashes(&seeded.ids[FIRST].eids),
+                "should hash the record into iv"
+            );
+            assert_eq!(result.store.writes().total(), 1, "should write once");
+        }
+
+        #[test]
+        fn capture_with_replayed_ec_cookie_changes_no_kv_row() {
+            let mut seeded = live_row();
+            seeded.ids.insert(
+                FIRST.to_owned(),
+                record_for_test("secret-uid-a", Some("lockr"), 500),
+            );
+            for body in [
+                json!({"invalidate": [FIRST]}),
+                json!({"opted_out": true}),
+                token_body(),
+            ] {
+                let mut request = call(
+                    answering_capture_provider("lockr", &[FIRST], None),
+                    "/integrations/lockr/api/token",
+                    Upstream::json(&body),
+                );
+                request.real_browser = false;
+                request.row = Some(&seeded);
+
+                let result = exchange(request);
+
+                assert_eq!(
+                    result.store.writes().total(),
+                    0,
+                    "should record zero writes for {body}"
+                );
+                assert_eq!(
+                    result.row.as_ref(),
+                    Some(&seeded),
+                    "should change no row for {body}"
+                );
+            }
+        }
     }
 }

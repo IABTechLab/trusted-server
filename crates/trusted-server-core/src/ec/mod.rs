@@ -555,7 +555,21 @@ impl EcContext {
             removal_lost: self.identity.removal_lost(),
             withdrawal_after_send: input.withdrawal_after_send,
             withdrawal_after_send_failed: input.withdrawal_after_send_failed,
+            capture_unpersisted: self.identity.capture_unpersisted().clone(),
         }
+    }
+
+    /// Asks finalize to run the consent-withdrawal tombstone path for this
+    /// request, as a `revoke_scope = "global"` capture from a real browser
+    /// does (spec 8).
+    pub(crate) fn request_global_revoke(&mut self) {
+        self.identity.request_global_revoke();
+    }
+
+    /// Whether a capture asked for the consent-withdrawal tombstone path.
+    #[must_use]
+    pub(crate) fn global_revoke_requested(&self) -> bool {
+        self.identity.global_revoke_requested()
     }
 
     /// The identity state this request decides and collects.
@@ -599,6 +613,12 @@ impl EcContext {
     /// Only an organic real-browser top-level document navigation that is not
     /// a prefetch writes (spec 5.1). Also captures the user agent, `DNT` and
     /// the page URL without query or fragment.
+    ///
+    /// The page URL is read from the request URI, so it needs an absolute
+    /// URI. The Fastly adapter gives one (`edgezero-adapter-fastly` builds the
+    /// request from `get_url_str()`); a request with an origin-form URI has no
+    /// page URL, and a provider that wants the `PageUrl` input is then not
+    /// due.
     pub fn decide_writer(
         &mut self,
         req: &Request<EdgeBody>,
@@ -672,6 +692,13 @@ impl EcContext {
     #[must_use]
     pub fn has_failed_withdrawals(&self) -> bool {
         !self.failed_withdrawals.is_empty()
+    }
+
+    /// Whether a capture removal write failed before send and awaits its
+    /// one retry after send.
+    #[must_use]
+    pub fn has_pending_removals(&self) -> bool {
+        self.identity.pending_removals().is_some()
     }
 
     /// Forgets a withdrawn EC ID whose retried tombstone was written.
@@ -957,6 +984,28 @@ mod tests {
                 "should keep the real-browser flag: {name}"
             );
         }
+    }
+
+    #[test]
+    fn decide_writer_has_no_page_url_for_an_origin_form_uri() {
+        let request = Request::builder()
+            .uri("/a?b=c")
+            .header("sec-fetch-dest", "document")
+            .body(EdgeBody::empty())
+            .expect("should build the request");
+        let mut context = EcContext::default();
+
+        context.decide_writer(&request, true, true);
+
+        assert!(
+            context.identity().writer(),
+            "control: the request is still the writer"
+        );
+        assert_eq!(
+            context.identity().page_url(),
+            None,
+            "should have no page URL without an absolute URI"
+        );
     }
 
     /// [`EcKvStore`] wrapper whose first `collisions` `Add` writes report a

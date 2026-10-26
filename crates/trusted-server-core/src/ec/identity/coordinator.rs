@@ -16,26 +16,31 @@ use super::descriptor::{Input, ProviderDescriptor, ResolveKind, Resolves};
 use super::exchange::{ProviderRequest, ProviderResponse};
 use super::flush::{DispatchInput, DispatchRun, add_dispatch_results, may_flush, request_facts};
 use super::ids::{IdentityProviderId, SourceDomain, UnixTime};
-use super::input::{RandomSource, ResolveInput, ResolveSignals, ThreadRandom};
+use super::input::{
+    CaptureInput, ProviderConsent, RandomSource, ResolveInput, ResolveSignals, StoredId,
+    ThreadRandom,
+};
 use super::mutation::{
     ApplyContext, IdentityMutation, PartnerIdChange, ProviderResult, ProviderStateChange,
     StateUpdate, apply,
 };
 use super::policy::{FP_US_OPT_OUT_MASK, PolicySignals, fingerprint_bits, policy_allows};
 use super::provider::IdentityProvider;
+use super::removal::{RemovalWriteOutcome, write_removals};
 use super::resolution::{
     EntrySet, EntrySets, IdentityProviderError, Resolution, ResolvedEid, StateChange, entry_sets,
 };
 use super::revision::{IdentityKeys, StateRevision, record_revision, uid_hash, visitor_key};
 use crate::consent::{ConsentContext, effective_tcf};
+use crate::ec::kv::KvIdentityGraph;
 use crate::ec::kv_types::{KvEid, KvEntry, KvOptOut, KvPartnerId};
 use crate::ec::rate_limiter::RateLimiter;
-use crate::ec::{EcContext, current_timestamp};
+use crate::ec::{EcContext, EcKvSnapshot, current_timestamp, log_id};
 use crate::platform::{
     PlatformBackendSpec, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
     RuntimeServices,
 };
-use crate::settings::{IdentitySettings, ProviderMode, ProviderSettings, Settings};
+use crate::settings::{IdentitySettings, ProviderMode, ProviderSettings, RevokeScope, Settings};
 use crate::streaming_processor::{BodyStreamDecoder, Compression};
 
 /// Deciseconds in a second: `LastUpdated` of a TC string counts deciseconds.
@@ -1769,6 +1774,294 @@ pub(crate) fn run_hold(deps: &IdentityDeps<'_>, context: &mut EcContext) -> Hold
     }
     context.identity_mut().mutation_mut().absorb(held);
     results
+}
+
+/// One proxied response offered for capture (spec 4.7).
+///
+/// There is no request body here: capture never reads it.
+pub(crate) struct CaptureCall<'a> {
+    pub(crate) method: &'a http::Method,
+    pub(crate) path: &'a str,
+    pub(crate) is_real_browser: bool,
+    pub(crate) status: StatusCode,
+    pub(crate) headers: &'a http::HeaderMap,
+    /// The decoded body, at most `max_response_bytes`.
+    pub(crate) body: &'a [u8],
+}
+
+/// Whether any enabled provider's capture rule matches the request.
+#[must_use]
+pub(crate) fn has_capture_rule(
+    catalog: &ProviderCatalog,
+    method: &http::Method,
+    path: &str,
+) -> bool {
+    catalog.providers().any(|provider| {
+        provider
+            .descriptor()
+            .captures()
+            .is_some_and(|captures| captures.matches(method, path))
+    })
+}
+
+/// The row a capture reads its view from: the request's own snapshot when it
+/// holds one for this EC ID, else one read. Empty when the row is missing,
+/// unreadable or not a live row.
+fn capture_view(
+    graph: Option<&KvIdentityGraph>,
+    context: &EcContext,
+    ec_id: Option<&str>,
+) -> EligibilityView {
+    let (Some(graph), Some(ec_id)) = (graph, ec_id) else {
+        return EligibilityView::empty();
+    };
+    let snapshot = if context.kv_snapshot().belongs_to(ec_id) {
+        context.kv_snapshot().clone()
+    } else {
+        graph.load_snapshot(ec_id)
+    };
+    match snapshot {
+        EcKvSnapshot::Present { entry, .. } if entry.consent.ok => EligibilityView::from_kv(&entry),
+        EcKvSnapshot::Failed { .. } => {
+            log::warn!(
+                "Identity capture for '{}' could not read the row, so its removals cannot be built",
+                log_id(ec_id)
+            );
+            EligibilityView::empty()
+        }
+        _ => EligibilityView::empty(),
+    }
+}
+
+/// Whether eligibility steps 1 to 3 of spec 4.7 pass for the request.
+fn passes_consent_steps(descriptor: &ProviderDescriptor, context: &EcContext, now: u64) -> bool {
+    let facts = request_facts(context, now, false);
+    facts.is_real_browser
+        && facts.ec_persistence_allowed
+        && policy_allows(
+            descriptor.consent_policy(),
+            context.consent(),
+            facts.policy_signals,
+        )
+}
+
+/// What one capture result asks for, once the real-browser gate has passed.
+struct CaptureAsk {
+    removals: Vec<PartnerIdChange>,
+    state: ProviderStateChange,
+}
+
+/// The sources the provider claims that a result carries IDs for, once each.
+fn positive_sources(
+    provider: &IdentityProviderId,
+    resolution: &Resolution,
+    catalog: &ProviderCatalog,
+) -> BTreeSet<SourceDomain> {
+    let claimed = catalog.sources_of(provider);
+    resolution
+        .eids()
+        .iter()
+        .map(|eid| eid.source().clone())
+        .filter(|source| claimed.contains(source))
+        .collect()
+}
+
+/// Reads one result for its removals, opt-out and clear, and nothing else.
+fn capture_ask(
+    deps: &IdentityDeps<'_>,
+    context: &EcContext,
+    provider: &dyn IdentityProvider,
+    resolution: Resolution,
+    view: &EligibilityView,
+    positive: bool,
+) -> CaptureAsk {
+    let descriptor = provider.descriptor();
+    let id = descriptor.id();
+    let now = UnixTime::from_secs(current_timestamp());
+    if resolution.changes_state() {
+        log::warn!("Identity provider '{id}' returned a state change from capture, ignoring it");
+    }
+    let opted_out = resolution.is_opted_out();
+    let facts = request_facts(context, now.as_secs(), false);
+    let fingerprint = fingerprint_bits(
+        descriptor.consent_policy(),
+        context.consent(),
+        facts.policy_signals,
+    );
+    let provider_settings = deps.settings.ec.identity.provider(id);
+    let changes = outcome_to_changes(
+        provider,
+        CallOutcome::Resolved(resolution),
+        view,
+        &OutcomeContext {
+            now,
+            catalog: deps.catalog,
+            settings: &provider_settings,
+            identity: &deps.settings.ec.identity,
+            expected_state: None,
+            fingerprint: &fingerprint,
+        },
+    );
+    let OutcomeChanges {
+        changes,
+        result,
+        state,
+    } = changes;
+    let resulting = result.map_or(state, |result| result.state);
+    let mut ask = CaptureAsk {
+        removals: changes
+            .into_iter()
+            .filter(PartnerIdChange::is_removal)
+            .collect(),
+        state: ProviderStateChange::default(),
+    };
+    if let Some(opt_out) = resulting.opt_out.filter(|_| opted_out) {
+        ask.state.opt_out = Some(opt_out);
+        ask.state.st = StateUpdate::Clear;
+    }
+    // Only a capture-only provider without a GVL ID has no other way to clear:
+    // a vendor that issues again has been re-consented through (spec 8).
+    let only_capture_clears =
+        deps.catalog.is_capture_only(id) && descriptor.consent_policy().tcf_vendor().is_none();
+    if positive
+        && only_capture_clears
+        && view.is_opted_out(id)
+        && passes_consent_steps(descriptor, context, now.as_secs())
+    {
+        ask.state.opt_out_clear = Some(now.as_secs());
+    }
+    ask
+}
+
+/// Offers a proxied 2xx response to each provider whose capture rule matches
+/// (spec 4.7).
+///
+/// Capture is revoke-only. A real browser's removals, opt-outs and clears are
+/// written at once with the removal write, whatever the consent; a request
+/// that is not a real browser writes and stages nothing. A positive ID is
+/// counted and never stored. A `revoke_scope = "global"` opt-out asks
+/// finalize for the consent-withdrawal tombstone path instead.
+pub(crate) fn run_capture(
+    deps: &IdentityDeps<'_>,
+    graph: Option<&KvIdentityGraph>,
+    context: &mut EcContext,
+    call: &CaptureCall<'_>,
+) {
+    let matching: Vec<&std::sync::Arc<dyn IdentityProvider>> = deps
+        .catalog
+        .providers()
+        .filter(|provider| {
+            provider
+                .descriptor()
+                .captures()
+                .is_some_and(|captures| captures.matches(call.method, call.path))
+        })
+        .collect();
+    if matching.is_empty() {
+        return;
+    }
+    let ec_id = context.ec_value().map(str::to_owned);
+    let view = if call.is_real_browser {
+        capture_view(graph, context, ec_id.as_deref())
+    } else {
+        EligibilityView::empty()
+    };
+    let response =
+        ProviderResponse::new(call.status, call.headers.clone(), call.body.to_vec(), None);
+    let consent = ProviderConsent::from_context(context.consent());
+    let now = UnixTime::from_secs(current_timestamp());
+
+    let mut mutation = IdentityMutation::default();
+    for provider in matching {
+        let descriptor = provider.descriptor();
+        let id = descriptor.id();
+        let stored: BTreeMap<SourceDomain, StoredId> = view
+            .records()
+            .filter(|(source, _)| deps.catalog.sources_of(id).contains(source))
+            .filter_map(|(source, record)| {
+                StoredId::from_record(source, record).map(|stored| (source.clone(), stored))
+            })
+            .collect();
+        let input = CaptureInput::new(
+            descriptor,
+            call.path,
+            &response,
+            &stored,
+            &consent,
+            &deps.settings.publisher.domain,
+            now,
+        );
+        let resolution = match provider.capture(&input) {
+            Ok(resolution) => resolution,
+            Err(error) => {
+                if !error.current_context().is_not_implemented() {
+                    log::warn!(
+                        "Identity provider '{id}' failed to capture: {}",
+                        error.current_context()
+                    );
+                }
+                continue;
+            }
+        };
+
+        let positive_sources = positive_sources(id, &resolution, deps.catalog);
+        for source in &positive_sources {
+            context
+                .identity_mut()
+                .record_unpersisted(id.clone(), source.clone());
+        }
+        if !call.is_real_browser {
+            for source in resolution.invalidated() {
+                log::debug!(
+                    "Dropping a capture removal of provider '{id}', source '{source}': the client is not a real browser"
+                );
+            }
+            if resolution.is_opted_out() {
+                log::debug!(
+                    "Dropping a capture opt-out of provider '{id}': the client is not a real browser"
+                );
+            }
+            continue;
+        }
+        if resolution.is_opted_out()
+            && deps.settings.ec.identity.provider(id).revoke_scope() == RevokeScope::Global
+        {
+            context.request_global_revoke();
+            continue;
+        }
+
+        let ask = capture_ask(
+            deps,
+            context,
+            provider.as_ref(),
+            resolution,
+            &view,
+            !positive_sources.is_empty(),
+        );
+        for removal in ask.removals {
+            mutation.add_change(removal);
+        }
+        mutation.merge_state(id.clone(), ask.state);
+    }
+
+    if !mutation.has_removals() {
+        return;
+    }
+    let (Some(graph), Some(ec_id)) = (graph, ec_id.as_deref()) else {
+        log::debug!("Dropping capture removals: no identity graph or EC ID for the request");
+        return;
+    };
+    let apply_context = ApplyContext {
+        now: now.as_secs(),
+        random: deps.random,
+        catalog: deps.catalog,
+    };
+    if write_removals(graph, ec_id, &mutation, &apply_context) == RemovalWriteOutcome::Failed {
+        if let Some(earlier) = context.identity().pending_removals().cloned() {
+            mutation.absorb(earlier);
+        }
+        context.identity_mut().set_pending_removals(Some(mutation));
+    }
 }
 
 #[cfg(test)]
@@ -5334,6 +5627,560 @@ mod tests {
                 "should leave the found's failure count alone"
             );
             assert_eq!(fixture.store.writes().total(), 1, "should make one write");
+        }
+    }
+
+    /// Revoke-only capture from proxied responses (spec 4.7).
+    mod capture_run {
+        use serde_json::json;
+
+        use super::*;
+        use crate::consent::jurisdiction::Jurisdiction;
+        use crate::ec::identity::revision::set_hashes;
+        use crate::ec::identity::test_support::capture_fixture::{CaptureFixture, capture_path};
+        use crate::ec::identity::test_support::hold_fixture::live_row;
+        use crate::ec::identity::test_support::{
+            TEST_EC_ID, answering_capture_provider, record_for_test,
+        };
+        use crate::ec::kv_types::KvProviderState;
+        use crate::test_support::logs::{captured_logs, install_capturing_logger};
+
+        const FIRST: &str = "a.example.com";
+        const SECOND: &str = "b.example.com";
+
+        fn lockr() -> Arc<dyn IdentityProvider> {
+            answering_capture_provider("lockr", &[FIRST, SECOND], None)
+        }
+
+        fn lockr_path() -> String {
+            capture_path("lockr")
+        }
+
+        fn row_with(records: &[(&str, &str, Option<&str>)]) -> KvEntry {
+            let mut row = live_row();
+            for (source, uid, writer) in records {
+                row.ids
+                    .insert((*source).to_owned(), record_for_test(uid, *writer, 500));
+            }
+            row
+        }
+
+        fn opted_out_row(at: u64) -> KvEntry {
+            let mut row = live_row();
+            row.ps.insert(
+                "lockr".to_owned(),
+                KvProviderState {
+                    o: Some(KvOptOut {
+                        at,
+                        fp: "0".to_owned(),
+                    }),
+                    ..KvProviderState::default()
+                },
+            );
+            row
+        }
+
+        fn denied_consent() -> ConsentContext {
+            ConsentContext {
+                gdpr_applies: true,
+                jurisdiction: Jurisdiction::Gdpr,
+                ..ConsentContext::default()
+            }
+        }
+
+        #[test]
+        fn capture_stores_no_positive_id_and_counts_it() {
+            let mut fixture = CaptureFixture::new(vec![lockr()], Some(&live_row()));
+
+            fixture.capture(
+                &lockr_path(),
+                &json!({"tokens": [
+                    {"source": FIRST, "value": "secret-uid-1"},
+                    {"source": SECOND, "value": "secret-uid-2"},
+                ]}),
+            );
+
+            assert_eq!(
+                fixture.row(),
+                live_row(),
+                "should store neither positive ID"
+            );
+            assert_eq!(fixture.store.writes().total(), 0, "should make no KV write");
+            let counted = fixture.context.identity().capture_unpersisted();
+            assert_eq!(
+                counted,
+                &BTreeMap::from([
+                    ((pid("lockr"), source(FIRST)), 1),
+                    ((pid("lockr"), source(SECOND)), 1),
+                ]),
+                "should count one per source"
+            );
+            assert!(
+                !format!("{counted:?}").contains("secret-uid"),
+                "should hold no value"
+            );
+        }
+
+        #[test]
+        fn capture_removal_is_written_before_send() {
+            let seeded = row_with(&[(FIRST, "secret-uid-a", None)]);
+            let mut fixture = CaptureFixture::new(vec![lockr()], Some(&seeded));
+
+            fixture.capture(
+                &lockr_path(),
+                &json!({"tokens": [{"source": SECOND, "value": "secret-uid-b"}],
+                    "invalidate": [FIRST]}),
+            );
+
+            let writes = fixture.store.writes();
+            assert_eq!(
+                writes.if_generation_match, 1,
+                "should write once with a CAS"
+            );
+            assert_eq!(writes.total(), 1, "should make no other write");
+            let row = fixture.row();
+            assert!(!row.ids.contains_key(FIRST), "should remove the record");
+            assert!(
+                !row.ids.contains_key(SECOND),
+                "should store no positive ID alongside"
+            );
+            assert_eq!(
+                row.ps["lockr"].iv,
+                set_hashes(&seeded.ids[FIRST].eids),
+                "should hash the removed record into iv"
+            );
+            assert!(
+                fixture.context.identity().pending_removals().is_none(),
+                "should leave nothing to retry"
+            );
+        }
+
+        #[test]
+        fn capture_removal_applies_whatever_the_consent() {
+            let seeded = row_with(&[(FIRST, "secret-uid-a", None)]);
+            let body = json!({"invalidate": [FIRST]});
+
+            let mut granted = CaptureFixture::new(vec![lockr()], Some(&seeded));
+            granted.capture(&lockr_path(), &body);
+            let mut denied =
+                CaptureFixture::new(vec![lockr()], Some(&seeded)).with_consent(denied_consent());
+            denied.capture(&lockr_path(), &body);
+
+            assert_eq!(
+                denied.row(),
+                granted.row(),
+                "should write the same removal under denied consent"
+            );
+            assert!(
+                !denied.row().ids.contains_key(FIRST),
+                "should remove the record"
+            );
+            assert_eq!(denied.store.writes().total(), 1, "should write once");
+        }
+
+        #[test]
+        fn capture_removal_write_retries_only_on_generation_mismatch() {
+            let seeded = row_with(&[(FIRST, "secret-uid-a", None)]);
+            let body = json!({"invalidate": [FIRST]});
+
+            let mut mismatched = CaptureFixture::new(vec![lockr()], Some(&seeded));
+            mismatched.store.refuse_conditional_writes(TEST_EC_ID, 2);
+            mismatched.capture(&lockr_path(), &body);
+            assert_eq!(
+                mismatched.store.writes().if_generation_match,
+                3,
+                "should retry each generation mismatch"
+            );
+            assert!(
+                !mismatched.row().ids.contains_key(FIRST),
+                "should win on the third write"
+            );
+
+            let mut failing = CaptureFixture::new(vec![lockr()], Some(&seeded));
+            failing.store.fail_conditional_writes(TEST_EC_ID);
+            failing.capture(&lockr_path(), &body);
+            assert_eq!(
+                failing.store.writes().if_generation_match,
+                1,
+                "should not retry a non-CAS error"
+            );
+        }
+
+        #[test]
+        fn failed_capture_removal_write_runs_once_more_after_send() {
+            let seeded = row_with(&[(FIRST, "secret-uid-a", None)]);
+            let mut fixture = CaptureFixture::new(vec![lockr()], Some(&seeded));
+            fixture.store.refuse_conditional_writes(TEST_EC_ID, 5);
+
+            fixture.capture(&lockr_path(), &json!({"invalidate": [FIRST]}));
+
+            assert!(
+                fixture.row().ids.contains_key(FIRST),
+                "should leave the record after five refusals"
+            );
+            assert!(
+                fixture.context.identity().pending_removals().is_some(),
+                "should keep the removal for the retry"
+            );
+            assert_eq!(
+                fixture.context.identity().removal_lost(),
+                0,
+                "should not count a removal lost yet"
+            );
+
+            fixture.retry_after_send();
+
+            assert!(
+                !fixture.row().ids.contains_key(FIRST),
+                "should write the removal after send"
+            );
+            assert!(
+                fixture.context.identity().pending_removals().is_none(),
+                "should clear the pending removal"
+            );
+            assert_eq!(
+                fixture.context.identity().removal_lost(),
+                0,
+                "should count nothing lost"
+            );
+        }
+
+        #[test]
+        fn capture_removal_lost_after_both_attempts_is_counted_and_logged_without_a_value() {
+            install_capturing_logger();
+            let provider = answering_capture_provider("lostcap", &[FIRST], None);
+            let seeded = row_with(&[(FIRST, "secret-uid-lost-9137", None)]);
+            let mut fixture = CaptureFixture::new(vec![provider], Some(&seeded));
+            fixture.store.fail_conditional_writes(TEST_EC_ID);
+
+            fixture.capture(&capture_path("lostcap"), &json!({"invalidate": [FIRST]}));
+            fixture.retry_after_send();
+
+            assert_eq!(
+                fixture.context.identity().removal_lost(),
+                1,
+                "should count the lost removal"
+            );
+            assert!(
+                fixture.context.identity().pending_removals().is_none(),
+                "should keep nothing after the last attempt"
+            );
+            assert!(
+                fixture.row().ids.contains_key(FIRST),
+                "control: the record is still there"
+            );
+            let logs = captured_logs();
+            assert!(
+                logs.iter().any(|line| line.contains("removal lost")
+                    && line.contains("lostcap")
+                    && line.contains(FIRST)),
+                "should log the provider and source: {logs:?}"
+            );
+            assert!(
+                !logs
+                    .iter()
+                    .any(|line| line.contains("secret-uid-lost-9137")),
+                "should log no value"
+            );
+        }
+
+        #[test]
+        fn capture_removal_write_skips_a_tombstone_a_missing_row_and_an_applied_removal() {
+            let body = json!({"invalidate": [FIRST]});
+
+            let mut tombstone =
+                CaptureFixture::new(vec![lockr()], Some(&KvEntry::tombstone(1_000)));
+            tombstone.capture(&lockr_path(), &body);
+            let mut missing = CaptureFixture::new(vec![lockr()], None);
+            missing.capture(&lockr_path(), &body);
+            let mut applied = CaptureFixture::new(vec![lockr()], Some(&live_row()));
+            applied.capture(&lockr_path(), &body);
+
+            for (name, fixture) in [
+                ("a tombstone", &tombstone),
+                ("a missing row", &missing),
+                ("an applied removal", &applied),
+            ] {
+                assert_eq!(
+                    fixture.store.writes().total(),
+                    0,
+                    "should write nothing for {name}"
+                );
+                assert!(
+                    fixture.context.identity().pending_removals().is_none(),
+                    "should keep nothing to retry for {name}"
+                );
+            }
+            let mut control = CaptureFixture::new(
+                vec![lockr()],
+                Some(&row_with(&[(FIRST, "secret-uid-a", None)])),
+            );
+            control.capture(&lockr_path(), &body);
+            assert_eq!(
+                control.store.writes().total(),
+                1,
+                "control: a live record is written"
+            );
+        }
+
+        #[test]
+        fn capture_opt_out_removes_every_record_the_provider_wrote() {
+            let seeded = row_with(&[
+                (FIRST, "secret-uid-a", Some("lockr")),
+                (SECOND, "secret-uid-b", Some("other")),
+            ]);
+            let mut fixture = CaptureFixture::new(vec![lockr()], Some(&seeded));
+
+            fixture.capture(&lockr_path(), &json!({"opted_out": true}));
+
+            let row = fixture.row();
+            assert!(
+                !row.ids.contains_key(FIRST),
+                "should remove the record the provider wrote"
+            );
+            assert!(
+                row.ids.contains_key(SECOND),
+                "control: should keep another writer's record"
+            );
+            assert!(row.ps["lockr"].o.is_some(), "should store the opt-out");
+            assert_eq!(
+                row.ps["lockr"].ov,
+                set_hashes(&seeded.ids[FIRST].eids),
+                "should hash the removed record into ov"
+            );
+            assert_eq!(fixture.store.writes().total(), 1, "should write once");
+        }
+
+        #[test]
+        fn capture_only_opt_out_also_removes_browser_records_of_its_sources() {
+            let seeded = row_with(&[
+                (FIRST, "secret-uid-a", None),
+                ("unrelated.example.com", "secret-uid-c", None),
+            ]);
+            let mut fixture = CaptureFixture::new(vec![lockr()], Some(&seeded));
+
+            fixture.capture(&lockr_path(), &json!({"opted_out": true}));
+
+            let row = fixture.row();
+            assert!(
+                !row.ids.contains_key(FIRST),
+                "should remove the browser record of its source"
+            );
+            assert!(
+                row.ids.contains_key("unrelated.example.com"),
+                "control: should keep a browser record of another source"
+            );
+        }
+
+        #[test]
+        fn capture_only_provider_clears_its_opt_out_on_a_consenting_positive_result() {
+            let seeded = opted_out_row(100);
+            let positive = json!({"tokens": [{"source": FIRST, "value": "secret-uid-a"}]});
+
+            let mut fixture = CaptureFixture::new(vec![lockr()], Some(&seeded));
+            fixture.capture(&lockr_path(), &positive);
+            let row = fixture.row();
+            assert!(
+                row.ps["lockr"].oc.is_some_and(|clear| clear > 100),
+                "should store the clear"
+            );
+            assert!(row.ids.is_empty(), "should store no ID");
+            assert_eq!(fixture.store.writes().total(), 1, "should write once");
+
+            let mut denied =
+                CaptureFixture::new(vec![lockr()], Some(&seeded)).with_consent(denied_consent());
+            denied.capture(&lockr_path(), &positive);
+            assert_eq!(
+                denied.row().ps["lockr"].oc,
+                None,
+                "control: should not clear under denied consent"
+            );
+            assert_eq!(denied.store.writes().total(), 0, "should not write");
+
+            let mut vendor = CaptureFixture::new(
+                vec![answering_capture_provider("lockr", &[FIRST], Some(7))],
+                Some(&seeded),
+            );
+            vendor.capture(&lockr_path(), &positive);
+            assert_eq!(
+                vendor.row().ps["lockr"].oc,
+                None,
+                "control: a provider with a GVL ID never clears by capture"
+            );
+
+            let mut empty = CaptureFixture::new(vec![lockr()], Some(&seeded));
+            empty.capture(&lockr_path(), &json!({}));
+            assert_eq!(
+                empty.row().ps["lockr"].oc,
+                None,
+                "control: a result without IDs does not clear"
+            );
+        }
+
+        #[test]
+        fn capture_global_revoke_from_a_real_browser_requests_the_tombstone_and_writes_nothing() {
+            let seeded = row_with(&[(FIRST, "secret-uid-a", Some("lockr"))]);
+            let mut global = CaptureFixture::with_scopes(vec![lockr()], Some(&seeded), &["lockr"]);
+
+            global.capture(&lockr_path(), &json!({"opted_out": true}));
+
+            assert!(
+                global.context.global_revoke_requested(),
+                "should request the global revoke"
+            );
+            assert_eq!(global.row(), seeded, "should leave the row to finalize");
+            assert_eq!(global.store.writes().total(), 0, "should write nothing");
+
+            let mut provider = CaptureFixture::new(vec![lockr()], Some(&seeded));
+            provider.capture(&lockr_path(), &json!({"opted_out": true}));
+            assert!(
+                !provider.context.global_revoke_requested(),
+                "control: the provider scope requests no global revoke"
+            );
+            assert!(
+                provider.row().ps["lockr"].o.is_some(),
+                "control: the provider scope stores the opt-out"
+            );
+        }
+
+        #[test]
+        fn capture_from_a_non_browser_writes_nothing() {
+            let seeded = row_with(&[(FIRST, "secret-uid-a", Some("lockr"))]);
+            for body in [
+                json!({"invalidate": [FIRST]}),
+                json!({"opted_out": true}),
+                json!({"tokens": [{"source": FIRST, "value": "secret-uid-z"}]}),
+            ] {
+                let mut fixture =
+                    CaptureFixture::with_scopes(vec![lockr()], Some(&seeded), &["lockr"])
+                        .not_a_browser();
+
+                fixture.capture(&lockr_path(), &body);
+
+                assert_eq!(
+                    fixture.store.writes().total(),
+                    0,
+                    "should write nothing for {body}"
+                );
+                assert_eq!(fixture.row(), seeded, "should change no row for {body}");
+                assert!(
+                    !fixture.context.global_revoke_requested(),
+                    "should request no global revoke for {body}"
+                );
+                assert!(
+                    fixture.context.identity().pending_removals().is_none(),
+                    "should stage nothing for {body}"
+                );
+                assert!(
+                    fixture.context.identity().mutation().is_empty(),
+                    "should add nothing to the mutation for {body}"
+                );
+            }
+            let mut positive = CaptureFixture::new(vec![lockr()], Some(&seeded)).not_a_browser();
+            positive.capture(
+                &lockr_path(),
+                &json!({"tokens": [{"source": FIRST, "value": "secret-uid-z"}]}),
+            );
+            assert_eq!(
+                positive.context.identity().capture_unpersisted().len(),
+                1,
+                "should still count the positive ID"
+            );
+        }
+
+        #[test]
+        fn capture_on_a_proxy_writer_navigation_uses_the_removal_write_not_the_mutation() {
+            let seeded = row_with(&[(FIRST, "secret-uid-a", None)]);
+            let mut fixture = CaptureFixture::new(vec![lockr()], Some(&seeded));
+            fixture.context.identity_mut().set_writer_decision(
+                crate::ec::identity::request::WriterDecision {
+                    writer: true,
+                    is_real_browser: true,
+                    user_agent: None,
+                    dnt: false,
+                    page_url: None,
+                },
+            );
+
+            fixture.capture(&lockr_path(), &json!({"invalidate": [FIRST]}));
+
+            assert!(
+                fixture.context.identity().mutation().is_empty(),
+                "should leave the writer's mutation alone"
+            );
+            assert_eq!(
+                fixture.store.writes().if_generation_match,
+                1,
+                "should write the removal at once"
+            );
+            assert!(
+                !fixture.row().ids.contains_key(FIRST),
+                "should remove the record"
+            );
+        }
+
+        #[test]
+        fn capture_never_touches_n_f_or_the_breaker() {
+            let mut seeded = row_with(&[(FIRST, "secret-uid-a", None)]);
+            seeded.ps.insert(
+                "lockr".to_owned(),
+                KvProviderState {
+                    n: Some(9_999_999_999),
+                    f: 2,
+                    ..KvProviderState::default()
+                },
+            );
+            for body in [
+                json!({"invalidate": [FIRST]}),
+                json!({"opted_out": true}),
+                json!({}),
+            ] {
+                let mut fixture = CaptureFixture::new(vec![lockr()], Some(&seeded));
+
+                fixture.capture(&lockr_path(), &body);
+
+                let state = &fixture.row().ps["lockr"];
+                assert_eq!(state.n, Some(9_999_999_999), "should keep n for {body}");
+                assert_eq!(state.f, 2, "should keep f for {body}");
+            }
+        }
+
+        #[test]
+        fn capture_state_change_is_ignored() {
+            let mut seeded = row_with(&[(FIRST, "secret-uid-a", None)]);
+            seeded.ps.insert(
+                "statecap".to_owned(),
+                KvProviderState {
+                    st: Some(json!("old-state")),
+                    ..KvProviderState::default()
+                },
+            );
+            install_capturing_logger();
+            let provider = answering_capture_provider("statecap", &[FIRST], None);
+            let mut fixture = CaptureFixture::new(vec![provider], Some(&seeded));
+
+            fixture.capture(
+                &capture_path("statecap"),
+                &json!({"invalidate": [FIRST], "state": "new-state"}),
+            );
+            assert!(
+                captured_logs()
+                    .iter()
+                    .any(|line| line.contains("'statecap'")
+                        && line.contains("state change from capture")),
+                "should warn about the ignored state change"
+            );
+
+            let row = fixture.row();
+            assert_eq!(
+                row.ps["statecap"].st,
+                Some(json!("old-state")),
+                "should keep the stored state"
+            );
+            assert!(
+                !row.ids.contains_key(FIRST),
+                "control: should still apply the removal"
+            );
         }
     }
 }

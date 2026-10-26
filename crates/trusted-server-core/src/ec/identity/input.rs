@@ -654,8 +654,6 @@ impl fmt::Debug for CaptureInput<'_> {
 impl<'a> CaptureInput<'a> {
     /// The input for one capture.
     #[must_use]
-    // Temporary: first used by a later identity task.
-    #[allow(dead_code)]
     pub(crate) fn new(
         descriptor: &'a ProviderDescriptor,
         path: &'a str,

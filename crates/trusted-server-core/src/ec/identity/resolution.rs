@@ -542,8 +542,6 @@ impl Resolution {
 
     /// Whether this result changes state at all.
     #[must_use]
-    // Temporary: first used by a later identity task.
-    #[allow(dead_code)]
     pub(crate) fn changes_state(&self) -> bool {
         self.state != StateOp::Keep
     }

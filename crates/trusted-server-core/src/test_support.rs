@@ -410,3 +410,59 @@ pub mod nextjs_auction {
             .build()
     }
 }
+
+/// One process-wide capturing logger, shared by every test that asserts on
+/// log output.
+///
+/// Tests run in parallel, so a test asserts on text unique to it: that a
+/// message holds, or that a value appears in none.
+#[cfg(test)]
+pub mod logs {
+    use std::sync::{Mutex, Once};
+
+    static CAPTURED_LOGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    static INSTALL_LOGGER: Once = Once::new();
+
+    struct CapturingLogger;
+
+    impl log::Log for CapturingLogger {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.level() <= log::Level::Debug
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if self.enabled(record.metadata()) {
+                CAPTURED_LOGS
+                    .lock()
+                    .expect("should lock captured logs")
+                    .push(record.args().to_string());
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    /// Installs the logger once for the test process.
+    ///
+    /// # Panics
+    ///
+    /// Panics when another logger is already installed.
+    pub fn install_capturing_logger() {
+        INSTALL_LOGGER.call_once(|| {
+            log::set_logger(&CapturingLogger).expect("should install the capturing test logger");
+            log::set_max_level(log::LevelFilter::Debug);
+        });
+    }
+
+    /// Every message logged so far, at debug and above.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the log is poisoned.
+    pub fn captured_logs() -> Vec<String> {
+        CAPTURED_LOGS
+            .lock()
+            .expect("should lock captured logs")
+            .clone()
+    }
+}

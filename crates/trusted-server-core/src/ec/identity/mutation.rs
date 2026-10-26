@@ -49,9 +49,8 @@ pub(crate) enum PartnerIdChange {
 }
 
 impl PartnerIdChange {
-    // Temporary: first used by a later identity task.
-    #[allow(dead_code)]
-    fn is_removal(&self) -> bool {
+    /// Whether the change removes a record.
+    pub(crate) fn is_removal(&self) -> bool {
         matches!(self, Self::OwnerRemove { .. } | Self::WriterRemove { .. })
     }
 }

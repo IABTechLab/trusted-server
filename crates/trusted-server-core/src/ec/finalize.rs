@@ -60,9 +60,16 @@ pub fn ec_finalize_response(
     response: &mut Response<EdgeBody>,
 ) {
     let consent_allows_ec = ec_consent_granted(ec_context.consent());
-    let consent_withdrawn = ec_consent_withdrawn(ec_context.consent());
+    // A global revoke captured from a real browser (spec 8) is a withdrawal:
+    // the same tombstone, cookie expiry and after-send run, with whatever the
+    // request staged dropped.
+    let global_revoke = ec_context.global_revoke_requested();
+    let consent_withdrawn = ec_consent_withdrawn(ec_context.consent()) || global_revoke;
 
-    if !consent_allows_ec {
+    if !consent_allows_ec || global_revoke {
+        if global_revoke {
+            *ec_context.identity_mut().mutation_mut() = IdentityMutation::default();
+        }
         finalize_unusable_consent(
             settings,
             ec_context,
@@ -2974,6 +2981,172 @@ mod tests {
                 1,
                 "should write one tombstone, for the cookie ID only"
             );
+        }
+    }
+
+    mod capture_revoke {
+        use super::*;
+        use crate::ec::identity::mutation::{IdentityMutation, PartnerIdChange};
+        use crate::ec::identity::revision::Revision;
+        use crate::ec::identity::test_support::{pid, source};
+
+        fn finalize(context: &mut EcContext, graph: &KvIdentityGraph) -> Response<EdgeBody> {
+            let mut response = empty_response();
+            ec_finalize_response(
+                &create_test_settings(),
+                context,
+                Some(graph),
+                &PartnerRegistry::empty(),
+                None,
+                None,
+                &mut response,
+            );
+            response
+        }
+
+        fn consenting_context(ec_id: &str) -> EcContext {
+            let mut context = make_context_with_consent(
+                Some(ec_id),
+                Some(ec_id),
+                true,
+                false,
+                granting_consent(),
+            );
+            context
+                .identity_mut()
+                .mutation_mut()
+                .add_change(PartnerIdChange::OwnerRemove {
+                    source: source("a.example.com"),
+                    provider: pid("lockr"),
+                    expected: Revision::Unset,
+                });
+            context
+        }
+
+        fn expires_the_ec_cookie(response: &Response<EdgeBody>) -> bool {
+            response
+                .headers()
+                .get_all("set-cookie")
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .any(|cookie| cookie.starts_with("ts-ec=") && cookie.contains("Max-Age=0"))
+        }
+
+        #[test]
+        fn capture_global_revoke_from_a_real_browser_tombstones_the_row_and_clears_the_ec_cookie() {
+            let (graph, store) = KvIdentityGraph::write_counting("ec-store");
+            let ec_id = sample_ec_id("revoke");
+            graph
+                .create(&ec_id, &KvEntry::minimal("p.example.com", "uid", 1_000))
+                .expect("should seed the row");
+            store.reset_counts();
+            let mut context = consenting_context(&ec_id);
+            context.set_kv_snapshot(graph.load_snapshot(&ec_id));
+            context.request_global_revoke();
+
+            let response = finalize(&mut context, &graph);
+
+            let (stored, _) = graph
+                .get(&ec_id)
+                .expect("should read the row")
+                .expect("should keep the tombstone");
+            assert!(!stored.consent.ok, "should tombstone the row");
+            assert!(stored.ids.is_empty(), "should remove every ID");
+            assert_eq!(
+                store.writes().if_generation_match,
+                1,
+                "should write one tombstone"
+            );
+            assert!(
+                expires_the_ec_cookie(&response),
+                "should expire the EC cookie"
+            );
+            assert!(
+                context.failed_withdrawals().is_empty(),
+                "should record no failed tombstone"
+            );
+            assert_eq!(
+                context.identity().mutation(),
+                &IdentityMutation::default(),
+                "should drop the request's mutation"
+            );
+
+            let (graph, store) = KvIdentityGraph::write_counting("ec-store");
+            graph
+                .create(&ec_id, &KvEntry::minimal("p.example.com", "uid", 1_000))
+                .expect("should seed the row");
+            store.reset_counts();
+            let mut control = consenting_context(&ec_id);
+            control.set_kv_snapshot(graph.load_snapshot(&ec_id));
+            let response = finalize(&mut control, &graph);
+            assert!(
+                graph
+                    .get(&ec_id)
+                    .expect("should read the row")
+                    .is_some_and(|(row, _)| row.consent.ok),
+                "control: without a revoke the row stays live"
+            );
+            assert!(
+                !expires_the_ec_cookie(&response),
+                "control: without a revoke the cookie stays"
+            );
+            assert_eq!(store.writes().total(), 0, "control: writes nothing");
+        }
+
+        #[test]
+        fn capture_global_revoke_failed_tombstone_gets_the_after_send_run() {
+            let (graph, store) = KvIdentityGraph::write_counting("ec-store");
+            let ec_id = sample_ec_id("rvfail");
+            graph
+                .create(&ec_id, &KvEntry::minimal("p.example.com", "uid", 1_000))
+                .expect("should seed the row");
+            store.refuse_conditional_writes(&ec_id, 5);
+            let mut context = consenting_context(&ec_id);
+            context.set_kv_snapshot(graph.load_snapshot(&ec_id));
+            context.request_global_revoke();
+
+            let response = finalize(&mut context, &graph);
+
+            assert_eq!(
+                context.failed_withdrawals(),
+                std::slice::from_ref(&ec_id),
+                "should record the failed tombstone for the after-send run"
+            );
+            assert!(
+                expires_the_ec_cookie(&response),
+                "should still expire the cookie"
+            );
+
+            retry_failed_withdrawals(&mut context, &graph);
+
+            assert!(
+                graph
+                    .get(&ec_id)
+                    .expect("should read the row")
+                    .is_some_and(|(row, _)| !row.consent.ok),
+                "should tombstone the row after send"
+            );
+        }
+
+        #[test]
+        fn capture_global_revoke_without_an_ec_cookie_expires_nothing() {
+            let (graph, store) = KvIdentityGraph::write_counting("ec-store");
+            let ec_id = sample_ec_id("nocook");
+            graph
+                .create(&ec_id, &KvEntry::minimal("p.example.com", "uid", 1_000))
+                .expect("should seed the row");
+            store.reset_counts();
+            let mut context =
+                make_context_with_consent(Some(&ec_id), None, false, true, granting_consent());
+            context.request_global_revoke();
+
+            let response = finalize(&mut context, &graph);
+
+            assert!(
+                !expires_the_ec_cookie(&response),
+                "should expire no cookie the request did not carry"
+            );
+            assert_eq!(store.writes().total(), 0, "should tombstone no row");
         }
     }
 

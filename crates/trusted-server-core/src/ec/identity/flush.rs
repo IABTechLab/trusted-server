@@ -294,6 +294,55 @@ fn write_failed(
     FlushOutcome::WriteFailed { removals: outcome }
 }
 
+/// Tries once more, after send, the capture removal write that failed before
+/// send (spec 5.3).
+///
+/// This is the last attempt: the pending removals are taken, and each one
+/// that still cannot be written is logged and counted as lost. Without a
+/// pending removal it does nothing.
+pub fn retry_pending_removals(context: &mut EcContext, graph: &KvIdentityGraph) {
+    let Some(removals) = context.identity().pending_removals().cloned() else {
+        return;
+    };
+    let ec_id = context.ec_value().map(str::to_owned);
+    let runtime = context.identity().runtime().cloned();
+    let (Some(ec_id), Some(runtime)) = (ec_id, runtime) else {
+        log::warn!("Capture removal retry skipped: no EC ID or identity runtime");
+        lose_pending_removals(context);
+        return;
+    };
+    let random = ThreadRandom;
+    let outcome = write_removals(
+        graph,
+        &ec_id,
+        &removals,
+        &ApplyContext {
+            now: current_timestamp(),
+            random: &random,
+            catalog: runtime.catalog(),
+        },
+    );
+    if outcome == RemovalWriteOutcome::Failed {
+        lose_pending_removals(context);
+    } else {
+        context.identity_mut().set_pending_removals(None);
+    }
+}
+
+/// Gives up the capture removal write that failed before send: logs and
+/// counts each removal as lost. For an after-send run that cannot even try,
+/// such as one without an identity graph.
+pub fn lose_pending_removals(context: &mut EcContext) {
+    let Some(removals) = context.identity().pending_removals().cloned() else {
+        return;
+    };
+    context.identity_mut().set_pending_removals(None);
+    log_removal_lost(context.ec_value().unwrap_or_default(), &removals);
+    for _ in removals.removal_labels() {
+        context.identity_mut().record_removal_lost();
+    }
+}
+
 /// What eligibility reads about the request itself.
 pub(super) fn request_facts(context: &EcContext, now: u64, runs_auction: bool) -> RequestFacts {
     let identity = context.identity();

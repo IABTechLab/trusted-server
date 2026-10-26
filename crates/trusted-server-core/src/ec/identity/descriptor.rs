@@ -461,8 +461,6 @@ impl Captures {
 
     /// Whether a proxied request matches a rule.
     #[must_use]
-    // Temporary: first used by a later identity task.
-    #[allow(dead_code)]
     pub(crate) fn matches(&self, method: &Method, path: &str) -> bool {
         self.paths
             .iter()

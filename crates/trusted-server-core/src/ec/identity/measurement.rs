@@ -5,7 +5,10 @@
 
 use core::fmt::Write as _;
 
+use std::collections::BTreeMap;
+
 use super::flush::FlushOutcome;
+use super::ids::{IdentityProviderId, SourceDomain};
 
 /// What kind of identity route the request was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display)]
@@ -49,6 +52,7 @@ pub struct IdentityMeasurement {
     pub(crate) removal_lost: u32,
     pub(crate) withdrawal_after_send: bool,
     pub(crate) withdrawal_after_send_failed: bool,
+    pub(crate) capture_unpersisted: BTreeMap<(IdentityProviderId, SourceDomain), u32>,
 }
 
 impl IdentityMeasurement {
@@ -100,6 +104,13 @@ impl IdentityMeasurement {
         self.withdrawal_after_send_failed
     }
 
+    /// Positive capture IDs counted and never stored, per provider and
+    /// source. Counts only: no value is held.
+    #[must_use]
+    pub fn capture_unpersisted(&self) -> &BTreeMap<(IdentityProviderId, SourceDomain), u32> {
+        &self.capture_unpersisted
+    }
+
     /// Logs the measurement at info level.
     pub fn log(&self) {
         log::info!("identity request measurement: {self}");
@@ -111,7 +122,7 @@ impl core::fmt::Display for IdentityMeasurement {
         write!(
             formatter,
             "cookie_header_bytes={} route={} kv_reads={} kv_writes={} flush={} removal_lost={} \
-             withdrawal_after_send={} withdrawal_after_send_failed={}",
+             withdrawal_after_send={} withdrawal_after_send_failed={} capture_unpersisted={}",
             self.cookie_header_bytes,
             self.route,
             self.kv_reads,
@@ -120,7 +131,26 @@ impl core::fmt::Display for IdentityMeasurement {
             self.removal_lost,
             u8::from(self.withdrawal_after_send),
             u8::from(self.withdrawal_after_send_failed),
+            CaptureUnpersisted(&self.capture_unpersisted),
         )
+    }
+}
+
+/// The capture counts as `provider/source:count`, comma separated, or `none`.
+struct CaptureUnpersisted<'a>(&'a BTreeMap<(IdentityProviderId, SourceDomain), u32>);
+
+impl core::fmt::Display for CaptureUnpersisted<'_> {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.0.is_empty() {
+            return formatter.write_str("none");
+        }
+        for (index, ((provider, source), count)) in self.0.iter().enumerate() {
+            if index > 0 {
+                formatter.write_char(',')?;
+            }
+            write!(formatter, "{provider}/{source}:{count}")?;
+        }
+        Ok(())
     }
 }
 
@@ -177,5 +207,52 @@ mod tests {
                 "should label {outcome:?}"
             );
         }
+    }
+
+    fn measurement(
+        capture_unpersisted: BTreeMap<(IdentityProviderId, SourceDomain), u32>,
+    ) -> IdentityMeasurement {
+        IdentityMeasurement {
+            cookie_header_bytes: 10,
+            route: RouteKind::Stager,
+            kv_reads: 0,
+            kv_writes: 0,
+            flush: None,
+            removal_lost: 0,
+            withdrawal_after_send: false,
+            withdrawal_after_send_failed: false,
+            capture_unpersisted,
+        }
+    }
+
+    #[test]
+    fn measurement_line_counts_capture_unpersisted_per_provider_and_source() {
+        let line = measurement(BTreeMap::from([
+            (
+                (
+                    "lockr".parse().expect("should parse the provider ID"),
+                    "a.example.com".parse().expect("should parse the source"),
+                ),
+                2,
+            ),
+            (
+                (
+                    "lockr".parse().expect("should parse the provider ID"),
+                    "b.example.com".parse().expect("should parse the source"),
+                ),
+                1,
+            ),
+        ]))
+        .to_string();
+        let empty = measurement(BTreeMap::new()).to_string();
+
+        assert!(
+            line.ends_with("capture_unpersisted=lockr/a.example.com:2,lockr/b.example.com:1"),
+            "should list each provider and source with its count: {line}"
+        );
+        assert!(
+            empty.ends_with("capture_unpersisted=none"),
+            "control: should print none without a capture: {empty}"
+        );
     }
 }

@@ -201,7 +201,8 @@ impl LockrIntegration {
             .unwrap_or_default();
         let target_url = format!("{}{}{}", self.config.api_endpoint, target_path, query);
 
-        log::info!("Forwarding to Lockr API: {}", target_url);
+        // The query string can carry identifiers, so only the path is logged.
+        log::info!("Forwarding to Lockr API path: {target_path}");
 
         let request_body = if method == Method::POST {
             let bytes =
@@ -227,8 +228,7 @@ impl LockrIntegration {
             .send(PlatformHttpRequest::new(target_req, backend_name))
             .await
             .change_context(Self::error(format!(
-                "Failed to forward request to {}",
-                target_url
+                "Failed to forward request to Lockr API path {target_path}"
             )))?
             .response;
 
@@ -575,6 +575,41 @@ mod tests {
             stub.recorded_backend_names().len(),
             1,
             "should route one outbound request through PlatformHttpClient"
+        );
+    }
+
+    #[test]
+    fn lockr_proxy_log_omits_query() {
+        use crate::test_support::logs::{captured_logs, install_capturing_logger};
+
+        install_capturing_logger();
+        let stub = Arc::new(StubHttpClient::new());
+        stub.push_response(200, b"ok".to_vec());
+        let services = build_services_with_http_client(
+            Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+        );
+        let settings = create_test_settings();
+        let integration = LockrIntegration::new(test_config());
+        let req = http::Request::builder()
+            .method(HttpMethod::GET)
+            .uri("https://publisher.example/integrations/lockr/api/logpath/v1/token?uid=query-secret-4471&email=person-4471%40example.com")
+            .body(EdgeBody::empty())
+            .expect("should build request");
+
+        futures::executor::block_on(integration.handle(&settings, &services, req))
+            .expect("should proxy request");
+
+        let logs = captured_logs();
+        assert!(
+            logs.iter()
+                .any(|line| line == "Forwarding to Lockr API path: /logpath/v1/token"),
+            "should log the upstream path: {logs:?}"
+        );
+        assert!(
+            !logs
+                .iter()
+                .any(|line| line.contains("query-secret-4471") || line.contains("person-4471")),
+            "should log no part of the query string"
         );
     }
 

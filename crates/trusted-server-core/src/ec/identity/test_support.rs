@@ -31,11 +31,14 @@ use crate::ec::identity::descriptor::{
 use crate::ec::identity::exchange::{ProviderRequest, ProviderResponse};
 use crate::ec::identity::ids::{IdentityProviderId, SourceDomain, UnixTime};
 use crate::ec::identity::input::{
-    HashedEmail, ProviderConsent, Region, ResolveInput, ResolveSignals, SeededRandom, StoredId,
+    CaptureInput, HashedEmail, ProviderConsent, Region, ResolveInput, ResolveSignals, SeededRandom,
+    StoredId,
 };
 use crate::ec::identity::policy::PolicySignals;
 use crate::ec::identity::provider::IdentityProvider;
-use crate::ec::identity::resolution::{IdentityProviderError, Resolution, When};
+use crate::ec::identity::resolution::{
+    IdentityProviderError, Resolution, ResolvedEid, ResolvedUid, When,
+};
 use crate::ec::identity::revision::{StateRevision, new_revision};
 use crate::ec::kv_backend::in_memory::InMemoryEcKv;
 use crate::ec::kv_backend::{EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcKvWriteOutcome};
@@ -162,6 +165,95 @@ pub fn fixed_capture_provider(id: &str, sources: &[&str]) -> Arc<dyn IdentityPro
     Arc::new(DescriptorOnly(
         builder.build().expect("should build the descriptor"),
     ))
+}
+
+/// A capture-only provider that answers as the 2xx JSON body says:
+/// `{"tokens":[{"source":"a.example.com","value":"x"}],"invalidate":["a.example.com"],
+/// "opted_out":true,"state":"s"}`. Every member is optional. `opted_out` wins,
+/// then `tokens`, then `invalidate`, and anything else is `no_match`.
+struct AnsweringCapture {
+    descriptor: ProviderDescriptor,
+}
+
+impl IdentityProvider for AnsweringCapture {
+    fn descriptor(&self) -> &ProviderDescriptor {
+        &self.descriptor
+    }
+
+    fn capture(
+        &self,
+        input: &CaptureInput<'_>,
+    ) -> Result<Resolution, Report<IdentityProviderError>> {
+        let Ok(body) = input.response().json::<serde_json::Value>() else {
+            return Ok(Resolution::no_match());
+        };
+        let sources = |name: &str| -> Vec<SourceDomain> {
+            body[name]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|value| value.as_str()?.parse().ok())
+                .collect()
+        };
+        let tokens: Vec<ResolvedEid> = body["tokens"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|token| {
+                let source = input.source_named(token["source"].as_str()?)?;
+                Some(ResolvedEid::new(
+                    source,
+                    ResolvedUid::new(token["value"].as_str()?),
+                ))
+            })
+            .collect();
+        let invalidated = sources("invalidate");
+        let mut resolution = if body["opted_out"].as_bool() == Some(true) {
+            Resolution::opted_out()
+        } else if !tokens.is_empty() {
+            Resolution::found(tokens)
+        } else if let Some(first) = invalidated.first() {
+            Resolution::invalidate(first)
+        } else {
+            Resolution::no_match()
+        };
+        for source in &invalidated {
+            resolution = resolution.also_invalidate(source);
+        }
+        if let Some(state) = body["state"].as_str() {
+            resolution = resolution.replacing_state(&state);
+        }
+        Ok(resolution)
+    }
+}
+
+/// A capture-only provider `id` over `sources` that answers as the response
+/// body says, with a capture rule on `/integrations/<id>/`. With `gvl_id` its
+/// consent policy names that TCF vendor.
+///
+/// # Panics
+///
+/// Panics when `id` or a source is not valid.
+#[must_use]
+pub fn answering_capture_provider(
+    id: &str,
+    sources: &[&str],
+    gvl_id: Option<u16>,
+) -> Arc<dyn IdentityProvider> {
+    let policy = match gvl_id {
+        Some(vendor) => ConsentPolicy::strict().with_tcf_vendor(vendor),
+        None => ConsentPolicy::eid_persistence_only(),
+    };
+    let mut builder =
+        ProviderDescriptor::builder(id.parse().expect("should parse the provider ID"))
+            .with_captures(Captures::new().with_path_prefix(&format!("/integrations/{id}/")))
+            .with_consent_policy(policy);
+    for source in sources {
+        builder = builder.with_source(source.parse().expect("should parse the source"));
+    }
+    Arc::new(AnsweringCapture {
+        descriptor: builder.build().expect("should build the descriptor"),
+    })
 }
 
 /// A [`fixed_provider`] that also declares a `with_provenance` default per
@@ -425,6 +517,7 @@ pub struct WriteCountingEcKv {
     overwrite: AtomicUsize,
     lookups: AtomicUsize,
     refusals: Mutex<BTreeMap<String, usize>>,
+    failing: Mutex<BTreeSet<String>>,
 }
 
 impl WriteCountingEcKv {
@@ -438,7 +531,22 @@ impl WriteCountingEcKv {
             overwrite: AtomicUsize::new(0),
             lookups: AtomicUsize::new(0),
             refusals: Mutex::new(BTreeMap::new()),
+            failing: Mutex::new(BTreeSet::new()),
         }
+    }
+
+    /// Fails every generation-checked write to `key` with a store error, the
+    /// non-retryable failure (Fastly's per-key write limit). A failed write
+    /// is still counted.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the failure table is poisoned.
+    pub fn fail_conditional_writes(&self, key: &str) {
+        self.failing
+            .lock()
+            .expect("should lock the failures")
+            .insert(key.to_owned());
     }
 
     /// Refuses the next `count` generation-checked writes to `key` with
@@ -505,6 +613,17 @@ impl EcKvStore for WriteCountingEcKv {
         };
         count.fetch_add(1, Ordering::SeqCst);
         if matches!(write.mode, EcKvWriteMode::IfGenerationMatch(_)) {
+            if self
+                .failing
+                .lock()
+                .expect("should lock the failures")
+                .contains(key)
+            {
+                return Err(Report::new(TrustedServerError::KvStore {
+                    store_name: self.inner.store_name().to_owned(),
+                    message: "per-key write limit".to_owned(),
+                }));
+            }
             let mut refusals = self.refusals.lock().expect("should lock the refusals");
             if let Some(remaining) = refusals.get_mut(key)
                 && *remaining > 0
@@ -1603,6 +1722,179 @@ pub(crate) mod hold_fixture {
                 status,
                 rate_limiter: self.limiter.as_ref(),
             })
+        }
+
+        /// The row as KV holds it.
+        pub(crate) fn row(&self) -> KvEntry {
+            self.graph
+                .get(TEST_EC_ID)
+                .expect("should read the row")
+                .expect("should hold the row")
+                .0
+        }
+    }
+}
+
+/// A proxied API call from a browser with a live row and capture-only
+/// providers, for the tests of the capture removal write.
+#[cfg(test)]
+pub(crate) mod capture_fixture {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use http::{HeaderMap, Method, StatusCode};
+
+    use super::fake_http::{FakeBackend, FakeHttpClient, fake_services};
+    use super::{TEST_EC_ID, WriteCountingEcKv, allowing_consent};
+    use crate::consent::ConsentContext;
+    use crate::ec::EcContext;
+    use crate::ec::identity::coordinator::{CaptureCall, run_capture};
+    use crate::ec::identity::flush::retry_pending_removals;
+    use crate::ec::identity::ids::{IdentityProviderId, SourceDomain};
+    use crate::ec::identity::input::ThreadRandom;
+    use crate::ec::identity::provider::IdentityProvider;
+    use crate::ec::identity::request::WriterDecision;
+    use crate::ec::identity::runtime::IdentityRuntime;
+    use crate::ec::kv::KvIdentityGraph;
+    use crate::ec::kv_types::KvEntry;
+    use crate::platform::RuntimeServices;
+    use crate::settings::{ProviderSettings, RevokeScope, Settings};
+    use crate::test_support::tests::create_test_settings;
+
+    /// The path every fixture capture call goes to.
+    pub(crate) fn capture_path(provider: &str) -> String {
+        format!("/integrations/{provider}/api/token")
+    }
+
+    /// Everything one capture call reads.
+    pub(crate) struct CaptureFixture {
+        pub(crate) settings: Settings,
+        pub(crate) runtime: Arc<IdentityRuntime>,
+        pub(crate) services: RuntimeServices,
+        pub(crate) graph: KvIdentityGraph,
+        pub(crate) store: Arc<WriteCountingEcKv>,
+        pub(crate) context: EcContext,
+    }
+
+    impl CaptureFixture {
+        /// A real browser's proxied call with `row` stored, read in phase 1,
+        /// and every provider's `revoke_scope` at its default.
+        pub(crate) fn new(
+            providers: Vec<Arc<dyn IdentityProvider>>,
+            row: Option<&KvEntry>,
+        ) -> Self {
+            Self::with_scopes(providers, row, &[])
+        }
+
+        /// As [`Self::new`], with `revoke_scope = "global"` for each provider
+        /// listed in `global`.
+        pub(crate) fn with_scopes(
+            providers: Vec<Arc<dyn IdentityProvider>>,
+            row: Option<&KvEntry>,
+            global: &[&str],
+        ) -> Self {
+            let mut settings = create_test_settings();
+            for id in global {
+                settings.ec.identity.providers.insert(
+                    (*id).to_owned(),
+                    ProviderSettings {
+                        revoke_scope: Some(RevokeScope::Global),
+                        ..ProviderSettings::default()
+                    },
+                );
+            }
+            let runtime = Arc::new(
+                IdentityRuntime::from_settings_with_providers(
+                    &settings,
+                    providers,
+                    BTreeMap::<SourceDomain, IdentityProviderId>::new(),
+                )
+                .expect("should build the runtime"),
+            );
+            let client = Arc::new(FakeHttpClient::new());
+            let backend = Arc::new(FakeBackend::new());
+            let services = fake_services(&client, &backend);
+            let (graph, store) = KvIdentityGraph::write_counting("capture-store");
+            if let Some(row) = row {
+                graph.create(TEST_EC_ID, row).expect("should seed the row");
+            }
+            let mut context = EcContext::new_for_test_with_ip(
+                Some(TEST_EC_ID.to_owned()),
+                allowing_consent(),
+                Some("192.0.2.10".to_owned()),
+            );
+            context.set_identity_runtime(Arc::clone(&runtime));
+            context.identity_mut().set_writer_decision(WriterDecision {
+                writer: false,
+                is_real_browser: true,
+                user_agent: Some("ExampleBrowser/1.0".to_owned()),
+                dnt: false,
+                page_url: None,
+            });
+            context.set_kv_snapshot(graph.load_snapshot(TEST_EC_ID));
+            store.reset_counts();
+            Self {
+                settings,
+                runtime,
+                services,
+                graph,
+                store,
+                context,
+            }
+        }
+
+        /// Replaces the request's consent.
+        pub(crate) fn with_consent(mut self, consent: ConsentContext) -> Self {
+            let mut context = EcContext::new_for_test_with_ip(
+                Some(TEST_EC_ID.to_owned()),
+                consent,
+                Some("192.0.2.10".to_owned()),
+            );
+            context.set_identity_runtime(Arc::clone(&self.runtime));
+            context.set_kv_snapshot(self.context.kv_snapshot().clone());
+            context.identity_mut().set_real_browser(true);
+            self.context = context;
+            self
+        }
+
+        /// Makes the request a client that does not look like a browser.
+        pub(crate) fn not_a_browser(mut self) -> Self {
+            self.context.identity_mut().set_real_browser(false);
+            self
+        }
+
+        /// Runs the capture for a 200 response holding `body` at `path`.
+        pub(crate) fn capture(&mut self, path: &str, body: &serde_json::Value) {
+            let bytes = serde_json::to_vec(body).expect("should serialize the body");
+            self.capture_bytes(path, StatusCode::OK, &bytes);
+        }
+
+        /// Runs the capture for a response with `status` holding `bytes`.
+        pub(crate) fn capture_bytes(&mut self, path: &str, status: StatusCode, bytes: &[u8]) {
+            let real_browser = self.context.identity().is_real_browser();
+            let random = ThreadRandom;
+            let deps = self
+                .runtime
+                .deps(&self.settings, &self.services, &random, None);
+            let headers = HeaderMap::new();
+            run_capture(
+                &deps,
+                Some(&self.graph),
+                &mut self.context,
+                &CaptureCall {
+                    method: &Method::POST,
+                    path,
+                    is_real_browser: real_browser,
+                    status,
+                    headers: &headers,
+                    body: bytes,
+                },
+            );
+        }
+
+        /// Runs the removal write's one retry after send.
+        pub(crate) fn retry_after_send(&mut self) {
+            retry_pending_removals(&mut self.context, &self.graph);
         }
 
         /// The row as KV holds it.

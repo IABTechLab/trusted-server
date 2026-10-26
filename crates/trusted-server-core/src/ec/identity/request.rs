@@ -47,6 +47,7 @@ pub(crate) struct RequestIdentity {
     cookie_header_bytes: usize,
     create_attempts: u32,
     capture_unpersisted: BTreeMap<(IdentityProviderId, SourceDomain), u32>,
+    global_revoke: bool,
 }
 
 impl core::fmt::Debug for RequestIdentity {
@@ -210,6 +211,17 @@ impl RequestIdentity {
             .entry((provider, source))
             .or_insert(0);
         *count = count.saturating_add(1);
+    }
+
+    /// Whether a real browser's capture asked for a global revoke (spec 8).
+    #[must_use]
+    pub(crate) fn global_revoke_requested(&self) -> bool {
+        self.global_revoke
+    }
+
+    /// Asks finalize to run the consent-withdrawal tombstone path.
+    pub(crate) fn request_global_revoke(&mut self) {
+        self.global_revoke = true;
     }
 
     /// Sets the writer decision and the signals captured with it.

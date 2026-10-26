@@ -18,7 +18,8 @@ use trusted_server_core::ec::device::DeviceSignals;
 use trusted_server_core::ec::finalize::{ec_finalize_response, retry_failed_withdrawals};
 use trusted_server_core::ec::identity::IdentityRuntime;
 use trusted_server_core::ec::identity::flush::{
-    AfterSendInput, FlushOutcome, may_flush, run_after_send,
+    AfterSendInput, FlushOutcome, lose_pending_removals, may_flush, retry_pending_removals,
+    run_after_send,
 };
 use trusted_server_core::ec::identity::measurement::{IdentityMeasurement, MeasurementInput};
 use trusted_server_core::ec::kv::KvIdentityGraph;
@@ -711,6 +712,17 @@ fn finalize_send_and_flush_measured(
         }
     }
     let withdrawal_after_send_failed = ec_state.ec_context.has_failed_withdrawals();
+
+    // A capture removal write that failed before send gets one more attempt.
+    if ec_state.ec_context.has_pending_removals() {
+        match graph_once() {
+            Some(graph) => retry_pending_removals(&mut ec_state.ec_context, &graph),
+            None => {
+                log::warn!("capture removal retry skipped: identity graph unavailable");
+                lose_pending_removals(&mut ec_state.ec_context);
+            }
+        }
+    }
 
     let outcome = flush_after_send(
         runtime,
@@ -3823,6 +3835,165 @@ mod tests {
                 stored_uid(&refused_always.row(), "ssp.example.com").as_deref(),
                 Some("probe-uid"),
                 "should leave the row as it was"
+            );
+        }
+
+        /// A scenario whose Didomi proxy answers `body`, with a capture-only
+        /// provider listening on that proxy's path and a row holding a
+        /// browser-written `ssp.example.com` ID for it to invalidate.
+        fn capture_scenario(body: &str) -> Scenario {
+            let Scenario {
+                state,
+                store,
+                network,
+            } = Scenario::with_settings(DIDOMI_TOML);
+            let provider =
+                trusted_server_core::ec::identity::test_support::answering_capture_provider(
+                    "didomi",
+                    &["ssp.example.com"],
+                    None,
+                );
+            let runtime = IdentityRuntime::from_settings_with_providers(
+                &state.settings,
+                vec![provider],
+                BTreeMap::new(),
+            )
+            .expect("should build the identity runtime");
+            let scenario = Scenario {
+                state: crate::app::app_state_with_identity_for_test(state, runtime),
+                store,
+                network,
+            };
+            scenario
+                .network
+                .respond("sdk.example.com", 200, "application/json", body);
+            let mut entry = live_entry();
+            entry.ids.insert(
+                "ssp.example.com".to_owned(),
+                KvPartnerId {
+                    rv: Some("0123456789abcdef".to_owned()),
+                    at: Some(1_000),
+                    ..KvPartnerId::new("probe-uid")
+                },
+            );
+            scenario.seed(&entry);
+            scenario
+        }
+
+        const CAPTURE_INVALIDATION: &str = r#"{"invalidate":["ssp.example.com"]}"#;
+
+        #[test]
+        fn capture_removal_is_a_separate_write_beside_the_one_flush() {
+            let control = capture_scenario(r#"{}"#);
+            control.drive(didomi_navigation(Some(&returning_with_shared_id())));
+            assert_writes(
+                &control.store,
+                (0, 1, 0),
+                "control: a proxied navigation with nothing to capture flushes once",
+            );
+
+            let scenario = capture_scenario(CAPTURE_INVALIDATION);
+
+            let (response, outcome) =
+                scenario.drive(didomi_navigation(Some(&returning_with_shared_id())));
+
+            assert_eq!(response.status(), 200, "should serve the proxied answer");
+            assert_eq!(
+                outcome,
+                Some(FlushOutcome::Written),
+                "should still flush the writer's ingest"
+            );
+            assert_writes(
+                &scenario.store,
+                (0, 2, 0),
+                "the capture removal write, then the writer's one flush",
+            );
+            let row = scenario.row();
+            assert_eq!(
+                stored_uid(&row, "ssp.example.com"),
+                None,
+                "should have removed the captured invalidation"
+            );
+            assert_eq!(
+                stored_uid(&row, "sharedid.org").as_deref(),
+                Some(SHARED_ID),
+                "should keep the writer's own ingest in its flush"
+            );
+        }
+
+        #[test]
+        fn failed_capture_removal_write_runs_once_more_after_send() {
+            let scenario = capture_scenario(CAPTURE_INVALIDATION);
+            scenario.store.refuse_conditional_writes(EC_ID, 5);
+
+            let (outcome, measurement) = drive_measured_for_test(
+                &scenario.state,
+                didomi_navigation(Some(&returning_with_shared_id())),
+            );
+
+            assert_eq!(
+                outcome,
+                Some(FlushOutcome::Written),
+                "should flush the ingest too"
+            );
+            assert_writes(
+                &scenario.store,
+                (0, 7, 0),
+                "five refused attempts before send, the retry after send, the flush",
+            );
+            assert_eq!(
+                stored_uid(&scenario.row(), "ssp.example.com"),
+                None,
+                "should have written the removal after send"
+            );
+            assert_eq!(measurement.removal_lost(), 0, "should lose no removal");
+        }
+
+        #[test]
+        fn capture_removal_lost_after_both_attempts_is_counted() {
+            let scenario = capture_scenario(CAPTURE_INVALIDATION);
+            scenario.store.refuse_conditional_writes(EC_ID, 10);
+
+            let (_, measurement) = drive_measured_for_test(
+                &scenario.state,
+                didomi_navigation(Some(&returning_with_shared_id())),
+            );
+
+            assert_eq!(
+                measurement.removal_lost(),
+                1,
+                "should count the removal lost after both attempts"
+            );
+            assert!(
+                measurement.to_string().contains("removal_lost=1"),
+                "should print the count on the measurement line"
+            );
+        }
+
+        #[test]
+        fn capture_positive_ids_are_counted_on_the_measurement_line_and_not_stored() {
+            let scenario = capture_scenario(
+                r#"{"tokens":[{"source":"ssp.example.com","value":"captured-secret-uid"}]}"#,
+            );
+
+            let (_, measurement) = drive_measured_for_test(
+                &scenario.state,
+                didomi_navigation(Some(&returning_with_shared_id())),
+            );
+
+            let line = measurement.to_string();
+            assert!(
+                line.contains("capture_unpersisted=didomi/ssp.example.com:1"),
+                "should count the positive ID: {line}"
+            );
+            assert!(
+                !line.contains("captured-secret-uid"),
+                "should print no value: {line}"
+            );
+            assert_eq!(
+                stored_uid(&scenario.row(), "ssp.example.com").as_deref(),
+                Some("probe-uid"),
+                "should not store the captured ID"
             );
         }
 
