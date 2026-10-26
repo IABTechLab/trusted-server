@@ -261,6 +261,8 @@ fn warn_if_certificate_check_disabled(settings: &Settings) {
 /// continues to rely on the trusted `fastly-ssl` header injected by
 /// `edgezero_main` after sanitization.
 fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
+    // No cooperative timer is installed: Fastly host calls block. EOF consumers
+    // must bound their own transport calls using the remaining finish budget.
     let client_info = ctx
         .request()
         .extensions()
@@ -702,6 +704,7 @@ async fn run_named_route(
                 Some(&partner_registry)
             };
             let auction = AuctionDispatch {
+                integration_registry: &state.registry,
                 orchestrator: &state.orchestrator,
                 slots: state.settings.creative_opportunity_slots(),
                 registry: registry_ref,
@@ -866,6 +869,7 @@ async fn dispatch_fallback(
         match PartnerRegistry::from_config(&state.settings.ec.partners) {
             Ok(partner_registry) => {
                 let auction = AuctionDispatch {
+                    integration_registry: &state.registry,
                     orchestrator: &state.orchestrator,
                     slots,
                     registry: Some(&partner_registry),
@@ -3010,6 +3014,7 @@ mod tests {
                         None,
                         &mut ec_context,
                         AuctionDispatch {
+                            integration_registry: &registry,
                             orchestrator: &orchestrator,
                             slots: settings.creative_opportunity_slots(),
                             registry: None,
