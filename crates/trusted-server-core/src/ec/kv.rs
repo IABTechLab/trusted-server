@@ -144,7 +144,7 @@ fn apply_cookie_partner_id_updates(
     let mut deferred = false;
     for (partner_id, uid) in latest_updates {
         match entry.ids.get(partner_id) {
-            Some(existing) if existing.uid == uid => continue,
+            Some(existing) if existing.first_uid() == Some(uid) => continue,
             // Browser EID cookies carry no value-owned sequence or timestamp.
             // A different value therefore has unknown freshness and must not
             // replace the stored value.
@@ -157,9 +157,7 @@ fn apply_cookie_partner_id_updates(
 
         entry.ids.insert(
             partner_id.to_owned(),
-            super::kv_types::KvPartnerId {
-                uid: uid.to_owned(),
-            },
+            super::kv_types::KvPartnerId::new(uid),
         );
         changed = true;
     }
@@ -183,7 +181,7 @@ fn partner_id_updates_match(entry: &KvEntry, updates: &[PartnerIdUpdate]) -> boo
         entry
             .ids
             .get(partner_id)
-            .is_some_and(|existing| existing.uid == uid)
+            .is_some_and(|existing| existing.first_uid() == Some(uid))
     })
 }
 
@@ -198,16 +196,14 @@ pub(crate) fn apply_partner_id_updates(entry: &mut KvEntry, updates: &[PartnerId
         if entry
             .ids
             .get(partner_id)
-            .is_some_and(|existing| existing.uid == uid)
+            .is_some_and(|existing| existing.first_uid() == Some(uid))
         {
             continue;
         }
 
         entry.ids.insert(
             partner_id.to_owned(),
-            super::kv_types::KvPartnerId {
-                uid: uid.to_owned(),
-            },
+            super::kv_types::KvPartnerId::new(uid),
         );
         changed = true;
     }
@@ -357,11 +353,27 @@ impl KvIdentityGraph {
         ec_id: &str,
         body_bytes: &[u8],
     ) -> Result<KvEntry, Report<TrustedServerError>> {
-        let entry: KvEntry =
+        let mut entry: KvEntry =
             serde_json::from_slice(body_bytes).change_context(TrustedServerError::KvStore {
                 store_name: store_name.to_owned(),
                 message: format!("Failed to deserialize entry for key '{}'", log_id(ec_id)),
             })?;
+
+        let dropped = entry.upgrade_for_read().map_err(|message| {
+            Report::new(TrustedServerError::KvStore {
+                store_name: store_name.to_owned(),
+                message: format!(
+                    "Loaded invalid entry for key '{}': {message}",
+                    log_id(ec_id)
+                ),
+            })
+        })?;
+        for message in dropped {
+            log::warn!(
+                "Dropping an invalid record on read for key '{}': {message}",
+                log_id(ec_id)
+            );
+        }
 
         entry.validate().map_err(|message| {
             Report::new(TrustedServerError::KvStore {
@@ -913,16 +925,14 @@ impl KvIdentityGraph {
             if entry
                 .ids
                 .get(partner_id)
-                .is_some_and(|existing| existing.uid == uid)
+                .is_some_and(|existing| existing.first_uid() == Some(uid))
             {
                 return Ok(());
             }
 
             entry.ids.insert(
                 partner_id.to_owned(),
-                super::kv_types::KvPartnerId {
-                    uid: uid.to_owned(),
-                },
+                super::kv_types::KvPartnerId::new(uid),
             );
 
             let (body, meta_str) = Self::serialize_entry(&entry, self.store_name())?;
@@ -985,16 +995,14 @@ impl KvIdentityGraph {
             if entry
                 .ids
                 .get(partner_id)
-                .is_some_and(|existing| existing.uid == uid)
+                .is_some_and(|existing| existing.first_uid() == Some(uid))
             {
                 return Ok(UpsertResult::Unchanged);
             }
 
             entry.ids.insert(
                 partner_id.to_owned(),
-                super::kv_types::KvPartnerId {
-                    uid: uid.to_owned(),
-                },
+                super::kv_types::KvPartnerId::new(uid),
             );
 
             let (body, meta_str) = Self::serialize_entry(&entry, self.store_name())?;
@@ -1733,22 +1741,74 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_entry_rejects_invalid_legacy_values() {
+    fn deserialize_entry_drops_an_invalid_record() {
         let mut entry = KvEntry::tombstone(1000);
         entry.ids.insert(
             "ssp_x".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "x".repeat(crate::ec::kv_types::MAX_UID_LENGTH + 1),
-            },
+            crate::ec::kv_types::KvPartnerId::new(
+                "x".repeat(crate::ec::kv_types::MAX_UID_LENGTH + 1),
+            ),
+        );
+        entry.ids.insert(
+            "ssp_y".to_owned(),
+            crate::ec::kv_types::KvPartnerId::new("valid-uid"),
         );
         let body = serde_json::to_vec(&entry).expect("should serialize invalid entry payload");
 
-        let err = KvIdentityGraph::deserialize_entry("test-store", "ec-id", &body)
-            .expect_err("should reject invalid legacy entry values");
-        let err_text = format!("{err}");
+        let read = KvIdentityGraph::deserialize_entry("test-store", "ec-id", &body)
+            .expect("should read a row whose one record is invalid");
+
         assert!(
-            err_text.contains("Loaded invalid entry"),
-            "should report validation failure for loaded entries"
+            !read.ids.contains_key("ssp_x"),
+            "should drop the invalid record"
+        );
+        assert_eq!(
+            read.ids["ssp_y"].first_uid(),
+            Some("valid-uid"),
+            "should keep the valid record"
+        );
+
+        let malformed = serde_json::json!({
+            "v": 2,
+            "created": 1000,
+            "consent": { "ok": "yes", "updated": 1000 },
+            "geo": { "country": "US" }
+        });
+        let err = KvIdentityGraph::deserialize_entry(
+            "test-store",
+            "ec-id",
+            &serde_json::to_vec(&malformed).expect("should serialize"),
+        )
+        .expect_err("should still fail a row-level fault as a whole");
+        assert!(
+            format!("{err}").contains("Failed to deserialize entry"),
+            "should report the row-level fault"
+        );
+    }
+
+    #[test]
+    fn deserialize_entry_reads_a_version_1_body() {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "v": 1,
+            "created": 1_760_000_000,
+            "consent": { "ok": true, "updated": 1_760_000_000 },
+            "geo": { "country": "US" },
+            "ids": { "id5-sync.com": { "uid": "ID5*example" } }
+        }))
+        .expect("should serialize a row from main");
+
+        let entry = KvIdentityGraph::deserialize_entry("test-store", "ec-id", &body)
+            .expect("should read a version 1 row");
+
+        assert_eq!(
+            entry.v,
+            crate::ec::kv_types::SCHEMA_VERSION,
+            "should upgrade the version"
+        );
+        assert_eq!(
+            entry.ids["id5-sync.com"],
+            crate::ec::kv_types::KvPartnerId::new("ID5*example"),
+            "should read the uid as one entry"
         );
     }
 
@@ -1772,9 +1832,9 @@ mod tests {
         let mut entry = KvEntry::tombstone(1000);
         entry.ids.insert(
             "ssp_x".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "x".repeat(crate::ec::kv_types::MAX_UID_LENGTH + 1),
-            },
+            crate::ec::kv_types::KvPartnerId::new(
+                "x".repeat(crate::ec::kv_types::MAX_UID_LENGTH + 1),
+            ),
         );
 
         let err = KvIdentityGraph::serialize_entry(&entry, "test-store")
@@ -1796,9 +1856,7 @@ mod tests {
         let mut entry = live_entry();
         entry.ids.insert(
             "concurrent.example.com".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "concurrent-uid".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::new("concurrent-uid"),
         );
         entry
     }
@@ -2131,16 +2189,14 @@ mod tests {
         let mut entry = live_entry();
         entry.ids.insert(
             "ssp_x".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "uid-1".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::new("uid-1"),
         );
         let updates = vec![PartnerIdUpdate::new("ssp_x", "uid-1")];
 
         let changed = apply_partner_id_updates(&mut entry, &updates);
 
         assert!(!changed, "should not change when UID already matches");
-        assert_eq!(entry.ids["ssp_x"].uid, "uid-1");
+        assert_eq!(entry.ids["ssp_x"].first_uid(), Some("uid-1"));
     }
 
     #[test]
@@ -2151,7 +2207,7 @@ mod tests {
         let changed = apply_partner_id_updates(&mut entry, &updates);
 
         assert!(changed, "should report changed entry");
-        assert_eq!(entry.ids["ssp_x"].uid, "uid-1");
+        assert_eq!(entry.ids["ssp_x"].first_uid(), Some("uid-1"));
     }
 
     #[test]
@@ -2159,16 +2215,14 @@ mod tests {
         let mut entry = live_entry();
         entry.ids.insert(
             "ssp_x".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "old-uid".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::new("old-uid"),
         );
         let updates = vec![PartnerIdUpdate::new("ssp_x", "new-uid")];
 
         let changed = apply_partner_id_updates(&mut entry, &updates);
 
         assert!(changed, "should report changed entry");
-        assert_eq!(entry.ids["ssp_x"].uid, "new-uid");
+        assert_eq!(entry.ids["ssp_x"].first_uid(), Some("new-uid"));
     }
 
     #[test]
@@ -2182,8 +2236,8 @@ mod tests {
         let changed = apply_partner_id_updates(&mut entry, &updates);
 
         assert!(changed, "should report changed entry");
-        assert_eq!(entry.ids["ssp_x"].uid, "uid-x");
-        assert_eq!(entry.ids["ssp_y"].uid, "uid-y");
+        assert_eq!(entry.ids["ssp_x"].first_uid(), Some("uid-x"));
+        assert_eq!(entry.ids["ssp_y"].first_uid(), Some("uid-y"));
     }
 
     #[test]
@@ -2191,9 +2245,7 @@ mod tests {
         let mut entry = live_entry();
         entry.ids.insert(
             "ssp_x".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "original".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::new("original"),
         );
         let updates = vec![
             PartnerIdUpdate::new("ssp_x", "intermediate"),
@@ -2206,7 +2258,7 @@ mod tests {
             !changed,
             "should not write when the final duplicate value matches existing state"
         );
-        assert_eq!(entry.ids["ssp_x"].uid, "original");
+        assert_eq!(entry.ids["ssp_x"].first_uid(), Some("original"));
     }
 
     #[test]
@@ -2215,9 +2267,7 @@ mod tests {
         let mut concurrent = live_entry();
         concurrent.ids.insert(
             "ssp_x".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "desired-uid".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::new("desired-uid"),
         );
         let lookups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2241,7 +2291,7 @@ mod tests {
             snapshot
                 .entry_for(&ec_id)
                 .and_then(|entry| entry.ids.get("ssp_x"))
-                .map(|id| id.uid.as_str()),
+                .and_then(|id| id.first_uid()),
             Some("desired-uid"),
             "the authoritative follow-up snapshot should replace stale request state"
         );
@@ -2333,9 +2383,7 @@ mod tests {
         let mut entry = live_entry();
         entry.ids.insert(
             "ssp_x".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "latest-uid".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::new("latest-uid"),
         );
         let updates = [
             PartnerIdUpdate::new("ssp_x", "older-uid"),
@@ -2354,9 +2402,7 @@ mod tests {
         let mut concurrent = live_entry();
         concurrent.ids.insert(
             "ssp_x".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "concurrent-uid".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::new("concurrent-uid"),
         );
         let lookups = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -2390,7 +2436,7 @@ mod tests {
             .get(&ec_id)
             .expect("should read concurrent row")
             .expect("row should remain");
-        assert_eq!(stored.ids["ssp_x"].uid, "concurrent-uid");
+        assert_eq!(stored.ids["ssp_x"].first_uid(), Some("concurrent-uid"));
     }
 
     #[test]
@@ -2439,9 +2485,7 @@ mod tests {
         let mut entry = live_entry();
         entry.ids.insert(
             "ssp_x".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "protected-uid".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::new("protected-uid"),
         );
         graph.create(&ec_id, &entry).expect("should seed entry");
 
@@ -2456,7 +2500,7 @@ mod tests {
             .get(&ec_id)
             .expect("should read protected row")
             .expect("row should remain");
-        assert_eq!(stored.ids["ssp_x"].uid, "protected-uid");
+        assert_eq!(stored.ids["ssp_x"].first_uid(), Some("protected-uid"));
     }
 
     #[test]
@@ -2466,9 +2510,7 @@ mod tests {
         let mut entry = live_entry();
         entry.ids.insert(
             "ssp_x".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "protected-uid".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::new("protected-uid"),
         );
         graph.create(&ec_id, &entry).expect("should seed entry");
 
@@ -2486,8 +2528,8 @@ mod tests {
             .get(&ec_id)
             .expect("should read updated row")
             .expect("row should remain");
-        assert_eq!(stored.ids["ssp_x"].uid, "protected-uid");
-        assert_eq!(stored.ids["ssp_y"].uid, "new-uid");
+        assert_eq!(stored.ids["ssp_x"].first_uid(), Some("protected-uid"));
+        assert_eq!(stored.ids["ssp_y"].first_uid(), Some("new-uid"));
     }
 
     #[test]
@@ -3139,7 +3181,7 @@ mod tests {
             .expect("should read persisted entry")
             .expect("should retain entry after conflict");
         assert_eq!(
-            entry.ids.get("ssp_x").map(|id| id.uid.as_str()),
+            entry.ids.get("ssp_x").and_then(|id| id.first_uid()),
             Some("uid-1"),
             "should persist requested UID after retry"
         );
@@ -3176,7 +3218,7 @@ mod tests {
             .entry_for(&ec_id)
             .expect("should retain persisted entry");
         assert_eq!(
-            entry.ids.get("ssp_x").map(|id| id.uid.as_str()),
+            entry.ids.get("ssp_x").and_then(|id| id.first_uid()),
             Some("uid-1")
         );
         assert_eq!(
@@ -3607,7 +3649,7 @@ mod tests {
             outcome
                 .entry_for(&ec_id)
                 .and_then(|entry| entry.ids.get("ssp_x"))
-                .map(|id| id.uid.as_str()),
+                .and_then(|id| id.first_uid()),
             Some("uid-1")
         );
         assert_eq!(
@@ -3695,7 +3737,7 @@ mod tests {
             outcome
                 .entry_for(&ec_id)
                 .and_then(|entry| entry.ids.get("ssp_x"))
-                .map(|id| id.uid.as_str()),
+                .and_then(|id| id.first_uid()),
             Some("uid-1"),
             "the fifth CAS attempt must still succeed after a refresh and four conflicts"
         );
@@ -3715,7 +3757,7 @@ mod tests {
             .entry_for(&ec_id)
             .expect("should persist re-merged entry");
         assert_eq!(
-            entry.ids.get("ssp_x").map(|id| id.uid.as_str()),
+            entry.ids.get("ssp_x").and_then(|id| id.first_uid()),
             Some("uid-1"),
             "conflict must re-merge our update onto the concurrently revived row"
         );
@@ -3742,9 +3784,10 @@ mod tests {
         );
 
         assert_eq!(
-            outcome
-                .entry_for(&ec_id)
-                .and_then(|entry| entry.ids.get("ssp_x").map(|id| id.uid.clone())),
+            outcome.entry_for(&ec_id).and_then(|entry| entry
+                .ids
+                .get("ssp_x")
+                .and_then(|id| id.first_uid().map(str::to_owned))),
             Some("uid-1".to_owned()),
             "a stale miss must be revalidated before the updates are dropped"
         );
@@ -3753,7 +3796,7 @@ mod tests {
             .expect("should read store")
             .expect("row should remain");
         assert_eq!(
-            stored.ids.get("ssp_x").map(|id| id.uid.as_str()),
+            stored.ids.get("ssp_x").and_then(|id| id.first_uid()),
             Some("uid-1"),
             "the revalidated update must reach the store"
         );

@@ -652,9 +652,7 @@ mod tests {
         if let EcKvSnapshot::Present { entry, .. } = &mut snapshot {
             entry.ids.insert(
                 "ssp.example.com".to_owned(),
-                crate::ec::kv_types::KvPartnerId {
-                    uid: "uid".to_owned(),
-                },
+                crate::ec::kv_types::KvPartnerId::new("uid"),
             );
         }
         ec_context.set_kv_snapshot(snapshot);
@@ -702,9 +700,7 @@ mod tests {
 
         entry.ids.insert(
             "b.example.com".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "uid-b".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::new("uid-b"),
         );
 
         assert!(
@@ -982,12 +978,18 @@ mod tests {
             .expect("should read store")
             .expect("entry should exist");
         assert_eq!(
-            entry.ids.get("alpha.example.com").map(|id| id.uid.as_str()),
+            entry
+                .ids
+                .get("alpha.example.com")
+                .and_then(|id| id.first_uid()),
             Some("synced-uid"),
             "first partner UID should persist"
         );
         assert_eq!(
-            entry.ids.get("beta.example.com").map(|id| id.uid.as_str()),
+            entry
+                .ids
+                .get("beta.example.com")
+                .and_then(|id| id.first_uid()),
             Some("synced-uid"),
             "second partner UID should persist"
         );
@@ -1045,7 +1047,7 @@ mod tests {
             entry
                 .ids
                 .get("alpha.example.com")
-                .map(|partner_id| partner_id.uid.as_str()),
+                .and_then(|partner_id| partner_id.first_uid()),
             Some("existing-alpha"),
             "existing UID should remain unchanged"
         );
@@ -1053,7 +1055,7 @@ mod tests {
             entry
                 .ids
                 .get("beta.example.com")
-                .map(|partner_id| partner_id.uid.as_str()),
+                .and_then(|partner_id| partner_id.first_uid()),
             Some("new-beta"),
             "missing UID should persist"
         );
@@ -1213,9 +1215,7 @@ mod tests {
         entry.consent.ok = true;
         entry.ids.insert(
             "alpha.example.com".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "already-known".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::new("already-known"),
         );
         graph
             .create(&ec_id, &entry)

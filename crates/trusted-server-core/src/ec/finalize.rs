@@ -1295,7 +1295,7 @@ mod tests {
                 .expect("should read store")
                 .expect("row should remain");
             assert_eq!(
-                stored.ids.get("sharedid.org").map(|id| id.uid.as_str()),
+                stored.ids.get("sharedid.org").and_then(|id| id.first_uid()),
                 Some(cookie_id),
                 "{source} should persist the returning-user EID cookie"
             );
@@ -1347,7 +1347,7 @@ mod tests {
             stored
                 .ids
                 .iter()
-                .map(|(source, id)| (source.as_str(), id.uid.as_str()))
+                .map(|(source, id)| (source.as_str(), id.first_uid().unwrap_or_default()))
                 .collect::<Vec<_>>(),
             vec![("ids.example.com", "cookie-uid")],
             "a new EC with no sync source should ingest the cookie"
@@ -1390,7 +1390,7 @@ mod tests {
             .expect("should read store")
             .expect("row should remain");
         assert_eq!(
-            stored.ids.get("sharedid.org").map(|id| id.uid.as_str()),
+            stored.ids.get("sharedid.org").and_then(|id| id.first_uid()),
             Some("generated-cookie-id")
         );
     }
@@ -1536,7 +1536,7 @@ mod tests {
             .expect("should read store")
             .expect("row should remain");
         assert_eq!(
-            stored.ids.get("sharedid.org").map(|id| id.uid.as_str()),
+            stored.ids.get("sharedid.org").and_then(|id| id.first_uid()),
             Some("shared-cookie-id"),
             "a stale endpoint miss must not suppress EID persistence"
         );
@@ -1614,12 +1614,12 @@ mod tests {
             .expect("should read store")
             .expect("row should exist after ingestion");
         assert_eq!(
-            stored.ids.get("id5-sync.com").map(|id| id.uid.as_str()),
+            stored.ids.get("id5-sync.com").and_then(|id| id.first_uid()),
             Some("ID5_from_body"),
             "the request body's EID should win over the cookie's stale value"
         );
         assert_eq!(
-            stored.ids.get("liveramp.com").map(|id| id.uid.as_str()),
+            stored.ids.get("liveramp.com").and_then(|id| id.first_uid()),
             Some("LR_from_body"),
             "a partner the cookie trimmed must still be ingested from the body"
         );
@@ -2376,9 +2376,7 @@ mod tests {
         let mut entry = live_entry();
         entry.ids.insert(
             "ssp.example.com".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "partner-uid".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::new("partner-uid"),
         );
         ec_context.set_kv_snapshot(EcKvSnapshot::Present {
             ec_id,

@@ -37,9 +37,9 @@ pub fn resolve_partner_ids(registry: &PartnerRegistry, entry: &KvEntry) -> Vec<R
     let mut resolved = Vec::new();
 
     for (source_domain, partner_uid) in &entry.ids {
-        if partner_uid.uid.is_empty() {
+        let Some(uid) = partner_uid.first_uid().filter(|uid| !uid.is_empty()) else {
             continue;
-        }
+        };
 
         let Some(partner) = registry.get(source_domain) else {
             continue;
@@ -50,7 +50,7 @@ pub fn resolve_partner_ids(registry: &PartnerRegistry, entry: &KvEntry) -> Vec<R
 
         resolved.push(ResolvedPartnerId {
             source_domain: partner.source_domain.clone(),
-            uid: partner_uid.uid.clone(),
+            uid: uid.to_owned(),
             openrtb_atype: partner.openrtb_atype,
         });
     }
@@ -181,15 +181,11 @@ mod tests {
         entry.consent.ok = true;
         entry.ids.insert(
             "zeta.example.com".to_owned(),
-            super::super::kv_types::KvPartnerId {
-                uid: "uid-z".to_owned(),
-            },
+            super::super::kv_types::KvPartnerId::new("uid-z"),
         );
         entry.ids.insert(
             "alpha.example.com".to_owned(),
-            super::super::kv_types::KvPartnerId {
-                uid: "uid-a".to_owned(),
-            },
+            super::super::kv_types::KvPartnerId::new("uid-a"),
         );
 
         let resolved = resolve_partner_ids(&registry, &entry);

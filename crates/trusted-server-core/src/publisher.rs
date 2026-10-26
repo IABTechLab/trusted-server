@@ -7979,12 +7979,9 @@ mod tests {
         ])
         .expect("should build partner registry");
         let mut entry = KvEntry::minimal("ids.example.com", "kv-stale", 1000);
-        entry.ids.insert(
-            "other.example.com".to_owned(),
-            KvPartnerId {
-                uid: "kv-other".to_owned(),
-            },
-        );
+        entry
+            .ids
+            .insert("other.example.com".to_owned(), KvPartnerId::new("kv-other"));
         let snapshot = EcKvSnapshot::Present {
             ec_id: ec_id.clone(),
             entry: Box::new(entry),

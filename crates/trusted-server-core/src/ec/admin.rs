@@ -368,6 +368,19 @@ fn requested_ec_id(req: &Request<EdgeBody>) -> Result<String, Box<Response<EdgeB
     Ok(ec_id)
 }
 
+/// Replaces every `ps.<provider>.st` with a marker. Provider state is never
+/// returned by the admin lookup (spec 6.1, 9.3).
+fn redact_provider_state(entry: &mut JsonValue) {
+    let Some(states) = entry.get_mut("ps").and_then(JsonValue::as_object_mut) else {
+        return;
+    };
+    for state in states.values_mut() {
+        if let Some(st) = state.get_mut("st") {
+            *st = JsonValue::String("[redacted]".to_owned());
+        }
+    }
+}
+
 /// Builds the success payload from a raw KV lookup.
 ///
 /// Parse failures are reported in the payload rather than propagated, so
@@ -393,14 +406,26 @@ fn build_lookup_response(
 
     match serde_json::from_slice::<JsonValue>(&lookup.body) {
         Ok(mut entry_json) => {
+            redact_provider_state(&mut entry_json);
             add_iso_timestamp_companions(&mut entry_json);
             payload.entry = Some(entry_json);
 
             match serde_json::from_slice::<KvEntry>(&lookup.body) {
-                Ok(entry) => {
+                Ok(mut entry) => {
                     payload.tombstone = Some(!entry.consent.ok);
-                    match entry.validate() {
-                        Ok(()) => payload.auction = Some(build_auction_view(registry, &entry)),
+                    // Upgrade first so the auction view matches what the read
+                    // path serves, with invalid records dropped.
+                    let upgraded = entry
+                        .upgrade_for_read()
+                        .and_then(|dropped| entry.validate().map(|()| dropped));
+                    match upgraded {
+                        Ok(dropped) => {
+                            payload.auction = Some(build_auction_view(registry, &entry));
+                            if !dropped.is_empty() {
+                                payload.entry_error =
+                                    Some(format!("dropped on read: {}", dropped.join("; ")));
+                            }
+                        }
                         Err(message) => {
                             payload.entry_error = Some(format!(
                                 "entry failed validation (auction reads fail closed \
@@ -487,7 +512,7 @@ fn build_auction_view(registry: &PartnerRegistry, entry: &KvEntry) -> AuctionEid
 
     let mut skipped = Vec::new();
     for (source_domain, partner_uid) in &entry.ids {
-        let reason = if partner_uid.uid.is_empty() {
+        let reason = if partner_uid.first_uid().is_none_or(str::is_empty) {
             "empty_uid"
         } else {
             match registry.get(source_domain) {
@@ -684,7 +709,7 @@ mod tests {
     use super::*;
     use crate::ec::kv_backend::test_support::InMemoryEcKv;
     use crate::ec::kv_backend::{EcKvStore as _, EcKvWrite, EcKvWriteMode};
-    use crate::ec::kv_types::KvPartnerId;
+    use crate::ec::kv_types::{KvPartnerId, KvProviderState};
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
 
@@ -778,15 +803,11 @@ mod tests {
         let mut entry = KvEntry::minimal("bidstream.example", "uid-live", 1_741_824_000);
         entry.ids.insert(
             "disabled.example".to_owned(),
-            KvPartnerId {
-                uid: "uid-disabled".to_owned(),
-            },
+            KvPartnerId::new("uid-disabled"),
         );
         entry.ids.insert(
             "unknown.example".to_owned(),
-            KvPartnerId {
-                uid: "uid-unknown".to_owned(),
-            },
+            KvPartnerId::new("uid-unknown"),
         );
         entry
     }
@@ -971,6 +992,83 @@ mod tests {
         }
     }
 
+    fn admin_lookup_body_for_test(entry: &KvEntry) -> serde_json::Value {
+        let ec_id = test_ec_id();
+        let kv = kv_with_entry(&ec_id, entry);
+        let req = get_request(&format!("/_ts/admin/ec/{ec_id}"));
+
+        let response = handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+            .expect("should handle lookup");
+        response_json(response)
+    }
+
+    #[test]
+    fn admin_lookup_redacts_provider_state() {
+        let mut entry = KvEntry::minimal("example.com", "example-uid", 1_760_000_000);
+        entry.ps.insert(
+            "id5".to_owned(),
+            KvProviderState {
+                n: Some(5),
+                st: Some(serde_json::json!({ "signature": "secret-state" })),
+                ..KvProviderState::default()
+            },
+        );
+        let body = admin_lookup_body_for_test(&entry);
+
+        assert_eq!(
+            body["entry"]["ps"]["id5"]["st"],
+            serde_json::json!("[redacted]"),
+            "should redact the state"
+        );
+        assert_eq!(
+            body["entry"]["ps"]["id5"]["n"],
+            serde_json::json!(5),
+            "should keep the rest of ps"
+        );
+        assert_eq!(
+            body["entry"]["ids"]["example.com"]["eids"][0]["uids"][0]["id"],
+            serde_json::json!("example-uid"),
+            "should keep the ids"
+        );
+        assert!(
+            !body.to_string().contains("secret-state"),
+            "should never return the provider state"
+        );
+    }
+
+    #[test]
+    fn admin_lookup_reports_records_dropped_on_read() {
+        let ec_id = test_ec_id();
+        let body = serde_json::json!({
+            "v": 2,
+            "created": 1_741_824_000_u64,
+            "consent": { "ok": true, "updated": 1_741_824_000_u64 },
+            "geo": { "country": "US" },
+            "ids": {
+                "bidstream.example": { "eids": [{ "uids": [{ "id": "uid-live" }] }] },
+                "blank.example": { "eids": [{ "uids": [{ "id": " " }] }] }
+            }
+        })
+        .to_string();
+        let kv = kv_with_raw_body(&ec_id, &body);
+        let req = get_request(&format!("/_ts/admin/ec/{ec_id}"));
+
+        let json = response_json(
+            handle_admin_ec_lookup(Some(&kv), &test_registry(), &req)
+                .expect("should handle lookup"),
+        );
+
+        let error = json["entry_error"].as_str().expect("should report a drop");
+        assert!(
+            error.starts_with("dropped on read: ") && error.contains("blank.example"),
+            "should name the dropped source, got {error}"
+        );
+        assert_eq!(
+            json["auction"]["eids"][0]["source"], "bidstream.example",
+            "should build the auction view from the surviving record"
+        );
+    }
+
     #[test]
     fn returns_entry_with_auction_view() {
         let ec_id = test_ec_id();
@@ -995,7 +1093,7 @@ mod tests {
         assert_eq!(json["store"], "test-store");
         assert_eq!(json["tombstone"], false);
         assert_eq!(
-            json["entry"]["ids"]["bidstream.example"]["uid"], "uid-live",
+            json["entry"]["ids"]["bidstream.example"]["eids"][0]["uids"][0]["id"], "uid-live",
             "should echo the stored entry verbatim"
         );
         assert_eq!(

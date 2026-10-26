@@ -375,9 +375,7 @@ mod tests {
         for domain in domains {
             entry.ids.insert(
                 (*domain).to_owned(),
-                crate::ec::kv_types::KvPartnerId {
-                    uid: format!("uid-{domain}"),
-                },
+                crate::ec::kv_types::KvPartnerId::new(format!("uid-{domain}")),
             );
         }
         EcKvSnapshot::Present {
@@ -510,9 +508,7 @@ mod tests {
         let mut tombstone = KvEntry::tombstone(1_000);
         tombstone.ids.insert(
             "a.example.com".to_owned(),
-            crate::ec::kv_types::KvPartnerId {
-                uid: "stale".to_owned(),
-            },
+            crate::ec::kv_types::KvPartnerId::new("stale"),
         );
         let snapshots = [
             live_snapshot(EC_ID, &[]),

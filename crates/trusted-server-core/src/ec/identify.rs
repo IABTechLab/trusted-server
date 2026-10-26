@@ -17,6 +17,7 @@ use crate::settings::Settings;
 
 use super::EcContext;
 use super::kv::KvIdentityGraph;
+use super::kv_types::KvPartnerId;
 use super::log_id;
 use super::registry::PartnerRegistry;
 
@@ -96,10 +97,13 @@ pub fn handle_identify(
                 log::trace!("Identify found tombstone for '{}'", log_id(ec_id));
             } else {
                 // Extract only this partner's UID.
-                if let Some(partner_uid) = entry.ids.get(&partner.source_domain)
-                    && !partner_uid.uid.is_empty()
+                if let Some(partner_uid) = entry
+                    .ids
+                    .get(&partner.source_domain)
+                    .and_then(KvPartnerId::first_uid)
+                    .filter(|partner_uid| !partner_uid.is_empty())
                 {
-                    uid = Some(partner_uid.uid.clone());
+                    uid = Some(partner_uid.to_owned());
                 }
 
                 // Evaluate cluster size lazily for identify responses. Existing

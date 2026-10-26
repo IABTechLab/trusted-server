@@ -711,7 +711,7 @@ mod tests {
             .expect("should read store")
             .expect("row should exist");
         assert_eq!(
-            stored.ids.get("sharedid.org").map(|id| id.uid.as_str()),
+            stored.ids.get("sharedid.org").and_then(|id| id.first_uid()),
             Some("shared-cookie-id"),
             "the sharedId update must still be ingested from the shared snapshot"
         );
@@ -752,7 +752,12 @@ mod tests {
         stored
             .ids
             .iter()
-            .map(|(source, id)| (source.clone(), id.uid.clone()))
+            .map(|(source, id)| {
+                (
+                    source.clone(),
+                    id.first_uid().unwrap_or_default().to_owned(),
+                )
+            })
             .collect()
     }
 
@@ -981,7 +986,7 @@ mod tests {
             .expect("should read store")
             .expect("row should exist");
         assert_eq!(
-            stored.ids.get("id5-sync.com").map(|id| id.uid.as_str()),
+            stored.ids.get("id5-sync.com").and_then(|id| id.first_uid()),
             Some("ID5_from_body"),
             "the body's EID must be ingested into KV without a ts-eids cookie"
         );
