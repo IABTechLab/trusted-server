@@ -3,9 +3,250 @@ import { createHash, randomUUID } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { createServer } from 'node:net'
 import { once } from 'node:events'
-import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
+import {
+  readFileSync,
+  readdirSync,
+  statSync,
+  writeFileSync,
+  openSync,
+  closeSync,
+  fsyncSync,
+  realpathSync,
+  mkdirSync,
+} from 'node:fs'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
+
+/** Fetches only fixed read-only current-run metadata, retaining strict-parser bytes. */
+export async function ordinaryApi(path, token, fetcher = fetch, deadline) {
+  if (
+    !/^\/repos\/[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*\/actions\/runs\/[1-9][0-9]*(?:\/attempts\/[1-9][0-9]*\/jobs|\/artifacts)\?per_page=100$/.test(
+      path
+    ) ||
+    !token
+  )
+    throw Error('Invalid ordinary metadata request')
+  const response = await ordinaryFetch(
+    // Fixed GitHub Actions metadata service, not an integration destination.
+    `https://api.github.com${path}`, // allow-domain: api.github.com
+    {
+      method: 'GET',
+      redirect: 'manual',
+      signal: AbortSignal.any([
+        AbortSignal.timeout(10_000),
+        ...(deadline ? [deadline] : []),
+      ]),
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+      },
+    },
+    fetcher
+  )
+  if (response.status !== 200) {
+    discardOrdinaryBody(response)
+    throw Error(`Ordinary metadata HTTP ${response.status}`)
+  }
+  const chunks = []
+  await ordinaryBody(response, 1024 * 1024, (chunk) =>
+    chunks.push(Buffer.from(chunk))
+  )
+  return Buffer.concat(chunks)
+}
+
+/** Downloads one already-bound archive by exact ID, without forwarding credentials. */
+export async function ordinaryDownload(request, fetcher = fetch) {
+  const { repository, archive, token, directory, deadline } = request
+  const limits = {
+    'canonical.zip': 768 * 1024 * 1024,
+    'canonical-observation.zip': 2 * 1024 * 1024,
+    'reproduction.zip': 768 * 1024 * 1024,
+    'reproduction-observation.zip': 2 * 1024 * 1024,
+  }
+  if (
+    !/^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(
+      repository
+    ) ||
+    repository.length > 200 ||
+    !token ||
+    !archive ||
+    !Number.isSafeInteger(archive.id) ||
+    archive.id <= 0 ||
+    !Number.isSafeInteger(archive.size) ||
+    archive.size <= 0 ||
+    !Object.hasOwn(limits, archive.file) ||
+    archive.size > limits[archive.file] ||
+    !/^[a-f0-9]{64}$/.test(archive.sha256) ||
+    realpathSync(directory) !== directory
+  )
+    throw Error('Invalid bound ordinary archive request')
+  let descriptor
+  try {
+    descriptor = openSync(join(directory, archive.file), 'wx', 0o600)
+    const signal = AbortSignal.any([
+      AbortSignal.timeout(60_000),
+      ...(deadline ? [deadline] : []),
+    ])
+    const response = await ordinaryFetch(
+      // Fixed artifact API returns the authenticated download redirect.
+      `https://api.github.com/repos/${repository}/actions/artifacts/${archive.id}/zip`, // allow-domain: api.github.com
+      {
+        method: 'GET',
+        redirect: 'manual',
+        signal,
+        headers: {
+          Authorization: `Bearer ${token}`,
+          Accept: 'application/vnd.github+json',
+          'X-GitHub-Api-Version': '2022-11-28',
+        },
+      },
+      fetcher
+    )
+    const location = response.headers.get('location')
+    discardOrdinaryBody(response)
+    if (response.status !== 302)
+      throw Error('Ordinary archive API did not return its single redirect')
+    const url = new URL(location)
+    if (
+      url.protocol !== 'https:' ||
+      url.username ||
+      url.password ||
+      url.port ||
+      url.hash
+    )
+      throw Error('Ordinary archive redirect rejected')
+    const blob = await ordinaryFetch(
+      url.href,
+      { method: 'GET', redirect: 'error', signal },
+      fetcher
+    )
+    if (blob.status !== 200) {
+      discardOrdinaryBody(blob)
+      throw Error('Ordinary archive blob response rejected')
+    }
+    const hash = createHash('sha256')
+    const size = await ordinaryBody(blob, archive.size, (chunk) => {
+      hash.update(chunk)
+      writeFileSync(descriptor, chunk)
+    })
+    if (size !== archive.size || hash.digest('hex') !== archive.sha256)
+      throw Error('Ordinary archive digest or size mismatch')
+    fsyncSync(descriptor)
+  } catch {
+    throw Error(
+      'Ordinary archive acquisition failed; no comparison result is available'
+    )
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor)
+  }
+}
+
+/** Acquires four archives only after the Rust current-run binding accepts metadata. */
+export async function acquireOrdinaryTransfers(
+  request,
+  fetcher = fetch,
+  planner = ordinaryPlan
+) {
+  const { producer, input, archives, repository, runId, attempt, token } =
+    request
+  if (
+    !/^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(
+      repository
+    ) ||
+    repository.length > 200 ||
+    !/^[1-9][0-9]*$/.test(runId) ||
+    !/^[1-9][0-9]*$/.test(attempt) ||
+    !Number.isSafeInteger(+runId) ||
+    !Number.isSafeInteger(+attempt) ||
+    realpathSync(input) !== input ||
+    !token
+  )
+    throw Error('Invalid ordinary acquisition context')
+  const prefix = `/repos/${repository}/actions/runs/${runId}`
+  const deadline = AbortSignal.timeout(300_000)
+  for (const [file, endpoint] of [
+    ['jobs.json', `${prefix}/attempts/${attempt}/jobs?per_page=100`],
+    ['artifacts.json', `${prefix}/artifacts?per_page=100`],
+  ])
+    writeFileSync(
+      join(input, file),
+      await ordinaryApi(endpoint, token, fetcher, deadline),
+      { flag: 'wx', mode: 0o600 }
+    )
+  const plan = planner(producer, input)
+  deadline.throwIfAborted()
+  const names = [
+    'canonical.zip',
+    'canonical-observation.zip',
+    'reproduction.zip',
+    'reproduction-observation.zip',
+  ]
+  if (
+    plan?.version !== 1 ||
+    !Array.isArray(plan.archives) ||
+    plan.archives.length !== 4 ||
+    !plan.archives.every((archive, index) => archive?.file === names[index]) ||
+    new Set(plan.archives.map((archive) => archive.id)).size !== 4
+  )
+    throw Error('Ordinary bound transfer plan rejected')
+  mkdirSync(archives, { mode: 0o700 })
+  for (const archive of plan.archives)
+    await ordinaryDownload(
+      { repository, archive, token, directory: archives, deadline },
+      fetcher
+    )
+}
+
+function ordinaryPlan(producer, input) {
+  try {
+    return JSON.parse(
+      execFileSync(producer, ['ordinary-transfer-plan', '--input', input], {
+        encoding: 'utf8',
+        timeout: 30_000,
+        killSignal: 'SIGKILL',
+        maxBuffer: 1024 * 1024,
+        env: { PATH: process.env.PATH, LC_ALL: 'C', TZ: 'UTC' },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+    )
+  } catch {
+    throw Error('Ordinary current-run transfer binding failed')
+  }
+}
+
+async function ordinaryFetch(url, options, fetcher) {
+  try {
+    options.signal.throwIfAborted()
+    return await fetcher(url, options)
+  } catch {
+    throw Error('Ordinary read-only transport failed')
+  }
+}
+
+function discardOrdinaryBody(response) {
+  response.body?.cancel().catch(() => {})
+}
+
+async function ordinaryBody(response, limit, consume) {
+  const reader = response.body?.getReader()
+  if (!reader) throw Error('Ordinary response body is missing')
+  let size = 0
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) return size
+      size += value.byteLength
+      if (size > limit) throw Error('Ordinary response exceeds its byte bound')
+      consume(value)
+    }
+  } catch {
+    throw Error('Ordinary response body failed its bounded read')
+  } finally {
+    await reader.cancel().catch(() => {})
+    reader.releaseLock()
+  }
+}
 
 /** Check minimal wasm headers and final Linux loader requirements. */
 export function checkReleaseFormat(bytes, target, elf = '') {
@@ -686,6 +927,17 @@ if (
     }
   } else if (command === 'smoke' && args.length === 2) {
     await smokeRelease(...args)
+  } else if (command === 'ordinary-fetch' && args.length === 3) {
+    const [producer, input, archives] = args
+    await acquireOrdinaryTransfers({
+      producer,
+      input,
+      archives,
+      repository: process.env.GITHUB_REPOSITORY,
+      runId: process.env.GITHUB_RUN_ID,
+      attempt: process.env.GITHUB_RUN_ATTEMPT,
+      token: process.env.GH_TOKEN,
+    })
   } else if (command === 'merge' && args.length === 4) {
     const [cargo, npm, binary, output] = args
     writeFileSync(

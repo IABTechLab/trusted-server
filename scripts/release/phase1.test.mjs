@@ -16,6 +16,421 @@ import * as fs from 'node:fs'
 import vm from 'node:vm'
 import { isDeepStrictEqual } from 'node:util'
 import { checkBinary, checkSource, mergeSboms, sentinels } from './phase1.mjs'
+import {
+  ordinaryApi,
+  ordinaryDownload,
+  acquireOrdinaryTransfers,
+} from './phase1.mjs'
+
+test('ordinary transport preserves raw metadata and uses only the fixed authenticated GET', async () => {
+  const calls = []
+  const bytes = '{"total_count":0,"jobs":[],"same":1,"same":2}'
+  const fetched = await ordinaryApi(
+    '/repos/example/release/actions/runs/17/attempts/2/jobs?per_page=100',
+    'fictional-token',
+    async (url, options) => {
+      calls.push({ url, options })
+      return new Response(bytes)
+    }
+  )
+  assert.equal(fetched.toString(), bytes)
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].options.method, 'GET')
+  assert.equal(calls[0].options.redirect, 'manual')
+  assert.equal(calls[0].options.headers.Authorization, 'Bearer fictional-token')
+  // Assert the fixed metadata origin without permitting arbitrary destinations.
+  assert.equal(new URL(calls[0].url).origin, 'https://api.github.com') // allow-domain: api.github.com
+})
+
+test('ordinary transport rejects metadata failures and oversized responses without leaking details', async () => {
+  let discarded = 0
+  await assert.rejects(
+    ordinaryApi(
+      '/repos/example/release/actions/runs/17/artifacts?per_page=100',
+      'fictional-token',
+      async () =>
+        new Response(
+          new ReadableStream({
+            cancel() {
+              discarded++
+            },
+          }),
+          { status: 403 }
+        )
+    )
+  )
+  assert.equal(discarded, 1)
+  for (const response of [
+    new Response('fictional-sensitive-body', { status: 403 }),
+    new Response('fictional-sensitive-body', {
+      status: 302,
+      headers: { location: 'https://example.com/fictional-secret' },
+    }),
+    new Response(Buffer.alloc(1024 * 1024 + 1)),
+  ])
+    await assert.rejects(
+      ordinaryApi(
+        '/repos/example/release/actions/runs/17/artifacts?per_page=100',
+        'fictional-token',
+        async () => response
+      ),
+      (error) =>
+        !/fictional-sensitive|fictional-secret|fictional-token/.test(
+          error.message
+        )
+    )
+  let called = false
+  await assert.rejects(
+    ordinaryApi(
+      '/repos/example/release/releases',
+      'fictional-token',
+      async () => {
+        called = true
+      }
+    )
+  )
+  assert.equal(called, false)
+  for (const path of [
+    '/repos/../release/actions/runs/17/artifacts?per_page=100',
+    '/repos/example/../actions/runs/17/artifacts?per_page=100',
+  ]) {
+    await assert.rejects(
+      ordinaryApi(path, 'fictional-token', async () => {
+        called = true
+      })
+    )
+    assert.equal(called, false)
+  }
+  await assert.rejects(
+    ordinaryApi(
+      '/repos/example/release/actions/runs/17/artifacts?per_page=100',
+      'fictional-token',
+      async () => {
+        throw Error('https://example.com/fictional-secret fictional-token')
+      }
+    ),
+    (error) => !/fictional-secret|fictional-token/.test(error.message)
+  )
+})
+
+test('ordinary transport downloads exact archive bytes without forwarding the API token', async () => {
+  const directory = fs.realpathSync(
+    mkdtempSync(join(tmpdir(), 'ordinary-transport-'))
+  )
+  const bytes = Buffer.from('fictional archive bytes')
+  const archive = {
+    id: 41,
+    size: bytes.length,
+    sha256: createHash('sha256').update(bytes).digest('hex'),
+    file: 'canonical.zip',
+  }
+  const calls = []
+  try {
+    await ordinaryDownload(
+      {
+        repository: 'example/release',
+        archive,
+        token: 'fictional-token',
+        directory,
+      },
+      async (url, options) => {
+        calls.push({ url, options })
+        return calls.length === 1
+          ? new Response(null, {
+              status: 302,
+              headers: {
+                location: 'https://example.com/archive?fictional-secret',
+              },
+            })
+          : new Response(bytes)
+      }
+    )
+    assert.deepEqual(readFileSync(join(directory, archive.file)), bytes)
+    assert.equal(calls.length, 2)
+    assert.match(calls[0].url, /\/actions\/artifacts\/41\/zip$/)
+    assert.equal(
+      calls[0].options.headers.Authorization,
+      'Bearer fictional-token'
+    )
+    assert.equal(calls[1].options.headers?.Authorization, undefined)
+    assert.equal(calls[1].options.redirect, 'error')
+  } finally {
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test('ordinary transport rejects wrong archive hashes and reused output paths', async () => {
+  const directory = fs.realpathSync(
+    mkdtempSync(join(tmpdir(), 'ordinary-transport-'))
+  )
+  const archive = {
+    id: 41,
+    size: 3,
+    sha256: 'a'.repeat(64),
+    file: 'canonical-observation.zip',
+  }
+  let calls = 0
+  const fetcher = async () =>
+    ++calls % 2 === 1
+      ? new Response(null, {
+          status: 302,
+          headers: { location: 'https://example.com/archive?fictional-secret' },
+        })
+      : new Response('bad')
+  try {
+    await assert.rejects(
+      ordinaryDownload(
+        {
+          repository: 'example/release',
+          archive,
+          token: 'fictional-token',
+          directory,
+        },
+        fetcher
+      ),
+      /archive/
+    )
+    writeFileSync(join(directory, archive.file), 'retained')
+    await assert.rejects(
+      ordinaryDownload(
+        {
+          repository: 'example/release',
+          archive,
+          token: 'fictional-token',
+          directory,
+        },
+        fetcher
+      )
+    )
+    assert.equal(
+      readFileSync(join(directory, archive.file), 'utf8'),
+      'retained'
+    )
+  } finally {
+    rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test('ordinary transport stops before ZIP requests when current-run binding fails', async () => {
+  const root = fs.realpathSync(
+    mkdtempSync(join(tmpdir(), 'ordinary-transport-'))
+  )
+  const input = join(root, 'input')
+  mkdirSync(input)
+  const calls = []
+  try {
+    await assert.rejects(
+      acquireOrdinaryTransfers(
+        {
+          producer: '/fictional/producer',
+          input,
+          archives: join(root, 'archives'),
+          repository: 'example/release',
+          runId: '17',
+          attempt: '2',
+          token: 'fictional-token',
+        },
+        async (url) => {
+          calls.push(url)
+          return new Response('{"total_count":0}')
+        },
+        () => {
+          assert.equal(
+            readFileSync(join(input, 'jobs.json'), 'utf8'),
+            '{"total_count":0}'
+          )
+          assert.equal(
+            readFileSync(join(input, 'artifacts.json'), 'utf8'),
+            '{"total_count":0}'
+          )
+          throw Error('rejected current-run metadata')
+        }
+      ),
+      /current-run/
+    )
+    assert.equal(calls.length, 2)
+    assert.ok(calls.every((url) => !url.endsWith('/zip')))
+    assert.equal(fs.existsSync(join(root, 'archives')), false)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('ordinary transport rejects unsafe redirects before any blob request', async () => {
+  for (const location of [
+    'http://example.com/archive',
+    'https://user:fictional-secret@example.com/archive',
+    'https://example.com:444/archive',
+    'not-a-url',
+  ]) {
+    const root = fs.realpathSync(
+      mkdtempSync(join(tmpdir(), 'ordinary-transport-'))
+    )
+    let calls = 0
+    try {
+      await assert.rejects(
+        ordinaryDownload(
+          {
+            repository: 'example/release',
+            token: 'fictional-token',
+            directory: root,
+            archive: {
+              id: 41,
+              file: 'canonical.zip',
+              size: 1,
+              sha256: 'a'.repeat(64),
+            },
+          },
+          async () => {
+            calls++
+            return new Response(null, { status: 302, headers: { location } })
+          }
+        ),
+        (error) => !error.message.includes('fictional-secret')
+      )
+      assert.equal(calls, 1)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  }
+})
+
+test('ordinary transport enforces observation and body bounds and aborts before fetching', async () => {
+  let oversizedCalled = false
+  await assert.rejects(
+    ordinaryDownload(
+      {
+        repository: 'example/release',
+        token: 'fictional-token',
+        directory: '/unused',
+        archive: {
+          id: 41,
+          file: 'canonical-observation.zip',
+          size: 2 * 1024 * 1024 + 1,
+          sha256: 'a'.repeat(64),
+        },
+      },
+      async () => {
+        oversizedCalled = true
+      }
+    )
+  )
+  assert.equal(oversizedCalled, false)
+  for (const body of ['short', 'longer-than-the-bound']) {
+    const root = fs.realpathSync(
+      mkdtempSync(join(tmpdir(), 'ordinary-transport-'))
+    )
+    let calls = 0
+    try {
+      await assert.rejects(
+        ordinaryDownload(
+          {
+            repository: 'example/release',
+            token: 'fictional-token',
+            directory: root,
+            archive: {
+              id: 41,
+              file: 'canonical-observation.zip',
+              size: 8,
+              sha256: 'a'.repeat(64),
+            },
+          },
+          async () =>
+            ++calls === 1
+              ? new Response(null, {
+                  status: 302,
+                  headers: { location: 'https://example.com/archive' },
+                })
+              : new Response(body)
+        )
+      )
+      assert.equal(calls, 2)
+      assert.ok(fs.statSync(join(root, 'canonical-observation.zip')).size <= 8)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  }
+  let called = false
+  await assert.rejects(
+    ordinaryApi(
+      '/repos/example/release/actions/runs/17/artifacts?per_page=100',
+      'fictional-token',
+      async () => {
+        called = true
+      },
+      AbortSignal.abort()
+    )
+  )
+  assert.equal(called, false)
+})
+
+test('ordinary transport acquires exactly the four Rust-bound archives in fixed order', async () => {
+  const root = fs.realpathSync(
+    mkdtempSync(join(tmpdir(), 'ordinary-transport-'))
+  )
+  const input = join(root, 'input'),
+    archives = join(root, 'archives')
+  mkdirSync(input)
+  const bytes = Buffer.from('fictional bound ZIP bytes')
+  const names = [
+    'canonical.zip',
+    'canonical-observation.zip',
+    'reproduction.zip',
+    'reproduction-observation.zip',
+  ]
+  let planned = false,
+    calls = 0
+  try {
+    await acquireOrdinaryTransfers(
+      {
+        producer: '/fictional/producer',
+        input,
+        archives,
+        repository: 'example/release',
+        runId: '17',
+        attempt: '2',
+        token: 'fictional-token',
+      },
+      async (url, options) => {
+        calls++
+        assert.equal(options.method, 'GET')
+        if (url.endsWith('per_page=100'))
+          return new Response('{"total_count":0}')
+        assert.equal(planned, true)
+        // The mock distinguishes the fixed authenticated API from blob reads.
+        const apiOrigin = 'https://api.github.com/' // allow-domain: api.github.com
+        if (url.startsWith(apiOrigin))
+          return new Response(null, {
+            status: 302,
+            headers: { location: 'https://example.com/archive' },
+          })
+        assert.equal(options.headers?.Authorization, undefined)
+        return new Response(bytes)
+      },
+      (producer, metadataRoot) => {
+        assert.equal(producer, '/fictional/producer')
+        assert.equal(metadataRoot, input)
+        assert.equal(fs.existsSync(join(input, 'artifacts.json')), true)
+        planned = true
+        return {
+          version: 1,
+          archives: names.map((file, index) => ({
+            file,
+            id: index + 41,
+            size: bytes.length,
+            sha256: createHash('sha256').update(bytes).digest('hex'),
+          })),
+        }
+      }
+    )
+    assert.equal(calls, 10)
+    assert.deepEqual(fs.readdirSync(archives).sort(), [...names].sort())
+    for (const name of names)
+      assert.deepEqual(readFileSync(join(archives, name)), bytes)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
 
 test('checked JS inventory metadata is confined to its exact build script', () => {
   const source = 'option_env!("TRUSTED_SERVER__TSJS_PREBUILT_INVENTORY")'
