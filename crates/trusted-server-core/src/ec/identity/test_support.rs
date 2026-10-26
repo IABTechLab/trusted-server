@@ -14,19 +14,21 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use error_stack::Report;
-use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::json;
 use url::Url;
 
-use crate::consent::ConsentContext;
 use crate::consent::jurisdiction::Jurisdiction;
+use crate::consent::types::RawConsentSignals;
 use crate::consent::types::TcfConsent;
+use crate::consent::{ConsentContext, build_context_from_signals};
 use crate::ec::identity::catalog::ProviderCatalog;
 use crate::ec::identity::coordinator::{OutcomeContext, RequestFacts};
 use crate::ec::identity::descriptor::{
-    Captures, ConsentPolicy, EidProvenance, Input, ProviderDescriptor, ResolveKind, Resolves,
+    Access, Captures, ConsentPolicy, EidProvenance, Input, ProviderDescriptor, ResolveKind,
+    Resolves,
 };
 use crate::ec::identity::exchange::{ProviderRequest, ProviderResponse};
 use crate::ec::identity::ids::{IdentityProviderId, SourceDomain, UnixTime};
@@ -34,10 +36,10 @@ use crate::ec::identity::input::{
     CaptureInput, HashedEmail, ProviderConsent, Region, ResolveInput, ResolveSignals, SeededRandom,
     StoredId,
 };
-use crate::ec::identity::policy::PolicySignals;
-use crate::ec::identity::provider::IdentityProvider;
+use crate::ec::identity::policy::{PolicySignals, policy_allows};
+use crate::ec::identity::provider::{IdentityProvider, IdentityProviderConfig};
 use crate::ec::identity::resolution::{
-    IdentityProviderError, Resolution, ResolvedEid, ResolvedUid, When,
+    IdentityProviderError, Resolution, ResolvedEid, ResolvedUid, StateChange, When, entry_sets,
 };
 use crate::ec::identity::revision::{StateRevision, new_revision};
 use crate::ec::kv_backend::in_memory::InMemoryEcKv;
@@ -45,6 +47,7 @@ use crate::ec::kv_backend::{EcKvLookup, EcKvStore, EcKvWrite, EcKvWriteMode, EcK
 use crate::ec::kv_types::{KvEid, KvPartnerId, KvUid};
 use crate::ec::rate_limiter::RateLimiter;
 use crate::error::TrustedServerError;
+use crate::openrtb::{Eid, Uid};
 use crate::redacted::Redacted;
 use crate::settings::{EcPartner, IdentitySettings, ProviderSettings};
 
@@ -495,8 +498,7 @@ pub fn ec_partner(source: &str, pull_sync_url: &str, token: &str) -> EcPartner {
 /// Panics when the record is not valid.
 #[must_use]
 pub(crate) fn stored_for_test(source: &SourceDomain, uid: &str) -> StoredId {
-    StoredId::from_record(source, &KvPartnerId::new(uid))
-        .expect("should build a stored ID from a record with a UID")
+    StoredId::for_test(source, uid)
 }
 
 /// Write and lookup counts of a [`WriteCountingEcKv`].
@@ -663,50 +665,26 @@ impl EcKvStore for WriteCountingEcKv {
     }
 }
 
-/// Drives one provider the way the coordinator does, so a vendor's tests
-/// stay short.
-///
-/// A source with a [`with_stored`](Self::with_stored) record is a `Refresh`,
-/// any other an `Initial`. Sources whose kind needs an input the harness
-/// does not hold are left out, and with none left
-/// [`request`](Self::request) returns `Ok(None)` without calling the
-/// provider.
-pub struct ProviderHarness<'provider> {
-    provider: &'provider dyn IdentityProvider,
+/// The harness clock when a test does not set one.
+const HARNESS_NOW: u64 = 1_760_000_000;
+
+/// Inputs for one harness run. The harness's own `with_*` methods delegate
+/// to an inner `HarnessSetup`.
+#[derive(Debug, Clone, Default)]
+pub struct HarnessSetup {
     client_ip: Option<IpAddr>,
     user_agent: Option<String>,
     page_url: Option<Url>,
     region: Option<Region>,
     hashed_email: Option<HashedEmail>,
-    stored: BTreeMap<SourceDomain, StoredId>,
+    consent: TestConsent,
+    stored: Vec<StoredId>,
     state_json: Option<String>,
-    now: UnixTime,
-    random: SeededRandom,
-    ec_id: Option<String>,
-    last_request: Option<ProviderRequest>,
+    now: Option<UnixTime>,
+    random_seed: Option<u64>,
 }
 
-impl<'provider> ProviderHarness<'provider> {
-    /// A harness for `provider` with no inputs, the clock at 1,760,000,000
-    /// and random seed 1.
-    #[must_use]
-    pub fn new(provider: &'provider dyn IdentityProvider) -> Self {
-        Self {
-            provider,
-            client_ip: None,
-            user_agent: None,
-            page_url: None,
-            region: None,
-            hashed_email: None,
-            stored: BTreeMap::new(),
-            state_json: None,
-            now: UnixTime::from_secs(1_760_000_000),
-            random: SeededRandom::new(1),
-            ec_id: None,
-            last_request: None,
-        }
-    }
-
+impl HarnessSetup {
     /// Sets the client IP.
     ///
     /// # Panics
@@ -755,16 +733,19 @@ impl<'provider> ProviderHarness<'provider> {
         self
     }
 
+    /// Sets the raw consent strings. Default: GDPR does not apply and there
+    /// are no opt-outs.
+    #[must_use]
+    pub fn with_consent(mut self, consent: TestConsent) -> Self {
+        self.consent = consent;
+        self
+    }
+
     /// Gives the provider a stored record, valid or expired. Its source is
     /// the one its first entry names, or the provider's primary source.
     #[must_use]
     pub fn with_stored(mut self, stored: StoredId) -> Self {
-        let source = stored
-            .eids()
-            .first()
-            .and_then(|eid| eid.source.parse().ok())
-            .unwrap_or_else(|| self.provider.descriptor().primary_source().clone());
-        self.stored.insert(source, stored);
+        self.stored.push(stored);
         self
     }
 
@@ -779,17 +760,419 @@ impl<'provider> ProviderHarness<'provider> {
         self
     }
 
-    /// Sets the fixed clock.
+    /// Sets the fixed clock. Default: 1,760,000,000.
     #[must_use]
     pub fn with_now(mut self, now: UnixTime) -> Self {
-        self.now = now;
+        self.now = Some(now);
         self
+    }
+
+    /// Seeds the random source. Default: 1.
+    #[must_use]
+    pub fn with_random_seed(mut self, seed: u64) -> Self {
+        self.random_seed = Some(seed);
+        self
+    }
+
+    fn now(&self) -> UnixTime {
+        self.now.unwrap_or(UnixTime::from_secs(HARNESS_NOW))
+    }
+
+    fn random(&self) -> SeededRandom {
+        SeededRandom::new(self.random_seed.unwrap_or(1))
+    }
+}
+
+/// Raw TCF, GPP and US Privacy strings, as a request would carry them.
+#[derive(Debug, Clone, Default)]
+pub struct TestConsent {
+    gdpr_applies: Option<bool>,
+    tc_string: Option<String>,
+    gpp: Option<(String, Vec<u16>)>,
+    us_privacy: Option<String>,
+    gpc: bool,
+    dnt: bool,
+}
+
+impl TestConsent {
+    /// Sets whether GDPR applies, whatever the strings say.
+    #[must_use]
+    pub fn with_gdpr_applies(mut self, applies: bool) -> Self {
+        self.gdpr_applies = Some(applies);
+        self
+    }
+
+    /// Sets the raw TCF string.
+    #[must_use]
+    pub fn with_tc_string(mut self, tc: &str) -> Self {
+        self.tc_string = Some(tc.to_owned());
+        self
+    }
+
+    /// Sets the raw GPP string and its section IDs.
+    #[must_use]
+    pub fn with_gpp_string(mut self, gpp: &str, section_ids: &[u16]) -> Self {
+        self.gpp = Some((gpp.to_owned(), section_ids.to_vec()));
+        self
+    }
+
+    /// Sets the raw US Privacy string.
+    #[must_use]
+    pub fn with_us_privacy(mut self, us_privacy: &str) -> Self {
+        self.us_privacy = Some(us_privacy.to_owned());
+        self
+    }
+
+    /// Sets the Global Privacy Control signal.
+    #[must_use]
+    pub fn with_gpc(mut self) -> Self {
+        self.gpc = true;
+        self
+    }
+
+    /// Sets the `DNT: 1` signal.
+    #[must_use]
+    pub fn with_dnt(mut self) -> Self {
+        self.dnt = true;
+        self
+    }
+
+    /// The consent context a request carrying these signals would build.
+    fn context(&self) -> ConsentContext {
+        let signals = RawConsentSignals {
+            raw_tc_string: self.tc_string.clone(),
+            raw_gpp_string: self.gpp.as_ref().map(|(gpp, _)| gpp.clone()),
+            raw_gpp_sid: self
+                .gpp
+                .as_ref()
+                .map(|(_, ids)| ids.iter().map(u16::to_string).collect::<Vec<_>>().join(",")),
+            raw_us_privacy: self.us_privacy.clone(),
+            gpc: self.gpc,
+        };
+        let mut context = build_context_from_signals(&signals);
+        // A known non-regulated region, so only the strings given matter.
+        context.jurisdiction = Jurisdiction::NonRegulated;
+        if let Some(applies) = self.gdpr_applies {
+            context.gdpr_applies = applies;
+        }
+        context
+    }
+}
+
+/// One proxied call: the request a capture rule matches, and its response.
+#[derive(Debug, Clone)]
+pub struct CaptureFixture {
+    method: Method,
+    path: String,
+    status: StatusCode,
+    body: Vec<u8>,
+}
+
+impl CaptureFixture {
+    /// A proxied call with `method` and `path`, answered 200 with no body.
+    #[must_use]
+    pub fn new(method: Method, path: &str) -> Self {
+        Self {
+            method,
+            path: path.to_owned(),
+            status: StatusCode::OK,
+            body: Vec::new(),
+        }
+    }
+
+    /// Sets the response status and JSON body.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `body` does not serialize.
+    #[must_use]
+    pub fn with_response(mut self, status: StatusCode, body: &serde_json::Value) -> Self {
+        self.status = status;
+        self.body = serde_json::to_vec(body).expect("should serialize the response body");
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ResolveCase {
+    setup: HarnessSetup,
+    status: StatusCode,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+/// The setups to run `request` under, the responses to answer with, and the
+/// proxied calls to capture from, for one conformance run.
+#[derive(Debug, Clone, Default)]
+pub struct ConformanceCases {
+    resolve: Vec<ResolveCase>,
+    capture: Vec<CaptureFixture>,
+}
+
+impl ConformanceCases {
+    /// A setup to run `request` under, and the response to answer it with.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `response` does not serialize.
+    #[must_use]
+    pub fn with_resolve_case(
+        self,
+        setup: HarnessSetup,
+        status: StatusCode,
+        response: &serde_json::Value,
+    ) -> Self {
+        let body = serde_json::to_vec(response).expect("should serialize the response body");
+        self.with_resolve_case_raw(setup, status, &[], &body)
+    }
+
+    /// As [`Self::with_resolve_case`], for text, binary or empty replies,
+    /// such as a base64 body or a 204.
+    #[must_use]
+    pub fn with_resolve_case_raw(
+        mut self,
+        setup: HarnessSetup,
+        status: StatusCode,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> Self {
+        self.resolve.push(ResolveCase {
+            setup,
+            status,
+            headers: headers
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect(),
+            body: body.to_vec(),
+        });
+        self
+    }
+
+    /// A proxied call to run `capture` on.
+    #[must_use]
+    pub fn with_capture_case(mut self, fixture: CaptureFixture) -> Self {
+        self.capture.push(fixture);
+        self
+    }
+}
+
+/// The first conformance check a provider failed. Each variant names what
+/// failed and never a value.
+#[derive(Debug, derive_more::Display)]
+#[non_exhaustive]
+pub enum ConformanceFailure {
+    /// A read of something the descriptor does not declare.
+    #[display("the provider read `{access}` without declaring it")]
+    UndeclaredInput {
+        /// What was read.
+        access: Access,
+    },
+    /// A request to a host the descriptor does not declare.
+    #[display("a request went to a host the descriptor does not declare")]
+    UndeclaredHost,
+    /// A request that is not `https`.
+    #[display("a request did not use https")]
+    InsecureScheme,
+    /// A request that sets a `Cookie` header.
+    #[display("a request set a Cookie header")]
+    CookieHeader,
+    /// A request header whose value is not visible ASCII.
+    #[display("a request header value is not valid")]
+    InvalidHeader,
+    /// An entry for a source the descriptor does not declare.
+    #[display("a result holds an entry for undeclared source `{source}`")]
+    UndeclaredSource {
+        /// The source.
+        source: SourceDomain,
+    },
+    /// A fixture result that hits a limit of spec 4.5.
+    #[display("a result for `{source}` hit a limit: {part} was dropped")]
+    LimitHit {
+        /// The source.
+        source: SourceDomain,
+        /// What the limit dropped.
+        part: String,
+    },
+    /// A fixture set over `MAX_ENTRY_SET_BYTES`.
+    #[display("the entry set for `{source}` is over the size limit")]
+    SetTooLarge {
+        /// The source.
+        source: SourceDomain,
+    },
+    /// A capability the descriptor declares and the provider does not
+    /// override.
+    #[display("`{method}` is declared but not implemented")]
+    NotImplemented {
+        /// The missing method.
+        method: &'static str,
+    },
+    /// A provider that declares `resolves` and builds no request in any case.
+    #[display("the provider built no request for any listed setup")]
+    ResolverNeverRequests,
+    /// A provider that declares `captures` and captures nothing in any case.
+    #[display("the provider captured nothing for any listed fixture")]
+    CapturerNeverMatches,
+    /// A provider without `with_private_state()` that returns state.
+    #[display("a provider without private state returned a state change")]
+    StatelessState,
+    /// A capture that returns a state change.
+    #[display("a capture returned a state change")]
+    CaptureStateChange,
+    /// A fixture set of an expiring source without an expiry.
+    #[display("the entry set for expiring source `{source}` carries no expiry")]
+    MissingExpiry {
+        /// The source.
+        source: SourceDomain,
+    },
+    /// A stateful provider that accepts a bare-JSON-string stored state.
+    #[display("the provider accepted a bare-string stored state as valid")]
+    BareStringStateAccepted,
+    /// A returned state that does not round-trip through the state type.
+    #[display("a returned state does not round-trip through the state type")]
+    StateRoundTrip,
+    /// A stateful provider checked without a state type.
+    #[display(
+        "the provider keeps private state: use `check_conformance_with_state` with its state type"
+    )]
+    StatefulNeedsStateType,
+    /// A provider bug that is not one of the checks above.
+    #[display("the provider failed in `{stage}` with a configuration error")]
+    ProviderFailed {
+        /// The failing method.
+        stage: &'static str,
+    },
+}
+
+impl core::error::Error for ConformanceFailure {}
+
+/// Checks that a returned state round-trips through the provider's state type.
+type StateRoundTrip<'a, 'provider> = dyn Fn(&ProviderHarness<'provider>, &str) -> bool + 'a;
+
+/// Drives one provider the way the coordinator does, so a vendor's tests
+/// stay short.
+///
+/// A source with a [`with_stored`](Self::with_stored) record is a `Refresh`,
+/// any other an `Initial`. Sources whose kind needs an input the harness
+/// does not hold are left out, and with none left
+/// [`request`](Self::request) returns `Ok(None)` without calling the
+/// provider. So does a consent the provider's policy refuses.
+pub struct ProviderHarness<'provider> {
+    provider: &'provider dyn IdentityProvider,
+    setup: HarnessSetup,
+    random: SeededRandom,
+    ec_id: Option<String>,
+    last_request: Option<ProviderRequest>,
+    recorded: Vec<Access>,
+    state_decoded: bool,
+}
+
+impl<'provider> ProviderHarness<'provider> {
+    /// A harness for `provider` with no inputs, the clock at 1,760,000,000
+    /// and random seed 1.
+    #[must_use]
+    pub fn new(provider: &'provider dyn IdentityProvider) -> Self {
+        let setup = HarnessSetup::default();
+        Self {
+            provider,
+            random: setup.random(),
+            setup,
+            ec_id: None,
+            last_request: None,
+            recorded: Vec::new(),
+            state_decoded: false,
+        }
+    }
+
+    /// Replaces every input at once, for conformance cases.
+    #[must_use]
+    pub fn with_setup(mut self, setup: HarnessSetup) -> Self {
+        self.random = setup.random();
+        self.setup = setup;
+        self
+    }
+
+    fn map_setup(mut self, change: impl FnOnce(HarnessSetup) -> HarnessSetup) -> Self {
+        self.setup = change(core::mem::take(&mut self.setup));
+        self
+    }
+
+    /// Sets the client IP.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `ip` is not an IP address.
+    #[must_use]
+    pub fn with_client_ip(self, ip: &str) -> Self {
+        self.map_setup(|setup| setup.with_client_ip(ip))
+    }
+
+    /// Sets the `User-Agent`.
+    #[must_use]
+    pub fn with_user_agent(self, user_agent: &str) -> Self {
+        self.map_setup(|setup| setup.with_user_agent(user_agent))
+    }
+
+    /// Sets the page URL.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `url` is not a URL.
+    #[must_use]
+    pub fn with_page_url(self, url: &str) -> Self {
+        self.map_setup(|setup| setup.with_page_url(url))
+    }
+
+    /// Sets the region.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `country` is not a country code.
+    #[must_use]
+    pub fn with_region(self, country: &str, subdivision: Option<&str>) -> Self {
+        self.map_setup(|setup| setup.with_region(country, subdivision))
+    }
+
+    /// Sets the hashed email.
+    #[must_use]
+    pub fn with_hashed_email(self, email: HashedEmail) -> Self {
+        self.map_setup(|setup| setup.with_hashed_email(email))
+    }
+
+    /// Sets the raw consent strings. Default: GDPR does not apply and no
+    /// opt-outs.
+    #[must_use]
+    pub fn with_consent(self, consent: TestConsent) -> Self {
+        self.map_setup(|setup| setup.with_consent(consent))
+    }
+
+    /// Gives the provider a stored record, valid or expired. Its source is
+    /// the one its first entry names, or the provider's primary source.
+    #[must_use]
+    pub fn with_stored(self, stored: StoredId) -> Self {
+        self.map_setup(|setup| setup.with_stored(stored))
+    }
+
+    /// Gives the provider its private state, as stored.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `state` does not serialize.
+    #[must_use]
+    pub fn with_state(self, state: &impl Serialize) -> Self {
+        self.map_setup(|setup| setup.with_state(state))
+    }
+
+    /// Sets the fixed clock.
+    #[must_use]
+    pub fn with_now(self, now: UnixTime) -> Self {
+        self.map_setup(|setup| setup.with_now(now))
     }
 
     /// Reseeds the random source.
     #[must_use]
     pub fn with_random_seed(mut self, seed: u64) -> Self {
-        self.random = SeededRandom::new(seed);
+        self.setup = core::mem::take(&mut self.setup).with_random_seed(seed);
+        self.random = self.setup.random();
         self
     }
 
@@ -807,14 +1190,14 @@ impl<'provider> ProviderHarness<'provider> {
     /// Returns what the provider returns.
     pub fn request(&mut self) -> Result<Option<ProviderRequest>, Report<IdentityProviderError>> {
         let kinds = self.kinds();
-        let request = if kinds.is_empty() {
-            None
+        let (result, recorded, decoded) = if kinds.is_empty() || !self.consent_allows() {
+            (Ok(None), Vec::new(), false)
         } else {
-            let signals = self.signals();
-            let input = ResolveInput::new(self.provider.descriptor(), kinds, &signals)
-                .with_state_json(self.state_json.clone());
-            self.provider.request(&input)?
+            self.call(kinds, |input| self.provider.request(input))
         };
+        self.recorded.extend(recorded);
+        self.state_decoded |= decoded;
+        let request = result?;
         self.last_request.clone_from(&request);
         Ok(request)
     }
@@ -878,26 +1261,375 @@ impl<'provider> ProviderHarness<'provider> {
             .as_ref()
             .and_then(|request| request.call_context_json().map(str::to_owned));
         let response = ProviderResponse::new(status, header_map, body.to_vec(), call_context);
-        let signals = self.signals();
-        let input = ResolveInput::new(self.provider.descriptor(), self.kinds(), &signals)
-            .with_state_json(self.state_json.clone());
-        self.provider.response(&response, &input)
+        let (result, recorded, decoded) = self.call(self.kinds(), |input| {
+            self.provider.response(&response, input)
+        });
+        self.recorded.extend(recorded);
+        self.state_decoded |= decoded;
+        result
+    }
+
+    /// Runs a capture as the coordinator does: the fixture's response is
+    /// already decoded. A call no capture rule matches is `no_match`, as
+    /// the coordinator never runs the provider for it.
+    ///
+    /// # Errors
+    ///
+    /// Returns what the provider returns.
+    pub fn capture(
+        &self,
+        fixture: &CaptureFixture,
+    ) -> Result<Resolution, Report<IdentityProviderError>> {
+        let descriptor = self.provider.descriptor();
+        if !descriptor
+            .captures()
+            .is_some_and(|captures| captures.matches(&fixture.method, &fixture.path))
+        {
+            return Ok(Resolution::no_match());
+        }
+        let response =
+            ProviderResponse::new(fixture.status, HeaderMap::new(), fixture.body.clone(), None);
+        let stored = self.stored_by_source();
+        let consent = ProviderConsent::from_context(&self.setup.consent.context());
+        let input = CaptureInput::new(
+            descriptor,
+            &fixture.path,
+            &response,
+            &stored,
+            &consent,
+            "www.example.com",
+            self.setup.now(),
+        );
+        self.provider.capture(&input)
     }
 
     /// Resolves an expiry or refresh against the fixed clock.
     #[must_use]
     pub fn resolve(&self, when: When) -> UnixTime {
-        when.resolve(self.now)
+        when.resolve(self.setup.now())
+    }
+
+    /// The replacement state in a result, decoded, for assertions.
+    #[must_use]
+    pub fn state_of<T: DeserializeOwned>(&self, resolution: &Resolution) -> Option<T> {
+        match resolution.state_change() {
+            StateChange::Replace(json) => serde_json::from_str(json).ok(),
+            StateChange::Keep | StateChange::Clear => None,
+        }
+    }
+
+    /// The EIDs bidders would see for a result: the section 4.5 rules, then
+    /// the descriptor's provenance default for an entry that sets none of
+    /// `inserter`, `matcher` and `mm` (section 7.1).
+    #[must_use]
+    pub fn output_eids(&self, resolution: &Resolution) -> Vec<Eid> {
+        let sets = entry_sets(resolution.eids(), self.setup.now());
+        let mut order: Vec<&SourceDomain> = Vec::new();
+        for eid in resolution.eids() {
+            if !order.contains(&eid.source()) {
+                order.push(eid.source());
+            }
+        }
+        let descriptor = self.provider.descriptor();
+        let mut output = Vec::new();
+        for source in order {
+            let Some(set) = sets.sets.get(source) else {
+                continue;
+            };
+            for entry in &set.entries {
+                let mut eid = Eid {
+                    source: source.as_str().to_owned(),
+                    uids: entry
+                        .uids
+                        .iter()
+                        .map(|uid| Uid {
+                            id: uid.id.clone(),
+                            atype: uid.atype,
+                            ext: uid.ext.clone(),
+                        })
+                        .collect(),
+                    inserter: entry.inserter.clone(),
+                    matcher: entry.matcher.clone(),
+                    mm: entry.mm,
+                    ext: entry.ext.clone(),
+                };
+                if let Some(default) = descriptor.provenance(source)
+                    && eid.inserter.is_none()
+                    && eid.matcher.is_none()
+                    && eid.mm.is_none()
+                {
+                    eid.inserter = default.inserter().map(str::to_owned);
+                    eid.matcher = default.matcher().map(str::to_owned);
+                    eid.mm = default.mm();
+                }
+                output.push(eid);
+            }
+        }
+        output
+    }
+
+    /// Runs only the cases passed in, never the harness's own inputs, and
+    /// fails the test on the first failed check. A provider declared
+    /// `with_private_state()` fails here with a pointer to
+    /// [`check_conformance_with_state`](Self::check_conformance_with_state).
+    ///
+    /// # Panics
+    ///
+    /// Panics when the provider does not conform.
+    pub fn check_conformance(&self, cases: &ConformanceCases) {
+        self.try_check_conformance(cases)
+            .expect("should conform: the provider failed a conformance check");
+    }
+
+    /// As [`check_conformance`](Self::check_conformance), for a provider with
+    /// private state of type `S`. Also checks that `S` round-trips through
+    /// `replacing_state` and `input.state()`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the provider does not conform.
+    pub fn check_conformance_with_state<S: Serialize + DeserializeOwned>(
+        &self,
+        cases: &ConformanceCases,
+    ) {
+        self.try_check_conformance_with_state::<S>(cases)
+            .expect("should conform: the provider failed a conformance check");
+    }
+
+    /// The same checks as [`check_conformance`](Self::check_conformance),
+    /// returning the first failure instead of failing the test. A panic
+    /// aborts a `wasm32-wasip1` test run, so the harness's own negative
+    /// tests use this.
+    ///
+    /// # Errors
+    ///
+    /// The first failed check.
+    pub fn try_check_conformance(
+        &self,
+        cases: &ConformanceCases,
+    ) -> Result<(), Report<ConformanceFailure>> {
+        self.conform(cases, None)
+    }
+
+    /// As [`try_check_conformance`](Self::try_check_conformance), for a
+    /// provider with private state of type `S`.
+    ///
+    /// # Errors
+    ///
+    /// The first failed check.
+    pub fn try_check_conformance_with_state<S: Serialize + DeserializeOwned>(
+        &self,
+        cases: &ConformanceCases,
+    ) -> Result<(), Report<ConformanceFailure>> {
+        self.conform(
+            cases,
+            Some(&|harness, json| harness.state_round_trips::<S>(json)),
+        )
+    }
+
+    fn conform(
+        &self,
+        cases: &ConformanceCases,
+        round_trip: Option<&StateRoundTrip<'_, 'provider>>,
+    ) -> Result<(), Report<ConformanceFailure>> {
+        let descriptor = self.provider.descriptor();
+        let stateful = descriptor
+            .resolves()
+            .is_some_and(Resolves::has_private_state);
+        if stateful && round_trip.is_none() {
+            return Err(Report::new(ConformanceFailure::StatefulNeedsStateType));
+        }
+
+        let mut requested = false;
+        for case in &cases.resolve {
+            let mut harness = Self::new(self.provider).with_setup(case.setup.clone());
+            let request = harness.request();
+            harness.check_recorded()?;
+            let request = match request {
+                Ok(Some(request)) => request,
+                Ok(None) => continue,
+                Err(error) => {
+                    classify(error.current_context(), "request")?;
+                    continue;
+                }
+            };
+            requested = true;
+            check_request(descriptor, &request)?;
+            let headers: Vec<(&str, &str)> = case
+                .headers
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect();
+            let resolution = harness.respond_raw(case.status, &headers, &case.body);
+            harness.check_recorded()?;
+            match resolution {
+                Ok(resolution) => {
+                    if !stateful && resolution.changes_state() {
+                        return Err(Report::new(ConformanceFailure::StatelessState));
+                    }
+                    self.check_resolution(&resolution)?;
+                    if let (StateChange::Replace(json), Some(round_trip)) =
+                        (resolution.state_change(), round_trip)
+                        && !round_trip(&harness, json)
+                    {
+                        return Err(Report::new(ConformanceFailure::StateRoundTrip));
+                    }
+                }
+                Err(error) => classify(error.current_context(), "response")?,
+            }
+            if stateful {
+                self.check_bare_string_state(case)?;
+            }
+        }
+        if descriptor.resolves().is_some() && !requested {
+            return Err(Report::new(ConformanceFailure::ResolverNeverRequests));
+        }
+
+        let mut captured = false;
+        for fixture in &cases.capture {
+            match self.capture(fixture) {
+                Ok(resolution) => {
+                    if resolution.changes_state() {
+                        return Err(Report::new(ConformanceFailure::CaptureStateChange));
+                    }
+                    self.check_resolution(&resolution)?;
+                    captured |= !resolution.is_no_match();
+                }
+                Err(error) => classify(error.current_context(), "capture")?,
+            }
+        }
+        if descriptor.captures().is_some() && !captured {
+            return Err(Report::new(ConformanceFailure::CapturerNeverMatches));
+        }
+        Ok(())
+    }
+
+    fn check_recorded(&self) -> Result<(), Report<ConformanceFailure>> {
+        match self.recorded.first() {
+            Some(access) => Err(Report::new(ConformanceFailure::UndeclaredInput {
+                access: *access,
+            })),
+            None => Ok(()),
+        }
+    }
+
+    fn check_resolution(&self, resolution: &Resolution) -> Result<(), Report<ConformanceFailure>> {
+        let descriptor = self.provider.descriptor();
+        for eid in resolution.eids() {
+            if !descriptor.sources().contains(eid.source()) {
+                return Err(Report::new(ConformanceFailure::UndeclaredSource {
+                    source: eid.source().clone(),
+                }));
+            }
+        }
+        let sets = entry_sets(resolution.eids(), self.setup.now());
+        if let Some(dropped) = sets.drops.first() {
+            return Err(Report::new(ConformanceFailure::LimitHit {
+                source: dropped.source.clone(),
+                part: dropped.part.to_string(),
+            }));
+        }
+        if let Some(source) = sets.oversized.first() {
+            return Err(Report::new(ConformanceFailure::SetTooLarge {
+                source: source.clone(),
+            }));
+        }
+        for (source, set) in &sets.sets {
+            if descriptor.is_expiring(source) && set.expires_at.is_none() {
+                return Err(Report::new(ConformanceFailure::MissingExpiry {
+                    source: source.clone(),
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    /// Injects a stored state that is a bare JSON string, which no struct
+    /// decodes, and fails when the provider decodes it as valid state.
+    fn check_bare_string_state(
+        &self,
+        case: &ResolveCase,
+    ) -> Result<(), Report<ConformanceFailure>> {
+        let mut setup = case.setup.clone();
+        setup.state_json = Some("\"bare\"".to_owned());
+        let mut probe = Self::new(self.provider).with_setup(setup);
+        if matches!(probe.request(), Ok(Some(_))) {
+            let _ignored = probe.respond_raw(case.status, &[], &case.body);
+        }
+        if probe.state_decoded {
+            return Err(Report::new(ConformanceFailure::BareStringStateAccepted));
+        }
+        Ok(())
+    }
+
+    /// Whether `json` decodes as `S`, serializes back to the same value and
+    /// decodes again through `input.state()`.
+    fn state_round_trips<S: Serialize + DeserializeOwned>(&self, json: &str) -> bool {
+        let Ok(state) = serde_json::from_str::<S>(json) else {
+            return false;
+        };
+        let Ok(again) = serde_json::to_string(&state) else {
+            return false;
+        };
+        let same = serde_json::from_str::<serde_json::Value>(json).ok()
+            == serde_json::from_str::<serde_json::Value>(&again).ok();
+        let mut setup = self.setup.clone();
+        setup.state_json = Some(again);
+        let probe = Self::new(self.provider).with_setup(setup);
+        #[allow(
+            clippy::redundant_closure_for_method_calls,
+            reason = "the method reference does not satisfy the higher-ranked closure bound"
+        )]
+        let (decoded, _, _) =
+            probe.call(probe.kinds(), |input: &ResolveInput<'_>| input.state::<S>());
+        same && matches!(decoded, Ok(Some(_)))
+    }
+
+    fn call<R>(
+        &self,
+        kinds: BTreeMap<SourceDomain, ResolveKind>,
+        run: impl FnOnce(&ResolveInput<'_>) -> R,
+    ) -> (R, Vec<Access>, bool) {
+        let signals = self.signals();
+        let input = ResolveInput::new(self.provider.descriptor(), kinds, &signals)
+            .with_state_json(self.setup.state_json.clone());
+        let result = run(&input);
+        (result, input.recorded_errors(), input.state_was_decoded())
+    }
+
+    fn consent_allows(&self) -> bool {
+        policy_allows(
+            self.provider.descriptor().consent_policy(),
+            &self.setup.consent.context(),
+            PolicySignals {
+                dnt: self.setup.consent.dnt,
+            },
+        )
+    }
+
+    fn stored_by_source(&self) -> BTreeMap<SourceDomain, StoredId> {
+        self.setup
+            .stored
+            .iter()
+            .map(|stored| {
+                let source = stored
+                    .eids()
+                    .first()
+                    .and_then(|eid| eid.source.parse().ok())
+                    .unwrap_or_else(|| self.provider.descriptor().primary_source().clone());
+                (source, stored.clone())
+            })
+            .collect()
     }
 
     fn available_inputs(&self) -> BTreeSet<Input> {
         let mut available = BTreeSet::new();
         for (input, present) in [
-            (Input::ClientIp, self.client_ip.is_some()),
-            (Input::UserAgent, self.user_agent.is_some()),
-            (Input::PageUrl, self.page_url.is_some()),
-            (Input::Region, self.region.is_some()),
-            (Input::HashedEmail, self.hashed_email.is_some()),
+            (Input::ClientIp, self.setup.client_ip.is_some()),
+            (Input::UserAgent, self.setup.user_agent.is_some()),
+            (Input::PageUrl, self.setup.page_url.is_some()),
+            (Input::Region, self.setup.region.is_some()),
+            (Input::HashedEmail, self.setup.hashed_email.is_some()),
         ] {
             if present {
                 available.insert(input);
@@ -912,11 +1644,12 @@ impl<'provider> ProviderHarness<'provider> {
             return BTreeMap::new();
         };
         let available = self.available_inputs();
+        let stored = self.stored_by_source();
         descriptor
             .sources()
             .iter()
             .filter_map(|source| {
-                let kind = if self.stored.contains_key(source) {
+                let kind = if stored.contains_key(source) {
                     ResolveKind::Refresh
                 } else {
                     ResolveKind::Initial
@@ -929,19 +1662,96 @@ impl<'provider> ProviderHarness<'provider> {
 
     fn signals(&self) -> ResolveSignals<'_> {
         ResolveSignals {
-            client_ip: self.client_ip,
-            user_agent: self.user_agent.as_deref(),
-            page_url: self.page_url.clone(),
-            region: self.region.clone(),
-            hashed_email: self.hashed_email.clone(),
-            consent: ProviderConsent::default(),
+            client_ip: self.setup.client_ip,
+            user_agent: self.setup.user_agent.as_deref(),
+            page_url: self.setup.page_url.clone(),
+            region: self.setup.region.clone(),
+            hashed_email: self.setup.hashed_email.clone(),
+            consent: ProviderConsent::from_context(&self.setup.consent.context()),
             publisher_domain: "www.example.com",
-            now: self.now,
+            now: self.setup.now(),
             random: &self.random,
             ec_id: self.ec_id.clone(),
-            stored: self.stored.clone(),
+            stored: self.stored_by_source(),
         }
     }
+}
+
+/// Maps a provider error to the conformance check it breaks. Failures the
+/// coordinator treats as a vendor outcome, such as a refusal or a body that
+/// does not parse, are not bugs.
+fn classify(
+    error: &IdentityProviderError,
+    stage: &'static str,
+) -> Result<(), Report<ConformanceFailure>> {
+    match error {
+        IdentityProviderError::UndeclaredInput { access } => {
+            Err(Report::new(ConformanceFailure::UndeclaredInput {
+                access: *access,
+            }))
+        }
+        error if error.is_not_implemented() => {
+            Err(Report::new(ConformanceFailure::NotImplemented {
+                method: stage,
+            }))
+        }
+        IdentityProviderError::Config { .. } => {
+            Err(Report::new(ConformanceFailure::ProviderFailed { stage }))
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The request rules of the coordinator, each as its own failure.
+fn check_request(
+    descriptor: &ProviderDescriptor,
+    request: &ProviderRequest,
+) -> Result<(), Report<ConformanceFailure>> {
+    if request.url().scheme() != "https" {
+        return Err(Report::new(ConformanceFailure::InsecureScheme));
+    }
+    let host = request.url().host_str().unwrap_or_default();
+    let declared = descriptor.resolves().is_some_and(|resolves| {
+        resolves
+            .hosts()
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(host))
+    });
+    if !declared {
+        return Err(Report::new(ConformanceFailure::UndeclaredHost));
+    }
+    if request.has_cookie_header() {
+        return Err(Report::new(ConformanceFailure::CookieHeader));
+    }
+    if request
+        .headers()
+        .values()
+        .any(|value| value.to_str().is_err())
+    {
+        return Err(Report::new(ConformanceFailure::InvalidHeader));
+    }
+    Ok(())
+}
+
+/// Builds the descriptor from a config with placeholder secret names and
+/// from one with resolved secrets, and fails the test when the two differ
+/// (spec 10.2).
+///
+/// # Panics
+///
+/// Panics when either config cannot describe a provider, or when the
+/// descriptors differ.
+pub fn check_descriptor_ignores_secrets<C: IdentityProviderConfig>(placeholder: &C, resolved: &C) {
+    let from_placeholder = placeholder
+        .build_descriptor()
+        .expect("should build the descriptor from the placeholder config");
+    let from_resolved = resolved
+        .build_descriptor()
+        .expect("should build the descriptor from the resolved config");
+    assert_eq!(
+        from_placeholder, from_resolved,
+        "should build the same descriptor whatever the secrets"
+    );
 }
 
 struct DescriptorOnly(ProviderDescriptor);

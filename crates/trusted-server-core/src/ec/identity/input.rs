@@ -170,6 +170,14 @@ impl HashedEmail {
         Self(bytes)
     }
 
+    /// From the SHA-256 digest of a normalized address. Test support only,
+    /// and the one constructor over [`Self::from_bytes`].
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn for_test(bytes: [u8; 32]) -> Self {
+        Self::from_bytes(bytes)
+    }
+
     /// The digest.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8; 32] {
@@ -257,6 +265,53 @@ impl StoredId {
 
     fn first_uid(&self) -> Option<&Uid> {
         self.eids.first().and_then(|eid| eid.uids.first())
+    }
+
+    /// A stored one-entry, one-UID record of `source`. Test support only.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `uid` is not a valid stored UID.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn for_test(source: &SourceDomain, uid: &str) -> Self {
+        Self::from_record(source, &KvPartnerId::new(uid))
+            .expect("should build a stored ID from a record with a UID")
+    }
+
+    /// Replaces the entry set with a full one, and `uid()` becomes its first
+    /// UID. Test support only, so a test can give a refreshing provider a
+    /// stored full set.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `eids` holds no UID.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn with_eids(mut self, eids: Vec<Eid>) -> Self {
+        self.uid = eids
+            .first()
+            .and_then(|eid| eid.uids.first())
+            .map(|uid| uid.id.clone())
+            .expect("should give the stored set at least one UID");
+        self.eids = eids;
+        self
+    }
+
+    /// Records `writer` as the provider that wrote it. Test support only.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn written_by(mut self, writer: &IdentityProviderId) -> Self {
+        self.writer = Some(writer.clone());
+        self
+    }
+
+    /// Sets the time it must stop being sent. Test support only.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn expiring_at(mut self, at: UnixTime) -> Self {
+        self.expires_at = Some(at);
+        self
     }
 
     /// Every stored entry for the source, in stored order, with its UIDs and
@@ -389,6 +444,7 @@ pub struct ResolveInput<'a> {
     state_json: Option<String>,
     undeclared: RefCell<Vec<Access>>,
     state_failed: RefCell<bool>,
+    state_decoded: RefCell<bool>,
 }
 
 impl fmt::Debug for ResolveInput<'_> {
@@ -432,6 +488,7 @@ impl<'a> ResolveInput<'a> {
             state_json: None,
             undeclared: RefCell::new(Vec::new()),
             state_failed: RefCell::new(false),
+            state_decoded: RefCell::new(false),
         }
     }
 
@@ -476,6 +533,15 @@ impl<'a> ResolveInput<'a> {
     #[must_use]
     pub(crate) fn state_decode_failed(&self) -> bool {
         *self.state_failed.borrow()
+    }
+
+    /// Whether a `state()` call decoded the stored state. The conformance
+    /// check of the test harness uses it to see a provider accept a state
+    /// that no valid state looks like.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub(crate) fn state_was_decoded(&self) -> bool {
+        *self.state_decoded.borrow()
     }
 
     /// The sources to resolve this time, each with its own kind.
@@ -525,10 +591,15 @@ impl<'a> ResolveInput<'a> {
         let Some(raw) = self.state_json.as_deref() else {
             return Ok(None);
         };
-        serde_json::from_str(raw).map(Some).map_err(|_| {
-            *self.state_failed.borrow_mut() = true;
-            Report::new(IdentityProviderError::InvalidState)
-        })
+        serde_json::from_str(raw)
+            .map(|state| {
+                *self.state_decoded.borrow_mut() = true;
+                Some(state)
+            })
+            .map_err(|_| {
+                *self.state_failed.borrow_mut() = true;
+                Report::new(IdentityProviderError::InvalidState)
+            })
     }
 
     /// The endpoint declared with `Resolves::with_endpoint`.
