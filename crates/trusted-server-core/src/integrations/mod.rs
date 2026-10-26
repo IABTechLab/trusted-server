@@ -295,6 +295,11 @@ pub(crate) fn builders() -> &'static [IntegrationBuilder] {
             id: js_asset_proxy::JS_ASSET_PROXY_INTEGRATION_ID,
             build: js_asset_proxy::register,
         },
+        #[cfg(feature = "test-utils")]
+        IntegrationBuilder {
+            id: crate::test_support::async_html_finalization::ID,
+            build: crate::test_support::async_html_finalization::register,
+        },
         IntegrationBuilder {
             id: "testlight",
             build: testlight::register,

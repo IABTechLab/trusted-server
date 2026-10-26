@@ -1,4 +1,7 @@
 #[cfg(test)]
+pub(crate) mod logging;
+
+#[cfg(test)]
 pub mod tests {
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{ConsentContext, ConsentSource, TcfConsent};
@@ -573,6 +576,12 @@ pub mod nextjs_auction {
     /// stubbed out.
     #[must_use]
     pub fn services(client: Arc<NextJsAuctionOrigin>) -> RuntimeServices {
+        services_with_http_client(client)
+    }
+
+    /// Build fixture runtime services with a custom asynchronous upstream.
+    #[must_use]
+    pub fn services_with_http_client(client: Arc<dyn PlatformHttpClient>) -> RuntimeServices {
         RuntimeServices::builder()
             .config_store(Arc::new(FixtureStore))
             .secret_store(Arc::new(FixtureStore))
@@ -584,3 +593,6 @@ pub mod nextjs_auction {
             .build()
     }
 }
+
+#[cfg(feature = "test-utils")]
+pub(crate) mod async_html_finalization;

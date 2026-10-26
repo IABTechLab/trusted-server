@@ -808,48 +808,29 @@ mod tests {
         use crate::html_processor::{HtmlProcessorConfig, create_html_processor};
         use crate::integrations::IntegrationRegistry;
         use crate::streaming_processor::{Compression, PipelineConfig, StreamingPipeline};
+        use crate::test_support::logging::WarningCapture;
         use crate::test_support::nextjs_auction;
         use serde_json::json;
-        use std::cell::RefCell;
         use std::io::Cursor;
 
-        struct FallbackLogger;
-
-        static LOGGER: FallbackLogger = FallbackLogger;
-        thread_local! {
-            static MESSAGES: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
-        }
-
-        impl log::Log for FallbackLogger {
-            fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-                metadata.level() == log::Level::Warn
-            }
-
-            fn log(&self, record: &log::Record<'_>) {
-                if self.enabled(record.metadata())
-                    && matches!(
-                        record.target(),
+        fn fallback_messages(warnings: &WarningCapture) -> Vec<String> {
+            warnings
+                .take()
+                .into_iter()
+                .filter(|warning| {
+                    matches!(
+                        warning.target.as_str(),
                         "trusted_server_core::integrations::nextjs::rsc_placeholders"
                             | "trusted_server_core::integrations::nextjs::rsc_stream"
                     )
-                {
-                    MESSAGES.with(|messages| {
-                        if let Some(messages) = messages.borrow_mut().as_mut() {
-                            messages.push(record.args().to_string());
-                        }
-                    });
-                }
-            }
-
-            fn flush(&self) {}
+                })
+                .map(|warning| warning.message)
+                .collect()
         }
 
         #[test]
         fn document_fallback_warns_once_without_publisher_source() {
-            log::set_logger(&LOGGER).expect("should install the fallback test logger");
-            let previous_level = log::max_level();
-            log::set_max_level(log::LevelFilter::Warn);
-            MESSAGES.with(|messages| *messages.borrow_mut() = Some(Vec::new()));
+            let warnings = WarningCapture::start();
             let document = IntegrationDocumentState::default();
             let rewriter = NextJsRscPlaceholderRewriter::new(test_config());
             rewriter.rewrite(
@@ -863,9 +844,7 @@ mod tests {
                     &ctx(true, &document),
                 );
             }
-            let messages = MESSAGES
-                .with(|messages| messages.borrow_mut().take())
-                .expect("should capture this thread's fallback warning");
+            let messages = fallback_messages(&warnings);
             assert_eq!(
                 messages,
                 ["Next.js RSC fallback: uncaptured data head; remaining Flight payloads stay raw"],
@@ -904,7 +883,6 @@ mod tests {
                 ),
             ] {
                 for chunk_size in [16, 8192] {
-                    MESSAGES.with(|messages| *messages.borrow_mut() = Some(Vec::new()));
                     let mut settings = nextjs_auction::script_composition_settings();
                     settings
                         .integrations
@@ -950,9 +928,7 @@ mod tests {
                         html.as_bytes(),
                         "should preserve original payloads and interstitial bytes at chunk {chunk_size}"
                     );
-                    let messages = MESSAGES
-                        .with(|messages| messages.borrow_mut().take())
-                        .expect("should capture both fallback stages on this thread");
+                    let messages = fallback_messages(&warnings);
                     assert_eq!(
                         messages,
                         [warning],
@@ -960,7 +936,6 @@ mod tests {
                     );
                 }
             }
-            log::set_max_level(previous_level);
         }
     }
 

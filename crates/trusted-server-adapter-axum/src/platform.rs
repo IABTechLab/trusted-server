@@ -551,7 +551,11 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
     static BACKEND: std::sync::OnceLock<Arc<dyn PlatformBackend>> = std::sync::OnceLock::new();
     static GEO: std::sync::OnceLock<Arc<dyn PlatformGeo>> = std::sync::OnceLock::new();
 
+    static TIMER: std::sync::OnceLock<Arc<dyn trusted_server_core::platform::PlatformTimer>> =
+        std::sync::OnceLock::new();
+
     RuntimeServices::builder()
+        .timer(Arc::clone(TIMER.get_or_init(|| Arc::new(AxumTimer))))
         .config_store(Arc::clone(CONFIG_STORE.get_or_init(|| {
             Arc::new(AxumPlatformConfigStore) as Arc<dyn PlatformConfigStore>
         })))
@@ -581,6 +585,16 @@ pub fn build_runtime_services(ctx: &edgezero_core::context::RequestContext) -> R
         .build()
 }
 
+struct AxumTimer;
+
+impl trusted_server_core::platform::PlatformTimer for AxumTimer {
+    fn delay(&self, duration: std::time::Duration) -> futures::future::LocalBoxFuture<'static, ()> {
+        Box::pin(async move {
+            tokio::time::sleep(duration).await;
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -591,6 +605,27 @@ mod tests {
     use edgezero_core::body::Body as EdgeBody;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    #[test]
+    fn html_finalization_timer_is_shared_without_an_executor() {
+        let request = edgezero_core::http::request_builder()
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build a request");
+        let context = edgezero_core::context::RequestContext::new(request, Default::default());
+        let services = build_runtime_services(&context);
+        let next_services = build_runtime_services(&context);
+        assert!(
+            std::ptr::eq(
+                services
+                    .timer()
+                    .expect("should install a cooperative timer"),
+                next_services
+                    .timer()
+                    .expect("should reuse the cooperative timer"),
+            ),
+            "should share the stateless timer without requiring an executor"
+        );
+    }
 
     #[test]
     fn auction_http_capabilities_are_explicit() {
