@@ -375,6 +375,13 @@ Every PR must pass:
 11. Documentation proposal scripts: `shellcheck scripts/docs-proposal/*.sh && node --test scripts/docs-proposal/hunks.test.mjs && scripts/docs-proposal/test.sh`
 12. Release producer checks: `node --test scripts/release/phase1.test.mjs && shellcheck scripts/release/phase1-build.sh`
 
+CI also runs these HTML EOF checks. Run them locally only when changing EOF
+finalization, publisher or HTML-processor code:
+
+- Native Rust HTML EOF harness configuration, timing and cleanup: `cargo test --manifest-path crates/trusted-server-integration-tests/Cargo.toml --features html-eof-runtime --test html_eof_runtime` and `cargo clippy --manifest-path crates/trusted-server-integration-tests/Cargo.toml --features html-eof-runtime --test html_eof_runtime -- -D warnings`
+- Actual Axum EOF/auction controls: `./scripts/async-html-finalization-local-test.sh axum --auction`
+- Actual Fastly EOF/auction controls with repository-pinned Viceroy (the fixture requires 0.19+): `./scripts/async-html-finalization-local-test.sh fastly --release --auction`. The auction control checks empty-bid assembly with a deliberately unreachable bidder. See `scripts/README.md` for retained diagnostics and other runtimes.
+
 ---
 
 ## Standard Workflow

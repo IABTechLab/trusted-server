@@ -300,9 +300,16 @@ The failed publisher check ran at 07:19:53.744 UTC; the independently verified r
 
 Post-publish downloads use fresh temporary directories and bounded transient read retries. The complete 29-file inventory and every byte, including SHA256SUMS, must match the cryptographically verified release/handoff. Missing, extra or changed files fail immediately. The release-body verification commands are tested against the operator guide’s canonical block. Axum uses the pinned EdgeZero resolver with every warning fatal; ports must be 1–65535, and primary `EDGEZERO__ADAPTER__PORT` and legacy `PORT` must agree. Container smokes use 0.0.0.0:8080 with host-side reachability.
 
-### Follow-ups
+### Axum diagnostic correction
 
-- Axum invalid-port diagnostics: `PORT=0` is correctly refused, but the forwarded EdgeZero warning names `EDGEZERO__ADAPTER__PORT="0"` and says “falling back.” Reword the error to name the actual supplied variable and state that startup is refused. This changes the binary and requires a fresh rehearsal; it is not part of this docs-only update.
+Invalid host and port errors now name the actual supplied environment variable
+and state that startup is refused. They no longer forward EdgeZero's fallback
+warnings. Each port alias is still validated with the pinned EdgeZero resolver;
+existing defaults, accepted values and conflict rejection are preserved.
+
+This correction and the current-main integration change the binary inputs.
+Rehearsal `.9` remains evidence for its recorded implementation only; a fresh
+rehearsal is required for the updated binaries.
 
 ## Approved Phase 2 rebuild-check compatibility
 
