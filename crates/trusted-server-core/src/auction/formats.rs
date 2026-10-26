@@ -341,10 +341,30 @@ pub fn convert_to_openrtb_response(
     auction_request: &AuctionRequest,
     ec_allowed: bool,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    Ok(
-        convert_to_openrtb_response_with_report(result, settings, auction_request, ec_allowed)?
-            .response,
-    )
+    convert_to_openrtb_response_with_mirror(result, settings, auction_request, ec_allowed, None)
+}
+
+/// Like [`convert_to_openrtb_response`], carrying the `ts-eids-s` mirror
+/// payload as `ext.ts_eids_s` (spec 6.2).
+///
+/// # Errors
+///
+/// Returns an error if response serialization fails.
+pub(crate) fn convert_to_openrtb_response_with_mirror(
+    result: &OrchestrationResult,
+    settings: &Settings,
+    auction_request: &AuctionRequest,
+    ec_allowed: bool,
+    ts_eids_s: Option<serde_json::Value>,
+) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    Ok(convert_to_openrtb_response_with_report(
+        result,
+        settings,
+        auction_request,
+        ec_allowed,
+        ts_eids_s,
+    )?
+    .response)
 }
 
 pub(crate) fn convert_to_openrtb_response_with_report(
@@ -352,6 +372,7 @@ pub(crate) fn convert_to_openrtb_response_with_report(
     settings: &Settings,
     auction_request: &AuctionRequest,
     ec_allowed: bool,
+    ts_eids_s: Option<serde_json::Value>,
 ) -> Result<OpenRtbResponseConversion, Report<TrustedServerError>> {
     let mut seatbids = Vec::with_capacity(result.winning_bids.len());
     let rewrite_creatives = settings.auction.rewrite_creatives;
@@ -512,6 +533,7 @@ pub(crate) fn convert_to_openrtb_response_with_report(
                 dropped_winner_count: delivery.dropped_winner_count,
                 dropped_winner_reasons: delivery.dropped_winner_reasons.clone(),
             },
+            ts_eids_s,
         }
         .to_ext(),
         ..Default::default()
@@ -1601,9 +1623,14 @@ mod tests {
             metadata: HashMap::new(),
         };
 
-        let conversion =
-            convert_to_openrtb_response_with_report(&result, &settings, &auction_request, false)
-                .expect("should omit invalid winners and preserve valid slots");
+        let conversion = convert_to_openrtb_response_with_report(
+            &result,
+            &settings,
+            &auction_request,
+            false,
+            None,
+        )
+        .expect("should omit invalid winners and preserve valid slots");
         assert_eq!(
             conversion.delivery.delivered_winner_slots,
             HashSet::from(["ordinary".to_string(), "renderer".to_string()]),
@@ -1926,9 +1953,14 @@ mod tests {
         let auction_request = make_auction_request();
         let result = make_result(make_bid("div-gpt-top", "appnexus", None));
 
-        let conversion =
-            convert_to_openrtb_response_with_report(&result, &settings, &auction_request, false)
-                .expect("should omit a winner without a decoded price");
+        let conversion = convert_to_openrtb_response_with_report(
+            &result,
+            &settings,
+            &auction_request,
+            false,
+            None,
+        )
+        .expect("should omit a winner without a decoded price");
         assert!(conversion.delivery.delivered_winner_slots.is_empty());
         assert_eq!(conversion.delivery.dropped_winner_count, 1);
         assert_eq!(

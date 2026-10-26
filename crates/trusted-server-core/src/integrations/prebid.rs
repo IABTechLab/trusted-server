@@ -973,6 +973,9 @@ fn validate_external_bundle_config(
 
 pub struct PrebidIntegration {
     config: PrebidIntegrationConfig,
+    /// Every `[[ec.partners]]` source domain, sorted, for the shim's
+    /// `ts-eids` trim (spec 5.3).
+    registered_sources: Vec<String>,
     planned_head_inserts: Option<Vec<String>>,
     #[cfg(test)]
     legacy_config: Option<LegacyPrebidServerConfig>,
@@ -986,6 +989,7 @@ impl PrebidIntegration {
         let engine = Arc::new(BidParamOverrideEngine::try_from_config(&config)?);
         Ok(Arc::new(Self {
             config: PrebidIntegrationConfig::from(&config),
+            registered_sources: Vec::new(),
             planned_head_inserts: None,
             legacy_config: Some(config),
             engine,
@@ -997,9 +1001,14 @@ impl PrebidIntegration {
         Self::try_new(config).expect("should compile prebid bid param overrides")
     }
 
-    fn for_browser_plan(config: &PrebidIntegrationConfig, plan: &AuctionPlan) -> Arc<Self> {
+    fn for_browser_plan(
+        config: &PrebidIntegrationConfig,
+        plan: &AuctionPlan,
+        registered_sources: Vec<String>,
+    ) -> Arc<Self> {
         let mut integration = Self {
             config: config.clone(),
+            registered_sources,
             planned_head_inserts: None,
             #[cfg(test)]
             legacy_config: None,
@@ -1123,6 +1132,7 @@ impl PrebidIntegration {
             } else {
                 Vec::new()
             }),
+            registered_sources: &self.registered_sources,
             ..InjectedPrebidClientConfig::from(browser_config)
         };
         let config_json = serialize_injected_prebid_config(&payload);
@@ -1368,7 +1378,15 @@ pub fn register_for_plan(
     config.excluded_gam_ad_unit_path_suffixes = canonical;
     validate_browser_config_for_startup(&config, &settings.proxy.allowed_domains)?;
     validate_browser_bidder_ownership(&config, plan)?;
-    let integration = PrebidIntegration::for_browser_plan(&config, plan);
+    let registered_sources = settings
+        .ec
+        .partners
+        .iter()
+        .map(|partner| partner.source_domain.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let integration = PrebidIntegration::for_browser_plan(&config, plan, registered_sources);
     Ok(Some(
         IntegrationRegistration::builder(PREBID_INTEGRATION_ID)
             .with_proxy(integration.clone())
@@ -1582,6 +1600,9 @@ struct InjectedPrebidClientConfig<'a> {
     client_side_bidders: &'a [String],
     #[serde(skip_serializing_if = "<[String]>::is_empty")]
     excluded_gam_ad_unit_path_suffixes: &'a [String],
+    /// The source domains of `[[ec.partners]]`, nothing else from the table.
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    registered_sources: &'a [String],
 }
 
 impl<'a> From<&'a PrebidIntegrationConfig> for InjectedPrebidClientConfig<'a> {
@@ -1599,6 +1620,7 @@ impl<'a> From<&'a PrebidIntegrationConfig> for InjectedPrebidClientConfig<'a> {
             server_side_bidders: None,
             client_side_bidders: &config.client_side_bidders,
             excluded_gam_ad_unit_path_suffixes: &config.excluded_gam_ad_unit_path_suffixes,
+            registered_sources: &[],
         }
     }
 }
@@ -4149,6 +4171,60 @@ server_url = "https://prebid.example/openrtb2/auction"
             "should inject the canonical suffix list: {config_insert}"
         );
     }
+    #[test]
+    fn injected_config_lists_registered_sources() {
+        let mut settings = make_settings();
+        settings
+            .integrations
+            .insert_config(
+                PREBID_INTEGRATION_ID,
+                &json!({
+                    "enabled": true,
+                    "external_bundle_url": "https://assets.example/prebid/trusted-prebid.js"
+                }),
+            )
+            .expect("should replace Prebid test configuration");
+        settings.ec.partners = ["zeta.example.com", "alpha.example.com", "mid.example.com"]
+            .into_iter()
+            .map(|source| {
+                crate::ec::identity::test_support::ec_partner(
+                    source,
+                    "https://sync.example.com/pull",
+                    "example-token-value-0123456789abcdef",
+                )
+            })
+            .collect();
+        let plan = Arc::new(
+            crate::auction::compile_auction_plan(&settings).expect("should compile auction plan"),
+        );
+        let registry = IntegrationRegistry::with_plan(&settings, plan)
+            .expect("should build integration registry");
+        let document_state = IntegrationDocumentState::default();
+        let context = IntegrationHtmlContext {
+            request_host: "pub.example",
+            request_scheme: "https",
+            origin_host: "origin.example",
+            document_state: &document_state,
+        };
+
+        let inserts = registry.head_inserts(&context);
+        let config_insert = inserts
+            .iter()
+            .find(|insert| insert.contains("window.__tsjs_prebid"))
+            .expect("should inject planned Prebid config");
+
+        assert!(
+            config_insert.contains(
+                r#""registeredSources":["alpha.example.com","mid.example.com","zeta.example.com"]"#
+            ),
+            "should list every partner source domain, sorted: {config_insert}"
+        );
+        assert!(
+            !config_insert.contains("example-token") && !config_insert.contains("sync.example.com"),
+            "should carry nothing else from the partner table: {config_insert}"
+        );
+    }
+
     #[test]
     fn managed_user_ids_parse_with_opaque_params() {
         let config = parse_prebid_toml(

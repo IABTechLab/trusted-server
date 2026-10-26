@@ -37,6 +37,9 @@ pub struct ResolvedPartnerId {
     /// The provider that wrote the record. `None` for browser ingest and
     /// version 1 rows.
     pub writer: Option<IdentityProviderId>,
+    /// Unix seconds at which the record stops being servable, when it has an
+    /// `exp`.
+    pub expires_at: Option<u64>,
 }
 
 /// Resolves source-domain keyed IDs from a KV entry against the partner registry.
@@ -79,6 +82,7 @@ pub(crate) fn resolve_partner_ids(
                 .w
                 .as_deref()
                 .and_then(|writer| writer.parse().ok()),
+            expires_at: partner_uid.exp,
         });
     }
 
@@ -406,6 +410,7 @@ mod tests {
                 openrtb_atype: 3,
                 entries: KvPartnerId::new("LR_xyz".to_owned()).eids,
                 writer: None,
+                expires_at: None,
             },
             ResolvedPartnerId {
                 uid: "ID5_abc".to_owned(),
@@ -413,6 +418,7 @@ mod tests {
                 openrtb_atype: 1,
                 entries: KvPartnerId::new("ID5_abc".to_owned()).eids,
                 writer: None,
+                expires_at: None,
             },
             ResolvedPartnerId {
                 uid: "pair-id".to_owned(),
@@ -420,6 +426,7 @@ mod tests {
                 openrtb_atype: 571187,
                 entries: KvPartnerId::new("pair-id".to_owned()).eids,
                 writer: None,
+                expires_at: None,
             },
         ];
 
@@ -451,6 +458,7 @@ mod tests {
                 openrtb_atype: 3,
                 entries: KvPartnerId::new(format!("uid_{}", "x".repeat(100))).eids,
                 writer: None,
+                expires_at: None,
             });
         }
 
@@ -472,6 +480,7 @@ mod tests {
             openrtb_atype: 3,
             entries: KvPartnerId::new("u1".to_owned()).eids,
             writer: None,
+            expires_at: None,
         }];
 
         let (encoded, truncated) =

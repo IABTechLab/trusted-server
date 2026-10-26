@@ -24,6 +24,7 @@ import {
 } from '../../core/first_impression';
 import { log } from '../../core/log';
 import { buildAdRequest, parseAuctionResponse } from '../../core/auction';
+import { writeEidsMirror } from '../../core/eids_mirror';
 import { registerApsPrebidRenderer, validateApsRenderer } from '../aps/render';
 import type { AuctionBid } from '../../core/auction';
 import type { AuctionSlot, TsjsApi } from '../../core/types';
@@ -189,6 +190,8 @@ interface InjectedPrebidConfig {
   excludedGamAdUnitPathSuffixes?: string[];
   /** Operator-owned Prebid User ID module entries, forwarded verbatim. */
   managedUserIds?: InjectedManagedUserId[];
+  /** `[[ec.partners]]` source domains the `ts-eids` trim keeps first. */
+  registeredSources?: string[];
 }
 
 /**
@@ -2320,6 +2323,11 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     ) {
       const body = serverResponse?.body;
       log.debug('[tsjs-prebid] interpretResponse', { hasSeatbid: !!body?.seatbid });
+      // The mirror is client-only state for page scripts; absent means the
+      // request read no KV and the cookie stays as it is.
+      if (body?.ext?.ts_eids_s !== undefined) {
+        writeEidsMirror(body.ext.ts_eids_s);
+      }
       const auctionBids = parseAuctionResponse(body);
       const bidRequests = request?.tsjsBidRequests ?? request?.bidRequests ?? [];
       return auctionBidsToPrebidBids(auctionBids, bidRequests, apsRendererSupported);
@@ -2874,7 +2882,7 @@ function logTrimmedEidSources(droppedSources: string[], trimmedSources: string[]
  */
 function writePrebidEidsCookie(eids: unknown[]): EidCookieDecision {
   try {
-    const fitted = fitEidCookie(eids);
+    const fitted = fitEidCookie(eids, new Set(getInjectedConfig()?.registeredSources ?? []));
     logTrimmedEidSources(fitted.droppedSources, fitted.trimmedSources);
     if (fitted.value === undefined) {
       clearPrebidEidsCookie();

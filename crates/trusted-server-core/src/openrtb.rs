@@ -232,6 +232,10 @@ pub struct BidTrustedServerExt<'a> {
 #[derive(Debug, Serialize)]
 pub struct ResponseExt {
     pub orchestrator: OrchestratorExt,
+    /// The `ts-eids-s` mirror payload, absent when the request read no KV
+    /// (spec 6.2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ts_eids_s: Option<serde_json::Value>,
 }
 
 impl ToExt for ResponseExt {}
@@ -352,6 +356,7 @@ mod tests {
                 dropped_winner_count: 0,
                 dropped_winner_reasons: Default::default(),
             },
+            ts_eids_s: None,
         }
         .to_ext();
 

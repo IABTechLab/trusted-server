@@ -235,6 +235,10 @@ interface TestAdapterSpec {
   ) => Array<Record<string, unknown>>;
 }
 
+const { mockWriteEidsMirror } = vi.hoisted(() => ({ mockWriteEidsMirror: vi.fn() }));
+
+vi.mock('../../../src/core/eids_mirror', () => ({ writeEidsMirror: mockWriteEidsMirror }));
+
 // Define mocks using vi.hoisted so they exist before the module under test is
 // imported. The shim reads Prebid.js from the `window.pbjs` global (owned by
 // the external bundle in production), so tests install the mock there instead
@@ -2926,6 +2930,59 @@ describe('prebid/installPrebidNpm', () => {
           bidderCode: 'appnexus',
         })
       );
+    });
+
+    it('interpretResponse writes the ts-eids-s mirror the response carries', () => {
+      mockWriteEidsMirror.mockClear();
+      const spec = getAdapterSpec();
+      const built = spec.buildRequests([]);
+      const mirror = { value: 'eyJ2IjoxfQ', max_age: 600 };
+
+      spec.interpretResponse({ body: { seatbid: [], ext: { ts_eids_s: mirror } } }, built);
+      spec.interpretResponse({ body: { seatbid: [], ext: { ts_eids_s: { clear: true } } } }, built);
+
+      expect(mockWriteEidsMirror).toHaveBeenCalledTimes(2);
+      expect(mockWriteEidsMirror).toHaveBeenNthCalledWith(1, mirror);
+      expect(mockWriteEidsMirror).toHaveBeenNthCalledWith(2, { clear: true });
+    });
+
+    it('interpretResponse leaves the mirror alone when the response has none', () => {
+      mockWriteEidsMirror.mockClear();
+      const spec = getAdapterSpec();
+      const built = spec.buildRequests([]);
+
+      spec.interpretResponse({ body: { seatbid: [], ext: {} } }, built);
+      spec.interpretResponse({ body: { seatbid: [] } }, built);
+      spec.interpretResponse({ body: null }, built);
+
+      expect(mockWriteEidsMirror).not.toHaveBeenCalled();
+    });
+
+    it('keeps injected registered sources in ts-eids when the set must be trimmed', () => {
+      testWindow.__tsjs_prebid = { registeredSources: ['registered.example.com'] };
+      try {
+        const spec = getAdapterSpec();
+        const long = 'x'.repeat(400);
+        const unregistered = [0, 1, 2, 3, 4, 5, 6].map((index) => ({
+          source: `u${index}.example.com`,
+          uids: [{ id: long, atype: 1 }],
+        }));
+        const registered = { source: 'registered.example.com', uids: [{ id: long, atype: 1 }] };
+
+        const result = spec.buildRequests(
+          trustedServerBidRequests(),
+          prebidBidderRequest({ ext: { eids: [...unregistered, registered] } })
+        );
+
+        expect(JSON.parse(String(result.data)).eids, 'the body keeps every entry').toHaveLength(8);
+        const sources = (decodedTsEidsCookie() as Array<{ source: string }>).map(
+          (entry) => entry.source
+        );
+        expect(sources[0]).toBe('registered.example.com');
+        expect(sources).not.toContain('u6.example.com');
+      } finally {
+        delete testWindow.__tsjs_prebid;
+      }
     });
 
     it('interpretResponse handles empty/missing seatbid', () => {

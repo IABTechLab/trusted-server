@@ -153,6 +153,13 @@ function cookieLabel(entry: unknown): string {
   return isRecord(entry) && typeof entry.source === 'string' ? entry.source : '(malformed entry)';
 }
 
+function isRegistered(entry: unknown, registeredSources: ReadonlySet<string>): boolean {
+  if (!isRecord(entry) || typeof entry.source !== 'string') {
+    return false;
+  }
+  return registeredSources.has(entry.source.trim().toLowerCase().replace(/\.$/, ''));
+}
+
 function encodeUtf8Base64(text: string): string {
   let binary = '';
   for (const byte of utf8Encoder.encode(text)) {
@@ -171,11 +178,21 @@ function encodeUtf8Base64(text: string): string {
  * entry itself, and repeat. A last entry that is not an object with a `uids`
  * array is removed whole. The input is not modified.
  *
+ * Only the writer navigation ingests `ts-eids`, so when the set does not fit
+ * the entries of registered sources move ahead of the others and trimming
+ * reaches them last. Within each group the order is unchanged. A set that
+ * fits keeps its order.
+ *
  * @param eids the entries forwarded in the `/auction` body
+ * @param registeredSources the `[[ec.partners]]` source domains the server
+ *   injected; empty keeps the plain tail trim
  * @returns the cookie value, or `undefined` when nothing fits, and the
  *   sources trimming touched
  */
-export function fitEidCookie(eids: readonly unknown[]): FittedEidCookie {
+export function fitEidCookie(
+  eids: readonly unknown[],
+  registeredSources: ReadonlySet<string> = new Set()
+): FittedEidCookie {
   const seen = new Set<string>();
   const payload: unknown[] = [];
   for (const entry of eids) {
@@ -194,6 +211,7 @@ export function fitEidCookie(eids: readonly unknown[]): FittedEidCookie {
 
   const dropped = new Set<string>();
   const trimmed = new Set<string>();
+  let registeredFirst = false;
   while (payload.length > 0) {
     const value = encodeUtf8Base64(JSON.stringify(payload));
     if (value.length <= MAX_EID_COOKIE_BYTES) {
@@ -202,6 +220,13 @@ export function fitEidCookie(eids: readonly unknown[]): FittedEidCookie {
         droppedSources: [...dropped],
         trimmedSources: [...trimmed],
       };
+    }
+
+    if (!registeredFirst) {
+      registeredFirst = true;
+      const registered = payload.filter((entry) => isRegistered(entry, registeredSources));
+      const others = payload.filter((entry) => !isRegistered(entry, registeredSources));
+      payload.splice(0, payload.length, ...registered, ...others);
     }
 
     const last = payload[payload.length - 1];

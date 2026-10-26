@@ -265,6 +265,81 @@ describe('collectBidderEids', () => {
 });
 
 describe('fitEidCookie', () => {
+  describe('registered sources', () => {
+    const long = 'x'.repeat(400);
+    const entry = (source: string) => ({ source, uids: [{ id: long, atype: 1 }] });
+
+    it('keeps_registered_sources_before_unregistered_ones', () => {
+      // Eight entries are over the cookie cap; the registered source comes last.
+      const unregistered = [0, 1, 2, 3, 4, 5, 6].map((index) => entry(`u${index}.example.com`));
+      const registered = entry('registered.example.com');
+
+      const fitted = fitEidCookie(
+        [...unregistered, registered],
+        new Set(['registered.example.com'])
+      );
+
+      const sources = (decodeCookie(fitted.value) as Array<{ source: string }>).map(
+        (item) => item.source
+      );
+      expect(sources[0]).toBe('registered.example.com');
+      expect(sources).not.toContain('u6.example.com');
+      expect(fitted.droppedSources).toContain('u6.example.com');
+      expect(fitted.droppedSources).not.toContain('registered.example.com');
+      expect(fitted.value!.length).toBeLessThanOrEqual(MAX_EID_COOKIE_BYTES);
+    });
+
+    it('matches registered sources after lowercasing and removing a trailing dot', () => {
+      const unregistered = [0, 1, 2, 3, 4, 5, 6].map((index) => entry(`u${index}.example.com`));
+
+      const fitted = fitEidCookie(
+        [...unregistered, entry('Registered.Example.com.')],
+        new Set(['registered.example.com'])
+      );
+
+      expect(fitted.droppedSources).not.toContain('Registered.Example.com.');
+    });
+
+    it('keeps the trim order within each group', () => {
+      const registered = [0, 1, 2, 3, 4, 5, 6].map((index) => entry(`r${index}.example.com`));
+      const unregistered = [0, 1].map((index) => entry(`u${index}.example.com`));
+
+      const fitted = fitEidCookie(
+        [...registered.slice(0, 3), unregistered[0], ...registered.slice(3), unregistered[1]],
+        new Set(registered.map((item) => item.source))
+      );
+
+      // Unregistered sources go first, last-first, then registered ones from the tail.
+      expect(fitted.droppedSources).toEqual([
+        'u1.example.com',
+        'u0.example.com',
+        'r6.example.com',
+        'r5.example.com',
+      ]);
+    });
+
+    it('keeps the input order when the set fits', () => {
+      const small = [
+        { source: 'u.example.com', uids: [{ id: 'u' }] },
+        { source: 'r.example.com', uids: [{ id: 'r' }] },
+      ];
+
+      const fitted = fitEidCookie(small, new Set(['r.example.com']));
+
+      expect(decodeCookie(fitted.value)).toEqual(small);
+    });
+
+    it('trims as before when no source is registered', () => {
+      const entries = [0, 1, 2, 3, 4, 5, 6].map((index) => entry(`s${index}.example.com`));
+
+      expect(fitEidCookie(entries, new Set())).toEqual(fitEidCookie(entries));
+      expect(fitEidCookie(entries, new Set()).droppedSources).toEqual([
+        's6.example.com',
+        's5.example.com',
+      ]);
+    });
+  });
+
   it('removes EID-level ext and drops the duplicates that creates, comparing with sorted keys', () => {
     const withExt = {
       source: 'a.example.com',

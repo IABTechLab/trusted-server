@@ -6,6 +6,7 @@ import {
   releaseTrustedServerFirstImpressionClaim,
   reservePublisherFirstImpressionFallback,
 } from '../../core/first_impression';
+import { writeEidsMirror } from '../../core/eids_mirror';
 import { log } from '../../core/log';
 import { resolveSlotElementByDivId } from '../../core/slot_element';
 import type {
@@ -1490,6 +1491,8 @@ export function installTsAdInit(): void {
 interface PageBidsResponse {
   slots: AuctionSlot[];
   bids: Record<string, AuctionBidData>;
+  /** The `__Host-ts-eids-s` mirror payload; absent when the request read no KV. */
+  ts_eids_s?: unknown;
 }
 
 /** Canonical SPA re-auction endpoint. Mirrors `PAGE_BIDS_PATH` in Rust. */
@@ -1716,6 +1719,12 @@ export function installSpaAuctionHook(): void {
         // newer navigation has already advanced currentPath.
         if (inflight === controller) currentPath = lastAppliedPath;
         return;
+      }
+      // The mirror comes from the row this response read, so it is written
+      // even when a newer navigation has superseded the route. Absent means
+      // no KV read and the cookie stays as it is.
+      if (data.ts_eids_s !== undefined) {
+        writeEidsMirror(data.ts_eids_s);
       }
       if (inflight !== controller) return;
       // Defer applying bids until the new route's ad containers exist, so a

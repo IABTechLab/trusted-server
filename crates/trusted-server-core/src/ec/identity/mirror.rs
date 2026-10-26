@@ -1,10 +1,6 @@
 //! The `ts-eids-s` mirror payload: the servable server set for page scripts,
 //! capped to one cookie (spec 6.2). The server never reads the cookie back.
 
-// Temporary: the coordinator, the first non-test caller, arrives in a later
-// task. Remove this when it lands.
-#![allow(dead_code)]
-
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde_json::json;

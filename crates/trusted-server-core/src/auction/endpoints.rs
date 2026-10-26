@@ -16,9 +16,12 @@ use crate::ec::EcContext;
 use crate::ec::EcKvSnapshot;
 use crate::ec::checked_current_timestamp;
 use crate::ec::client_eids::parse_client_eids;
-use crate::ec::eids::{resolve_partner_ids, to_eids};
+use crate::ec::current_timestamp;
+use crate::ec::eids::{ResolvedPartnerId, resolve_partner_ids, to_eids};
+use crate::ec::identity::IdentityRuntime;
 use crate::ec::identity::UnixTime;
 use crate::ec::identity::catalog::ProviderCatalog;
+use crate::ec::identity::mirror::{MirrorPayload, MirrorRead, MirrorSource, mirror_payload};
 use crate::ec::identity::policy::PolicySignals;
 use crate::ec::identity::request::opted_out;
 use crate::ec::identity::servable::ServeContext;
@@ -33,7 +36,7 @@ use crate::settings::Settings;
 
 use super::AuctionOrchestrator;
 use super::formats::{
-    convert_to_openrtb_response, convert_to_openrtb_response_with_report,
+    convert_to_openrtb_response_with_mirror, convert_to_openrtb_response_with_report,
     convert_tsjs_to_auction_request,
 };
 use super::telemetry::{
@@ -219,11 +222,17 @@ pub async fn handle_auction(
             total_time_ms: 0,
             metadata: HashMap::new(),
         };
-        return convert_to_openrtb_response(
+        return convert_to_openrtb_response_with_mirror(
             &empty_result,
             settings,
             &auction_request,
             ec_context.ec_allowed(),
+            mirror_member(
+                &EcKvSnapshot::NotRead,
+                None,
+                ec_context,
+                PolicySignals::from_headers(http_req.headers()),
+            ),
         );
     }
 
@@ -272,11 +281,14 @@ pub async fn handle_auction(
             total_time_ms: 0,
             metadata: HashMap::new(),
         };
-        return convert_to_openrtb_response(
+        // A denial clears the mirror so a withdrawal reaches the cookie
+        // (spec 5.6).
+        return convert_to_openrtb_response_with_mirror(
             &empty_result,
             settings,
             &auction_request,
             ec_context.ec_allowed(),
+            Some(MirrorPayload::Clear.to_json()),
         );
     }
 
@@ -301,12 +313,8 @@ pub async fn handle_auction(
     } else {
         None
     };
-    // Carry the full request-local EID set to response finalization so KV
-    // ingestion uses what this request actually sent, not just whatever fits
-    // in the size-capped `ts-eids` cookie (see `ec::finalize::ec_finalize_response`).
-    if let Some(eids) = &client_eids {
-        ec_context.set_client_eids(eids.clone());
-    }
+    // The browser's EIDs feed the merge below and nothing else: `/auction` is
+    // a stager, so they never reach KV (spec 5.3, G10).
 
     // Resolve partner EIDs from the KV identity graph when the user has a valid
     // EC and both KV and partner stores are available. Gate the read on a
@@ -316,19 +324,15 @@ pub async fn handle_auction(
         (Some(graph), Some(ec_id), Some(_)) => graph.load_snapshot(ec_id),
         _ => EcKvSnapshot::NotRead,
     };
-    // Hand the loaded row to the request context so response finalization —
-    // which runs on an EC context the adapter owns, after this handler returns
-    // — ingests `ts-eids`/`sharedId` updates from this read instead of paying
-    // for a second lookup.
+    // Hand the loaded row to the request context so response finalization,
+    // which runs on an EC context the adapter owns after this handler
+    // returns, reuses this read instead of paying for a second lookup.
     if !matches!(auction_kv_snapshot, EcKvSnapshot::NotRead) {
         ec_context.set_kv_snapshot(auction_kv_snapshot.clone());
     }
-    let eids = resolve_auction_eids(
-        &auction_kv_snapshot,
-        registry,
-        ec_context,
-        PolicySignals::from_headers(http_req.headers()),
-    );
+    let signals = PolicySignals::from_headers(http_req.headers());
+    let eids = resolve_auction_eids(&auction_kv_snapshot, registry, ec_context, signals);
+    let mirror = mirror_member(&auction_kv_snapshot, registry, ec_context, signals);
 
     // Look up geo for device info.
     let geo = services
@@ -404,6 +408,7 @@ pub async fn handle_auction(
         settings,
         &auction_request,
         ec_context.ec_allowed(),
+        mirror,
     ) {
         Ok(conversion) => conversion,
         Err(error) => {
@@ -460,6 +465,17 @@ pub(crate) fn resolve_auction_eids(
     ec_context: &EcContext,
     signals: PolicySignals,
 ) -> Option<Vec<Eid>> {
+    resolve_servable_ids(snapshot, registry, ec_context, signals).map(|resolved| to_eids(&resolved))
+}
+
+/// The servable stored records behind [`resolve_auction_eids`], before they
+/// become EIDs.
+fn resolve_servable_ids(
+    snapshot: &EcKvSnapshot,
+    registry: Option<&PartnerRegistry>,
+    ec_context: &EcContext,
+    signals: PolicySignals,
+) -> Option<Vec<ResolvedPartnerId>> {
     let registry = registry?;
 
     if !ec_context.ec_allowed() {
@@ -499,8 +515,82 @@ pub(crate) fn resolve_auction_eids(
         catalog,
         opted_out: &opted_out,
     };
-    let resolved = resolve_partner_ids(registry, entry, &serve);
-    Some(to_eids(&resolved))
+    Some(resolve_partner_ids(registry, entry, &serve))
+}
+
+/// What the request's KV read gives the `ts-eids-s` mirror (spec 6.2).
+///
+/// `sources` receives the servable server set, one [`MirrorSource`] per
+/// source, after `gate_eids_by_consent`: the mirror never carries an ID
+/// consent filtered out. The returned [`MirrorRead`] borrows it.
+///
+/// Consent that denies EC use clears the mirror before any KV read is
+/// needed, so a withdrawal reaches the cookie. Otherwise the result follows
+/// the row this request read: [`MirrorRead::NotRead`] when it read none,
+/// [`MirrorRead::Cleared`] for a missing row, a tombstone or `consent.ok =
+/// false`, and the servable set for a live row.
+pub(crate) fn mirror_read<'a>(
+    snapshot: &EcKvSnapshot,
+    registry: Option<&PartnerRegistry>,
+    ec_context: &EcContext,
+    signals: PolicySignals,
+    sources: &'a mut Vec<MirrorSource>,
+) -> MirrorRead<'a> {
+    if !ec_context.ec_allowed() {
+        return MirrorRead::Cleared;
+    }
+    let (Some(ec_id), Some(_)) = (ec_context.ec_value(), registry) else {
+        return MirrorRead::NotRead;
+    };
+    match snapshot {
+        EcKvSnapshot::Missing { ec_id: read } if read == ec_id => return MirrorRead::Cleared,
+        EcKvSnapshot::Present {
+            ec_id: read, entry, ..
+        } if read == ec_id && !entry.consent.ok => {
+            return MirrorRead::Cleared;
+        }
+        EcKvSnapshot::Present { ec_id: read, .. } if read == ec_id => {}
+        _ => return MirrorRead::NotRead,
+    }
+    let resolved =
+        resolve_servable_ids(snapshot, registry, ec_context, signals).unwrap_or_default();
+    let identity = ec_context.identity_runtime().map(IdentityRuntime::identity);
+    let candidates: Vec<MirrorSource> = resolved
+        .iter()
+        .map(|record| {
+            let priority = match (&record.writer, identity) {
+                (Some(writer), Some(identity)) => identity.provider(writer).cookie_priority,
+                _ => 0,
+            };
+            MirrorSource {
+                source: record.source_domain.clone(),
+                provider: record.writer.clone(),
+                priority,
+                expires_at: record.expires_at,
+                eids: to_eids(core::slice::from_ref(record)),
+            }
+        })
+        .collect();
+    match gate_eids_by_consent(Some(candidates), Some(ec_context.consent())) {
+        Some(gated) => {
+            *sources = gated;
+            MirrorRead::Servable(sources)
+        }
+        None => MirrorRead::Cleared,
+    }
+}
+
+/// The mirror member of an `/auction` or `/_ts/page-bids` response, from the
+/// row this request read (spec 6.2).
+pub(crate) fn mirror_member(
+    snapshot: &EcKvSnapshot,
+    registry: Option<&PartnerRegistry>,
+    ec_context: &EcContext,
+    signals: PolicySignals,
+) -> Option<serde_json::Value> {
+    let mut sources = Vec::new();
+    let read = mirror_read(snapshot, registry, ec_context, signals, &mut sources);
+    mirror_payload(read, current_timestamp()).map(|payload| payload.to_json())
 }
 
 /// Resolves the request's browser EIDs: the `/auction` body when it has a
@@ -2336,5 +2426,451 @@ mod tests {
                 "streaming request body should fail as bad request"
             );
         });
+    }
+
+    mod mirror {
+        use super::*;
+        use crate::ec::kv_types::{KvEntry, KvPartnerId};
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        const MIRROR_SOURCE_A: &str = "a.example.com";
+        const MIRROR_SOURCE_B: &str = "b.example.com";
+
+        fn mirror_registry() -> PartnerRegistry {
+            let mut disabled = counting_test_partner("off.example.com");
+            disabled.bidstream_enabled = false;
+            PartnerRegistry::from_config(&[
+                counting_test_partner(MIRROR_SOURCE_A),
+                counting_test_partner(MIRROR_SOURCE_B),
+                disabled,
+            ])
+            .expect("should build partner registry")
+        }
+
+        fn row_with(records: &[(&str, &str, Option<u64>)]) -> KvEntry {
+            let mut entry = KvEntry::minimal("unregistered.example.com", "x", 1);
+            entry.ids.clear();
+            for (source, uid, exp) in records {
+                entry.ids.insert(
+                    (*source).to_owned(),
+                    KvPartnerId {
+                        exp: *exp,
+                        ..KvPartnerId::browser(*uid, Some(1))
+                    },
+                );
+            }
+            entry
+        }
+
+        fn ec_id_for(tag: &str) -> String {
+            format!("{}.{tag}", "a".repeat(64))
+        }
+
+        /// Records the EIDs its request carried, then answers no-bid so the
+        /// auction completes and the response can be inspected.
+        struct NoBidRecordingProvider {
+            eids: Arc<Mutex<Option<JsonValue>>>,
+        }
+
+        #[async_trait::async_trait(?Send)]
+        impl AuctionProvider for NoBidRecordingProvider {
+            fn provider_name(&self) -> &str {
+                "eid_recording_provider"
+            }
+
+            async fn request_bids(
+                &self,
+                request: &AuctionRequest,
+                _context: &AuctionContext<'_>,
+            ) -> Result<ProviderRequestOutcome, Report<TrustedServerError>> {
+                *self.eids.lock().expect("should lock recorded eids") = Some(
+                    serde_json::to_value(&request.user.eids)
+                        .expect("should serialize recorded eids"),
+                );
+                Ok(ProviderRequestOutcome::Immediate(AuctionResponse::no_bid(
+                    self.provider_name(),
+                    0,
+                )))
+            }
+
+            async fn parse_response(
+                &self,
+                _response: PlatformResponse,
+                _response_time_ms: u64,
+            ) -> Result<AuctionResponse, Report<TrustedServerError>> {
+                panic!("parse_response must not run for an immediate answer");
+            }
+
+            fn timeout_ms(&self) -> u32 {
+                100
+            }
+
+            fn backend_name(
+                &self,
+                _services: &RuntimeServices,
+                _timeout_ms: u32,
+            ) -> Option<String> {
+                Some("record-backend".to_string())
+            }
+        }
+
+        fn recording_orchestrator(recorded: &Arc<Mutex<Option<JsonValue>>>) -> AuctionOrchestrator {
+            let mut orchestrator = AuctionOrchestrator::new(AuctionConfig {
+                enabled: true,
+                providers: AuctionConfig::legacy_provider_map(&["eid_recording_provider"]),
+                timeout_ms: 2000,
+                mediator: None,
+                ..Default::default()
+            });
+            orchestrator.register_provider(Arc::new(NoBidRecordingProvider {
+                eids: Arc::clone(recorded),
+            }));
+            orchestrator
+        }
+
+        async fn run_auction(
+            ec_context: &mut EcContext,
+            graph: Option<&KvIdentityGraph>,
+            registry: Option<&PartnerRegistry>,
+            body: Vec<u8>,
+        ) -> JsonValue {
+            let recorded = Arc::new(Mutex::new(None));
+            let orchestrator = recording_orchestrator(&recorded);
+            let req = Request::builder()
+                .method("POST")
+                .uri("https://test-publisher.com/auction")
+                .body(EdgeBody::from(body))
+                .expect("should build auction request");
+            let response = handle_auction(
+                &create_test_settings(),
+                &orchestrator,
+                graph,
+                registry,
+                ec_context,
+                &noop_services(),
+                req,
+            )
+            .await
+            .expect("should answer the auction");
+            let bytes = response
+                .into_body()
+                .into_bytes()
+                .expect("should buffer the body");
+            serde_json::from_slice(&bytes).expect("should parse the response")
+        }
+
+        fn mirror_of(response: &JsonValue) -> Option<&JsonValue> {
+            response.get("ext").and_then(|ext| ext.get("ts_eids_s"))
+        }
+
+        fn decoded(mirror: &JsonValue) -> JsonValue {
+            let value = mirror["value"].as_str().expect("should hold a value");
+            let bytes = URL_SAFE_NO_PAD
+                .decode(value)
+                .expect("should be unpadded base64url");
+            serde_json::from_slice(&bytes).expect("should be JSON")
+        }
+
+        fn live_context(ec_id: &str, graph: &KvIdentityGraph) -> EcContext {
+            let _ = graph;
+            make_ec_context(Jurisdiction::NonRegulated, Some(ec_id))
+        }
+
+        #[tokio::test]
+        async fn auction_body_eids_are_not_written_to_kv() {
+            let (graph, store) = KvIdentityGraph::write_counting("test_store");
+            let ec_id = ec_id_for("nowrit");
+            graph
+                .create(&ec_id, &row_with(&[]))
+                .expect("should seed the live row");
+            store.reset_counts();
+            let registry = mirror_registry();
+            let recorded = Arc::new(Mutex::new(None));
+            let orchestrator = recording_orchestrator(&recorded);
+            let mut ec_context = live_context(&ec_id, &graph);
+            let req = Request::builder()
+                .method("POST")
+                .uri("https://test-publisher.com/auction")
+                .body(EdgeBody::from(
+                    serde_json::to_vec(&json!({
+                        "adUnits": [{ "code": "div-gpt-1", "mediaTypes": { "banner": { "sizes": [[300, 250]] } } }],
+                        "eids": [{ "source": MIRROR_SOURCE_A, "uids": [{ "id": "body-uid", "atype": 1 }] }]
+                    }))
+                    .expect("should serialize body"),
+                ))
+                .expect("should build auction request");
+
+            let _ = handle_auction(
+                &create_test_settings(),
+                &orchestrator,
+                Some(&graph),
+                Some(&registry),
+                &mut ec_context,
+                &noop_services(),
+                req,
+            )
+            .await;
+            let mut response = http::Response::new(EdgeBody::empty());
+            crate::ec::finalize::ec_finalize_response(
+                &create_test_settings(),
+                &mut ec_context,
+                Some(&graph),
+                &registry,
+                None,
+                None,
+                &mut response,
+            );
+
+            let writes = store.writes();
+            assert_eq!(
+                (writes.add, writes.if_generation_match, writes.overwrite),
+                (0, 0, 0),
+                "should write nothing to KV"
+            );
+            assert_eq!(
+                recorded.lock().expect("should lock recorded eids").clone(),
+                Some(
+                    json!([{ "source": MIRROR_SOURCE_A, "uids": [{ "id": "body-uid", "atype": 1 }] }])
+                ),
+                "should still send the body's UID to the bidder"
+            );
+        }
+
+        #[tokio::test]
+        async fn auction_returns_the_mirror_of_its_servable_set() {
+            let ec_id = ec_id_for("mirror");
+            let graph = KvIdentityGraph::in_memory("test_store");
+            graph
+                .create(&ec_id, &row_with(&[(MIRROR_SOURCE_A, "uid-a", None)]))
+                .expect("should seed the live row");
+            let registry = mirror_registry();
+            let mut ec_context = live_context(&ec_id, &graph);
+
+            let response = run_auction(
+                &mut ec_context,
+                Some(&graph),
+                Some(&registry),
+                ad_units_only_body(),
+            )
+            .await;
+
+            let mirror = mirror_of(&response).expect("should carry the mirror");
+            let atype = crate::settings::EcPartner::default_openrtb_atype();
+            assert_eq!(
+                decoded(mirror),
+                json!({ "v": 1, "eids": [{ "source": MIRROR_SOURCE_A, "uids": [{ "id": "uid-a", "atype": atype }] }] }),
+                "should hold exactly the servable record's EID"
+            );
+            assert_eq!(
+                mirror["max_age"], 86_400,
+                "should live a day without an exp"
+            );
+        }
+
+        #[tokio::test]
+        async fn auction_mirror_max_age_follows_the_earliest_exp() {
+            let now = crate::ec::current_timestamp();
+            let ec_id = ec_id_for("maxage");
+            let graph = KvIdentityGraph::in_memory("test_store");
+            graph
+                .create(
+                    &ec_id,
+                    &row_with(&[
+                        (MIRROR_SOURCE_A, "uid-a", Some(now + 600)),
+                        (MIRROR_SOURCE_B, "uid-b", Some(now + 999_999)),
+                    ]),
+                )
+                .expect("should seed the live row");
+            let registry = mirror_registry();
+            let mut ec_context = live_context(&ec_id, &graph);
+
+            let response = run_auction(
+                &mut ec_context,
+                Some(&graph),
+                Some(&registry),
+                ad_units_only_body(),
+            )
+            .await;
+
+            let max_age = mirror_of(&response).expect("should carry the mirror")["max_age"]
+                .as_u64()
+                .expect("should hold a number");
+            assert!(
+                (595..=600).contains(&max_age),
+                "should take the earliest exp, got {max_age}"
+            );
+        }
+
+        #[tokio::test]
+        async fn auction_mirror_leaves_out_bidstream_disabled_sources() {
+            let ec_id = ec_id_for("bidoff");
+            let graph = KvIdentityGraph::in_memory("test_store");
+            graph
+                .create(
+                    &ec_id,
+                    &row_with(&[
+                        (MIRROR_SOURCE_A, "uid-a", None),
+                        ("off.example.com", "uid-off", None),
+                    ]),
+                )
+                .expect("should seed the live row");
+            let registry = mirror_registry();
+            let mut ec_context = live_context(&ec_id, &graph);
+
+            let response = run_auction(
+                &mut ec_context,
+                Some(&graph),
+                Some(&registry),
+                ad_units_only_body(),
+            )
+            .await;
+
+            let sources: Vec<String> =
+                decoded(mirror_of(&response).expect("should carry the mirror"))["eids"]
+                    .as_array()
+                    .expect("should hold EIDs")
+                    .iter()
+                    .map(|eid| eid["source"].as_str().unwrap_or_default().to_owned())
+                    .collect();
+            assert_eq!(
+                sources,
+                vec![MIRROR_SOURCE_A.to_owned()],
+                "should leave out the source bidstream disabled"
+            );
+        }
+
+        #[tokio::test]
+        async fn auction_mirror_leaves_out_ids_consent_filters_out() {
+            // TCF Purpose 1 granted, Purpose 4 refused: the auction runs, but
+            // `gate_eids_by_consent` strips every EID the bidder would get.
+            let ec_id = ec_id_for("gated");
+            let graph = KvIdentityGraph::in_memory("test_store");
+            graph
+                .create(&ec_id, &row_with(&[(MIRROR_SOURCE_A, "uid-a", None)]))
+                .expect("should seed the live row");
+            let registry = mirror_registry();
+            let mut ec_context =
+                EcContext::new_for_test(Some(ec_id.clone()), gdpr_consent_with_purposes(&[1], 4));
+
+            let response = run_auction(
+                &mut ec_context,
+                Some(&graph),
+                Some(&registry),
+                ad_units_only_body(),
+            )
+            .await;
+
+            assert_eq!(
+                mirror_of(&response),
+                Some(&json!({ "clear": true })),
+                "should not mirror an ID consent filtered out"
+            );
+        }
+
+        fn gdpr_consent_with_purposes(granted: &[usize], _refused: usize) -> ConsentContext {
+            let mut consent =
+                crate::ec::identity::test_support::test_consent_gdpr_without_vendor(9_999);
+            let tcf = consent.tcf.as_mut().expect("should hold a TCF string");
+            tcf.purpose_consents = (1..=24).map(|purpose| granted.contains(&purpose)).collect();
+            consent
+        }
+
+        #[tokio::test]
+        async fn auction_returns_clear_on_consent_denial_tombstone_and_missing_row() {
+            let registry = mirror_registry();
+            let live = row_with(&[(MIRROR_SOURCE_A, "uid-a", None)]);
+            let mut withdrawn = live.clone();
+            withdrawn.consent.ok = false;
+            let cases: [(&str, Option<KvEntry>, bool, JsonValue); 5] = [
+                ("live row", Some(live.clone()), false, json!("value")),
+                (
+                    "tombstone",
+                    Some(KvEntry::tombstone(1_000)),
+                    false,
+                    json!({ "clear": true }),
+                ),
+                (
+                    "consent.ok false",
+                    Some(withdrawn),
+                    false,
+                    json!({ "clear": true }),
+                ),
+                ("missing row", None, false, json!({ "clear": true })),
+                ("consent denial", Some(live), true, json!({ "clear": true })),
+            ];
+
+            for (label, row, deny_consent, expected) in cases {
+                let ec_id = ec_id_for("clears");
+                let graph = KvIdentityGraph::in_memory("test_store");
+                if let Some(row) = &row {
+                    graph.create(&ec_id, row).expect("should seed the row");
+                }
+                let mut ec_context = if deny_consent {
+                    // No TCF Purpose 1: the auction consent gate answers early.
+                    EcContext::new_for_test(Some(ec_id.clone()), gdpr_consent_with_purposes(&[], 4))
+                } else {
+                    live_context(&ec_id, &graph)
+                };
+
+                let response = run_auction(
+                    &mut ec_context,
+                    Some(&graph),
+                    Some(&registry),
+                    ad_units_only_body(),
+                )
+                .await;
+
+                let mirror = mirror_of(&response)
+                    .unwrap_or_else(|| panic!("{label}: should carry a mirror"));
+                if expected == json!("value") {
+                    assert!(
+                        mirror.get("value").is_some(),
+                        "{label}: should carry a value"
+                    );
+                } else {
+                    assert_eq!(mirror, &expected, "{label}: should clear");
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn auction_returns_clear_when_the_servable_set_is_empty() {
+            let ec_id = ec_id_for("empty");
+            let graph = KvIdentityGraph::in_memory("test_store");
+            graph
+                .create(&ec_id, &row_with(&[("off.example.com", "uid-off", None)]))
+                .expect("should seed the live row");
+            let registry = mirror_registry();
+            let mut ec_context = live_context(&ec_id, &graph);
+
+            let response = run_auction(
+                &mut ec_context,
+                Some(&graph),
+                Some(&registry),
+                ad_units_only_body(),
+            )
+            .await;
+
+            assert_eq!(
+                mirror_of(&response),
+                Some(&json!({ "clear": true })),
+                "should clear an empty servable set"
+            );
+        }
+
+        #[tokio::test]
+        async fn auction_without_a_kv_read_omits_the_mirror() {
+            let ec_id = ec_id_for("noread");
+            let registry = mirror_registry();
+            let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+
+            let response =
+                run_auction(&mut ec_context, None, Some(&registry), ad_units_only_body()).await;
+
+            assert!(
+                response["ext"].get("ts_eids_s").is_none(),
+                "should leave the mirror cookie as it is"
+            );
+        }
     }
 }

@@ -613,7 +613,6 @@ mod tests {
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{ConsentContext, ConsentSource};
     use crate::ec::identity::request::WriterDecision;
-    use crate::openrtb::{Eid, Uid};
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
     use crate::test_support::tests::{create_test_settings, purpose_one_only_consent};
@@ -1615,61 +1614,6 @@ mod tests {
         assert!(
             ec_context.identity().mutation().is_empty(),
             "a stager must not queue ingest"
-        );
-    }
-
-    #[test]
-    fn finalize_ignores_auction_body_eids_as_ingest() {
-        // The `/auction` body is no longer an ingest input (spec G10): the
-        // writer navigation ingests `ts-eids` and sharedId only, so a body
-        // that the cookie's size cap trimmed reaches bidders but never KV.
-        let settings = create_test_settings();
-        let ec_id = sample_ec_id("cleids1");
-        let graph = KvIdentityGraph::in_memory("test_store");
-        let live = KvEntry::new(
-            &granting_consent(),
-            None,
-            current_timestamp(),
-            &settings.publisher.domain,
-        );
-        graph
-            .create(&ec_id, &live)
-            .expect("should seed the live row this request updates");
-        let mut ec_context = returning_user_context(&ec_id, graph.load_snapshot(&ec_id), false);
-        ec_context.set_eid_sync_source(EidSyncSource::Auction);
-        ec_context.set_client_eids(vec![Eid::new(
-            "liveramp.com".to_owned(),
-            vec![Uid {
-                id: "LR_from_body".to_owned(),
-                atype: Some(3),
-                ext: None,
-            }],
-        )]);
-        let partners = vec![make_partner("id5-sync.com"), make_partner("liveramp.com")];
-        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
-        let mut response = empty_response();
-
-        ec_finalize_response(
-            &settings,
-            &mut ec_context,
-            Some(&graph),
-            &registry,
-            None,
-            None,
-            &mut response,
-        );
-
-        let (stored, _) = graph
-            .get(&ec_id)
-            .expect("should read store")
-            .expect("row should remain");
-        assert!(
-            stored.ids.is_empty(),
-            "a body EID must not be written to KV"
-        );
-        assert!(
-            ec_context.identity().mutation().is_empty(),
-            "a body EID must not be queued"
         );
     }
 
@@ -2799,14 +2743,6 @@ mod tests {
                 if let Some(source) = source {
                     context.set_eid_sync_source(source);
                 }
-                context.set_client_eids(vec![Eid::new(
-                    SHARED_ID_SOURCE.to_owned(),
-                    vec![Uid {
-                        id: "example-body-id".to_owned(),
-                        atype: None,
-                        ext: None,
-                    }],
-                )]);
 
                 let response =
                     finalize_with_shared_id(&mut context, &graph, Some("example-shared-id"));

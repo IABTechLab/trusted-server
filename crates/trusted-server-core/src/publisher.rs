@@ -38,7 +38,7 @@ use sha2::Digest as _;
 use web_time::Instant;
 
 use crate::auction::endpoints::{
-    merge_auction_eids, resolve_auction_eids, resolve_client_auction_eids,
+    merge_auction_eids, mirror_member, resolve_auction_eids, resolve_client_auction_eids,
 };
 use crate::auction::formats::sanitize_publisher_page_url;
 use crate::auction::orchestrator::{
@@ -7058,6 +7058,9 @@ pub async fn handle_page_bids(
     // unchanged) but skip the live auction, matching the existing behavior.
     let ad_stack_enabled = ad_templates_enabled && auction_enabled && consent_allows_auction;
 
+    // The row the auction read, for the `ts-eids-s` mirror. It stays
+    // `NotRead` when no auction runs, so the mirror is then absent.
+    let mut mirror_snapshot = crate::ec::EcKvSnapshot::NotRead;
     let (winning_bids, prebuilt_bid_map) = if matched_slots.is_empty() {
         (std::collections::HashMap::new(), None)
     } else {
@@ -7090,9 +7093,9 @@ pub async fn handle_page_bids(
                 _ => crate::ec::EcKvSnapshot::NotRead,
             };
             // Hand the loaded row to the request context so response
-            // finalization — which runs on an EC context the adapter owns,
-            // after this handler returns — ingests `ts-eids`/`sharedId` updates
-            // from this read instead of paying for a second lookup.
+            // finalization, which runs on an EC context the adapter owns after
+            // this handler returns, reuses this read instead of paying for a
+            // second lookup.
             if !matches!(page_bids_kv_snapshot, crate::ec::EcKvSnapshot::NotRead) {
                 ec_context.set_kv_snapshot(page_bids_kv_snapshot.clone());
             }
@@ -7118,6 +7121,7 @@ pub async fn handle_page_bids(
                     path_label: "Page-bids",
                 },
             );
+            mirror_snapshot = page_bids_kv_snapshot;
             let timeout_ms = co_config
                 .auction_timeout_ms
                 .unwrap_or(settings.auction.timeout_ms);
@@ -7229,10 +7233,18 @@ pub async fn handle_page_bids(
         Vec::new()
     };
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "slots": slots_json,
         "bids": bid_map,
     });
+    if let Some(mirror) = mirror_member(
+        &mirror_snapshot,
+        auction.registry,
+        ec_context,
+        PolicySignals::from_headers(req.headers()),
+    ) {
+        body["ts_eids_s"] = mirror;
+    }
     let body = serde_json::to_string(&body).change_context(TrustedServerError::Proxy {
         message: "Failed to serialize page-bids response".to_string(),
     })?;
@@ -23932,6 +23944,7 @@ mod tests {
         use crate::platform::test_support::{StubHttpClient, noop_services};
         use crate::platform::{PlatformHttpRequest, PlatformResponse};
         use crate::test_support::tests::crate_test_settings_str;
+        use base64::Engine as _;
         use error_stack::{Report, ResultExt};
         use http::Method;
         use std::sync::{Arc, Mutex};
@@ -24121,6 +24134,205 @@ mod tests {
 
         fn make_page_bids_request(path: &str) -> Request<EdgeBody> {
             make_page_bids_request_on(PAGE_BIDS_PATH, path)
+        }
+
+        const MIRROR_SOURCE: &str = "mirror.example.com";
+
+        fn mirror_registry() -> PartnerRegistry {
+            let mut partner = crate::ec::identity::test_support::ec_partner(
+                MIRROR_SOURCE,
+                "https://sync.mirror.example.com/pull",
+                "example-token-value-0123456789abcdef",
+            );
+            partner.pull_sync_enabled = false;
+            partner.pull_sync_url = None;
+            partner.pull_sync_allowed_domains = Vec::new();
+            partner.ts_pull_token = None;
+            partner.api_token = Some(crate::redacted::Redacted::new(
+                "token-mirror-example-com-32-bytes-minimum".to_owned(),
+            ));
+            PartnerRegistry::from_config(&[partner]).expect("should build partner registry")
+        }
+
+        fn mirror_ec_id() -> String {
+            format!("{}.mirror", "a".repeat(64))
+        }
+
+        fn seeded_graph(records: &[(&str, &str)]) -> KvIdentityGraph {
+            let graph = KvIdentityGraph::in_memory("test_store");
+            let mut entry =
+                crate::ec::kv_types::KvEntry::minimal("unregistered.example.com", "x", 1);
+            entry.ids.clear();
+            for (source, uid) in records {
+                entry.ids.insert(
+                    (*source).to_owned(),
+                    crate::ec::kv_types::KvPartnerId::browser(*uid, Some(1)),
+                );
+            }
+            graph
+                .create(&mirror_ec_id(), &entry)
+                .expect("should seed the live row");
+            graph
+        }
+
+        fn consenting_context_with_ec() -> EcContext {
+            EcContext::new_for_test(
+                Some(mirror_ec_id()),
+                crate::consent::ConsentContext {
+                    jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                    ..Default::default()
+                },
+            )
+        }
+
+        async fn page_bids_body(
+            settings: &Settings,
+            graph: &KvIdentityGraph,
+            ec_context: &mut EcContext,
+            req: Request<EdgeBody>,
+        ) -> serde_json::Value {
+            let stub = Arc::new(StubHttpClient::new());
+            stub.push_response(200, b"no bid".to_vec());
+            let services = build_services_with_http_client(
+                Arc::clone(&stub) as Arc<dyn crate::platform::PlatformHttpClient>
+            );
+            let orchestrator =
+                auction_id_test_orchestrator(settings, Arc::new(Mutex::new(None)), false);
+            let registry = mirror_registry();
+            let slots = article_slot();
+            let response = handle_page_bids(
+                settings,
+                &services,
+                Some(graph),
+                AuctionDispatch {
+                    orchestrator: &orchestrator,
+                    slots: &slots,
+                    registry: Some(&registry),
+                },
+                ec_context,
+                req,
+            )
+            .await
+            .expect("should return ok response");
+            serde_json::from_slice(
+                &response
+                    .into_body()
+                    .into_bytes()
+                    .expect("should read the page-bids body"),
+            )
+            .expect("should parse the page-bids body")
+        }
+
+        fn auction_settings() -> Settings {
+            let mut settings = settings_with_co();
+            settings.auction.providers =
+                crate::auction::AuctionConfig::legacy_provider_map(&[AUCTION_ID_TEST_PROVIDER]);
+            settings
+        }
+
+        #[tokio::test]
+        async fn page_bids_never_writes_kv() {
+            let settings = auction_settings();
+            let (graph, store) = KvIdentityGraph::write_counting("test_store");
+            let mut entry =
+                crate::ec::kv_types::KvEntry::minimal("unregistered.example.com", "x", 1);
+            entry.ids.clear();
+            graph
+                .create(&mirror_ec_id(), &entry)
+                .expect("should seed the live row");
+            store.reset_counts();
+            let cookie = base64::engine::general_purpose::STANDARD.encode(
+                serde_json::to_vec(&serde_json::json!([
+                    { "source": MIRROR_SOURCE, "uids": [{ "id": "cookie-uid" }] }
+                ]))
+                .expect("should serialize the cookie"),
+            );
+            let mut req = make_page_bids_request("/2024/01/my-article/");
+            req.headers_mut().insert(
+                header::COOKIE,
+                HeaderValue::from_str(&format!("ts-eids={cookie}"))
+                    .expect("should build the cookie header"),
+            );
+            let mut ec_context = consenting_context_with_ec();
+
+            let _ = page_bids_body(&settings, &graph, &mut ec_context, req).await;
+            let mut response = Response::new(EdgeBody::empty());
+            crate::ec::finalize::ec_finalize_response(
+                &settings,
+                &mut ec_context,
+                Some(&graph),
+                &mirror_registry(),
+                Some(&cookie),
+                None,
+                &mut response,
+            );
+
+            let writes = store.writes();
+            assert_eq!(
+                (writes.add, writes.if_generation_match, writes.overwrite),
+                (0, 0, 0),
+                "should write nothing to KV"
+            );
+            assert!(
+                ec_context.identity().mutation().is_empty(),
+                "should queue nothing for a writer"
+            );
+        }
+
+        #[tokio::test]
+        async fn page_bids_returns_the_mirror_payload() {
+            let settings = auction_settings();
+            let graph = seeded_graph(&[(MIRROR_SOURCE, "uid-mirror")]);
+            let mut ec_context = consenting_context_with_ec();
+
+            let body = page_bids_body(
+                &settings,
+                &graph,
+                &mut ec_context,
+                make_page_bids_request("/2024/01/my-article/"),
+            )
+            .await;
+
+            let mirror = &body["ts_eids_s"];
+            let decoded: serde_json::Value = serde_json::from_slice(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(mirror["value"].as_str().expect("should hold a value"))
+                    .expect("should be unpadded base64url"),
+            )
+            .expect("should be JSON");
+            let atype = crate::settings::EcPartner::default_openrtb_atype();
+            assert_eq!(
+                decoded,
+                serde_json::json!({ "v": 1, "eids": [{
+                    "source": MIRROR_SOURCE,
+                    "uids": [{ "id": "uid-mirror", "atype": atype }]
+                }] }),
+                "should hold the servable record's EID"
+            );
+            assert_eq!(
+                mirror["max_age"], 86_400,
+                "should live a day without an exp"
+            );
+        }
+
+        #[tokio::test]
+        async fn page_bids_without_an_auction_omits_the_mirror() {
+            let settings = settings_with_co_auction_disabled();
+            let graph = seeded_graph(&[(MIRROR_SOURCE, "uid-mirror")]);
+            let mut ec_context = consenting_context_with_ec();
+
+            let body = page_bids_body(
+                &settings,
+                &graph,
+                &mut ec_context,
+                make_page_bids_request("/2024/01/my-article/"),
+            )
+            .await;
+
+            assert!(
+                body.get("ts_eids_s").is_none(),
+                "should leave the mirror cookie as it is"
+            );
         }
 
         #[tokio::test]
