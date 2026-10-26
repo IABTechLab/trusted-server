@@ -125,7 +125,8 @@ use trusted_server_core::integrations::{
     RequestFilterRegistryOutcome,
 };
 use trusted_server_core::platform::{
-    ClientInfo, GeoInfo, PlatformKvStore, RuntimeServices, StoreName,
+    ClientInfo, GeoInfo, PlatformGeo, PlatformHttpClient, PlatformKvStore, RuntimeServices,
+    StoreName,
 };
 use trusted_server_core::proxy::{
     AssetProxyCachePolicy, handle_asset_proxy_request, handle_first_party_click,
@@ -196,6 +197,13 @@ pub(crate) struct AppState {
     /// The identity graph over `ec.ec_store`, built once. `None` when no
     /// store is configured.
     pub(crate) identity_graph: Option<KvIdentityGraph>,
+    /// Replaces the Fastly HTTP client in tests, so a request reaches a
+    /// scripted origin and bidder instead of the network.
+    #[cfg(test)]
+    pub(crate) http_client_for_test: Option<Arc<dyn PlatformHttpClient>>,
+    /// Replaces the Fastly geolocation in tests, which Viceroy does not serve.
+    #[cfg(test)]
+    pub(crate) geo_for_test: Option<Arc<dyn PlatformGeo>>,
 }
 
 /// Build the application state, loading settings and constructing all per-application components.
@@ -256,6 +264,10 @@ pub(crate) fn build_state_from_settings(
         identity_graph,
         auction_telemetry_sink,
         identity,
+        #[cfg(test)]
+        http_client_for_test: None,
+        #[cfg(test)]
+        geo_for_test: None,
     }))
 }
 
@@ -270,6 +282,36 @@ pub(crate) fn app_state_with_graph_for_test(
     let mut state = Arc::try_unwrap(state)
         .unwrap_or_else(|_| unreachable!("a freshly built state should have one owner"));
     state.identity_graph = Some(graph);
+    Arc::new(state)
+}
+
+/// `state` with `identity` as its identity runtime, for a request that
+/// reaches a provider no configuration can name.
+#[cfg(test)]
+pub(crate) fn app_state_with_identity_for_test(
+    state: Arc<AppState>,
+    identity: IdentityRuntime,
+) -> Arc<AppState> {
+    let mut state = Arc::try_unwrap(state)
+        .unwrap_or_else(|_| unreachable!("a freshly built state should have one owner"));
+    state.identity = Arc::new(identity);
+    Arc::new(state)
+}
+
+/// As [`app_state_with_graph_for_test`], with `client` answering every
+/// outbound request the routes make and `geo` locating every client.
+#[cfg(test)]
+pub(crate) fn app_state_with_network_for_test(
+    settings: Settings,
+    graph: KvIdentityGraph,
+    client: Arc<dyn PlatformHttpClient>,
+    geo: Arc<dyn PlatformGeo>,
+) -> Arc<AppState> {
+    let state = app_state_with_graph_for_test(settings, graph);
+    let mut state = Arc::try_unwrap(state)
+        .unwrap_or_else(|_| unreachable!("a freshly built state should have one owner"));
+    state.http_client_for_test = Some(client);
+    state.geo_for_test = Some(geo);
     Arc::new(state)
 }
 
@@ -297,6 +339,13 @@ fn warn_if_certificate_check_disabled(settings: &Settings) {
 /// continues to rely on the trusted `fastly-ssl` header injected by
 /// `edgezero_main` after sanitization.
 fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> RuntimeServices {
+    let http_client: Arc<dyn PlatformHttpClient> = Arc::new(FastlyPlatformHttpClient);
+    #[cfg(test)]
+    let http_client = state.http_client_for_test.clone().unwrap_or(http_client);
+    let geo: Arc<dyn PlatformGeo> = Arc::new(FastlyPlatformGeo);
+    #[cfg(test)]
+    let geo = state.geo_for_test.clone().unwrap_or(geo);
+
     let client_info = ctx
         .request()
         .extensions()
@@ -317,8 +366,8 @@ fn build_per_request_services(state: &AppState, ctx: &RequestContext) -> Runtime
         .template_cache(Arc::new(crate::template_cache::FastlyTemplateCache::new()))
         .template_assembler(Arc::new(crate::esi_assembly::FastlyTemplateAssembler))
         .backend(Arc::new(FastlyPlatformBackend))
-        .http_client(Arc::new(FastlyPlatformHttpClient))
-        .geo(Arc::new(FastlyPlatformGeo))
+        .http_client(http_client)
+        .geo(geo)
         .auction_telemetry_sink(Arc::clone(&state.auction_telemetry_sink))
         .client_info(client_info)
         .build()
@@ -723,7 +772,13 @@ async fn run_named_route(
             if req.method() == Method::OPTIONS {
                 cors_preflight_identify(&state.settings, &req)
             } else {
-                let kv = crate::require_identity_graph(&state.settings)?;
+                // The state's graph is the one over `ec.ec_store` that
+                // `require_identity_graph` would build, so the answer reads the
+                // same store the rest of the request counts against.
+                let kv = match state.identity_graph.clone() {
+                    Some(graph) => graph,
+                    None => crate::require_identity_graph(&state.settings)?,
+                };
                 let partner_registry = PartnerRegistry::from_config(&state.settings.ec.partners)?;
                 handle_identify(
                     &state.settings,
@@ -1660,6 +1715,8 @@ mod tests {
             default_kv_store,
             identity,
             identity_graph: None,
+            http_client_for_test: None,
+            geo_for_test: None,
         });
         TrustedServerApp::routes_for_state(&state)
     }

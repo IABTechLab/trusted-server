@@ -55,6 +55,29 @@ impl IdentityRuntime {
         })
     }
 
+    /// Builds the runtime with `providers` and source `owners` in place of
+    /// the generic pull providers `settings` describes, for tests that drive
+    /// a request through a provider no configuration can name.
+    ///
+    /// # Errors
+    ///
+    /// Never fails today; it returns a `Result` to match
+    /// [`from_settings`](Self::from_settings).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn from_settings_with_providers(
+        settings: &Settings,
+        providers: Vec<std::sync::Arc<dyn super::provider::IdentityProvider>>,
+        owners: BTreeMap<SourceDomain, IdentityProviderId>,
+    ) -> Result<Self, Report<TrustedServerError>> {
+        let catalog = ProviderCatalog::new(providers, owners)
+            .with_narrowing(narrowing(&settings.ec.identity));
+        Ok(Self {
+            catalog,
+            keys: IdentityKeys::from_settings(settings),
+            identity: settings.ec.identity.clone(),
+        })
+    }
+
     /// The enabled providers.
     #[must_use]
     pub(crate) fn catalog(&self) -> &ProviderCatalog {

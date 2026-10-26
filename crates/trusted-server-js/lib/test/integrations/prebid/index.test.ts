@@ -2803,6 +2803,94 @@ describe('prebid/installPrebidNpm', () => {
       }
     });
 
+    it('ortb2_config_only_eid_reaches_ts_eids_and_the_auction_body', () => {
+      // Lockr writes its ID5 into Prebid's ortb2 config only, so
+      // getUserIdsAsEids() (the canary) never returns it. The Rust identity
+      // tests carry the same cookie value as a fixture.
+      const spec = getAdapterSpec();
+      const lockrId5 = {
+        source: 'id5-sync.com',
+        inserter: 'inserter.example.com',
+        mm: 2,
+        uids: [{ id: 'fictional-id5', atype: 1 }],
+      };
+      expect(
+        mockGetUserIdsAsEids().map((eid: { source: string }) => eid.source),
+        'control: getUserIdsAsEids should not hold the ID5 entry'
+      ).not.toContain('id5-sync.com');
+
+      const result = spec.buildRequests(
+        trustedServerBidRequests(),
+        prebidBidderRequest({ ext: { eids: [lockrId5] } })
+      );
+
+      expect(JSON.parse(String(result.data)).eids, 'the /auction body carries the entry').toEqual([
+        lockrId5,
+      ]);
+      expect(readTsEidsCookie(), 'ts-eids carries the entry, as this exact value').toBe(
+        readFixture('ts-eids-ortb2-only.txt')
+      );
+    });
+
+    it('ts_eids_cookie_golden', () => {
+      // A set with no unregistered source, so the registered-first trim
+      // leaves it exactly as before. EID-level ext never reaches the cookie.
+      testWindow.__tsjs_prebid = { registeredSources: ['id5-sync.com', 'sharedid.org'] };
+      try {
+        const spec = getAdapterSpec();
+
+        spec.buildRequests(
+          trustedServerBidRequests(),
+          prebidBidderRequest({
+            ext: {
+              eids: [
+                {
+                  source: 'id5-sync.com',
+                  inserter: 'inserter.example.com',
+                  matcher: 'id5-sync.com',
+                  mm: 2,
+                  ext: { segments: ['s1'] },
+                  uids: [
+                    { id: 'golden-id5-a', atype: 1, ext: { linkType: 2 } },
+                    { id: 'golden-id5-b', atype: 1 },
+                  ],
+                },
+                { source: 'sharedid.org', uids: [{ id: 'golden-shared', atype: 1 }] },
+              ],
+            },
+          })
+        );
+
+        expect(readTsEidsCookie()).toBe(readFixture('ts-eids-golden.txt'));
+      } finally {
+        delete testWindow.__tsjs_prebid;
+      }
+    });
+
+    it('writes a registered source beyond the old trim into ts-eids as this exact value', () => {
+      // The Rust identity tests ingest this value: its registered source is
+      // the eighth entry, which the pre-G10 trim dropped.
+      testWindow.__tsjs_prebid = { registeredSources: ['registered.example.com'] };
+      try {
+        const spec = getAdapterSpec();
+        const long = 'x'.repeat(400);
+        const unregistered = [0, 1, 2, 3, 4, 5, 6].map((index) => ({
+          source: `u${index}.example.com`,
+          uids: [{ id: long, atype: 1 }],
+        }));
+        const registered = { source: 'registered.example.com', uids: [{ id: long, atype: 1 }] };
+
+        spec.buildRequests(
+          trustedServerBidRequests(),
+          prebidBidderRequest({ ext: { eids: [...unregistered, registered] } })
+        );
+
+        expect(readTsEidsCookie()).toBe(readFixture('ts-eids-registered-first-trim.txt'));
+      } finally {
+        delete testWindow.__tsjs_prebid;
+      }
+    });
+
     it('logs EID counts and the cookie decision at debug level, never values', () => {
       log.setLevel('debug');
       const spies = [
