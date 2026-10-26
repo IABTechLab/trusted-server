@@ -1,15 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::File;
+use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-
-#[cfg(unix)]
-use std::os::unix::process::CommandExt as _;
 
 use error_stack::{Report, ResultExt as _};
 use tokio::runtime::Handle;
@@ -82,61 +80,48 @@ impl Cancellation {
     }
 
     pub(super) fn watch(&self, handle: &Handle) -> HarnessResult<()> {
-        #[cfg(unix)]
-        {
-            let _entered = handle.enter();
-            let mut term =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .change_context(HarnessError::Runtime)?;
-            let mut interrupt =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-                    .change_context(HarnessError::Runtime)?;
-            // Cargo owns the test process. Detect its disappearance as well as
-            // direct signals so terminating the shell entry point leaves no runtimes.
-            let parent = unsafe { libc::getppid() };
-            let cancellation = self.clone();
-            handle.spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = term.recv() => break,
-                        _ = interrupt.recv() => break,
-                        _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                            if unsafe { libc::getppid() } != parent { break; }
-                        }
+        let _entered = handle.enter();
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .change_context(HarnessError::Runtime)?;
+        let mut interrupt =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                .change_context(HarnessError::Runtime)?;
+        // Cargo owns the test process. Detect its disappearance as well as
+        // direct signals so terminating the shell entry point leaves no runtimes.
+        let parent = unsafe { libc::getppid() };
+        let cancellation = self.clone();
+        handle.spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = term.recv() => break,
+                    _ = interrupt.recv() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                        if unsafe { libc::getppid() } != parent { break; }
                     }
                 }
-                cancellation.cancel();
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                for id in cancellation
-                    .groups
-                    .lock()
-                    .expect("should lock owned process groups")
-                    .iter()
-                {
-                    signal_group(*id, libc::SIGKILL);
-                }
-            });
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = handle;
-            return Err(Report::new(HarnessError::Runtime)
-                .attach("EOF runtime controls require Unix process groups"));
-        }
+            }
+            cancellation.cancel();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            for id in cancellation
+                .groups
+                .lock()
+                .expect("should lock owned process groups")
+                .iter()
+            {
+                signal_group(*id, libc::SIGKILL);
+            }
+        });
         Ok(())
     }
 }
 
 fn signal_group(id: u32, signal: i32) {
-    #[cfg(unix)]
     if let Ok(id) = libc::pid_t::try_from(id) {
         // Every registered ID belongs to a child started in its own process group.
         unsafe {
             libc::killpg(id, signal);
         }
     }
-    #[cfg(not(unix))]
-    let _ = (id, signal);
 }
 
 pub(super) struct ManagedChild {
@@ -147,7 +132,6 @@ pub(super) struct ManagedChild {
 impl ManagedChild {
     pub(super) fn spawn(command: &mut Command, cancellation: &Cancellation) -> HarnessResult<Self> {
         cancellation.check()?;
-        #[cfg(unix)]
         command.process_group(0);
         command.stdin(Stdio::null());
         let child = command.spawn().change_context(HarnessError::Runtime)?;
@@ -186,8 +170,6 @@ impl Drop for ManagedChild {
             thread::sleep(Duration::from_millis(20));
         }
         signal_group(id, libc::SIGKILL);
-        #[cfg(not(unix))]
-        let _ = self.child.kill();
         let _ = self.child.wait();
         self.cancellation
             .groups
@@ -266,7 +248,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn owned_process_is_reaped_on_drop() {
         let cancellation = Cancellation::default();
         let mut command = Command::new("sleep");
@@ -310,7 +291,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn completed_process_is_safe_to_drop() {
         let cancellation = Cancellation::default();
         let child = ManagedChild::spawn(&mut Command::new("true"), &cancellation)
@@ -332,18 +312,15 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn sigterm_cleans_owned_descendants() {
         signal_cleanup(libc::SIGTERM);
     }
 
     #[test]
-    #[cfg(unix)]
     fn sigint_cleans_owned_descendants() {
         signal_cleanup(libc::SIGINT);
     }
 
-    #[cfg(unix)]
     fn signal_cleanup(signal: i32) {
         let directory = tempfile::tempdir().expect("should create probe workspace");
         let cancellation = Cancellation::default();
@@ -412,7 +389,6 @@ mod tests {
 
     #[test]
     #[ignore = "internal subprocess probe, selected only by cleanup tests"]
-    #[cfg(unix)]
     fn cleanup_leaf_probe() {
         let directory = PathBuf::from(
             std::env::var_os("HTML_EOF_PROBE_DIR").expect("should supply probe workspace"),
@@ -427,7 +403,6 @@ mod tests {
 
     #[test]
     #[ignore = "internal subprocess probe, selected only by cleanup tests"]
-    #[cfg(unix)]
     fn cleanup_owner_probe() {
         let directory = PathBuf::from(
             std::env::var_os("HTML_EOF_PROBE_DIR").expect("should supply probe workspace"),
