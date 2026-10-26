@@ -6,14 +6,14 @@ use serde_json::{Value, json};
 
 use super::{javascript_identity, source_identity};
 
-struct Fixture {
+pub(super) struct Fixture {
     _temporary: tempfile::TempDir,
-    checkout: PathBuf,
-    target: PathBuf,
+    pub(super) checkout: PathBuf,
+    pub(super) target: PathBuf,
 }
 
 impl Fixture {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let temporary = tempfile::tempdir().expect("should create source fixture");
         let outer = fs::canonicalize(temporary.path()).expect("should resolve fixture root");
         let checkout = outer.join("source");
@@ -41,7 +41,7 @@ impl Fixture {
         }
     }
 
-    fn private_js(&self) -> (Value, Vec<Value>) {
+    pub(super) fn private_js(&self) -> (Value, Vec<Value>) {
         let js = self.checkout.join("crates/trusted-server-js");
         fs::write(js.join("Cargo.toml"), b"example package").expect("should write JS manifest");
         for module in ["core", "integrations/example"] {

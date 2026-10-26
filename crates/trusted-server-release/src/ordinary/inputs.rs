@@ -12,6 +12,8 @@ use super::{digest, require, root};
 use crate::documents::{self, RawBytes, Role};
 use crate::error::ReleaseError;
 
+mod record;
+
 /// Source-owned ordinary build input identities, independent of runner paths.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct SourceIdentity {

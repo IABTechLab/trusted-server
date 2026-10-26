@@ -6,7 +6,7 @@
 //! observation roots are only checked lexically here.
 
 use error_stack::Report;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use std::path::{Component, Path};
@@ -179,14 +179,14 @@ struct Facts {
     gaps: Vec<String>,
 }
 
-#[derive(Deserialize, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Tool {
     version: String,
     sha256: String,
 }
 
-#[derive(Deserialize, PartialEq, Eq)]
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 struct Tools {
     rustc: Tool,
@@ -194,7 +194,7 @@ struct Tools {
     acquisition: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Environment {
     checkout_root: String,
