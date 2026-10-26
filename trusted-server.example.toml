@@ -110,8 +110,26 @@ ec_store = "ec_identity_store"
 # max_calls_per_minute = 1
 # breaker_failures_per_minute = 50
 # cookie_priority = 0
-# `revoke_scope = "provider"` (or "global") applies only to a provider that
-# captures IDs, from Part 2 of the identity rollout; do not set it here.
+
+# Capture provider (a vendor whose responses Trusted Server proxies; the
+# provider declares `captures`). A capture-only provider must list its
+# `sources`: its opt-out removes browser-ingested records of every source
+# listed here, so list only the sources it is the delivery path for. Each
+# source also needs an [[ec.partners]] entry with bidstream_enabled = true.
+# [ec.identity.providers.examplecapture]
+# sources = ["capture.example.com"]
+# `provider` (default) removes only this provider's records. `global` runs
+# the consent-withdrawal tombstone for a captured opt-out from a real browser.
+# revoke_scope = "provider"
+
+# A source can name the identity provider that owns it. The owner refreshes the
+# source and its result replaces the source's whole entry set. Absent: unowned.
+# [[ec.partners]]
+# name = "Example ID"
+# source_domain = "exampleid.example.com"
+# openrtb_atype = 1
+# bidstream_enabled = true
+# owner = "exampleid"
 
 # Example partner configuration. Provision referenced keys in
 # trusted_server_secrets before validating/pushing.

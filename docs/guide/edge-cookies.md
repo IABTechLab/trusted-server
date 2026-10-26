@@ -294,6 +294,70 @@ Each request also logs one `identity request measurement: ...` line after the re
 - Size: at most 2,048 bytes. When the IDs do not fit, whole sources are left out, lowest `cookie_priority` first, never part of a source.
 - The shim's `ts-eids` trim now keeps registered sources first, so a size-capped `ts-eids` loses unregistered sources before registered ones.
 
+## Server-Side Identity Providers
+
+Identity providers fetch or capture IDs on the server. Engineers who write one should read [Writing an Identity Provider](/guide/identity-providers). The sections below are for operators. Per-key reference is in the [Configuration Reference](/guide/configuration#identity-providers-ec-identity).
+
+### Capture Provider Checklist
+
+A capture provider reads responses that Trusted Server proxies for a vendor. It is revoke-only: a captured revocation, opt-out or clear is written to KV, and captured positive IDs are only counted in `capture_unpersisted`, never stored. Work through these steps before enabling one on a live service:
+
+1. **Register every captured source.** Each source the provider declares has an `[[ec.partners]]` entry with `bidstream_enabled = true` and the right `openrtb_atype`.
+2. **Move a source off pull sync first.** A source that is going to have an `owner` must not also have `pull_sync_enabled = true`. A pull-sync entry registers a generic pull provider that claims the source, and two providers cannot claim an owned source.
+3. **Keep `sources` minimal.** The provider's `sources` list in `[ec.identity.providers.<id>]` holds only the sources it is the delivery path for. Its opt-out removes browser-ingested records of every source on the list, whoever produced them.
+4. **Run the live acceptance check.** After a revocation is captured on a live page, look up the visitor's row with `GET /_ts/admin/ec` and confirm it shows the provider's `ps.o` and no record for the provider's sources. After the vendor issues again, confirm the row shows `ps.oc`, and that the next returning-visitor navigation ingests the source again. Use `GET /_ts/admin/eids` with the visitor's `ts-eids` cookie to preview what the browser would ingest. Read the `identity request measurement: ...` log line of the revocation request: `removal_lost` must stay at `0`, and `capture_unpersisted` shows the positive IDs a durable path would add.
+
+### Revoke Scope
+
+`revoke_scope` in `[ec.identity.providers.<id>]` decides how far a captured opt-out reaches. The default, `provider`, removes only that provider's records and, for a capture-only provider, the records of its listed sources that no provider wrote.
+
+With `revoke_scope = "global"`, a captured opt-out from a real browser runs the consent-withdrawal tombstone: the row is tombstoned, the `ts-ec` cookie is cleared, and everything is removed, provider opt-outs included. The visitor then starts again with a new EC. A client that is not a real browser, such as a script replaying a copied `ts-ec` cookie, never changes the KV row: its capture is dropped and logged by provider and source only.
+
+### Complete Provider EIDs
+
+A provider can return more than one EID entry for a source, several UIDs per entry, and EID-level `inserter`, `matcher`, `mm` and `ext`. KV stores the whole set in the source's `eids` array, and the admin lookup (`GET /_ts/admin/ec`) shows it in the row's `ids` map, as stored (other row fields omitted):
+
+```json
+{
+  "entry": {
+    "ids": {
+      "exampleid.example.com": {
+        "w": "exampleid",
+        "rv": "0123456789abcdef",
+        "at": 1790000000,
+        "eids": [
+          {
+            "uids": [
+              { "id": "uid-a", "atype": 1, "ext": { "kind": "a" } },
+              { "id": "uid-b" }
+            ],
+            "inserter": "exampleid.example.com",
+            "matcher": "exampleid.example.com",
+            "mm": 2
+          },
+          { "uids": [{ "id": "uid-c" }], "ext": { "segment": "x" } }
+        ]
+      }
+    }
+  }
+}
+```
+
+Bidders receive the entries in that order, after the browser's entries. An entry that sets none of `inserter`, `matcher` and `mm` gets the provider's configured defaults at output. The `ext` data is stored only in KV and reaches bidders, `x-ts-eids` and the `__Host-ts-eids-s` mirror under the same consent gates as the UIDs. The mirror can be read by every script on the page.
+
+`GET /_ts/api/v1/identify` is unchanged: it still returns one UID per source, the first UID of the first entry, with the partner's `openrtb_atype`.
+
+### Rolling Back from Vendor Providers
+
+To go back to the identity release without vendor providers:
+
+1. Remove every `owner` key from `[[ec.partners]]` and every vendor `[ec.identity.providers.*]` table first, then push the config. The earlier release's validation rejects both. Pull-partner tables (`pull-...`) stay.
+2. Deploy the earlier release.
+
+After the rollback, multi-entry records stay readable but are not served while the provider that wrote them is not configured, and browser ingest may replace them. Each provider's `ps.o`, `ps.oc` and `ps.ov` (the opt-out, its clear and the removed-ID hashes) are kept, so opt-outs survive; the rest of its `ps` is pruned. Invalidated values can therefore be seeded once more, and stateful providers start over when rolled forward again.
+
+Rolling back past the identity release is unsupported, because a release before it cannot read KV schema version 2.
+
 ## Configuration
 
 Configure EC settings in the `[ec]` section of `trusted-server.toml`. See the [Configuration Reference](/guide/configuration) for the full surface and environment variable overrides.
@@ -347,6 +411,7 @@ receives any Trusted Server identity cookie (`ts-ec`, `ts-eids`, or
 
 - Follow the [EC Setup Guide](/guide/ec-setup-guide)
 - [Configuration Reference](/guide/configuration)
+- [Writing an Identity Provider](/guide/identity-providers)
 - [GDPR Compliance](/guide/gdpr-compliance) for consent signal handling
 - Configure [Ad Serving](/guide/ad-serving)
 - [Collective Sync](/guide/collective-sync) for cross-publisher data sharing details and diagrams

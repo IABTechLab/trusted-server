@@ -645,7 +645,9 @@ Policy for server-side identity providers. The table is optional; every key has 
 | `hold_retry_sec`     | Integer | `300`   | Seconds to wait before calling a provider again after the hold budget cut its call off |
 | `max_response_bytes` | Integer | `65536` | Largest provider response body accepted, before and after decoding                     |
 
-Each provider can have an `[ec.identity.providers.<id>]` table. A provider with no table uses the defaults.
+#### Per-provider keys
+
+Each provider can have an `[ec.identity.providers.<id>]` table. A provider with no table uses the defaults. The table name is the provider ID: the integration ID of a vendor provider, or the generated `pull-` ID of a pull partner.
 
 | Key                           | Type    | Default                            | Meaning                                                                                                                                           |
 | ----------------------------- | ------- | ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -657,7 +659,54 @@ Each provider can have an `[ec.identity.providers.<id>]` table. A provider with 
 | `max_calls_per_minute`        | Integer | `1`                                | Per-visitor burst cap, enforced in 60-second windows                                                                                              |
 | `breaker_failures_per_minute` | Integer | `50`                               | Transport failures, timeouts, 429s and 5xx responses in one 60-second window after which the provider is skipped for every visitor                |
 | `cookie_priority`             | Integer | `0`                                | Lower values are left out of the `__Host-ts-eids-s` mirror first when it exceeds its size cap                                                     |
-| `revoke_scope`                | String  | `provider` (capture only)          | `provider` or `global`. Applies only to a provider that captures IDs, from Part 2 of the identity rollout.                                        |
+| `revoke_scope`                | String  | `provider` (capture only)          | `provider` or `global`. Applies only to a provider that captures IDs; setting it on any other provider is a validation error. See below.          |
+
+**`mode`, `timeout_ms` and `after_send_timeout_ms`.** A provider runs only on a returning visitor's full page navigation. In `hold` mode the call runs before the navigation's auction, within the shared `hold_budget_ms`, and its answer joins that auction. A call the budget cuts off is not a failure: the provider waits `hold_retry_sec` before the next call. When the navigation runs no auction, a hold-mode provider runs after send instead and waits `after_send_timeout_ms`. In `after_send` mode (the default) the provider always runs after the response is sent.
+
+**`sources`.** Narrows the source domains the provider may write, before ownership is checked. It must name only sources the provider declares and keep at least one. A capture-only provider has no usable default and must list its `sources`: its opt-out removes browser-ingested records of every source it lists, so list only the sources it is the delivery path for.
+
+**`refresh_after_sec`, `max_calls_per_minute`, `breaker_failures_per_minute`.** `refresh_after_sec` is how long a stored ID lives before it is refreshed when the provider gives no hint, and how long to wait after a skipped call. `max_calls_per_minute` caps bursts per visitor in 60-second windows. `breaker_failures_per_minute` counts transport failures, timeouts, 429s and 5xx responses across all visitors at one edge location. Past it the provider is skipped for everyone until the window clears. Input-caused 4xx responses and unparseable replies back off only that visitor and never open the breaker.
+
+**`cookie_priority`.** When the `__Host-ts-eids-s` mirror exceeds its size cap, whole sources are left out, lowest `cookie_priority` first.
+
+**`revoke_scope`.** For a provider that captures IDs from proxied responses. With `provider`, a captured opt-out removes that provider's records and, for a capture-only provider, the records of its listed sources that no provider wrote. With `global`, a captured opt-out from a real browser runs the consent-withdrawal tombstone: the row is tombstoned, the `ts-ec` cookie is cleared, and everything is removed, provider opt-outs included. A client that is not a real browser never changes the row either way.
+
+#### Source ownership (`[[ec.partners]].owner`)
+
+`owner` is an optional key on an `[[ec.partners]]` entry. It names the identity provider that owns that source. An owner refreshes the source and wins over browser and other writers: its result replaces the source's whole entry set, and batch sync never replaces its value. A source with no `owner` is unowned, and a provider can only fill it when absent or expired.
+
+```toml
+[[ec.partners]]
+name = "Example ID"
+source_domain = "exampleid.example.com"
+openrtb_atype = 1
+bidstream_enabled = true
+owner = "exampleid"
+
+[ec.identity.providers.exampleid]
+mode = "hold"
+timeout_ms = 80
+```
+
+**Validation.** Each of these stops startup and fails `ts config validate` and `ts config push`.
+
+| Mistake                                                    | Error                                                                                                                                                      |
+| ---------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `owner` names a provider that is not enabled               | ``ec.partners source `exampleid.example.com` names owner `exampleid`, which is not an enabled identity provider``                                          |
+| `owner` names a capture-only provider                      | ``... names owner `examplecapture`, which is capture-only; a capture-only provider stores no positive ID and cannot own a source``                         |
+| `owner` names a provider that does not claim the source    | ``... names owner `exampleid`, which does not claim that source``                                                                                          |
+| Two providers claim an owned source                        | ``identity provider `other` claims source `exampleid.example.com`, which `exampleid` owns; use ec.identity.providers.other.sources to narrow one of them`` |
+| A provider claims a source with no `[[ec.partners]]` entry | ``identity provider `exampleid` claims source `exampleid.example.com`, which has no [[ec.partners]] entry``                                                |
+| A capture-only provider has no `sources`                   | ``provider `examplecapture` is capture-only, so ec.identity.providers.examplecapture.sources must list the sources it is the delivery path for``           |
+| `sources` names a source the provider does not declare     | ``ec.identity.providers.exampleid.sources names `other.example.com`, which provider `exampleid` does not declare``                                         |
+| A provider table names no enabled provider                 | `ec.identity.providers.missing names no enabled identity provider; configured providers: exampleid`                                                        |
+| `revoke_scope` on a provider that declares no captures     | ``ec.identity.providers.exampleid.revoke_scope is set, but provider `exampleid` declares no captures``                                                     |
+| `timeout_ms` above the hold budget in hold mode            | `ec.identity.providers.exampleid.timeout_ms must not exceed hold_budget_ms (100)`                                                                          |
+| `after_send_timeout_ms` outside 1 to 10000                 | `ec.identity.providers.exampleid.after_send_timeout_ms must be between 1 and 10000, got 0`                                                                 |
+| `refresh_after_sec = 0`                                    | `ec.identity.providers.exampleid.refresh_after_sec must be greater than 0`                                                                                 |
+| `hold_budget_ms` above 1000, `max_concurrency = 0`         | `ec.identity.hold_budget_ms must be at most 1000, got 1001` and `ec.identity.max_concurrency must be at least 1`                                           |
+
+Also an error: a duplicate provider ID, more than 32 enabled providers (generic pull partners included), a `mode` other than `hold` or `after_send`, and a `revoke_scope` other than `provider` or `global`. Before enabling a capture provider on a live service, work through the [capture provider checklist](/guide/edge-cookies#capture-provider-checklist).
 
 **Pull partner provider IDs.** Each `[[ec.partners]]` entry with `pull_sync_enabled = true` registers a provider whose ID is `pull-` plus the source domain with dots replaced by `-`. For example, `ssp.example.com` is `pull-ssp-example-com`. A domain that contains `-`, or an ID that would be longer than 63 characters, also gets `-` and the first 8 hex digits of the SHA-256 of the full domain, so `a-b.example.com` and `a.b.example.com` get different IDs. Configure the partner's pacing in `[ec.identity.providers.pull-ssp-example-com]`.
 
@@ -675,11 +724,7 @@ The old rate limit counted calls per hour; the new one counts them per minute an
 
 This release moves the KV identity row to schema version 2. A release before it cannot read a version 2 row, so rolling back past this release is unsupported once it has written one; going back needs a KV migration to version 1, which is not provided.
 
-A later release that adds vendor providers can be rolled back to this one with these steps:
-
-- Remove `owner` and every vendor `[ec.identity.providers.*]` table from the config first. This release rejects an `owner` or a provider table it does not know.
-- Complete entry sets that a vendor wrote stay readable, but they are not served while the provider that wrote them is not configured.
-- A write prunes an unconfigured provider's state down to its opt-out fields, so opt-outs survive. Its invalidated-value list and its provider state do not, so invalidated values can be seeded once more and stateful providers start over when rolled forward again.
+To roll back from a release that adds vendor providers to the identity framework without vendors, follow the steps in [Rolling back from vendor providers](/guide/edge-cookies#rolling-back-from-vendor-providers): remove every `owner` and vendor `[ec.identity.providers.*]` table first, because the earlier release rejects both.
 
 ### `[ec]`
 
