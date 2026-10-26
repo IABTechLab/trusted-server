@@ -6,6 +6,9 @@ pub const COOKIE_TS_EC_PULL_COMPLETE: &str = "ts-ec-pull-complete";
 /// Cookie written by the Trusted Server JS SDK containing a standard-base64-encoded
 /// JSON array of Extended User IDs (`[{ source, uids }]`) from identity providers.
 pub const COOKIE_TS_EIDS: &str = "ts-eids";
+/// Client-only mirror of the servable server-side EIDs, written by the shim
+/// and never read by the server (spec 6.2).
+pub const COOKIE_TS_EIDS_S: &str = "__Host-ts-eids-s";
 pub const COOKIE_TS_TESTER: &str = "ts-tester";
 pub const COOKIE_SHAREDID: &str = "sharedId";
 

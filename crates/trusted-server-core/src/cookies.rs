@@ -11,7 +11,10 @@ use error_stack::{Report, ResultExt as _};
 use http::Request;
 use http::header;
 
-use crate::constants::{COOKIE_EUCONSENT_V2, COOKIE_GPP, COOKIE_GPP_SID, COOKIE_US_PRIVACY};
+use crate::constants::{
+    COOKIE_EUCONSENT_V2, COOKIE_GPP, COOKIE_GPP_SID, COOKIE_TS_EC, COOKIE_TS_EIDS,
+    COOKIE_TS_EIDS_S, COOKIE_US_PRIVACY,
+};
 use crate::error::TrustedServerError;
 
 /// Cookie names carrying privacy consent signals.
@@ -25,6 +28,19 @@ pub const CONSENT_COOKIE_NAMES: &[&str] = &[
     COOKIE_GPP_SID,
     COOKIE_US_PRIVACY,
 ];
+
+/// Trusted Server identity cookies that never reach a third party.
+///
+/// Stripped from Prebid Server requests and never added to proxy or provider
+/// requests.
+pub const TS_IDENTITY_COOKIE_NAMES: &[&str] = &[COOKIE_TS_EC, COOKIE_TS_EIDS, COOKIE_TS_EIDS_S];
+
+/// Identity cookies removed from publisher-origin requests.
+///
+/// `ts-ec` still reaches the origin. The ID cookies
+/// are removed so that they cannot push the origin's `Cookie` header past
+/// common 8 KB header limits.
+pub const TS_ORIGIN_STRIPPED_COOKIE_NAMES: &[&str] = &[COOKIE_TS_EIDS, COOKIE_TS_EIDS_S];
 
 /// Parses a cookie string into a [`CookieJar`].
 ///
@@ -102,6 +118,52 @@ pub fn strip_cookies(cookie_header: &str, cookie_names: &[&str]) -> String {
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+/// Strips cookies whose name is exactly one of `names` from a `Cookie` header
+/// value.
+///
+/// Returns an empty string when nothing is left.
+#[must_use]
+pub fn strip_cookie_pairs(cookie_header: &str, names: &[&str]) -> String {
+    cookie_header
+        .split(';')
+        .map(str::trim)
+        .filter(|pair| !pair.is_empty())
+        .filter(|pair| {
+            let name = pair.split('=').next().unwrap_or_default().trim();
+            !names.contains(&name)
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Strips matching cookies from every `Cookie` field in `headers`.
+///
+/// All `Cookie` fields are read, matching pairs are removed, and the rest is
+/// written back as one field. A field that is not valid UTF-8 is dropped
+/// rather than forwarded, because it cannot be checked. The header is removed
+/// when nothing is left.
+pub fn strip_cookie_headers(headers: &mut http::HeaderMap, names: &[&str]) {
+    let retained = headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .map(|value| strip_cookie_pairs(value, names))
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    headers.remove(header::COOKIE);
+    if retained.is_empty() {
+        return;
+    }
+    match http::HeaderValue::from_str(&retained) {
+        Ok(value) => {
+            headers.insert(header::COOKIE, value);
+        }
+        Err(_) => log::debug!("Dropping Cookie header that is invalid after stripping"),
+    }
 }
 
 /// Copies the `Cookie` header from one request to another, optionally
@@ -450,5 +512,65 @@ mod tests {
         let header = "euconsent-v2=BOE=xyz; session=abc=123=def";
         let stripped = strip_cookies(header, CONSENT_COOKIE_NAMES);
         assert_eq!(stripped, "session=abc=123=def");
+    }
+
+    #[test]
+    fn strip_cookie_pairs_removes_exact_names_only() {
+        let header =
+            "ts-ec=abc; ts-eids=W10; __Host-ts-eids-s=eyJ2IjoxfQ; other=1; ts-eids-extra=keep";
+
+        let stripped = strip_cookie_pairs(header, TS_ORIGIN_STRIPPED_COOKIE_NAMES);
+
+        assert_eq!(
+            stripped, "ts-ec=abc; other=1; ts-eids-extra=keep",
+            "should drop the ID cookies and keep ts-ec and a cookie that only shares a prefix"
+        );
+    }
+
+    #[test]
+    fn strip_cookie_headers_joins_every_cookie_field_and_drops_non_utf8() {
+        let mut headers = http::HeaderMap::new();
+        headers.append(
+            header::COOKIE,
+            http::HeaderValue::from_static("ts-ec=abc; ts-eids=W10"),
+        );
+        headers.append(
+            header::COOKIE,
+            http::HeaderValue::from_bytes(b"bad=\xff").expect("should build an opaque header"),
+        );
+        headers.append(header::COOKIE, http::HeaderValue::from_static("other=1"));
+
+        strip_cookie_headers(&mut headers, TS_IDENTITY_COOKIE_NAMES);
+
+        let values: Vec<_> = headers.get_all(header::COOKIE).iter().collect();
+        assert_eq!(values.len(), 1, "should collapse into one Cookie header");
+        assert_eq!(
+            values[0], "other=1",
+            "should keep only the unrelated cookie"
+        );
+    }
+
+    #[test]
+    fn strip_cookie_headers_removes_header_when_nothing_is_left() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            http::HeaderValue::from_static("ts-ec=abc; __Host-ts-eids-s=eyJ2IjoxfQ"),
+        );
+        headers.insert(
+            header::USER_AGENT,
+            http::HeaderValue::from_static("ExampleBrowser/1.0"),
+        );
+
+        strip_cookie_headers(&mut headers, TS_IDENTITY_COOKIE_NAMES);
+
+        assert!(
+            headers.get(header::COOKIE).is_none(),
+            "should remove the empty Cookie header"
+        );
+        assert!(
+            headers.get(header::USER_AGENT).is_some(),
+            "should leave other headers alone"
+        );
     }
 }
