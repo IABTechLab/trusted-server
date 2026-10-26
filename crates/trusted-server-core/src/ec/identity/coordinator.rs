@@ -26,18 +26,16 @@ use super::mutation::{
 };
 use super::policy::{FP_US_OPT_OUT_MASK, PolicySignals, fingerprint_bits, policy_allows};
 use super::provider::IdentityProvider;
-use super::removal::{RemovalWriteOutcome, log_removal_lost, write_removals_counted};
+use super::removal::{RemovalWriteOutcome, write_removals_counted};
 use super::resolution::{
     EntrySet, EntrySets, IdentityProviderError, Resolution, ResolvedEid, StateChange, entry_sets,
 };
-use super::revision::{
-    IdentityKeys, Revision, StateRevision, record_revision, uid_hash, visitor_key,
-};
+use super::revision::{IdentityKeys, StateRevision, record_revision, uid_hash, visitor_key};
 use crate::consent::{ConsentContext, effective_tcf};
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::kv_types::{KvEid, KvEntry, KvOptOut, KvPartnerId};
 use crate::ec::rate_limiter::RateLimiter;
-use crate::ec::{EcContext, EcKvSnapshot, current_timestamp};
+use crate::ec::{EcContext, EcKvSnapshot, current_timestamp, log_id};
 use crate::platform::{
     PlatformBackendSpec, PlatformHttpRequest, PlatformPendingRequest, PlatformResponse,
     RuntimeServices,
@@ -1847,9 +1845,11 @@ fn capture_view(
     }
 }
 
-/// Counts and logs the removals a capture result asked for when the row could
-/// not be read, so they cannot be built or retried (spec 5.3). Holds no value.
-fn lose_unbuildable_removals(
+/// Counts and logs the source invalidations a capture result asked for when
+/// the row could not be read: each needs the record's revision, so none can be
+/// built or retried (spec 5.3). An opt-out needs no view and is not counted
+/// here. Holds no value.
+fn lose_unbuildable_invalidations(
     context: &mut EcContext,
     ec_id: Option<&str>,
     provider: &IdentityProviderId,
@@ -1857,32 +1857,15 @@ fn lose_unbuildable_removals(
     catalog: &ProviderCatalog,
 ) {
     let claimed = catalog.sources_of(provider);
-    let mut lost = IdentityMutation::default();
     for source in resolution
         .invalidated()
         .iter()
         .filter(|source| claimed.contains(source))
     {
-        lost.add_change(PartnerIdChange::OwnerRemove {
-            source: source.clone(),
-            provider: provider.clone(),
-            expected: Revision::Unset,
-        });
-    }
-    if resolution.is_opted_out() {
-        lost.merge_state(
-            provider.clone(),
-            ProviderStateChange {
-                opt_out: Some(KvOptOut {
-                    at: 0,
-                    fp: String::new(),
-                }),
-                ..ProviderStateChange::default()
-            },
+        log::error!(
+            "Identity removal lost for '{}': provider '{provider}', source '{source}'",
+            log_id(ec_id.unwrap_or_default()),
         );
-    }
-    log_removal_lost(ec_id.unwrap_or_default(), &lost);
-    for _ in lost.removal_labels() {
         context.identity_mut().record_removal_lost();
     }
 }
@@ -2094,8 +2077,13 @@ pub(crate) fn run_capture(
         }
 
         if unreadable {
-            lose_unbuildable_removals(context, ec_id.as_deref(), id, &resolution, deps.catalog);
-            continue;
+            lose_unbuildable_invalidations(
+                context,
+                ec_id.as_deref(),
+                id,
+                &resolution,
+                deps.catalog,
+            );
         }
         let ask = capture_ask(
             deps,
@@ -6222,28 +6210,69 @@ mod tests {
             install_capturing_logger();
             let provider = answering_capture_provider("unreadcap", &[FIRST], None);
             let seeded = row_with(&[(FIRST, "secret-uid-unread-5521", None)]);
-            for (body, expected_lost) in [
-                (json!({"invalidate": [FIRST]}), 1),
-                (json!({"opted_out": true}), 1),
-                (json!({}), 0),
-            ] {
-                let mut fixture = CaptureFixture::new(vec![provider.clone()], Some(&seeded));
+            let unreadable = |fixture: &mut CaptureFixture| {
                 fixture.context.set_kv_snapshot(EcKvSnapshot::Failed {
                     ec_id: TEST_EC_ID.to_owned(),
                 });
+            };
 
-                fixture.capture(&capture_path("unreadcap"), &body);
+            // An invalidation needs the row's revision, so it is lost.
+            let mut invalidating = CaptureFixture::new(vec![provider.clone()], Some(&seeded));
+            unreadable(&mut invalidating);
+            invalidating.capture(&capture_path("unreadcap"), &json!({"invalidate": [FIRST]}));
+            assert_eq!(
+                invalidating.context.identity().removal_lost(),
+                1,
+                "should count the invalidation it could not build"
+            );
+            assert_eq!(
+                invalidating.store.writes().total(),
+                0,
+                "should write nothing"
+            );
 
-                assert_eq!(
-                    fixture.context.identity().removal_lost(),
-                    expected_lost,
-                    "should count the removals it could not build for {body}"
-                );
-                assert!(
-                    fixture.context.identity().pending_removals().is_none(),
-                    "should keep nothing to retry for {body}"
-                );
-            }
+            // An opt-out needs no view: the removal write re-reads and writes it.
+            let mut opting_out = CaptureFixture::new(vec![provider.clone()], Some(&seeded));
+            unreadable(&mut opting_out);
+            opting_out.capture(&capture_path("unreadcap"), &json!({"opted_out": true}));
+            assert_eq!(
+                opting_out.context.identity().removal_lost(),
+                0,
+                "should not count the opt-out lost"
+            );
+            let row = opting_out.row();
+            assert!(row.ps["unreadcap"].o.is_some(), "should store the opt-out");
+            assert!(
+                !row.ids.contains_key(FIRST),
+                "should remove the provider's source record"
+            );
+
+            // A failed opt-out write gets the after-send retry, then is lost.
+            let mut failing = CaptureFixture::new(vec![provider.clone()], Some(&seeded));
+            unreadable(&mut failing);
+            failing.store.fail_conditional_writes(TEST_EC_ID);
+            failing.capture(&capture_path("unreadcap"), &json!({"opted_out": true}));
+            assert!(
+                failing.context.identity().pending_removals().is_some(),
+                "should stage the opt-out for the retry"
+            );
+            assert_eq!(failing.context.identity().removal_lost(), 0, "not lost yet");
+            failing.retry_after_send();
+            assert_eq!(
+                failing.context.identity().removal_lost(),
+                1,
+                "should count the opt-out lost once its retry fails"
+            );
+
+            let mut empty = CaptureFixture::new(vec![provider], Some(&seeded));
+            unreadable(&mut empty);
+            empty.capture(&capture_path("unreadcap"), &json!({}));
+            assert_eq!(
+                empty.context.identity().removal_lost(),
+                0,
+                "control: a result without removals loses nothing"
+            );
+
             let logs = captured_logs();
             assert!(
                 logs.iter().any(|line| line.contains("removal lost")
