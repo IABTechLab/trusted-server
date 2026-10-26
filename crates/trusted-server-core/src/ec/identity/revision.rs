@@ -29,7 +29,6 @@ impl core::fmt::Debug for IdentityKeys {
 impl IdentityKeys {
     /// Derives the visitor key from `ec.passphrase`.
     #[must_use]
-    // Temporary: first used by a later identity task.
     pub(crate) fn from_settings(settings: &Settings) -> Self {
         let passphrase = settings.ec.passphrase.expose().as_bytes();
         let mut mac =

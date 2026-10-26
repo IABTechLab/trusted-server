@@ -531,7 +531,10 @@ fn edgezero_main(mut req: FastlyRequest, sandbox: &mut Sandbox, ordinal: u64, re
                     match build_identity_runtime(&settings) {
                         Ok(identity) => ec_state.ec_context.set_identity_runtime(identity),
                         Err(e) => {
-                            log::warn!("identity runtime unavailable after settings reload: {e:?}");
+                            log::warn!(
+                                "identity runtime unavailable after settings reload: {}",
+                                e.current_context()
+                            );
                         }
                     }
                     match apply_edgezero_ec_finalize(&settings, &mut ec_state, &mut response) {

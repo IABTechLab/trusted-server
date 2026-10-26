@@ -2070,6 +2070,61 @@ mod tests {
     }
 
     #[test]
+    fn handle_proxy_generates_an_ec_only_for_a_real_browser() {
+        let settings = create_test_settings();
+        let registry = IntegrationRegistry::from_routes(vec![(
+            Method::GET,
+            "/integrations/test/ec",
+            (
+                Arc::new(EcTestProxy) as Arc<dyn IntegrationProxy>,
+                "ec_test",
+            ),
+        )]);
+        let services = noop_services();
+        let mut minted = Vec::new();
+
+        for is_real_browser in [false, true] {
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri("https://test-publisher.com/integrations/test/ec")
+                .header("sec-fetch-dest", "document")
+                .body(EdgeBody::empty())
+                .expect("should build request");
+            let mut ec_context = EcContext::new_for_test_with_ip(
+                None,
+                crate::consent::ConsentContext {
+                    jurisdiction: crate::consent::jurisdiction::Jurisdiction::NonRegulated,
+                    ..crate::consent::ConsentContext::default()
+                },
+                Some("192.0.2.1".to_owned()),
+            );
+
+            let result = futures::executor::block_on(registry.handle_proxy(ProxyDispatchInput {
+                method: &Method::GET,
+                path: "/integrations/test/ec",
+                settings: &settings,
+                kv: None,
+                ec_context: &mut ec_context,
+                services: &services,
+                is_real_browser,
+                req,
+            }));
+
+            assert!(
+                result.is_some_and(|response| response.is_ok()),
+                "should handle the request"
+            );
+            minted.push(ec_context.ec_value().is_some());
+        }
+
+        assert_eq!(
+            minted,
+            [false, true],
+            "should mint an EC only when the client is a real browser"
+        );
+    }
+
+    #[test]
     fn handle_proxy_rejects_invalid_ec_request_header() {
         let settings = create_test_settings();
         let routes = vec![(
