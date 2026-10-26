@@ -6,6 +6,7 @@
 //! write-back, so every page load makes at most one browser-driven KV
 //! write. See `docs/superpowers/specs/2026-10-20-server-side-identity-providers-design.md`.
 
+pub(crate) mod catalog;
 pub mod descriptor;
 pub mod exchange;
 pub mod ids;
@@ -14,6 +15,9 @@ pub(crate) mod policy;
 pub mod provider;
 pub mod resolution;
 pub(crate) mod revision;
+pub(crate) mod servable;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_support;
 
 pub use descriptor::{
     Access, Captures, ConsentPolicy, EidProvenance, Input, ProviderDescriptor,

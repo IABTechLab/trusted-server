@@ -84,6 +84,10 @@ fn checked_sources() -> &'static [(&'static str, &'static str)] {
         ("ec/generation.rs", include_str!("ec/generation.rs")),
         ("ec/identify.rs", include_str!("ec/identify.rs")),
         (
+            "ec/identity/catalog.rs",
+            include_str!("ec/identity/catalog.rs"),
+        ),
+        (
             "ec/identity/descriptor.rs",
             include_str!("ec/identity/descriptor.rs"),
         ),
@@ -105,6 +109,14 @@ fn checked_sources() -> &'static [(&'static str, &'static str)] {
         (
             "ec/identity/resolution.rs",
             include_str!("ec/identity/resolution.rs"),
+        ),
+        (
+            "ec/identity/servable.rs",
+            include_str!("ec/identity/servable.rs"),
+        ),
+        (
+            "ec/identity/test_support.rs",
+            include_str!("ec/identity/test_support.rs"),
         ),
         (
             "ec/identity/revision.rs",

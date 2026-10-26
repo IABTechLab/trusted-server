@@ -66,6 +66,7 @@ use crate::creative_opportunities::{
     AdStackGateInput, AssemblyMode, CreativeOpportunitiesConfig, RuntimeAdStackExpected,
     evaluate_ad_stack_gate,
 };
+use crate::ec::identity::policy::PolicySignals;
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::registry::PartnerRegistry;
 use crate::ec::{EcContext, EidSyncSource};
@@ -4941,6 +4942,7 @@ pub async fn handle_publisher_request(
                     kv_snapshot: ec_context.kv_snapshot(),
                     partner_registry: auction.registry,
                     ec_context,
+                    signals: PolicySignals::from_headers(auction_client_request.headers()),
                     services,
                     geo: geo.as_ref(),
                     path_label: "Server-side",
@@ -5537,6 +5539,9 @@ struct AuctionEidTargeting<'a> {
     kv_snapshot: &'a crate::ec::EcKvSnapshot,
     partner_registry: Option<&'a PartnerRegistry>,
     ec_context: &'a EcContext,
+    /// Policy signals the consent context does not carry, read from the
+    /// request's headers.
+    signals: PolicySignals,
     services: &'a RuntimeServices,
     geo: Option<&'a GeoInfo>,
     /// Prefix for the consent-stripped warning (e.g. `"Server-side"`).
@@ -5566,6 +5571,7 @@ fn apply_auction_eids_and_device(
         targeting.kv_snapshot,
         targeting.partner_registry,
         targeting.ec_context,
+        targeting.signals,
     );
     let merged_eids = merge_auction_eids(client_eids, kv_eids);
     let had_eids = merged_eids.as_ref().is_some_and(|v| !v.is_empty());
@@ -7116,6 +7122,7 @@ pub async fn handle_page_bids(
                     kv_snapshot: &page_bids_kv_snapshot,
                     partner_registry: auction.registry,
                     ec_context,
+                    signals: PolicySignals::from_headers(req.headers()),
                     services,
                     geo: geo.as_ref(),
                     path_label: "Page-bids",
@@ -8017,6 +8024,7 @@ mod tests {
                 kv_snapshot: &snapshot,
                 partner_registry: Some(&registry),
                 ec_context: &ec_context,
+                signals: PolicySignals::default(),
                 services: &services,
                 geo: None,
                 path_label: "Test",

@@ -684,8 +684,6 @@ impl ConsentPolicy {
     }
 
     /// Whether this is generic pull's parity policy.
-    // Temporary: its only caller, `policy_allows`, is not yet used.
-    #[allow(dead_code)]
     #[must_use]
     pub(crate) fn is_eid_persistence_only(&self) -> bool {
         self.eid_persistence_only

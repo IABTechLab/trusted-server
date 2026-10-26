@@ -26,13 +26,20 @@ use serde_json::Value as JsonValue;
 use edgezero_core::body::Body as EdgeBody;
 use error_stack::{Report, ResultExt as _};
 
+use crate::consent::ConsentContext;
+use crate::consent::jurisdiction::Jurisdiction;
 use crate::constants::{COOKIE_SHAREDID, COOKIE_TS_EIDS};
 use crate::cookies::extract_cookie_value;
 use crate::error::TrustedServerError;
 use crate::openrtb::Eid;
 
+use super::checked_current_timestamp;
 use super::eids::{resolve_partner_ids, to_eids};
 use super::generation::is_valid_ec_id;
+use super::identity::UnixTime;
+use super::identity::catalog::ProviderCatalog;
+use super::identity::policy::PolicySignals;
+use super::identity::servable::{ServeContext, opted_out_providers};
 use super::kv::KvIdentityGraph;
 use super::kv_backend::EcKvLookup;
 use super::kv_types::{KvEntry, KvMetadata};
@@ -507,7 +514,27 @@ fn iso_timestamp(unix_seconds: u64) -> Option<String> {
 /// Derives the auction EID view for a valid entry, mirroring the filters in
 /// [`resolve_partner_ids`] and reporting why each stored ID was skipped.
 fn build_auction_view(registry: &PartnerRegistry, entry: &KvEntry) -> AuctionEidsView {
-    let resolved = resolve_partner_ids(registry, entry);
+    // The admin view has no request, so it reads with permissive consent. A
+    // failed clock resolves no KV IDs, as the auction does (spec 4.4).
+    let consent = ConsentContext {
+        jurisdiction: Jurisdiction::NonRegulated,
+        ..ConsentContext::default()
+    };
+    let catalog = ProviderCatalog::empty();
+    let opted_out = opted_out_providers(entry);
+    let now = checked_current_timestamp();
+    let serve = ServeContext {
+        now: UnixTime::from_secs(now.unwrap_or(0)),
+        consent: &consent,
+        signals: PolicySignals::default(),
+        catalog: &catalog,
+        opted_out: &opted_out,
+    };
+    let resolved = if now.is_some() {
+        resolve_partner_ids(registry, entry, &serve)
+    } else {
+        Vec::new()
+    };
     let eids = to_eids(&resolved);
 
     let mut skipped = Vec::new();
@@ -518,7 +545,14 @@ fn build_auction_view(registry: &PartnerRegistry, entry: &KvEntry) -> AuctionEid
             match registry.get(source_domain) {
                 None => "not_in_registry",
                 Some(partner) if !partner.bidstream_enabled => "bidstream_disabled",
-                Some(_) => continue,
+                Some(_)
+                    if resolved
+                        .iter()
+                        .any(|item| item.source_domain == *source_domain) =>
+                {
+                    continue;
+                }
+                Some(_) => "not_servable",
             }
         };
         skipped.push(SkippedPartnerId {
@@ -1066,6 +1100,25 @@ mod tests {
         assert_eq!(
             json["auction"]["eids"][0]["source"], "bidstream.example",
             "should build the auction view from the surviving record"
+        );
+    }
+
+    #[test]
+    fn auction_view_reports_an_expired_record_as_not_servable() {
+        let mut entry = KvEntry::minimal("bidstream.example", "uid-expired", 1_741_824_000);
+        entry
+            .ids
+            .get_mut("bidstream.example")
+            .expect("should hold the source")
+            .exp = Some(50);
+
+        let view = build_auction_view(&test_registry(), &entry);
+
+        assert!(view.eids.is_empty(), "should not resolve the expired ID");
+        assert_eq!(view.skipped.len(), 1, "should explain the dropped ID");
+        assert_eq!(
+            view.skipped[0].reason, "not_servable",
+            "should report the servability reason"
         );
     }
 

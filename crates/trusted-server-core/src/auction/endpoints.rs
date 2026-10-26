@@ -14,8 +14,13 @@ use crate::constants::COOKIE_TS_EIDS;
 use crate::cookies::extract_cookie_value;
 use crate::ec::EcContext;
 use crate::ec::EcKvSnapshot;
+use crate::ec::checked_current_timestamp;
 use crate::ec::client_eids::parse_client_eids;
 use crate::ec::eids::{resolve_partner_ids, to_eids};
+use crate::ec::identity::UnixTime;
+use crate::ec::identity::catalog::ProviderCatalog;
+use crate::ec::identity::policy::PolicySignals;
+use crate::ec::identity::servable::{ServeContext, opted_out_providers};
 use crate::ec::kv::KvIdentityGraph;
 use crate::ec::partner::normalize_partner_source_domain;
 use crate::ec::prebid_eids::parse_prebid_eids_cookie;
@@ -317,7 +322,12 @@ pub async fn handle_auction(
     if !matches!(auction_kv_snapshot, EcKvSnapshot::NotRead) {
         ec_context.set_kv_snapshot(auction_kv_snapshot.clone());
     }
-    let eids = resolve_auction_eids(&auction_kv_snapshot, registry, ec_context);
+    let eids = resolve_auction_eids(
+        &auction_kv_snapshot,
+        registry,
+        ec_context,
+        PolicySignals::from_headers(http_req.headers()),
+    );
 
     // Look up geo for device info.
     let geo = services
@@ -441,10 +451,13 @@ pub async fn handle_auction(
 /// Returns `None` when any prerequisite is missing (no KV store, no partner
 /// store, no EC, consent denied). On KV or partner-resolution errors, logs a
 /// warning and returns empty EIDs so the auction can proceed in degraded mode.
+/// A stored record is sent only when the shared servability check passes under
+/// this request's consent and `signals`.
 pub(crate) fn resolve_auction_eids(
     snapshot: &EcKvSnapshot,
     registry: Option<&PartnerRegistry>,
     ec_context: &EcContext,
+    signals: PolicySignals,
 ) -> Option<Vec<Eid>> {
     let registry = registry?;
 
@@ -462,7 +475,23 @@ pub(crate) fn resolve_auction_eids(
         return Some(Vec::new());
     }
 
-    let resolved = resolve_partner_ids(registry, entry);
+    // A zero time would make every expiry check pass (spec 4.4), so a failed
+    // clock resolves no KV IDs.
+    let Some(now) = checked_current_timestamp() else {
+        return Some(Vec::new());
+    };
+    // Until the request's identity runtime is on `EcContext`, no provider is
+    // configured, so only unowned records without a writer are servable.
+    let catalog = ProviderCatalog::empty();
+    let opted_out = opted_out_providers(entry);
+    let serve = ServeContext {
+        now: UnixTime::from_secs(now),
+        consent: ec_context.consent(),
+        signals,
+        catalog: &catalog,
+        opted_out: &opted_out,
+    };
+    let resolved = resolve_partner_ids(registry, entry, &serve);
     Some(to_eids(&resolved))
 }
 
@@ -1674,7 +1703,12 @@ mod tests {
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
 
-        let result = resolve_auction_eids(&EcKvSnapshot::NotRead, Some(&registry), &ec_context);
+        let result = resolve_auction_eids(
+            &EcKvSnapshot::NotRead,
+            Some(&registry),
+            &ec_context,
+            PolicySignals::default(),
+        );
         assert!(
             result.is_some_and(|eids| eids.is_empty()),
             "should degrade to empty EIDs without a snapshot"
@@ -1686,7 +1720,12 @@ mod tests {
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
 
-        let result = resolve_auction_eids(&EcKvSnapshot::NotRead, None, &ec_context);
+        let result = resolve_auction_eids(
+            &EcKvSnapshot::NotRead,
+            None,
+            &ec_context,
+            PolicySignals::default(),
+        );
         assert!(
             result.is_none(),
             "should return None when registry is missing"
@@ -1699,7 +1738,12 @@ mod tests {
         let ec_id = format!("{}.ABC123", "a".repeat(64));
         let ec_context = make_ec_context(Jurisdiction::Unknown, Some(&ec_id));
 
-        let result = resolve_auction_eids(&EcKvSnapshot::NotRead, Some(&registry), &ec_context);
+        let result = resolve_auction_eids(
+            &EcKvSnapshot::NotRead,
+            Some(&registry),
+            &ec_context,
+            PolicySignals::default(),
+        );
         assert!(
             result.is_none(),
             "should return None when consent is denied"
@@ -1711,7 +1755,12 @@ mod tests {
         let registry = PartnerRegistry::empty();
         let ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
 
-        let result = resolve_auction_eids(&EcKvSnapshot::NotRead, Some(&registry), &ec_context);
+        let result = resolve_auction_eids(
+            &EcKvSnapshot::NotRead,
+            Some(&registry),
+            &ec_context,
+            PolicySignals::default(),
+        );
         assert!(
             result.is_none(),
             "should return None when no EC value is present"
@@ -1727,11 +1776,64 @@ mod tests {
         let snapshot = EcKvSnapshot::Failed {
             ec_id: ec_id.clone(),
         };
-        let result = resolve_auction_eids(&snapshot, Some(&registry), &ec_context);
+        let result = resolve_auction_eids(
+            &snapshot,
+            Some(&registry),
+            &ec_context,
+            PolicySignals::default(),
+        );
         let eids = result.expect("should return Some on KV error (degraded mode)");
         assert!(
             eids.is_empty(),
             "should return empty vec on KV error (degraded mode)"
+        );
+    }
+
+    #[test]
+    fn resolve_auction_eids_without_providers_matches_pre_identity_output() {
+        let partners = vec![
+            counting_test_partner("a.example.com"),
+            counting_test_partner("b.example.com"),
+        ];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(&ec_id));
+        let mut entry = crate::ec::kv_types::KvEntry::minimal("a.example.com", "ua", 1);
+        entry.ids.insert(
+            "b.example.com".to_owned(),
+            crate::ec::kv_types::KvPartnerId::new("ub"),
+        );
+        let snapshot = EcKvSnapshot::Present {
+            ec_id: ec_id.clone(),
+            entry: Box::new(entry),
+            generation: None,
+        };
+
+        let eids = resolve_auction_eids(
+            &snapshot,
+            Some(&registry),
+            &ec_context,
+            PolicySignals::default(),
+        )
+        .expect("should resolve EIDs");
+
+        let atype = crate::settings::EcPartner::default_openrtb_atype();
+        let expected: Vec<Eid> = [("a.example.com", "ua"), ("b.example.com", "ub")]
+            .into_iter()
+            .map(|(source, uid)| {
+                Eid::new(
+                    source.to_owned(),
+                    vec![crate::openrtb::Uid {
+                        id: uid.to_owned(),
+                        atype: Some(atype),
+                        ext: None,
+                    }],
+                )
+            })
+            .collect();
+        assert_eq!(
+            eids, expected,
+            "should send exactly the EIDs sent before identity providers existed"
         );
     }
 

@@ -6,17 +6,26 @@ use crate::consent::types::PrivacyFlag;
 use crate::consent::{ConsentContext, effective_tcf};
 
 /// Signals the consent context does not carry.
-// Temporary: first used by a later identity task.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct PolicySignals {
     /// `DNT: 1` was present.
     pub(crate) dnt: bool,
 }
 
+impl PolicySignals {
+    /// Reads the signals a request's headers carry.
+    #[must_use]
+    pub(crate) fn from_headers(headers: &http::HeaderMap) -> Self {
+        Self {
+            dnt: headers
+                .get("dnt")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.trim() == "1"),
+        }
+    }
+}
+
 /// Where TCF applies: `gdpr_applies`, or a jurisdiction of GDPR or unknown.
-// Temporary: first used by a later identity task.
-#[allow(dead_code)]
 #[must_use]
 pub(crate) fn tcf_applies(consent: &ConsentContext) -> bool {
     consent.gdpr_applies
@@ -28,8 +37,6 @@ pub(crate) fn tcf_applies(consent: &ConsentContext) -> bool {
 
 /// Whether the request carries a decoded US sale opt-out, from GPP or from
 /// the US Privacy string.
-// Temporary: first used by a later identity task.
-#[allow(dead_code)]
 fn us_sale_opt_out(consent: &ConsentContext) -> bool {
     consent.gpp.as_ref().and_then(|gpp| gpp.us_sale_opt_out) == Some(true)
         || consent
@@ -41,8 +48,6 @@ fn us_sale_opt_out(consent: &ConsentContext) -> bool {
 /// Whether `policy` allows a provider under this request's consent. The
 /// global EC and EID-persistence gates are checked separately (eligibility
 /// steps 1 and 2) and are not repeated here.
-// Temporary: first used by a later identity task.
-#[allow(dead_code)]
 #[must_use]
 pub(crate) fn policy_allows(
     policy: &ConsentPolicy,

@@ -67,7 +67,8 @@ pub struct ConsentedProvidersSettings {
 /// An Extended User ID entry from an identity provider.
 ///
 /// Mirrors `OpenRTB` 2.6 §3.2.27. Browser entries keep the EID-level fields
-/// Prebid set; KV-resolved entries leave them empty.
+/// Prebid set; KV-resolved entries carry the EID-level fields a provider
+/// stored, and a record from browser ingest or a version 1 row has none.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Eid {

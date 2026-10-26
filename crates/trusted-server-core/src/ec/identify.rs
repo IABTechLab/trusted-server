@@ -16,6 +16,12 @@ use crate::openrtb::{Eid, Uid};
 use crate::settings::Settings;
 
 use super::EcContext;
+use super::checked_current_timestamp;
+use super::identity::SourceDomain;
+use super::identity::UnixTime;
+use super::identity::catalog::ProviderCatalog;
+use super::identity::policy::PolicySignals;
+use super::identity::servable::{ServeContext, is_servable, opted_out_providers};
 use super::kv::KvIdentityGraph;
 use super::kv_types::KvPartnerId;
 use super::log_id;
@@ -96,14 +102,36 @@ pub fn handle_identify(
                 // write back with the live-entry TTL.
                 log::trace!("Identify found tombstone for '{}'", log_id(ec_id));
             } else {
-                // Extract only this partner's UID.
-                if let Some(partner_uid) = entry
-                    .ids
-                    .get(&partner.source_domain)
-                    .and_then(KvPartnerId::first_uid)
-                    .filter(|partner_uid| !partner_uid.is_empty())
-                {
-                    uid = Some(partner_uid.to_owned());
+                // Extract only this partner's UID, and only when the shared
+                // servability check passes under this request's consent, never
+                // the row's stored snapshot. A failed clock serves nothing,
+                // because a zero time would make every expiry check pass.
+                if let Some(now) = checked_current_timestamp() {
+                    // Until the request's identity runtime is on `EcContext`, no
+                    // provider is configured.
+                    let catalog = ProviderCatalog::empty();
+                    let opted_out = opted_out_providers(&entry);
+                    let serve = ServeContext {
+                        now: UnixTime::from_secs(now),
+                        consent: ec_context.consent(),
+                        signals: PolicySignals::from_headers(req.headers()),
+                        catalog: &catalog,
+                        opted_out: &opted_out,
+                    };
+                    if let Some(partner_uid) = entry
+                        .ids
+                        .get(&partner.source_domain)
+                        .filter(|record| {
+                            partner
+                                .source_domain
+                                .parse::<SourceDomain>()
+                                .is_ok_and(|source| is_servable(&serve, &source, record))
+                        })
+                        .and_then(KvPartnerId::first_uid)
+                        .filter(|partner_uid| !partner_uid.is_empty())
+                    {
+                        uid = Some(partner_uid.to_owned());
+                    }
                 }
 
                 // Evaluate cluster size lazily for identify responses. Existing
@@ -340,6 +368,8 @@ mod tests {
     use super::*;
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{ConsentContext, ConsentSource};
+    use crate::ec::identity::test_support::{example_entry_set, full_record};
+    use crate::ec::kv_types::KvEntry;
     use crate::ec::registry::PartnerRegistry;
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
@@ -642,6 +672,90 @@ mod tests {
         assert!(
             body.get("eid").is_none(),
             "eid should be omitted when KV read fails"
+        );
+    }
+
+    fn identify_body(kv: &KvIdentityGraph, ec_id: &str) -> serde_json::Value {
+        let settings = create_test_settings();
+        let partners = vec![make_test_partner("ssp.example.com", VALID_API_TOKEN)];
+        let registry = PartnerRegistry::from_config(&partners).expect("should build registry");
+        let req = Request::builder()
+            .method("GET")
+            .uri("https://edge.test-publisher.com/identify")
+            .header("authorization", format!("Bearer {VALID_API_TOKEN}"))
+            .body(EdgeBody::empty())
+            .expect("should build test request");
+        let ec_context = make_ec_context(Jurisdiction::NonRegulated, Some(ec_id));
+
+        let response = handle_identify(&settings, kv, &registry, &req, &ec_context)
+            .expect("should construct identify response");
+        assert_eq!(response.status(), StatusCode::OK, "should answer 200");
+        serde_json::from_slice(&response.into_body().into_bytes().unwrap_or_default())
+            .expect("should decode identify response JSON")
+    }
+
+    #[test]
+    fn handle_identify_omits_an_expired_record_and_keeps_a_valid_one() {
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let mut entry = KvEntry::minimal("ssp.example.com", "expired-uid", 1);
+        entry
+            .ids
+            .get_mut("ssp.example.com")
+            .expect("should hold the partner source")
+            .exp = Some(50);
+        entry.ids.insert(
+            "other.example.com".to_owned(),
+            KvPartnerId::new("valid-uid"),
+        );
+        let kv = KvIdentityGraph::in_memory("identify-store");
+        kv.create(&ec_id, &entry).expect("should seed KV entry");
+
+        let body = identify_body(&kv, &ec_id);
+
+        assert!(
+            body.get("uid").is_none() && body.get("eid").is_none(),
+            "should not return the expired ID"
+        );
+
+        let mut live = KvEntry::minimal("ssp.example.com", "live-uid", 1);
+        live.ids
+            .get_mut("ssp.example.com")
+            .expect("should hold the partner source")
+            .exp = Some(u64::MAX);
+        let kv = KvIdentityGraph::in_memory("identify-store");
+        kv.create(&ec_id, &live).expect("should seed KV entry");
+
+        let body = identify_body(&kv, &ec_id);
+
+        assert_eq!(body["uid"], "live-uid", "should return the unexpired ID");
+    }
+
+    #[test]
+    fn handle_identify_returns_one_uid_for_a_full_record() {
+        let ec_id = format!("{}.ABC123", "a".repeat(64));
+        let mut entry = KvEntry::minimal("other.example.com", "other-uid", 1);
+        entry.ids.insert(
+            "ssp.example.com".to_owned(),
+            full_record(None, example_entry_set()),
+        );
+        let kv = KvIdentityGraph::in_memory("identify-store");
+        kv.create(&ec_id, &entry).expect("should seed KV entry");
+
+        let body = identify_body(&kv, &ec_id);
+
+        assert_eq!(body["uid"], "example-a", "should return the first UID");
+        let expected = Eid::new(
+            "ssp.example.com".to_owned(),
+            vec![Uid {
+                id: "example-a".to_owned(),
+                atype: Some(EcPartner::default_openrtb_atype()),
+                ext: None,
+            }],
+        );
+        assert_eq!(
+            body["eid"],
+            serde_json::to_value(expected).expect("should serialize the expected EID"),
+            "should return the one-UID shape, never the full set"
         );
     }
 
