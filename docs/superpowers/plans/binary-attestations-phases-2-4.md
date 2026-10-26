@@ -27,6 +27,7 @@ Finish and rehearse each phase before the next. Keep PRs draft, without reviewer
 - In `recipe/tests/complete.rs`, Phase 2 keeps build/composition/JS rejection tests; Phase 3 adds the SPDX-generation rejection test and the collection-export assertion. `full.rs`, `cli.rs` and `macos_cli.rs` retain build, equality or native measurement, inspection, remapping and runtime/startup checks in Phase 2; Phase 3 restores SPDX/index/export assertions. No test is dropped from the final stack.
 - Four `native_spdx_*` tests in `composition/native/tests.rs` land in Phase 3. Capture tests and `fixture_for_projection` remain in Phase 2. `recipe/startup/accepted/tests.rs` contains no evidence-module imports and stays wholly in Phase 2.
 - `crates/trusted-server-cli/tests/fixtures/release/release-index.json` moves to Phase 3 because distribution tests embed it. CLI consumer code remains Phase 4.
+- Three `workflow_contract_command_*` process tests in `tests/commands.rs` are restored in Phase 3 with the workflow-contract command; all other frozen command tests remain in Phase 2.
 - Main command/module registrations, error variants, re-exports, manifests, lockfile, workflows and shared tests are staged by dependency. Stage unused evidence/publication variants until their owning phase rather than introducing broad warning suppressions.
 
 ### Avoid duplicate build-facts ports
@@ -147,94 +148,94 @@ The landing phase below is exclusive file ownership. Shared files receive later 
 | `scripts/release/qualification/2026-10-21-candidate-release-index.md`                                          | 1 — carried   | Carried in #1435                                          |
 | `scripts/release/qualification/2026-10-21-four-asset-candidate-join.md`                                        | 1 — carried   | Carried in #1435                                          |
 | `scripts/release/qualification/2026-10-21-native-reproduction-schedule.md`                                     | 1 — carried   | Carried in #1435                                          |
-| `Cargo.lock`                                                                                                   | 2             | Pending                                                   |
-| `Cargo.toml`                                                                                                   | 2             | Pending                                                   |
-| `crates/trusted-server-release/Cargo.toml`                                                                     | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/documents.rs`                                                               | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/documents/tests.rs`                                                         | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/error.rs`                                                                   | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/git_objects.rs`                                                             | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/main.rs`                                                                    | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/policy.rs`                                                                  | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/policy/tests.rs`                                                            | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/policy/tools.rs`                                                            | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/preflight.rs`                                                               | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/preflight/child.rs`                                                         | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/preflight/tests.rs`                                                         | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/source.rs`                                                                  | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/source/closure.rs`                                                          | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/source/config.rs`                                                           | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/source/git.rs`                                                              | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/source/materialize.rs`                                                      | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/source/tests.rs`                                                            | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/source/tests/closure.rs`                                                    | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/source/tests/layout.rs`                                                     | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/source/tests/objects.rs`                                                    | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/source/tests/process.rs`                                                    | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/source/tests/worktree.rs`                                                   | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/source/tree.rs`                                                             | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/source/worktree.rs`                                                         | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/tool_tree.rs`                                                               | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/tool_tree/tests.rs`                                                         | 2             | Pending                                                   |
-| `crates/trusted-server-release/tests/commands.rs`                                                              | 2             | Pending                                                   |
-| `crates/trusted-server-release/tests/fixtures/sha-mbles-1.bin`                                                 | 2             | Pending                                                   |
-| `scripts/release/bootstrap.sh`                                                                                 | 2             | Pending                                                   |
-| `scripts/release/release-cohort.json`                                                                          | 2             | Pending                                                   |
+| `Cargo.lock`                                                                                                   | 2             | Staged Phase 2 dependency/support subset                  |
+| `Cargo.toml`                                                                                                   | 2             | Staged Phase 2 dependency/support subset                  |
+| `crates/trusted-server-release/Cargo.toml`                                                                     | 2             | Staged Phase 2 dependency/support subset                  |
+| `crates/trusted-server-release/src/documents.rs`                                                               | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/documents/tests.rs`                                                         | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/error.rs`                                                                   | 2             | Staged Phase 2 dependency/support subset                  |
+| `crates/trusted-server-release/src/git_objects.rs`                                                             | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/main.rs`                                                                    | 2             | Staged Phase 2 dependency/support subset                  |
+| `crates/trusted-server-release/src/policy.rs`                                                                  | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/policy/tests.rs`                                                            | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/policy/tools.rs`                                                            | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/preflight.rs`                                                               | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/preflight/child.rs`                                                         | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/preflight/tests.rs`                                                         | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/source.rs`                                                                  | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/source/closure.rs`                                                          | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/source/config.rs`                                                           | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/source/git.rs`                                                              | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/source/materialize.rs`                                                      | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/source/tests.rs`                                                            | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/source/tests/closure.rs`                                                    | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/source/tests/layout.rs`                                                     | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/source/tests/objects.rs`                                                    | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/source/tests/process.rs`                                                    | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/source/tests/worktree.rs`                                                   | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/source/tree.rs`                                                             | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/source/worktree.rs`                                                         | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/tool_tree.rs`                                                               | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/tool_tree/tests.rs`                                                         | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/tests/commands.rs`                                                              | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/tests/fixtures/sha-mbles-1.bin`                                                 | 2             | Ported Phase 2 source or approved split                   |
+| `scripts/release/bootstrap.sh`                                                                                 | 2             | Ported Phase 2 source or approved split                   |
+| `scripts/release/release-cohort.json`                                                                          | 2             | Retained current seven rows; strict metadata validation   |
 | `scripts/release/release-tools.json`                                                                           | 2             | Already identical; retain, no port                        |
-| `crates/trusted-server-release/src/boundary.rs`                                                                | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/boundary/cleanup_and_system_root_tests.rs`                                  | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/boundary/command.rs`                                                        | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/boundary/command/selector_tests.rs`                                         | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/boundary/daemon.rs`                                                         | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/boundary/docker.rs`                                                         | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/boundary/docker/host_path_tests.rs`                                         | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/boundary/entropy.rs`                                                        | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/boundary/host_inputs.rs`                                                    | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/boundary/macos.rs`                                                          | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/boundary/probe.rs`                                                          | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/boundary/proof.rs`                                                          | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/boundary/roots.rs`                                                          | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/boundary/seccomp.rs`                                                        | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/boundary/selector_placement_tests.rs`                                       | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/boundary/sibling_tests.rs`                                                  | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/boundary/survivors.rs`                                                      | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/boundary/tests.rs`                                                          | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/boundary/tests/container.rs`                                                | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/boundary/tests/linux.rs`                                                    | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/boundary/tests/macos.rs`                                                    | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/boundary/tests/modes.rs`                                                    | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/boundary/tests/unit.rs`                                                     | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/lifecycle_guard.rs`                                                         | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/process.rs`                                                                 | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/process/environment.rs`                                                     | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/process/environment/selector_tests.rs`                                      | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/process/pipes.rs`                                                           | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/process/redact.rs`                                                          | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/process/supervise.rs`                                                       | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/process/tests.rs`                                                           | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/process/tests/fixture.rs`                                                   | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/process/tests/outcomes.rs`                                                  | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/process/tests/redaction.rs`                                                 | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/process/tests/supervision.rs`                                               | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/process/tests/variables.rs`                                                 | 2             | Pending                                                   |
-| `crates/trusted-server-release/tests/boundary.rs`                                                              | 2             | Pending                                                   |
-| `crates/trusted-server-release/tests/fixtures/cargo-denial/Cargo.lock`                                         | 2             | Pending                                                   |
-| `crates/trusted-server-release/tests/fixtures/cargo-denial/Cargo.toml`                                         | 2             | Pending                                                   |
-| `crates/trusted-server-release/tests/fixtures/cargo-denial/crates/build-direct/Cargo.toml`                     | 2             | Pending                                                   |
-| `crates/trusted-server-release/tests/fixtures/cargo-denial/crates/build-direct/build.rs`                       | 2             | Pending                                                   |
-| `crates/trusted-server-release/tests/fixtures/cargo-denial/crates/build-direct/src/main.rs`                    | 2             | Pending                                                   |
-| `crates/trusted-server-release/tests/fixtures/cargo-denial/crates/build-grandchild/Cargo.toml`                 | 2             | Pending                                                   |
-| `crates/trusted-server-release/tests/fixtures/cargo-denial/crates/build-grandchild/build.rs`                   | 2             | Pending                                                   |
-| `crates/trusted-server-release/tests/fixtures/cargo-denial/crates/build-grandchild/src/main.rs`                | 2             | Pending                                                   |
-| `crates/trusted-server-release/tests/fixtures/cargo-denial/crates/control/Cargo.toml`                          | 2             | Pending                                                   |
-| `crates/trusted-server-release/tests/fixtures/cargo-denial/crates/control/build.rs`                            | 2             | Pending                                                   |
-| `crates/trusted-server-release/tests/fixtures/cargo-denial/crates/control/src/control.rs`                      | 2             | Pending                                                   |
-| `crates/trusted-server-release/tests/fixtures/cargo-denial/crates/control/src/main.rs`                         | 2             | Pending                                                   |
-| `crates/trusted-server-release/tests/fixtures/cargo-denial/crates/macro-attempt/Cargo.toml`                    | 2             | Pending                                                   |
-| `crates/trusted-server-release/tests/fixtures/cargo-denial/crates/macro-attempt/src/lib.rs`                    | 2             | Pending                                                   |
-| `crates/trusted-server-release/tests/fixtures/cargo-denial/crates/macro-attempt/src/main.rs`                   | 2             | Pending                                                   |
-| `scripts/release/qualification/SECCOMP-LICENSE`                                                                | 2             | Pending                                                   |
-| `scripts/release/qualification/seccomp-default.json`                                                           | 2             | Pending                                                   |
+| `crates/trusted-server-release/src/boundary.rs`                                                                | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/boundary/cleanup_and_system_root_tests.rs`                                  | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/boundary/command.rs`                                                        | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/boundary/command/selector_tests.rs`                                         | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/boundary/daemon.rs`                                                         | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/boundary/docker.rs`                                                         | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/boundary/docker/host_path_tests.rs`                                         | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/boundary/entropy.rs`                                                        | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/boundary/host_inputs.rs`                                                    | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/boundary/macos.rs`                                                          | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/boundary/probe.rs`                                                          | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/boundary/proof.rs`                                                          | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/boundary/roots.rs`                                                          | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/boundary/seccomp.rs`                                                        | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/boundary/selector_placement_tests.rs`                                       | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/boundary/sibling_tests.rs`                                                  | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/boundary/survivors.rs`                                                      | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/boundary/tests.rs`                                                          | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/boundary/tests/container.rs`                                                | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/boundary/tests/linux.rs`                                                    | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/boundary/tests/macos.rs`                                                    | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/boundary/tests/modes.rs`                                                    | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/boundary/tests/unit.rs`                                                     | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/lifecycle_guard.rs`                                                         | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/process.rs`                                                                 | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/process/environment.rs`                                                     | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/process/environment/selector_tests.rs`                                      | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/process/pipes.rs`                                                           | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/process/redact.rs`                                                          | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/process/supervise.rs`                                                       | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/process/tests.rs`                                                           | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/process/tests/fixture.rs`                                                   | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/process/tests/outcomes.rs`                                                  | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/process/tests/redaction.rs`                                                 | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/process/tests/supervision.rs`                                               | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/process/tests/variables.rs`                                                 | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/tests/boundary.rs`                                                              | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/tests/fixtures/cargo-denial/Cargo.lock`                                         | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/tests/fixtures/cargo-denial/Cargo.toml`                                         | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/tests/fixtures/cargo-denial/crates/build-direct/Cargo.toml`                     | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/tests/fixtures/cargo-denial/crates/build-direct/build.rs`                       | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/tests/fixtures/cargo-denial/crates/build-direct/src/main.rs`                    | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/tests/fixtures/cargo-denial/crates/build-grandchild/Cargo.toml`                 | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/tests/fixtures/cargo-denial/crates/build-grandchild/build.rs`                   | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/tests/fixtures/cargo-denial/crates/build-grandchild/src/main.rs`                | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/tests/fixtures/cargo-denial/crates/control/Cargo.toml`                          | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/tests/fixtures/cargo-denial/crates/control/build.rs`                            | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/tests/fixtures/cargo-denial/crates/control/src/control.rs`                      | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/tests/fixtures/cargo-denial/crates/control/src/main.rs`                         | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/tests/fixtures/cargo-denial/crates/macro-attempt/Cargo.toml`                    | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/tests/fixtures/cargo-denial/crates/macro-attempt/src/lib.rs`                    | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/tests/fixtures/cargo-denial/crates/macro-attempt/src/main.rs`                   | 2             | Ported Phase 2 source or approved split                   |
+| `scripts/release/qualification/SECCOMP-LICENSE`                                                                | 2             | Ported Phase 2 source or approved split                   |
+| `scripts/release/qualification/seccomp-default.json`                                                           | 2             | Ported Phase 2 source or approved split                   |
 | `crates/trusted-server-adapter-fastly/build.rs`                                                                | 1 — carried   | Build facts landed in #1435; preserve current refinements |
 | `crates/trusted-server-adapter-fastly/src/main.rs`                                                             | 1 — carried   | Build facts landed in #1435; preserve current refinements |
 | `crates/trusted-server-cli/build.rs`                                                                           | 1 — carried   | Build facts landed in #1435; preserve current refinements |
@@ -246,11 +247,11 @@ The landing phase below is exclusive file ownership. Shared files receive later 
 | `crates/trusted-server-core/src/constants.rs`                                                                  | 1 — carried   | Build facts landed in #1435; preserve current refinements |
 | `crates/trusted-server-core/src/lib.rs`                                                                        | 1 — carried   | Build facts landed in #1435; preserve current refinements |
 | `crates/trusted-server-core/tests/git_version_resolve.rs`                                                      | 1 — carried   | Build facts landed in #1435; preserve current refinements |
-| `crates/trusted-server-integration-tests/browser/helpers/infra.ts`                                             | 2             | Pending                                                   |
-| `crates/trusted-server-integration-tests/tests/common/runtime.rs`                                              | 2             | Pending                                                   |
-| `crates/trusted-server-integration-tests/tests/frameworks/mod.rs`                                              | 2             | Pending                                                   |
-| `crates/trusted-server-integration-tests/tests/parity.rs`                                                      | 2             | Pending                                                   |
-| `docs/superpowers/specs/2026-09-25-git-version-header-design.md`                                               | 2             | Pending                                                   |
+| `crates/trusted-server-integration-tests/browser/helpers/infra.ts`                                             | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-integration-tests/tests/common/runtime.rs`                                              | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-integration-tests/tests/frameworks/mod.rs`                                              | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-integration-tests/tests/parity.rs`                                                      | 2             | Ported Phase 2 source or approved split                   |
+| `docs/superpowers/specs/2026-09-25-git-version-header-design.md`                                               | 2             | Ported Phase 2 source or approved split                   |
 | `crates/trusted-server-js/Cargo.toml`                                                                          | 2             | Pending                                                   |
 | `crates/trusted-server-js/README.md`                                                                           | 2             | Pending                                                   |
 | `crates/trusted-server-js/build.rs`                                                                            | 2             | Pending                                                   |
@@ -268,151 +269,151 @@ The landing phase below is exclusive file ownership. Shared files receive later 
 | `crates/trusted-server-js/lib/test/release-composition.test.mjs`                                               | 2             | Pending                                                   |
 | `crates/trusted-server-js/lib/vitest.config.ts`                                                                | 2             | Pending                                                   |
 | `crates/trusted-server-js/tests/release_prebuilt.rs`                                                           | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/javascript.rs`                                                              | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/javascript/contributions.rs`                                                | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/javascript/contributions/tests.rs`                                          | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/javascript/tests.rs`                                                        | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/javascript/tests/adopt.rs`                                                  | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/materials.rs`                                                               | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/materials/archive.rs`                                                       | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/materials/cargo_vendor.rs`                                                  | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/materials/cargo_vendor/differential.rs`                                     | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/materials/cargo_vendor/git_tree.rs`                                         | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/materials/cargo_vendor/index.rs`                                            | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/materials/cargo_vendor/normalize.rs`                                        | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/materials/cargo_vendor/source.rs`                                           | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/materials/cargo_vendor/tests.rs`                                            | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/materials/cargo_vendor/tests/git.rs`                                        | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/materials/cargo_vendor/tests/normalize.rs`                                  | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/materials/cargo_vendor/tests/registry.rs`                                   | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/materials/cargo_vendor/tests/source.rs`                                     | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/materials/cargo_vendor/tests/support.rs`                                    | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/materials/cargo_vendor/writer.rs`                                           | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/materials/extract.rs`                                                       | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/materials/extract/compatibility.rs`                                         | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/materials/extract/tests.rs`                                                 | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/materials/extract/tests/cargo_package.rs`                                   | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/materials/extract/tests/npm_compatibility.rs`                               | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/materials/git.rs`                                                           | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/materials/git/input.rs`                                                     | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/materials/git/tests.rs`                                                     | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/materials/locked.rs`                                                        | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/materials/manifest.rs`                                                      | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/materials/npm_bundle.rs`                                                    | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/materials/tests.rs`                                                         | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/preparation.rs`                                                             | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/preparation/tests.rs`                                                       | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/preparation/tests/full.rs`                                                  | 2             | Pending                                                   |
+| `crates/trusted-server-release/src/javascript.rs`                                                              | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/javascript/contributions.rs`                                                | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/javascript/contributions/tests.rs`                                          | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/javascript/tests.rs`                                                        | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/javascript/tests/adopt.rs`                                                  | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/materials.rs`                                                               | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/materials/archive.rs`                                                       | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/materials/cargo_vendor.rs`                                                  | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/materials/cargo_vendor/differential.rs`                                     | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/materials/cargo_vendor/git_tree.rs`                                         | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/materials/cargo_vendor/index.rs`                                            | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/materials/cargo_vendor/normalize.rs`                                        | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/materials/cargo_vendor/source.rs`                                           | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/materials/cargo_vendor/tests.rs`                                            | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/materials/cargo_vendor/tests/git.rs`                                        | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/materials/cargo_vendor/tests/normalize.rs`                                  | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/materials/cargo_vendor/tests/registry.rs`                                   | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/materials/cargo_vendor/tests/source.rs`                                     | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/materials/cargo_vendor/tests/support.rs`                                    | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/materials/cargo_vendor/writer.rs`                                           | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/materials/extract.rs`                                                       | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/materials/extract/compatibility.rs`                                         | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/materials/extract/tests.rs`                                                 | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/materials/extract/tests/cargo_package.rs`                                   | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/materials/extract/tests/npm_compatibility.rs`                               | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/materials/git.rs`                                                           | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/materials/git/input.rs`                                                     | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/materials/git/tests.rs`                                                     | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/materials/locked.rs`                                                        | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/materials/manifest.rs`                                                      | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/materials/npm_bundle.rs`                                                    | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/materials/tests.rs`                                                         | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/preparation.rs`                                                             | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/preparation/tests.rs`                                                       | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/preparation/tests/full.rs`                                                  | 2             | Ported Phase 2 source or approved split                   |
 | `scripts/release/build-js.sh`                                                                                  | 2             | Pending                                                   |
 | `scripts/release/collect-js.mjs`                                                                               | 2             | Pending                                                   |
 | `scripts/release/observe-npm.mjs`                                                                              | 2             | Pending                                                   |
 | `scripts/release/tests/js-fixture.Dockerfile`                                                                  | 2             | Pending                                                   |
 | `scripts/release/tests/prepare-js-fixture.mjs`                                                                 | 2             | Pending                                                   |
 | `crates/trusted-server-adapter-cloudflare/build.sh`                                                            | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/inspect.rs`                                                                 | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/inspect/elf.rs`                                                             | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/inspect/elf/loader.rs`                                                      | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/inspect/macho.rs`                                                           | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/inspect/macho/signature.rs`                                                 | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/inspect/tests.rs`                                                           | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/inspect/tests/builders.rs`                                                  | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/inspect/tests/builders/macho_data.rs`                                       | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/inspect/tests/elf.rs`                                                       | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/inspect/tests/macho.rs`                                                     | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/inspect/tests/wasm.rs`                                                      | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/inspect/wasm.rs`                                                            | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/package.rs`                                                                 | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/package/tests.rs`                                                           | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe.rs`                                                                  | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/ambient.rs`                                                          | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/apple.rs`                                                            | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/apple/sdk.rs`                                                        | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/apple/toolchain.rs`                                                  | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/apple/toolchain/tests.rs`                                            | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/artifact.rs`                                                         | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/artifact/tests.rs`                                                   | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/cargo_home.rs`                                                       | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/cargo_home/tests.rs`                                                 | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/cargo_output.rs`                                                     | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/cargo_output/tests.rs`                                               | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/compare.rs`                                                          | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/completed.rs`                                                        | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/execute.rs`                                                          | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/fastly_tools.rs`                                                     | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/final_paths.rs`                                                      | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/fresh.rs`                                                            | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/gnu.rs`                                                              | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/gnu/image.rs`                                                        | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/gnu/tests.rs`                                                        | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/identity.rs`                                                         | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/identity/tests.rs`                                                   | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/native.rs`                                                           | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/paths.rs`                                                            | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/paths/fake.rs`                                                       | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/plan.rs`                                                             | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/remap.rs`                                                            | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/runtime.rs`                                                          | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/runtime/config.rs`                                                   | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/runtime/exchange.rs`                                                 | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/runtime/export.rs`                                                   | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/runtime/export/tests.rs`                                             | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/runtime/logs.rs`                                                     | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/runtime/viceroy.rs`                                                  | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/sources.rs`                                                          | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/startup.rs`                                                          | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/startup/accepted.rs`                                                 | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/startup/accepted/tests.rs`                                           | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/startup/lifecycle.rs`                                                | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/startup/native.rs`                                                   | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/tests.rs`                                                            | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/tests/ambient.rs`                                                    | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/tests/bind.rs`                                                       | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/tests/candidate.rs`                                                  | 2             | Pending                                                   |
+| `crates/trusted-server-release/src/inspect.rs`                                                                 | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/inspect/elf.rs`                                                             | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/inspect/elf/loader.rs`                                                      | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/inspect/macho.rs`                                                           | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/inspect/macho/signature.rs`                                                 | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/inspect/tests.rs`                                                           | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/inspect/tests/builders.rs`                                                  | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/inspect/tests/builders/macho_data.rs`                                       | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/inspect/tests/elf.rs`                                                       | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/inspect/tests/macho.rs`                                                     | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/inspect/tests/wasm.rs`                                                      | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/inspect/wasm.rs`                                                            | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/package.rs`                                                                 | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/package/tests.rs`                                                           | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe.rs`                                                                  | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/ambient.rs`                                                          | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/apple.rs`                                                            | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/apple/sdk.rs`                                                        | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/apple/toolchain.rs`                                                  | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/apple/toolchain/tests.rs`                                            | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/artifact.rs`                                                         | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/artifact/tests.rs`                                                   | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/cargo_home.rs`                                                       | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/cargo_home/tests.rs`                                                 | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/cargo_output.rs`                                                     | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/cargo_output/tests.rs`                                               | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/compare.rs`                                                          | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/completed.rs`                                                        | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/execute.rs`                                                          | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/fastly_tools.rs`                                                     | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/final_paths.rs`                                                      | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/fresh.rs`                                                            | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/gnu.rs`                                                              | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/gnu/image.rs`                                                        | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/gnu/tests.rs`                                                        | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/identity.rs`                                                         | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/identity/tests.rs`                                                   | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/native.rs`                                                           | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/paths.rs`                                                            | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/paths/fake.rs`                                                       | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/plan.rs`                                                             | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/remap.rs`                                                            | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/runtime.rs`                                                          | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/runtime/config.rs`                                                   | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/runtime/exchange.rs`                                                 | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/runtime/export.rs`                                                   | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/runtime/export/tests.rs`                                             | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/runtime/logs.rs`                                                     | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/runtime/viceroy.rs`                                                  | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/sources.rs`                                                          | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/startup.rs`                                                          | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/startup/accepted.rs`                                                 | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/startup/accepted/tests.rs`                                           | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/startup/lifecycle.rs`                                                | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/startup/native.rs`                                                   | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/tests.rs`                                                            | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/tests/ambient.rs`                                                    | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/tests/bind.rs`                                                       | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/tests/candidate.rs`                                                  | 2             | Ported Phase 2 source or approved split                   |
 | `crates/trusted-server-release/src/recipe/tests/candidate_entry.rs`                                            | 3             | Pending                                                   |
 | `crates/trusted-server-release/src/recipe/tests/candidate_index.rs`                                            | 3             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/tests/cli.rs`                                                        | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/tests/cli_candidate.rs`                                              | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/tests/compare.rs`                                                    | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/tests/complete.rs`                                                   | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/tests/complete_darwin.rs`                                            | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/tests/darwin.rs`                                                     | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/tests/darwin_toolchain.rs`                                           | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/tests/fixture.rs`                                                    | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/tests/full.rs`                                                       | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/tests/full_macos.rs`                                                 | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/tests/macos_candidate.rs`                                            | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/tests/macos_cli.rs`                                                  | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/tests/native.rs`                                                     | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/tests/plan.rs`                                                       | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/tests/real_fixture.rs`                                               | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/tests/remap.rs`                                                      | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/tests/runtime.rs`                                                    | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/tests/sources.rs`                                                    | 2             | Pending                                                   |
+| `crates/trusted-server-release/src/recipe/tests/cli.rs`                                                        | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/tests/cli_candidate.rs`                                              | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/tests/compare.rs`                                                    | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/tests/complete.rs`                                                   | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/tests/complete_darwin.rs`                                            | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/tests/darwin.rs`                                                     | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/tests/darwin_toolchain.rs`                                           | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/tests/fixture.rs`                                                    | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/tests/full.rs`                                                       | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/tests/full_macos.rs`                                                 | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/tests/macos_candidate.rs`                                            | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/tests/macos_cli.rs`                                                  | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/tests/native.rs`                                                     | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/tests/plan.rs`                                                       | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/tests/real_fixture.rs`                                               | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/tests/remap.rs`                                                      | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/tests/runtime.rs`                                                    | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/tests/sources.rs`                                                    | 2             | Ported Phase 2 source or approved split                   |
 | `crates/trusted-server-release/src/recipe/tests/spdx_candidate.rs`                                             | 3             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/tests/tools.rs`                                                      | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/recipe/tools.rs`                                                            | 2             | Pending                                                   |
+| `crates/trusted-server-release/src/recipe/tests/tools.rs`                                                      | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/recipe/tools.rs`                                                            | 2             | Ported Phase 2 source or approved split                   |
 | `scripts/release/build.sh`                                                                                     | 2             | Pending                                                   |
 | `scripts/release/tests/cargo-fixture.Dockerfile`                                                               | 2             | Pending                                                   |
-| `scripts/release/tests/cli-builder.Dockerfile`                                                                 | 2             | Pending                                                   |
+| `scripts/release/tests/cli-builder.Dockerfile`                                                                 | 2             | Ported Phase 2 source or approved split                   |
 | `scripts/release/tests/prepare-cargo-fixture.mjs`                                                              | 2             | Pending                                                   |
 | `scripts/release/tests/prepare-cli-fixture.mjs`                                                                | 2             | Pending                                                   |
-| `crates/trusted-server-release/schemas/SPDX-LICENSE`                                                           | 2             | Pending                                                   |
-| `crates/trusted-server-release/schemas/spdx-2.3.schema.json`                                                   | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/composition.rs`                                                             | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/composition/capture.rs`                                                     | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/composition/external.rs`                                                    | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/composition/external/tests.rs`                                              | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/composition/graph.rs`                                                       | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/composition/graph/tests.rs`                                                 | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/composition/javascript.rs`                                                  | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/composition/javascript/tests.rs`                                            | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/composition/native.rs`                                                      | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/composition/native/tests.rs`                                                | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/composition/origin.rs`                                                      | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/composition/origin/tests.rs`                                                | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/composition/platform.rs`                                                    | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/composition/platform/tests.rs`                                              | 2             | Pending                                                   |
-| `crates/trusted-server-release/src/composition/tests.rs`                                                       | 2             | Pending                                                   |
+| `crates/trusted-server-release/schemas/SPDX-LICENSE`                                                           | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/schemas/spdx-2.3.schema.json`                                                   | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/composition.rs`                                                             | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/composition/capture.rs`                                                     | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/composition/external.rs`                                                    | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/composition/external/tests.rs`                                              | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/composition/graph.rs`                                                       | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/composition/graph/tests.rs`                                                 | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/composition/javascript.rs`                                                  | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/composition/javascript/tests.rs`                                            | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/composition/native.rs`                                                      | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/composition/native/tests.rs`                                                | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/composition/origin.rs`                                                      | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/composition/origin/tests.rs`                                                | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/composition/platform.rs`                                                    | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/composition/platform/tests.rs`                                              | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/src/composition/tests.rs`                                                       | 2             | Ported Phase 2 source or approved split                   |
 | `crates/trusted-server-release/src/spdx.rs`                                                                    | 3             | Pending                                                   |
 | `crates/trusted-server-release/src/spdx/candidate.rs`                                                          | 3             | Pending                                                   |
 | `crates/trusted-server-release/src/spdx/candidate/tests.rs`                                                    | 3             | Pending                                                   |
@@ -425,13 +426,13 @@ The landing phase below is exclusive file ownership. Shared files receive later 
 | `crates/trusted-server-release/src/spdx/platform.rs`                                                           | 3             | Pending                                                   |
 | `crates/trusted-server-release/src/spdx/platform/tests.rs`                                                     | 3             | Pending                                                   |
 | `crates/trusted-server-release/src/spdx/tests.rs`                                                              | 3             | Pending                                                   |
-| `crates/trusted-server-release/tests/fixtures/composition/README.md`                                           | 2             | Pending                                                   |
-| `crates/trusted-server-release/tests/fixtures/composition/cargo-1.95-cross-host-metadata.json`                 | 2             | Pending                                                   |
-| `crates/trusted-server-release/tests/fixtures/composition/cargo-1.95-cross-messages.jsonl`                     | 2             | Pending                                                   |
-| `crates/trusted-server-release/tests/fixtures/composition/cargo-1.95-cross-target-filtered-metadata.json`      | 2             | Pending                                                   |
-| `crates/trusted-server-release/tests/fixtures/composition/cargo-1.95-cross-tree.txt`                           | 2             | Pending                                                   |
-| `crates/trusted-server-release/tests/fixtures/composition/cargo-1.95-messages.jsonl`                           | 2             | Pending                                                   |
-| `crates/trusted-server-release/tests/fixtures/composition/cargo-1.95-metadata.json`                            | 2             | Pending                                                   |
+| `crates/trusted-server-release/tests/fixtures/composition/README.md`                                           | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/tests/fixtures/composition/cargo-1.95-cross-host-metadata.json`                 | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/tests/fixtures/composition/cargo-1.95-cross-messages.jsonl`                     | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/tests/fixtures/composition/cargo-1.95-cross-target-filtered-metadata.json`      | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/tests/fixtures/composition/cargo-1.95-cross-tree.txt`                           | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/tests/fixtures/composition/cargo-1.95-messages.jsonl`                           | 2             | Ported Phase 2 source or approved split                   |
+| `crates/trusted-server-release/tests/fixtures/composition/cargo-1.95-metadata.json`                            | 2             | Ported Phase 2 source or approved split                   |
 | `crates/trusted-server-release/src/collection.rs`                                                              | 3             | Pending                                                   |
 | `crates/trusted-server-release/src/collection/archive.rs`                                                      | 3             | Pending                                                   |
 | `crates/trusted-server-release/src/collection/producer.rs`                                                     | 3             | Pending                                                   |
@@ -499,7 +500,7 @@ The landing phase below is exclusive file ownership. Shared files receive later 
 | `crates/trusted-server-release/src/workflow_contract/tests.rs`                                                 | 3             | Pending                                                   |
 | `scripts/release/qualification/approvals.json`                                                                 | 3             | Pending                                                   |
 | `scripts/release/qualification/hosted-workflow.proposal.yml`                                                   | 3             | Pending                                                   |
-| `scripts/release/qualification/results.schema.json`                                                            | 2             | Pending                                                   |
+| `scripts/release/qualification/results.schema.json`                                                            | 2             | Ported Phase 2 source or approved split                   |
 | `scripts/release/tests/candidate-changes.sh`                                                                   | 3             | Pending                                                   |
 | `scripts/release/tests/candidate-changes.test.mjs`                                                             | 3             | Pending                                                   |
 | `crates/trusted-server-cli/Cargo.toml`                                                                         | 4             | Pending                                                   |
@@ -543,7 +544,7 @@ The landing phase below is exclusive file ownership. Shared files receive later 
 | `crates/trusted-server-cli/tests/fixtures/release/release-index.json`                                          | 3             | Pending                                                   |
 | `crates/trusted-server-cli/tests/fixtures/release/upstream-formats.json`                                       | 4             | Pending                                                   |
 | `crates/trusted-server-cli/tests/release_cli.rs`                                                               | 4             | Pending                                                   |
-| `.github/workflows/format.yml`                                                                                 | 2             | Pending                                                   |
+| `.github/workflows/format.yml`                                                                                 | 2             | Staged Phase 2 dependency/support subset                  |
 | `CHANGELOG.md`                                                                                                 | 2             | Pending                                                   |
 | `crates/trusted-server-adapter-spin/src/app.rs`                                                                | 2             | Pending                                                   |
 | `crates/trusted-server-adapter-spin/src/middleware.rs`                                                         | 2             | Pending                                                   |
@@ -559,3 +560,13 @@ The landing phase below is exclusive file ownership. Shared files receive later 
 | `scripts/docs-proposal/hunks.test.mjs`                                                                         | 2             | Pending                                                   |
 | `scripts/release/qualification/README.md`                                                                      | 2             | Pending                                                   |
 | `scripts/release/tests/fixtures/README.md`                                                                     | 2             | Pending                                                   |
+
+## Current port boundary at `13f63f020`
+
+The dependency-coupled producer graph is ported with the approved Phase 3 evidence-test splits. Its frozen diagnostic/preflight, package inspection, GNU measurement and loopback probe commands are present; no build/equality/export/publication command or inhabited qualified selector is introduced. The ordinary adapter remains a separate implementation group. Host all-target check, strict clippy, documentation and 229 audited pure tests pass; process and ignored tests remain CI-only.
+
+The tracked cohort is validated as exactly seven ordinary rows. The four `FIXED_ARTIFACTS` rows remain the closed controlled-recipe/consumer/index destination contract; source-owned projection joins those exact names and order to the unchanged four-row consumer policy. Ordinary Axum metadata cannot select a controlled recipe. The seven-asset index amendment and controlled Axum integration are not implied by this metadata adaptation.
+
+The retained tools/consumer policy selects GitHub CLI 2.97.0 for its destination contract. The current operator guide uses 2.102.0 and the ordinary publisher records its installed version; carrying the destination pins does not enforce them in the ordinary path. Other selected tool versions match current source pins.
+
+The inspector recipe link is restored after the recipe port. A startup documentation link now names the private accepted-module type directly, without restoring a Phase 3-only re-export. Three workflow-contract command tests are held for their Phase 3 command.

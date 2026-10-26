@@ -1135,5 +1135,939 @@
     "scripts/docs-proposal/hunks.test.mjs": 2,
     "scripts/release/qualification/README.md": 2,
     "scripts/release/tests/fixtures/README.md": 2
+  },
+  "landing_status": {
+    "Cargo.lock": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Staged Phase 2 dependency/support subset"
+    },
+    "Cargo.toml": {
+      "commit": "1534d462d052debae8b5d886268701077bf879a5",
+      "state": "Staged Phase 2 dependency/support subset"
+    },
+    "crates/trusted-server-release/Cargo.toml": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Staged Phase 2 dependency/support subset"
+    },
+    "crates/trusted-server-release/src/documents.rs": {
+      "commit": "1534d462d052debae8b5d886268701077bf879a5",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/documents/tests.rs": {
+      "commit": "1534d462d052debae8b5d886268701077bf879a5",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/error.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Staged Phase 2 dependency/support subset"
+    },
+    "crates/trusted-server-release/src/git_objects.rs": {
+      "commit": "1534d462d052debae8b5d886268701077bf879a5",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/main.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Staged Phase 2 dependency/support subset"
+    },
+    "crates/trusted-server-release/src/policy.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/policy/tests.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/policy/tools.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/preflight.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/preflight/child.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/preflight/tests.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/source.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/source/closure.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/source/config.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/source/git.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/source/materialize.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/source/tests.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/source/tests/closure.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/source/tests/layout.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/source/tests/objects.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/source/tests/process.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/source/tests/worktree.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/source/tree.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/source/worktree.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/tool_tree.rs": {
+      "commit": "4447b68a5cc935d7ea7aaf9032d2b657537f1e98",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/tool_tree/tests.rs": {
+      "commit": "4447b68a5cc935d7ea7aaf9032d2b657537f1e98",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/tests/commands.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/tests/fixtures/sha-mbles-1.bin": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "scripts/release/bootstrap.sh": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/boundary.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/boundary/cleanup_and_system_root_tests.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/boundary/command.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/boundary/command/selector_tests.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/boundary/daemon.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/boundary/docker.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/boundary/docker/host_path_tests.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/boundary/entropy.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/boundary/host_inputs.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/boundary/macos.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/boundary/probe.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/boundary/proof.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/boundary/roots.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/boundary/seccomp.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/boundary/selector_placement_tests.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/boundary/sibling_tests.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/boundary/survivors.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/boundary/tests.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/boundary/tests/container.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/boundary/tests/linux.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/boundary/tests/macos.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/boundary/tests/modes.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/boundary/tests/unit.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/lifecycle_guard.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/process.rs": {
+      "commit": "1534d462d052debae8b5d886268701077bf879a5",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/process/environment.rs": {
+      "commit": "1534d462d052debae8b5d886268701077bf879a5",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/process/environment/selector_tests.rs": {
+      "commit": "1534d462d052debae8b5d886268701077bf879a5",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/process/pipes.rs": {
+      "commit": "1534d462d052debae8b5d886268701077bf879a5",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/process/redact.rs": {
+      "commit": "1534d462d052debae8b5d886268701077bf879a5",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/process/supervise.rs": {
+      "commit": "1534d462d052debae8b5d886268701077bf879a5",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/process/tests.rs": {
+      "commit": "1534d462d052debae8b5d886268701077bf879a5",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/process/tests/fixture.rs": {
+      "commit": "1534d462d052debae8b5d886268701077bf879a5",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/process/tests/outcomes.rs": {
+      "commit": "1534d462d052debae8b5d886268701077bf879a5",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/process/tests/redaction.rs": {
+      "commit": "1534d462d052debae8b5d886268701077bf879a5",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/process/tests/supervision.rs": {
+      "commit": "1534d462d052debae8b5d886268701077bf879a5",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/process/tests/variables.rs": {
+      "commit": "1534d462d052debae8b5d886268701077bf879a5",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/tests/boundary.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/tests/fixtures/cargo-denial/Cargo.lock": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/tests/fixtures/cargo-denial/Cargo.toml": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/tests/fixtures/cargo-denial/crates/build-direct/Cargo.toml": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/tests/fixtures/cargo-denial/crates/build-direct/build.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/tests/fixtures/cargo-denial/crates/build-direct/src/main.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/tests/fixtures/cargo-denial/crates/build-grandchild/Cargo.toml": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/tests/fixtures/cargo-denial/crates/build-grandchild/build.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/tests/fixtures/cargo-denial/crates/build-grandchild/src/main.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/tests/fixtures/cargo-denial/crates/control/Cargo.toml": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/tests/fixtures/cargo-denial/crates/control/build.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/tests/fixtures/cargo-denial/crates/control/src/control.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/tests/fixtures/cargo-denial/crates/control/src/main.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/tests/fixtures/cargo-denial/crates/macro-attempt/Cargo.toml": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/tests/fixtures/cargo-denial/crates/macro-attempt/src/lib.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/tests/fixtures/cargo-denial/crates/macro-attempt/src/main.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "scripts/release/qualification/SECCOMP-LICENSE": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "scripts/release/qualification/seccomp-default.json": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-cli/src/prebid_bundle.rs": {
+      "commit": "4ee86da6ca6eebe4afed185029272ff9150a7b74",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-integration-tests/browser/helpers/infra.ts": {
+      "commit": "d1c1d6967c4a6813fe6d3b6c0168fb37a6618360",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-integration-tests/tests/common/runtime.rs": {
+      "commit": "d1c1d6967c4a6813fe6d3b6c0168fb37a6618360",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-integration-tests/tests/frameworks/mod.rs": {
+      "commit": "d1c1d6967c4a6813fe6d3b6c0168fb37a6618360",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-integration-tests/tests/parity.rs": {
+      "commit": "d1c1d6967c4a6813fe6d3b6c0168fb37a6618360",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "docs/superpowers/specs/2026-09-25-git-version-header-design.md": {
+      "commit": "d1c1d6967c4a6813fe6d3b6c0168fb37a6618360",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/javascript.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/javascript/contributions.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/javascript/contributions/tests.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/javascript/tests.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/javascript/tests/adopt.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/materials.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/materials/archive.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/materials/cargo_vendor.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/materials/cargo_vendor/differential.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/materials/cargo_vendor/git_tree.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/materials/cargo_vendor/index.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/materials/cargo_vendor/normalize.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/materials/cargo_vendor/source.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/materials/cargo_vendor/tests.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/materials/cargo_vendor/tests/git.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/materials/cargo_vendor/tests/normalize.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/materials/cargo_vendor/tests/registry.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/materials/cargo_vendor/tests/source.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/materials/cargo_vendor/tests/support.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/materials/cargo_vendor/writer.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/materials/extract.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/materials/extract/compatibility.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/materials/extract/tests.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/materials/extract/tests/cargo_package.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/materials/extract/tests/npm_compatibility.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/materials/git.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/materials/git/input.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/materials/git/tests.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/materials/locked.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/materials/manifest.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/materials/npm_bundle.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/materials/tests.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/preparation.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/preparation/tests.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/preparation/tests/full.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/inspect.rs": {
+      "commit": "ee5598bf59d59ac2601f064397762738c69da63d",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/inspect/elf.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/inspect/elf/loader.rs": {
+      "commit": "ee5598bf59d59ac2601f064397762738c69da63d",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/inspect/macho.rs": {
+      "commit": "ee5598bf59d59ac2601f064397762738c69da63d",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/inspect/macho/signature.rs": {
+      "commit": "ee5598bf59d59ac2601f064397762738c69da63d",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/inspect/tests.rs": {
+      "commit": "ee5598bf59d59ac2601f064397762738c69da63d",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/inspect/tests/builders.rs": {
+      "commit": "ee5598bf59d59ac2601f064397762738c69da63d",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/inspect/tests/builders/macho_data.rs": {
+      "commit": "ee5598bf59d59ac2601f064397762738c69da63d",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/inspect/tests/elf.rs": {
+      "commit": "ee5598bf59d59ac2601f064397762738c69da63d",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/inspect/tests/macho.rs": {
+      "commit": "ee5598bf59d59ac2601f064397762738c69da63d",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/inspect/tests/wasm.rs": {
+      "commit": "ee5598bf59d59ac2601f064397762738c69da63d",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/inspect/wasm.rs": {
+      "commit": "ee5598bf59d59ac2601f064397762738c69da63d",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/package.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/package/tests.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/ambient.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/apple.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/apple/sdk.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/apple/toolchain.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/apple/toolchain/tests.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/artifact.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/artifact/tests.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/cargo_home.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/cargo_home/tests.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/cargo_output.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/cargo_output/tests.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/compare.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/completed.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/execute.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/fastly_tools.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/final_paths.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/fresh.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/gnu.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/gnu/image.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/gnu/tests.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/identity.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/identity/tests.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/native.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/paths.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/paths/fake.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/plan.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/remap.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/runtime.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/runtime/config.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/runtime/exchange.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/runtime/export.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/runtime/export/tests.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/runtime/logs.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/runtime/viceroy.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/sources.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/startup.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/startup/accepted.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/startup/accepted/tests.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/startup/lifecycle.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/startup/native.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/tests.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/tests/ambient.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/tests/bind.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/tests/candidate.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/tests/cli.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/tests/cli_candidate.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/tests/compare.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/tests/complete.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/tests/complete_darwin.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/tests/darwin.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/tests/darwin_toolchain.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/tests/fixture.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/tests/full.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/tests/full_macos.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/tests/macos_candidate.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/tests/macos_cli.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/tests/native.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/tests/plan.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/tests/real_fixture.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/tests/remap.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/tests/runtime.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/tests/sources.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/tests/tools.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/recipe/tools.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "scripts/release/tests/cli-builder.Dockerfile": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/schemas/SPDX-LICENSE": {
+      "commit": "1534d462d052debae8b5d886268701077bf879a5",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/schemas/spdx-2.3.schema.json": {
+      "commit": "1534d462d052debae8b5d886268701077bf879a5",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/composition.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/composition/capture.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/composition/external.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/composition/external/tests.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/composition/graph.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/composition/graph/tests.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/composition/javascript.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/composition/javascript/tests.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/composition/native.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/composition/native/tests.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/composition/origin.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/composition/origin/tests.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/composition/platform.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/composition/platform/tests.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/src/composition/tests.rs": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/tests/fixtures/composition/README.md": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/tests/fixtures/composition/cargo-1.95-cross-host-metadata.json": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/tests/fixtures/composition/cargo-1.95-cross-messages.jsonl": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/tests/fixtures/composition/cargo-1.95-cross-target-filtered-metadata.json": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/tests/fixtures/composition/cargo-1.95-cross-tree.txt": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/tests/fixtures/composition/cargo-1.95-messages.jsonl": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "crates/trusted-server-release/tests/fixtures/composition/cargo-1.95-metadata.json": {
+      "commit": "13f63f020766a0a7b28f9c0401aa708350b563c0",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    "scripts/release/qualification/results.schema.json": {
+      "commit": "1534d462d052debae8b5d886268701077bf879a5",
+      "state": "Ported Phase 2 source or approved split"
+    },
+    ".github/workflows/format.yml": {
+      "commit": "1534d462d052debae8b5d886268701077bf879a5",
+      "state": "Staged Phase 2 dependency/support subset"
+    }
   }
 }

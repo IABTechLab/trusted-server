@@ -318,3 +318,9 @@ Gate 1's ordinary-release Fastly adapter was approved on 2026-10-26; implementat
 Phase 3 will index and digest this same companion. Later controlled-recipe evidence may supersede the ordinary profile in the same filename using a distinct profile value while preserving compatible version-1 source, outcome and digest joins. Incompatible informational changes need an explicit reviewed version change; neither a filename change nor silently stronger interpretation is allowed.
 
 The Fastly provenance attestation adds the rebuild-check subject while retaining the existing reusable signer identity and bundle name. Rehearsal must prove that existing binary verification commands pass unchanged and separately verify the rebuild-check's provenance, release membership and checksum. Merging Phase 2 activates the gate on the next real tag, adding a second Fastly build and comparison before signing. A mismatch prevents release; retain bounded diagnostics and ask for a decision without exclusions or weaker comparison.
+
+### Phase 2 ordinary metadata and closed destination policy
+
+Phase 2 validates all seven current ordinary cohort rows strictly. The retained controlled recipes, consumer policy and index schema still cover four destination artifacts. Projection uses those four source-owned names in fixed order; the three ordinary Axum rows grant no controlled recipe or seven-asset index authority. The separate Phase 3 index amendment remains required. No carried cohort, tools, consumer-policy or schema bytes are changed by this split.
+
+The carried tools and consumer policy name GitHub CLI 2.97.0 as a destination pin. Current operator instructions use 2.102.0, and the ordinary publisher records the installed version. Qualification pins, controlled reproducibility profiles and the destination GitHub CLI pin are not enforced by the ordinary producer. Its existing publication, signing and verification checks remain in force.
