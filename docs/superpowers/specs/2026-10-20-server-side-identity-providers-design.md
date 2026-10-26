@@ -1507,7 +1507,9 @@ request when all of these hold:
    `max_calls_per_minute` on the key `identity:<provider>:<visitor>`, where
    `visitor` is an HMAC of the full EC ID with a key derived from
    `ec.passphrase`. It is not `ec_hash`, which everyone behind one IP shares
-   (section 3.4).
+   (section 3.4). A due provider the cap stops is not dispatched and gets
+   `n = max(n, now + 60 s)`, one limiter window, and never a failure
+   (section 8).
 
 Pacing per visitor comes from `ps.n` and the refresh rules in step 4, not
 from the limiter. The limiter only caps bursts, because its windows are 60
@@ -2583,6 +2585,7 @@ write (section 5.3), and nothing else.
 | `Rejected` with a 4xx other than 429, `Config`, `UndeclaredInput`, `Malformed` | unchanged                                                                                                                                              | `f += 1`, `n = now + min(1 h × 2^(f-1), 24 h)`                                         | warn  |
 | `Rejected` with 429 or 5xx, `Transport`, timeout                               | unchanged                                                                                                                                              | `f += 1`, `n = now + min(5 min × 2^(f-1), 1 h)`; breaker `record`                      | info  |
 | Breaker open                                                                   | not dispatched                                                                                                                                         | unchanged                                                                              | debug |
+| Burst cap exceeded (section 4.7 step 8)                                        | not dispatched                                                                                                                                         | `n = max(n, now + 60 s)`; never a failure                                              | debug |
 | Capture: any result or error                                                   | removals as above; positive IDs counted in `capture_unpersisted`, never stored                                                                         | only `o`, `oc`, `iv` and `ov`; never `n`, `f` or the breaker                           | debug |
 | Captured `opted_out`, `revoke_scope = "global"`, real browser                  | the withdrawal tombstone removes the row (section 5.1)                                                                                                 | removed with the row                                                                   | info  |
 
@@ -2927,9 +2930,14 @@ object-safe.
 
 Each `[[ec.partners]]` entry with `pull_sync_enabled = true` registers a
 built-in `GenericPullProvider`. Its ID is `pull-` plus the source domain with
-dots replaced by `-` (for example `pull-ssp-example-com`). An ID that would
-exceed 63 characters is cut and given an 8-character hash suffix of the full
-domain, so IDs stay unique and valid.
+dots replaced by `-` (for example `pull-ssp-example-com`). A domain that
+already contains `-` also gets `-` and the first 8 hex digits of the SHA-256
+of the full domain, so `a-b.example.com` and `a.b.example.com` get different
+IDs. An ID that would exceed 63 characters is cut and given the same hash
+suffix, so IDs stay unique and valid.
+No earlier build stored a generic pull provider ID: before this spec, pull
+sync kept no per-provider state and wrote no `w`, so the hash rule renames
+nothing that is persisted.
 
 Unchanged:
 

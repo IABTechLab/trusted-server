@@ -42,8 +42,8 @@ Copied from the spec and `AGENTS.md`. Every task implicitly includes these.
   - KV: `SCHEMA_VERSION` is **2**. Every record is `{w?, rv?, at?, exp?, ra?, ru?, eids: [{uids: [{id, atype?, ext?}], inserter?, matcher?, mm?, ext?}]}`, and `eids` is never empty. A version 1 record (`{uid, ...}`) reads as one entry holding that UID, and the row's next write stores version 2. Every UID-level and EID-level `ext` is a JSON object of at most **2,048** bytes as compact JSON. `inserter` and `matcher` are not blank and at most **255** bytes. A source holds at most **8** entries and **32** UIDs, and its entry set is at most **4,096** bytes as compact JSON (`MAX_ENTRY_SET_BYTES`). `ps.st` is at most **1,024** bytes of embedded JSON, a row has at most **32** `ps` entries, and `ps.iv` and `ps.ov` are each an ordered list of at most **128** hashes (`MAX_INVALIDATED_UIDS`), oldest first, truncated from the front before validation. One function, `entry_set_bytes`, measures `MAX_ENTRY_SET_BYTES` on the stored `eids` array, for both the coordinator and `KvEntry::validate`. Expired means `now >= exp`. `rv` is **16** hex digits (64 random bits). On read, a record that breaks a limit is dropped from the row and logged with its source only; only `serialize_entry` rejects.
   - `ProviderRequest` call context: at most **1,024** bytes of JSON. `IdentityProviderId`: `^[a-z][a-z0-9_-]{0,62}$`.
   - `[ec.identity]` defaults: `max_concurrency = 4`, `hold_budget_ms = 100`, `hold_retry_sec = 300`, `max_response_bytes = 65536`. Per-provider defaults: `mode = "after_send"`, `timeout_ms` = `hold_budget_ms`, `after_send_timeout_ms = 1000`, `refresh_after_sec = 86400`, `max_calls_per_minute = 1`, `breaker_failures_per_minute = 50`, `cookie_priority = 0`, `sources` = every source the descriptor declares (required for a capture-only provider). For a provider that declares `captures`: `revoke_scope = "provider"`.
-  - Removed config keys, each rejected with an error that names its replacement (spec 10.2): `ec.pull_sync_concurrency` (`[ec.identity].max_concurrency`), and `pull_sync_ttl_sec` and `pull_sync_rate_limit` on `[[ec.partners]]` (`refresh_after_sec` and `max_calls_per_minute = ceil(N / 60)` in `[ec.identity.providers.pull-<domain>]`).
-  - Backoff (spec 8): a `no_match` waits `n = now + retry_in`, default 24 h and at most 7 d. An input-caused failure waits `min(1 h × 2^(f-1), 24 h)`. A transport, 429 or 5xx failure waits `min(5 min × 2^(f-1), 1 h)`. A cut-off hold call waits `hold_retry_sec`. A skip waits `refresh_after_sec`. A due provider that was not dispatched gets `ps.n = max(ps.n, now + 60 s)`.
+  - Removed config keys, each rejected with an error that names its replacement (spec 10.2): `ec.pull_sync_concurrency` (`[ec.identity].max_concurrency`), and `pull_sync_ttl_sec` and `pull_sync_rate_limit` on `[[ec.partners]]` (`refresh_after_sec` and `max_calls_per_minute = ceil(N / 60)` in `[ec.identity.providers.<pull-id>]`).
+  - Backoff (spec 8): a `found` sets `f = 0`. A `no_match` waits `n = now + retry_in`, default 24 h and at most 7 d. `with_retry_in` on any other resolution makes `n` at least `now + retry_in`, after the row's own rule (so an `invalidate` gets `n = max(now, now + retry_in)`). An input-caused failure waits `min(1 h × 2^(f-1), 24 h)`. A transport, 429 or 5xx failure waits `min(5 min × 2^(f-1), 1 h)`. A cut-off hold call waits `hold_retry_sec`. A skip waits `refresh_after_sec`. A due provider the burst cap stops gets `ps.n = max(ps.n, now + 60 s)`. A provider the breaker or a limiter error stops is not dispatched and its `ps` is unchanged.
 - **G4 is strict.** A page load makes at most one KV write, never retried as a whole. The only exceptions (spec 5.1):
   - the consent-withdrawal tombstone path (a CAS with up to five attempts, then its completion marker, per withdrawn EC ID), which also runs for a `revoke_scope = "global"` capture from a real browser, and gets one more attempt after send when it fails before send (Task 27)
   - the removal-only retry of a failed flush (spec 5.2, phase 4, step 5; Task 29)
@@ -56,7 +56,7 @@ Copied from the spec and `AGENTS.md`. Every task implicitly includes these.
 - **Behaviour that predates the spec does not change (G13).** G13 itself changes none of the paths that predate the spec. Browser ingest, `ts-eids`, batch sync, generic pull, `/auction` body forwarding and the `/identify` response keep the behaviour the rest of the spec gives them, and every record they write is one entry with one UID: one UID per registered source, picked by today's rule (`collect_eid_updates`, `ec/prebid_eids.rs:146-151`: for a repeated source, the first valid UID of its last entry, with the sharedId cookie applied last), and nothing for an unregistered source. Only a provider result writes more, and no Part 1 code writes more. A version 1 row goes out to bidders exactly as it does on `main`. Golden tests, named `golden_*` so `cargo test-fastly -- golden` runs them all, pin these paths (Tasks 6, 7, 28 and 30).
 - **Feature gate for test support.** Gate test-only code on `#[cfg(any(test, feature = "test-utils"))]`, the feature `trusted-server-core` already has (`crates/trusted-server-core/Cargo.toml`) and spec 13 names. `ec::identity::test_support` is a `pub mod` under that gate, and every item in it is `pub`, from the task that creates it, as existing `test-utils` items are (`IntegrationRegistry::from_request_filters`). A `pub(crate)` item behind the feature is dead code in the non-test library build that `cargo clippy-fastly` lints with `--all-features`, so `-D warnings` fails it. The Fastly adapter's dev-dependencies already enable the feature (`crates/trusted-server-adapter-fastly/Cargo.toml`).
 - **Adapter-facing API.** The Fastly adapter is a separate crate. It reaches identity state only through `pub struct IdentityRuntime` (Task 23) and `pub` opaque wrappers such as `BrowserSeed` (Task 25). Core types stay `pub(crate)`, and no `pub` item exposes a `pub(crate)` type: `private_interfaces` is an error under `-D warnings`.
-- **Lints that bite plan code.** Backtick `OpenRTB`, CamelCase vendor names such as `LiveRamp` and `SharedID`, and other code-like words in doc comments (`clippy::doc_markdown`). `clippy::panic` is denied workspace-wide, tests included. On `wasm32-wasip1` a panic aborts the whole test binary under Viceroy and `#[should_panic]` tests are ignored, so a check that a test must see fail returns a `Result` instead of panicking.
+- **Lints that bite plan code.** Backtick `OpenRTB`, CamelCase vendor names such as `LiveRamp` and `SharedID`, and other code-like words in doc comments (`clippy::doc_markdown`). `clippy::panic` is denied in production code; `clippy.toml` allows `panic!` in tests. On `wasm32-wasip1` a panic aborts the whole test binary under Viceroy and `#[should_panic]` tests are ignored, so a check that a test must see fail returns a `Result` instead of panicking.
 - Test discipline:
   1. **Red first.** Run each new test against unchanged code and watch it fail for the expected reason before you implement.
   2. **Pair absence with presence.** Each "X is gone" assertion sits next to a "control Y is still there" assertion on the same value.
@@ -2001,7 +2001,7 @@ git commit --signoff -S -m "Record when browser ingest acquired each ID" -m "Ing
   - `ProviderDescriptor` and its getters: `builder`, `id`, `sources`, `primary_source`, `source_named`, `resolves`, `endpoint`, `captures`, `consent_policy`, `provenance`, `is_expiring`
   - `ProviderDescriptorBuilder`: `with_source`, `with_resolves`, `with_captures`, `with_consent_policy`, `with_expiring_ids`, `with_expiring_source`, `with_provenance`, `build`
   - `Resolves`: `new`, `with_endpoint(&str)`, `with_host(&str)`, `with_needs`, `with_needs_for`, `with_wants`, `with_kinds`, `with_private_state`, plus `pub(in crate::ec::identity) fn with_ec_id(self)` and crate-visible getters `hosts()`, `needs(kind)`, `wants()`, `kinds()`, `has_private_state()`, `gets_ec_id()`
-  - `Captures`: `new`, `with_path(Method, &str)`, `with_path_prefix(&str)`, plus crate-visible `matches(&Method, &str) -> bool`, `paths()`, `prefixes()`. There is no body-consent rule: capture is gated by the request's own consent, from its cookies and headers (spec 5.5).
+  - `Captures`: `new`, `with_path(Method, &str)`, `with_path_prefix(&str)`, plus crate-visible `matches(&Method, &str) -> bool`, `paths()`, `prefixes()`. There is no body-consent rule: capture is gated by the request's own consent, from its cookies and headers (spec 4.7).
   - `EidProvenance`: `new`, `with_inserter`, `with_matcher`, `with_mm`, `inserter`, `matcher`, `mm`
   - `ConsentPolicy`: `strict`, `with_tcf_purposes`, `with_tcf_vendor`, `allowing_dnt`, `allowing_gpc`, `allowing_us_opt_out`, plus `pub(in crate::ec::identity) fn eid_persistence_only()` for generic pull and crate-visible getters
   - `UsOptOut { Sale, Sharing, TargetedAdvertising }`
@@ -2648,7 +2648,7 @@ impl Resolves {
 
 /// Revoke-only capture from responses TS proxies for this provider: it
 /// can remove IDs, opt out or clear an opt-out, and never stores a positive
-/// ID (spec 5.5).
+/// ID (spec 4.7).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Captures {
     paths: Vec<(Method, String)>,
@@ -5368,7 +5368,7 @@ impl<'a> CaptureInput<'a> {
     }
 
     /// The request's consent, from its cookies and headers. The request
-    /// body is never read (spec 5.5).
+    /// body is never read (spec 4.7).
     #[must_use]
     pub fn consent(&self) -> &ProviderConsent {
         self.consent
@@ -7236,7 +7236,7 @@ mod tests {
             "should hold the entries exactly as bidders receive them"
         );
         assert_eq!(max_age, MIRROR_MAX_AGE_SEC, "should live a day without an exp");
-        let MirrorPayload::Value { value, .. } = &payload else { unreachable!() };
+        let MirrorPayload::Value { value, .. } = &payload else { panic!("should hold a value") };
         assert_eq!(payload.to_json(), json!({ "value": value, "max_age": MIRROR_MAX_AGE_SEC }), "should serialize");
     }
 
@@ -7435,7 +7435,7 @@ git commit --signoff -S -m "Add the ts-eids-s mirror payload and its size cap" -
 - Produces:
   - `KvIdentityGraph::write_if_generation(&self, ec_id: &str, entry: &KvEntry, generation: u64) -> Result<EcKvWriteOutcome, Report<TrustedServerError>>`, `pub(crate)`: serializes with `serialize_entry` (so `validate` runs) and writes with `ENTRY_TTL` and `EcKvWriteMode::IfGenerationMatch(generation)`. Phase 4's flush (Task 29) uses it too, so every identity write goes through one path.
   - `pub(crate) const REMOVAL_WRITE_ATTEMPTS: u32 = MAX_CAS_RETRIES;` (5)
-  - `pub(crate) enum RemovalWriteOutcome { Written, NothingToWrite, Failed }`. `NothingToWrite` covers a tombstone, `consent.ok = false`, a missing row and removals that are already applied. `Failed` covers a failed read, a non-CAS write error such as Fastly's per-key limit, and five generation mismatches in a row.
+  - `pub enum RemovalWriteOutcome { Written, NothingToWrite, Failed }`. `NothingToWrite` covers a tombstone, `consent.ok = false`, a missing row and removals that are already applied. `Failed` covers a failed read, a non-CAS write error such as Fastly's per-key limit, and five generation mismatches in a row. It is `pub`, not `pub(crate)`, because the public `FlushOutcome::WriteFailed` (Task 29) carries it, and `private_interfaces` would fail the clippy gate otherwise.
   - `pub(crate) fn write_removals(graph: &KvIdentityGraph, ec_id: &str, removals: &IdentityMutation, context: &ApplyContext<'_>) -> RemovalWriteOutcome`
   - `pub(crate) fn log_removal_lost(ec_id: &str, removals: &IdentityMutation)`: logs at error with `log_id(ec_id)` and the provider IDs and sources from `removal_labels()`, never a UID. The caller increments `removal_lost` (Task 23 adds the counter to `RequestIdentity`).
 
@@ -7616,7 +7616,7 @@ pub(crate) const REMOVAL_WRITE_ATTEMPTS: u32 = MAX_CAS_RETRIES;
 
 /// How a removal write ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RemovalWriteOutcome {
+pub enum RemovalWriteOutcome {
     /// The removals are in KV.
     Written,
     /// Nothing to write: a tombstone, a missing row, or already applied.
@@ -7869,7 +7869,7 @@ git commit --signoff -S -m "Add [ec.identity] coordinator settings" -m "Adds coo
   - `pub(crate) struct EligibilityInput<'a> { provider: &'a dyn IdentityProvider, settings: &'a ProviderSettings, identity: &'a IdentitySettings, catalog: &'a ProviderCatalog, consent: &'a ConsentContext }`, so `eligibility` stays within 7 arguments
   - `pub(crate) fn eligibility(input: &EligibilityInput<'_>, view: &EligibilityView, facts: &RequestFacts, phase: Phase) -> Eligibility`
   - `pub(crate) fn fingerprint_bits(policy: &ConsentPolicy, consent: &ConsentContext, signals: PolicySignals) -> String`: the consent an opt-out's `fp` records, as a plain lowercase hex bitmask of at most 16 digits (`format!("{bits:x}")` of a `u64`), never a hash (spec 8, 9.3). Part 1 covers the signals TS decodes today, one bit each in this order: each TCF purpose the policy reads (1 to 10), the vendor bit when the policy names one, the US sale opt-out (from `us_privacy` or GPP), GPC and DNT. A signal the policy relaxes stays 0. Task 34 appends the sharing and targeted-advertising opt-outs after these and keeps these bits where they are.
-  - `pub(crate) enum CallOutcome { Resolved(Resolution), Skipped, InputUnavailable, InvalidState(Option<Resolution>), HoldCutOff, InputFailure, TransportFailure, BreakerOpen }`
+  - `pub(crate) enum CallOutcome { Resolved(Resolution), Skipped, InputUnavailable, InvalidState(Option<Resolution>), HoldCutOff, InputFailure, TransportFailure, BreakerOpen, BurstCapped, NotDispatched }`. `BurstCapped` is the burst cap's skip; `NotDispatched` is a limiter error's
   - `pub(crate) fn outcome_to_changes(provider: &dyn IdentityProvider, outcome: CallOutcome, view: &EligibilityView, context: &OutcomeContext<'_>) -> OutcomeChanges`, where `OutcomeChanges { changes: Vec<PartnerIdChange>, result: Option<ProviderResult>, state: ProviderStateChange }`. This is the section 8 table, row by row. `changes` holds every removal, and the positive changes of a provider without private state. `OutcomeContext` holds `now`, `catalog`, provider settings, `identity` settings, `expected_state: Option<StateRevision>` and the consent fingerprint bits from `fingerprint_bits`.
 
 Eligibility steps, in order (spec 4.7):
@@ -7897,13 +7897,15 @@ How `Resolved(resolution)` becomes changes (spec 4.5, "From entries to an entry 
 5. A result that named at least one source and all of whose sets are discarded is handled as `Malformed` (spec 4.5, section 8): `f += 1` with its backoff, and its removals still apply. Timing comes only from kept entries (Task 10).
 6. `EntrySet.refresh_until` from a provider without private state is ignored with a warning.
 7. Each kept set becomes `KvPartnerId { w: Some(provider), at: Some(now), exp, ra, ru, eids: set.entries, .. }`, with `exp`, `ra` and `ru` from the `EntrySet`. A one-UID result writes the same one-entry shape browser ingest writes. Descriptor provenance is not stored: Task 28 fills it in at output.
+   7a. A `Resolution::found` that steps 4, 5 and 12 do not turn into `Malformed` sets `f = 0`, even when `entry_sets` dropped every entry and nothing is stored. It sets `f = 0` in the state it writes, in the `ProviderResult` for a provider with private state and in `state` otherwise.
 8. Each record becomes `OwnerWrite` with `expected = Some(record_revision(stored))` (or `None` when no record) when this provider owns the source, else `FillMissing`. Either change replaces the source's set whole. A source the result does not name gets no change.
 9. `invalidated` becomes `OwnerRemove { source, provider, expected: record_revision(stored) }` for each named source that has a record in the view, plus `n = now`. It carries no hash: `mutation::apply` (Task 15) hashes every UID of the live record it removes into the provider's `ps.iv`. A named source with no record makes no change.
 10. `opted_out` becomes `WriterRemove { source, writer: provider }` for every source in the view whose record this provider wrote, and, for a capture-only provider, for every one of its `capture_only_sources` whose record has no writer. Plus `opt_out = KvOptOut { at: now, fp: fingerprint_bits }` and `st = Clear`. The mutation hashes each removed record into `ps.ov`.
 11. When the provider has private state, the positive changes plus the state change plus `n` and `f` go into one `ProviderResult` with `expected_state`. Otherwise they go into `changes`, and `n` and `f` into `state`.
 12. `state_rejected()` drops the positive part and applies the `Malformed` backoff.
+13. `with_retry_in` on any resolution, not only `no_match`: after steps 1 to 12 set `n`, raise it to `max(n, now + retry_in)`, with `retry_in` capped at 7 d. A `found`, `invalidate` or `opted_out` with no `n` of its own gets `n = now + retry_in`.
 
-The other rows of section 8: `Skipped` and `InputUnavailable` set `n = now + refresh_after_sec`. `InvalidState` clears `st`, keeps `f`, and sets `n = now + refresh_after_sec` unless its resolution sets `n`. `HoldCutOff` sets `n = now + hold_retry_sec` and never counts a failure; only a hold dispatch before the auction can be cut off. An after-send timeout is a `TransportFailure`. `InputFailure` is `f += 1`, `n = now + min(1 h × 2^(f-1), 24 h)`. `TransportFailure` is `f += 1`, `n = now + min(5 min × 2^(f-1), 1 h)`. `BreakerOpen` changes nothing. Backoff arithmetic uses `saturating_pow` and `min`, so a large `f` cannot overflow.
+The other rows of section 8: `Skipped` and `InputUnavailable` set `n = now + refresh_after_sec`. `BurstCapped` sets `n = max(n, now + 60)` and never counts a failure (spec 4.7 step 8). `InvalidState` clears `st`, keeps `f`, and sets `n = now + refresh_after_sec` unless its resolution sets `n`. `HoldCutOff` sets `n = now + hold_retry_sec` and never counts a failure; only a hold dispatch before the auction can be cut off. An after-send timeout is a `TransportFailure`. `InputFailure` is `f += 1`, `n = now + min(1 h × 2^(f-1), 24 h)`. `TransportFailure` is `f += 1`, `n = now + min(5 min × 2^(f-1), 1 h)`. `BreakerOpen` and `NotDispatched` change nothing. Backoff arithmetic uses `saturating_pow` and `min`, so a large `f` cannot overflow.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -7973,6 +7975,35 @@ Here are seven written out in full. Write the rest in the same shape:
             &context,
         );
         assert_eq!(long.state.n, Some(1_000 + 7 * 86_400), "should cap the wait at 7 days");
+    }
+
+    #[test]
+    fn found_resets_failures_and_retry_in_applies_to_every_resolution() {
+        let provider = fixed_provider("p", &["a.example.com"]);
+        let a: SourceDomain = "a.example.com".parse().expect("should parse the source");
+        let mut view = EligibilityView::empty();
+        view.set_failures_for_test("p", 3);
+        view.set_record_for_test(&a, record_for_test("example-old", Some("p"), 900));
+        let fixture = OutcomeFixture::new();
+        let context = fixture.context_at(1_000);
+
+        let found = outcome_to_changes(
+            provider.as_ref(),
+            CallOutcome::Resolved(Resolution::found([ResolvedEid::new(&a, ResolvedUid::new("u"))]).with_retry_in(Duration::from_secs(600))),
+            &view,
+            &context,
+        );
+        let invalidated = outcome_to_changes(
+            provider.as_ref(),
+            CallOutcome::Resolved(Resolution::invalidate(&a).with_retry_in(Duration::from_secs(600))),
+            &view,
+            &context,
+        );
+
+        assert_eq!(found.state.f, Some(0), "should reset the failure count on found");
+        assert_eq!(found.state.n, Some(1_000 + 600), "should wait at least retry_in after found");
+        assert_eq!(invalidated.changes.len(), 1, "control: should remove the stored record");
+        assert_eq!(invalidated.state.n, Some(1_000 + 600), "should raise invalidate's n = now to retry_in");
     }
 
     #[test]
@@ -8152,7 +8183,7 @@ Dispatch per call:
    - Any recorded undeclared read is also logged as `Config` and turns the outcome into `InputFailure`.
 2. `check_request`. On failure: log `Config`, `InputFailure`.
 3. Order: calls are dispatched in a stable order. Generic pull providers keep today's fairness rule (spec 10.4, `pull_sync.rs:143-156`): sorted by source domain, then rotated left by `(now / 3600) % len`, so the starting partner changes each hour when `max_concurrency` limits a batch. Other providers follow, by provider ID.
-4. The burst cap: `rate_limiter.exceeded_per_minute(&format!("identity:{provider}:{}", visitor_key(keys, ec_id)), settings.max_calls_per_minute)`. Exceeded means not dispatched: the call's outcome is `Skipped` with `n = max(n, now + 60)` (Global Constraints), never a failure. A limiter error is logged and the call is skipped the same way.
+4. The burst cap: `rate_limiter.exceeded_per_minute(&format!("identity:{provider}:{}", visitor_key(keys, ec_id)), settings.max_calls_per_minute)`. Exceeded means not dispatched: the call's outcome is `BurstCapped`, which sets `n = max(n, now + 60)` (Task 20), never a failure. A limiter error is logged and the call's outcome is `NotDispatched`: not dispatched, `ps` unchanged (Task 35).
 5. `ensure` a backend with first-byte timeout `after_send_timeout_ms` after send, or for a hold dispatch `min(hold_timeout_ms, remaining budget)`, rounded up to the orchestrator's buckets (`auction/orchestrator.rs`, search for the bucket rounding). Do not follow redirects. Send with `send_async`, keeping at most `[ec.identity].max_concurrency` in flight.
 6. Collect responses: check `Content-Length` against `max_response_bytes`, buffer, `decode_body`. Over the cap is `TransportFailure`. Build the `ProviderResponse` with the request's call context. Call `response`.
    - `Ok(resolution)` is `Resolved`, or `InvalidState(Some(resolution))` when the input recorded a state decode failure.
@@ -8270,7 +8301,7 @@ Its `request` is a `GET` of `validated_pull_sync_url(partner.pull_sync_url.as_de
 - The body is `success_json::<{ uid: Option<String> }>()`. `None`, an empty UID or one over `MAX_UID_LENGTH` (`is_valid_eid_uid`) is `no_match`, never `Malformed`, so a partner's "no user" answer waits the `no_match` 24 h instead of counting a failure.
 - Any other UID is `found([ResolvedEid::new(&source, ResolvedUid::new(uid))])`: one entry, one UID, no `atype`, no `ext` and no EID-level fields, so the coordinator stores the one-entry record pull sync stores today (G13).
 
-A generic pull provider's settings are `settings.ec.identity.provider(&generic_pull_id(&partner.source_domain))` like any other provider's: `ProviderSettings::default()` unless the operator writes an `[ec.identity.providers.pull-<domain>]` table. Pacing moves there (spec 10.4): an operator who had `pull_sync_rate_limit = N` per hour sets `max_calls_per_minute = ceil(N / 60)`, and one who had `pull_sync_ttl_sec` sets `refresh_after_sec`. The changelog (Task 31) gives both conversions.
+A generic pull provider's settings are `settings.ec.identity.provider(&generic_pull_id(&partner.source_domain))` like any other provider's: `ProviderSettings::default()` unless the operator writes an `[ec.identity.providers.<pull-id>]` table, where `<pull-id>` is `generic_pull_id(source_domain)` (below). The unknown-provider validation error lists every configured provider ID, so an operator who writes the plain form for a hyphenated domain sees the real ID. Pacing moves there (spec 10.4): an operator who had `pull_sync_rate_limit = N` per hour sets `max_calls_per_minute = ceil(N / 60)`, and one who had `pull_sync_ttl_sec` sets `refresh_after_sec`. The changelog (Task 31) gives both conversions.
 
 Until Task 29 deletes `dispatch_pull_sync`, `ec/pull_sync.rs` reads the same table: its rate check becomes `rate_limiter.exceeded_per_minute(&rate_key, provider_settings.max_calls_per_minute)` (`pull_sync.rs:200`), and its marker TTL uses `provider_settings.refresh_after_sec`. Its tests set those through `settings.ec.identity.providers` instead of the removed partner fields.
 
@@ -8367,7 +8398,7 @@ Expected: PASS.
 
 ```bash
 git add -A crates/trusted-server-core/src
-git commit --signoff -S -m "Model pull sync partners as GenericPullProvider" -m "Adds the provider harness basics and a KV store that counts writes by mode. Generic pull results stay one UID per source, a 404 or null UID stays a no-op, and one catalog validator rejects provider tables it cannot apply." -m "pull_sync_ttl_sec and pull_sync_rate_limit are removed from [[ec.partners]]: pacing comes from each pull partner's [ec.identity.providers.pull-<domain>] table, and a config that sets either key fails validation with an error naming its replacement."
+git commit --signoff -S -m "Model pull sync partners as GenericPullProvider" -m "Adds the provider harness basics and a KV store that counts writes by mode. Generic pull results stay one UID per source, a 404 or null UID stays a no-op, and one catalog validator rejects provider tables it cannot apply." -m "pull_sync_ttl_sec and pull_sync_rate_limit are removed from [[ec.partners]]: pacing comes from each pull partner's [ec.identity.providers.<pull-id>] table, and a config that sets either key fails validation with an error naming its replacement."
 ```
 
 ---
@@ -9005,7 +9036,7 @@ Phase 4 (`run_after_send`, spec 5.2 steps 1 to 5):
 4. Recompute eligibility steps 4 and 5 for each after-send provider from the live row, rebuild its request from it (the live `ps.st` for a stateful provider), dispatch with `coordinator::dispatch(.., budget: None)`, and turn the outcomes into changes added to the mutation.
 5. If the live row has no `cluster_size`, add it with `compute_cluster_size` and `set_cluster_size`.
 6. `mutation::apply` against the live entry. If `changed`, write once with `IfGenerationMatch(generation)`: `Written`, or `NoChange` when nothing changed. Never retry the whole flush.
-7. On a failed write (a precondition failure, Fastly's per-key rate limit or any other error), log at `warn` with `log_id`. When `mutation.removals()` (Task 15) is not empty, run `write_removals(graph, ec_id, &removals, &context)` (Task 18): a re-read, the removal rules of section 5.4, and up to five attempts. `Failed` there calls `log_removal_lost` and `RequestIdentity::record_removal_lost` (Task 23) once per lost removal. Return `WriteFailed { removals }` with that outcome, or `NothingToWrite` when the mutation held no removal.
+7. On a failed write (a precondition failure, Fastly's per-key rate limit or any other error), log at `warn` with `log_id`. When `mutation.removals()` (Task 15) is not empty, run `write_removals(graph, ec_id, &removals, &context)` (Task 18): a re-read, the removal rules of section 5.4, and up to five attempts. `Failed` there calls `log_removal_lost` and `RequestIdentity::record_removal_lost` (Task 23) once per lost removal. Return `FlushOutcome::WriteFailed { removals }` with that `RemovalWriteOutcome`, using `RemovalWriteOutcome::NothingToWrite` when the mutation held no removal.
 
 `mutation::apply` writes each source's record whole (Task 15), so a multi-entry record the mutation does not touch keeps its `eids` byte for byte, and a version 1 row upgraded on write serializes as Task 6's golden expects.
 
@@ -9160,7 +9191,7 @@ Add `identity_measurement_records_counts_for_a_writer_navigation` (a writer navi
 - [ ] **Step 2: Docs**
 
 - `edge-cookies.md`: add a section for `__Host-ts-eids-s`: a client-only mirror of the server IDs that the shim writes from `/auction` and `/_ts/page-bids` responses for page scripts, with `Path=/; Secure; SameSite=Lax`, not `HttpOnly`, a `Max-Age` of at most one day and never past the earliest ID expiry, and a 2,048-byte cap that leaves out whole sources by `cookie_priority`. The server never reads it, and it is stripped from origin and Prebid Server requests (Tasks 1 to 4). Note that `ts-ec-pull-complete` is gone. Describe the writer-request rule in plain words: only a full page navigation from a returning visitor writes KV, once, after the page is sent. Say that the shim's `ts-eids` trim now keeps registered sources first.
-- `configuration.md`: the `[ec.identity]` table, with every key, its default and its meaning, from spec 10.1. Name `revoke_scope` as applying from Part 2. Name the removed keys and their replacements: `ec.pull_sync_concurrency` becomes `[ec.identity].max_concurrency`; `pull_sync_ttl_sec` becomes `refresh_after_sec` and `pull_sync_rate_limit = N` becomes `max_calls_per_minute = ceil(N / 60)`, both in `[ec.identity.providers.pull-<domain>]` (Tasks 19 and 22). Validation rejects the old keys. The capture provider checklist lands with capture, in Task 41.
+- `configuration.md`: the `[ec.identity]` table, with every key, its default and its meaning, from spec 10.1. Name `revoke_scope` as applying from Part 2. Name the removed keys and their replacements: `ec.pull_sync_concurrency` becomes `[ec.identity].max_concurrency`; `pull_sync_ttl_sec` becomes `refresh_after_sec` and `pull_sync_rate_limit = N` becomes `max_calls_per_minute = ceil(N / 60)`, both in `[ec.identity.providers.<pull-id>]` (Tasks 19 and 22). Give the ID rule with examples: `ssp.example.com` is `pull-ssp-example-com`, and a domain that contains `-`, or an ID over 63 characters, also gets `-` and 8 hex digits of the domain's SHA-256 (spec 10.4). Validation rejects the old keys. The capture provider checklist lands with capture, in Task 41.
 - `ec-setup-guide.md`: pull partners now run from a visitor's second page load, back off on errors, and are paced by their provider table.
 - `api-reference.md`: `/_ts/api/v1/identify`, `/auction` and `/_ts/page-bids` no longer write KV, and `/identify` omits expired IDs. `/identify`'s response shape is unchanged: one UID per source, even for a record that holds several. Document `ext.ts_eids_s` in the `/auction` response and `ts_eids_s` in the page-bids body, with the `value`, `clear` and absent cases (spec 6.2).
 - `configuration.md`, a "Rolling back" subsection after the `[ec.identity]` table (spec 14). This release moves KV to schema version 2, and a release before it cannot read a version 2 row, so a rollback past it is unsupported once it has written. For a later vendor release rolled back to this one: remove `owner` and every vendor `[ec.identity.providers.*]` table from the config first, because this release rejects an owner or a provider table it does not know; entry sets stay readable but are not served while their writer is not configured; and a write prunes an unconfigured provider's `ps` to `o`, `oc` and `ov`, so opt-outs survive while `ps.iv` and `ps.st` do not.
