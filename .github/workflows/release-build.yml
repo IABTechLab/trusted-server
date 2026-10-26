@@ -13,6 +13,152 @@ jobs:
         with:
           persist-credentials: false
       - run: node --test scripts/release/phase1.test.mjs
+  fastly-canonical:
+    needs: checks
+    name: Build trusted-server-fastly.wasm
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+        working-directory: ordinary-canonical-source
+    outputs:
+      artifact-id: ${{ steps.artifact.outputs.artifact-id }}
+      artifact-digest: ${{ steps.artifact.outputs.artifact-digest }}
+      observation-id: ${{ steps.observation.outputs.artifact-id }}
+      observation-digest: ${{ steps.observation.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: ordinary-canonical-source
+      - name: Read pinned toolchains
+        id: tools
+        run: |
+          set -euo pipefail
+          echo "node=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+          echo "rust=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: ${{ steps.tools.outputs.node }}
+      - name: Install the pinned Rust toolchain without build caches
+        env:
+          RUST_VERSION: ${{ steps.tools.outputs.rust }}
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal --target wasm32-wasip1
+      - name: Build the ordinary measurement tool separately
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/ordinary-producer-target
+        run: |
+          set -euo pipefail
+          test ! -e "$CARGO_TARGET_DIR"
+          cargo build --package trusted-server-release --release --target x86_64-unknown-linux-gnu --locked
+      - name: Build and observe the actual canonical Fastly release bytes
+        env:
+          SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+          RELEASE_VERSION: ${{ github.ref_name }}
+          RELEASE_ASSET: trusted-server-fastly.wasm
+        run: |
+          set -euo pipefail
+          env -i PATH="$PATH" HOME="$HOME" \
+            CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
+            RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
+            TMPDIR="${TMPDIR:-/tmp}" RUNNER_TEMP="$RUNNER_TEMP" \
+            SOURCE_COMMIT="$SOURCE_COMMIT" RELEASE_VERSION="$RELEASE_VERSION" \
+            ORDINARY_RELEASE_PRODUCER="$RUNNER_TEMP/ordinary-producer-target/x86_64-unknown-linux-gnu/release/trusted-server-release" \
+            bash scripts/release/phase1-build.sh trusted-server-adapter-fastly wasm32-wasip1 "$RELEASE_ASSET" canonical
+      - name: Upload canonical release artifact
+        id: artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: release-trusted-server-fastly.wasm
+          path: ordinary-canonical-source/release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload canonical observation
+        id: observation
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: fastly-observation-canonical
+          path: ${{ runner.temp }}/fastly-observation/*
+          if-no-files-found: error
+          retention-days: 7
+
+  fastly-reproduction:
+    needs: [checks, fastly-canonical]
+    name: Reproduce trusted-server-fastly.wasm
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+        working-directory: ordinary-reproduction-source
+    outputs:
+      artifact-id: ${{ steps.artifact.outputs.artifact-id }}
+      artifact-digest: ${{ steps.artifact.outputs.artifact-digest }}
+      observation-id: ${{ steps.observation.outputs.artifact-id }}
+      observation-digest: ${{ steps.observation.outputs.artifact-digest }}
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: ordinary-reproduction-source
+      - name: Read pinned toolchains
+        id: tools
+        run: |
+          set -euo pipefail
+          echo "node=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+          echo "rust=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: ${{ steps.tools.outputs.node }}
+      - name: Install the pinned Rust toolchain without build caches
+        env:
+          RUST_VERSION: ${{ steps.tools.outputs.rust }}
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal --target wasm32-wasip1
+      - name: Build the ordinary measurement tool separately
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/ordinary-producer-target
+        run: |
+          set -euo pipefail
+          test ! -e "$CARGO_TARGET_DIR"
+          cargo build --package trusted-server-release --release --target x86_64-unknown-linux-gnu --locked
+      - name: Build and observe the actual reproduction Fastly release bytes
+        env:
+          SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+          RELEASE_VERSION: ${{ github.ref_name }}
+          RELEASE_ASSET: trusted-server-fastly.wasm
+        run: |
+          set -euo pipefail
+          env -i PATH="$PATH" HOME="$HOME" \
+            CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
+            RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
+            TMPDIR="${TMPDIR:-/tmp}" RUNNER_TEMP="$RUNNER_TEMP" \
+            SOURCE_COMMIT="$SOURCE_COMMIT" RELEASE_VERSION="$RELEASE_VERSION" \
+            ORDINARY_RELEASE_PRODUCER="$RUNNER_TEMP/ordinary-producer-target/x86_64-unknown-linux-gnu/release/trusted-server-release" \
+            bash scripts/release/phase1-build.sh trusted-server-adapter-fastly wasm32-wasip1 "$RELEASE_ASSET" reproduction
+      - name: Upload reproduction release artifact
+        id: artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: reproduction-trusted-server-fastly.wasm
+          path: ordinary-reproduction-source/release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload reproduction observation
+        id: observation
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: fastly-observation-reproduction
+          path: ${{ runner.temp }}/fastly-observation/*
+          if-no-files-found: error
+          retention-days: 7
+
   build:
     needs: checks
     name: Build ${{ matrix.asset }}
@@ -24,10 +170,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-24.04
-            package: trusted-server-adapter-fastly
-            target: wasm32-wasip1
-            asset: trusted-server-fastly.wasm
           - os: ubuntu-24.04
             package: trusted-server-cli
             target: x86_64-unknown-linux-gnu
@@ -94,9 +236,121 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  fastly-comparison:
+    needs: [fastly-canonical, fastly-reproduction]
+    name: Compare ordinary Fastly release bytes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Read pinned toolchains
+        id: tools
+        run: |
+          set -euo pipefail
+          echo "node=$(awk '$1 == "nodejs" { print $2 }' .tool-versions)" >> "$GITHUB_OUTPUT"
+          echo "rust=$(sed -n 's/^channel = "\([^"]*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: ${{ steps.tools.outputs.node }}
+      - name: Install the pinned Rust toolchain
+        env:
+          RUST_VERSION: ${{ steps.tools.outputs.rust }}
+        run: rustup toolchain install "$RUST_VERSION" --profile minimal
+      - name: Build the ordinary comparison tool from the expected source
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/ordinary-compare-tool
+          SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test ! -e "$CARGO_TARGET_DIR"
+          cargo build --package trusted-server-release --release --target x86_64-unknown-linux-gnu --locked
+      - name: Retain the invocation and all eight direct upload outputs
+        env:
+          SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          HEAD_REPOSITORY_ID: ${{ github.event.pull_request.head.repo.id || github.repository_id }}
+          A_ARTIFACT_ID: ${{ needs.fastly-canonical.outputs.artifact-id }}
+          A_ARTIFACT_DIGEST: ${{ needs.fastly-canonical.outputs.artifact-digest }}
+          A_OBSERVATION_ID: ${{ needs.fastly-canonical.outputs.observation-id }}
+          A_OBSERVATION_DIGEST: ${{ needs.fastly-canonical.outputs.observation-digest }}
+          B_ARTIFACT_ID: ${{ needs.fastly-reproduction.outputs.artifact-id }}
+          B_ARTIFACT_DIGEST: ${{ needs.fastly-reproduction.outputs.artifact-digest }}
+          B_OBSERVATION_ID: ${{ needs.fastly-reproduction.outputs.observation-id }}
+          B_OBSERVATION_DIGEST: ${{ needs.fastly-reproduction.outputs.observation-digest }}
+        run: |
+          set -euo pipefail
+          node <<'JAVASCRIPT'
+          const fs = require('node:fs'), path = require('node:path'), e = process.env;
+          const directory = path.join(e.RUNNER_TEMP, 'ordinary-inputs');
+          fs.mkdirSync(directory, { mode: 0o700 });
+          const upload = prefix => ({
+            artifact_id: Number(e[`${prefix}_ARTIFACT_ID`]),
+            artifact_digest: e[`${prefix}_ARTIFACT_DIGEST`],
+            observation_id: Number(e[`${prefix}_OBSERVATION_ID`]),
+            observation_digest: e[`${prefix}_OBSERVATION_DIGEST`],
+          });
+          fs.writeFileSync(path.join(directory, 'context.json'), JSON.stringify({
+            repository: e.GITHUB_REPOSITORY, repository_id: Number(e.REPOSITORY_ID),
+            head_repository_id: Number(e.HEAD_REPOSITORY_ID), source_commit: e.SOURCE_COMMIT,
+            run_id: Number(e.GITHUB_RUN_ID), run_attempt: Number(e.GITHUB_RUN_ATTEMPT),
+            canonical: upload('A'), reproduction: upload('B'),
+          }) + '\n', { flag: 'wx', mode: 0o600 });
+          JAVASCRIPT
+      - name: Acquire only current-run bound archives through read-only APIs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          node scripts/release/phase1.mjs ordinary-fetch \
+            "$RUNNER_TEMP/ordinary-compare-tool/x86_64-unknown-linux-gnu/release/trusted-server-release" \
+            "$RUNNER_TEMP/ordinary-inputs" "$RUNNER_TEMP/ordinary-archives"
+      - name: Compare every final byte and seal only a real matched companion
+        run: |
+          set -euo pipefail
+          if ! env -i PATH="$PATH" LC_ALL=C TZ=UTC \
+            "$RUNNER_TEMP/ordinary-compare-tool/x86_64-unknown-linux-gnu/release/trusted-server-release" \
+            ordinary-compare --input "$RUNNER_TEMP/ordinary-inputs" \
+            --archives "$RUNNER_TEMP/ordinary-archives" --source "$PWD" \
+            --output "$RUNNER_TEMP/ordinary-comparison" \
+            2> "$RUNNER_TEMP/ordinary-comparison-failure.txt"; then
+            head -c 16384 "$RUNNER_TEMP/ordinary-comparison-failure.txt"
+            exit 1
+          fi
+          echo 'SUCCESS: actual canonical and reproduction Fastly bytes match; ordinary unqualified companion sealed'
+      - name: Upload the real Fastly rebuild check
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: fastly-rebuild-check
+          path: ${{ runner.temp }}/ordinary-comparison/trusted-server-fastly.wasm.rebuild-check.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Retain bounded nonpublishable comparison diagnostics
+        if: failure()
+        run: |
+          if test -f "$RUNNER_TEMP/ordinary-comparison-failure.txt"; then
+            head -c 16384 "$RUNNER_TEMP/ordinary-comparison-failure.txt" > "$RUNNER_TEMP/ordinary-comparison-diagnostic.txt"
+          else
+            echo 'Ordinary inputs unavailable; no publishable equality result' > "$RUNNER_TEMP/ordinary-comparison-diagnostic.txt"
+          fi
+      - name: Upload only the failed comparison diagnostic
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: fastly-comparison-failure
+          path: ${{ runner.temp }}/ordinary-comparison-diagnostic.txt
+          if-no-files-found: error
+          retention-days: 7
+
   sign:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && vars.RELEASE_PUBLICATION_ENABLED == 'true'
-    needs: build
+    needs: [build, fastly-comparison]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:

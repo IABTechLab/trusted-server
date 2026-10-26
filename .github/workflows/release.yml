@@ -18,6 +18,7 @@ on:
       - 'crates/trusted-server-core/build.rs'
       - 'crates/trusted-server-core/Cargo.toml'
       - 'crates/trusted-server-cli/**'
+      - 'crates/trusted-server-release/**'
       - 'crates/trusted-server-js/**'
       - 'crates/trusted-server-adapter-fastly/**'
       - 'crates/trusted-server-adapter-axum/**'
@@ -32,6 +33,7 @@ jobs:
     uses: ./.github/workflows/release-build.yml
     permissions:
       contents: read
+      actions: read
       id-token: write
       attestations: write
   release:

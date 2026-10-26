@@ -1313,8 +1313,15 @@ test('workflows select exactly the descriptive cohort and restrict actual build 
   const names = cohort.artifacts.map((a) => a.name).sort()
   const build = readFileSync('.github/workflows/release-build.yml', 'utf8')
   const release = readFileSync('.github/workflows/release.yml', 'utf8')
+  const canonical = build
+    .split('\n  fastly-canonical:')[1]
+    ?.split(/\n  [a-z][\w-]*:\n/)[0]
+  const fastly = canonical?.match(/^          RELEASE_ASSET: (\S+)/m)?.[1]
   assert.deepEqual(
-    [...build.matchAll(/^            asset: (\S+)/gm)].map((m) => m[1]).sort(),
+    [...build.matchAll(/^            asset: (\S+)/gm)]
+      .map((m) => m[1])
+      .concat(fastly ? [fastly] : [])
+      .sort(),
     names
   )
   const sign = build.split('\n  sign:')[1]
@@ -1339,6 +1346,57 @@ test('workflows select exactly the descriptive cohort and restrict actual build 
     build.split('\n  sign:')[1],
     /vars\.RELEASE_PUBLICATION_ENABLED == 'true'/
   )
+})
+
+test('ordinary Fastly gate binds dedicated A and B uploads before isolated signing', () => {
+  const workflow = readFileSync('.github/workflows/release-build.yml', 'utf8')
+  const caller = readFileSync('.github/workflows/release.yml', 'utf8')
+  const job = (name) =>
+    workflow.split(`\n  ${name}:`)[1]?.split(/\n  [a-z][\w-]*:\n/)[0]
+  const canonical = job('fastly-canonical'),
+    reproduction = job('fastly-reproduction'),
+    comparison = job('fastly-comparison')
+  assert.ok(
+    canonical && reproduction && comparison,
+    'should run two dedicated builds and a comparison'
+  )
+  assert.match(canonical, /name: Build trusted-server-fastly\.wasm/)
+  assert.match(reproduction, /name: Reproduce trusted-server-fastly\.wasm/)
+  assert.match(reproduction, /needs:.*fastly-canonical/)
+  for (const [role, body] of [
+    ['canonical', canonical],
+    ['reproduction', reproduction],
+  ]) {
+    assert.doesNotMatch(body, /id-token|attestations:|contents: write/)
+    assert.match(body, new RegExp(`path: ordinary-${role}-source`))
+    assert.match(body, new RegExp(`Upload ${role} release artifact`))
+    assert.match(body, new RegExp(`Upload ${role} observation`))
+    for (const output of [
+      'artifact-id',
+      'artifact-digest',
+      'observation-id',
+      'observation-digest',
+    ])
+      assert.match(body, new RegExp(`      ${output}:`))
+  }
+  assert.match(comparison, /needs: \[fastly-canonical, fastly-reproduction\]/)
+  assert.match(comparison, /actions: read/)
+  assert.doesNotMatch(comparison, /id-token|attestations:|contents: write/)
+  assert.match(comparison, /ordinary-fetch/)
+  assert.match(comparison, /ordinary-compare/)
+  for (const role of ['canonical', 'reproduction'])
+    for (const output of [
+      'artifact-id',
+      'artifact-digest',
+      'observation-id',
+      'observation-digest',
+    ])
+      assert.ok(
+        comparison.includes(`needs.fastly-${role}.outputs.${output}`),
+        'should carry every direct upload output'
+      )
+  assert.match(job('sign'), /needs: \[build, fastly-comparison\]/)
+  assert.match(caller.split('\n  release:')[0], /actions: read/)
 })
 test('release preflight rejects inherited controls in an isolated script fixture', () => {
   const root = mkdtempSync(join(tmpdir(), 'phase1-preflight-'))
