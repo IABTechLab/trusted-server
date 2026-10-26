@@ -1,9 +1,5 @@
 //! The enabled identity providers and source ownership.
 
-// Temporary: the narrowing, claim and capture-only accessors are first used by
-// later identity tasks. Remove this when they land.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -52,6 +48,8 @@ impl ProviderCatalog {
     /// (spec 10.1). Config validation has rejected a source a descriptor
     /// does not declare and a narrowing to nothing.
     #[must_use]
+    // Temporary: first used by a later identity task.
+    #[allow(dead_code)]
     pub(crate) fn with_narrowing(
         mut self,
         narrowing: BTreeMap<IdentityProviderId, Vec<SourceDomain>>,
@@ -71,6 +69,8 @@ impl ProviderCatalog {
     }
 
     /// Every provider, ordered by ID.
+    // Temporary: first used by a later identity task.
+    #[allow(dead_code)]
     pub(crate) fn providers(&self) -> impl Iterator<Item = &Arc<dyn IdentityProvider>> {
         self.providers.values()
     }
@@ -94,6 +94,8 @@ impl ProviderCatalog {
     }
 
     /// Every provider that claims `source` after narrowing, ordered by ID.
+    // Temporary: first used by a later identity task.
+    #[allow(dead_code)]
     pub(crate) fn claimants<'a>(
         &'a self,
         source: &'a SourceDomain,

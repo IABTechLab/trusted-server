@@ -1,10 +1,6 @@
 //! One request's identity changes as a single mutation, and its merge into
 //! the live KV row (spec 5.4).
 
-// Temporary: the coordinator, the first non-test caller, arrives in a later
-// task. Remove this when it lands.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 
 use super::catalog::ProviderCatalog;
@@ -53,6 +49,8 @@ pub(crate) enum PartnerIdChange {
 }
 
 impl PartnerIdChange {
+    // Temporary: first used by a later identity task.
+    #[allow(dead_code)]
     fn is_removal(&self) -> bool {
         matches!(self, Self::OwnerRemove { .. } | Self::WriterRemove { .. })
     }
@@ -82,14 +80,20 @@ pub(crate) struct ProviderStateChange {
 }
 
 impl ProviderStateChange {
+    // Temporary: first used by a later identity task.
+    #[allow(dead_code)]
     fn is_noop(&self) -> bool {
         *self == Self::default()
     }
 
+    // Temporary: first used by a later identity task.
+    #[allow(dead_code)]
     fn has_removal(&self) -> bool {
         self.opt_out.is_some() || self.opt_out_clear.is_some()
     }
 
+    // Temporary: first used by a later identity task.
+    #[allow(dead_code)]
     fn removals(&self) -> Self {
         Self {
             opt_out: self.opt_out.clone(),
@@ -98,6 +102,8 @@ impl ProviderStateChange {
         }
     }
 
+    // Temporary: first used by a later identity task.
+    #[allow(dead_code)]
     fn merge(&mut self, later: Self) {
         self.n = self.n.max(later.n);
         self.f = later.f.or(self.f);
@@ -125,6 +131,8 @@ pub(crate) struct ProviderResult {
 
 /// Everything one request changes in the identity row.
 #[derive(Debug, Clone, Default, PartialEq)]
+// Temporary: first used by a later identity task.
+#[allow(dead_code)]
 pub(crate) struct IdentityMutation {
     partner_ids: Vec<PartnerIdChange>,
     provider_state: BTreeMap<IdentityProviderId, ProviderStateChange>,
@@ -134,6 +142,8 @@ pub(crate) struct IdentityMutation {
 
 impl IdentityMutation {
     /// Adds a change that stands alone.
+    // Temporary: first used by a later identity task.
+    #[allow(dead_code)]
     pub(crate) fn add_change(&mut self, change: PartnerIdChange) {
         self.partner_ids.push(change);
     }
@@ -143,6 +153,8 @@ impl IdentityMutation {
     /// A removal in `result.ids` is a provider-side mistake: removals go
     /// through `partner_ids` and `provider_state`. It is logged by provider
     /// and source, never by UID.
+    // Temporary: first used by a later identity task.
+    #[allow(dead_code)]
     pub(crate) fn add_result(&mut self, result: ProviderResult) {
         for change in result.ids.iter().filter(|change| change.is_removal()) {
             let (PartnerIdChange::OwnerRemove { source, .. }
@@ -162,6 +174,8 @@ impl IdentityMutation {
     /// Merges a state change into any earlier one for the same provider:
     /// later `n`, last `f`, the later opt-out and clear, last non-`Keep`
     /// `st`.
+    // Temporary: first used by a later identity task.
+    #[allow(dead_code)]
     pub(crate) fn merge_state(
         &mut self,
         provider: IdentityProviderId,
@@ -174,12 +188,16 @@ impl IdentityMutation {
     }
 
     /// Sets the cluster size to write.
+    // Temporary: first used by a later identity task.
+    #[allow(dead_code)]
     pub(crate) fn set_cluster_size(&mut self, size: u32) {
         self.cluster_size = Some(size);
     }
 
     /// Whether nothing would change.
     #[must_use]
+    // Temporary: first used by a later identity task.
+    #[allow(dead_code)]
     pub(crate) fn is_empty(&self) -> bool {
         self.partner_ids.is_empty()
             && self.results.is_empty()
@@ -192,6 +210,8 @@ impl IdentityMutation {
 
     /// Whether any removal, opt-out or clear is present.
     #[must_use]
+    // Temporary: first used by a later identity task.
+    #[allow(dead_code)]
     pub(crate) fn has_removals(&self) -> bool {
         self.partner_ids.iter().any(PartnerIdChange::is_removal)
             || self
@@ -205,6 +225,8 @@ impl IdentityMutation {
     /// de-duplicated. An opt-out or clear has no source. Holds no UID, so it
     /// is safe to log.
     #[must_use]
+    // Temporary: first used by a later identity task.
+    #[allow(dead_code)]
     pub(crate) fn removal_labels(&self) -> Vec<(IdentityProviderId, Option<SourceDomain>)> {
         let mut labels: Vec<_> = self
             .partner_ids
@@ -232,6 +254,8 @@ impl IdentityMutation {
     /// A copy holding only the removals, opt-outs and clears, for the
     /// removal write and the removal-only retry.
     #[must_use]
+    // Temporary: first used by a later identity task.
+    #[allow(dead_code)]
     pub(crate) fn removals(&self) -> Self {
         let mut copy = Self {
             partner_ids: self
@@ -257,6 +281,8 @@ impl IdentityMutation {
 
     /// Every provider state change that applies regardless of its result:
     /// the standalone ones, and each result's.
+    // Temporary: first used by a later identity task.
+    #[allow(dead_code)]
     fn all_states(&self) -> impl Iterator<Item = (&IdentityProviderId, &ProviderStateChange)> {
         self.provider_state.iter().chain(
             self.results
@@ -267,6 +293,8 @@ impl IdentityMutation {
 }
 
 /// What the merge needs besides the mutation and the live row.
+// Temporary: first used by a later identity task.
+#[allow(dead_code)]
 pub(crate) struct ApplyContext<'a> {
     pub(crate) now: u64,
     pub(crate) random: &'a dyn RandomSource,
@@ -275,6 +303,8 @@ pub(crate) struct ApplyContext<'a> {
 
 /// The merged row.
 #[derive(Debug, Clone, PartialEq)]
+// Temporary: first used by a later identity task.
+#[allow(dead_code)]
 pub(crate) struct Applied {
     pub(crate) entry: KvEntry,
     /// Whether the result differs from the live row. A caller skips the
@@ -347,6 +377,8 @@ pub(crate) struct Applied {
 ///    breaks one is dropped whole here and never trimmed.
 /// 6. `changed` is whether the result differs from `live`.
 #[must_use]
+// Temporary: first used by a later identity task.
+#[allow(dead_code)]
 pub(crate) fn apply(
     mutation: &IdentityMutation,
     live: &KvEntry,
@@ -382,6 +414,8 @@ pub(crate) fn apply(
 /// for the capture removal write and the removal-only retry. It ignores every
 /// positive change, `n`, `f`, `st` and `cluster_size`.
 #[must_use]
+// Temporary: first used by a later identity task.
+#[allow(dead_code)]
 pub(crate) fn apply_removals_only(
     mutation: &IdentityMutation,
     live: &KvEntry,
@@ -407,12 +441,16 @@ pub(crate) fn apply_removals_only(
     })
 }
 
+// Temporary: first used by a later identity task.
+#[allow(dead_code)]
 fn state_mut<'a>(entry: &'a mut KvEntry, provider: &IdentityProviderId) -> &'a mut KvProviderState {
     entry.ps.entry(provider.to_string()).or_default()
 }
 
 /// Removes the record at `source` when `matches` accepts it, and hashes its
 /// set into the list `list` picks from `provider`'s state.
+// Temporary: first used by a later identity task.
+#[allow(dead_code)]
 fn remove_record(
     entry: &mut KvEntry,
     source: &str,
@@ -429,14 +467,20 @@ fn remove_record(
     }
 }
 
+// Temporary: first used by a later identity task.
+#[allow(dead_code)]
 fn invalidated(state: &mut KvProviderState) -> &mut Vec<String> {
     &mut state.iv
 }
 
+// Temporary: first used by a later identity task.
+#[allow(dead_code)]
 fn opted_out_hashes(state: &mut KvProviderState) -> &mut Vec<String> {
     &mut state.ov
 }
 
+// Temporary: first used by a later identity task.
+#[allow(dead_code)]
 fn apply_removals(entry: &mut KvEntry, mutation: &IdentityMutation, context: &ApplyContext<'_>) {
     for change in &mutation.partner_ids {
         match change {
@@ -483,6 +527,8 @@ fn apply_removals(entry: &mut KvEntry, mutation: &IdentityMutation, context: &Ap
     }
 }
 
+// Temporary: first used by a later identity task.
+#[allow(dead_code)]
 fn apply_opt_out(
     entry: &mut KvEntry,
     provider: &IdentityProviderId,
@@ -518,6 +564,8 @@ fn apply_opt_out(
     }
 }
 
+// Temporary: first used by a later identity task.
+#[allow(dead_code)]
 fn apply_clear(entry: &mut KvEntry, provider: &IdentityProviderId, clear: u64) {
     let Some(state) = entry.ps.get_mut(provider.as_str()) else {
         return;
@@ -528,6 +576,8 @@ fn apply_clear(entry: &mut KvEntry, provider: &IdentityProviderId, clear: u64) {
     }
 }
 
+// Temporary: first used by a later identity task.
+#[allow(dead_code)]
 fn is_opted_out(entry: &KvEntry, provider: &str) -> bool {
     entry
         .ps
@@ -536,10 +586,14 @@ fn is_opted_out(entry: &KvEntry, provider: &str) -> bool {
         .is_some_and(|(opt_out, cleared)| cleared.is_none_or(|cleared| cleared <= opt_out.at))
 }
 
+// Temporary: first used by a later identity task.
+#[allow(dead_code)]
 fn is_expired(record: &KvPartnerId, now: u64) -> bool {
     record.exp.is_some_and(|exp| exp <= now)
 }
 
+// Temporary: first used by a later identity task.
+#[allow(dead_code)]
 fn change_applies(entry: &KvEntry, change: &PartnerIdChange, context: &ApplyContext<'_>) -> bool {
     match change {
         PartnerIdChange::FillMissing { source, record } => {
@@ -569,6 +623,8 @@ fn change_applies(entry: &KvEntry, change: &PartnerIdChange, context: &ApplyCont
     }
 }
 
+// Temporary: first used by a later identity task.
+#[allow(dead_code)]
 fn fill_applies(
     entry: &KvEntry,
     source: &SourceDomain,
@@ -612,6 +668,8 @@ fn fill_applies(
     })
 }
 
+// Temporary: first used by a later identity task.
+#[allow(dead_code)]
 fn write_change(entry: &mut KvEntry, change: &PartnerIdChange, context: &ApplyContext<'_>) {
     let (PartnerIdChange::FillMissing { source, record }
     | PartnerIdChange::OwnerWrite { source, record, .. }) = change
@@ -626,6 +684,8 @@ fn write_change(entry: &mut KvEntry, change: &PartnerIdChange, context: &ApplyCo
 
 /// Applies the positive changes and returns the state changes that go with
 /// them: every standalone one, and those of the results that applied.
+// Temporary: first used by a later identity task.
+#[allow(dead_code)]
 fn apply_positive<'a>(
     entry: &mut KvEntry,
     mutation: &'a IdentityMutation,
@@ -657,6 +717,8 @@ fn apply_positive<'a>(
     accepted
 }
 
+// Temporary: first used by a later identity task.
+#[allow(dead_code)]
 fn apply_state(
     entry: &mut KvEntry,
     mutation: &IdentityMutation,
@@ -683,12 +745,16 @@ fn apply_state(
     }
 }
 
+// Temporary: first used by a later identity task.
+#[allow(dead_code)]
 fn is_configured(entry_key: &str, context: &ApplyContext<'_>) -> bool {
     entry_key
         .parse::<IdentityProviderId>()
         .is_ok_and(|id| context.catalog.is_configured(&id))
 }
 
+// Temporary: first used by a later identity task.
+#[allow(dead_code)]
 fn finish_removal_fields(entry: &mut KvEntry, context: &ApplyContext<'_>) {
     for state in entry.ps.values_mut() {
         for list in [&mut state.iv, &mut state.ov] {
@@ -725,6 +791,8 @@ fn finish_removal_fields(entry: &mut KvEntry, context: &ApplyContext<'_>) {
     }
 }
 
+// Temporary: first used by a later identity task.
+#[allow(dead_code)]
 fn drop_expired_records(entry: &mut KvEntry, context: &ApplyContext<'_>) {
     let ps = &entry.ps;
     entry.ids.retain(|source, record| {

@@ -7,6 +7,8 @@ use super::input::RandomSource;
 use crate::ec::kv_types::{KvEid, KvPartnerId, RECORD_REVISION_HEX_LEN};
 use crate::settings::Settings;
 
+// Temporary: first used by a later identity task.
+#[allow(dead_code)]
 type HmacSha256 = Hmac<Sha256>;
 
 /// The visitor key, derived from `ec.passphrase` once per settings load.
@@ -101,6 +103,8 @@ impl StateRevision {
     /// the empty string when there is none. Compact JSON is never empty, so
     /// absent and present state never share a revision.
     #[must_use]
+    // Temporary: first used by a later identity task.
+    #[allow(dead_code)]
     pub(crate) fn of(st: Option<&serde_json::Value>) -> Self {
         let bytes = st
             .and_then(|value| serde_json::to_vec(value).ok())
@@ -118,6 +122,8 @@ pub(crate) fn uid_hash(uid: &str) -> String {
 
 /// One hash per UID of a removed set, in set order, without duplicates.
 #[must_use]
+// Temporary: first used by a later identity task.
+#[allow(dead_code)]
 pub(crate) fn set_hashes(set: &[KvEid]) -> Vec<String> {
     let mut hashes = Vec::new();
     for uid in set.iter().flat_map(|entry| &entry.uids) {
@@ -131,6 +137,8 @@ pub(crate) fn set_hashes(set: &[KvEid]) -> Vec<String> {
 
 /// Appends hashes to a `ps.iv` or `ps.ov` list, oldest first. A hash
 /// already present moves to the end. The caller truncates.
+// Temporary: first used by a later identity task.
+#[allow(dead_code)]
 pub(crate) fn push_hashes(list: &mut Vec<String>, hashes: Vec<String>) {
     for hash in hashes {
         list.retain(|existing| *existing != hash);

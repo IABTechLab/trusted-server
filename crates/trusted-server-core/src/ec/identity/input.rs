@@ -1,9 +1,5 @@
 //! What a provider may read for one call.
 
-// Temporary: the coordinator, the first non-test caller, arrives in a later
-// task. Remove this when it lands.
-#![allow(dead_code)]
-
 use core::cell::RefCell;
 use core::fmt;
 use std::collections::{BTreeMap, BTreeSet};
@@ -59,6 +55,8 @@ impl fmt::Debug for ProviderConsent {
 impl ProviderConsent {
     /// The view of a request's consent context.
     #[must_use]
+    // Temporary: first used by a later identity task.
+    #[allow(dead_code)]
     pub(crate) fn from_context(context: &ConsentContext) -> Self {
         Self {
             gdpr_applies: context.gdpr_applies,
@@ -111,6 +109,8 @@ impl Region {
     /// Normalizes platform geo: upper case, and an ISO 3166-2 `US-CA` style
     /// region loses its country prefix. `None` without a two-letter country.
     #[must_use]
+    // Temporary: first used by a later identity task.
+    #[allow(dead_code)]
     pub(crate) fn from_geo(country: &str, region: Option<&str>) -> Option<Self> {
         let country = country.trim().to_ascii_uppercase();
         if country.len() != 2 || !country.bytes().all(|byte| byte.is_ascii_alphabetic()) {
@@ -221,6 +221,8 @@ impl StoredId {
     /// treated as none. `None` for a record with no entry, which
     /// `KvEntry::validate` never lets through.
     #[must_use]
+    // Temporary: first used by a later identity task.
+    #[allow(dead_code)]
     pub(crate) fn from_record(source: &SourceDomain, record: &KvPartnerId) -> Option<Self> {
         let uid = record.first_uid()?.to_owned();
         let eids = record
@@ -323,6 +325,8 @@ pub(crate) trait RandomSource: Send + Sync {
 }
 
 /// The platform generator EC generation uses (`rand::thread_rng`).
+// Temporary: first used by a later identity task.
+#[allow(dead_code)]
 pub(crate) struct ThreadRandom;
 
 impl RandomSource for ThreadRandom {
@@ -371,6 +375,8 @@ pub(crate) struct ResolveSignals<'a> {
     pub(crate) publisher_domain: &'a str,
     pub(crate) now: UnixTime,
     pub(crate) random: &'a dyn RandomSource,
+    // Temporary: first used by a later identity task.
+    #[allow(dead_code)]
     pub(crate) ec_id: Option<String>,
     pub(crate) stored: BTreeMap<SourceDomain, StoredId>,
     pub(crate) state_json: Option<String>,
@@ -404,6 +410,8 @@ impl<'a> ResolveInput<'a> {
     /// declared, so reading it is not an error of the provider, but it is
     /// unavailable (spec 4.4).
     #[must_use]
+    // Temporary: first used by a later identity task.
+    #[allow(dead_code)]
     pub(crate) fn new(
         descriptor: &'a ProviderDescriptor,
         kinds: BTreeMap<SourceDomain, ResolveKind>,
@@ -454,12 +462,16 @@ impl<'a> ResolveInput<'a> {
     /// Undeclared reads recorded so far. The coordinator logs them as
     /// `Config`, and the harness fails the test.
     #[must_use]
+    // Temporary: first used by a later identity task.
+    #[allow(dead_code)]
     pub(crate) fn recorded_errors(&self) -> Vec<Access> {
         self.undeclared.borrow().clone()
     }
 
     /// Whether a `state()` call failed to decode.
     #[must_use]
+    // Temporary: first used by a later identity task.
+    #[allow(dead_code)]
     pub(crate) fn state_decode_failed(&self) -> bool {
         *self.state_failed.borrow()
     }
@@ -606,6 +618,8 @@ impl<'a> ResolveInput<'a> {
     /// `UndeclaredInput { access: EcId }` otherwise. `Config` when the
     /// request has no EC ID, which the coordinator never allows: it does not
     /// dispatch generic pull without one.
+    // Temporary: first used by a later identity task.
+    #[allow(dead_code)]
     pub(in crate::ec::identity) fn ec_id(&self) -> Result<&str, Report<IdentityProviderError>> {
         if !self.descriptor.resolves().is_some_and(Resolves::gets_ec_id) {
             return Err(self.record(Access::EcId));
@@ -640,6 +654,8 @@ impl fmt::Debug for CaptureInput<'_> {
 impl<'a> CaptureInput<'a> {
     /// The input for one capture.
     #[must_use]
+    // Temporary: first used by a later identity task.
+    #[allow(dead_code)]
     pub(crate) fn new(
         descriptor: &'a ProviderDescriptor,
         path: &'a str,

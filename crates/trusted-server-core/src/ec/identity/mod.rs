@@ -7,6 +7,7 @@
 //! write. See `docs/superpowers/specs/2026-10-20-server-side-identity-providers-design.md`.
 
 pub(crate) mod catalog;
+pub(crate) mod coordinator;
 pub mod descriptor;
 pub mod exchange;
 pub mod ids;

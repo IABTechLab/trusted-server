@@ -1,9 +1,5 @@
 //! Provider results and errors.
 
-// Temporary: the coordinator, the first non-test caller, arrives in a later
-// task. Remove this when it lands.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::iter;
 use std::time::Duration;
@@ -91,9 +87,9 @@ impl IdentityProviderError {
     }
 
     /// Whether this is the [`Self::not_implemented`] marker.
-    // Temporary: first used by the provider test harness in a later task.
-    #[allow(dead_code)]
     #[must_use]
+    // Temporary: first used by a later identity task.
+    #[allow(dead_code)]
     pub(crate) fn is_not_implemented(&self) -> bool {
         matches!(self, Self::Config { message } if message.starts_with(NOT_IMPLEMENTED_MARKER))
     }
@@ -111,8 +107,6 @@ pub enum When {
 impl When {
     /// Resolves against `now`.
     #[must_use]
-    // Temporary: the coordinator, the first non-test caller, arrives in a later task.
-    #[allow(dead_code)]
     pub(crate) fn resolve(self, now: UnixTime) -> UnixTime {
         match self {
             Self::In(delay) => now + delay,
@@ -548,6 +542,8 @@ impl Resolution {
 
     /// Whether this result changes state at all.
     #[must_use]
+    // Temporary: first used by a later identity task.
+    #[allow(dead_code)]
     pub(crate) fn changes_state(&self) -> bool {
         self.state != StateOp::Keep
     }

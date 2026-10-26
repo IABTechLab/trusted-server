@@ -185,17 +185,17 @@ impl ProviderRequest {
     }
 
     /// The call context JSON.
-    // Temporary: the coordinator, the first non-test caller, arrives in a later task.
-    #[allow(dead_code)]
     #[must_use]
+    // Temporary: first used by a later identity task.
+    #[allow(dead_code)]
     pub(crate) fn call_context_json(&self) -> Option<&str> {
         self.call_context.as_deref()
     }
 
     /// Whether the provider set a `Cookie` header.
-    // Temporary: the coordinator, the first non-test caller, arrives in a later task.
-    #[allow(dead_code)]
     #[must_use]
+    // Temporary: first used by a later identity task.
+    #[allow(dead_code)]
     pub(crate) fn has_cookie_header(&self) -> bool {
         self.headers.contains_key(COOKIE)
     }
@@ -222,7 +222,7 @@ impl fmt::Debug for ProviderResponse {
 
 impl ProviderResponse {
     /// Built by the coordinator after buffering and decoding.
-    // Temporary: the coordinator, the first non-test caller, arrives in a later task.
+    // Temporary: the dispatcher, the first non-test caller, arrives in a later task.
     #[allow(dead_code)]
     #[must_use]
     pub(crate) fn new(

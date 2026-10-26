@@ -370,25 +370,23 @@ impl Resolves {
     }
 
     /// Gives the provider the full EC ID. Only generic pull may use this.
+    #[must_use]
     // Temporary: first used by a later identity task.
     #[allow(dead_code)]
-    #[must_use]
     pub(in crate::ec::identity) fn with_ec_id(mut self) -> Self {
         self.ec_id = true;
         self
     }
 
     /// Hosts the provider may call.
+    #[must_use]
     // Temporary: first used by a later identity task.
     #[allow(dead_code)]
-    #[must_use]
     pub(crate) fn hosts(&self) -> &[String] {
         &self.hosts
     }
 
     /// Inputs required for `kind`: the common needs plus that kind's.
-    // Temporary: first used by a later identity task.
-    #[allow(dead_code)]
     #[must_use]
     pub(crate) fn needs(&self, kind: ResolveKind) -> BTreeSet<Input> {
         let mut needs = self.needs.clone();
@@ -399,9 +397,9 @@ impl Resolves {
     }
 
     /// Every input declared for any kind, needed or wanted.
+    #[must_use]
     // Temporary: first used by a later identity task.
     #[allow(dead_code)]
-    #[must_use]
     pub(crate) fn declared_inputs(&self) -> BTreeSet<Input> {
         let mut all = self.needs.clone();
         all.extend(self.wants.iter().copied());
@@ -412,33 +410,29 @@ impl Resolves {
     }
 
     /// Inputs passed when available.
+    #[must_use]
     // Temporary: first used by a later identity task.
     #[allow(dead_code)]
-    #[must_use]
     pub(crate) fn wants(&self) -> &BTreeSet<Input> {
         &self.wants
     }
 
     /// The kinds this provider handles.
-    // Temporary: first used by a later identity task.
-    #[allow(dead_code)]
     #[must_use]
     pub(crate) fn kinds(&self) -> &[ResolveKind] {
         &self.kinds
     }
 
     /// Whether the provider keeps private state.
-    // Temporary: first used by a later identity task.
-    #[allow(dead_code)]
     #[must_use]
     pub(crate) fn has_private_state(&self) -> bool {
         self.private_state
     }
 
     /// Whether the provider receives the full EC ID.
+    #[must_use]
     // Temporary: first used by a later identity task.
     #[allow(dead_code)]
-    #[must_use]
     pub(crate) fn gets_ec_id(&self) -> bool {
         self.ec_id
     }
@@ -476,9 +470,9 @@ impl Captures {
     }
 
     /// Whether a proxied request matches a rule.
+    #[must_use]
     // Temporary: first used by a later identity task.
     #[allow(dead_code)]
-    #[must_use]
     pub(crate) fn matches(&self, method: &Method, path: &str) -> bool {
         self.paths
             .iter()
@@ -490,17 +484,17 @@ impl Captures {
     }
 
     /// Exact path rules.
+    #[must_use]
     // Temporary: first used by a later identity task.
     #[allow(dead_code)]
-    #[must_use]
     pub(crate) fn paths(&self) -> &[(Method, String)] {
         &self.paths
     }
 
     /// Prefix rules.
+    #[must_use]
     // Temporary: first used by a later identity task.
     #[allow(dead_code)]
-    #[must_use]
     pub(crate) fn prefixes(&self) -> &[String] {
         &self.prefixes
     }

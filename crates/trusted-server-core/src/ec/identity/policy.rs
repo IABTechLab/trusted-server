@@ -37,7 +37,7 @@ pub(crate) fn tcf_applies(consent: &ConsentContext) -> bool {
 
 /// Whether the request carries a decoded US sale opt-out, from GPP or from
 /// the US Privacy string.
-fn us_sale_opt_out(consent: &ConsentContext) -> bool {
+pub(crate) fn us_sale_opt_out(consent: &ConsentContext) -> bool {
     consent.gpp.as_ref().and_then(|gpp| gpp.us_sale_opt_out) == Some(true)
         || consent
             .us_privacy
